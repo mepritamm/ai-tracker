@@ -4,6 +4,12 @@ A zero-dependency, local web dashboard that shows you **what your Claude Code se
 
 Nothing is sent anywhere. It's a single Python file using only the standard library, serving a local page you open in your browser.
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="Claude Code Session Tracker — live dashboard showing the session sidebar, a plain-language summary, background agents, and Claude's narration" width="880">
+</p>
+
+<p align="center"><sub>Live dashboard — session sidebar, summary (Goal / Now / So far), stat chips, background agents & shells, and Claude's own narration.</sub></p>
+
 ---
 
 ## Quick start
