@@ -1,0 +1,14 @@
+# Personal / runtime data — do not share
+flags.json
+titles.json
+.claude/launch.json
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
