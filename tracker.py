@@ -283,10 +283,6 @@ def _auggie_all():
     return m
 
 
-def _is_auggie_root(t):
-    return (t.get("description") or "").startswith("Root task for conversation")
-
-
 def _auggie_resolve(root, allmap, seen=None):
     """A root's subTasks are UUID references to other task files — flatten them
     (depth-first, cycle-safe) into todo dicts."""
@@ -307,76 +303,129 @@ def _auggie_resolve(root, allmap, seen=None):
     return out
 
 
-def _auggie_title(todos):
-    """A recognizable title for a conversation whose root is just 'Current Task List'."""
-    ip = next((t for t in todos if t["status"] == "in_progress"), None)
-    if ip and ip["content"]:
-        return ip["content"][:100]
-    for t in todos:                      # else first named task (usually the goal)
-        if t["content"]:
-            return t["content"][:100]
+AUGGIE_SESSIONS = os.path.join(AUGMENT_DIR, "sessions")
+_AUGGIE_LIST_CACHE = {}  # session-file path -> (mtime, list-entry fields)
+
+
+def _iso_epoch(s):
+    try:
+        import datetime as _dt
+        return _dt.datetime.strptime((s or "")[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=_dt.timezone.utc).timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _auggie_first_request(chat):
+    for m in chat or []:
+        r = (m.get("exchange") or {}).get("request_message")
+        if isinstance(r, str) and r.strip() and not r.lstrip().startswith("<"):
+            return " ".join(r.split())[:200]
     return ""
 
 
-def _auggie_mtime(t):
-    return t["lastUpdated"] / 1000 if t.get("lastUpdated") else t.get("_mtime", 0)
-
-
-AUGGIE_NOTE = ("Auggie keeps the full conversation in the Augment cloud — the tracker shows "
-               "the local task list and last-activity time only.")
+def _auggie_todos_for(root_uuid):
+    if not root_uuid:
+        return []
+    allmap = _auggie_all()
+    root = allmap.get(root_uuid)
+    return _auggie_resolve(root, allmap) if root else []
 
 
 def list_auggie():
-    """One Auggie session per conversation (root task); sub-tasks become its todos."""
-    allmap = _auggie_all()
+    """Auggie CLI sessions live at ~/.augment/sessions/<id>.json (the local transcripts)."""
     titles = load_titles()
     cwd = _augment_cwd()
     proj = os.path.basename(cwd) if cwd else "Augment"
     out = []
-    for t in allmap.values():
-        if not _is_auggie_root(t):
+    for f in glob.glob(os.path.join(AUGGIE_SESSIONS, "*.json")):
+        try:
+            mt = os.path.getmtime(f)
+        except OSError:
             continue
-        sid = "auggie:" + t["uuid"]
-        auto = _auggie_title(_auggie_resolve(t, allmap)) or "Auggie session"
+        hit = _AUGGIE_LIST_CACHE.get(f)
+        if hit and hit[0] == mt:
+            e = hit[1]
+        else:
+            try:
+                d = json.load(open(f, encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            sid = d.get("sessionId") or os.path.basename(f)[:-5]
+            req = _auggie_first_request(d.get("chatHistory"))
+            e = {"sid": sid,
+                 "title": d.get("customTitle") or (_short_title(req) if req else "Auggie session"),
+                 "prompt": req,
+                 "mtime": _iso_epoch(d.get("modified")) or mt}
+            _AUGGIE_LIST_CACHE[f] = (mt, e)
+        gid = "auggie:" + e["sid"]
         out.append({
-            "id": sid,
-            "project": proj,
-            "cwd": cwd,
-            "title": titles.get(sid) or auto,
-            "prompt": auto,
-            "source": "auggie",
-            "mtime": _auggie_mtime(t),
+            "id": gid, "project": proj, "cwd": cwd,
+            "title": titles.get(gid) or e["title"],
+            "prompt": e["prompt"], "source": "auggie", "mtime": e["mtime"],
         })
     return out
 
 
-def parse_auggie(uuid):
-    allmap = _auggie_all()
-    t = allmap.get(uuid)
-    if not t:
+def parse_auggie(session_id):
+    f = os.path.join(AUGGIE_SESSIONS, session_id + ".json")
+    if not os.path.isfile(f):
         return None
+    try:
+        d = json.load(open(f, encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    requests, narrative, files = [], [], {}
+    for m in d.get("chatHistory") or []:
+        ex = m.get("exchange") or {}
+        ts = m.get("finishedAt")
+        r = ex.get("request_message")
+        if isinstance(r, str) and r.strip() and not r.lstrip().startswith("<"):
+            requests.append({"t": ts, "text": " ".join(r.split())[:300]})
+        resp = ex.get("response_text")
+        if isinstance(resp, str) and resp.strip():
+            narrative.append({"t": ts, "text": resp.strip()[:900]})
+        for cf in m.get("changedFiles") or []:
+            p = cf if isinstance(cf, str) else (cf.get("path") or cf.get("filePath") or cf.get("file"))
+            if p:
+                fe = files.setdefault(p, {"path": p, "ops": 0, "created": False})
+                fe["ops"] += 1
+                fe["last"] = ts
     cwd = _augment_cwd()
-    todos = _auggie_resolve(t, allmap)
+    todos = _auggie_todos_for(d.get("rootTaskUuid"))
     done = sum(1 for x in todos if x["status"] == "completed")
     ip = next((x for x in todos if x["status"] == "in_progress"), None)
-    title = load_titles().get("auggie:" + uuid) or _auggie_title(todos) or "Auggie session"
+    gid = "auggie:" + session_id
+    title = (load_titles().get(gid) or d.get("customTitle")
+             or (_short_title(requests[0]["text"]) if requests else "Auggie session"))
+    latest = narrative[-1]["text"] if narrative else ""
+    so = []
+    if files:
+        so.append("touched %d file(s)" % len(files))
+    if todos:
+        so.append("%d/%d tasks done" % (done, len(todos)))
+    if requests:
+        so.append("%d exchange(s)" % len(requests))
     return {
-        "meta": {"cwd": cwd, "title": title, "source": "auggie", "entrypoint": "auggie"},
+        "meta": {"cwd": cwd, "title": title, "source": "auggie", "entrypoint": "auggie",
+                 "model": ((d.get("chatHistory") or [{}])[-1].get("exchange") or {}).get("model_id") or ""},
         "todos": todos,
-        "files": [], "reads": [], "commands": [], "commits": [], "tests": [],
-        "requests": [], "agents": [], "agents_bg": [], "narrative": [], "message": "",
+        "files": sorted(files.values(), key=lambda x: x.get("last") or "", reverse=True),
+        "reads": [], "commands": [], "commits": [], "tests": [],
+        "requests": requests, "agents": [], "agents_bg": [], "shells": [],
+        "narrative": narrative[-16:][::-1],
+        "message": latest[:2000],
         "tokens": {"in": 0, "out": 0},
-        "counts": {"done": done, "todos": len(todos), "created": 0, "edited": 0, "read": 0,
+        "counts": {"done": done, "todos": len(todos), "created": 0, "edited": len(files), "read": 0,
                    "commits": 0, "tests": 0, "tests_failed": 0, "errors": 0, "agents": 0, "searches": 0},
         "overview": {
             "where": os.path.basename(cwd) if cwd else "Augment",
-            "goal": t.get("description", ""),
-            "now": ("▶ " + ip["content"]) if ip else title,
-            "sofar": "%d of %d task(s) done" % (done, len(todos)) if todos else "No local task list yet.",
+            "goal": requests[-1]["text"] if requests else "",
+            "now": ("▶ " + ip["content"]) if ip else (_first_line(latest) if latest else title),
+            "sofar": "; ".join(so).capitalize() if so else "No activity recorded yet.",
             "commits": [],
         },
-        "note": AUGGIE_NOTE,
-        "mtime": _auggie_mtime(t),
+        "mtime": _iso_epoch(d.get("modified")) or os.path.getmtime(f),
         "now": time.time(),
     }
 
@@ -2111,29 +2160,37 @@ def _selfcheck():
     # a term that lives ONLY in the injected skill list must NOT match
     assert _match_content(data, "bitbucket-automation")[0] == 0, "boilerplate leaked into search"
 
-    # auggie (Augment CLI) sessions from task-storage
-    global AUGMENT_DIR
+    # auggie (Augment CLI) sessions from ~/.augment/sessions + todos from task-storage
+    global AUGMENT_DIR, AUGGIE_SESSIONS
     AUGMENT_DIR = tempfile.mkdtemp()
+    AUGGIE_SESSIONS = os.path.join(AUGMENT_DIR, "sessions")
+    os.makedirs(AUGGIE_SESSIONS)
     atd = os.path.join(AUGMENT_DIR, "task-storage", "tasks")
     os.makedirs(atd)
+    _AUGGIE_LIST_CACHE.clear()
     with open(os.path.join(AUGMENT_DIR, "settings.json"), "w") as fh:
         json.dump({"indexingAllowDirs": ["/x/myrepo"]}, fh)
 
     def _wtask(u, **kw):
         with open(os.path.join(atd, u), "w") as fh:
             json.dump({"uuid": u, **kw}, fh)
-    # a root conversation + two sub-task files referenced by UUID
-    _wtask("root1", name="Current Task List", description="Root task for conversation Z",
-           lastUpdated=1782460486658, subTasks=["s1", "s2"])
+    _wtask("root1", name="Current Task List", description="Root task for conversation Z", subTasks=["s1", "s2"])
     _wtask("s1", name="step one", state="COMPLETE", subTasks=[])
     _wtask("s2", name="step two", state="IN_PROGRESS", subTasks=[])
+    with open(os.path.join(AUGGIE_SESSIONS, "sess1.json"), "w") as fh:
+        json.dump({"sessionId": "sess1", "modified": "2026-06-27T05:48:03Z",
+                   "customTitle": "List Home Dir", "rootTaskUuid": "root1",
+                   "chatHistory": [{"finishedAt": "2026-06-27T05:47:50Z",
+                                    "exchange": {"request_message": "list the dir",
+                                                 "response_text": "I'll list it."}}]}, fh)
     al = list_auggie()
-    assert len(al) == 1 and al[0]["id"] == "auggie:root1", al          # only the root, not the 2 sub-tasks
+    assert len(al) == 1 and al[0]["id"] == "auggie:sess1", al
     assert al[0]["source"] == "auggie" and al[0]["project"] == "myrepo", al
-    assert al[0]["title"] == "step two", al                            # in-progress sub-task as the title
-    pa = parse_auggie("root1")
-    assert pa and pa["counts"]["done"] == 1 and pa["counts"]["todos"] == 2, pa
-    assert any(t["status"] == "in_progress" for t in pa["todos"]) and "cloud" in pa["note"].lower()
+    assert al[0]["title"] == "List Home Dir", al                       # customTitle wins
+    pa = parse_auggie("sess1")
+    assert pa and pa["counts"]["done"] == 1 and pa["counts"]["todos"] == 2, pa   # todos via rootTaskUuid
+    assert [r["text"] for r in pa["requests"]] == ["list the dir"], pa["requests"]
+    assert pa["narrative"] and "list it" in pa["narrative"][0]["text"].lower()
     assert parse_auggie("missing") is None
 
     # task store (TaskCreate/TaskUpdate) — replaced in-transcript TodoWrite
