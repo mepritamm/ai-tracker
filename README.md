@@ -1,6 +1,8 @@
-# Claude Code Session Tracker
+# AI Session Tracker
 
-A zero-dependency, local web dashboard that shows you **what your Claude Code sessions are doing — live**. It reads the session logs Claude Code already writes to disk and turns them into a readable view: a plain-language summary, todos, files touched, commands run, background agents/shells, and Claude's own narration — refreshing every 2 seconds.
+A zero-dependency, local web dashboard that shows you **what your AI coding sessions are doing — live**, across tools. It reads the session logs each AI coding tool already writes to disk and turns them into one readable view: a plain-language summary, todos, files touched, commands run, background agents/shells, and the assistant's own narration — refreshing every 2 seconds.
+
+Works across tools via a small **provider** for each. Built in today: **Claude Code** and **Auggie / Augment**. Adding another is a ~2-function adapter (see [Adding a tool](#adding-a-tool)).
 
 Nothing is sent anywhere. It's a single Python file using only the standard library, serving a local page you open in your browser.
 
@@ -60,6 +62,49 @@ Claude Code writes an append-only log for every session at `~/.claude/projects/<
 3. The browser **polls** every 2s — that re-read is the "live".
 
 Because it only reads what's already on disk, there's no integration, no API key, and no network traffic.
+
+Each AI tool plugs in as a **provider** (a small adapter). The registry (`PROVIDERS` in `tracker.py`) merges every available provider's sessions into one list and routes each session id — namespaced by prefix — to the adapter that owns it. One broken provider can't sink the list.
+
+---
+
+## Supported tools
+
+| Tool | Source on disk | Status |
+|------|----------------|--------|
+| **Claude Code** (Desktop / CLI / VS Code) | `~/.claude/projects/**/*.jsonl` | ✅ built in |
+| **Auggie / Augment** | `~/.augment/sessions/*.json` | ✅ built in |
+| Cursor, OpenAI Codex | SQLite databases | ⚙️ needs an adapter (format-specific reader) |
+| GitHub Copilot CLI | binary LMDB blobs | ⚙️ needs an adapter |
+
+Only tools that keep a **readable local transcript** can be adapted. Claude and Auggie write plain JSON/JSONL; others use SQLite or binary stores that each need their own reader.
+
+## Adding a tool
+
+Write one `Provider` in `tracker.py` and register it — no core changes:
+
+```python
+class MyToolProvider(Provider):
+    prefix = "mytool:"                     # namespaces this tool's session ids
+
+    def available(self):                   # is the tool's data on this machine?
+        return os.path.isdir(MY_TOOL_DIR)
+
+    def list(self):                        # -> session summaries for the sidebar
+        # return [{ "id": "mytool:<id>", "title", "project", "source": "mytool",
+        #           "mtime", "prompt", "cwd" }, ...]
+        ...
+
+    def parse(self, sid):                  # full id -> the detail view dict
+        # return the same shape parse_session()/parse_auggie() return
+        ...
+
+    def search(self, q):                   # optional keyword search
+        return []
+
+PROVIDERS = [ClaudeProvider(), AuggieProvider(), MyToolProvider()]
+```
+
+Add its source label to the `SRC` map in the page (e.g. `"mytool": "◆ MyTool"`) and it shows up with a badge, live status, search, and the full session view — same as the built-in tools.
 
 ---
 

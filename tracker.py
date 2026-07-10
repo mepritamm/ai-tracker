@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Live tracker for Claude Code sessions.
+"""Live tracker for AI coding sessions — across tools.
 
 Run:  python3 tracker.py            # opens http://localhost:8787
-Then paste a session id (or pick a recent one) and watch todos, files
-touched, and activity update live while Claude Code works.
+Pick a session (Claude Code, Auggie/Augment, …) and watch todos, files,
+commands, background agents, and the assistant's narration update live.
 
-Zero dependencies — stdlib only. Reads ~/.claude/projects/*/<id>.jsonl.
+Each tool plugs in as a Provider (see PROVIDERS). Zero dependencies —
+stdlib only. Reads what the tools already write to disk; nothing leaves
+your machine.
 """
 import difflib
 import glob
@@ -18,7 +20,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 PROJECTS = os.path.expanduser("~/.claude/projects")
 _HERE = os.path.dirname(os.path.abspath(__file__))
 FLAGS_FILE = os.path.join(_HERE, "flags.json")
@@ -27,6 +29,7 @@ AUGMENT_DIR = os.path.expanduser("~/.augment")     # Auggie (Augment CLI) local 
 TASKS_DIR = os.path.expanduser("~/.claude/tasks")   # TaskCreate/TaskUpdate store (replaced TodoWrite)
 EDIT_TOOLS = {"Edit", "MultiEdit", "NotebookEdit"}  # Write handled separately (= created)
 LIVE_WINDOW = 300  # a session stays "live" for this many seconds after its last activity (5 min)
+NARRATION_CAP = 40000  # max chars kept per narration message (modal shows full; list clamps the preview)
 TEST_RE = re.compile(r"\b(pytest|jest|vitest|mocha|go test|cargo test|rspec|"
                      r"npm (run )?test|yarn test|pnpm test|mvn test|gradle test|"
                      r"phpunit|tox|nox|ctest|unittest)\b")
@@ -254,15 +257,30 @@ def list_sessions(limit=200):
     return out
 
 
-def _augment_cwd():
+def _augment_dirs():
+    """Auggie's indexed workspace roots, longest (most specific) first."""
     try:
         s = json.load(open(os.path.join(AUGMENT_DIR, "settings.json"), encoding="utf-8"))
-        dirs = s.get("indexingAllowDirs") or []
-        if dirs:
-            return dirs[0]
+        return sorted([d for d in (s.get("indexingAllowDirs") or []) if isinstance(d, str)],
+                      key=len, reverse=True)
     except (OSError, ValueError):
-        pass
-    return ""
+        return []
+
+
+def _augment_cwd():
+    dirs = _augment_dirs()
+    return dirs[0] if dirs else ""
+
+
+def _auggie_cwd(file_paths):
+    """Auggie stores no per-session workspace, so pick the indexed root that
+    actually contains this session's changed files; fall back to the default."""
+    dirs = _augment_dirs()
+    for fp in file_paths:
+        for d in dirs:
+            if isinstance(fp, str) and (fp == d or fp.startswith(d + os.sep)):
+                return d
+    return dirs[0] if dirs else ""
 
 
 _ASTATE = {"COMPLETE": "completed", "COMPLETED": "completed", "DONE": "completed",
@@ -376,22 +394,29 @@ def parse_auggie(session_id):
     except (OSError, ValueError):
         return None
     requests, narrative, files = [], [], {}
+    tok_in = tok_out = 0
     for m in d.get("chatHistory") or []:
         ex = m.get("exchange") or {}
         ts = m.get("finishedAt")
+        for rn in ex.get("response_nodes") or []:   # tokens: mirror Claude (input + cache)
+            tu = rn.get("token_usage")
+            if isinstance(tu, dict):
+                tok_in += ((tu.get("input_tokens") or 0) + (tu.get("cache_read_input_tokens") or 0)
+                           + (tu.get("cache_creation_input_tokens") or 0))
+                tok_out += tu.get("output_tokens") or 0
         r = ex.get("request_message")
         if isinstance(r, str) and r.strip() and not r.lstrip().startswith("<"):
             requests.append({"t": ts, "text": " ".join(r.split())[:300]})
         resp = ex.get("response_text")
         if isinstance(resp, str) and resp.strip():
-            narrative.append({"t": ts, "text": resp.strip()[:900]})
+            narrative.append({"t": ts, "text": resp.strip()[:NARRATION_CAP]})
         for cf in m.get("changedFiles") or []:
             p = cf if isinstance(cf, str) else (cf.get("path") or cf.get("filePath") or cf.get("file"))
             if p:
                 fe = files.setdefault(p, {"path": p, "ops": 0, "created": False})
                 fe["ops"] += 1
                 fe["last"] = ts
-    cwd = _augment_cwd()
+    cwd = _auggie_cwd(list(files.keys()))
     todos = _auggie_todos_for(d.get("rootTaskUuid"))
     done = sum(1 for x in todos if x["status"] == "completed")
     ip = next((x for x in todos if x["status"] == "in_progress"), None)
@@ -415,7 +440,7 @@ def parse_auggie(session_id):
         "requests": requests, "agents": [], "agents_bg": [], "shells": [],
         "narrative": narrative[-16:][::-1],
         "message": latest[:2000],
-        "tokens": {"in": 0, "out": 0},
+        "tokens": {"in": tok_in, "out": tok_out},
         "counts": {"done": done, "todos": len(todos), "created": 0, "edited": len(files), "read": 0,
                    "commits": 0, "tests": 0, "tests_failed": 0, "errors": 0, "agents": 0, "searches": 0},
         "overview": {
@@ -546,6 +571,73 @@ def search_sessions(q, limit=500):
     # rank: title matches first, then hits in the user's own prompt, then the rest
     # (stable sort preserves the newest-first order within each group)
     out.sort(key=lambda r: (not r["titleMatch"], not r["inQuery"]))
+    return out
+
+
+def _score_segments(segs, terms, ql):
+    """Count keyword hits across (text, is_user) segments; require every term.
+    Returns (count, snippet, hit_in_user_prompt) — snippet prefers a user hit."""
+    count = 0
+    user_snip = any_snip = None
+    seen = set()
+    for text, is_user in segs:
+        tl = text.lower()
+        hit = [t for t in terms if t in tl]
+        if not hit:
+            continue
+        for t in hit:
+            count += tl.count(t)
+            seen.add(t)
+        w = _window(text, ql if ql in tl else hit[0])
+        if is_user and user_snip is None:
+            user_snip = w
+        elif any_snip is None:
+            any_snip = w
+    if seen < set(terms):          # not every word appeared in real content
+        return 0, "", False
+    return count, (user_snip or any_snip or ""), (user_snip is not None)
+
+
+def search_auggie(q, limit=500):
+    """Auggie counterpart of search_sessions — scans each session's chatHistory
+    (user prompts + assistant replies), returning the SAME result shape so
+    search_all can rank Claude and Auggie hits together."""
+    ql = q.lower().strip()
+    if not ql:
+        return []
+    terms = ql.split()
+    titles = load_titles()
+    cwd = _augment_cwd()
+    proj = os.path.basename(cwd) if cwd else "Augment"
+    out = []
+    for f in glob.glob(os.path.join(AUGGIE_SESSIONS, "*.json"))[:limit]:
+        try:
+            d = json.load(open(f, encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        sid = d.get("sessionId") or os.path.basename(f)[:-5]
+        gid = "auggie:" + sid
+        title = (titles.get(gid) or d.get("customTitle")
+                 or _short_title(_auggie_first_request(d.get("chatHistory"))) or "Auggie session")
+        segs = []  # (text, is_user)
+        for m in d.get("chatHistory") or []:
+            ex = m.get("exchange") or {}
+            r = ex.get("request_message")
+            if isinstance(r, str) and r.strip() and not r.lstrip().startswith("<"):
+                segs.append((r, True))
+            resp = ex.get("response_text")
+            if isinstance(resp, str) and resp.strip():
+                segs.append((resp, False))
+        title_match = all(t in (title or "").lower() for t in terms)
+        count, snippet, in_query = _score_segments(segs, terms, ql)
+        if not count and not title_match:
+            continue
+        out.append({
+            "id": gid, "project": proj, "title": title,
+            "matches": count, "snippet": snippet, "inQuery": in_query,
+            "titleMatch": title_match,
+            "mtime": _iso_epoch(d.get("modified")) or os.path.getmtime(f),
+        })
     return out
 
 
@@ -911,7 +1003,7 @@ def parse_session(path):
                     txt = b["text"].strip()
                     if not txt.startswith("<"):  # skip command/system echoes
                         text_last = txt
-                        narrative.append({"t": ts, "text": txt[:12000]})  # full message; list clamps the preview
+                        narrative.append({"t": ts, "text": txt[:NARRATION_CAP]})  # modal shows full; list clamps preview
                 elif bt == "tool_result" and b.get("is_error"):
                     errors_by_id[b.get("tool_use_id")] = True
                 elif bt == "tool_use":
@@ -1061,6 +1153,109 @@ def save_flags(flags):
     _save_json(FLAGS_FILE, flags)
 
 
+# --- Session providers -------------------------------------------------------
+# Each AI code-gen tool plugs in as one Provider. To support a new tool, add a
+# Provider whose list() returns session summaries and parse(sid) returns the
+# detail dict (same shape parse_session/parse_auggie return), then append it to
+# PROVIDERS. Session ids are namespaced by prefix: "" is the default (Claude,
+# bare ids); other tools use a prefix like "auggie:" so routing stays unambiguous.
+#
+# Only tools that keep a *readable* local transcript can be adapted here.
+# Claude Code (JSONL) and Auggie/Augment (JSON) do. Cursor & Codex store sessions
+# in SQLite, Copilot in binary LMDB blobs — each needs a format-specific reader,
+# which is why they aren't built in (guessing a binary schema is how bugs happen).
+
+class Provider:
+    prefix = ""              # id namespace ("" = default/Claude with bare ids)
+
+    def available(self):     # is this tool's data present on the machine?
+        return True
+
+    def list(self):          # -> [session summary dicts]
+        return []
+
+    def parse(self, sid):    # full id -> detail dict (or None if not found)
+        return None
+
+    def search(self, q):     # -> [search result dicts] (optional)
+        return []
+
+
+class ClaudeProvider(Provider):
+    prefix = ""
+
+    def available(self):
+        return os.path.isdir(PROJECTS)
+
+    def list(self):
+        return list_sessions()
+
+    def parse(self, sid):
+        path = find_session(sid)
+        return parse_session(path) if path else None
+
+    def search(self, q):
+        return search_sessions(q)
+
+
+class AuggieProvider(Provider):
+    prefix = "auggie:"
+
+    def available(self):
+        return os.path.isdir(AUGGIE_SESSIONS)
+
+    def list(self):
+        return list_auggie()
+
+    def parse(self, sid):
+        return parse_auggie(sid[len(self.prefix):])
+
+    def search(self, q):
+        return search_auggie(q)
+
+
+# Register providers here (order doesn't matter — the merged list is re-sorted).
+PROVIDERS = [ClaudeProvider(), AuggieProvider()]
+
+
+def all_sessions():
+    """Every available provider's sessions, merged newest-first."""
+    out = []
+    for p in PROVIDERS:
+        try:
+            if p.available():
+                out += p.list()
+        except Exception:
+            pass  # one broken provider must not sink the whole list
+    out.sort(key=lambda s: s.get("mtime", 0), reverse=True)
+    return out
+
+
+def parse_any(sid):
+    """Route a namespaced session id to the provider that owns it."""
+    for p in sorted(PROVIDERS, key=lambda x: len(x.prefix), reverse=True):
+        if p.prefix and sid.startswith(p.prefix):
+            return p.parse(sid)
+    for p in PROVIDERS:  # default: the unprefixed provider (Claude)
+        if p.prefix == "":
+            return p.parse(sid)
+    return None
+
+
+def search_all(q):
+    """Merge every provider's search hits and rank them together: title matches
+    first, then hits in the user's own prompt, then by recency — across sources."""
+    out = []
+    for p in PROVIDERS:
+        try:
+            if p.available():
+                out += p.search(q)
+        except Exception:
+            pass
+    out.sort(key=lambda r: (not r.get("titleMatch"), not r.get("inQuery"), -r.get("mtime", 0)))
+    return out
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         body = json.dumps(obj).encode()
@@ -1088,13 +1283,11 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
         elif p.path == "/api/list":
-            both = list_sessions() + list_auggie()
-            both.sort(key=lambda s: s.get("mtime", 0), reverse=True)
-            self._json(both)
+            self._json(all_sessions())
         elif p.path == "/api/flags":
             self._json(load_flags())
         elif p.path == "/api/search":
-            self._json(search_sessions(parse_qs(p.query).get("q", [""])[0]))
+            self._json(search_all(parse_qs(p.query).get("q", [""])[0]))
         elif p.path == "/api/diff":
             qs = parse_qs(p.query)
             sid, fp = qs.get("id", [""])[0], qs.get("file", [""])[0]
@@ -1143,21 +1336,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json(agent_detail(path, aid))
         elif p.path == "/api/session":
             sid = parse_qs(p.query).get("id", [""])[0]
-            if sid.startswith("auggie:"):
-                data = parse_auggie(sid[len("auggie:"):])
-                self._json(data if data else {"error": "auggie session not found", "id": sid},
-                           200 if data else 404)
-                return
-            path = find_session(sid)
-            if not path:
-                self._json({"error": "session not found", "id": sid}, 404)
-                return
             try:
-                data = parse_session(path)
+                data = parse_any(sid)          # routes to the owning provider
             except OSError as e:
                 self._json({"error": str(e)}, 500)
                 return
-            self._json(data)  # write errors handled inside _json, not as a 500
+            self._json(data if data else {"error": "session not found", "id": sid},
+                       200 if data else 404)
         else:
             self.send_error(404)
 
@@ -1515,13 +1700,13 @@ a{color:#4c8dff}
 <div class=toasts id=toasts></div>
 <div class=overlay id=diffmodal onclick="if(event.target===this)closeDiff()">
   <div class=modal>
-    <div class=mh><span class=fn id=diffname>file</span><span class=pp id=diffpath></span><span class=mdbtn id=diffmd onclick=toggleDiffMd() style=display:none>◧ Rendered</span><span class=x onclick=closeDiff()>✕</span></div>
+    <div class=mh><span class=fn id=diffname>file</span><span class=pp id=diffpath></span><span class=mdbtn onclick="popOut('diffname','diffbody')" title="Open in a new tab">⤢ New tab</span><span class=mdbtn id=diffmd onclick=toggleDiffMd() style=display:none>◧ Rendered</span><span class=x onclick=closeDiff()>✕</span></div>
     <div class=mb id=diffbody></div>
   </div>
 </div>
 <div class=overlay id=msgmodal onclick="if(event.target===this)closeMsg()">
   <div class=modal>
-    <div class=mh><span class=fn id=msgtitle>Narration</span><span class=pp id=msgwhen></span><span class=x onclick=closeMsg()>✕</span></div>
+    <div class=mh><span class=fn id=msgtitle>Narration</span><span class=pp id=msgwhen></span><span class=mdbtn onclick="popOut('msgtitle','msgbody')" title="Open in a new tab">⤢ New tab</span><span class=x onclick=closeMsg()>✕</span></div>
     <div class=msgbody id=msgbody></div>
   </div>
 </div>
@@ -1964,6 +2149,20 @@ async function openAgent(i){
     (d.narration?md(d.narration):"<div class=empty>no narration recorded</div>");
 }
 function closeMsg(){$("msgmodal").style.display="none";}
+function popOut(titleId,bodyId){
+  const body=$(bodyId); if(!body)return;
+  const title=($(titleId)&&$(titleId).textContent)||"Tracker";
+  const head=[...document.querySelectorAll("style, link[rel=stylesheet]")].map(e=>e.outerHTML).join("");
+  const w=window.open("","_blank");
+  if(!w){alert("Popup blocked — allow popups for this page to open in a new tab.");return;}
+  w.document.write(
+    `<!doctype html><html><head><meta charset=utf-8><title>${esc(title)}</title>${head}`+
+    `<style>body{background:#0a0d12;margin:0}.pw{max-width:920px;margin:0 auto;padding:22px 20px}`+
+    `.pw h1{font:600 15px/1.3 inherit;color:#e6edf3;margin:0 0 14px;border-bottom:1px solid #1c2330;padding-bottom:10px}`+
+    `.pw .${body.className.split(" ").join(".")}{overflow:visible;max-height:none}</style></head>`+
+    `<body><div class=pw><h1>${esc(title)}</h1><div class="${body.className}" style="overflow:visible;max-height:none">${body.innerHTML}</div></div></body></html>`);
+  w.document.close();
+}
 function flashTo(id){
   const el=$(id); if(!el||el.style.display==="none")return;
   el.scrollIntoView({behavior:"smooth",block:"start"});
@@ -2169,7 +2368,7 @@ def _selfcheck():
     os.makedirs(atd)
     _AUGGIE_LIST_CACHE.clear()
     with open(os.path.join(AUGMENT_DIR, "settings.json"), "w") as fh:
-        json.dump({"indexingAllowDirs": ["/x/myrepo"]}, fh)
+        json.dump({"indexingAllowDirs": ["/x/myrepo", "/x"]}, fh)  # two roots; specific one wins
 
     def _wtask(u, **kw):
         with open(os.path.join(atd, u), "w") as fh:
@@ -2182,7 +2381,11 @@ def _selfcheck():
                    "customTitle": "List Home Dir", "rootTaskUuid": "root1",
                    "chatHistory": [{"finishedAt": "2026-06-27T05:47:50Z",
                                     "exchange": {"request_message": "list the dir",
-                                                 "response_text": "I'll list it."}}]}, fh)
+                                                 "response_text": "I'll list it. " + "Z" * 2000,
+                                                 "changedFiles": ["/x/myrepo/app.py"],
+                                                 "response_nodes": [
+                                                     {"token_usage": {"input_tokens": 10, "output_tokens": 20,
+                                                                      "cache_read_input_tokens": 100}}]}}]}, fh)
     al = list_auggie()
     assert len(al) == 1 and al[0]["id"] == "auggie:sess1", al
     assert al[0]["source"] == "auggie" and al[0]["project"] == "myrepo", al
@@ -2191,7 +2394,23 @@ def _selfcheck():
     assert pa and pa["counts"]["done"] == 1 and pa["counts"]["todos"] == 2, pa   # todos via rootTaskUuid
     assert [r["text"] for r in pa["requests"]] == ["list the dir"], pa["requests"]
     assert pa["narrative"] and "list it" in pa["narrative"][0]["text"].lower()
+    assert len(pa["narrative"][0]["text"]) > 2000, "narration must keep the full message, not cap at 900"
+    assert pa["tokens"] == {"in": 110, "out": 20}, pa["tokens"]          # input + cache, like Claude
+    assert pa["meta"]["cwd"] == "/x/myrepo", pa["meta"]["cwd"]           # cwd from the changed file's root
     assert parse_auggie("missing") is None
+
+    # provider registry routes ids to the owning adapter
+    assert parse_any("auggie:sess1")["meta"]["source"] == "auggie", "auggie prefix must route to Auggie"
+    assert parse_any("auggie:missing") is None
+    assert parse_any("no-such-claude-session-id") is None, "bare id must route to the Claude provider"
+
+    # search reaches Auggie too (it was Claude-only): match the transcript + title
+    byq = search_auggie("list the dir")            # in the user's request_message
+    hit = [r for r in byq if r["id"] == "auggie:sess1"]
+    assert hit and hit[0]["inQuery"] is True, ("auggie search must hit the transcript", byq)
+    byt = search_auggie("home dir")                # both words in customTitle "List Home Dir"
+    assert any(r["id"] == "auggie:sess1" and r["titleMatch"] for r in byt), byt
+    assert search_auggie("zzznotfoundzzz") == []
 
     # task store (TaskCreate/TaskUpdate) — replaced in-transcript TodoWrite
     global TASKS_DIR
@@ -2243,7 +2462,7 @@ class Server(ThreadingHTTPServer):
 
 def main():
     if "--version" in sys.argv or "-v" in sys.argv:
-        print("claude-tracker", __version__)
+        print("ai-tracker", __version__)
         return
     if "--help" in sys.argv or "-h" in sys.argv:
         print(__doc__.strip())
