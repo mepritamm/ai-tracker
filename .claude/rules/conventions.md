@@ -3,7 +3,7 @@
 These are invariants, not suggestions. Breaking one is a regression even if the app still runs.
 
 ## Structure
-1. **One file.** The whole app is `tracker.py` (stdlib backend + the embedded `PAGE` SPA). Do not split it into packages/modules, do not add a `frontend/`, do not extract the JS. "Copy one file, run it" is the product.
+1. **Package, not a scratchpad.** Sources live in `aitracker/` (Python) and `aitracker/web/` (the SPA). Edit those — never `dist/tracker.py`, which `make bundle` regenerates. Keep the module boundaries: providers under `providers/`, the shared seam in `registry.py`.
 2. **Zero dependencies.** Standard library only. No `pip install`, no `requirements.txt`/`pyproject.toml`, no bundler, no build step.
 
 ## The shared seam (don't fork)
@@ -18,7 +18,7 @@ These are invariants, not suggestions. Breaking one is a regression even if the 
 
 ## Verification
 9. Non-trivial logic (a parser branch, ranking, a new panel) ships **one assertion in `_selfcheck()`**, covering both Claude and Auggie when the capability spans them.
-10. `python3 tracker.py --selfcheck` must print **`selfcheck ok`** — never regress it.
+10. `make check` must print **`selfcheck ok`** — never regress it.
 11. **Restart to see UI/parse changes** (`make serve`) — the `PAGE` is baked at startup. Only the JSON data files are live. State which kind of change you made.
 
 ## Process

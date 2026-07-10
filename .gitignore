@@ -12,3 +12,8 @@ __pycache__/
 *.swp
 .idea/
 .vscode/
+
+# build artifacts
+dist/
+*.egg-info/
+.venv/

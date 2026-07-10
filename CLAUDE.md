@@ -1,45 +1,47 @@
 # CLAUDE.md — ai-tracker
 
-Agent context for this repo. Read before editing. Hard rules live in [`.claude/rules/conventions.md`](.claude/rules/conventions.md).
+Agent context. Read before editing. Hard rules: [`.claude/rules/conventions.md`](.claude/rules/conventions.md).
 
 ## What this is
-A **single-file, zero-dependency** local web dashboard that shows what your AI coding sessions are doing — live, across tools. It reads the logs each tool already writes to disk and renders them. Nothing leaves the machine; no API keys, no network calls.
+A **zero-dependency** local web dashboard showing what your AI coding sessions are doing — live, across tools (Claude Code, Auggie, …). It only **reads** the logs each tool writes to disk; nothing leaves the machine.
 
-The whole app is **`tracker.py`** — a stdlib `http.server` backend **plus an embedded vanilla-JS SPA** (the `PAGE` string). There is intentionally no framework, no build step, and no package tree. "Copy one file and run it" is a feature, not an accident. **Do not split it up.**
+## Layout (production package; still stdlib-only)
+```
+aitracker/            the Python package
+  cli.py server.py page.py registry.py store.py overview.py util.py config.py
+  providers/base.py providers/claude.py providers/auggie.py
+  web/index.html app.css app.js        the SPA as real files (inlined at serve time by page.py)
+tests/test_selfcheck.py                 the self-check, as stdlib unittest
+scripts/bundle.py                       make bundle -> dist/tracker.py (standalone single file)
+pyproject.toml  Makefile  README.md
+```
+Run from a clone via `python -m aitracker`, or install with `uv` → the `ai-tracker` command.
 
 ## Commands
 ```bash
-make serve            # start / cleanly restart on http://localhost:8787 (frees the port first)
-make stop             # stop it
-make check            # the test gate: python3 tracker.py --selfcheck  → must print "selfcheck ok"
-python3 tracker.py --version | --help
+make serve            # start / restart on http://localhost:8787 (frees the port first)
+make stop
+make check            # the gate: python -m unittest discover -s tests  → prints "selfcheck ok"
+make bundle           # regenerate the standalone dist/tracker.py
+python -m aitracker --version | --help | --selfcheck
 ```
 
 ## Architecture (the seams)
-- **Providers.** Each AI tool plugs in as a `Provider` (`available/list/parse/search`). Registry: `PROVIDERS = [ClaudeProvider(), AuggieProvider()]`. The routes call the seam, not a source: `all_sessions()`, `parse_any(sid)`, `search_all(q)`. Ids are namespaced by prefix (`""` = Claude, `auggie:` = Auggie). **Add a tool = one adapter + one line in `PROVIDERS` + a `SRC` label** — no core changes.
-- **Two shared shapes** every provider emits (so the client renders any source uniformly):
-  - session-list dict: `{id, project, cwd, title, prompt, source, mtime}`
-  - session-detail dict: `{meta, todos, files, reads, commands, commits, tests, requests, agents, agents_bg, shells, narrative, message, tokens, counts, overview, note, mtime, now}`
-- **Server ↔ client.** Backend emits JSON; the SPA (`render`, `renderSide`, the modals) draws it. A capability spans **both** — add the field/route server-side *and* render it. Never re-derive server policy in JS.
-- **Data sources (read-only):** Claude `~/.claude/projects/**/*.jsonl`; Auggie `~/.augment/sessions/*.json` (+ `task-storage` for todos). Cursor/Codex (SQLite) and Copilot (binary LMDB) have no adapter — they need format-specific readers.
-- **App-owned state:** `flags.json`, `titles.json` via `_load_json`/`_save_json` — **read live** (no restart). Both are gitignored (personal).
-- **Liveness:** one constant — `LIVE_WINDOW` (server) / `LIVE` (client) = 300s. Don't add a second threshold.
+- **Providers.** Each tool is a `Provider` (`available/list/parse/search`) in `aitracker/providers/`. Registry (`registry.py`): `PROVIDERS`, `all_sessions()`, `parse_any(sid)`, `search_all(q)`. Routes call the seam, never a source. Ids namespaced by prefix (`""`=Claude, `auggie:`). **Add a tool = one module in `providers/` + one line in `PROVIDERS` + a `SRC` label in `web/app.js`.**
+- **Shared shapes** both providers emit: the session-list dict and the session-detail dict (`meta/todos/files/commands/narration/agents_bg/shells/overview/counts/…`). The SPA renders any source uniformly.
+- **Overridable paths are late-bound via `config.NAME`** (so tests and callers see one source of truth). `store.py`/`providers/*` reference `config.FLAGS_FILE` etc., not a copied import.
+- **App-owned state:** `flags.json`/`titles.json` via `store._load_json`/`_save_json` — read **live**. Both gitignored.
+- **Liveness:** one constant — `LIVE_WINDOW` (config) = `LIVE` (web/app.js) = 300s.
 
 ## The rule that bites everyone
-**The `PAGE` (HTML/CSS/JS) is baked into the server at startup.** After editing `tracker.py` you **must restart** (`make serve`) to see UI/parse changes. Only `flags.json`/`titles.json` are read live. Tell the user which kind of change you made.
+The page is assembled from `web/*` **at server startup** (`page.build_page`). After editing `aitracker/**` or `web/**` you **must restart** (`make serve`). Only `flags.json`/`titles.json` are read live.
 
 ## Conventions
-- Stdlib only. **No new dependencies. No build step. One file.**
-- Land a capability at the **shared seam** so both providers inherit it — never two forked implementations (that *is* the next gap).
-- Confirm a log's real shape (open an actual `~/.claude`/`~/.augment` file) **before** writing a parser — assumption is the top cause of bad fixes here.
-- Non-trivial logic ships an assertion in `_selfcheck()`; `make check` stays 100% green.
-- Atomic writes for on-disk state; keep the `BrokenPipeError`/`ConnectionResetError` guards (clients hang up mid-poll).
-- **This file is edited by many sessions — re-read the region right before editing; never assume it matches an earlier read.**
+- **Stdlib only, no new dependencies.** No build step for running (the `web/` inline is at serve time; `make bundle` is optional packaging).
+- Land a capability at the **shared seam** so every provider inherits it — never two forked implementations.
+- Confirm a log's real shape (open an actual `~/.claude`/`~/.augment` file) **before** writing a parser.
+- Non-trivial logic ships an assertion in `tests/`; `make check` stays green.
+- **Edit the sources (`aitracker/`, `web/`), never `dist/tracker.py`** — it's generated. Re-read a region before editing (multiple sessions touch this repo).
 
-## Skills (in `.claude/skills/`)
-- `/tracker-gap` — add/uplift a capability at the shared seam.
-- `/fix-flags` — resolve an issue the user 🚩-flagged in the app.
-- `/tracker-push` — commit + push to both remotes (license-split policy).
-
-## Releasing
-Two remotes, one tree: `personal` (public MIT, keeps `LICENSE`) and `advisor360` (work org, must be LICENSE-free — enforced by a pre-push hook). Use `/tracker-push`; don't push by hand.
+## Skills (`.claude/skills/`)
+`/tracker-gap` (add a capability at the seam), `/fix-flags` (resolve a 🚩), `/tracker-push` (PR to both remotes, license-split).
