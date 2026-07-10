@@ -7,16 +7,36 @@ Works across tools via a small **provider** for each. Built in today: **Claude C
 Nothing is sent anywhere. It's a single Python file using only the standard library, serving a local page you open in your browser.
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="Claude Code Session Tracker — live dashboard showing the session sidebar, a plain-language summary, background agents, and Claude's narration" width="880">
+  <img src="docs/screenshot.png" alt="AI Session Tracker — live dashboard showing the session sidebar, a plain-language summary, background agents, and the assistant's narration" width="880">
 </p>
 
-<p align="center"><sub>Live dashboard — session sidebar, summary (Goal / Now / So far), stat chips, background agents & shells, and Claude's own narration.</sub></p>
+<p align="center"><sub>Live dashboard — session sidebar, summary (Goal / Now / So far), stat chips, background agents & shells, and the assistant's own narration.</sub></p>
+
+---
+
+## Installation
+
+**Prerequisites:** **Python 3.8+**. That's it — the app is a single file using only the Python standard library, so there is **nothing to `pip install`** and no build step.
+
+**Get the code:**
+
+```bash
+git clone https://github.com/mepritamm/ai-tracker.git
+cd ai-tracker
+```
+
+(or just download `tracker.py` — it's the whole app).
+
+**Nothing else to configure.** The tracker auto-discovers your local session data:
+
+- **Claude Code** → `~/.claude/projects/**/*.jsonl` (Desktop, CLI, and VS Code)
+- **Auggie / Augment** → `~/.augment/sessions/*.json`
+
+A tool only appears if its data exists on the machine — install nothing, it just lights up what you already have.
 
 ---
 
 ## Quick start
-
-Requires **Python 3.8+** (standard library only — no `pip install`).
 
 ```bash
 python3 tracker.py
@@ -24,46 +44,58 @@ python3 tracker.py
 
 That's it. It starts a local server on **http://localhost:8787** and opens your browser. Pick a session from the sidebar (or paste a session id) and watch it work.
 
-Or use the Makefile, which cleanly restarts (frees a stuck port so UI updates always take effect):
+Prefer the Makefile — it restarts cleanly (frees a stuck port so UI changes always take effect):
 
 ```bash
-make serve            # start (or restart) the tracker
+make serve            # start (or restart) the tracker on :8787
 make stop             # stop it
 make serve PORT=9000  # use a different port
-make check            # run the built-in self-check
+make check            # run the built-in self-check (no server needed)
 ```
 
-Other flags: `python3 tracker.py --version | --help`.
+Flags: `python3 tracker.py --version` · `--help`. Set a port without the Makefile: `PORT=9000 python3 tracker.py`.
+
+To keep it running in the background: `nohup python3 tracker.py >/tmp/tracker.log 2>&1 &`.
 
 ---
 
 ## What it shows
 
-**Sidebar** — every session across all your projects, newest first, with a source badge (Claude Desktop / Claude CLI / Claude VS Code / Auggie), a live dot, and a short title.
-- **Click "N live"** to filter to only active sessions.
-- **Search** by keyword — matches your prompts and the conversation; sessions whose *name* matches rank first.
-- **✎ rename** any session to a title that means something to you.
+**Sidebar** — every session across all your tools and projects, newest first, each with a source badge (Claude Desktop / Claude CLI / Claude VS Code / Auggie), a live dot, and a short title.
+- **Click "N live"** to filter to only active sessions (live = touched in the last 5 minutes).
+- **Search** by keyword — matches your prompts and the conversation (not the boilerplate); sessions whose *name* matches rank first.
+- **✎ rename** any session to a title that means something to you (saved to `titles.json`).
 
 **Main view** for the selected session:
-- **Session summary** — Goal, what it's doing *Now*, and a one-line "So far".
-- **Background agents & shells** — running ones shown; finished ones one click away. Toasts + a sound when one completes.
-- **Narration** — Claude's own words, step by step (full markdown rendering in the modal).
-- **Todos**, **Files** (with a Diff ⇄ Rendered-markdown toggle), **Commands** (with ✓/✗), and **Requests**.
-- **🚩 Flag** anything you want to fix later — see the [fix-flags skill](#the-fix-flags-skill).
+- **Session summary** — Goal, what it's doing *Now*, and a one-line "So far", with stat chips (files, commands, reads, commits, tests, tokens, git branch).
+- **Background agents & shells** — running ones shown; finished ones one click away. A toast + sound fires when one completes. *(Claude Code only — Auggie has no background-work model.)*
+- **Narration** — the assistant's own words, step by step, with full markdown rendering (tables, code, lists) in the pop-out modal.
+- **Todos**, **Files** (with a Diff ⇄ Rendered-markdown toggle and an "open in new tab" button), **Commands** (with ✓/✗ for Claude), and **Requests**.
+- **🚩 Flag** anything you want to fix later — see [Skills](#skills).
 
 ---
 
 ## How it works
 
-Claude Code writes an append-only log for every session at `~/.claude/projects/<project>/<session-id>.jsonl`. Background agents write to a `<session-id>/` subdirectory. The tracker:
+Every supported tool writes an append-only session log to disk. The tracker only ever **reads** those files — there's no integration, no API key, and no network traffic.
 
-1. **Serves** a single HTML page (`GET /`).
-2. **Parses** a session's log on demand (`/api/session`) into the structured view.
-3. The browser **polls** every 2s — that re-read is the "live".
+1. **Serves** a single self-contained HTML page (`GET /`).
+2. **Parses** a session's log on demand (`/api/session?id=…`) into one structured view.
+3. The browser **polls** every 2 s — that re-read is the "live".
 
-Because it only reads what's already on disk, there's no integration, no API key, and no network traffic.
+Each tool plugs in as a **provider** (a small adapter). The registry — `PROVIDERS` in `tracker.py` — merges every available provider's sessions into one list and routes each session id (namespaced by prefix, e.g. `auggie:`) to the adapter that owns it. One broken provider can't sink the list.
 
-Each AI tool plugs in as a **provider** (a small adapter). The registry (`PROVIDERS` in `tracker.py`) merges every available provider's sessions into one list and routes each session id — namespaced by prefix — to the adapter that owns it. One broken provider can't sink the list.
+Both providers emit the **same result shape**, so the browser renders them identically. Where a tool records the data, the tracker surfaces it:
+
+| Data | Claude Code | Auggie / Augment |
+|------|-------------|------------------|
+| Summary, todos, requests, narration, files, tokens | ✅ | ✅ |
+| Commands, reads, commits, tests | ✅ | ✅ (from `launch-process` / `view` tools) |
+| Working folder + git branch (worktree-aware) | ✅ (from the log) | ✅ (folder from IDE state; branch from `.git/HEAD`) |
+| Command exit status (✓/✗) | ✅ | ➖ Auggie stores none — commands show as ✓ |
+| Background agents & shells | ✅ | ➖ Auggie has no such model |
+
+**Data files** — `flags.json` (your flags) and `titles.json` (your renames) are read **live** (no restart). Everything else is baked into the page at startup, so **editing `tracker.py` needs a server restart** to show.
 
 ---
 
@@ -108,17 +140,22 @@ Add its source label to the `SRC` map in the page (e.g. `"mytool": "◆ MyTool"`
 
 ---
 
-## The fix-flags skill
+## Skills
 
-Included at [`.claude/skills/fix-flags/`](.claude/skills/fix-flags/) — a Claude Code skill that reads the issues you 🚩-flag in the app, investigates them against the real session data, fixes them, verifies with `--selfcheck`, and marks them resolved. Invoke it in Claude Code with `/fix-flags`.
+The repo ships Claude Code skills under [`.claude/skills/`](.claude/skills/). Invoke them in Claude Code with `/<name>`:
+
+- **`/fix-flags`** — reads the issues you 🚩-flag in the app, investigates them against the real session data, fixes them, verifies with `--selfcheck`, and marks them resolved.
+- **`/tracker-gap`** — add or uplift a capability at the **shared seam** so every provider (Claude, Auggie, …) inherits it — never a forked one-off. Ships a self-check assertion and proves it end-to-end.
+- **`/tracker-push`** — the maintainer's commit-and-publish workflow (green self-check → commit → push), so a change ships without leaving the tree half-committed.
 
 ---
 
 ## Good to know
 
-- **Restart to see UI changes.** The page is served fresh on startup, so after editing `tracker.py` you must restart the server (`make serve`). Your data files (`flags.json`, `titles.json`) are read live and don't need a restart.
-- **Auggie / Augment sessions** show up too, but Augment keeps the full transcript in its cloud — so only the local task list and activity time are available for those.
-- **Background-agent completion** is inferred from a 5-minute inactivity window, so an agent-finished notification can lag a few minutes behind the actual finish. Background shells with real process state notify promptly.
+- **Restart to see UI/parse changes.** The page and parsers are loaded at startup; only `flags.json` / `titles.json` are read live. After editing `tracker.py`, run `make serve` (or restart the process).
+- **Auggie / Augment now reads the full local transcript** (`~/.augment/sessions/`) — summary, tokens, narration, files, commands, reads, working folder, and git branch — at near-Claude parity. The only gaps are background agents/shells (Auggie has no such model) and command exit status (Auggie doesn't record it, so its commands render as ✓).
+- **"Live" is a 5-minute window** since the last activity. Background-agent completion is inferred from that window, so an agent-finished notification can lag a few minutes; background shells with real process state notify promptly.
+- **Everything stays on your machine.** Read-only against the tool logs, no outbound network, no telemetry.
 
 ---
 
@@ -127,9 +164,16 @@ Included at [`.claude/skills/fix-flags/`](.claude/skills/fix-flags/) — a Claud
 ```
 tracker.py                     the entire app (stdlib only)
 Makefile                       make serve / make stop / make check
-.claude/skills/fix-flags/      Claude Code skill to fix flagged issues
+docs/screenshot.png            the dashboard screenshot in this README
+CLAUDE.md / AGENTS.md          context for AI agents working in this repo
+.claude/rules/                 hard conventions for edits (single-file, no deps)
+.claude/skills/fix-flags/      skill: fix issues you 🚩-flag in the app
+.claude/skills/tracker-gap/    skill: add a capability at the shared seam
+.claude/skills/tracker-push/   skill: commit + publish workflow
 flags.json / titles.json       your local data (git-ignored)
 ```
+
+Run the self-check any time with `make check` (or `python3 tracker.py --selfcheck`) — it exercises the parsers and providers with fixtures and must print `selfcheck ok`.
 
 ---
 

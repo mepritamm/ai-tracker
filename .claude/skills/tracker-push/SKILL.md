@@ -30,10 +30,19 @@ Bash calls** — the harness classifier tends to block a single call that bundle
 1. **Gate.** `python3 tracker.py --selfcheck` must print `selfcheck ok`. Never push a red build.
 2. **Confirm data stays local.** `git status --porcelain --ignored | grep -E 'flags.json|titles.json'`
    should show them as ignored (`!!`), never staged.
-3. **Commit on `main`** (the LICENSE-bearing history):
+3. **Sync the README, then commit on `main`** (the LICENSE-bearing history). Before staging, make
+   sure `README.md` reflects what you're shipping — a stale README is a **push blocker**. Update it in
+   the **same commit** whenever the change:
+   - adds / renames / removes a user-facing capability, panel, badge, flag, or endpoint;
+   - changes how to install or run it (deps, ports, commands, data locations);
+   - shifts Claude ↔ Auggie (or any provider) parity — keep the **How-it-works parity table** honest;
+   - adds/removes a skill or a top-level file (keep the **Skills** and **Project layout** sections current).
+
+   Read the diff you're about to push and ask "does the README still describe this accurately?" If not,
+   fix it first. Then:
    ```
    git checkout main
-   git add -A
+   git add -A                 # includes README.md if you touched it
    git commit -m "<summary>\n\n<bullets>\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
    ```
 4. **Push `main` → personal** (LICENSE allowed here):
@@ -77,6 +86,9 @@ If a push is rejected non-fast-forward, a remote moved (this repo is edited acro
   one side usually just needs propagating to the other (README/code fixes), not a merge conflict.
 
 ## Rules
+- **The README ships with the code.** Every push that changes user-facing behavior must update
+  `README.md` in the **same commit** — verify it's accurate before committing, never leave it for later.
+  A push with a stale README is not done.
 - `--selfcheck` green before any commit. Commit and push in **separate** Bash calls.
 - The pre-push hook is the last line of defense, not the plan — always send advisor360 a license-free
   tree deliberately (step 5), so the hook never has to fire.
