@@ -1,0 +1,18 @@
+#!/bin/sh
+# Mandatory gate: the built-in self-check AND the unit-test suite must pass
+# before any commit. Install with `make hooks` (shared across worktrees).
+#
+# Robust across worktree states: only runs a check if the file for it exists,
+# so a clone/worktree without the tests (or a restructured tree) commits fine.
+
+root=$(git rev-parse --show-toplevel) || exit 0
+cd "$root" || exit 0
+
+if [ -f tracker.py ]; then
+  python3 tracker.py --selfcheck || { echo "pre-commit BLOCKED: --selfcheck failed"; exit 1; }
+fi
+if [ -f test_tracker.py ]; then
+  python3 -W ignore::ResourceWarning -m unittest -q test_tracker \
+    || { echo "pre-commit BLOCKED: unit tests failed (test_tracker.py)"; exit 1; }
+fi
+exit 0

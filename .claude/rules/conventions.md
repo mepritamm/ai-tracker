@@ -17,8 +17,8 @@ These are invariants, not suggestions. Breaking one is a regression even if the 
 8. Keep the `BrokenPipeError`/`ConnectionResetError` guards — clients disconnect mid-poll every 2s.
 
 ## Verification
-9. Non-trivial logic (a parser branch, ranking, a new panel) ships **one assertion in `_selfcheck()`**, covering both Claude and Auggie when the capability spans them.
-10. `python3 tracker.py --selfcheck` must print **`selfcheck ok`** — never regress it.
+9. **Non-trivial logic ships a test** (a parser branch, ranking, a helper, a provider) — an assertion in `_selfcheck()` and/or a case in `test_tracker.py`, covering both Claude and Auggie when the capability spans them. Coverage only goes up.
+10. **`make check` is the mandatory gate** — it runs `python3 tracker.py --selfcheck` (must print `selfcheck ok`) **and** the `test_tracker.py` suite; both green before any change lands. Enforced by a pre-commit hook: run `make hooks` once, and a failing gate blocks the commit.
 11. **Restart to see UI/parse changes** (`make serve`) — the `PAGE` is baked at startup. Only the JSON data files are live. State which kind of change you made.
 
 ## Process

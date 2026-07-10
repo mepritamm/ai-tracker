@@ -11,7 +11,9 @@ The whole app is **`tracker.py`** — a stdlib `http.server` backend **plus an e
 ```bash
 make serve            # start / cleanly restart on http://localhost:8787 (frees the port first)
 make stop             # stop it
-make check            # the test gate: python3 tracker.py --selfcheck  → must print "selfcheck ok"
+make check            # the mandatory gate: --selfcheck + the test_tracker.py suite (both green)
+make test             # just the unit-test suite
+make hooks            # install the pre-commit gate (blocks commits that fail `make check`)
 python3 tracker.py --version | --help
 ```
 
@@ -32,7 +34,7 @@ python3 tracker.py --version | --help
 - Stdlib only. **No new dependencies. No build step. One file.**
 - Land a capability at the **shared seam** so both providers inherit it — never two forked implementations (that *is* the next gap).
 - Confirm a log's real shape (open an actual `~/.claude`/`~/.augment` file) **before** writing a parser — assumption is the top cause of bad fixes here.
-- Non-trivial logic ships an assertion in `_selfcheck()`; `make check` stays 100% green.
+- **Non-trivial logic ships a test** — an assertion in `_selfcheck()` and/or a case in `test_tracker.py`. `make check` (both) stays 100% green; it's enforced by a pre-commit hook (`make hooks`), so a failing gate blocks the commit.
 - Atomic writes for on-disk state; keep the `BrokenPipeError`/`ConnectionResetError` guards (clients hang up mid-poll).
 - **This file is edited by many sessions — re-read the region right before editing; never assume it matches an earlier read.**
 
