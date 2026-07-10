@@ -50,7 +50,9 @@ Prefer the Makefile — it restarts cleanly (frees a stuck port so UI changes al
 make serve            # start (or restart) the tracker on :8787
 make stop             # stop it
 make serve PORT=9000  # use a different port
-make check            # run the built-in self-check (no server needed)
+make check            # the gate: --selfcheck + unit tests (must be green)
+make test             # just the unit-test suite
+make hooks            # install the pre-commit gate (blocks commits that fail check)
 ```
 
 Flags: `python3 tracker.py --version` · `--help`. Set a port without the Makefile: `PORT=9000 python3 tracker.py`.
@@ -163,7 +165,9 @@ The repo ships Claude Code skills under [`.claude/skills/`](.claude/skills/). In
 
 ```
 tracker.py                     the entire app (stdlib only)
-Makefile                       make serve / make stop / make check
+test_tracker.py                unit tests + evals — the mandatory gate
+hooks/pre-commit               runs the gate before every commit (make hooks)
+Makefile                       make serve / stop / check / test / hooks
 docs/screenshot.png            the dashboard screenshot in this README
 CLAUDE.md / AGENTS.md          context for AI agents working in this repo
 .claude/rules/                 hard conventions for edits (single-file, no deps)
@@ -173,7 +177,19 @@ CLAUDE.md / AGENTS.md          context for AI agents working in this repo
 flags.json / titles.json       your local data (git-ignored)
 ```
 
-Run the self-check any time with `make check` (or `python3 tracker.py --selfcheck`) — it exercises the parsers and providers with fixtures and must print `selfcheck ok`.
+## Testing (mandatory)
+
+Every change must keep the gate green — the built-in `--selfcheck` **and** the `test_tracker.py`
+suite (stdlib `unittest`, no deps): granular unit tests for the helpers plus end-to-end evals that
+parse a fixture session and assert the whole derived view, so a break in any feature fails here.
+
+```bash
+make check     # run both — must be green before anything lands
+make hooks     # once per clone: install the pre-commit hook that runs `make check`
+```
+
+With the hook installed, a commit is **blocked** until the gate passes. Add a test alongside any new
+parser branch, helper, or provider (mirror the fixtures already in `_selfcheck()` / `test_tracker.py`).
 
 ---
 

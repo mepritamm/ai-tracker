@@ -91,12 +91,13 @@ JS — **no new dependencies**, no build step, no framework. Keep it one file.
 - **Server ↔ client:** the JSON key the server adds is the key the client reads — same name, no
   re-derivation.
 
-## Step 4 — Verify: self-check green, then prove it end-to-end
-The gate is the built-in self-check; a UI change is invisible until the server restarts.
-1. **Extend `_selfcheck()`** with one assertion pinning the new behavior (mirror the existing
-   fixture style — build a temp JSONL / temp `~/.augment` dir, call the parser/lister, assert the shape).
-   Cover **both** the Claude and Auggie paths when the capability spans them.
-2. **`python3 tracker.py --selfcheck`** must print `selfcheck ok` (100% green — never regress it).
+## Step 4 — Verify: the gate green, then prove it end-to-end
+The gate is `make check` (the built-in `--selfcheck` **and** the `test_tracker.py` suite); a UI change
+is invisible until the server restarts. A pre-commit hook (`make hooks`) enforces the gate on commit.
+1. **Ship a test** pinning the new behavior — an assertion in `_selfcheck()` and/or a case in
+   `test_tracker.py` (mirror the fixtures — temp JSONL / temp `~/.augment` dir, call the parser/lister,
+   assert the shape). Cover **both** the Claude and Auggie paths when the capability spans them.
+2. **`make check`** must be green — `selfcheck ok` plus the suite passing (never regress it).
 3. **Restart the server** (`make serve`, or kill the `:8787` listener and relaunch) — the `PAGE` is baked
    in at startup, so a client change won't show otherwise.
 4. **Prove it live:** `curl` the relevant endpoint (`/api/list`, `/api/session?id=…`, `/api/search?q=…`)
