@@ -2,6 +2,7 @@
 flags.json
 titles.json
 .claude/launch.json
+.claude/skills/tracker-push/
 
 # Python
 __pycache__/
