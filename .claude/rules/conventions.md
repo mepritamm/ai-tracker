@@ -23,4 +23,4 @@ These are invariants, not suggestions. Breaking one is a regression even if the 
 
 ## Process
 12. **Re-read the region right before editing** — this file is edited by multiple concurrent sessions and diverges. If an edit's match fails, the file moved; re-read.
-13. Minimal diff, no drive-by refactors, no new deps. No commit/push unless asked — use `/tracker-push` (dual-remote license split), never a manual push.
+13. Minimal diff, no drive-by refactors, no new deps. No commit/push unless asked.

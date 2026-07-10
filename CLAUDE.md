@@ -41,7 +41,6 @@ python3 tracker.py --version | --help
 ## Skills (in `.claude/skills/`)
 - `/tracker-gap` — add/uplift a capability at the shared seam.
 - `/fix-flags` — resolve an issue the user 🚩-flagged in the app.
-- `/tracker-push` — commit + push to both remotes (license-split policy).
 
 ## Releasing
-Two remotes, one tree: `personal` (public MIT, keeps `LICENSE`) and `work-remote` (work org, must be LICENSE-free — enforced by a pre-push hook). Use `/tracker-push`; don't push by hand.
+Open a PR against `main`. Maintainer publishing runs from a local, gitignored workflow — nothing to run from this repo.

@@ -148,7 +148,6 @@ The repo ships Claude Code skills under [`.claude/skills/`](.claude/skills/). In
 
 - **`/fix-flags`** — reads the issues you 🚩-flag in the app, investigates them against the real session data, fixes them, verifies with `--selfcheck`, and marks them resolved.
 - **`/tracker-gap`** — add or uplift a capability at the **shared seam** so every provider (Claude, Auggie, …) inherits it — never a forked one-off. Ships a self-check assertion and proves it end-to-end.
-- **`/tracker-push`** — the maintainer's commit-and-publish workflow (green self-check → commit → push), so a change ships without leaving the tree half-committed.
 
 ---
 
@@ -173,7 +172,6 @@ CLAUDE.md / AGENTS.md          context for AI agents working in this repo
 .claude/rules/                 hard conventions for edits (single-file, no deps)
 .claude/skills/fix-flags/      skill: fix issues you 🚩-flag in the app
 .claude/skills/tracker-gap/    skill: add a capability at the shared seam
-.claude/skills/tracker-push/   skill: commit + publish workflow
 flags.json / titles.json       your local data (git-ignored)
 ```
 
