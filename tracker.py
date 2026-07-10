@@ -300,6 +300,27 @@ def _auggie_cwd(file_paths):
     return dirs[0] if dirs else ""
 
 
+def _git_branch(cwd):
+    """Current branch of the checkout at cwd — handles git worktrees, where `.git`
+    is a file pointing at the real gitdir. Auggie doesn't record the branch (Claude
+    does, in its JSONL), so we read it from the repo to reach parity."""
+    if not cwd:
+        return ""
+    try:
+        gitpath = os.path.join(cwd, ".git")
+        if os.path.isfile(gitpath):                       # worktree: "gitdir: <path>"
+            line = open(gitpath, encoding="utf-8").read().strip()
+            head = os.path.join(line[7:].strip(), "HEAD") if line.startswith("gitdir:") else ""
+        else:
+            head = os.path.join(gitpath, "HEAD")
+        ref = open(head, encoding="utf-8").read().strip()
+        if ref.startswith("ref: refs/heads/"):
+            return ref[len("ref: refs/heads/"):]
+        return ref[:12]                                   # detached HEAD -> short sha
+    except OSError:
+        return ""
+
+
 _ASTATE = {"COMPLETE": "completed", "COMPLETED": "completed", "DONE": "completed",
            "IN_PROGRESS": "in_progress", "STARTED": "in_progress"}
 
@@ -411,17 +432,37 @@ def parse_auggie(session_id):
         d = json.load(open(f, encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    requests, narrative, files = [], [], {}
+    requests, narrative, files, cmds, reads, commits = [], [], {}, [], {}, []
     tok_in = tok_out = 0
     for m in d.get("chatHistory") or []:
         ex = m.get("exchange") or {}
         ts = m.get("finishedAt")
-        for rn in ex.get("response_nodes") or []:   # tokens: mirror Claude (input + cache)
+        for rn in ex.get("response_nodes") or []:
             tu = rn.get("token_usage")
-            if isinstance(tu, dict):
+            if isinstance(tu, dict):                # tokens: mirror Claude (input + cache)
                 tok_in += ((tu.get("input_tokens") or 0) + (tu.get("cache_read_input_tokens") or 0)
                            + (tu.get("cache_creation_input_tokens") or 0))
                 tok_out += tu.get("output_tokens") or 0
+            call = rn.get("tool_use")               # commands/reads, from Auggie's tools
+            if isinstance(call, dict):
+                inp = call.get("input_json")
+                if isinstance(inp, str):
+                    try:
+                        inp = json.loads(inp)
+                    except ValueError:
+                        inp = {}
+                inp = inp if isinstance(inp, dict) else {}
+                name = call.get("tool_name")
+                if name == "launch-process" and inp.get("command"):   # ~ Claude's Bash
+                    c = inp["command"]
+                    k = cmd_kind(c)
+                    cmds.append({"id": call.get("tool_use_id"), "t": ts, "cmd": c[:200],
+                                 "kind": k, "ok": True})   # Auggie stores no exit status
+                    if k == "commit":
+                        mm = COMMIT_MSG_RE.search(c)
+                        commits.append({"t": ts, "msg": (mm.group(2) if mm else c)[:120]})
+                elif name == "view" and inp.get("path") and inp.get("type") != "directory":
+                    reads[inp["path"]] = ts           # ~ Claude's Read
         r = ex.get("request_message")
         if isinstance(r, str) and r.strip() and not r.lstrip().startswith("<"):
             requests.append({"t": ts, "text": " ".join(r.split())[:300]})
@@ -435,6 +476,8 @@ def parse_auggie(session_id):
                 fe["ops"] += 1
                 fe["last"] = ts
     cwd = _auggie_ide_cwd(d) or _auggie_cwd(list(files.keys()))   # real cwd, like Claude's
+    branch = _git_branch(cwd)
+    tests = [c for c in cmds if c["kind"] == "test"]
     todos = _auggie_todos_for(d.get("rootTaskUuid"))
     done = sum(1 for x in todos if x["status"] == "completed")
     ip = next((x for x in todos if x["status"] == "in_progress"), None)
@@ -445,28 +488,36 @@ def parse_auggie(session_id):
     so = []
     if files:
         so.append("touched %d file(s)" % len(files))
+    if cmds:
+        so.append("ran %d command(s)" % len(cmds))
     if todos:
         so.append("%d/%d tasks done" % (done, len(todos)))
     if requests:
         so.append("%d exchange(s)" % len(requests))
     return {
         "meta": {"cwd": cwd, "title": title, "source": "auggie", "entrypoint": "auggie",
+                 "gitBranch": branch,
                  "model": ((d.get("chatHistory") or [{}])[-1].get("exchange") or {}).get("model_id") or ""},
         "todos": todos,
         "files": sorted(files.values(), key=lambda x: x.get("last") or "", reverse=True),
-        "reads": [], "commands": [], "commits": [], "tests": [],
+        "reads": [{"path": p, "t": t} for p, t in
+                  sorted(reads.items(), key=lambda kv: kv[1] or "", reverse=True)],
+        "commands": cmds[-60:][::-1],
+        "commits": commits[::-1],
+        "tests": tests[::-1],
         "requests": requests, "agents": [], "agents_bg": [], "shells": [],
         "narrative": narrative[-16:][::-1],
         "message": latest[:2000],
         "tokens": {"in": tok_in, "out": tok_out},
-        "counts": {"done": done, "todos": len(todos), "created": 0, "edited": len(files), "read": 0,
-                   "commits": 0, "tests": 0, "tests_failed": 0, "errors": 0, "agents": 0, "searches": 0},
+        "counts": {"done": done, "todos": len(todos), "created": 0, "edited": len(files),
+                   "read": len(reads), "commits": len(commits), "tests": len(tests),
+                   "tests_failed": 0, "errors": 0, "agents": 0, "searches": 0},
         "overview": {
             "where": os.path.basename(cwd) if cwd else "Augment",
             "goal": requests[-1]["text"] if requests else "",
             "now": ("▶ " + ip["content"]) if ip else (_first_line(latest) if latest else title),
             "sofar": "; ".join(so).capitalize() if so else "No activity recorded yet.",
-            "commits": [],
+            "commits": [cm["msg"] for cm in commits[:6]],
         },
         "mtime": _iso_epoch(d.get("modified")) or os.path.getmtime(f),
         "now": time.time(),
@@ -2419,7 +2470,13 @@ def _selfcheck():
                                                      "current_working_directory": "/work/dw-stack"}}}],
                                                  "response_nodes": [
                                                      {"token_usage": {"input_tokens": 10, "output_tokens": 20,
-                                                                      "cache_read_input_tokens": 100}}]}}]}, fh)
+                                                                      "cache_read_input_tokens": 100}},
+                                                     {"tool_use": {"tool_name": "launch-process", "tool_use_id": "c1",
+                                                                   "input_json": {"command": "git commit -m \"fix it\""}}},
+                                                     {"tool_use": {"tool_name": "launch-process", "tool_use_id": "c2",
+                                                                   "input_json": {"command": "pytest -q"}}},
+                                                     {"tool_use": {"tool_name": "view", "tool_use_id": "v1",
+                                                                   "input_json": {"path": "app.py", "type": "file"}}}]}}]}, fh)
     al = list_auggie()
     assert len(al) == 1 and al[0]["id"] == "auggie:sess1", al
     # real IDE cwd wins over the indexed-root/changed-file fallback (matches Claude's per-session cwd)
@@ -2432,7 +2489,28 @@ def _selfcheck():
     assert len(pa["narrative"][0]["text"]) > 2000, "narration must keep the full message, not cap at 900"
     assert pa["tokens"] == {"in": 110, "out": 20}, pa["tokens"]          # input + cache, like Claude
     assert pa["meta"]["cwd"] == "/work/dw-stack", pa["meta"]["cwd"]      # real IDE cwd, like Claude
+    # parity: commands (launch-process), reads (view), commits + tests — like Claude
+    assert len(pa["commands"]) == 2 and pa["counts"]["read"] == 1, (pa["commands"], pa["counts"])
+    assert pa["counts"]["commits"] == 1 and pa["counts"]["tests"] == 1, pa["counts"]
+    assert pa["commits"] and pa["commits"][0]["msg"] == "fix it", pa["commits"]
+    assert pa["reads"][0]["path"] == "app.py", pa["reads"]
+    assert "gitBranch" in pa["meta"], "auggie meta must carry gitBranch like Claude"
     assert parse_auggie("missing") is None
+
+    # _git_branch reads a normal repo and a worktree (Auggie's git branch source)
+    gdir = tempfile.mkdtemp()
+    os.makedirs(os.path.join(gdir, ".git"))
+    with open(os.path.join(gdir, ".git", "HEAD"), "w") as fh:
+        fh.write("ref: refs/heads/feat/x\n")
+    assert _git_branch(gdir) == "feat/x", _git_branch(gdir)
+    wt = tempfile.mkdtemp()
+    real = os.path.join(gdir, ".git", "worktrees", "wt")
+    os.makedirs(real)
+    with open(os.path.join(real, "HEAD"), "w") as fh:
+        fh.write("ref: refs/heads/wt-branch\n")
+    with open(os.path.join(wt, ".git"), "w") as fh:
+        fh.write("gitdir: " + real + "\n")
+    assert _git_branch(wt) == "wt-branch", _git_branch(wt)
 
     # provider registry routes ids to the owning adapter
     assert parse_any("auggie:sess1")["meta"]["source"] == "auggie", "auggie prefix must route to Auggie"
