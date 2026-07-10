@@ -1,6 +1,7 @@
 <!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width, initial-scale=1">
-<title>Claude Code Tracker</title>
+<title>AI Session Tracker</title>
+<link rel=icon href="data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20viewBox=%270%200%2032%2032%27%3E%3Crect%20x=%272.5%27%20y=%272.5%27%20width=%2727%27%20height=%2727%27%20rx=%278%27%20fill=%27%2311161f%27%20stroke=%27%23f5b443%27%20stroke-width=%272%27/%3E%3Cpath%20d=%27M6.5%2018h3.6l2-5.6%203%2010%202.2-6.3%201.5%201.9H25%27%20fill=%27none%27%20stroke=%27%23f5b443%27%20stroke-width=%272.3%27%20stroke-linecap=%27round%27%20stroke-linejoin=%27round%27/%3E%3Ccircle%20cx=%2723.4%27%20cy=%279%27%20r=%273%27%20fill=%27%2329d398%27/%3E%3C/svg%3E">
 <link rel=preconnect href="https://fonts.googleapis.com">
 <link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel=stylesheet>
@@ -8,7 +9,7 @@
 <div class=app>
 <aside class=side>
   <div class=sidehead>
-    <div class=sidetop><div class=ttl>Sessions</div><div class=livebadge id=livecount onclick=toggleLiveOnly() title="Click to show live sessions only">0 live</div><span class=bell id=bell onclick=toggleSound() title="Completion sound: on">🔔</span></div>
+    <div class=sidetop><span class=logo aria-hidden=true title="AI Session Tracker"><svg viewBox='0 0 32 32' xmlns='http://www.w3.org/2000/svg'><rect x='2.5' y='2.5' width='27' height='27' rx='8' fill='#11161f' stroke='#f5b443' stroke-width='2'/><path d='M6.5 18h3.6l2-5.6 3 10 2.2-6.3 1.5 1.9H25' fill='none' stroke='#f5b443' stroke-width='2.3' stroke-linecap='round' stroke-linejoin='round'/><circle cx='23.4' cy='9' r='3' fill='#29d398'/></svg></span><div class=ttl>Sessions</div><div class=livebadge id=livecount onclick=toggleLiveOnly() title="Click to show live sessions only">0 live</div><span class=bell id=bell onclick=toggleSound() title="Completion sound: on">🔔</span></div>
     <div class=searchbox>
       <span class=ic onclick=doSearch()>⌕</span>
       <input id=q placeholder="search sessions…" autocomplete=off>

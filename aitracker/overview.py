@@ -1,5 +1,6 @@
 import os
 import re
+from .config import LIVE_WINDOW
 from .util import _dur, _names, _first_line, _short_title, _window
 
 

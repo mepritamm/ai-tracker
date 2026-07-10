@@ -1,6 +1,6 @@
 ---
 name: tracker-gap
-description: Close a capability GAP in the ai-tracker app (tracker.py — a single stdlib http.server backend + an embedded vanilla-JS SPA) with ONE change landed at the SHARED SEAM so every path inherits it — never two forked implementations. The tracker's paths/asymmetries: (1) the SESSION-LIST shape produced by BOTH list_sessions() (Claude) and list_auggie() (Auggie), merged in /api/list — a per-session capability (title, source badge, live-ness, filter, search) must hold for both; (2) the SESSION-DETAIL result dict produced by BOTH parse_session() (Claude) and parse_auggie() (Auggie) — same keys (meta/todos/files/commands/narration/agents_bg/shells/overview/counts/note/mtime/now), so a detail capability lands on the shared shape + both producers; (3) the SERVER→CLIENT contract — a capability spans the parse/endpoint AND render()/renderSide() in the embedded PAGE, never hardcoded in one; (4) background AGENTS vs background SHELLS (parallel panels that usually move together). Ships a real assertion in the built-in _selfcheck(), keeps `python3 tracker.py --selfcheck` 100% green, then RESTARTS the server and curls the endpoint to prove it end-to-end (the page is baked at startup — a UI change is invisible until restart). For ADDING or uplifting a capability in THIS repo — not fixing an issue the user 🚩-flagged in the app (that's /fix-flags). Local change only — no commit/push unless asked.
+description: Close a capability GAP in the ai-tracker app (tracker.py — a single stdlib http.server backend + an embedded vanilla-JS SPA) with ONE change landed at the SHARED SEAM so every path inherits it — never two forked implementations. The tracker's paths/asymmetries: (1) the SESSION-LIST shape produced by BOTH list_sessions() (Claude) and list_auggie() (Auggie), merged in /api/list — a per-session capability (title, source badge, live-ness, filter, search) must hold for both; (2) the SESSION-DETAIL result dict produced by BOTH parse_session() (Claude) and parse_auggie() (Auggie) — same keys (meta/todos/files/commands/narration/agents_bg/shells/overview/counts/note/mtime/now), so a detail capability lands on the shared shape + both producers; (3) the SERVER→CLIENT contract — a capability spans the parse/endpoint AND render()/renderSide() in the embedded PAGE, never hardcoded in one; (4) background AGENTS vs background SHELLS (parallel panels that usually move together). Ships a real assertion in the built-in _selfcheck(), keeps `make check` 100% green, then RESTARTS the server and curls the endpoint to prove it end-to-end (the page is baked at startup — a UI change is invisible until restart). For ADDING or uplifting a capability in THIS repo — not fixing an issue the user 🚩-flagged in the app (that's /fix-flags). Local change only — no commit/push unless asked.
 ---
 
 # Close a Capability Gap in the tracker — universally, across every path
@@ -91,12 +91,13 @@ JS — **no new dependencies**, no build step, no framework. Keep it one file.
 - **Server ↔ client:** the JSON key the server adds is the key the client reads — same name, no
   re-derivation.
 
-## Step 4 — Verify: self-check green, then prove it end-to-end
-The gate is the built-in self-check; a UI change is invisible until the server restarts.
-1. **Extend `_selfcheck()`** with one assertion pinning the new behavior (mirror the existing
-   fixture style — build a temp JSONL / temp `~/.augment` dir, call the parser/lister, assert the shape).
-   Cover **both** the Claude and Auggie paths when the capability spans them.
-2. **`python3 tracker.py --selfcheck`** must print `selfcheck ok` (100% green — never regress it).
+## Step 4 — Verify: the gate green, then prove it end-to-end
+The gate is `make check` (the built-in `--selfcheck` **and** the `tests/` suite); a UI change
+is invisible until the server restarts. A pre-commit hook (`make hooks`) enforces the gate on commit.
+1. **Ship a test** pinning the new behavior — an assertion in `_selfcheck()` and/or a case in
+   `tests/` (mirror the fixtures — temp JSONL / temp `~/.augment` dir, call the parser/lister,
+   assert the shape). Cover **both** the Claude and Auggie paths when the capability spans them.
+2. **`make check`** must be green — `selfcheck ok` plus the suite passing (never regress it).
 3. **Restart the server** (`make serve`, or kill the `:8787` listener and relaunch) — the `PAGE` is baked
    in at startup, so a client change won't show otherwise.
 4. **Prove it live:** `curl` the relevant endpoint (`/api/list`, `/api/session?id=…`, `/api/search?q=…`)

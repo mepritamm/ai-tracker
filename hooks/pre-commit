@@ -1,0 +1,9 @@
+#!/bin/sh
+# Mandatory gate: the full test suite (unit tests + evals + selfcheck) must pass
+# before any commit. Install with `make hooks`.
+root=$(git rev-parse --show-toplevel) || exit 0
+cd "$root" || exit 0
+if [ -f Makefile ] && grep -q '^check' Makefile; then
+  make check || { echo "pre-commit BLOCKED: make check failed"; exit 1; }
+fi
+exit 0

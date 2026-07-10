@@ -284,7 +284,3 @@ def _run():
     assert load_titles()["sess-1"] == "My Custom Name"
     os.unlink(config.TITLES_FILE)
     print("selfcheck ok")
-
-class SelfCheck(unittest.TestCase):
-    def test_all(self):
-        _run()

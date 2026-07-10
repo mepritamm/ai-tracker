@@ -25,7 +25,7 @@ git clone https://github.com/mepritamm/ai-tracker.git
 cd ai-tracker
 ```
 
-(or just download `tracker.py` — it's the whole app).
+(or just grab the standalone `dist/tracker.py` from a `make bundle` — one file, no install).
 
 **Nothing else to configure.** The tracker auto-discovers your local session data:
 
@@ -39,7 +39,7 @@ A tool only appears if its data exists on the machine — install nothing, it ju
 ## Quick start
 
 ```bash
-python3 tracker.py
+python3 -m aitracker
 ```
 
 That's it. It starts a local server on **http://localhost:8787** and opens your browser. Pick a session from the sidebar (or paste a session id) and watch it work.
@@ -50,12 +50,14 @@ Prefer the Makefile — it restarts cleanly (frees a stuck port so UI changes al
 make serve            # start (or restart) the tracker on :8787
 make stop             # stop it
 make serve PORT=9000  # use a different port
-make check            # run the built-in self-check (no server needed)
+make check            # the gate: --selfcheck + unit tests (must be green)
+make test             # just the unit-test suite
+make hooks            # install the pre-commit gate (blocks commits that fail check)
 ```
 
-Flags: `python3 tracker.py --version` · `--help`. Set a port without the Makefile: `PORT=9000 python3 tracker.py`.
+Flags: `python3 -m aitracker --version` · `--help`. Set a port without the Makefile: `PORT=9000 python3 -m aitracker`.
 
-To keep it running in the background: `nohup python3 tracker.py >/tmp/tracker.log 2>&1 &`.
+To keep it running in the background: `nohup python3 -m aitracker >/tmp/tracker.log 2>&1 &`.
 
 ---
 
@@ -83,7 +85,7 @@ Every supported tool writes an append-only session log to disk. The tracker only
 2. **Parses** a session's log on demand (`/api/session?id=…`) into one structured view.
 3. The browser **polls** every 2 s — that re-read is the "live".
 
-Each tool plugs in as a **provider** (a small adapter). The registry — `PROVIDERS` in `tracker.py` — merges every available provider's sessions into one list and routes each session id (namespaced by prefix, e.g. `auggie:`) to the adapter that owns it. One broken provider can't sink the list.
+Each tool plugs in as a **provider** (a small adapter). The registry — `PROVIDERS` in `aitracker/registry.py` — merges every available provider's sessions into one list and routes each session id (namespaced by prefix, e.g. `auggie:`) to the adapter that owns it. One broken provider can't sink the list.
 
 Both providers emit the **same result shape**, so the browser renders them identically. Where a tool records the data, the tracker surfaces it:
 
@@ -95,7 +97,7 @@ Both providers emit the **same result shape**, so the browser renders them ident
 | Command exit status (✓/✗) | ✅ | ➖ Auggie stores none — commands show as ✓ |
 | Background agents & shells | ✅ | ➖ Auggie has no such model |
 
-**Data files** — `flags.json` (your flags) and `titles.json` (your renames) are read **live** (no restart). Everything else is baked into the page at startup, so **editing `tracker.py` needs a server restart** to show.
+**Data files** — `flags.json` (your flags) and `titles.json` (your renames) are read **live** (no restart). Everything else is baked into the page at startup, so **editing `aitracker/` or `web/` needs a server restart** to show.
 
 ---
 
@@ -112,7 +114,7 @@ Only tools that keep a **readable local transcript** can be adapted. Claude and 
 
 ## Adding a tool
 
-Write one `Provider` in `tracker.py` and register it — no core changes:
+Write one `Provider` in `aitracker/providers/` and register it in `aitracker/registry.py` — no core changes:
 
 ```python
 class MyToolProvider(Provider):
@@ -152,7 +154,7 @@ The repo ships Claude Code skills under [`.claude/skills/`](.claude/skills/). In
 
 ## Good to know
 
-- **Restart to see UI/parse changes.** The page and parsers are loaded at startup; only `flags.json` / `titles.json` are read live. After editing `tracker.py`, run `make serve` (or restart the process).
+- **Restart to see UI/parse changes.** The page and parsers are loaded at startup; only `flags.json` / `titles.json` are read live. After editing `aitracker/` or `web/`, run `make serve` (or restart the process).
 - **Auggie / Augment now reads the full local transcript** (`~/.augment/sessions/`) — summary, tokens, narration, files, commands, reads, working folder, and git branch — at near-Claude parity. The only gaps are background agents/shells (Auggie has no such model) and command exit status (Auggie doesn't record it, so its commands render as ✓).
 - **"Live" is a 5-minute window** since the last activity. Background-agent completion is inferred from that window, so an agent-finished notification can lag a few minutes; background shells with real process state notify promptly.
 - **Everything stays on your machine.** Read-only against the tool logs, no outbound network, no telemetry.
@@ -162,8 +164,11 @@ The repo ships Claude Code skills under [`.claude/skills/`](.claude/skills/). In
 ## Project layout
 
 ```
-tracker.py                     the entire app (stdlib only)
-Makefile                       make serve / make stop / make check
+aitracker/                     the app package (stdlib only): providers/, web/, server, cli
+web assets in aitracker/web/    index.html · app.css · app.js (inlined at serve time)
+tests/                unit tests + evals — the mandatory gate
+hooks/pre-commit               runs the gate before every commit (make hooks)
+Makefile                       make serve / stop / check / test / hooks
 docs/screenshot.png            the dashboard screenshot in this README
 CLAUDE.md / AGENTS.md          context for AI agents working in this repo
 .claude/rules/                 hard conventions for edits (single-file, no deps)
@@ -173,7 +178,19 @@ CLAUDE.md / AGENTS.md          context for AI agents working in this repo
 flags.json / titles.json       your local data (git-ignored)
 ```
 
-Run the self-check any time with `make check` (or `python3 tracker.py --selfcheck`) — it exercises the parsers and providers with fixtures and must print `selfcheck ok`.
+## Testing (mandatory)
+
+Every change must keep the gate green — the built-in `--selfcheck` **and** the `tests/`
+suite (stdlib `unittest`, no deps): granular unit tests for the helpers plus end-to-end evals that
+parse a fixture session and assert the whole derived view, so a break in any feature fails here.
+
+```bash
+make check     # run both — must be green before anything lands
+make hooks     # once per clone: install the pre-commit hook that runs `make check`
+```
+
+With the hook installed, a commit is **blocked** until the gate passes. Add a test alongside any new
+parser branch, helper, or provider (mirror the fixtures already in `_selfcheck()` / `tests/`).
 
 ---
 

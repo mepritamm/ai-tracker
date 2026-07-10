@@ -16,7 +16,7 @@ Env:   PORT   (default 8787)
 def _selfcheck():
     import unittest
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    suite = unittest.TestLoader().discover(os.path.join(here, "tests"))
+    suite = unittest.TestLoader().discover(os.path.join(here, "tests"), top_level_dir=here)
     ok = unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful()
     if ok:
         print("selfcheck ok")
