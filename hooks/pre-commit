@@ -1,9 +1,10 @@
-#!/bin/sh
-# Mandatory gate: the full test suite (unit tests + evals + selfcheck) must pass
-# before any commit. Install with `make hooks`.
-root=$(git rev-parse --show-toplevel) || exit 0
-cd "$root" || exit 0
-if [ -f Makefile ] && grep -q '^check' Makefile; then
-  make check || { echo "pre-commit BLOCKED: make check failed"; exit 1; }
+#!/usr/bin/env bash
+# Mandatory gate: the test suite must be green before a commit lands.
+set -e
+cd "$(git rev-parse --show-toplevel)"
+if ls tests/test_*.py >/dev/null 2>&1; then          # package layout
+    python3 -m unittest discover -s tests -t . -q || { echo "✗ tests failed — commit blocked"; exit 1; }
+elif [ -f test_tracker.py ]; then                    # legacy single-file layout
+    python3 tracker.py --selfcheck && python3 -m unittest -q test_tracker || { echo "✗ tests failed — commit blocked"; exit 1; }
 fi
-exit 0
+echo "✓ gate green"

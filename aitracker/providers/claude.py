@@ -112,6 +112,7 @@ def _searchable_texts(o):
     if not isinstance(m, dict):
         return
     role = m.get("role")
+    is_assistant = o.get("type") == "assistant"   # reliable regardless of message.role
     c = m.get("content")
     if isinstance(c, str):
         s = c.lstrip()
@@ -124,8 +125,10 @@ def _searchable_texts(o):
             ty = b.get("type")
             if ty == "text":
                 txt = b.get("text") or ""
-                if not txt.lstrip().startswith("<"):
-                    yield (txt, role == "user")
+                # only the assistant's own replies — a user-role list carries injected
+                # skill/tool/attachment text, not conversation (would pollute search).
+                if is_assistant and not txt.lstrip().startswith("<"):
+                    yield (txt, False)
             elif ty == "tool_use":
                 inp = b.get("input") or {}
                 for k in ("command", "file_path", "notebook_path", "pattern",
@@ -575,7 +578,10 @@ def parse_session(path):
                 if not isinstance(b, dict):
                     continue
                 bt = b.get("type")
-                if bt == "text" and b.get("text", "").strip():
+                # narration is the ASSISTANT's own words only — a user-role list carries
+                # injected skill/command/tool text ("Base directory for this skill: …"),
+                # which is not conversation and must not leak into the Narration panel.
+                if bt == "text" and b.get("text", "").strip() and o.get("type") == "assistant":
                     txt = b["text"].strip()
                     if not txt.startswith("<"):  # skip command/system echoes
                         text_last = txt
