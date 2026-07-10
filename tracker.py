@@ -272,9 +272,26 @@ def _augment_cwd():
     return dirs[0] if dirs else ""
 
 
+def _auggie_ide_cwd(d):
+    """Auggie records the session's real working dir in each request's IDE state
+    node — the analog of Claude's per-session `cwd`. Take the most recent one."""
+    cwd = ""
+    for m in d.get("chatHistory") or []:
+        for rn in (m.get("exchange") or {}).get("request_nodes") or []:
+            ide = rn.get("ide_state_node") if isinstance(rn, dict) else None
+            if not isinstance(ide, dict):
+                continue
+            term = ide.get("current_terminal") or {}
+            c = (term.get("current_working_directory")
+                 or ide.get("repository_root") or ide.get("folder_root"))
+            if isinstance(c, str) and c:
+                cwd = c   # latest exchange wins
+    return cwd
+
+
 def _auggie_cwd(file_paths):
-    """Auggie stores no per-session workspace, so pick the indexed root that
-    actually contains this session's changed files; fall back to the default."""
+    """Fallback when a session has no IDE-state cwd: pick the indexed root that
+    contains this session's changed files, else the default indexed root."""
     dirs = _augment_dirs()
     for fp in file_paths:
         for d in dirs:
@@ -353,8 +370,7 @@ def _auggie_todos_for(root_uuid):
 def list_auggie():
     """Auggie CLI sessions live at ~/.augment/sessions/<id>.json (the local transcripts)."""
     titles = load_titles()
-    cwd = _augment_cwd()
-    proj = os.path.basename(cwd) if cwd else "Augment"
+    default_cwd = _augment_cwd()
     out = []
     for f in glob.glob(os.path.join(AUGGIE_SESSIONS, "*.json")):
         try:
@@ -374,11 +390,13 @@ def list_auggie():
             e = {"sid": sid,
                  "title": d.get("customTitle") or (_short_title(req) if req else "Auggie session"),
                  "prompt": req,
+                 "cwd": _auggie_ide_cwd(d),   # real per-session working dir (like Claude)
                  "mtime": _iso_epoch(d.get("modified")) or mt}
             _AUGGIE_LIST_CACHE[f] = (mt, e)
         gid = "auggie:" + e["sid"]
+        cwd = e.get("cwd") or default_cwd
         out.append({
-            "id": gid, "project": proj, "cwd": cwd,
+            "id": gid, "project": os.path.basename(cwd) if cwd else "Augment", "cwd": cwd,
             "title": titles.get(gid) or e["title"],
             "prompt": e["prompt"], "source": "auggie", "mtime": e["mtime"],
         })
@@ -416,7 +434,7 @@ def parse_auggie(session_id):
                 fe = files.setdefault(p, {"path": p, "ops": 0, "created": False})
                 fe["ops"] += 1
                 fe["last"] = ts
-    cwd = _auggie_cwd(list(files.keys()))
+    cwd = _auggie_ide_cwd(d) or _auggie_cwd(list(files.keys()))   # real cwd, like Claude's
     todos = _auggie_todos_for(d.get("rootTaskUuid"))
     done = sum(1 for x in todos if x["status"] == "completed")
     ip = next((x for x in todos if x["status"] == "in_progress"), None)
@@ -607,8 +625,7 @@ def search_auggie(q, limit=500):
         return []
     terms = ql.split()
     titles = load_titles()
-    cwd = _augment_cwd()
-    proj = os.path.basename(cwd) if cwd else "Augment"
+    default_cwd = _augment_cwd()
     out = []
     for f in glob.glob(os.path.join(AUGGIE_SESSIONS, "*.json"))[:limit]:
         try:
@@ -632,8 +649,9 @@ def search_auggie(q, limit=500):
         count, snippet, in_query = _score_segments(segs, terms, ql)
         if not count and not title_match:
             continue
+        cwd = _auggie_ide_cwd(d) or default_cwd    # per-session folder, like list/detail
         out.append({
-            "id": gid, "project": proj, "title": title,
+            "id": gid, "project": os.path.basename(cwd) if cwd else "Augment", "title": title,
             "matches": count, "snippet": snippet, "inQuery": in_query,
             "titleMatch": title_match,
             "mtime": _iso_epoch(d.get("modified")) or os.path.getmtime(f),
@@ -1700,13 +1718,13 @@ a{color:#4c8dff}
 <div class=toasts id=toasts></div>
 <div class=overlay id=diffmodal onclick="if(event.target===this)closeDiff()">
   <div class=modal>
-    <div class=mh><span class=fn id=diffname>file</span><span class=pp id=diffpath></span><span class=mdbtn onclick="popOut('diffname','diffbody')" title="Open in a new tab">⤢ New tab</span><span class=mdbtn id=diffmd onclick=toggleDiffMd() style=display:none>◧ Rendered</span><span class=x onclick=closeDiff()>✕</span></div>
+    <div class=mh><span class=fn id=diffname>file</span><span class=pp id=diffpath></span><span class=mdbtn onclick="copyModal('diffbody',this)" title="Copy to clipboard">⧉ Copy</span><span class=mdbtn onclick="popOut('diffname','diffbody')" title="Open in a new tab">⤢ New tab</span><span class=mdbtn id=diffmd onclick=toggleDiffMd() style=display:none>◧ Rendered</span><span class=x onclick=closeDiff()>✕</span></div>
     <div class=mb id=diffbody></div>
   </div>
 </div>
 <div class=overlay id=msgmodal onclick="if(event.target===this)closeMsg()">
   <div class=modal>
-    <div class=mh><span class=fn id=msgtitle>Narration</span><span class=pp id=msgwhen></span><span class=mdbtn onclick="popOut('msgtitle','msgbody')" title="Open in a new tab">⤢ New tab</span><span class=x onclick=closeMsg()>✕</span></div>
+    <div class=mh><span class=fn id=msgtitle>Narration</span><span class=pp id=msgwhen></span><span class=mdbtn onclick="copyModal('msgbody',this)" title="Copy to clipboard">⧉ Copy</span><span class=mdbtn onclick="popOut('msgtitle','msgbody')" title="Open in a new tab">⤢ New tab</span><span class=x onclick=closeMsg()>✕</span></div>
     <div class=msgbody id=msgbody></div>
   </div>
 </div>
@@ -2149,6 +2167,20 @@ async function openAgent(i){
     (d.narration?md(d.narration):"<div class=empty>no narration recorded</div>");
 }
 function closeMsg(){$("msgmodal").style.display="none";}
+function copyModal(bodyId,btn){
+  const el=$(bodyId); if(!el)return;
+  const text=el.innerText||el.textContent||"";
+  const done=()=>{if(btn){const o=btn.textContent;btn.textContent="✓ Copied";setTimeout(()=>btn.textContent=o,1200);}};
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(done).catch(()=>fallbackCopy(el,done));
+  }else{fallbackCopy(el,done);}
+}
+function fallbackCopy(el,done){
+  const r=document.createRange();r.selectNodeContents(el);
+  const s=getSelection();s.removeAllRanges();s.addRange(r);
+  try{document.execCommand("copy");done();}catch(e){}
+  s.removeAllRanges();
+}
 function popOut(titleId,bodyId){
   const body=$(bodyId); if(!body)return;
   const title=($(titleId)&&$(titleId).textContent)||"Tracker";
@@ -2383,12 +2415,15 @@ def _selfcheck():
                                     "exchange": {"request_message": "list the dir",
                                                  "response_text": "I'll list it. " + "Z" * 2000,
                                                  "changedFiles": ["/x/myrepo/app.py"],
+                                                 "request_nodes": [{"ide_state_node": {"current_terminal": {
+                                                     "current_working_directory": "/work/dw-stack"}}}],
                                                  "response_nodes": [
                                                      {"token_usage": {"input_tokens": 10, "output_tokens": 20,
                                                                       "cache_read_input_tokens": 100}}]}}]}, fh)
     al = list_auggie()
     assert len(al) == 1 and al[0]["id"] == "auggie:sess1", al
-    assert al[0]["source"] == "auggie" and al[0]["project"] == "myrepo", al
+    # real IDE cwd wins over the indexed-root/changed-file fallback (matches Claude's per-session cwd)
+    assert al[0]["source"] == "auggie" and al[0]["project"] == "dw-stack" and al[0]["cwd"] == "/work/dw-stack", al
     assert al[0]["title"] == "List Home Dir", al                       # customTitle wins
     pa = parse_auggie("sess1")
     assert pa and pa["counts"]["done"] == 1 and pa["counts"]["todos"] == 2, pa   # todos via rootTaskUuid
@@ -2396,7 +2431,7 @@ def _selfcheck():
     assert pa["narrative"] and "list it" in pa["narrative"][0]["text"].lower()
     assert len(pa["narrative"][0]["text"]) > 2000, "narration must keep the full message, not cap at 900"
     assert pa["tokens"] == {"in": 110, "out": 20}, pa["tokens"]          # input + cache, like Claude
-    assert pa["meta"]["cwd"] == "/x/myrepo", pa["meta"]["cwd"]           # cwd from the changed file's root
+    assert pa["meta"]["cwd"] == "/work/dw-stack", pa["meta"]["cwd"]      # real IDE cwd, like Claude
     assert parse_auggie("missing") is None
 
     # provider registry routes ids to the owning adapter
@@ -2408,6 +2443,7 @@ def _selfcheck():
     byq = search_auggie("list the dir")            # in the user's request_message
     hit = [r for r in byq if r["id"] == "auggie:sess1"]
     assert hit and hit[0]["inQuery"] is True, ("auggie search must hit the transcript", byq)
+    assert hit[0]["project"] == "dw-stack", hit[0]["project"]   # search project = real IDE cwd too
     byt = search_auggie("home dir")                # both words in customTitle "List Home Dir"
     assert any(r["id"] == "auggie:sess1" and r["titleMatch"] for r in byt), byt
     assert search_auggie("zzznotfoundzzz") == []
