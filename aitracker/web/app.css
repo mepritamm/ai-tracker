@@ -212,3 +212,4 @@ a{color:#4c8dff}
 body{background:#0a0d12;margin:0}.pw{max-width:920px;margin:0 auto;padding:22px 20px}`+
     `.pw h1{font:600 15px/1.3 inherit;color:#e6edf3;margin:0 0 14px;border-bottom:1px solid #1c2330;padding-bottom:10px}`+
     `.pw .${body.className.split(" ").join(".")}{overflow:visible;max-height:none}
+.loadmore{text-align:center;color:#5b6573;font-size:11px;padding:9px;cursor:default;border-top:1px solid #161c27}

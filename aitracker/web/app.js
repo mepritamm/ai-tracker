@@ -286,8 +286,8 @@ function render(d){
   // narration
   const nr=d.narrative||[];
   curNarr=nr;
-  $("narr").innerHTML=nr.length?nr.map((x,i)=>
-    `<div class=narr onclick="openMsg(${i})" title="Read full message"><span class=t>${x.t?ago(d.now-Date.parse(x.t)/1000):""}</span><span class=x>${md(x.text)}</span><span class=chev>›</span></div>`).join(""):"<div class=empty>no narration yet</div>";
+  winList("narr", nr, (x,i)=>
+    `<div class=narr onclick="openMsg(${i})" title="Read full message"><span class=t>${x.t?ago(d.now-Date.parse(x.t)/1000):""}</span><span class=x>${md(x.text)}</span><span class=chev>›</span></div>`, "no narration yet");
 
   // todos
   const td=d.todos||[];
@@ -296,29 +296,29 @@ function render(d){
   const TICON={completed:"✓",in_progress:"▶",pending:"○"};
   $("todoc").textContent=td.length?c.done+"/"+td.length:"";
   curTodos=sorted;
-  $("todos").innerHTML=td.length?sorted.map((t,i)=>
-    `<div class="todo t-${t.status} clk" onclick="openTodo(${i})"><span class=ic>${TICON[t.status]||"○"}</span><span class=tx>${md(t.content)}</span></div>`).join(""):"<div class=empty>no todos in this session</div>";
+  winList("todos", sorted, (t,i)=>
+    `<div class="todo t-${t.status} clk" onclick="openTodo(${i})"><span class=ic>${TICON[t.status]||"○"}</span><span class=tx>${md(t.content)}</span></div>`, "no todos in this session");
 
   // requests (markdown + click to read full)
   curReqs=[...(d.requests||[])].reverse();
   $("reqc").textContent=curReqs.length||"";
-  $("reqs").innerHTML=curReqs.length?curReqs.map((r,i)=>
-    `<div class="item clk" onclick="openReq(${i})"><div class="mdtext clamp3">${md(r.text)}</div><div class="muted mono" style=font-size:11px;margin-top:3px>${r.t?ago(d.now-Date.parse(r.t)/1000):""}</div></div>`).join(""):"<div class=empty>—</div>";
+  winList("reqs", curReqs, (r,i)=>
+    `<div class="item clk" onclick="openReq(${i})"><div class="mdtext clamp3">${md(r.text)}</div><div class="muted mono" style=font-size:11px;margin-top:3px>${r.t?ago(d.now-Date.parse(r.t)/1000):""}</div></div>`, "—");
 
   // files
   const fs=d.files||[];
   curFiles=fs;
   $("filec").textContent=fs.length||"";
-  $("files").innerHTML=fs.length?fs.map((f,i)=>
+  winList("files", fs, (f,i)=>
     `<div class="item filerow" onclick="openDiff(${i})" title="View diff"><div class=fpath><span class="kind ${f.created?'new':''}">${f.created?'created':'edited'}</span> <b>${esc(base(f.path))}</b><span class=chev>diff ›</span></div>`+
-    `<div class="muted mono" style=font-size:11px;margin-top:3px>${esc(f.path.replace("/"+base(f.path),""))} · ${f.ops}× · ${ago(d.now-Date.parse(f.last)/1000)}</div></div>`).join(""):"<div class=empty>no files written yet</div>";
+    `<div class="muted mono" style=font-size:11px;margin-top:3px>${esc(f.path.replace("/"+base(f.path),""))} · ${f.ops}× · ${ago(d.now-Date.parse(f.last)/1000)}</div></div>`, "no files written yet");
 
   // commands (click to see output)
   curCmds=d.commands||[];
   $("cmdc").textContent=curCmds.length||"";
-  $("cmds").innerHTML=curCmds.length?curCmds.map((x,i)=>
+  winList("cmds", curCmds, (x,i)=>
     `<div class="item clk" onclick="openCmd(${i})"><span class="${x.ok?'ok':'bad'}">${x.ok?'✓':'✗'}</span> <span class=muted>${KICON[x.kind]||'$'}</span> `+
-    `<span class="cmd mono">${esc(x.cmd)}</span> <span class=chev style=float:right;color:#5b6573>output ›</span></div>`).join(""):"<div class=empty>—</div>";
+    `<span class="cmd mono">${esc(x.cmd)}</span> <span class=chev style=float:right;color:#5b6573>output ›</span></div>`, "—");
 }
 let curFiles=[], curDiffFile=null, curDiffOps=[], diffMode="diff";
 const isMd=p=>/\.(md|markdown|mdx)$/i.test(p||"");
@@ -526,3 +526,27 @@ document.addEventListener("keydown",e=>{
   if(e.key==="ArrowLeft"){navModal(-1);e.preventDefault();}
   else if(e.key==="ArrowRight"){navModal(1);e.preventDefault();}
 });
+
+// ---- generic windowed list: render a growing window, reveal +30 on scroll,
+// survive the 2s poll (persisted window + preserved scroll position). Used by
+// every list panel so "scroll to load older" works app-wide.
+let _win={};
+function winList(elId, items, render, empty){
+  const el=$(elId); if(!el)return;
+  if(!items||!items.length){ el.innerHTML="<div class=empty>"+empty+"</div>"; _win[elId]=30; return; }
+  el._items=items; el._render=render; el._empty=empty;
+  const shown=Math.min(_win[elId]||30, items.length);
+  const top=el.scrollTop;
+  let html=items.slice(0,shown).map(render).join("");
+  if(shown<items.length) html+=`<div class=loadmore>↓ ${items.length-shown} older — scroll to load</div>`;
+  el.innerHTML=html;
+  el.scrollTop=top;
+  if(!el._wired){ el._wired=true;
+    el.addEventListener("scroll",()=>{
+      if(el.scrollTop+el.clientHeight>=el.scrollHeight-48){
+        const n=_win[elId]||30;
+        if(n<(el._items||[]).length){ _win[elId]=n+30; winList(elId, el._items, el._render, el._empty); }
+      }
+    });
+  }
+}

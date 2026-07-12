@@ -76,8 +76,8 @@ class TestNarrationCap(unittest.TestCase):
         d = parse_session(p); os.unlink(p)
         self.assertEqual(len(d["narrative"]), 30)      # was 16
 
-    def test_caps_at_60(self):
-        p = self._session(80)
+    def test_caps_at_150(self):
+        p = self._session(200)
         d = parse_session(p); os.unlink(p)
-        self.assertEqual(len(d["narrative"]), 60)      # bounded for payload
-        self.assertEqual(d["narrative"][0]["text"], "reply number 79")   # newest first
+        self.assertEqual(len(d["narrative"]), 150)     # bounded for payload
+        self.assertEqual(d["narrative"][0]["text"], "reply number 199")   # newest first
