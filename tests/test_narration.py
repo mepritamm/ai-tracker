@@ -61,8 +61,10 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestNarrationCap(unittest.TestCase):
-    """The narration list is no longer capped at 16 (real sessions have 100s)."""
+class TestNarrationUnbounded(unittest.TestCase):
+    """Providers emit the FULL narration (newest-first). Pagination — bounding the
+    per-poll payload — is the route's job (see TestNarrationPagination), not a
+    provider cap. Real sessions have hundreds of entries and none are dropped."""
 
     def _session(self, n_replies):
         lines = [{"type": "user", "cwd": "/x", "message": {"role": "user", "content": "go"}}]
@@ -71,13 +73,9 @@ class TestNarrationCap(unittest.TestCase):
                           "message": {"content": [{"type": "text", "text": "reply number %d" % k}]}})
         return _write(lines)
 
-    def test_more_than_16_kept(self):
-        p = self._session(30)
-        d = parse_session(p); os.unlink(p)
-        self.assertEqual(len(d["narrative"]), 30)      # was 16
-
-    def test_caps_at_150(self):
+    def test_all_kept_newest_first(self):
         p = self._session(200)
         d = parse_session(p); os.unlink(p)
-        self.assertEqual(len(d["narrative"]), 150)     # bounded for payload
+        self.assertEqual(len(d["narrative"]), 200)               # uncapped
         self.assertEqual(d["narrative"][0]["text"], "reply number 199")   # newest first
+        self.assertEqual(d["narrative"][-1]["text"], "reply number 0")    # oldest last

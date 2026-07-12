@@ -225,7 +225,7 @@ def parse_auggie(session_id):
         "commits": commits[::-1],
         "tests": tests[::-1],
         "requests": requests, "agents": [], "agents_bg": [], "shells": [],
-        "narrative": narrative[-150:][::-1],   # windowed on the client; scroll reveals older
+        "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": latest[:2000],
         "tokens": {"in": tok_in, "out": tok_out},
         "counts": {"done": done, "todos": len(todos), "created": 0, "edited": len(files),

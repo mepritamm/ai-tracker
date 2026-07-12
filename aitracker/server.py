@@ -1,7 +1,7 @@
 import json, os, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
-from .config import LIVE_WINDOW
+from .config import LIVE_WINDOW, NARR_PAGE
 from .page import build_page
 from .registry import all_sessions, parse_any, search_all
 from .store import load_flags, save_flags, load_titles, _load_json, _save_json
@@ -94,8 +94,34 @@ class Handler(BaseHTTPRequestHandler):
             except OSError as e:
                 self._json({"error": str(e)}, 500)
                 return
+            if data:
+                # narration is unbounded; ship only the newest page here (the 2s
+                # poll's payload) — older entries come from /api/narration on scroll.
+                full = data.get("narrative") or []
+                data["narrative_total"] = len(full)
+                data["narrative"] = full[:NARR_PAGE]
             self._json(data if data else {"error": "session not found", "id": sid},
                        200 if data else 404)
+        elif p.path == "/api/narration":
+            # paginated tail of a session's narration (newest-first). Lets the
+            # client load older entries on demand without capping history.
+            qs = parse_qs(p.query)
+            sid = qs.get("id", [""])[0]
+            try:
+                off = max(0, int(qs.get("offset", ["0"])[0]))
+                lim = min(200, max(1, int(qs.get("limit", [str(NARR_PAGE)])[0])))
+            except ValueError:
+                off, lim = 0, NARR_PAGE
+            try:
+                data = parse_any(sid)
+            except OSError as e:
+                self._json({"error": str(e)}, 500)
+                return
+            if not data:
+                self._json({"error": "session not found", "id": sid}, 404)
+                return
+            full = data.get("narrative") or []
+            self._json({"items": full[off:off + lim], "total": len(full), "offset": off})
         else:
             self.send_error(404)
 

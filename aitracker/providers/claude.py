@@ -647,7 +647,7 @@ def parse_session(path):
         "agents": agents[::-1],
         "agents_bg": agents_bg,
         "shells": shells,
-        "narrative": narrative[-150:][::-1],   # windowed on the client; scroll reveals older
+        "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": text_last[:2000],
         "tokens": {"in": tok_in, "out": tok_out},
         "counts": {

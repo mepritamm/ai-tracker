@@ -283,11 +283,31 @@ function render(d){
   $("nowbanner").style.display=ov.now?"flex":"none";
   $("nowtext").innerHTML="▶ "+md(ov.now||"")+'<span class=cursor>▍</span>';
 
-  // narration
-  const nr=d.narrative||[];
-  curNarr=nr;
-  winList("narr", nr, (x,i)=>
-    `<div class=narr onclick="openMsg(${i})" title="Read full message"><span class=t>${x.t?ago(d.now-Date.parse(x.t)/1000):""}</span><span class=x>${md(x.text)}</span><span class=chev>›</span></div>`, "no narration yet");
+  // narration — unbounded, server-paginated. The poll ships only the newest page
+  // (d.narrative) + the full count (d.narrative_total); we keep an accumulator so
+  // scrolled-in older entries survive, and prepend whatever's genuinely new.
+  const fresh=d.narrative||[], total=d.narrative_total!=null?d.narrative_total:fresh.length;
+  if(narrState.id!==cur){ narrState={id:cur,items:fresh.slice(),total}; _win.narr=30; }
+  else {
+    const delta=total-narrState.total;     // new entries since last poll (<= page size at 2s cadence)
+    if(delta>0) narrState.items=fresh.slice(0,delta).concat(narrState.items);
+    else if(!narrState.items.length) narrState.items=fresh.slice();
+    narrState.total=total;
+  }
+  curNarr=narrState.items;
+  const moreNarr=async()=>{
+    if(narrState.items.length>=narrState.total) return null;
+    const r=await fetch(`/api/narration?id=${encodeURIComponent(cur)}&offset=${narrState.items.length}&limit=60`);
+    if(!r.ok) return null;
+    const j=await r.json();
+    narrState.items=narrState.items.concat(j.items||[]);
+    narrState.total=j.total!=null?j.total:narrState.total;
+    curNarr=narrState.items;
+    return {items:narrState.items,total:narrState.total};
+  };
+  winList("narr", narrState.items, (x,i)=>
+    `<div class=narr onclick="openMsg(${i})" title="Read full message"><span class=t>${x.t?ago(d.now-Date.parse(x.t)/1000):""}</span><span class=x>${md(x.text)}</span><span class=chev>›</span></div>`,
+    "no narration yet", {total:narrState.total,more:moreNarr});
 
   // todos
   const td=d.todos||[];
@@ -380,6 +400,7 @@ function renderDiff(t){
 }
 function closeDiff(){$("diffmodal").style.display="none";}
 let curNarr=[], curCmds=[], curReqs=[], curOv={};
+let narrState={id:null,items:[],total:0};   // accumulator for server-paginated narration
 // ---- modal navigation: prev/next across the list that opened the dialog ----
 let curModal=null;
 function _setNav(open,i,n){
@@ -530,22 +551,34 @@ document.addEventListener("keydown",e=>{
 // ---- generic windowed list: render a growing window, reveal +30 on scroll,
 // survive the 2s poll (persisted window + preserved scroll position). Used by
 // every list panel so "scroll to load older" works app-wide.
+// opts (optional): {total, more}. total = full count incl. entries not yet loaded
+// (server-paginated panels); more() = async ()=>{items,total}|null fetching the
+// next batch. Omit both for fully in-memory panels.
 let _win={};
-function winList(elId, items, render, empty){
+function winList(elId, items, render, empty, opts){
+  opts=opts||{};
   const el=$(elId); if(!el)return;
-  if(!items||!items.length){ el.innerHTML="<div class=empty>"+empty+"</div>"; _win[elId]=30; return; }
-  el._items=items; el._render=render; el._empty=empty;
+  el._render=render; el._empty=empty; el._opts=opts;
+  if(!items||!items.length){ el.innerHTML="<div class=empty>"+empty+"</div>"; _win[elId]=30; el._items=[]; return; }
+  el._items=items;
+  const total=opts.total!=null?opts.total:items.length;
   const shown=Math.min(_win[elId]||30, items.length);
   const top=el.scrollTop;
   let html=items.slice(0,shown).map(render).join("");
-  if(shown<items.length) html+=`<div class=loadmore>↓ ${items.length-shown} older — scroll to load</div>`;
+  const older=total-shown;                 // local window + server-side not-yet-loaded
+  if(older>0) html+=`<div class=loadmore>↓ ${older} older — scroll to load</div>`;
   el.innerHTML=html;
   el.scrollTop=top;
   if(!el._wired){ el._wired=true;
     el.addEventListener("scroll",()=>{
-      if(el.scrollTop+el.clientHeight>=el.scrollHeight-48){
-        const n=_win[elId]||30;
-        if(n<(el._items||[]).length){ _win[elId]=n+30; winList(elId, el._items, el._render, el._empty); }
+      if(el.scrollTop+el.clientHeight<el.scrollHeight-48) return;
+      const n=_win[elId]||30;
+      if(n<el._items.length){ _win[elId]=n+30; winList(elId, el._items, el._render, el._empty, el._opts); }
+      else if(el._opts.more && !el._loading){   // window exhausted: fetch older from the server
+        el._loading=true;
+        el._opts.more().then(res=>{ el._loading=false;
+          if(res){ _win[elId]=n+30; el._opts.total=res.total; winList(elId, res.items, el._render, el._empty, el._opts); }
+        }, ()=>{ el._loading=false; });
       }
     });
   }

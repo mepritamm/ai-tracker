@@ -180,6 +180,77 @@ class TestHelpers(unittest.TestCase):
         self.assertGreater(_iso_epoch("2026-06-27T06:00:00Z"), _iso_epoch("2026-06-27T05:00:00Z"))
 
 
+def _write_claude(sid, n_replies):
+    """A Claude session under config.PROJECTS with n_replies narration entries."""
+    d = os.path.join(config.PROJECTS, "proj")
+    os.makedirs(d, exist_ok=True)
+    lines = [{"type": "user", "cwd": "/x", "message": {"role": "user", "content": "go"}}]
+    for k in range(n_replies):
+        lines.append({"type": "assistant", "timestamp": "2026-06-22T10:00:%02dZ" % (k % 60),
+                      "message": {"content": [{"type": "text", "text": "reply number %d" % k}]}})
+    with open(os.path.join(d, sid + ".jsonl"), "w") as fh:
+        for o in lines:
+            fh.write(json.dumps(o) + "\n")
+
+
+class TestNarrationPagination(unittest.TestCase):
+    """The route pages narration: /api/session ships one page + a total; the full
+    tail is served on demand by /api/narration. History is unbounded end-to-end."""
+
+    def setUp(self):
+        self.snap = _snap()
+        _empty_env()
+        _write_claude("spage", 200)
+        self.srv = _server.Server(("127.0.0.1", 0), _server.Handler)
+        self.port = self.srv.server_address[1]
+        self.t = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.t.start()
+
+    def tearDown(self):
+        self.srv.shutdown(); self.srv.server_close()
+        _restore(self.snap)
+
+    def _get(self, path):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", path)
+        r = c.getresponse(); body = r.read(); c.close()
+        return r.status, json.loads(body)
+
+    def test_session_ships_one_page_and_total(self):
+        st, d = self._get("/api/session?id=spage")
+        self.assertEqual(st, 200)
+        self.assertEqual(len(d["narrative"]), 60)              # NARR_PAGE, not 200
+        self.assertEqual(d["narrative_total"], 200)
+        self.assertEqual(d["narrative"][0]["text"], "reply number 199")   # newest first
+
+    def test_narration_serves_the_tail(self):
+        st, j = self._get("/api/narration?id=spage&offset=60&limit=60")
+        self.assertEqual(st, 200)
+        self.assertEqual(j["total"], 200)
+        self.assertEqual(j["offset"], 60)
+        self.assertEqual(len(j["items"]), 60)
+        self.assertEqual(j["items"][0]["text"], "reply number 139")       # 200-1-60
+
+    def test_pages_tile_to_cover_everything(self):
+        seen = []
+        for off in range(0, 200, 60):
+            _, j = self._get("/api/narration?id=spage&offset=%d&limit=60" % off)
+            seen += [it["text"] for it in j["items"]]
+        self.assertEqual(len(seen), 200)                       # nothing dropped
+        self.assertEqual(len(set(seen)), 200)                  # nothing duplicated
+
+    def test_offset_past_end_is_empty(self):
+        _, j = self._get("/api/narration?id=spage&offset=999&limit=60")
+        self.assertEqual(j["items"], [])
+        self.assertEqual(j["total"], 200)
+
+    def test_narration_missing_session_404(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", "/api/narration?id=nope-xyz")
+        r = c.getresponse(); r.read(); c.close()
+        self.assertEqual(r.status, 404)
+
+
 class TestBundle(unittest.TestCase):
     """`make bundle` produces a valid, standalone single-file build."""
 

@@ -28,4 +28,7 @@ LIVE_WINDOW = 300
 NARRATION_CAP = 40000
 
 
+NARR_PAGE = 60          # narration entries per /api/session page + per /api/narration fetch
+
+
 AUGGIE_SESSIONS = os.path.join(AUGMENT_DIR, "sessions")
