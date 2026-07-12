@@ -324,6 +324,7 @@ let curFiles=[], curDiffFile=null, curDiffOps=[], diffMode="diff";
 const isMd=p=>/\.(md|markdown|mdx)$/i.test(p||"");
 async function openDiff(i){
   const f=curFiles[i]; if(!f||!cur)return;
+  _setNav(openDiff,i,curFiles.length);
   curDiffFile=f; curDiffOps=[];
   diffMode=isMd(f.path)?"md":"diff";   // markdown files render by default
   $("diffname").textContent=base(f.path);
@@ -379,6 +380,15 @@ function renderDiff(t){
 }
 function closeDiff(){$("diffmodal").style.display="none";}
 let curNarr=[], curCmds=[], curReqs=[], curOv={};
+// ---- modal navigation: prev/next across the list that opened the dialog ----
+let curModal=null;
+function _setNav(open,i,n){
+  curModal={open:open,i:i,n:n};
+  const pos=n>1?(i+1)+" / "+n:"";
+  const a=$("msgnav"), b=$("diffnav");
+  if(a)a.textContent=pos; if(b)b.textContent=pos;
+}
+function navModal(d){ if(!curModal)return; const j=curModal.i+d; if(j>=0&&j<curModal.n) curModal.open(j); }
 const tago=t=>t?ago(Date.now()/1000-Date.parse(t)/1000):"";
 // generic readable modal: title + optional time + markdown body
 function openText(title,when,text){
@@ -388,10 +398,11 @@ function openText(title,when,text){
   $("msgbody").innerHTML=mdBlock(text)||"<span class=muted>(empty)</span>";
   $("msgmodal").style.display="flex";
 }
-function openMsg(i){const n=curNarr[i]; if(n)openText("Narration",tago(n.t),n.text);}
-function openReq(i){const r=curReqs[i]; if(r)openText("Request",tago(r.t),r.text);}
+function openMsg(i){const n=curNarr[i]; if(!n)return; _setNav(openMsg,i,curNarr.length); openText("Narration",tago(n.t),n.text);}
+function openReq(i){const r=curReqs[i]; if(!r)return; _setNav(openReq,i,curReqs.length); openText("Request",tago(r.t),r.text);}
 async function openCmd(i){
   const x=curCmds[i]; if(!x||!cur)return;
+  _setNav(openCmd,i,curCmds.length);
   $("msgtitle").textContent="Command";
   $("msgwhen").textContent=tago(x.t);
   $("msgbody").className="msgbody cmdmode";
@@ -409,10 +420,12 @@ function toggleAgentsDone(){showAgentsDone=!showAgentsDone; if(lastData)render(l
 function toggleShellsDone(){showShellsDone=!showShellsDone; if(lastData)render(lastData);}
 function openTodo(i){
   const t=curTodos[i]; if(!t)return;
+  _setNav(openTodo,i,curTodos.length);
   openText("Task",t.status,"**"+(t.content||"")+"**"+(t.desc?"\n\n"+t.desc:""));
 }
 async function openShell(i){
   const s=curShells[i]; if(!s||!cur)return;
+  _setNav(openShell,i,curShells.length);
   $("msgtitle").textContent="Shell · "+s.id;
   $("msgwhen").textContent=(s.running?"running":"done")+(s.ts?" · "+tago(s.ts):"");
   $("msgbody").className="msgbody cmdmode";
@@ -424,6 +437,7 @@ async function openShell(i){
 }
 async function openAgent(i){
   const a=curAgents[i]; if(!a||!cur)return;
+  _setNav(openAgent,i,curAgents.length);
   $("msgtitle").textContent="Agent";
   $("msgwhen").textContent=(a.running?"running":"done")+(a.ts?" · "+tago(a.ts):"");
   $("msgbody").className="msgbody";
@@ -505,3 +519,10 @@ function toggleRaw(){const r=$("raw");
 $("q").addEventListener("keydown",e=>{if(e.key==="Enter")doSearch();if(e.key==="Escape")clearSearch();});
 setBell();
 start();
+
+document.addEventListener("keydown",e=>{
+  const open=$("msgmodal").style.display==="flex"||$("diffmodal").style.display==="flex";
+  if(!open)return;
+  if(e.key==="ArrowLeft"){navModal(-1);e.preventDefault();}
+  else if(e.key==="ArrowRight"){navModal(1);e.preventDefault();}
+});

@@ -59,3 +59,25 @@ class TestNarrationExcludesInjectedContent(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNarrationCap(unittest.TestCase):
+    """The narration list is no longer capped at 16 (real sessions have 100s)."""
+
+    def _session(self, n_replies):
+        lines = [{"type": "user", "cwd": "/x", "message": {"role": "user", "content": "go"}}]
+        for k in range(n_replies):
+            lines.append({"type": "assistant", "timestamp": "2026-06-22T10:00:%02dZ" % (k % 60),
+                          "message": {"content": [{"type": "text", "text": "reply number %d" % k}]}})
+        return _write(lines)
+
+    def test_more_than_16_kept(self):
+        p = self._session(30)
+        d = parse_session(p); os.unlink(p)
+        self.assertEqual(len(d["narrative"]), 30)      # was 16
+
+    def test_caps_at_60(self):
+        p = self._session(80)
+        d = parse_session(p); os.unlink(p)
+        self.assertEqual(len(d["narrative"]), 60)      # bounded for payload
+        self.assertEqual(d["narrative"][0]["text"], "reply number 79")   # newest first

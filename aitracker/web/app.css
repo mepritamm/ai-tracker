@@ -185,6 +185,11 @@ a{color:#4c8dff}
 .modal .mb{overflow:auto;padding:8px 0}
 .mh .mdbtn{cursor:pointer;color:#8b949e;font-size:11px;border:1px solid #2a3340;border-radius:6px;padding:3px 9px;white-space:nowrap;flex:0 0 auto}
 .mh .mdbtn:hover{color:#e6edf3;border-color:#4c8dff}
+.mh .mnav{display:flex;align-items:center;gap:4px;flex:0 0 auto}
+.mh .mnav .mbtn{cursor:pointer;color:#8b949e;font-size:16px;line-height:1;padding:1px 8px;border:1px solid #2a3340;border-radius:6px;user-select:none}
+.mh .mnav .mbtn:hover{color:#e6edf3;border-color:#4c8dff}
+.mh .mnav .mpos{color:#6b7585;font-size:11px;font-family:'JetBrains Mono',monospace;min-width:44px;text-align:center}
+.mh .mnav .mpos:empty{display:none}
 .diffop{margin:0 12px 12px}
 .diffhd{display:flex;align-items:center;gap:8px;font-size:11px;color:#8b949e;margin:10px 2px 6px}
 .diff{background:#0a0d12;border:1px solid #1c2330;border-radius:8px;overflow:auto;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.5}

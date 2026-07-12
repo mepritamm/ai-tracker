@@ -647,7 +647,7 @@ def parse_session(path):
         "agents": agents[::-1],
         "agents_bg": agents_bg,
         "shells": shells,
-        "narrative": narrative[-16:][::-1],
+        "narrative": narrative[-60:][::-1],   # was 16 — many sessions have 100s of turns
         "message": text_last[:2000],
         "tokens": {"in": tok_in, "out": tok_out},
         "counts": {

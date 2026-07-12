@@ -225,7 +225,7 @@ def parse_auggie(session_id):
         "commits": commits[::-1],
         "tests": tests[::-1],
         "requests": requests, "agents": [], "agents_bg": [], "shells": [],
-        "narrative": narrative[-16:][::-1],
+        "narrative": narrative[-60:][::-1],   # was 16 — many sessions have 100s of turns
         "message": latest[:2000],
         "tokens": {"in": tok_in, "out": tok_out},
         "counts": {"done": done, "todos": len(todos), "created": 0, "edited": len(files),
