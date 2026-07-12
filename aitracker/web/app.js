@@ -565,6 +565,20 @@ document.addEventListener("keydown",e=>{
 // (server-paginated panels); more() = async ()=>{items,total}|null fetching the
 // next batch. Omit both for fully in-memory panels.
 let _win={};
+// Advance a windowed panel by one batch: reveal the next 30 already-loaded items,
+// or fetch the next server page when the local window is exhausted. Both triggers
+// (scroll + IntersectionObserver) call this — keep the load path in one place.
+function _winAdvance(elId){
+  const el=$(elId); if(!el||!el._items||!el._items.length) return;
+  const n=_win[elId]||30;
+  if(n<el._items.length){ _win[elId]=n+30; winList(elId, el._items, el._render, el._empty, el._opts); }
+  else if(el._opts && el._opts.more && !el._loading){   // window exhausted: fetch older from the server
+    el._loading=true;
+    el._opts.more().then(res=>{ el._loading=false;
+      if(res){ _win[elId]=(_win[elId]||30)+30; el._opts.total=res.total; winList(elId, res.items, el._render, el._empty, el._opts); }
+    }, ()=>{ el._loading=false; });
+  }
+}
 function winList(elId, items, render, empty, opts){
   opts=opts||{};
   const el=$(elId); if(!el)return;
@@ -579,17 +593,18 @@ function winList(elId, items, render, empty, opts){
   if(older>0) html+=`<div class=loadmore>↓ ${older} older — scroll to load</div>`;
   el.innerHTML=html;
   el.scrollTop=top;
+  // Load the next batch as the "↓ older" sentinel nears the bottom of THIS box.
+  // Two triggers, for reliability: a scroll handler (fires on every scroll) and an
+  // IntersectionObserver with a prefetch margin (visibility-driven — catches the
+  // momentum / sub-pixel / trackpad cases the scroll math can miss).
   if(!el._wired){ el._wired=true;
-    el.addEventListener("scroll",()=>{
-      if(el.scrollTop+el.clientHeight<el.scrollHeight-48) return;
-      const n=_win[elId]||30;
-      if(n<el._items.length){ _win[elId]=n+30; winList(elId, el._items, el._render, el._empty, el._opts); }
-      else if(el._opts.more && !el._loading){   // window exhausted: fetch older from the server
-        el._loading=true;
-        el._opts.more().then(res=>{ el._loading=false;
-          if(res){ _win[elId]=n+30; el._opts.total=res.total; winList(elId, res.items, el._render, el._empty, el._opts); }
-        }, ()=>{ el._loading=false; });
-      }
-    });
+    el.addEventListener("scroll",()=>{ if(el.scrollTop+el.clientHeight>=el.scrollHeight-64) _winAdvance(elId); });
+    if(window.IntersectionObserver)
+      el._io=new IntersectionObserver(es=>{ if(es.some(e=>e.isIntersecting)) _winAdvance(elId); },
+                                      {root:el, rootMargin:"0px 0px 240px 0px"});
+  }
+  if(el._io){ el._io.disconnect();             // last render's sentinel is gone; watch the new one
+    const sentinel=el.querySelector(".loadmore");
+    if(sentinel) el._io.observe(sentinel);
   }
 }
