@@ -349,6 +349,8 @@ function render(d){
   winList("cmds", curCmds, (x,i)=>
     `<div class="item clk" onclick="openCmd(${i})"><span class="${x.ok?'ok':'bad'}">${x.ok?'✓':'✗'}</span> <span class=muted>${KICON[x.kind]||'$'}</span> `+
     `<span class="cmd mono">${esc(x.cmd)}</span> <span class=chev style=float:right;color:#5b6573>output ›</span></div>`, "—");
+
+  syncModal();   // keep an open narration/request modal live with this poll
 }
 let curFiles=[], curDiffFile=null, curDiffOps=[], diffMode="diff";
 const isMd=p=>/\.(md|markdown|mdx)$/i.test(p||"");
@@ -413,13 +415,29 @@ let curNarr=[], curCmds=[], curReqs=[], curOv={};
 let narrState={id:null,items:[],total:0};   // accumulator for server-paginated narration
 // ---- modal navigation: prev/next across the list that opened the dialog ----
 let curModal=null;
-function _setNav(open,i,n){
-  curModal={open:open,i:i,n:n};
+function _setNav(open,i,n,opts){
+  opts=opts||{};
+  curModal={open:open,i:i,n:n,fromEnd:n-1-i,len:opts.len||(()=>n),live:!!opts.live};
   const pos=n>1?(i+1)+" / "+n:"";
   const a=$("msgnav"), b=$("diffnav");
   if(a)a.textContent=pos; if(b)b.textContent=pos;
 }
 function navModal(d){ if(!curModal)return; const j=curModal.i+d; if(j>=0&&j<curModal.n) curModal.open(j); }
+// Keep an open text modal in sync with the 2s poll — re-render the entry being read
+// with fresh data (content, "time ago", the N/total counter). Pinned by distance-
+// from-end so prepended entries don't yank it, EXCEPT when they were on the newest
+// (i=0) where it follows the latest, like a chat sticking to the top. Called from
+// render(); only the in-memory text modal opts in (fetch-based ones would re-fetch).
+function syncModal(){
+  if(!curModal||!curModal.live)return;
+  if($("msgmodal").style.display!=="flex")return;
+  const newN=curModal.len();
+  if(!newN){closeMsg();return;}                    // the list emptied out
+  const newI=curModal.i===0?0:Math.max(0,Math.min(newN-1,newN-1-curModal.fromEnd));
+  const body=$("msgbody"), st=body?body.scrollTop:0;
+  curModal.open(newI);
+  if(body)body.scrollTop=st;                        // don't jump the reader mid-entry
+}
 const tago=t=>t?ago(Date.now()/1000-Date.parse(t)/1000):"";
 // generic readable modal: title + optional time + markdown body
 function openText(title,when,text){
@@ -429,8 +447,8 @@ function openText(title,when,text){
   $("msgbody").innerHTML=mdBlock(text)||"<span class=muted>(empty)</span>";
   $("msgmodal").style.display="flex";
 }
-function openMsg(i){const n=curNarr[i]; if(!n)return; _setNav(openMsg,i,curNarr.length); openText("Narration",tago(n.t),n.text);}
-function openReq(i){const r=curReqs[i]; if(!r)return; _setNav(openReq,i,curReqs.length); openText("Request",tago(r.t),r.text);}
+function openMsg(i){const n=curNarr[i]; if(!n)return; _setNav(openMsg,i,curNarr.length,{len:()=>curNarr.length,live:true}); openText("Narration",tago(n.t),n.text);}
+function openReq(i){const r=curReqs[i]; if(!r)return; _setNav(openReq,i,curReqs.length,{len:()=>curReqs.length,live:true}); openText("Request",tago(r.t),r.text);}
 async function openCmd(i){
   const x=curCmds[i]; if(!x||!cur)return;
   _setNav(openCmd,i,curCmds.length);
