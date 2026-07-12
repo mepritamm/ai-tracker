@@ -100,6 +100,36 @@ TEST_RE = re.compile(r"\b(pytest|jest|vitest|mocha|go test|cargo test|rspec|"
 
 COMMIT_MSG_RE = re.compile(r"-m\s+(['\"])(.+?)\1", re.S)
 
+# PR/MR links a session touched: GitHub /pull/N, Bitbucket /pull-requests/N,
+# GitLab /merge_requests/N. Scanned out of assistant text + command output so the
+# app can list them as clickable links (see collect_prs).
+PR_URL_RE = re.compile(r"""https?://[^\s<>"'()\[\]]+?/(?:pull|pull-requests|merge_requests)/\d+""")
+
+
+def collect_prs(acc, text, ts, created=False):
+    """Merge PR/MR URLs found in `text` into acc (url -> entry). `created` marks
+    URLs that came from a `gh pr create` result (vs merely referenced). Dedupes by
+    URL; a URL seen created anywhere stays created; keeps the latest timestamp."""
+    if not text:
+        return
+    for raw in PR_URL_RE.findall(text):
+        url = raw.rstrip("/.,);]'\"")
+        e = acc.get(url)
+        if not e:
+            m = re.search(r"([^/]+/[^/]+)/(?:pull|pull-requests|merge_requests)/(\d+)", url)
+            e = acc[url] = {"url": url, "repo": m.group(1) if m else "",
+                            "num": m.group(2) if m else "", "created": False, "t": ts}
+        if created:
+            e["created"] = True
+        if ts and (not e["t"] or ts > e["t"]):
+            e["t"] = ts
+
+
+def prs_sorted(acc):
+    """Created PRs first, then most-recently-seen — the shared shape's `prs` list."""
+    return sorted(acc.values(), key=lambda p: (p["created"], p["t"] or ""), reverse=True)
+
+
 def cmd_kind(c):
     if re.search(r"git\s+commit", c):
         return "commit"

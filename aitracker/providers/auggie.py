@@ -1,7 +1,7 @@
 import glob, json, os, re, time
 from ..config import LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, prs_sorted
 from ..overview import build_overview
 from ..store import load_titles, load_tasks
 from .base import Provider
@@ -152,6 +152,7 @@ def parse_auggie(session_id):
     except (OSError, ValueError):
         return None
     requests, narrative, files, cmds, reads, commits = [], [], {}, [], {}, []
+    prs = {}          # url -> entry : PR/MR links touched this session (parity with Claude)
     tok_in = tok_out = 0
     for m in d.get("chatHistory") or []:
         ex = m.get("exchange") or {}
@@ -177,6 +178,7 @@ def parse_auggie(session_id):
                     k = cmd_kind(c)
                     cmds.append({"id": call.get("tool_use_id"), "t": ts, "cmd": c[:200],
                                  "kind": k, "ok": True})   # Auggie stores no exit status
+                    collect_prs(prs, c, ts)
                     if k == "commit":
                         mm = COMMIT_MSG_RE.search(c)
                         commits.append({"t": ts, "msg": (mm.group(2) if mm else c)[:120]})
@@ -185,9 +187,11 @@ def parse_auggie(session_id):
         r = ex.get("request_message")
         if isinstance(r, str) and r.strip() and not r.lstrip().startswith("<"):
             requests.append({"t": ts, "text": " ".join(r.split())[:300]})
+            collect_prs(prs, r, ts)
         resp = ex.get("response_text")
         if isinstance(resp, str) and resp.strip():
             narrative.append({"t": ts, "text": resp.strip()[:NARRATION_CAP]})
+            collect_prs(prs, resp, ts)
         for cf in m.get("changedFiles") or []:
             p = cf if isinstance(cf, str) else (cf.get("path") or cf.get("filePath") or cf.get("file"))
             if p:
@@ -225,6 +229,7 @@ def parse_auggie(session_id):
         "commits": commits[::-1],
         "tests": tests[::-1],
         "requests": requests, "agents": [], "agents_bg": [], "shells": [],
+        "prs": prs_sorted(prs),         # PR/MR links touched this session; created ones first
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": latest[:2000],
         "tokens": {"in": tok_in, "out": tok_out},

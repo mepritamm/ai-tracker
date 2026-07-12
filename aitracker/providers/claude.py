@@ -1,7 +1,7 @@
 import difflib, glob, json, os, re, time
 from ..config import EDIT_TOOLS, LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, prs_sorted
 from ..overview import build_overview
 from ..store import load_titles, load_tasks
 from .base import Provider
@@ -533,6 +533,8 @@ def parse_session(path):
     requests = []         # user asks {t, text}
     agents = []           # {t, type, desc}
     errors_by_id = {}     # tool_use_id -> True
+    prs = {}              # url -> {url, repo, num, created, t} : PRs touched this session
+    pr_create_ids = set() # tool_use_ids of `gh pr create` Bash calls (their result URL = created)
     narrative = []       # Claude's own text, in order: the blow-by-blow
     meta = {}
     text_last = ""
@@ -571,6 +573,7 @@ def parse_session(path):
                 s = content.strip()
                 if s and not s.startswith("<") and not s.startswith("Caveat:"):
                     requests.append({"t": ts, "text": s[:8000]})  # full prompt; list clamps preview
+                    collect_prs(prs, s, ts)                        # a PR pasted into a prompt counts
                 continue
             if not isinstance(content, list):
                 continue
@@ -586,8 +589,13 @@ def parse_session(path):
                     if not txt.startswith("<"):  # skip command/system echoes
                         text_last = txt
                         narrative.append({"t": ts, "text": txt[:NARRATION_CAP]})  # modal shows full; list clamps preview
-                elif bt == "tool_result" and b.get("is_error"):
-                    errors_by_id[b.get("tool_use_id")] = True
+                        collect_prs(prs, txt, ts)                 # PR links Claude prints in its narration
+                elif bt == "tool_result":
+                    if b.get("is_error"):
+                        errors_by_id[b.get("tool_use_id")] = True
+                    cc = b.get("content")                          # command output: gh prints the PR URL here
+                    rtext = cc if isinstance(cc, str) else (json.dumps(cc) if cc else "")
+                    collect_prs(prs, rtext, ts, b.get("tool_use_id") in pr_create_ids)
                 elif bt == "tool_use":
                     name = b.get("name")
                     inp = b.get("input") or {}
@@ -612,6 +620,9 @@ def parse_session(path):
                         c = inp.get("command", "")
                         k = cmd_kind(c)
                         cmds.append({"id": bid, "t": ts, "cmd": c[:200], "kind": k})
+                        if re.search(r"\bpr\s+create\b", c):       # its result URL is a created PR
+                            pr_create_ids.add(bid)
+                        collect_prs(prs, c, ts)                    # e.g. `gh pr view <url>`, `gh pr merge <url>`
                         if k == "commit":
                             m = COMMIT_MSG_RE.search(c)
                             commits.append({"t": ts, "msg": (m.group(2) if m else c)[:120]})
@@ -647,6 +658,7 @@ def parse_session(path):
         "agents": agents[::-1],
         "agents_bg": agents_bg,
         "shells": shells,
+        "prs": prs_sorted(prs),         # PR/MR links touched this session; created ones first
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": text_last[:2000],
         "tokens": {"in": tok_in, "out": tok_out},
