@@ -600,6 +600,8 @@ def parse_session(path):
                     name = b.get("name")
                     inp = b.get("input") or {}
                     bid = b.get("id")
+                    if name and "create_pull_request" in name:   # GitHub MCP: result URL is a created PR
+                        pr_create_ids.add(bid)
                     if name == "TodoWrite":
                         todos = inp.get("todos", todos)
                     elif name == "Write":
@@ -658,7 +660,7 @@ def parse_session(path):
         "agents": agents[::-1],
         "agents_bg": agents_bg,
         "shells": shells,
-        "prs": prs_sorted(prs),         # PR/MR links touched this session; created ones first
+        "prs": [p for p in prs_sorted(prs) if p["created"]],   # only PRs generated in this session, not ones it merely referenced
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": text_last[:2000],
         "tokens": {"in": tok_in, "out": tok_out},

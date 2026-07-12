@@ -157,6 +157,7 @@ def parse_auggie(session_id):
     for m in d.get("chatHistory") or []:
         ex = m.get("exchange") or {}
         ts = m.get("finishedAt")
+        pr_here = False       # this exchange ran a PR-create tool → its response URL is a created PR
         for rn in ex.get("response_nodes") or []:
             tu = rn.get("token_usage")
             if isinstance(tu, dict):                # tokens: mirror Claude (input + cache)
@@ -173,11 +174,15 @@ def parse_auggie(session_id):
                         inp = {}
                 inp = inp if isinstance(inp, dict) else {}
                 name = call.get("tool_name")
+                if name and "create_pull_request" in name:   # MCP PR creation in this exchange
+                    pr_here = True
                 if name == "launch-process" and inp.get("command"):   # ~ Claude's Bash
                     c = inp["command"]
                     k = cmd_kind(c)
                     cmds.append({"id": call.get("tool_use_id"), "t": ts, "cmd": c[:200],
                                  "kind": k, "ok": True})   # Auggie stores no exit status
+                    if re.search(r"\bpr\s+create\b", c):
+                        pr_here = True
                     collect_prs(prs, c, ts)
                     if k == "commit":
                         mm = COMMIT_MSG_RE.search(c)
@@ -191,7 +196,7 @@ def parse_auggie(session_id):
         resp = ex.get("response_text")
         if isinstance(resp, str) and resp.strip():
             narrative.append({"t": ts, "text": resp.strip()[:NARRATION_CAP]})
-            collect_prs(prs, resp, ts)
+            collect_prs(prs, resp, ts, created=pr_here)   # URL printed after a PR-create = generated here
         for cf in m.get("changedFiles") or []:
             p = cf if isinstance(cf, str) else (cf.get("path") or cf.get("filePath") or cf.get("file"))
             if p:
@@ -229,7 +234,7 @@ def parse_auggie(session_id):
         "commits": commits[::-1],
         "tests": tests[::-1],
         "requests": requests, "agents": [], "agents_bg": [], "shells": [],
-        "prs": prs_sorted(prs),         # PR/MR links touched this session; created ones first
+        "prs": [p for p in prs_sorted(prs) if p["created"]],   # only PRs generated in this session, not ones it merely referenced
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": latest[:2000],
         "tokens": {"in": tok_in, "out": tok_out},

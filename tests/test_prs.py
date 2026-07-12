@@ -69,9 +69,9 @@ def _write_jsonl(lines):
 
 
 class TestClaudePrs(unittest.TestCase):
-    def test_created_from_gh_output_vs_referenced(self):
-        # a Bash `gh pr create` whose tool_result carries the new URL (=created),
-        # plus an unrelated PR the assistant merely mentions (=referenced).
+    def test_only_generated_prs_not_referenced(self):
+        # a Bash `gh pr create` whose tool_result carries the new URL (=generated here),
+        # plus an unrelated PR the assistant merely mentions. Only the generated one shows.
         path = _write_jsonl([
             {"type": "user", "cwd": "/x", "message": {"role": "user", "content": "ship it"}},
             {"type": "assistant", "message": {"content": [
@@ -85,12 +85,39 @@ class TestClaudePrs(unittest.TestCase):
         ])
         d = parse_session(path)
         os.unlink(path)
-        by = {p["num"]: p for p in d["prs"]}
-        self.assertEqual(set(by), {"7", "3"})
-        self.assertTrue(by["7"]["created"])                # came from gh pr create result
-        self.assertFalse(by["3"]["created"])               # merely referenced
-        self.assertEqual(d["prs"][0]["num"], "7")          # created sorts first
-        self.assertEqual(by["7"]["repo"], "acme/app")
+        nums = [p["num"] for p in d["prs"]]
+        self.assertEqual(nums, ["7"])                      # #3 (referenced) filtered out
+        self.assertTrue(d["prs"][0]["created"])
+        self.assertEqual(d["prs"][0]["repo"], "acme/app")
+
+    def test_generated_via_github_mcp_tool(self):
+        # PR created through the GitHub MCP tool (not gh): its result URL still counts.
+        path = _write_jsonl([
+            {"type": "user", "cwd": "/x", "message": {"role": "user", "content": "open a PR"}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "mcp1", "name": "mcp__github__create_pull_request",
+                 "input": {"title": "x"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "mcp1",
+                 "content": '{"html_url": "https://github.com/acme/app/pull/9"}'}]}},
+        ])
+        d = parse_session(path)
+        os.unlink(path)
+        self.assertEqual([p["num"] for p in d["prs"]], ["9"])
+        self.assertTrue(d["prs"][0]["created"])
+
+    def test_referenced_only_session_shows_none(self):
+        # a session that only views/pastes PRs generates none -> empty panel.
+        path = _write_jsonl([
+            {"type": "user", "cwd": "/x", "message": {"role": "user",
+             "content": "does https://github.com/acme/app/pull/3 affect us?"}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "b1", "name": "Bash",
+                 "input": {"command": "gh pr view https://github.com/acme/app/pull/3"}}]}},
+        ])
+        d = parse_session(path)
+        os.unlink(path)
+        self.assertEqual(d["prs"], [])
 
 
 class TestAuggiePrs(unittest.TestCase):
@@ -103,18 +130,28 @@ class TestAuggiePrs(unittest.TestCase):
         config.AUGGIE_SESSIONS = self._sess
         _auggie._AUGGIE_LIST_CACHE.clear()
 
-    def test_pr_from_response_text(self):
-        sid = "s1"
+    def _write(self, sid, exchange):
         json.dump({"sessionId": sid, "modified": "2026-06-27T05:48:03Z",
-                   "chatHistory": [{"finishedAt": "2026-06-27T05:47:50Z", "exchange": {
-                       "request_message": "open a PR",
-                       "response_text": "Opened https://github.com/acme/lib/pull/12"}}]},
+                   "chatHistory": [{"finishedAt": "2026-06-27T05:47:50Z", "exchange": exchange}]},
                   open(os.path.join(config.AUGGIE_SESSIONS, sid + ".json"), "w"))
-        d = _auggie.parse_auggie(sid)
-        self.assertIsNotNone(d)
-        nums = [p["num"] for p in d["prs"]]
-        self.assertEqual(nums, ["12"])
+
+    def test_generated_pr_from_create_command(self):
+        # exchange runs `gh pr create`, response prints the URL -> generated here.
+        self._write("s1", {
+            "request_message": "open a PR",
+            "response_nodes": [{"tool_use": {"tool_name": "launch-process",
+                                             "input_json": '{"command": "gh pr create --fill"}'}}],
+            "response_text": "Opened https://github.com/acme/lib/pull/12"})
+        d = _auggie.parse_auggie("s1")
+        self.assertEqual([p["num"] for p in d["prs"]], ["12"])
         self.assertEqual(d["prs"][0]["repo"], "acme/lib")
+
+    def test_referenced_pr_is_not_shown(self):
+        # a PR merely mentioned (no create in the exchange) generates nothing.
+        self._write("s2", {"request_message": "see https://github.com/acme/lib/pull/5",
+                           "response_text": "yes that one at https://github.com/acme/lib/pull/5"})
+        d = _auggie.parse_auggie("s2")
+        self.assertEqual(d["prs"], [])
 
 
 if __name__ == "__main__":

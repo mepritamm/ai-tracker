@@ -309,15 +309,15 @@ function render(d){
     `<div class=narr onclick="openMsg(${i})" title="Read full message"><span class=t>${x.t?ago(d.now-Date.parse(x.t)/1000):""}</span><span class=x>${md(x.text)}</span><span class=chev>›</span></div>`,
     "no narration yet", {total:narrState.total,more:moreNarr});
 
-  // pull requests — clickable links to every PR/MR touched this session (created first)
+  // pull requests — clickable links to the PRs this session generated (server sends created-only)
   const prs=d.prs||[];
   $("prpanel").style.display=prs.length?"":"none";
   $("prc").textContent=prs.length||"";
   winList("prs", prs, (p,i)=>
     `<div class="item prrow"><a class=prlink href="${esc(p.url)}" target=_blank rel=noopener title="${esc(p.url)}">`+
-    `<span class="kind ${p.created?'new':''}">${p.created?'created':'ref'}</span> `+
+    `<span class="kind new">created</span> `+
     `<b>${esc((p.repo?p.repo+' ':'')+'#'+p.num)}</b><span class=prurl>${esc(p.url)}</span><span class=chev>open ›</span></a></div>`,
-    "no pull requests in this session");
+    "no pull requests created in this session");
 
   // todos
   const td=d.todos||[];
