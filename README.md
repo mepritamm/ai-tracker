@@ -71,8 +71,10 @@ To keep it running in the background: `nohup python3 -m aitracker >/tmp/tracker.
 **Main view** for the selected session:
 - **Session summary** — Goal, what it's doing *Now*, and a one-line "So far", with stat chips (files, commands, reads, commits, tests, tokens, git branch).
 - **Background agents & shells** — running ones shown; finished ones one click away. A toast + sound fires when one completes. *(Claude Code only — Auggie has no background-work model.)*
-- **Narration** — the assistant's own words, step by step, with full markdown rendering (tables, code, lists) in the pop-out modal.
+- **Pull requests** — the PRs a session actually *generated* (created via `gh pr create` or the GitHub MCP tool), as clickable links; PRs it merely referenced are left out.
+- **Narration** — the assistant's own words, step by step, with full markdown rendering (tables, code, lists) in the pop-out modal, and prev/next arrows across every entry. History is unbounded — older entries page in from the server as you scroll.
 - **Todos**, **Files** (with a Diff ⇄ Rendered-markdown toggle and an "open in new tab" button), **Commands** (with ✓/✗ for Claude), and **Requests**.
+- Every list panel loads a window and reveals older entries as you scroll to the bottom.
 - **🚩 Flag** anything you want to fix later — see [Skills](#skills).
 
 ---
@@ -95,6 +97,7 @@ Both providers emit the **same result shape**, so the browser renders them ident
 | Commands, reads, commits, tests | ✅ | ✅ (from `launch-process` / `view` tools) |
 | Working folder + git branch (worktree-aware) | ✅ (from the log) | ✅ (folder from IDE state; branch from `.git/HEAD`) |
 | Command exit status (✓/✗) | ✅ | ➖ Auggie stores none — commands show as ✓ |
+| Generated pull requests | ✅ (linked to the `gh pr create` / MCP result) | ✅ when the created URL is in the reply |
 | Background agents & shells | ✅ | ➖ Auggie has no such model |
 
 **Data files** — `flags.json` (your flags) and `titles.json` (your renames) are read **live** (no restart). Everything else is baked into the page at startup, so **editing `aitracker/` or `web/` needs a server restart** to show.
