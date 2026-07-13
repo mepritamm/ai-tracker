@@ -165,6 +165,7 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid #1c2330}
 .fpath b{color:#e6edf3}.fpath{word-break:break-all}
 .kind{font-size:10px;padding:1px 6px;border-radius:4px;background:#1f6feb33;color:#4c8dff}
 .kind.new{background:#3fb95033;color:#3fb950}
+.agenttag{font-size:10px;padding:1px 6px;border-radius:4px;background:#f5b44322;color:#f5b443}
 .ok{color:#3fb950}.bad{color:#f85149}.cmd{word-break:break-all}
 .empty{padding:14px;color:#6b7585;font-size:13px}
 code{font-family:'JetBrains Mono',monospace;font-size:.9em;background:#161c27;color:#9fd1ff;padding:1px 5px;border-radius:4px;word-break:break-word}

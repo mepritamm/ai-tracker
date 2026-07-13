@@ -340,7 +340,7 @@ function render(d){
   curFiles=fs;
   $("filec").textContent=fs.length||"";
   winList("files", fs, (f,i)=>
-    `<div class="item filerow" onclick="openDiff(${i})" title="View diff"><div class=fpath><span class="kind ${f.created?'new':''}">${f.created?'created':'edited'}</span> <b>${esc(base(f.path))}</b><span class=chev>diff ›</span></div>`+
+    `<div class="item filerow" onclick="openDiff(${i})" title="View diff"><div class=fpath><span class="kind ${f.created?'new':''}">${f.created?'created':'edited'}</span>${f.agent?' <span class=agenttag title="edited by a background agent">🤖 agent</span>':''} <b>${esc(base(f.path))}</b><span class=chev>diff ›</span></div>`+
     `<div class="muted mono" style=font-size:11px;margin-top:3px>${esc(f.path.replace("/"+base(f.path),""))} · ${f.ops}× · ${ago(d.now-Date.parse(f.last)/1000)}</div></div>`, "no files written yet");
 
   // commands (click to see output)

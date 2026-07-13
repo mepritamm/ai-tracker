@@ -94,16 +94,23 @@ def _run():
     with open(os.path.join(adir, "agent-deadbeef00.jsonl"), "w") as f:
         f.write(json.dumps({"type": "user", "timestamp": "2026-06-22T10:00:00Z",
                             "message": {"role": "user", "content": "Audit the auth module"}}) + "\n")
-        f.write(json.dumps({"type": "assistant", "message": {"content": [
+        f.write(json.dumps({"type": "assistant", "timestamp": "2026-06-22T10:01:00Z",
+                            "message": {"content": [
             {"type": "text", "text": "Scanning auth.py for issues"},
-            {"type": "tool_use", "name": "Read", "input": {}}]}}) + "\n")
-    ags, newest = parse_agents(spath)
+            {"type": "tool_use", "name": "Read", "input": {}},
+            {"type": "tool_use", "name": "Edit",
+             "input": {"file_path": "/x/.worktrees/wt/auth.py",
+                       "old_string": "a", "new_string": "b"}}]}}) + "\n")
+    ags, newest, afiles = parse_agents(spath)
     assert len(ags) == 1 and ags[0]["task"] == "Audit the auth module", ags
-    assert ags[0]["last"] == "Scanning auth.py for issues" and ags[0]["tools"] == 1, ags
+    assert ags[0]["last"] == "Scanning auth.py for issues" and ags[0]["tools"] == 2, ags
     assert ags[0]["wf"] == "wf_abc123", ags
+    assert "/x/.worktrees/wt/auth.py" in afiles, afiles         # agent file edit captured
     assert _active_mtime(spath) >= os.path.getmtime(spath)
     ds = parse_session(spath)
     assert len(ds["agents_bg"]) == 1 and "background agent" in ds["overview"]["now"], ds["overview"]["now"]
+    afile = next((x for x in ds["files"] if x["path"] == "/x/.worktrees/wt/auth.py"), None)
+    assert afile and afile.get("agent"), "agent-edited file must surface in files, tagged"  # the gap
 
     # live window: activity within 5 min counts as live; older does not
     af = os.path.join(adir, "agent-deadbeef00.jsonl")

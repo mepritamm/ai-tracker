@@ -241,6 +241,7 @@ def _active_mtime(path):
 def parse_agents(path):
     """Parse background-agent transcripts: what each one is, doing, and whether it's live."""
     out = []
+    agent_files = {}      # path -> file entry : edits made by background agents (worktrees etc.)
     newest = 0.0
     now = time.time()
     for af in sorted(_agent_files(path)):
@@ -275,6 +276,18 @@ def parse_agents(path):
                                 continue
                             if b.get("type") == "tool_use":
                                 tools += 1
+                                nm = b.get("name")
+                                if nm == "Write" or nm in EDIT_TOOLS:   # agents write files too
+                                    finp = b.get("input") or {}
+                                    fp = finp.get("file_path") or finp.get("notebook_path")
+                                    if fp:
+                                        fe = agent_files.setdefault(
+                                            fp, {"path": fp, "ops": 0, "created": False, "agent": True})
+                                        fe["ops"] += 1
+                                        if last_ts:
+                                            fe["last"] = last_ts
+                                        if nm == "Write":
+                                            fe["created"] = True
                             elif b.get("type") == "text" and b.get("text", "").strip():
                                 t = b["text"].strip()
                                 if not t.startswith("<"):
@@ -293,7 +306,7 @@ def parse_agents(path):
             "running": (now - mt) < LIVE_WINDOW,
         })
     out.sort(key=lambda a: (not a["running"], a["ts"] or ""), reverse=False)
-    return out, newest
+    return out, newest, agent_files
 
 
 def _unified(old, new, cap=20000):
@@ -304,42 +317,45 @@ def _unified(old, new, cap=20000):
 
 
 def file_diffs(path, target):
-    """Reconstruct every Write/Edit to `target` from the transcript, in order.
+    """Reconstruct every Write/Edit to `target`, in order — from the main transcript
+    AND the session's background-agent transcripts (so agent edits are diffable too).
     The tool inputs ARE the diff: Write=full content, Edit=old/new strings."""
     ops = []
-    try:
-        fh = open(path, encoding="utf-8")
-    except OSError:
-        return ops
-    with fh:
-        for line in fh:
-            try:
-                o = json.loads(line)
-            except ValueError:
-                continue
-            ts = o.get("timestamp")
-            m = o.get("message")
-            content = m.get("content") if isinstance(m, dict) else None
-            if not isinstance(content, list):
-                continue
-            for b in content:
-                if not isinstance(b, dict) or b.get("type") != "tool_use":
+    for src in [path] + _agent_files(path):
+        try:
+            fh = open(src, encoding="utf-8")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                try:
+                    o = json.loads(line)
+                except ValueError:
                     continue
-                inp = b.get("input") or {}
-                if (inp.get("file_path") or inp.get("notebook_path")) != target:
+                ts = o.get("timestamp")
+                m = o.get("message")
+                content = m.get("content") if isinstance(m, dict) else None
+                if not isinstance(content, list):
                     continue
-                name = b.get("name")
-                if name == "Write":
-                    ops.append({"ts": ts, "kind": "created", "diff": _unified("", inp.get("content", ""))})
-                elif name == "Edit":
-                    ops.append({"ts": ts, "kind": "edited",
-                                "diff": _unified(inp.get("old_string", ""), inp.get("new_string", ""))})
-                elif name == "MultiEdit":
-                    parts = [_unified(e.get("old_string", ""), e.get("new_string", ""))
-                             for e in inp.get("edits", []) if isinstance(e, dict)]
-                    ops.append({"ts": ts, "kind": "edited", "diff": "\n".join(p for p in parts if p)})
-                elif name == "NotebookEdit":
-                    ops.append({"ts": ts, "kind": "edited", "diff": _unified("", inp.get("new_source", ""))})
+                for b in content:
+                    if not isinstance(b, dict) or b.get("type") != "tool_use":
+                        continue
+                    inp = b.get("input") or {}
+                    if (inp.get("file_path") or inp.get("notebook_path")) != target:
+                        continue
+                    name = b.get("name")
+                    if name == "Write":
+                        ops.append({"ts": ts, "kind": "created", "diff": _unified("", inp.get("content", ""))})
+                    elif name == "Edit":
+                        ops.append({"ts": ts, "kind": "edited",
+                                    "diff": _unified(inp.get("old_string", ""), inp.get("new_string", ""))})
+                    elif name == "MultiEdit":
+                        parts = [_unified(e.get("old_string", ""), e.get("new_string", ""))
+                                 for e in inp.get("edits", []) if isinstance(e, dict)]
+                        ops.append({"ts": ts, "kind": "edited", "diff": "\n".join(p for p in parts if p)})
+                    elif name == "NotebookEdit":
+                        ops.append({"ts": ts, "kind": "edited", "diff": _unified("", inp.get("new_source", ""))})
+    ops.sort(key=lambda o: o.get("ts") or "")       # interleave main + agent edits chronologically
     return ops
 
 
@@ -642,7 +658,19 @@ def parse_session(path):
     if tasks:
         todos = tasks
     done_todos = [t for t in todos if t.get("status") == "completed"]
-    agents_bg, newest_agent = parse_agents(path)
+    agents_bg, newest_agent, agent_files = parse_agents(path)
+    # merge background-agent file edits into the shared files shape so they show in
+    # the Files panel (and the counts) — e.g. an agent editing inside a worktree.
+    for fp, ae in agent_files.items():
+        existed = fp in files
+        e = files.setdefault(fp, {"path": fp, "ops": 0, "created": ae["created"]})
+        e["ops"] += ae["ops"]
+        if ae.get("last") and (not e.get("last") or ae["last"] > e["last"]):
+            e["last"] = ae["last"]
+        if ae["created"]:
+            e["created"] = True
+        if not existed:
+            e["agent"] = True                     # only the main session never touched it
     shells = parse_shells(path)
     meta["title"] = (load_titles().get(sid) or meta.get("customTitle") or meta.get("aiTitle")
                      or (_short_title(requests[0]["text"]) if requests else ""))
