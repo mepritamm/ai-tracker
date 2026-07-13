@@ -73,7 +73,7 @@ To keep it running in the background: `nohup python3 -m aitracker >/tmp/tracker.
 - **Background agents & shells** — running ones shown; finished ones one click away. A toast + sound fires when one completes. *(Claude Code only — Auggie has no background-work model.)*
 - **Pull requests** — the PRs a session actually *generated* (created via `gh pr create` or the GitHub MCP tool), as clickable links; PRs it merely referenced are left out.
 - **Narration** — the assistant's own words, step by step, with full markdown rendering (tables, code, lists) in the pop-out modal, and prev/next arrows across every entry. History is unbounded — older entries page in from the server as you scroll. An open entry stays live: it follows the newest message, or holds your place if you've paged back into history.
-- **Todos**, **Files** (with a Diff ⇄ Rendered-markdown toggle and an "open in new tab" button), **Commands** (with ✓/✗ for Claude), and **Requests**.
+- **Todos**, **Files** (with a Diff ⇄ Rendered-markdown toggle and an "open in new tab" button), **Commands** (with ✓/✗ for Claude), and **Requests**. Files a background agent wrote — e.g. editing inside a git worktree — show too, tagged **🤖 agent**, and stay diffable.
 - Every list panel loads a window and reveals older entries as you scroll to the bottom.
 - **🚩 Flag** anything you want to fix later — see [Skills](#skills).
 
