@@ -179,6 +179,7 @@ a{color:#4c8dff}
 .prlink{display:flex;align-items:center;gap:8px;padding:9px 14px;text-decoration:none;color:inherit}
 .prlink b{color:#e6edf3;flex:0 0 auto}
 .prurl{color:#5b6573;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1 1 auto}
+.prtime{color:#5b6573;font-size:11px;font-family:'JetBrains Mono',monospace;flex:0 0 auto;white-space:nowrap}
 .prlink .chev{color:#5b6573;font-size:11px;flex:0 0 auto}
 .prlink:hover .chev{color:#4c8dff}
 /* diff modal */
