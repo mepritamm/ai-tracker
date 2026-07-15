@@ -53,8 +53,10 @@ function hl(text,q){
   const re=new RegExp("("+q.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")+")","ig");
   return e.replace(re,"<b>$1</b>");
 }
+let selEntry=null;   // last list row seen for the selected session — pin it so a poll can't drop it
 function renderSide(){
   const now=Date.now()/1000;
+  const sl=$("slist"), sc=sl?sl.scrollTop:0;   // preserve scroll: a background poll must not yank the list to the top
   if(searchResults!==null){       // search mode: show matches instead of the full list
     const q=$("q").value.trim();
     $("livecount").textContent=`${searchResults.length} match${searchResults.length==1?"":"es"}`;
@@ -67,6 +69,7 @@ function renderSide(){
         (s.snippet?`<div class=ssnip>${hl(s.snippet,q)}</div>`:"")+
         `</div>`;
     }).join(""):`<div class=empty>no sessions match “${esc(q)}”</div>`;
+    if(sl)sl.scrollTop=sc;
     return;
   }
   const liveN=sessions.filter(s=>now-s.mtime<LIVE).length;
@@ -74,7 +77,10 @@ function renderSide(){
   lc.textContent=liveOnly?`${liveN} live ✕`:`${liveN} live`;
   lc.title=liveOnly?"Showing live only — click to show all":"Click to show live sessions only";
   lc.classList.toggle("on",liveOnly);
-  const shown=liveOnly?sessions.filter(s=>now-s.mtime<LIVE):sessions;
+  const found=sessions.find(s=>s.id===cur); if(found)selEntry=found;
+  let shown=liveOnly?sessions.filter(s=>now-s.mtime<LIVE):sessions;
+  // never let the selected session fall off (top-N cap or live filter) — pin it so the selection persists
+  if(cur && !shown.some(s=>s.id===cur) && selEntry && selEntry.id===cur) shown=[selEntry,...shown];
   $("slist").innerHTML=shown.length?shown.map(s=>{
     const live=now-s.mtime<LIVE;
     const label=s.title||s.project||s.id.slice(0,8);
@@ -86,6 +92,7 @@ function renderSide(){
       `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename this session">✎</span></div>`+
       `<div class=smeta>${bits.join(" · ")}</div></div>`;
   }).join(""):`<div class=empty>${liveOnly?"no live sessions":"no sessions"}</div>`;
+  if(sl)sl.scrollTop=sc;
 }
 function toggleLiveOnly(){liveOnly=!liveOnly;renderSide();}
 async function loadSide(){
@@ -368,12 +375,12 @@ function render(d){
 
   syncModal();   // keep an open narration/request modal live with this poll
 }
-let curFiles=[], curDiffFile=null, curDiffOps=[], diffMode="diff";
+let curFiles=[], curDiffFile=null, curDiffOps=[], diffMode="diff", diffExpand=[], curDiffText=null, diffAllExpanded=false;
 const isMd=p=>/\.(md|markdown|mdx)$/i.test(p||"");
 async function openDiff(i){
   const f=curFiles[i]; if(!f||!cur)return;
   _setNav(openDiff,i,curFiles.length);
-  curDiffFile=f; curDiffOps=[];
+  curDiffFile=f; curDiffOps=[]; diffExpand=[]; curDiffText=null; diffAllExpanded=false;
   diffMode=isMd(f.path)?"md":"diff";   // markdown files render by default
   $("diffname").textContent=base(f.path);
   $("diffpath").textContent=f.path;
@@ -383,39 +390,82 @@ async function openDiff(i){
   try{const d=await(await fetch(`/api/diff?id=${encodeURIComponent(cur)}&file=${encodeURIComponent(f.path)}`)).json();
       curDiffOps=(d.ops||[]).reverse();}   // newest edit first
   catch(e){curDiffOps=[];}
+  try{const r=await(await fetch("/api/file?path="+encodeURIComponent(f.path))).json();
+      if(!r.error) curDiffText=r.content||"";}catch(e){}   // full file → GitHub-style context expansion
   renderDiffView();
 }
 function updateMdToggle(){
-  const btn=$("diffmd"); if(!btn)return;
-  btn.style.display=isMd(curDiffFile&&curDiffFile.path)?"":"none";
-  btn.textContent=diffMode==="md"?"◧ Diff":"◧ Rendered";
+  const btn=$("diffmd");
+  if(btn){ btn.style.display=isMd(curDiffFile&&curDiffFile.path)?"":"none";
+           btn.textContent=diffMode==="md"?"◧ Diff":"◧ Rendered"; }
+  const ab=$("diffall");   // expand-all only makes sense in diff mode with edits to expand
+  if(ab){ ab.style.display=(diffMode==="diff"&&curDiffOps.length)?"":"none";
+          ab.textContent=diffAllExpanded?"⇕ Collapse":"⇕ Expand all"; }
 }
 function toggleDiffMd(){ diffMode=diffMode==="md"?"diff":"md"; updateMdToggle(); renderDiffView(); }
+function toggleDiffAll(){
+  diffAllExpanded=!diffAllExpanded;
+  if(diffAllExpanded){
+    const N=(curDiffText!=null?curDiffText:"").split("\n").length;   // enough to clamp to the whole file
+    diffExpand=curDiffOps.map(()=>({up:N,down:N}));
+  } else diffExpand=[];
+  renderDiffView();
+}
 async function renderDiffView(){
+  updateMdToggle();   // sync the header buttons now that ops/mode are known
   if(diffMode==="md"){ await renderMdView(); return; }
   const now=Date.now()/1000;
-  $("diffbody").innerHTML=curDiffOps.length?curDiffOps.map(op=>
+  const fileLines=curDiffText!=null?curDiffText.split("\n"):[];
+  $("diffbody").innerHTML=curDiffOps.length?curDiffOps.map((op,idx)=>
     `<div class=diffop><div class=diffhd><span class="kind ${op.kind==='created'?'new':''}">${op.kind}</span>`+
     `${op.ts?`<span>${ago(now-Date.parse(op.ts)/1000)}</span>`:""}</div>`+
-    `<div class=diff>${renderDiff(op.diff)}</div></div>`).join(""):
+    `<div class=diff>${renderOpDiff(op,idx,fileLines)}</div></div>`).join(""):
     "<div class=empty>no recorded edits for this file</div>";
 }
+// The recorded diff is just the edit's snippet; anchor its after-text uniquely in the
+// real file so up/down can reveal the true surrounding lines (GitHub-style). A superseded
+// or non-unique edit can't be anchored — then we show the snippet alone, no expander.
+function _afterLines(op){
+  let a=(op.diff||"").split("\n")
+    .filter(l=>!/^(@@|\+\+\+|---)/.test(l) && l[0]!=="-")
+    .map(l=> (l[0]==="+"||l[0]===" ") ? l.slice(1) : l);
+  while(a.length && a[a.length-1]==="") a.pop();
+  return a;
+}
+function _anchorIdx(a,f){
+  if(!a.length || a.length>f.length) return -1;
+  let hit=-1;
+  for(let i=0;i+a.length<=f.length;i++){
+    let ok=true; for(let j=0;j<a.length;j++){ if(f[i+j]!==a[j]){ok=false;break;} }
+    if(ok){ if(hit>=0) return -1; hit=i; }   // ambiguous → don't guess a location
+  }
+  return hit;
+}
+function _expBar(idx,dir,n){
+  return `<div class=diffexp onclick="diffExpandMore(${idx},'${dir}')" title="show more of the file">`+
+         `${dir==='up'?'↑':'↓'} ${n} more line${n===1?'':'s'} ${dir==='up'?'above':'below'}</div>`;
+}
+function renderOpDiff(op,idx,fileLines){
+  const hunk=renderDiff(op.diff);
+  const after=_afterLines(op), at=_anchorIdx(after,fileLines);
+  if(at<0) return hunk;                              // no reliable anchor → snippet only
+  const st=diffExpand[idx]||{up:0,down:0}, end=at+after.length;
+  const upStart=Math.max(0,at-st.up), downEnd=Math.min(fileLines.length,end+st.down);
+  const ctx=(a,b)=>fileLines.slice(a,b).map(l=>`<span class="dl dctx">${esc(l)||" "}</span>`).join("");
+  return (upStart>0?_expBar(idx,'up',upStart):"")+ctx(upStart,at)+hunk+
+         ctx(end,downEnd)+(downEnd<fileLines.length?_expBar(idx,'down',fileLines.length-downEnd):"");
+}
+function diffExpandMore(idx,dir){
+  const e=diffExpand[idx]||(diffExpand[idx]={up:0,down:0});
+  e[dir]+=20; renderDiffView();
+}
 async function renderMdView(){
-  $("diffbody").innerHTML="<div class=empty>rendering…</div>";
-  let content="";
-  try{const r=await(await fetch("/api/file?path="+encodeURIComponent(curDiffFile.path))).json();
-      if(!r.error) content=r.content||"";}catch(e){}
-  if(!content) content=reconstructAfter(curDiffOps);   // fallback: rebuild from the diff
+  const content=(curDiffText!=null?curDiffText:"")||reconstructAfter(curDiffOps);
   $("diffbody").innerHTML=content
     ? `<div class="msgbody mdmode" style=overflow:visible>${mdBlock(content)}</div>`
     : "<div class=empty>could not read the file to render</div>";
 }
-function reconstructAfter(ops){
-  if(!ops.length)return "";
-  return (ops[0].diff||"").split("\n")
-    .filter(l=>!/^(@@|\+\+\+|---)/.test(l) && l[0]!=="-")
-    .map(l=> (l[0]==="+"||l[0]===" ") ? l.slice(1) : l).join("\n");
-}
+function reconstructAfter(ops){ return ops.length?_afterLines(ops[0]).join("\n"):""; }
 function renderDiff(t){
   return (t||"").split("\n").map(l=>{
     let cls="dl";

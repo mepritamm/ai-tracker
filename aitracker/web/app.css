@@ -206,6 +206,9 @@ a{color:#4c8dff}
 .dl.ddel{background:#3a161633;color:#f85149}
 .dl.dat{color:#4c8dff}
 .dl.dh{color:#5b6573}
+.dl.dctx{color:#8b949e}
+.diffexp{cursor:pointer;color:#4c8dff;background:#0d1622;border-top:1px solid #1c2330;border-bottom:1px solid #1c2330;padding:2px 12px;font-size:11px;user-select:none}
+.diffexp:hover{background:#12203a}
 @media(max-width:900px){.app{flex-direction:column}.side{width:100%;flex:none;max-height:38vh}}
 .foot{text-align:center;padding:10px 12px 12px;border-top:1px solid #1c2330;font-size:10px;color:#8b949e;opacity:.4;letter-spacing:.03em}
 .foot a{color:inherit;text-decoration:underline;text-underline-offset:2px}
