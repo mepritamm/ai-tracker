@@ -146,6 +146,23 @@ class TestServerEndToEnd(unittest.TestCase):
         self.assertEqual(st, 404)
 
 
+class TestPortFallback(unittest.TestCase):
+    """bind() skips a busy port and takes the next free one."""
+
+    def test_bind_skips_busy_port(self):
+        busy = _server.Server(("127.0.0.1", 0), _server.Handler)   # occupy an ephemeral port
+        p = busy.server_address[1]
+        try:
+            srv = _server.bind("127.0.0.1", p, tries=10)
+            try:
+                self.assertNotEqual(srv.server_address[1], p)       # didn't reuse the busy port
+                self.assertGreater(srv.server_address[1], p)        # took a later one
+            finally:
+                srv.server_close()
+        finally:
+            busy.server_close()
+
+
 class TestOverviewSynthesis(unittest.TestCase):
     """build_overview turns the derived counts into the Goal / Now / So-far line."""
 

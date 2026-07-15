@@ -1,4 +1,4 @@
-import json, os, sys
+import json, os, sys, errno, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from .config import LIVE_WINDOW, NARR_PAGE
@@ -187,5 +187,28 @@ class Server(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-def run(host="127.0.0.1", port=8787):
-    Server((host, port), Handler).serve_forever()
+def bind(host="127.0.0.1", port=8787, tries=20):
+    """Bind to `port`, or the next free port after it (up to `tries`).
+    Returns the listening Server — read its real port off server_address."""
+    for p in range(port, port + tries):
+        try:
+            return Server((host, p), Handler)
+        except OSError as e:
+            if e.errno == errno.EADDRINUSE and p < port + tries - 1:
+                continue
+            raise
+
+
+def run(host="127.0.0.1", port=8787, open_browser=True):
+    srv = bind(host, port)
+    actual = srv.server_address[1]
+    if actual != port:
+        print(f"port {port} is in use → using {actual}")
+    url = f"http://localhost:{actual}"
+    print(f"AI session tracker → {url}  (Ctrl-C to stop)")
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    srv.serve_forever()

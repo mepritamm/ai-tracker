@@ -131,7 +131,7 @@ let lastData=null;
 let soundOn=localStorage.getItem("soundOff")!=="1";
 let notifSession=null, notifRunning=null, audioCtx=null;
 function setBell(){const b=$("bell");if(b){b.textContent=soundOn?"🔔":"🔕";b.title="Completion sound: "+(soundOn?"on":"muted");}}
-function toggleSound(){soundOn=!soundOn;localStorage.setItem("soundOff",soundOn?"0":"1");setBell();if(soundOn)beep();}
+function toggleSound(){soundOn=!soundOn;localStorage.setItem("soundOff",soundOn?"0":"1");setBell();if(soundOn){beep();primeNotify();}}
 function beep(){
   try{
     audioCtx=audioCtx||new (window.AudioContext||window.webkitAudioContext)();
@@ -147,6 +147,14 @@ function beep(){
     });
   }catch(e){}
 }
+// Browsers only allow Notification.requestPermission() and audio to start from a real
+// user gesture — prime both on the first interaction so a completion can alert you even
+// when this tab is backgrounded (where the WebAudio beep is suspended).
+function primeNotify(){
+  try{audioCtx=audioCtx||new (window.AudioContext||window.webkitAudioContext)();if(audioCtx.state==="suspended")audioCtx.resume();}catch(e){}
+  if(soundOn && "Notification" in window && Notification.permission==="default"){try{Notification.requestPermission();}catch(e){}}
+}
+addEventListener("pointerdown",primeNotify,{once:true});
 function toast(msg,sub){
   const el=document.createElement("div");
   el.className="toast";
@@ -156,6 +164,14 @@ function toast(msg,sub){
   requestAnimationFrame(()=>el.classList.add("show"));
   setTimeout(()=>{el.classList.remove("show");setTimeout(()=>el.remove(),300);},7000);
 }
+function notifyDone(title,sub){
+  toast(title,sub);                                   // in-page banner (seen when you're on the tab)
+  if(soundOn)beep();                                  // WebAudio — reliable only while the tab is focused
+  // an OS notification reaches you in another tab or app, where the beep + toast can't
+  if(document.hidden && soundOn && "Notification" in window && Notification.permission==="granted"){
+    try{const n=new Notification(title,{body:sub||""});n.onclick=()=>{window.focus();n.close();};}catch(e){}
+  }
+}
 function checkCompletions(d){
   const items=[...(d.agents_bg||[]).map(a=>({id:"a:"+a.id,name:a.task||a.id,kind:"agent",run:a.running})),
                ...(d.shells||[]).map(s=>({id:"s:"+s.id,name:s.desc||s.cmd,kind:"shell",run:s.running}))];
@@ -164,8 +180,7 @@ function checkCompletions(d){
   if(notifSession!==cur||notifRunning===null){notifSession=cur;notifRunning=running;return;}
   for(const x of items){
     if(!x.run && notifRunning.has(x.id)){
-      toast(x.kind==="shell"?"Background shell finished":"Background agent finished", (x.name||"").slice(0,90));
-      if(soundOn)beep();
+      notifyDone(x.kind==="shell"?"Background shell finished":"Background agent finished", (x.name||"").slice(0,90));
     }
   }
   notifRunning=running;

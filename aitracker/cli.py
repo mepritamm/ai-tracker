@@ -1,7 +1,6 @@
 """ai-tracker CLI: serve the dashboard, or run the self-check."""
 import os
 import sys
-import webbrowser
 
 from . import __version__
 from .server import run
@@ -34,10 +33,4 @@ def main():
         _selfcheck()
         return
     port = int(os.environ.get("PORT", 8787))
-    url = f"http://localhost:{port}"
-    print(f"AI session tracker → {url}  (Ctrl-C to stop)")
-    try:
-        webbrowser.open(url)
-    except Exception:
-        pass
-    run(port=port)
+    run(port=port)   # run() picks the next free port if this one is busy, and opens the browser

@@ -42,7 +42,7 @@ A tool only appears if its data exists on the machine — install nothing, it ju
 python3 -m aitracker
 ```
 
-That's it. It starts a local server on **http://localhost:8787** and opens your browser. Pick a session from the sidebar (or paste a session id) and watch it work.
+That's it. It starts a local server on **http://localhost:8787** and opens your browser. Pick a session from the sidebar (or paste a session id) and watch it work. If `8787` is already taken it automatically uses the next free port (and prints the one it picked).
 
 Prefer the Makefile — it restarts cleanly (frees a stuck port so UI changes always take effect):
 
@@ -70,7 +70,7 @@ To keep it running in the background: `nohup python3 -m aitracker >/tmp/tracker.
 
 **Main view** for the selected session:
 - **Session summary** — Goal, what it's doing *Now*, and a one-line "So far", with stat chips (files, commands, reads, commits, tests, tokens, git branch).
-- **Background agents & shells** — running ones shown; finished ones one click away. A toast + sound fires when one completes. *(Claude Code only — Auggie has no background-work model.)*
+- **Background agents & shells** — running ones shown; finished ones one click away. When one completes you get a toast + sound, plus a desktop notification if the tab is in the background (so you're alerted even while working elsewhere — allow notifications on first click; toggle with the 🔔 bell). *(Claude Code only — Auggie has no background-work model.)*
 - **Pull requests** — the PRs a session actually *generated* (created via `gh pr create` or the GitHub MCP tool), as clickable links; PRs it merely referenced are left out.
 - **Narration** — the assistant's own words, step by step, with full markdown rendering (tables, code, lists) in the pop-out modal, and prev/next arrows across every entry. History is unbounded — older entries page in from the server as you scroll. An open entry stays live: it follows the newest message, or holds your place if you've paged back into history.
 - **Todos**, **Files** (with a Diff ⇄ Rendered-markdown toggle and an "open in new tab" button), **Commands** (with ✓/✗ for Claude), and **Requests**. Files a background agent wrote — e.g. editing inside a git worktree — show too, tagged **🤖 agent**, and stay diffable.
