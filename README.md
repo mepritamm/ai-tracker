@@ -70,6 +70,7 @@ To keep it running in the background: `nohup python3 -m aitracker >/tmp/tracker.
 
 **Main view** for the selected session:
 - **Session summary** — Goal, what it's doing *Now*, and a one-line "So far", with stat chips (files, commands, reads, commits, tests, tokens, git branch).
+- **Decisions & open questions** — every question the session asked you (Claude `AskUserQuestion` / Auggie `ask-user`) with its options; **open** ones (awaiting your answer) are flagged and pinned to the top, decided ones show the choice you made. It's view-only — answer in the actual session (the tracker never writes to it).
 - **Background agents & shells** — running ones shown; finished ones one click away. When one completes you get a toast + sound, plus a desktop notification if the tab is in the background (so you're alerted even while working elsewhere — allow notifications on first click; toggle with the 🔔 bell). *(Claude Code only — Auggie has no background-work model.)*
 - **Pull requests** — the PRs a session actually *generated* (created via `gh pr create` or the GitHub MCP tool), as clickable links; PRs it merely referenced are left out.
 - **Narration** — the assistant's own words, step by step, with full markdown rendering (tables, code, lists) in the pop-out modal, and prev/next arrows across every entry. History is unbounded — older entries page in from the server as you scroll. An open entry stays live: it follows the newest message, or holds your place if you've paged back into history.
@@ -98,6 +99,7 @@ Both providers emit the **same result shape**, so the browser renders them ident
 | Working folder + git branch (worktree-aware) | ✅ (from the log) | ✅ (folder from IDE state; branch from `.git/HEAD`) |
 | Command exit status (✓/✗) | ✅ | ➖ Auggie stores none — commands show as ✓ |
 | Generated pull requests | ✅ (linked to the `gh pr create` / MCP result) | ✅ when the created URL is in the reply |
+| Decisions & open questions | ✅ (`AskUserQuestion`) | ✅ (`ask-user` — answer from the next turn's tool result) |
 | Background agents & shells | ✅ | ➖ Auggie has no such model |
 
 **Data files** — `flags.json` (your flags) and `titles.json` (your renames) are read **live** (no restart). Everything else is baked into the page at startup, so **editing `aitracker/` or `web/` needs a server restart** to show.

@@ -342,6 +342,23 @@ function render(d){
     `<span class=prtime>${p.t?ago(d.now-Date.parse(p.t)/1000):""}</span><span class=chev>open ›</span></a></div>`,
     "no pull requests created in this session");
 
+  // decisions / open questions the session asked the user for (Claude AskUserQuestion, Auggie ask-user)
+  const dec=d.decisions||[], nOpen=dec.filter(x=>x.open).length;
+  $("decpanel").style.display=dec.length?"":"none";
+  $("decc").textContent=dec.length?(nOpen?nOpen+" open · "+dec.length:dec.length):"";
+  $("dec").innerHTML=dec.length?dec.map(x=>{
+    const qs=(x.questions||[]).map(q=>
+      (q.header?`<span class=dechd>${esc(q.header)}</span>`:"")+
+      `<div class=decq>${md(q.q||"")}</div>`+
+      (q.options&&q.options.length?`<div class=decopts>${q.options.map(o=>`<span class=decopt>${esc(o)}</span>`).join("")}</div>`:"")
+    ).join("");
+    const foot=x.open
+      ? `<div class="decans open">⏳ awaiting your answer — decide in the session</div>`
+      : `<div class=decans><span class=deck>✓ decided</span> ${md(x.answer||"")}</div>`;
+    return `<div class="decitem${x.open?' isopen':''}">${qs}${foot}`+
+           `<div class=dectime>${x.t?ago(d.now-Date.parse(x.t)/1000):""}</div></div>`;
+  }).join(""):"<div class=empty>no questions asked</div>";
+
   // todos
   const td=d.todos||[];
   const order={completed:0,in_progress:1,pending:2};

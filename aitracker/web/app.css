@@ -207,6 +207,17 @@ a{color:#4c8dff}
 .dl.dat{color:#4c8dff}
 .dl.dh{color:#5b6573}
 .dl.dctx{color:#8b949e}
+/* decisions / open questions */
+.decitem{padding:11px 12px;border:1px solid #1c2330;border-radius:10px;margin-bottom:8px;background:#0c1017}
+.decitem.isopen{border-color:#3a2a0f;border-left:3px solid #d29922;background:#150f04}
+.dechd{display:inline-block;font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:#f5b443;background:#1a1206;border:1px solid #3a2a0f;border-radius:5px;padding:1px 7px;margin-bottom:6px}
+.decq{font-size:13.5px;color:#dbe7f5;font-weight:600;line-height:1.4;margin-bottom:7px}
+.decopts{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:7px}
+.decopt{font-size:11.5px;color:#c9d4e0;background:#10141c;border:1px solid #2c333f;border-radius:14px;padding:2px 10px}
+.decans{font-size:12.5px;color:#c9d4e0;line-height:1.45}
+.decans.open{color:#e3b341;font-weight:600}
+.deck{color:#3fb950;font-weight:600;margin-right:4px}
+.dectime{margin-top:6px;font-size:11px;color:#6b7585;font-family:'JetBrains Mono',monospace}
 .diffexp{cursor:pointer;color:#4c8dff;background:#0d1622;border-top:1px solid #1c2330;border-bottom:1px solid #1c2330;padding:2px 12px;font-size:11px;user-select:none}
 .diffexp:hover{background:#12203a}
 @media(max-width:900px){.app{flex-direction:column}.side{width:100%;flex:none;max-height:38vh}}

@@ -551,6 +551,7 @@ def parse_session(path):
     errors_by_id = {}     # tool_use_id -> True
     prs = {}              # url -> {url, repo, num, created, t} : PRs touched this session
     pr_create_ids = set() # tool_use_ids of `gh pr create` Bash calls (their result URL = created)
+    asks = {}             # tool_use_id -> AskUserQuestion decision {t, open, answer, questions}
     narrative = []       # Claude's own text, in order: the blow-by-blow
     meta = {}
     text_last = ""
@@ -607,11 +608,15 @@ def parse_session(path):
                         narrative.append({"t": ts, "text": txt[:NARRATION_CAP]})  # modal shows full; list clamps preview
                         collect_prs(prs, txt, ts)                 # PR links Claude prints in its narration
                 elif bt == "tool_result":
+                    rid = b.get("tool_use_id")
                     if b.get("is_error"):
-                        errors_by_id[b.get("tool_use_id")] = True
+                        errors_by_id[rid] = True
                     cc = b.get("content")                          # command output: gh prints the PR URL here
                     rtext = cc if isinstance(cc, str) else (json.dumps(cc) if cc else "")
-                    collect_prs(prs, rtext, ts, b.get("tool_use_id") in pr_create_ids)
+                    if rid in asks:                                # the user's answer to an AskUserQuestion
+                        asks[rid]["answer"] = re.sub(r"^Your questions have been answered:\s*", "", rtext).strip()[:2000]
+                        asks[rid]["open"] = False
+                    collect_prs(prs, rtext, ts, rid in pr_create_ids)
                 elif bt == "tool_use":
                     name = b.get("name")
                     inp = b.get("input") or {}
@@ -649,6 +654,12 @@ def parse_session(path):
                     elif name == "Task":
                         agents.append({"t": ts, "type": inp.get("subagent_type") or "agent",
                                        "desc": (inp.get("description") or "")[:80]})
+                    elif name == "AskUserQuestion":                # a decision the session asked the user for
+                        qs = [{"q": (q.get("question") or "")[:500], "header": (q.get("header") or "")[:40],
+                               "options": [(o.get("label") or "")[:120] for o in (q.get("options") or [])
+                                           if isinstance(o, dict)]}
+                              for q in (inp.get("questions") or []) if isinstance(q, dict)]
+                        asks[bid] = {"t": ts, "open": True, "answer": "", "questions": qs}
     # annotate commands with pass/fail from the error map
     for c in cmds:
         c["ok"] = not errors_by_id.get(c["id"], False)
@@ -688,6 +699,8 @@ def parse_session(path):
         "agents": agents[::-1],
         "agents_bg": agents_bg,
         "shells": shells,
+        # open decisions first, then most-recent — so a pending question is at the top
+        "decisions": sorted(asks.values(), key=lambda a: (a["open"], a["t"] or ""), reverse=True),
         "prs": [p for p in prs_sorted(prs) if p["created"]],   # only PRs generated in this session, not ones it merely referenced
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": text_last[:2000],

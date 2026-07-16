@@ -152,12 +152,19 @@ def parse_auggie(session_id):
     except (OSError, ValueError):
         return None
     requests, narrative, files, cmds, reads, commits = [], [], {}, [], {}, []
+    asks = {}         # tool_use_id -> ask-user decision {t, open, answer, questions} (parity with Claude)
     prs = {}          # url -> entry : PR/MR links touched this session (parity with Claude)
     tok_in = tok_out = 0
     for m in d.get("chatHistory") or []:
         ex = m.get("exchange") or {}
         ts = m.get("finishedAt")
         pr_here = False       # this exchange ran a PR-create tool → its response URL is a created PR
+        for rn in ex.get("request_nodes") or []:              # the user's answer to a prior ask-user lands here
+            trn = rn.get("tool_result_node") if isinstance(rn, dict) else None
+            if isinstance(trn, dict) and trn.get("tool_use_id") in asks:
+                c = trn.get("content") or ""
+                asks[trn["tool_use_id"]]["answer"] = re.sub(r"^User responded:\s*", "", c).strip()[:2000]
+                asks[trn["tool_use_id"]]["open"] = False
         for rn in ex.get("response_nodes") or []:
             tu = rn.get("token_usage")
             if isinstance(tu, dict):                # tokens: mirror Claude (input + cache)
@@ -189,6 +196,11 @@ def parse_auggie(session_id):
                         commits.append({"t": ts, "msg": (mm.group(2) if mm else c)[:120]})
                 elif name == "view" and inp.get("path") and inp.get("type") != "directory":
                     reads[inp["path"]] = ts           # ~ Claude's Read
+                elif name == "ask-user":              # Auggie's user-question tool (~ Claude's AskUserQuestion)
+                    opts = [o[:120] for o in (inp.get("suggested_responses") or []) if isinstance(o, str)]
+                    asks[call.get("tool_use_id")] = {"t": ts, "open": True, "answer": "",
+                                                     "questions": [{"q": (inp.get("question") or "")[:500],
+                                                                    "header": "", "options": opts}]}
         r = ex.get("request_message")
         if isinstance(r, str) and r.strip() and not r.lstrip().startswith("<"):
             requests.append({"t": ts, "text": " ".join(r.split())[:300]})
@@ -234,6 +246,8 @@ def parse_auggie(session_id):
         "commits": commits[::-1],
         "tests": tests[::-1],
         "requests": requests, "agents": [], "agents_bg": [], "shells": [],
+        # open decisions first, then most-recent — parity with Claude's AskUserQuestion panel
+        "decisions": sorted(asks.values(), key=lambda a: (a["open"], a["t"] or ""), reverse=True),
         "prs": [p for p in prs_sorted(prs) if p["created"]],   # only PRs generated in this session, not ones it merely referenced
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": latest[:2000],

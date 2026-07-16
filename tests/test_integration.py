@@ -163,6 +163,61 @@ class TestPortFallback(unittest.TestCase):
             busy.server_close()
 
 
+class TestDecisions(unittest.TestCase):
+    """AskUserQuestion (Claude) + ask-user (Auggie) surface as `decisions`, open ones pinned first."""
+
+    def setUp(self):
+        self.snap = _snap(); _empty_env()
+
+    def tearDown(self):
+        _restore(self.snap)
+
+    def test_claude_decisions(self):
+        d = os.path.join(config.PROJECTS, "proj"); os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "s1.jsonl")
+        lines = [
+            {"type": "assistant", "timestamp": "2026-07-16T10:00:00Z", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "a1", "name": "AskUserQuestion", "input": {"questions": [
+                    {"question": "Ship it now?", "header": "Scope",
+                     "options": [{"label": "Yes"}, {"label": "No"}]}]}}]}},
+            {"type": "user", "timestamp": "2026-07-16T10:01:00Z", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a1",
+                 "content": 'Your questions have been answered: "Ship it now?"="Yes"'}]}},
+            {"type": "assistant", "timestamp": "2026-07-16T10:02:00Z", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "a2", "name": "AskUserQuestion", "input": {"questions": [
+                    {"question": "Which DB?", "header": "DB",
+                     "options": [{"label": "pg"}, {"label": "sqlite"}]}]}}]}},
+        ]
+        open(path, "w").write("\n".join(json.dumps(x) for x in lines))
+        dec = _claude.parse_session(path)["decisions"]
+        self.assertEqual(len(dec), 2)
+        self.assertTrue(dec[0]["open"])                                  # open pinned first
+        self.assertEqual(dec[0]["questions"][0]["header"], "DB")
+        self.assertEqual(dec[0]["questions"][0]["options"], ["pg", "sqlite"])
+        decided = next(x for x in dec if not x["open"])
+        self.assertIn("Yes", decided["answer"])
+        self.assertFalse(decided["answer"].startswith("Your questions"))  # prefix stripped
+
+    def test_auggie_decisions(self):
+        sid = "au1"
+        doc = {"sessionId": sid, "modified": "2026-07-16T10:00:00Z", "chatHistory": [
+            {"finishedAt": "2026-07-16T10:00:00Z", "exchange": {"request_message": "go", "response_nodes": [
+                {"tool_use": {"tool_use_id": "q1", "tool_name": "ask-user",
+                              "input_json": json.dumps({"question": "Proceed?",
+                                                        "suggested_responses": ["Yes", "No"]})}}]}},
+            {"finishedAt": "2026-07-16T10:01:00Z", "exchange": {"request_message": "", "response_nodes": [],
+                "request_nodes": [{"tool_result_node": {"tool_use_id": "q1",
+                                                        "content": "User responded: Yes, go ahead"}}]}},
+        ]}
+        json.dump(doc, open(os.path.join(config.AUGGIE_SESSIONS, sid + ".json"), "w"))
+        dec = _auggie.parse_auggie(sid)["decisions"]
+        self.assertEqual(len(dec), 1)
+        self.assertFalse(dec[0]["open"])
+        self.assertEqual(dec[0]["questions"][0]["options"], ["Yes", "No"])
+        self.assertIn("Yes", dec[0]["answer"])
+        self.assertNotIn("User responded", dec[0]["answer"])             # prefix stripped
+
+
 class TestOverviewSynthesis(unittest.TestCase):
     """build_overview turns the derived counts into the Goal / Now / So-far line."""
 
