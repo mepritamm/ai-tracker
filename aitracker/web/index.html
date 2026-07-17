@@ -38,10 +38,11 @@
   </div>
   <div class=nowbanner id=nowbanner style=display:none onclick="openNow()" title="Open the latest activity — follows the session live">
     <span class=dot></span>
-    <div style=min-width:0>
+    <div style="min-width:0;flex:1">
       <div class=lbl id=nowlbl>Now working on</div>
       <div class=txt id=nowtext></div>
     </div>
+    <div class=nowfile id=nowfile onclick="openLastFile(event)" style=display:none title="Open the last file updated"></div>
   </div>
   <div class=srcnote id=srcnote style=display:none></div>
 </header>

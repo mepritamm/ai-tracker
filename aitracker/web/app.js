@@ -309,6 +309,10 @@ function render(d){
   const nowClean=(ov.now||"").replace(/^(?:▶|⚙|✓)\s+/,"").replace(/^Idle — last said:\s*/,"");
   $("nowlbl").textContent=live?"Now working on":"Completed last task";
   $("nowtext").innerHTML=(live?"▶ ":"✓ ")+md(nowClean)+(live?'<span class=cursor>▍</span>':"");
+  // the last file touched — click jumps to the Files panel and opens its diff
+  const lastFile=(d.files||[])[0];
+  $("nowfile").style.display=lastFile?"":"none";
+  if(lastFile)$("nowfile").innerHTML=`📄 <span class=nfn>${esc(base(lastFile.path))}</span>`;
 
   // narration — unbounded, server-paginated. The poll ships only the newest page
   // (d.narrative) + the full count (d.narrative_total); we keep an accumulator so
@@ -551,6 +555,16 @@ function openNow(){
   else if(k==="shells" && curShells.length){ const i=curShells.findIndex(s=>s.running); openShell(i<0?0:i); }
   else if(k==="todo"){ const i=curTodos.findIndex(t=>t.status==="in_progress"); if(i>=0) openTodo(i); }
   else if(curNarr && curNarr.length){ openMsg(0); }
+}
+// the last-file chip in the banner → scroll to the Files panel, flash it, open the newest file's diff
+function openLastFile(e){
+  if(e) e.stopPropagation();            // don't also trigger the banner's openNow
+  if(!curFiles.length) return;
+  const el=$("card_files");
+  if(el){ el.scrollIntoView({behavior:"smooth", block:"center"});
+          el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash");
+          setTimeout(()=>el.classList.remove("flash"), 1500); }
+  openDiff(0);                          // curFiles[0] = most recently updated file
 }
 function openReq(i){const r=curReqs[i]; if(!r)return; _setNav(openReq,i,curReqs.length,{len:()=>curReqs.length,live:true}); openText("Request",tago(r.t),r.text);}
 async function openCmd(i){
