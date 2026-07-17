@@ -154,11 +154,18 @@ def parse_auggie(session_id):
     requests, narrative, files, cmds, reads, commits = [], [], {}, [], {}, []
     asks = {}         # tool_use_id -> ask-user decision {t, open, answer, questions} (parity with Claude)
     prs = {}          # url -> entry : PR/MR links touched this session (parity with Claude)
+    pr_creates = []   # exchange indices where a PR-create ran — Auggie logs no output URL, so we
+    pr_first_ex = {}  # url -> exchange it first appeared in → attribute "created" by order, below
     tok_in = tok_out = 0
-    for m in d.get("chatHistory") or []:
+    def _cprs(text):  # collect PRs + note which exchange each URL first showed up in
+        before = set(prs)
+        collect_prs(prs, text, ts)
+        for u in prs:
+            if u not in before:
+                pr_first_ex.setdefault(u, i)
+    for i, m in enumerate(d.get("chatHistory") or []):
         ex = m.get("exchange") or {}
         ts = m.get("finishedAt")
-        pr_here = False       # this exchange ran a PR-create tool → its response URL is a created PR
         for rn in ex.get("request_nodes") or []:              # the user's answer to a prior ask-user lands here
             trn = rn.get("tool_result_node") if isinstance(rn, dict) else None
             if isinstance(trn, dict) and trn.get("tool_use_id") in asks:
@@ -182,15 +189,15 @@ def parse_auggie(session_id):
                 inp = inp if isinstance(inp, dict) else {}
                 name = call.get("tool_name")
                 if name and "create_pull_request" in name:   # MCP PR creation in this exchange
-                    pr_here = True
+                    pr_creates.append(i)
                 if name == "launch-process" and inp.get("command"):   # ~ Claude's Bash
                     c = inp["command"]
                     k = cmd_kind(c)
                     cmds.append({"id": call.get("tool_use_id"), "t": ts, "cmd": c[:200],
                                  "kind": k, "ok": True})   # Auggie stores no exit status
                     if re.search(r"\bpr\s+create\b", c):
-                        pr_here = True
-                    collect_prs(prs, c, ts)
+                        pr_creates.append(i)
+                    _cprs(c)
                     if k == "commit":
                         mm = COMMIT_MSG_RE.search(c)
                         commits.append({"t": ts, "msg": (mm.group(2) if mm else c)[:120]})
@@ -204,17 +211,24 @@ def parse_auggie(session_id):
         r = ex.get("request_message")
         if isinstance(r, str) and r.strip() and not r.lstrip().startswith("<"):
             requests.append({"t": ts, "text": " ".join(r.split())[:300]})
-            collect_prs(prs, r, ts)
+            _cprs(r)
         resp = ex.get("response_text")
         if isinstance(resp, str) and resp.strip():
             narrative.append({"t": ts, "text": resp.strip()[:NARRATION_CAP]})
-            collect_prs(prs, resp, ts, created=pr_here)   # URL printed after a PR-create = generated here
+            _cprs(resp)
         for cf in m.get("changedFiles") or []:
             p = cf if isinstance(cf, str) else (cf.get("path") or cf.get("filePath") or cf.get("file"))
             if p:
                 fe = files.setdefault(p, {"path": p, "ops": 0, "created": False})
                 fe["ops"] += 1
                 fe["last"] = ts
+    # Auggie logs no command output, and a created PR's URL only appears in a later narration
+    # line — so tie each `gh pr create` to the first new PR URL at or after its exchange.
+    for cx in sorted(pr_creates):
+        cand = sorted((u for u, fx in pr_first_ex.items() if fx >= cx and not prs[u]["created"]),
+                      key=lambda u: pr_first_ex[u])
+        if cand:
+            prs[cand[0]]["created"] = True
     cwd = _auggie_ide_cwd(d) or _auggie_cwd(list(files.keys()))   # real cwd, like Claude's
     branch = _git_branch(cwd)
     tests = [c for c in cmds if c["kind"] == "test"]

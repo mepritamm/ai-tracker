@@ -218,6 +218,37 @@ class TestDecisions(unittest.TestCase):
         self.assertNotIn("User responded", dec[0]["answer"])             # prefix stripped
 
 
+class TestAuggiePRs(unittest.TestCase):
+    """Auggie logs no command output; a created PR's URL only shows up in a later narration
+    line. parse_auggie ties each `gh pr create` to the first new PR URL at/after it, so the
+    generated PR shows and a merely-referenced one doesn't."""
+
+    def setUp(self):
+        self.snap = _snap(); _empty_env()
+
+    def tearDown(self):
+        _restore(self.snap)
+
+    def test_created_pr_attributed_from_later_narration(self):
+        sid = "aupr"
+        doc = {"sessionId": sid, "modified": "2026-07-16T10:03:00Z", "chatHistory": [
+            {"finishedAt": "2026-07-16T10:00:00Z", "exchange": {                # references an old PR (pre-create)
+                "request_message": "go", "response_text": "see old PR https://github.com/o/r/pull/99",
+                "response_nodes": []}},
+            {"finishedAt": "2026-07-16T10:01:00Z", "exchange": {                # runs gh pr create (no URL here)
+                "request_message": "", "response_text": "creating it now", "response_nodes": [
+                    {"tool_use": {"tool_use_id": "c1", "tool_name": "launch-process",
+                                  "input_json": json.dumps({"command": "gh pr create --base main"})}}]}},
+            {"finishedAt": "2026-07-16T10:02:00Z", "exchange": {                # the created URL, two turns later
+                "request_message": "", "response_text": "Done — PR #7 https://github.com/o/r/pull/7",
+                "response_nodes": []}},
+        ]}
+        json.dump(doc, open(os.path.join(config.AUGGIE_SESSIONS, sid + ".json"), "w"))
+        prs = _auggie.parse_auggie(sid)["prs"]                                  # created-only, like Claude
+        self.assertEqual([p["num"] for p in prs], ["7"])                        # the generated PR shows
+        self.assertNotIn("99", [p["num"] for p in prs])                        # the referenced one does not
+
+
 class TestOverviewSynthesis(unittest.TestCase):
     """build_overview turns the derived counts into the Goal / Now / So-far line."""
 
