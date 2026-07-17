@@ -36,10 +36,10 @@
       <div class=chips id=chips></div>
     </div>
   </div>
-  <div class=nowbanner id=nowbanner style=display:none onclick="openText('Now working on','',curOv.now||'')">
+  <div class=nowbanner id=nowbanner style=display:none onclick="openNow()" title="Open the latest activity — follows the session live">
     <span class=dot></span>
     <div style=min-width:0>
-      <div class=lbl>Now working on</div>
+      <div class=lbl id=nowlbl>Now working on</div>
       <div class=txt id=nowtext></div>
     </div>
   </div>
@@ -62,7 +62,7 @@
     <h2>Session summary</h2>
     <div class=ov>
       <div class=ovrow><span class=ovk>Goal</span><span id=ov_goal class="ovv ovclk" onclick="openText('Goal','',curOv.goal||'')">—</span></div>
-      <div class=ovrow><span class=ovk>Now</span><span id=ov_now class=ovclk onclick="openText('Now working on','',curOv.now||'')">—</span></div>
+      <div class=ovrow><span class=ovk>Now</span><span id=ov_now class=ovclk onclick="openNow()">—</span></div>
       <div class=ovrow><span class=ovk>So far</span><span id=ov_sofar class=ovclk onclick="openText('So far','',curOv.sofar||'')">—</span></div>
       <div class=ovrow id=ov_crow style=display:none><span class=ovk>Commits</span><span id=ov_commits class=ovv></span></div>
     </div>
@@ -82,7 +82,7 @@
       <button class=addflag onclick=addFlag()>🚩 Flag an issue or gap</button>
     </div>
   </div>
-  <div class="card span2">
+  <div class="card span2" id=card_narr>
     <h2><span>Narration — what Claude is doing, in its own words</span><button class=mini onclick=toggleRaw()>&lt;/&gt; debug</button></h2>
     <div class=cbody style="padding:6px 8px;max-height:230px" id=narr><div class=empty>—</div></div>
     <pre id=raw class=raw style=display:none></pre>

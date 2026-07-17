@@ -259,6 +259,7 @@ def parse_auggie(session_id):
             "where": os.path.basename(cwd) if cwd else "Augment",
             "goal": requests[-1]["text"] if requests else "",
             "now": ("▶ " + ip["content"]) if ip else (_first_line(latest) if latest else title),
+            "now_kind": "todo" if ip else ("narration" if latest else ""),   # panel the "now" click jumps to
             "sofar": "; ".join(so).capitalize() if so else "No activity recorded yet.",
             "commits": [cm["msg"] for cm in commits[:6]],
         },

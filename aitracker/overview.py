@@ -27,14 +27,19 @@ def build_overview(d, todos, files, cmds, commits, tests, agents, requests,
         now = "⚙ %d background agent(s) working" % len(running)
         if lead:
             now += " — " + _first_line(lead, 140)
+        kind = "agents"                 # which panel the "now" click should jump to
     elif ip:
         now = "▶ " + (ip.get("activeForm") or ip["content"])
+        kind = "todo"
     elif narrative and idle < LIVE_WINDOW:
         now = _first_line(narrative[-1]["text"])
+        kind = "narration"
     elif narrative:
         now = "Idle — last said: " + _first_line(narrative[-1]["text"], 140)
+        kind = "narration"
     else:
         now = ""
+        kind = ""
 
     # one-line synthesis of concrete work
     so = []
@@ -56,5 +61,5 @@ def build_overview(d, todos, files, cmds, commits, tests, agents, requests,
         so.append("%d/%d tasks done" % (c["done"], c["todos"]))
     sofar = "; ".join(so).capitalize() if so else "Nothing recorded yet."
 
-    return {"where": where, "goal": goal, "now": now, "sofar": sofar,
+    return {"where": where, "goal": goal, "now": now, "now_kind": kind, "sofar": sofar,
             "commits": [cm["msg"] for cm in commits[:6]]}

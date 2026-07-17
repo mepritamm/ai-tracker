@@ -73,6 +73,9 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid #1c2330}
 .nowbanner{margin-top:16px;display:flex;align-items:center;gap:12px;background:linear-gradient(90deg,#10243f,#0d1622);border:1px solid #1d3a5f;border-left:3px solid #4c8dff;border-radius:10px;padding:11px 14px}
 .nowbanner .dot{width:9px;height:9px;background:#4c8dff;animation:pulseDot 1.8s infinite}
 .nowbanner .lbl{font-size:10px;letter-spacing:.6px;text-transform:uppercase;color:#6f8db5}
+.nowbanner.done{background:linear-gradient(90deg,#10241a,#0d1620);border-color:#1c4634;border-left-color:#29d398}
+.nowbanner.done .dot{background:#29d398;animation:none}
+.nowbanner.done .lbl{color:#5fae86}
 .nowbanner .txt{font-size:14px;color:#dbe7f5;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .cursor{animation:blink 1s steps(1) infinite}
 .srcnote{margin-top:12px;padding:8px 12px;background:#1a1206;border:1px solid #3a2a0f;border-left:3px solid #d29922;border-radius:8px;color:#e3b341;font-size:12px}

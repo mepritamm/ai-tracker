@@ -301,9 +301,14 @@ function render(d){
   $("ov_crow").style.display=ocm.length?"flex":"none";
   $("ov_commits").textContent=ocm.join("  ·  ");
 
-  // now banner (markdown + click to read full)
+  // now banner: live → what it's working on (blue, blinking cursor); idle → the last thing
+  // it completed (green, no cursor). Click opens the newest narration entry in the
+  // live-following modal — so an active session is tracked as it works.
   $("nowbanner").style.display=ov.now?"flex":"none";
-  $("nowtext").innerHTML="▶ "+md(ov.now||"")+'<span class=cursor>▍</span>';
+  $("nowbanner").classList.toggle("done",!live);
+  const nowClean=(ov.now||"").replace(/^(?:▶|⚙|✓)\s+/,"").replace(/^Idle — last said:\s*/,"");
+  $("nowlbl").textContent=live?"Now working on":"Completed last task";
+  $("nowtext").innerHTML=(live?"▶ ":"✓ ")+md(nowClean)+(live?'<span class=cursor>▍</span>':"");
 
   // narration — unbounded, server-paginated. The poll ships only the newest page
   // (d.narrative) + the full count (d.narrative_total); we keep an accumulator so
@@ -531,6 +536,22 @@ function openText(title,when,text){
   $("msgmodal").style.display="flex";
 }
 function openMsg(i){const n=curNarr[i]; if(!n)return; _setNav(openMsg,i,curNarr.length,{len:()=>curNarr.length,live:true}); openText("Narration",tago(n.t),n.text);}
+// the Now banner → jump to the panel that reflects the CURRENT activity (server says which via
+// now_kind), flash it so you see WHERE it's happening, AND open that item's live dialog.
+function openNow(){
+  const k=curOv.now_kind||"narration";
+  const el=$({agents:"bgpanel", shells:"shpanel", todo:"card_todos", narration:"card_narr"}[k]||"card_narr");
+  if(el && el.style.display!=="none"){
+    el.scrollIntoView({behavior:"smooth", block:"center"});
+    el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash");   // re-trigger the flash
+    setTimeout(()=>el.classList.remove("flash"), 1500);
+  }
+  // open the dialog of the item that's actually active (running agent/shell, in-progress todo, newest narration)
+  if(k==="agents" && curAgents.length){ const i=curAgents.findIndex(a=>a.running); openAgent(i<0?0:i); }
+  else if(k==="shells" && curShells.length){ const i=curShells.findIndex(s=>s.running); openShell(i<0?0:i); }
+  else if(k==="todo"){ const i=curTodos.findIndex(t=>t.status==="in_progress"); if(i>=0) openTodo(i); }
+  else if(curNarr && curNarr.length){ openMsg(0); }
+}
 function openReq(i){const r=curReqs[i]; if(!r)return; _setNav(openReq,i,curReqs.length,{len:()=>curReqs.length,live:true}); openText("Request",tago(r.t),r.text);}
 async function openCmd(i){
   const x=curCmds[i]; if(!x||!cur)return;

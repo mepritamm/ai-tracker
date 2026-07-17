@@ -234,8 +234,18 @@ class TestOverviewSynthesis(unittest.TestCase):
                             5, "2026-06-22T10:00:00Z", "2026-06-22T10:05:00Z")
         self.assertEqual(ov["goal"], "build the thing")
         self.assertEqual(ov["now"], "▶ b")   # the in-progress todo
+        self.assertEqual(ov["now_kind"], "todo")   # the "now" click jumps to the Progress panel
         self.assertIn("proj", ov["where"])
         self.assertTrue(ov["now"].startswith("▶"))
+
+    def test_now_kind_agents(self):
+        d = {"meta": {"cwd": "/x/proj"}, "counts": {"done": 0, "todos": 0, "created": 0, "edited": 0,
+             "read": 0, "commits": 0, "tests": 0, "tests_failed": 0, "errors": 0, "agents": 0, "searches": 0}}
+        ov = build_overview(d, [], [], [], [], [], [], [], [{"text": "hi"}],
+                            [{"running": True, "task": "exploring the repo"}],
+                            5, "2026-06-22T10:00:00Z", "2026-06-22T10:05:00Z")
+        self.assertEqual(ov["now_kind"], "agents")   # running agent → Background agents panel
+        self.assertTrue(ov["now"].startswith("⚙"))
 
 
 class TestHelpers(unittest.TestCase):
