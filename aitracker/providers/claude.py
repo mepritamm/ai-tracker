@@ -1,7 +1,7 @@
 import difflib, glob, json, os, re, time
 from ..config import EDIT_TOOLS, LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, prs_sorted, pr_worked
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, prs_sorted, pr_worked, PR_CREATE_RE
 from ..overview import build_overview
 from ..store import load_titles, load_tasks
 from .base import Provider
@@ -643,7 +643,7 @@ def parse_session(path):
                         c = inp.get("command", "")
                         k = cmd_kind(c)
                         cmds.append({"id": bid, "t": ts, "cmd": c[:200], "kind": k})
-                        if re.search(r"\bpr\s+create\b", c):       # its result URL is a created PR
+                        if PR_CREATE_RE.search(c):       # its result URL is a created PR
                             pr_create_ids.add(bid)
                         collect_prs(prs, c, ts)                    # a command's PR ref alone isn't "worked on"
                         if k == "commit":

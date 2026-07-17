@@ -1,7 +1,7 @@
 import glob, json, os, re, time
 from ..config import LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, prs_sorted, pr_worked
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, prs_sorted, pr_worked, PR_CREATE_RE
 from ..overview import build_overview
 from ..store import load_titles, load_tasks
 from .base import Provider
@@ -195,7 +195,7 @@ def parse_auggie(session_id):
                     k = cmd_kind(c)
                     cmds.append({"id": call.get("tool_use_id"), "t": ts, "cmd": c[:200],
                                  "kind": k, "ok": True})   # Auggie stores no exit status
-                    if re.search(r"\bpr\s+create\b", c):
+                    if PR_CREATE_RE.search(c):
                         pr_creates.append(i)
                     _cprs(c)                              # a command's PR ref alone isn't "worked on"
                     if k == "commit":

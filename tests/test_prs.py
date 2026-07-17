@@ -119,6 +119,22 @@ class TestClaudePrs(unittest.TestCase):
         os.unlink(path)
         self.assertEqual(d["prs"], [])
 
+    def test_command_mentioning_pr_create_does_not_mark_output_created(self):
+        # a command that only MENTIONS "gh pr create" (a grep) must NOT flag the PRs in its
+        # output as created — only a real invocation does. (Was: diagnostic greps polluted the panel.)
+        path = _write_jsonl([
+            {"type": "user", "cwd": "/x", "message": {"role": "user", "content": "audit the logs"}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "g1", "name": "Bash",
+                 "input": {"command": "grep -rn 'gh pr create' ~/.augment"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "g1",
+                 "content": "found https://github.com/other/repo/pull/55"}]}},
+        ])
+        d = parse_session(path)
+        os.unlink(path)
+        self.assertEqual(d["prs"], [])                     # #55 not created (grep) and cross-repo → hidden
+
 
 class TestAuggiePrs(unittest.TestCase):
     def setUp(self):

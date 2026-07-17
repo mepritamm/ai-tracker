@@ -104,6 +104,9 @@ COMMIT_MSG_RE = re.compile(r"-m\s+(['\"])(.+?)\1", re.S)
 # GitLab /merge_requests/N. Scanned out of assistant text + command output so the
 # app can list them as clickable links (see collect_prs).
 PR_URL_RE = re.compile(r"""https?://[^\s<>"'()\[\]]+?/(?:pull|pull-requests|merge_requests)/\d+""")
+# an ACTUAL `gh pr create` invocation — at a command boundary (start / after ; && | newline), so a
+# grep or script that merely mentions "pr create" doesn't get its output mislabelled as a created PR.
+PR_CREATE_RE = re.compile(r"(?:^|[\n;&|])\s*gh\s+pr\s+create\b")
 
 
 def collect_prs(acc, text, ts, created=False, narr=False):
