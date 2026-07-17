@@ -1,6 +1,7 @@
 # Personal / runtime data — do not share
 flags.json
 titles.json
+pins.json
 .claude/launch.json
 .claude/skills/tracker-push/
 

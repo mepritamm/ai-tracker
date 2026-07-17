@@ -20,7 +20,7 @@ from aitracker.util import _first_line, _iso_epoch
 from aitracker.providers import auggie as _auggie
 from aitracker.providers import claude as _claude
 
-_PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "FLAGS_FILE", "TITLES_FILE", "TASKS_DIR")
+_PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "TASKS_DIR")
 
 
 def _snap():
@@ -247,6 +247,37 @@ class TestAuggiePRs(unittest.TestCase):
         prs = _auggie.parse_auggie(sid)["prs"]                                  # created-only, like Claude
         self.assertEqual([p["num"] for p in prs], ["7"])                        # the generated PR shows
         self.assertNotIn("99", [p["num"] for p in prs])                        # the referenced one does not
+
+
+class TestPinnedSessions(unittest.TestCase):
+    """A pinned session sorts to the top of all_sessions(), over recency — read live from pins.json."""
+
+    def setUp(self):
+        self.snap = _snap(); _empty_env()
+        config.PINS_FILE = os.path.join(tempfile.mkdtemp(), "pins.json")
+
+    def tearDown(self):
+        _restore(self.snap)
+
+    def _wr(self, sid, modified):
+        json.dump({"sessionId": sid, "modified": modified, "customTitle": sid,
+                   "chatHistory": [{"finishedAt": modified,
+                                    "exchange": {"request_message": "hi", "response_text": "ok"}}]},
+                  open(os.path.join(config.AUGGIE_SESSIONS, sid + ".json"), "w"))
+        _auggie._AUGGIE_LIST_CACHE.clear()
+
+    def test_pinned_sorts_first(self):
+        from aitracker.registry import all_sessions
+        self._wr("old", "2026-07-16T10:00:00Z")
+        self._wr("new", "2026-07-16T11:00:00Z")
+        ids = [s["id"] for s in all_sessions()]
+        self.assertLess(ids.index("auggie:new"), ids.index("auggie:old"))   # newest-first by default
+        json.dump(["auggie:old"], open(config.PINS_FILE, "w"))              # pin the older one
+        _auggie._AUGGIE_LIST_CACHE.clear()
+        ses = all_sessions()
+        self.assertEqual(ses[0]["id"], "auggie:old")                        # pinned jumps to the top
+        self.assertTrue(ses[0]["pinned"])
+        self.assertFalse(next(s for s in ses if s["id"] == "auggie:new")["pinned"])
 
 
 class TestOverviewSynthesis(unittest.TestCase):

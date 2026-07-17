@@ -67,6 +67,7 @@ To keep it running in the background: `nohup python3 -m aitracker >/tmp/tracker.
 - **Click "N live"** to filter to only active sessions (live = touched in the last 5 minutes).
 - **Search** by keyword — matches your prompts and the conversation (not the boilerplate); sessions whose *name* matches rank first.
 - **✎ rename** any session to a title that means something to you (saved to `titles.json`).
+- **📌 pin** any session to keep it at the top of the list, above recency (saved to `pins.json`).
 
 **Main view** for the selected session:
 - **Session summary** — Goal, what it's doing *Now*, and a one-line "So far", with stat chips (files, commands, reads, commits, tests, tokens, git branch).
@@ -180,7 +181,7 @@ CLAUDE.md / AGENTS.md          context for AI agents working in this repo
 .claude/skills/fix-flags/      skill: fix issues you 🚩-flag in the app
 .claude/skills/tracker-gap/    skill: add a capability at the shared seam
 .claude/skills/tracker-push/   skill: commit + publish workflow
-flags.json / titles.json       your local data (git-ignored)
+flags.json / titles.json / pins.json   your local data (git-ignored)
 ```
 
 ## Testing (mandatory)

@@ -87,8 +87,9 @@ function renderSide(){
     const bits=[`<span class=proj>${s.title?esc(s.project):s.id.slice(0,8)}</span>`];
     if(s.source)bits.push(srcLabel(s.source));
     bits.push(ago(now-s.mtime));
-    return `<div class="sitem ${s.id===cur?'active':''}" onclick="pick('${s.id}')" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
+    return `<div class="sitem ${s.id===cur?'active':''}${s.pinned?' pinned':''}" onclick="pick('${s.id}')" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
       `<div class=srow1><span class="dot ${live?'live':''}"></span><span class=nm>${esc(label)}</span>`+
+      `<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">📌</span>`+
       `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename this session">✎</span></div>`+
       `<div class=smeta>${bits.join(" · ")}</div></div>`;
   }).join(""):`<div class=empty>${liveOnly?"no live sessions":"no sessions"}</div>`;
@@ -119,6 +120,13 @@ async function renameSession(e,id){
     body:JSON.stringify({session:id,title:t})});
   await loadSide();
   if(id===cur)poll();  // refresh the main header title too
+}
+async function togglePin(e,id){
+  e.stopPropagation();
+  const s=sessions.find(x=>x.id===id)||{};
+  await fetch("/api/pin",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({session:id,pinned:!s.pinned})});
+  await loadSide();   // server re-sorts pinned-first; scroll is preserved by renderSide
 }
 async function start(){
   await loadSide();

@@ -1,12 +1,13 @@
 from .providers.claude import ClaudeProvider
 from .providers.auggie import AuggieProvider
+from .store import load_pins
 
 
 PROVIDERS = [ClaudeProvider(), AuggieProvider()]
 
 
 def all_sessions():
-    """Every available provider's sessions, merged newest-first."""
+    """Every available provider's sessions, pinned first then newest-first."""
     out = []
     for p in PROVIDERS:
         try:
@@ -14,7 +15,10 @@ def all_sessions():
                 out += p.list()
         except Exception:
             pass  # one broken provider must not sink the whole list
-    out.sort(key=lambda s: s.get("mtime", 0), reverse=True)
+    pins = set(load_pins())                       # user-pinned ids, read live
+    for s in out:
+        s["pinned"] = s.get("id") in pins
+    out.sort(key=lambda s: (not s.get("pinned"), -s.get("mtime", 0)))   # pinned first, then newest
     return out
 
 

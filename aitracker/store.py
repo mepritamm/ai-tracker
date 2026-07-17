@@ -21,6 +21,12 @@ def load_titles():
     return _load_json(config.TITLES_FILE, {})
 
 
+def load_pins():
+    """Session ids the user pinned to the top of the list — read live, like titles."""
+    p = _load_json(config.PINS_FILE, [])
+    return p if isinstance(p, list) else []
+
+
 _TSTATUS = {"completed": "completed", "complete": "completed", "done": "completed",
             "in_progress": "in_progress", "started": "in_progress", "pending": "pending"}
 

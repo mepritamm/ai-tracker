@@ -33,6 +33,11 @@ html,body{margin:0;height:100%;background:#0c0f15;color:#e6edf3;font-family:'Sou
 .srow1 .nm{font-weight:600;font-size:13.5px;color:#e6edf3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
 .ren{color:#5b6573;cursor:pointer;opacity:0;font-style:normal;flex:0 0 auto}
 .sitem:hover .ren{opacity:.8}.ren:hover{color:#4c8dff}
+.pin{cursor:pointer;opacity:0;font-size:11px;flex:0 0 auto;filter:grayscale(1) opacity(.6)}
+.sitem:hover .pin{opacity:.6}.pin:hover{opacity:1;filter:none}
+.pin.on{opacity:1;filter:none}
+.sitem.pinned{background:rgba(245,180,67,.06)}
+.sitem.pinned.active{background:rgba(76,141,255,.10)}
 .smeta{display:flex;align-items:center;gap:6px;color:#6b7585;font-size:11px;font-family:'JetBrains Mono',monospace;flex-wrap:wrap}
 .smeta .proj{color:#7d8898}
 .ssnip{color:#6b7585;font-size:11px;margin-top:6px;line-height:1.35;font-family:'JetBrains Mono',monospace;overflow-wrap:anywhere}

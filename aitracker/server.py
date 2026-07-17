@@ -4,8 +4,8 @@ from urllib.parse import urlparse, parse_qs
 from .config import LIVE_WINDOW, NARR_PAGE
 from .page import build_page
 from .registry import all_sessions, parse_any, search_all
-from .store import load_flags, save_flags, load_titles, _load_json, _save_json
-from .config import TITLES_FILE, FLAGS_FILE
+from .store import load_flags, save_flags, load_titles, load_pins, _load_json, _save_json
+from .config import TITLES_FILE, FLAGS_FILE, PINS_FILE
 from .providers.claude import find_session, file_diffs, command_output, shell_output, agent_detail
 
 
@@ -141,6 +141,16 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 titles.pop(sid, None)  # empty = clear override, fall back to auto
             _save_json(TITLES_FILE, titles)
+            self._json({"ok": True})
+            return
+        if p.path == "/api/pin":
+            sid = body.get("session", "")
+            pins = load_pins()
+            if body.get("pinned") and sid and sid not in pins:
+                pins.append(sid)
+            elif not body.get("pinned") and sid in pins:
+                pins.remove(sid)
+            _save_json(PINS_FILE, pins)
             self._json({"ok": True})
             return
         flags = load_flags()

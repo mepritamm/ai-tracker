@@ -13,6 +13,9 @@ FLAGS_FILE = os.path.join(_HERE, "flags.json")
 TITLES_FILE = os.path.join(_HERE, "titles.json")
 
 
+PINS_FILE = os.path.join(_HERE, "pins.json")
+
+
 AUGMENT_DIR = os.path.expanduser("~/.augment")
 
 
