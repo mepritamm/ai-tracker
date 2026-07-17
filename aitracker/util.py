@@ -106,10 +106,12 @@ COMMIT_MSG_RE = re.compile(r"-m\s+(['\"])(.+?)\1", re.S)
 PR_URL_RE = re.compile(r"""https?://[^\s<>"'()\[\]]+?/(?:pull|pull-requests|merge_requests)/\d+""")
 
 
-def collect_prs(acc, text, ts, created=False):
-    """Merge PR/MR URLs found in `text` into acc (url -> entry). `created` marks
-    URLs that came from a `gh pr create` result (vs merely referenced). Dedupes by
-    URL; a URL seen created anywhere stays created; keeps the latest timestamp."""
+def collect_prs(acc, text, ts, created=False, narr=False):
+    """Merge PR/MR URLs found in `text` into acc (url -> entry). `created` = URL from a
+    `gh pr create`/MCP result. `narr` = the assistant narrated about it (shown only if it's the
+    session's own repo — see pr_worked; a cross-repo status-report mention doesn't count). A
+    prompt-only reference passes neither flag → stays hidden. Dedupes by URL; flags are sticky;
+    keeps the latest timestamp."""
     if not text:
         return
     for raw in PR_URL_RE.findall(text):
@@ -118,11 +120,24 @@ def collect_prs(acc, text, ts, created=False):
         if not e:
             m = re.search(r"([^/]+/[^/]+)/(?:pull|pull-requests|merge_requests)/(\d+)", url)
             e = acc[url] = {"url": url, "repo": m.group(1) if m else "",
-                            "num": m.group(2) if m else "", "created": False, "t": ts}
+                            "num": m.group(2) if m else "", "created": False, "narr": False, "t": ts}
         if created:
             e["created"] = True
+        if narr:
+            e["narr"] = True
         if ts and (not e["t"] or ts > e["t"]):
             e["t"] = ts
+
+
+def pr_worked(e, cwd):
+    """True if the session generated the PR, or narrated about it AND it lives in the session's
+    own repo. Excludes cross-repo status-report mentions and prompt-only references."""
+    if e["created"]:
+        return True
+    if not e.get("narr") or not cwd:
+        return False
+    name = (e["repo"] or "").rsplit("/", 1)[-1]
+    return bool(name) and any(s == name or s.startswith(name + "-") for s in cwd.split("/"))
 
 
 def prs_sorted(acc):

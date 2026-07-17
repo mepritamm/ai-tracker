@@ -1,7 +1,7 @@
 import difflib, glob, json, os, re, time
 from ..config import EDIT_TOOLS, LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, prs_sorted
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, prs_sorted, pr_worked
 from ..overview import build_overview
 from ..store import load_titles, load_tasks
 from .base import Provider
@@ -606,7 +606,7 @@ def parse_session(path):
                     if not txt.startswith("<"):  # skip command/system echoes
                         text_last = txt
                         narrative.append({"t": ts, "text": txt[:NARRATION_CAP]})  # modal shows full; list clamps preview
-                        collect_prs(prs, txt, ts)                 # PR links Claude prints in its narration
+                        collect_prs(prs, txt, ts, narr=True)      # PR links Claude prints in its narration
                 elif bt == "tool_result":
                     rid = b.get("tool_use_id")
                     if b.get("is_error"):
@@ -645,7 +645,7 @@ def parse_session(path):
                         cmds.append({"id": bid, "t": ts, "cmd": c[:200], "kind": k})
                         if re.search(r"\bpr\s+create\b", c):       # its result URL is a created PR
                             pr_create_ids.add(bid)
-                        collect_prs(prs, c, ts)                    # e.g. `gh pr view <url>`, `gh pr merge <url>`
+                        collect_prs(prs, c, ts)                    # a command's PR ref alone isn't "worked on"
                         if k == "commit":
                             m = COMMIT_MSG_RE.search(c)
                             commits.append({"t": ts, "msg": (m.group(2) if m else c)[:120]})
@@ -701,7 +701,7 @@ def parse_session(path):
         "shells": shells,
         # open decisions first, then most-recent — so a pending question is at the top
         "decisions": sorted(asks.values(), key=lambda a: (a["open"], a["t"] or ""), reverse=True),
-        "prs": [p for p in prs_sorted(prs) if p["created"]],   # only PRs generated in this session, not ones it merely referenced
+        "prs": [p for p in prs_sorted(prs) if pr_worked(p, meta.get("cwd"))],   # created or worked-on, not prompt-only references
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": text_last[:2000],
         "tokens": {"in": tok_in, "out": tok_out},

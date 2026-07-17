@@ -219,9 +219,9 @@ class TestDecisions(unittest.TestCase):
 
 
 class TestAuggiePRs(unittest.TestCase):
-    """Auggie logs no command output; a created PR's URL only shows up in a later narration
-    line. parse_auggie ties each `gh pr create` to the first new PR URL at/after it, so the
-    generated PR shows and a merely-referenced one doesn't."""
+    """The PR panel shows PRs the session created OR actively worked on (URL in the assistant's
+    narration/commands), not ones only referenced in a user prompt. Auggie logs no command
+    output, so each `gh pr create` is tied to the first PR URL at/after it for the created flag."""
 
     def setUp(self):
         self.snap = _snap(); _empty_env()
@@ -229,11 +229,11 @@ class TestAuggiePRs(unittest.TestCase):
     def tearDown(self):
         _restore(self.snap)
 
-    def test_created_pr_attributed_from_later_narration(self):
+    def test_created_pr_attributed_and_prompt_ref_hidden(self):
         sid = "aupr"
         doc = {"sessionId": sid, "modified": "2026-07-16T10:03:00Z", "chatHistory": [
-            {"finishedAt": "2026-07-16T10:00:00Z", "exchange": {                # references an old PR (pre-create)
-                "request_message": "go", "response_text": "see old PR https://github.com/o/r/pull/99",
+            {"finishedAt": "2026-07-16T10:00:00Z", "exchange": {                # #99 pasted in a PROMPT → reference only
+                "request_message": "see https://github.com/o/r/pull/99 for context", "response_text": "ok",
                 "response_nodes": []}},
             {"finishedAt": "2026-07-16T10:01:00Z", "exchange": {                # runs gh pr create (no URL here)
                 "request_message": "", "response_text": "creating it now", "response_nodes": [
@@ -244,9 +244,31 @@ class TestAuggiePRs(unittest.TestCase):
                 "response_nodes": []}},
         ]}
         json.dump(doc, open(os.path.join(config.AUGGIE_SESSIONS, sid + ".json"), "w"))
-        prs = _auggie.parse_auggie(sid)["prs"]                                  # created-only, like Claude
-        self.assertEqual([p["num"] for p in prs], ["7"])                        # the generated PR shows
-        self.assertNotIn("99", [p["num"] for p in prs])                        # the referenced one does not
+        prs = _auggie.parse_auggie(sid)["prs"]
+        nums = [p["num"] for p in prs]
+        self.assertIn("7", nums)                                               # the generated PR shows
+        self.assertTrue(next(p for p in prs if p["num"] == "7")["created"])    # ...flagged created
+        self.assertNotIn("99", nums)                                           # prompt-only reference stays hidden
+
+    def test_worked_on_same_repo_shows_crossrepo_hidden(self):
+        # no create — the session works an EXISTING PR in its own repo (widgets), while its
+        # narration also lists a PR in another repo (a status report). Only the own-repo one shows.
+        sid = "aupr2"
+        ide = {"ide_state_node": {"current_terminal": {"current_working_directory": "/home/me/proj/widgets"}}}
+        doc = {"sessionId": sid, "modified": "2026-07-16T10:01:00Z", "chatHistory": [
+            {"finishedAt": "2026-07-16T10:00:00Z", "exchange": {
+                "request_message": "use the same PR", "request_nodes": [ide],
+                "response_text": "", "response_nodes": []}},
+            {"finishedAt": "2026-07-16T10:01:00Z", "exchange": {
+                "request_message": "", "response_nodes": [],
+                "response_text": ("PR #48 is now 1 clean commit https://github.com/acme/widgets/pull/48 "
+                                  "(related: https://github.com/acme/other/pull/9)")}},
+        ]}
+        json.dump(doc, open(os.path.join(config.AUGGIE_SESSIONS, sid + ".json"), "w"))
+        prs = _auggie.parse_auggie(sid)["prs"]
+        self.assertEqual([p["num"] for p in prs], ["48"])                      # own-repo worked-on shows
+        self.assertFalse(prs[0]["created"])                                    # not created — worked on
+        self.assertNotIn("9", [p["num"] for p in prs])                        # cross-repo status mention hidden
 
 
 class TestPinnedSessions(unittest.TestCase):

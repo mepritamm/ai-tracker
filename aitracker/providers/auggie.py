@@ -1,7 +1,7 @@
 import glob, json, os, re, time
 from ..config import LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, prs_sorted
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, prs_sorted, pr_worked
 from ..overview import build_overview
 from ..store import load_titles, load_tasks
 from .base import Provider
@@ -157,9 +157,9 @@ def parse_auggie(session_id):
     pr_creates = []   # exchange indices where a PR-create ran — Auggie logs no output URL, so we
     pr_first_ex = {}  # url -> exchange it first appeared in → attribute "created" by order, below
     tok_in = tok_out = 0
-    def _cprs(text):  # collect PRs + note which exchange each URL first showed up in
+    def _cprs(text, narr=False):  # collect PRs + note which exchange each URL first showed up in
         before = set(prs)
-        collect_prs(prs, text, ts)
+        collect_prs(prs, text, ts, narr=narr)
         for u in prs:
             if u not in before:
                 pr_first_ex.setdefault(u, i)
@@ -197,7 +197,7 @@ def parse_auggie(session_id):
                                  "kind": k, "ok": True})   # Auggie stores no exit status
                     if re.search(r"\bpr\s+create\b", c):
                         pr_creates.append(i)
-                    _cprs(c)
+                    _cprs(c)                              # a command's PR ref alone isn't "worked on"
                     if k == "commit":
                         mm = COMMIT_MSG_RE.search(c)
                         commits.append({"t": ts, "msg": (mm.group(2) if mm else c)[:120]})
@@ -215,7 +215,7 @@ def parse_auggie(session_id):
         resp = ex.get("response_text")
         if isinstance(resp, str) and resp.strip():
             narrative.append({"t": ts, "text": resp.strip()[:NARRATION_CAP]})
-            _cprs(resp)
+            _cprs(resp, narr=True)                        # PR the assistant narrates about (shown if same-repo)
         for cf in m.get("changedFiles") or []:
             p = cf if isinstance(cf, str) else (cf.get("path") or cf.get("filePath") or cf.get("file"))
             if p:
@@ -262,7 +262,7 @@ def parse_auggie(session_id):
         "requests": requests, "agents": [], "agents_bg": [], "shells": [],
         # open decisions first, then most-recent — parity with Claude's AskUserQuestion panel
         "decisions": sorted(asks.values(), key=lambda a: (a["open"], a["t"] or ""), reverse=True),
-        "prs": [p for p in prs_sorted(prs) if p["created"]],   # only PRs generated in this session, not ones it merely referenced
+        "prs": [p for p in prs_sorted(prs) if pr_worked(p, cwd)],   # created or worked-on, not prompt-only references
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": latest[:2000],
         "tokens": {"in": tok_in, "out": tok_out},

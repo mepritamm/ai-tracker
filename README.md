@@ -99,7 +99,7 @@ Both providers emit the **same result shape**, so the browser renders them ident
 | Commands, reads, commits, tests | ✅ | ✅ (from `launch-process` / `view` tools) |
 | Working folder + git branch (worktree-aware) | ✅ (from the log) | ✅ (folder from IDE state; branch from `.git/HEAD`) |
 | Command exit status (✓/✗) | ✅ | ➖ Auggie stores none — commands show as ✓ |
-| Generated pull requests | ✅ (linked to the `gh pr create` / MCP result) | ✅ (Auggie logs no command output, so each `gh pr create` is tied to the first PR URL that appears after it) |
+| Pull requests — created **or** worked on | ✅ (created via `gh pr create` / MCP; worked-on = narrated about **and** in the session's own repo) | ✅ (Auggie logs no command output, so a created PR is tied to the first URL after `gh pr create`; worked-on = narrated about **and** in its own repo) |
 | Decisions & open questions | ✅ (`AskUserQuestion`) | ✅ (`ask-user` — answer from the next turn's tool result) |
 | Background agents & shells | ✅ | ➖ Auggie has no such model |
 

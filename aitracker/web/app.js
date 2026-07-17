@@ -354,7 +354,7 @@ function render(d){
   $("prc").textContent=prs.length||"";
   winList("prs", prs, (p,i)=>
     `<div class="item prrow"><a class=prlink href="${esc(p.url)}" target=_blank rel=noopener title="${esc(p.url)}">`+
-    `<span class="kind new">created</span> `+
+    `<span class="kind ${p.created?'new':''}">${p.created?'created':'worked on'}</span> `+
     `<b>${esc((p.repo?p.repo+' ':'')+'#'+p.num)}</b><span class=prurl>${esc(p.url)}</span>`+
     `<span class=prtime>${p.t?ago(d.now-Date.parse(p.t)/1000):""}</span><span class=chev>open ›</span></a></div>`,
     "no pull requests created in this session");
