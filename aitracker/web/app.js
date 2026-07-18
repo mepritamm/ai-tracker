@@ -42,7 +42,7 @@ function mdBlock(s){
 }
 function ago(sec){sec=Math.max(0,sec|0);if(sec<60)return sec+"s ago";if(sec<3600)return(sec/60|0)+"m ago";if(sec<86400)return(sec/3600|0)+"h ago";return(sec/86400|0)+"d ago"}
 function base(p){return (p||"").split("/").pop()}
-const SRC={"claude-desktop":"🖥 Desktop","cli":"⌨ CLI","claude-vscode":"⧉ VS Code","auggie":"◆ Auggie"};
+const SRC={"claude-desktop":"🖥 Desktop","cli":"⌨ CLI","sdk-cli":"⚙ SDK","claude-vscode":"⧉ VS Code","auggie":"◆ Auggie"};
 const srcLabel=v=>SRC[v]||v||"";
 const CIRC=2*Math.PI*51; // progress-ring circumference
 

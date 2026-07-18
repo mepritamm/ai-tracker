@@ -63,7 +63,7 @@ To keep it running in the background: `nohup python3 -m aitracker >/tmp/tracker.
 
 ## What it shows
 
-**Sidebar** — every session across all your tools and projects, newest first, each with a source badge (Claude Desktop / Claude CLI / Claude VS Code / Auggie), a live dot, and a short title.
+**Sidebar** — every session across all your tools and projects, newest first, each with a source badge (Claude Desktop / Claude CLI / Claude SDK / Claude VS Code / Auggie), a live dot, and a short title.
 - **Click "N live"** to filter to only active sessions (live = touched in the last 5 minutes).
 - **Search** by keyword — matches your prompts and the conversation (not the boilerplate); sessions whose *name* matches rank first.
 - **✎ rename** any session to a title that means something to you (saved to `titles.json`).
