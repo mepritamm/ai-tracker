@@ -106,13 +106,13 @@
 <div class=toasts id=toasts></div>
 <div class=overlay id=diffmodal onclick="if(event.target===this)closeDiff()">
   <div class=modal>
-    <div class=mh><span class=fn id=diffname>file</span><span class=pp id=diffpath></span><span class=mnav><span class=mbtn onclick="navModal(-1)" title="Previous (←)">‹</span><span id=diffnav class=mpos></span><span class=mbtn onclick="navModal(1)" title="Next (→)">›</span></span><span class=mdbtn onclick="copyModal('diffbody',this)" title="Copy to clipboard">⧉ Copy</span><span class=mdbtn onclick="popOut('diffname','diffbody')" title="Open in a new tab">⤢ New tab</span><span class=mdbtn id=diffall onclick=toggleDiffAll() title="Show the whole file around every edit" style=display:none>⇕ Expand all</span><span class=mdbtn id=diffmd onclick=toggleDiffMd() style=display:none>◧ Rendered</span><span class=x onclick=closeDiff()>✕</span></div>
+    <div class=mh><span class=fn id=diffname>file</span><span class=pp id=diffpath></span><span class=mnav><span class=mbtn onclick="navModal(-1)" title="Previous (←)">‹</span><span id=diffnav class=mpos></span><span class=mbtn onclick="navModal(1)" title="Next (→)">›</span><span class=mbtn onclick="navFirst()" title="Jump to latest">⤒</span></span><span class=mdbtn onclick="copyModal('diffbody',this)" title="Copy to clipboard">⧉ Copy</span><span class=mdbtn onclick="popOut('diffname','diffbody')" title="Open in a new tab">⤢ New tab</span><span class=mdbtn id=diffall onclick=toggleDiffAll() title="Show the whole file around every edit" style=display:none>⇕ Expand all</span><span class=mdbtn id=diffmd onclick=toggleDiffMd() style=display:none>◧ Rendered</span><span class=x onclick=closeDiff()>✕</span></div>
     <div class=mb id=diffbody></div>
   </div>
 </div>
 <div class=overlay id=msgmodal onclick="if(event.target===this)closeMsg()">
   <div class=modal>
-    <div class=mh><span class=fn id=msgtitle>Narration</span><span class=pp id=msgwhen></span><span class=mnav><span class=mbtn onclick="navModal(-1)" title="Previous (←)">‹</span><span id=msgnav class=mpos></span><span class=mbtn onclick="navModal(1)" title="Next (→)">›</span></span><span class=mdbtn onclick="copyModal('msgbody',this)" title="Copy to clipboard">⧉ Copy</span><span class=mdbtn onclick="popOut('msgtitle','msgbody')" title="Open in a new tab">⤢ New tab</span><span class=x onclick=closeMsg()>✕</span></div>
+    <div class=mh><span class=fn id=msgtitle>Narration</span><span class=pp id=msgwhen></span><span class=mnav><span class=mbtn onclick="navModal(-1)" title="Previous (←)">‹</span><span id=msgnav class=mpos></span><span class=mbtn onclick="navModal(1)" title="Next (→)">›</span><span class=mbtn onclick="navFirst()" title="Jump to latest">⤒</span></span><span class=mdbtn onclick="copyModal('msgbody',this)" title="Copy to clipboard">⧉ Copy</span><span class=mdbtn onclick="popOut('msgtitle','msgbody')" title="Open in a new tab">⤢ New tab</span><span class=x onclick=closeMsg()>✕</span></div>
     <div class=msgbody id=msgbody></div>
   </div>
 </div>

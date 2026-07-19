@@ -523,6 +523,7 @@ function _setNav(open,i,n,opts){
   if(a)a.textContent=pos; if(b)b.textContent=pos;
 }
 function navModal(d){ if(!curModal)return; const j=curModal.i+d; if(j>=0&&j<curModal.n) curModal.open(j); }
+function navFirst(){ if(curModal&&curModal.i>0) curModal.open(0); }   // jump to the current/latest entry (index 0 = newest)
 // Keep an open text modal in sync with the 2s poll — re-render the entry being read
 // with fresh data (content, "time ago", the N/total counter). Pinned by distance-
 // from-end so prepended entries don't yank it, EXCEPT when they were on the newest
@@ -654,6 +655,7 @@ function popOut(titleId,bodyId){
     `</head>`+
     `<body><div class=pw><h1>${esc(title)}</h1><div class="${body.className}" style="overflow:visible;max-height:none">${body.innerHTML}</div></div></body></html>`);
   w.document.close();
+  w.focus();   // move keyboard focus to the popped-out tab, not the parent window
 }
 function flashTo(id){
   const el=$(id); if(!el||el.style.display==="none")return;
