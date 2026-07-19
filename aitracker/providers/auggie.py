@@ -139,6 +139,7 @@ def list_auggie():
             "id": gid, "project": os.path.basename(cwd) if cwd else "Augment", "cwd": cwd,
             "title": titles.get(gid) or e["title"],
             "prompt": e["prompt"], "source": "auggie", "mtime": e["mtime"],
+            "agent": False, "group": "", "groupLabel": "",   # Auggie has no background-agent/SDK model
         })
     return out
 
@@ -259,7 +260,7 @@ def parse_auggie(session_id):
         "commands": cmds[-60:][::-1],
         "commits": commits[::-1],
         "tests": tests[::-1],
-        "requests": requests, "agents": [], "agents_bg": [], "shells": [],
+        "requests": requests, "agents": [], "agents_bg": [], "agent_sessions": [], "shells": [],
         # open decisions first, then most-recent — parity with Claude's AskUserQuestion panel
         "decisions": sorted(asks.values(), key=lambda a: (a["open"], a["t"] or ""), reverse=True),
         "prs": [p for p in prs_sorted(prs) if pr_worked(p, cwd)],   # created or worked-on, not prompt-only references
@@ -342,6 +343,7 @@ def search_auggie(q, limit=500):
         cwd = _auggie_ide_cwd(d) or default_cwd    # per-session folder, like list/detail
         out.append({
             "id": gid, "project": os.path.basename(cwd) if cwd else "Augment", "title": title,
+            "agent": False,
             "matches": count, "snippet": snippet, "inQuery": in_query,
             "titleMatch": title_match,
             "mtime": _iso_epoch(d.get("modified")) or os.path.getmtime(f),

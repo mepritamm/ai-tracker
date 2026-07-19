@@ -40,6 +40,16 @@ html,body{margin:0;height:100%;background:#0c0f15;color:#e6edf3;font-family:'Sou
 .sitem.pinned.active{background:rgba(76,141,255,.10)}
 .smeta{display:flex;align-items:center;gap:6px;color:#6b7585;font-size:11px;font-family:'JetBrains Mono',monospace;flex-wrap:wrap}
 .smeta .proj{color:#7d8898}
+.agentbadge{color:#f5b443;background:rgba(245,180,67,.12);border-radius:4px;padding:0 5px;font-size:10px}
+/* collapsible per-repo group of background-agent (SDK) sessions in the sidebar */
+.agrp{margin-bottom:4px}
+.agrphdr{display:flex;align-items:center;gap:7px;padding:9px 12px;border-radius:10px;cursor:pointer;color:#c9d4e0;user-select:none;border:1px solid transparent}
+.agrphdr:hover{background:rgba(245,180,67,.06);border-color:#3a2f18}
+.agrpchev{color:#f5b443;font-size:11px;width:10px;flex:0 0 auto}
+.agrpname{font-weight:600;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
+.agrpn{font-family:'JetBrains Mono',monospace;font-size:10.5px;color:#f5b443;background:rgba(245,180,67,.12);border-radius:5px;padding:1px 7px;flex:0 0 auto}
+.agrpkids{margin:2px 0 4px 12px;padding-left:8px;border-left:1px solid #223047}
+.sitem.agentrow .nm{color:#e8c98a}
 .ssnip{color:#6b7585;font-size:11px;margin-top:6px;line-height:1.35;font-family:'JetBrains Mono',monospace;overflow-wrap:anywhere}
 .ssnip b{color:#e6edf3;background:#1f6feb40;border-radius:2px}
 .smatch{color:#29d398}

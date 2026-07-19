@@ -83,6 +83,57 @@ def _session_meta(path):
     return meta
 
 
+_WT_MARKER = os.sep + ".claude" + os.sep + "worktrees" + os.sep
+
+
+def _agent_group(cwd, source):
+    """An SDK-spawned session (entrypoint=sdk-cli) is a background *agent* session; the
+    sidebar folds these under a collapsible per-repo group instead of listing each flat.
+    Returns (groupKey, groupLabel): the repo it belongs under. Worktree agents ->
+    the repo root (path before /.claude/worktrees/); temp cc-agentic sandboxes ->
+    a shared 'sandbox' bucket; any other sdk-cli -> its own cwd. Non-agents -> ('','')."""
+    if source != "sdk-cli":
+        return "", ""
+    cwd = cwd or ""
+    if _WT_MARKER in cwd:
+        repo = cwd.split(_WT_MARKER, 1)[0]
+        return repo, (os.path.basename(repo) or repo)
+    if "cc-agentic-" in cwd or "/T/" in cwd:              # ephemeral SDK sandbox
+        return "sandbox", "sandbox"
+    return cwd or "sandbox", (os.path.basename(cwd) or "sandbox")
+
+
+def _worktree_name(cwd):
+    """The worktree folder name for a worktree agent session, else ''."""
+    return cwd.split(_WT_MARKER, 1)[1].split(os.sep)[0] if cwd and _WT_MARKER in cwd else ""
+
+
+def child_agent_sessions(cwd):
+    """The SDK/worktree agent sessions spawned from repo `cwd` — deterministic link:
+    their cwd is <cwd>/.claude/worktrees/... . A root session surfaces these so you can
+    jump straight into an agent from the background-agents panel. [] for agent sessions
+    themselves (they have no children) so the poll skips the projects scan."""
+    if not cwd or _WT_MARKER in cwd:
+        return []
+    prefix = os.path.join(cwd, ".claude", "worktrees") + os.sep
+    titles = load_titles()
+    out = []
+    for f in glob.glob(os.path.join(config.PROJECTS, "*", "*.jsonl")):
+        sm = _session_meta(f)
+        if sm["source"] == "sdk-cli" and (sm["cwd"] or "").startswith(prefix):
+            sid = os.path.basename(f)[:-6]
+            mt = _active_mtime(f)
+            out.append({
+                "id": sid,
+                "title": titles.get(sid) or sm["title"],
+                "wt": _worktree_name(sm["cwd"]),
+                "running": (time.time() - mt) < LIVE_WINDOW,
+                "mtime": mt,
+            })
+    out.sort(key=lambda r: r["mtime"], reverse=True)
+    return out
+
+
 def list_sessions(limit=200):
     fs = glob.glob(os.path.join(config.PROJECTS, "*", "*.jsonl"))
     fs.sort(key=os.path.getmtime, reverse=True)
@@ -91,6 +142,7 @@ def list_sessions(limit=200):
     for f in fs[:limit]:
         sm = _session_meta(f)
         sid = os.path.basename(f)[:-6]
+        gkey, glabel = _agent_group(sm["cwd"], sm["source"])
         out.append({
             "id": sid,
             "project": os.path.basename(sm["cwd"]) if sm["cwd"] else os.path.basename(os.path.dirname(f)),
@@ -98,6 +150,8 @@ def list_sessions(limit=200):
             "title": titles.get(sid) or sm["title"],
             "prompt": sm["prompt"],
             "source": sm["source"],
+            "agent": sm["source"] == "sdk-cli",     # background-agent session -> 🤖, folded under its repo
+            "group": gkey, "groupLabel": glabel,     # sidebar nesting bucket (repo); "" for non-agents
             "mtime": _active_mtime(f),  # counts background-agent activity too
         })
     return out
@@ -204,6 +258,7 @@ def search_sessions(q, limit=500):
             "id": sid,
             "project": os.path.basename(sm["cwd"]) if sm["cwd"] else os.path.basename(os.path.dirname(f)),
             "title": title,
+            "agent": sm["source"] == "sdk-cli",     # 🤖 marker in search results too
             "matches": count,
             "snippet": snippet,
             "inQuery": in_query,
@@ -698,6 +753,7 @@ def parse_session(path):
         "requests": requests,
         "agents": agents[::-1],
         "agents_bg": agents_bg,
+        "agent_sessions": child_agent_sessions(meta.get("cwd")),  # spawned SDK/worktree sessions — click to open
         "shells": shells,
         # open decisions first, then most-recent — so a pending question is at the top
         "decisions": sorted(asks.values(), key=lambda a: (a["open"], a["t"] or ""), reverse=True),

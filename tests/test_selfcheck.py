@@ -14,7 +14,8 @@ from aitracker.store import load_flags, save_flags, load_titles, load_tasks, _sa
 from aitracker.registry import parse_any
 from aitracker.providers.claude import (
     parse_session, parse_agents, parse_shells, _match_content, _active_mtime,
-    file_diffs, command_output, shell_output, agent_detail, _redirect_log)
+    file_diffs, command_output, shell_output, agent_detail, _redirect_log,
+    list_sessions, child_agent_sessions, _agent_group)
 from aitracker.providers.auggie import (
     list_auggie, parse_auggie, search_auggie, _AUGGIE_LIST_CACHE)
 
@@ -185,6 +186,25 @@ def _run():
     assert cnt >= 2 and inq is True and "auth bug" in snip.lower(), (cnt, snip, inq)
     # a term that lives ONLY in the injected skill list must NOT match
     assert _match_content(data, "bitbucket-automation")[0] == 0, "boilerplate leaked into search"
+
+    # background-agent (SDK) sessions: flagged 🤖, bucketed under their repo, and linked from the root.
+    assert _agent_group("/repo/x/.claude/worktrees/wt-a", "sdk-cli") == ("/repo/x", "x")
+    assert _agent_group("/repo/x", "cli") == ("", ""), "human sessions are never agents"
+    pdir = tempfile.mkdtemp(); config.PROJECTS = pdir
+    root_d = os.path.join(pdir, "-repo-x"); os.makedirs(root_d)
+    wt_d = os.path.join(pdir, "-repo-x--claude-worktrees-wt-a"); os.makedirs(wt_d)
+    with open(os.path.join(root_d, "root1.jsonl"), "w") as f:
+        f.write(json.dumps({"cwd": "/repo/x", "entrypoint": "cli",
+                            "message": {"role": "user", "content": "drive the pipeline"}}) + "\n")
+    with open(os.path.join(wt_d, "agentsess.jsonl"), "w") as f:
+        f.write(json.dumps({"cwd": "/repo/x/.claude/worktrees/wt-a", "entrypoint": "sdk-cli",
+                            "message": {"role": "user", "content": "fix finding 42"}}) + "\n")
+    ls = {s["id"]: s for s in list_sessions()}
+    assert ls["agentsess"]["agent"] and ls["agentsess"]["group"] == "/repo/x", ls["agentsess"]
+    assert not ls["root1"]["agent"] and ls["root1"]["group"] == "", ls["root1"]
+    kids = child_agent_sessions("/repo/x")           # root surfaces its spawned agent sessions
+    assert [k["id"] for k in kids] == ["agentsess"] and kids[0]["wt"] == "wt-a", kids
+    assert child_agent_sessions("/repo/x/.claude/worktrees/wt-a") == [], "agent sessions have no children"
 
     # auggie (Augment CLI) sessions from ~/.augment/sessions + todos from task-storage
     config.AUGMENT_DIR = tempfile.mkdtemp()

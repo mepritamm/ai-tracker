@@ -63,7 +63,7 @@ function renderSide(){
     $("slist").innerHTML=searchResults.length?searchResults.map(s=>{
       const live=now-s.mtime<LIVE;
       return `<div class="sitem ${s.id===cur?'active':''}" onclick="pick('${s.id}')" title="${esc(s.title||'')}">`+
-        `<div class=srow1><span class="dot ${live?'live':''}"></span><span class=nm>${esc(s.title||s.project||s.id.slice(0,8))}</span>`+
+        `<div class=srow1><span class="dot ${live?'live':''}"></span><span class=nm>${s.agent?'🤖 ':''}${esc(s.title||s.project||s.id.slice(0,8))}</span>`+
         `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename">✎</span></div>`+
         `<div class=smeta><span class=proj>${esc(s.project)}</span>${s.inQuery?' · <span class=smatch>your query</span>':''} · <span>${s.matches}×</span></div>`+
         (s.snippet?`<div class=ssnip>${hl(s.snippet,q)}</div>`:"")+
@@ -81,19 +81,52 @@ function renderSide(){
   let shown=liveOnly?sessions.filter(s=>now-s.mtime<LIVE):sessions;
   // never let the selected session fall off (top-N cap or live filter) — pin it so the selection persists
   if(cur && !shown.some(s=>s.id===cur) && selEntry && selEntry.id===cur) shown=[selEntry,...shown];
-  $("slist").innerHTML=shown.length?shown.map(s=>{
-    const live=now-s.mtime<LIVE;
-    const label=s.title||s.project||s.id.slice(0,8);
-    const bits=[`<span class=proj>${s.title?esc(s.project):s.id.slice(0,8)}</span>`];
-    if(s.source)bits.push(srcLabel(s.source));
-    bits.push(ago(now-s.mtime));
-    return `<div class="sitem ${s.id===cur?'active':''}${s.pinned?' pinned':''}" onclick="pick('${s.id}')" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
-      `<div class=srow1><span class="dot ${live?'live':''}"></span><span class=nm>${esc(label)}</span>`+
-      `<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">📌</span>`+
-      `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename this session">✎</span></div>`+
-      `<div class=smeta>${bits.join(" · ")}</div></div>`;
+  // fold background-agent (SDK) sessions into a collapsible per-repo group; normal sessions stay flat.
+  // Each group sorts by its newest child's mtime, so it interleaves with normal rows by recency.
+  const buckets={}, items=[];
+  shown.forEach(s=>{
+    if(s.agent && s.group){
+      (buckets[s.group]||(buckets[s.group]={key:s.group,label:s.groupLabel||s.group,kids:[]})).kids.push(s);
+    }else items.push({t:"s",mtime:s.mtime,s});
+  });
+  Object.values(buckets).forEach(b=>{
+    b.mtime=Math.max(...b.kids.map(k=>k.mtime));
+    b.live=b.kids.filter(k=>now-k.mtime<LIVE).length;
+    if(cur && b.kids.some(k=>k.id===cur)) expandedGroups.add(b.key);   // keep the selected agent visible
+    items.push({t:"g",mtime:b.mtime,b});
+  });
+  items.sort((a,b)=>b.mtime-a.mtime);
+  $("slist").innerHTML=items.length?items.map(it=>{
+    if(it.t==="s") return sessionRow(it.s,now);
+    const b=it.b, open=expandedGroups.has(b.key);
+    return `<div class="agrp ${open?'open':''}">`+
+      `<div class=agrphdr onclick="toggleGroup('${encodeURIComponent(b.key)}')" title="${esc(b.key)}">`+
+        `<span class=agrpchev>${open?"▾":"▸"}</span><span class=agrpname>🤖 Agents · ${esc(b.label)}</span>`+
+        `<span class=agrpn>${b.live?b.live+" live / ":""}${b.kids.length}</span></div>`+
+      (open?`<div class=agrpkids>${b.kids.slice().sort((x,y)=>y.mtime-x.mtime).map(k=>sessionRow(k,now)).join("")}</div>`:"")+
+      `</div>`;
   }).join(""):`<div class=empty>${liveOnly?"no live sessions":"no sessions"}</div>`;
   if(sl)sl.scrollTop=sc;
+}
+// one session row — shared by the flat list and the agent-group children. Agent rows get a 🤖 marker.
+function sessionRow(s,now){
+  const live=now-s.mtime<LIVE;
+  const label=s.title||s.project||s.id.slice(0,8);
+  const bits=[`<span class=proj>${s.title?esc(s.project):s.id.slice(0,8)}</span>`];
+  if(s.source)bits.push(srcLabel(s.source));
+  bits.push(ago(now-s.mtime));
+  return `<div class="sitem ${s.id===cur?'active':''}${s.pinned?' pinned':''}${s.agent?' agentrow':''}" onclick="pick('${s.id}')" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
+    `<div class=srow1><span class="dot ${live?'live':''}"></span><span class=nm>${s.agent?'🤖 ':''}${esc(label)}</span>`+
+    `<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">📌</span>`+
+    `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename this session">✎</span></div>`+
+    `<div class=smeta>${s.agent?'<span class=agentbadge>🤖 Agent</span> · ':''}${bits.join(" · ")}</div></div>`;
+}
+let expandedGroups=new Set(JSON.parse(localStorage.getItem("agrpOpen")||"[]"));
+function toggleGroup(k){
+  k=decodeURIComponent(k);
+  if(expandedGroups.has(k))expandedGroups.delete(k); else expandedGroups.add(k);
+  localStorage.setItem("agrpOpen",JSON.stringify([...expandedGroups]));
+  renderSide();
 }
 function toggleLiveOnly(){liveOnly=!liveOnly;renderSide();}
 async function loadSide(){
@@ -253,11 +286,21 @@ function render(d){
   // background agents (click to read full narration)
   // background agents — running shown; finished tucked behind a disclosure
   const bg=d.agents_bg||[];
+  const asx=d.agent_sessions||[];   // spawned SDK/worktree agent SESSIONS — open one in the main view
   curAgents=bg;
-  $("bgpanel").style.display=bg.length?"flex":"none";
-  if(bg.length){
-    const runN=bg.filter(a=>a.running).length;
+  $("bgpanel").style.display=(bg.length||asx.length)?"flex":"none";
+  if(bg.length||asx.length){
+    const runN=bg.filter(a=>a.running).length+asx.filter(a=>a.running).length;
     $("bgc").textContent=runN?`${runN} running`:"all finished";
+    let html="";
+    if(asx.length){
+      html+=asx.map(a=>
+        `<div class="agent clk agentrow" onclick="pick('${a.id}')" title="Open this agent session">`+
+        `<div class=top><span class="dot ${a.running?'live':''}"></span><span class=nm>🤖 ${esc(a.title||a.wt||a.id.slice(0,8))}</span>`+
+        (a.wt?` <span class=tag>${esc(a.wt.slice(0,16))}</span>`:"")+`<span class=chev>open ›</span></div>`+
+        `<div class=ft><span>agent session</span><span>·</span><span style=color:${a.running?'#3fb950':'#6b7585'}>${a.running?'running':'done'}</span>`+
+        `${a.mtime?"<span>·</span><span>"+ago(d.now-a.mtime)+"</span>":""}</div></div>`).join("");
+    }
     const card=(a,i)=>
       `<div class="agent clk" onclick="openAgent(${i})"><div class=top><span class="dot ${a.running?'amber':''}"></span><span class=nm>${esc(a.task||a.id)}</span>`+
       (a.wf?` <span class=tag>${esc(a.wf.slice(0,12))}</span>`:"")+`<span class=chev>›</span></div>`+
@@ -266,7 +309,7 @@ function render(d){
       `${a.ts?"<span>·</span><span>"+ago(d.now-Date.parse(a.ts)/1000)+"</span>":""}</div></div>`;
     const run=[],done=[];
     bg.forEach((a,i)=>(a.running?run:done).push(card(a,i)));
-    let html=run.length?run.join(""):"<div class=empty>No agents running right now.</div>";
+    if(bg.length) html+=run.length?run.join(""):(asx.length?"":"<div class=empty>No agents running right now.</div>");
     if(done.length){
       html+=`<div class=disclosure onclick=toggleAgentsDone()>${showAgentsDone?"▾ Hide":"▸ Show"} ${done.length} finished</div>`;
       if(showAgentsDone)html+=done.join("");
