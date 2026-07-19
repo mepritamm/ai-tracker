@@ -516,9 +516,9 @@ def agent_detail(path, aid):
                     continue
                 c = m.get("content")
                 if m.get("role") == "user" and isinstance(c, str) and not task:
-                    s = " ".join(c.split())
+                    s = c.strip()                              # keep paragraphs (.cmdcode is pre-wrap)
                     if s and not s.startswith("<"):
-                        task = s[:200]
+                        task = s[:8000]                        # full prompt, not the 160-char card blurb
                 if isinstance(c, list):
                     for b in c:
                         if not isinstance(b, dict):

@@ -14,7 +14,7 @@ from aitracker.store import load_flags, save_flags, load_titles, load_tasks, _sa
 from aitracker.registry import parse_any
 from aitracker.providers.claude import (
     parse_session, parse_agents, parse_shells, _match_content, _active_mtime,
-    file_diffs, command_output, shell_output, _redirect_log)
+    file_diffs, command_output, shell_output, agent_detail, _redirect_log)
 from aitracker.providers.auggie import (
     list_auggie, parse_auggie, search_auggie, _AUGGIE_LIST_CACHE)
 
@@ -119,6 +119,17 @@ def _run():
     os.utime(af, (time.time() - 400, time.time() - 400))
     assert parse_agents(spath)[0][0]["running"] is False, "400s ago should be stale"
     assert parse_agents(spath)[0][0]["aid"] == "deadbeef00", "agent detail id"
+
+    # agent_detail returns the FULL prompt (multi-paragraph, un-truncated) — the card blurb
+    # collapses to 160 chars, but the click-through detail must not lose the message.
+    longtask = "Map the pipeline.\n\n" + "x" * 400 + "\n\nStop before any push."
+    adir2 = os.path.join(sdir, "sess", "subagents", "workflows", "wf_full")
+    os.makedirs(adir2)
+    with open(os.path.join(adir2, "agent-cafebabe00.jsonl"), "w") as f:
+        f.write(json.dumps({"type": "user", "timestamp": "2026-06-22T10:00:00Z",
+                            "message": {"role": "user", "content": longtask}}) + "\n")
+    det = agent_detail(spath, "cafebabe00")
+    assert det["task"] == longtask, "detail task must be full & keep paragraph breaks"
 
     # background shells: launch + result naming id/output file; live .output -> running
     outp = os.path.join(sdir, "srv.output")

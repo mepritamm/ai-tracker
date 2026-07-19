@@ -517,7 +517,7 @@ let narrState={id:null,items:[],total:0};   // accumulator for server-paginated 
 let curModal=null;
 function _setNav(open,i,n,opts){
   opts=opts||{};
-  curModal={open:open,i:i,n:n,fromEnd:n-1-i,len:opts.len||(()=>n),live:!!opts.live};
+  curModal={open:open,i:i,n:n,fromEnd:n-1-i,len:opts.len||(()=>n),live:!!opts.live,refresh:opts.refresh};
   const pos=n>1?(i+1)+" / "+n:"";
   const a=$("msgnav"), b=$("diffnav");
   if(a)a.textContent=pos; if(b)b.textContent=pos;
@@ -531,6 +531,7 @@ function navModal(d){ if(!curModal)return; const j=curModal.i+d; if(j>=0&&j<curM
 function syncModal(){
   if(!curModal||!curModal.live)return;
   if($("msgmodal").style.display!=="flex")return;
+  if(curModal.refresh){curModal.refresh();return;}   // fetch-based (agent/shell): re-fetch quietly
   const newN=curModal.len();
   if(!newN){closeMsg();return;}                    // the list emptied out
   const newI=curModal.i===0?0:Math.max(0,Math.min(newN-1,newN-1-curModal.fromEnd));
@@ -598,30 +599,34 @@ function openTodo(i){
   _setNav(openTodo,i,curTodos.length);
   openText("Task",t.status,"**"+(t.content||"")+"**"+(t.desc?"\n\n"+t.desc:""));
 }
-async function openShell(i){
+async function openShell(i,quiet){
   const s=curShells[i]; if(!s||!cur)return;
-  _setNav(openShell,i,curShells.length);
+  _setNav(openShell,i,curShells.length,{live:!!s.running,refresh:()=>openShell(i,true)});
+  const body=$("msgbody"), st=quiet?body.scrollTop:0;
   $("msgtitle").textContent="Shell · "+s.id;
   $("msgwhen").textContent=(s.running?"running":"done")+(s.ts?" · "+tago(s.ts):"");
   $("msgbody").className="msgbody cmdmode";
-  $("msgbody").innerHTML=`<div class=cmdcode>${esc(s.cmd)}</div><div class=empty>loading output…</div>`;
+  if(!quiet)$("msgbody").innerHTML=`<div class=cmdcode>${esc(s.cmd)}</div><div class=empty>loading output…</div>`;
   $("msgmodal").style.display="flex";
   let d;try{d=await(await fetch(`/api/shell?id=${encodeURIComponent(cur)}&shell=${encodeURIComponent(s.id)}`)).json()}catch(e){d={}}
   $("msgbody").innerHTML=`<div class=cmdcode>${esc(d.cmd||s.cmd)}</div>`+
     (d.out?`<pre class=cmdout>${esc(d.out)}</pre>`:"<div class=empty>no output yet</div>");
+  if(quiet)body.scrollTop=st;
 }
-async function openAgent(i){
+async function openAgent(i,quiet){
   const a=curAgents[i]; if(!a||!cur)return;
-  _setNav(openAgent,i,curAgents.length);
+  _setNav(openAgent,i,curAgents.length,{live:!!a.running,refresh:()=>openAgent(i,true)});
+  const body=$("msgbody"), st=quiet?body.scrollTop:0;
   $("msgtitle").textContent="Agent";
   $("msgwhen").textContent=(a.running?"running":"done")+(a.ts?" · "+tago(a.ts):"");
   $("msgbody").className="msgbody";
-  $("msgbody").innerHTML="<div class=empty>loading…</div>";
+  if(!quiet)$("msgbody").innerHTML="<div class=empty>loading…</div>";
   $("msgmodal").style.display="flex";
   let d;try{d=await(await fetch(`/api/agent?id=${encodeURIComponent(cur)}&agent=${encodeURIComponent(a.aid||a.id)}`)).json()}catch(e){d={}}
   $("msgbody").innerHTML=(d.task?`<div class=cmdcode>${esc(d.task)}</div>`:"")+
     `<div class="muted mono" style=margin-bottom:10px>${d.tools||0} tool calls · ${d.running?'running':'done'}</div>`+
     (d.narration?md(d.narration):"<div class=empty>no narration recorded</div>");
+  if(quiet)body.scrollTop=st;
 }
 function closeMsg(){$("msgmodal").style.display="none";}
 function copyModal(bodyId,btn){
