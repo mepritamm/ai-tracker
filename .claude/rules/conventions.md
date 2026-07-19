@@ -23,4 +23,5 @@ These are invariants, not suggestions. Breaking one is a regression even if the 
 
 ## Process
 12. **Re-read the region right before editing** — this file is edited by multiple concurrent sessions and diverges. If an edit's match fails, the file moved; re-read.
-13. Minimal diff, no drive-by refactors, no new deps. No commit/push unless asked — use `/tracker-push` (dual-remote license split), never a manual push.
+13. **Work in a separate git worktree — never edit the primary checkout in place.** Concurrent sessions share one checkout; in-place edits interleave with another session's WIP and force a `git add -A` that sweeps it. Start in a worktree (`EnterWorktree`, based on local HEAD — no `origin` remote), validate (`make check` green) there, then move to the main checkout / push.
+14. Minimal diff, no drive-by refactors, no new deps. No commit/push unless asked — use `/tracker-push` (direct push to `personal`), never a manual push.

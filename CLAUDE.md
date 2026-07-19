@@ -36,6 +36,9 @@ python -m aitracker --version | --help | --selfcheck
 ## The rule that bites everyone
 The page is assembled from `web/*` **at server startup** (`page.build_page`). After editing `aitracker/**` or `web/**` you **must restart** (`make serve`). Only `flags.json`/`titles.json` are read live.
 
+## Worktree discipline
+**Always work in a separate git worktree — never edit the primary checkout in place.** Multiple sessions share this one checkout; an in-place edit interleaves with another session's WIP and forces a `git add -A` that sweeps their unfinished work. Start every task with a worktree (`EnterWorktree`, based on **local HEAD** — there is no `origin` remote, only `personal`), do all edits + `make check` **in the worktree**, and only then move to the main checkout / push to `personal`. No in-place edits on the primary checkout.
+
 ## Conventions
 - **Stdlib only, no new dependencies.** No build step for running (the `web/` inline is at serve time; `make bundle` is optional packaging).
 - Land a capability at the **shared seam** so every provider inherits it — never two forked implementations.
