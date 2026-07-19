@@ -15,7 +15,7 @@ from aitracker.registry import parse_any
 from aitracker.providers.claude import (
     parse_session, parse_agents, parse_shells, _match_content, _active_mtime,
     file_diffs, command_output, shell_output, agent_detail, _redirect_log,
-    list_sessions, child_agent_sessions, _agent_group)
+    list_sessions, child_agent_sessions, _agent_group, _pick_parent)
 from aitracker.providers.auggie import (
     list_auggie, parse_auggie, search_auggie, _AUGGIE_LIST_CACHE)
 
@@ -187,24 +187,42 @@ def _run():
     # a term that lives ONLY in the injected skill list must NOT match
     assert _match_content(data, "bitbucket-automation")[0] == 0, "boilerplate leaked into search"
 
-    # background-agent (SDK) sessions: flagged 🤖, bucketed under their repo, and linked from the root.
+    # background-agent (SDK) sessions nest under their ORIGINATING session — attributed by shared PROJECT
+    # DIR (the SDK writes each agent transcript beside its orchestrator, even when their cwd fields differ)
+    # and by who was live when the agent spawned (latest start <= agent start — handles resume chains).
     assert _agent_group("/repo/x/.claude/worktrees/wt-a", "sdk-cli") == ("/repo/x", "x")
     assert _agent_group("/repo/x", "cli") == ("", ""), "human sessions are never agents"
+    assert _pick_parent(500, [("A", 100), ("B", 400), ("C", 900)]) == "B", "latest start <= agent"
+    assert _pick_parent(50, [("A", 100), ("B", 400)]) == "A", "predates all -> earliest human"
     pdir = tempfile.mkdtemp(); config.PROJECTS = pdir
-    root_d = os.path.join(pdir, "-repo-x"); os.makedirs(root_d)
-    wt_d = os.path.join(pdir, "-repo-x--claude-worktrees-wt-a"); os.makedirs(wt_d)
-    with open(os.path.join(root_d, "root1.jsonl"), "w") as f:
-        f.write(json.dumps({"cwd": "/repo/x", "entrypoint": "cli",
-                            "message": {"role": "user", "content": "drive the pipeline"}}) + "\n")
-    with open(os.path.join(wt_d, "agentsess.jsonl"), "w") as f:
-        f.write(json.dumps({"cwd": "/repo/x/.claude/worktrees/wt-a", "entrypoint": "sdk-cli",
-                            "message": {"role": "user", "content": "fix finding 42"}}) + "\n")
+    WT = "/repo/x/.claude/worktrees/wt-a"
+    d1 = os.path.join(pdir, "-repo-x--claude-worktrees-wt-a"); os.makedirs(d1)
+    def _mk(dd, fn, cwd, ep, ts, content="go"):
+        with open(os.path.join(dd, fn), "w") as f:
+            f.write(json.dumps({"cwd": cwd, "entrypoint": ep, "timestamp": ts,
+                                "message": {"role": "user", "content": content}}) + "\n")
+    _mk(d1, "orchA.jsonl", WT, "cli", "2026-06-01T10:00:00Z", "start the run")   # first orchestrator
+    _mk(d1, "orchB.jsonl", WT, "cli", "2026-06-01T12:00:00Z", "resume the run")  # resumed later, same dir
+    _mk(d1, "ag_late.jsonl", WT, "sdk-cli", "2026-06-01T12:30:00Z", "finding 1")  # after orchB -> orchB
+    _mk(d1, "ag_mid.jsonl",  WT, "sdk-cli", "2026-06-01T11:00:00Z", "finding 2")  # between A and B -> orchA
+    # repo-root-orchestrator topology: the orchestrator's file is in the worktree dir but its cwd is the
+    # REPO ROOT (not the worktree). Attribution must still find it — via the shared dir, not the cwd field.
+    d3 = os.path.join(pdir, "-repo-x--claude-worktrees-wt-c"); os.makedirs(d3)
+    _mk(d3, "orchR.jsonl", "/repo/x", "cli", "2026-06-01T08:00:00Z", "drive from the repo root")
+    _mk(d3, "ag_root.jsonl", "/repo/x/.claude/worktrees/wt-c", "sdk-cli", "2026-06-01T08:30:00Z", "finding 3")
+    d2 = os.path.join(pdir, "-repo-x--claude-worktrees-wt-b"); os.makedirs(d2)   # dir with agents but no human
+    _mk(d2, "ag_orphan.jsonl", "/repo/x/.claude/worktrees/wt-b", "sdk-cli", "2026-06-01T09:00:00Z", "orphan")
     ls = {s["id"]: s for s in list_sessions()}
-    assert ls["agentsess"]["agent"] and ls["agentsess"]["group"] == "/repo/x", ls["agentsess"]
-    assert not ls["root1"]["agent"] and ls["root1"]["group"] == "", ls["root1"]
-    kids = child_agent_sessions("/repo/x")           # root surfaces its spawned agent sessions
-    assert [k["id"] for k in kids] == ["agentsess"] and kids[0]["wt"] == "wt-a", kids
-    assert child_agent_sessions("/repo/x/.claude/worktrees/wt-a") == [], "agent sessions have no children"
+    assert ls["ag_late"]["agent"] and ls["ag_late"]["parentId"] == "orchB", ls["ag_late"]
+    assert ls["ag_mid"]["parentId"] == "orchA", ls["ag_mid"]
+    assert ls["ag_root"]["parentId"] == "orchR", "repo-root orchestrator attributed via shared dir despite cwd mismatch"
+    assert ls["ag_orphan"]["parentId"] == "" and ls["ag_orphan"]["group"] == "/repo/x", "no same-dir human -> bucket"
+    assert not ls["orchR"]["agent"] and ls["orchR"]["parentId"] == "", ls["orchR"]
+    kb = child_agent_sessions("orchB", d1)           # detail uses the SAME dir-scoped set as the sidebar
+    assert [k["id"] for k in kb] == ["ag_late"] and kb[0]["wt"] == "wt-a", kb
+    assert [k["id"] for k in child_agent_sessions("orchA", d1)] == ["ag_mid"], "each orchestrator gets its own agents"
+    assert [k["id"] for k in child_agent_sessions("orchR", d3)] == ["ag_root"], "repo-root orchestrator surfaces its agent"
+    assert child_agent_sessions("ag_late", d1) == [], "an agent is not the orchestrator of its siblings"
 
     # auggie (Augment CLI) sessions from ~/.augment/sessions + todos from task-storage
     config.AUGMENT_DIR = tempfile.mkdtemp()

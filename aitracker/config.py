@@ -35,3 +35,9 @@ NARR_PAGE = 60          # narration entries per /api/session page + per /api/nar
 
 
 AUGGIE_SESSIONS = os.path.join(AUGMENT_DIR, "sessions")
+
+
+# HTTP Basic Auth for the whole server. Empty = off (default; localhost dev unaffected).
+# Set TRACKER_AUTH="user:pass" to require a login on every route — the one gate that covers
+# every access path (localhost, LAN, Tailscale, ngrok), so remote viewers must authenticate.
+AUTH = os.environ.get("TRACKER_AUTH", "")

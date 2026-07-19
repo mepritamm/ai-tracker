@@ -85,6 +85,16 @@ def _iso_epoch(s):
         return 0.0
 
 
+def _ts_epoch(s):
+    """ISO timestamp -> epoch keeping sub-second precision (unlike _iso_epoch, which floors to
+    the second). Used to order sessions started in the same second when attributing agents."""
+    try:
+        import datetime as _dt
+        return _dt.datetime.fromisoformat((s or "").replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def _window(text, ql, pad=70):
     t = " ".join(text.split())
     i = t.lower().find(ql)

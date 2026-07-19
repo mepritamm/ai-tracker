@@ -1,0 +1,135 @@
+# Remote & mobile access — track your agents on the go
+
+The tracker is a **local, read-only** dashboard. By default it binds to `127.0.0.1` (localhost only) with
+no login — nothing is reachable off your machine. This guide shows how to safely reach it from a phone or
+tablet, install it as an app, and require a password.
+
+Three things combine here, each independent:
+
+1. **Connectivity** — how the phone reaches your Mac (Tailscale / ngrok / same-Wi-Fi).
+2. **Auth** — an optional password on every route (`TRACKER_AUTH`).
+3. **Install & feel** — Add to Home Screen (PWA), responsive phone/tablet layout, local-only flagging.
+
+---
+
+## TL;DR
+
+```bash
+# Recommended: private mesh (Tailscale) + a password, reachable from anywhere
+TRACKER_AUTH="you:pick-a-strong-pass" HOST=0.0.0.0 make serve
+# then on the phone open  http://<your-mac-name>:8787  (Tailscale MagicDNS)
+```
+
+| Env var | Default | Set it to… |
+|---|---|---|
+| `HOST` | `127.0.0.1` (localhost only) | `0.0.0.0` to accept connections from LAN / Tailscale |
+| `TRACKER_AUTH` | *(empty — off)* | `"user:pass"` to require HTTP Basic Auth on **every** route |
+| `PORT` | `8787` | any free port |
+
+`HOST` and `TRACKER_AUTH` are **off by default** — local development is completely unchanged unless you
+opt in.
+
+---
+
+## Security model (read this first)
+
+- **Auth is one gate for every path.** `TRACKER_AUTH` is checked in the HTTP handler, so it covers every
+  route (`/`, `/api/*`) and both providers (Claude, Auggie) uniformly — localhost, LAN, Tailscale, or
+  ngrok. Credentials are compared in constant time.
+- **The tracker only reads** your session logs and makes **no outbound network calls.** The only way data
+  leaves the machine is through the tunnel/network path *you* set up below.
+- **Flagging is desk-only.** The "🚩 Flag an issue or gap" button is hidden automatically when the
+  dashboard is opened from any non-localhost host (phone/tablet). Existing flags stay **viewable** —
+  you just can't file new ones remotely. (Detected via `location.hostname`, which — unlike the server —
+  can tell a tunneled phone from a local browser.)
+- **Basic Auth is only as private as the transport.** Over HTTPS (ngrok) or an encrypted mesh (Tailscale)
+  it's safe. Over **plain-HTTP LAN** the header is base64 (not encrypted) — fine on a trusted home
+  network, not on public Wi-Fi.
+
+---
+
+## Option A — Tailscale (recommended for "on the go")
+
+A free, private WireGuard mesh: only *your* devices can see each other, from anywhere. No public exposure.
+
+1. Install Tailscale on the **Mac** and the **phone/tablet**, sign in to the same account on both.
+2. On the Mac, start the tracker bound for the mesh, with a password:
+   ```bash
+   TRACKER_AUTH="you:pick-a-strong-pass" HOST=0.0.0.0 make serve
+   ```
+3. Find your Mac's Tailscale name (MagicDNS) — e.g. `pritams-mac` — in the Tailscale app.
+4. On the phone open `http://pritams-mac:8787`, enter the username/password.
+
+The Tailscale name never changes, so the Home-Screen icon (below) keeps working across restarts. This is
+the best fit for the tracker's "nothing leaves the machine to strangers" design.
+
+---
+
+## Option B — ngrok (public HTTPS tunnel)
+
+A public URL that forwards to your localhost. Convenient, but it puts your dashboard on the public internet
+— so a password is **mandatory**.
+
+1. One-time: sign up free at `dashboard.ngrok.com`, then `ngrok config add-authtoken <YOUR_TOKEN>`.
+   (Optional but recommended: claim your one free **static domain** so the URL is stable.)
+2. Start the tracker **with a password** (no `HOST` change needed — ngrok reaches it via localhost):
+   ```bash
+   TRACKER_AUTH="you:pick-a-strong-pass" make serve
+   ```
+3. In another terminal, open the tunnel:
+   ```bash
+   ngrok http 8787
+   # or, with your reserved domain:  ngrok http --domain=your-name.ngrok-free.app 8787
+   ```
+4. Open the `https://…ngrok-free.app` URL on the phone (click through ngrok's one-time warning), enter the
+   password.
+
+Because the app enforces `TRACKER_AUTH`, you don't also need ngrok's `--basic-auth` — one password covers
+it. Never run an ngrok tunnel to the tracker **without** `TRACKER_AUTH`.
+
+---
+
+## Option C — Same Wi-Fi (LAN)
+
+Simplest, but only works while the phone is on the **same network** as the Mac (not truly "on the go").
+
+1. Start bound to all interfaces, with a password:
+   ```bash
+   TRACKER_AUTH="you:pick-a-strong-pass" HOST=0.0.0.0 make serve
+   ```
+2. Find the Mac's LAN IP: `ipconfig getifaddr en0` (e.g. `192.168.1.105`).
+3. On the phone open `http://192.168.1.105:8787`, enter the password.
+
+---
+
+## Install it as an app (Add to Home Screen)
+
+Once the dashboard opens on the phone/tablet (any option above), install it so it launches fullscreen like
+a native app:
+
+- **iPhone / iPad (Safari):** Share → **Add to Home Screen** → *Add*. You get an "AI Tracker" icon.
+- **Android (Chrome):** ⋮ menu → **Install app** / **Add to Home screen**.
+
+The layout is responsive: a phone gets a stacked single-column view; a tablet (iPad / Android, portrait or
+landscape) gets the master-detail sidebar-beside-content layout.
+
+---
+
+## Notifications?
+
+There are none by design — the tracker makes no outbound calls, so it won't push to your phone when an
+agent finishes. The in-app completion 🔔 only fires with a tab open. "On the go" means *you glance at it*,
+not *it pings you*. Adding push would mean an outbound integration, a deliberate departure from the
+read-only, nothing-leaves-the-machine model.
+
+---
+
+## Troubleshooting
+
+- **Phone can't connect (LAN/Tailscale):** you forgot `HOST=0.0.0.0` — the default `127.0.0.1` refuses
+  non-local connections. (ngrok doesn't need it.)
+- **No password prompt:** `TRACKER_AUTH` wasn't set in the *same* shell that launched the server. Confirm
+  with `ai-tracker --help` (it lists the env vars) and relaunch.
+- **Home-Screen icon points at a dead URL:** you used ngrok's *random* URL; claim a static domain, or use
+  Tailscale (its name is stable).
+- **Flag button missing on the phone:** that's intentional — flagging is local-only. Use the Mac.

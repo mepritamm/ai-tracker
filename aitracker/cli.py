@@ -8,7 +8,9 @@ from .server import run
 HELP = """ai-tracker — live dashboard for AI coding sessions (Claude Code, Auggie, …).
 
 Usage: ai-tracker [--serve | --selfcheck | --version | --help]
-Env:   PORT   (default 8787)
+Env:   PORT          (default 8787)
+       HOST          bind address (default 127.0.0.1; use 0.0.0.0 for LAN/Tailscale access)
+       TRACKER_AUTH  "user:pass" to require HTTP Basic Auth on every route (default off)
 """
 
 
@@ -33,4 +35,5 @@ def main():
         _selfcheck()
         return
     port = int(os.environ.get("PORT", 8787))
-    run(port=port)   # run() picks the next free port if this one is busy, and opens the browser
+    host = os.environ.get("HOST", "127.0.0.1")   # 0.0.0.0 to reach it from a phone/tablet on LAN/Tailscale
+    run(host=host, port=port)   # run() picks the next free port if this one is busy, and opens the browser

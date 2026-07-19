@@ -50,6 +50,11 @@ html,body{margin:0;height:100%;background:#0c0f15;color:#e6edf3;font-family:'Sou
 .agrpn{font-family:'JetBrains Mono',monospace;font-size:10.5px;color:#f5b443;background:rgba(245,180,67,.12);border-radius:5px;padding:1px 7px;flex:0 0 auto}
 .agrpkids{margin:2px 0 4px 12px;padding-left:8px;border-left:1px solid #223047}
 .sitem.agentrow .nm{color:#e8c98a}
+/* 🤖 expander on an originating session row that spawned agent sessions — dim when collapsed, full when open */
+.agtoggle{font-size:13px;flex:0 0 auto;cursor:pointer;user-select:none;margin-left:-2px;line-height:1;opacity:.5;filter:grayscale(.4)}
+.agtoggle:hover{opacity:1;filter:none}
+.agtoggle.open{opacity:1;filter:none}
+.sitem.hasagents{border-color:#3a2f18}
 .ssnip{color:#6b7585;font-size:11px;margin-top:6px;line-height:1.35;font-family:'JetBrains Mono',monospace;overflow-wrap:anywhere}
 .ssnip b{color:#e6edf3;background:#1f6feb40;border-radius:2px}
 .smatch{color:#29d398}
@@ -149,6 +154,7 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid #1c2330}
 .link{cursor:pointer}.link.blue{color:#4c8dff}.link.grey{color:#6b7585}.link:hover{text-decoration:underline}
 .addflag{width:100%;margin-top:2px;background:#10141c;border:1px dashed #2c333f;color:#8b949e;padding:9px;border-radius:9px;font-family:'Source Sans 3',sans-serif;font-size:12.5px;cursor:pointer}
 .addflag:hover{border-color:#f85149}
+.remote .addflag{display:none}   /* flagging is local-only — hidden on phone/tablet (non-localhost) */
 
 /* narration */
 .narr{display:flex;gap:12px;padding:9px 9px;border-bottom:1px solid #161c27;cursor:pointer;border-radius:8px}
@@ -242,6 +248,28 @@ a{color:#4c8dff}
 .diffexp{cursor:pointer;color:#4c8dff;background:#0d1622;border-top:1px solid #1c2330;border-bottom:1px solid #1c2330;padding:2px 12px;font-size:11px;user-select:none}
 .diffexp:hover{background:#12203a}
 @media(max-width:900px){.app{flex-direction:column}.side{width:100%;flex:none;max-height:38vh}}
+/* tablets (portrait ~768–834, iPad/Android): keep the sidebar beside content (master-detail),
+   not the phone top-strip. After the 900 rule so it wins in the 601–900 overlap. */
+@media(min-width:601px) and (max-width:900px){.app{flex-direction:row}.side{width:260px;flex:0 0 260px;max-height:none}}
+/* phones: reclaim horizontal space, let modals fill the screen */
+@media(max-width:600px){
+  header.hd{padding:14px 14px 12px}
+  .hero{gap:14px}
+  .ring,.ring svg{width:92px;height:92px}
+  .ringpct{font-size:20px}
+  .htitle{min-width:0}
+  .htop h2{font-size:17px}
+  .body{padding:12px 12px 24px;gap:12px}
+  .card h2{padding:10px 12px}
+  .side{max-height:32vh}
+  .overlay{padding:6px}
+  .modal{max-height:94vh}
+  .modal .mh{flex-wrap:wrap;gap:7px;padding:11px 12px}
+  /* PR rows: let a long title shrink+ellipsize and drop the redundant raw URL (else the row overflows) */
+  .prlink b{min-width:0;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .prurl{display:none}
+  .foot{padding:8px}
+}
 .foot{text-align:center;padding:10px 12px 12px;border-top:1px solid #1c2330;font-size:10px;color:#8b949e;opacity:.4;letter-spacing:.03em}
 .foot a{color:inherit;text-decoration:underline;text-underline-offset:2px}
 .bell{cursor:pointer;font-size:14px;margin-left:8px;opacity:.85;user-select:none;line-height:1}

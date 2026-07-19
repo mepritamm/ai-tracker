@@ -1,6 +1,7 @@
-import json, os, sys, errno, webbrowser
+import json, os, sys, errno, webbrowser, base64, hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+from . import config                       # referenced live (config.AUTH) so tests/env see one source
 from .config import LIVE_WINDOW, NARR_PAGE
 from .page import build_page
 from .registry import all_sessions, parse_any, search_all
@@ -23,7 +24,35 @@ class Handler(BaseHTTPRequestHandler):
             # this one, or the tab closed). Nothing to send; don't crash.
             pass
 
+    def _authed(self):
+        """True if the request may proceed. When config.AUTH is set, require matching
+        HTTP Basic credentials; otherwise send 401 and return False. Off by default."""
+        cred = config.AUTH
+        if not cred:
+            return True
+        got = self.headers.get("Authorization", "")
+        if got.startswith("Basic "):
+            try:
+                dec = base64.b64decode(got[6:]).decode("utf-8", "replace")
+            except Exception:
+                dec = ""
+            if hmac.compare_digest(dec, cred):   # constant-time — don't leak length/prefix via ==
+                return True
+        body = b"authentication required"
+        try:
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="ai-tracker"')
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return False
+
     def do_GET(self):
+        if not self._authed():
+            return
         p = urlparse(self.path)
         if p.path == "/":
             body = build_page().encode()
@@ -126,6 +155,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if not self._authed():
+            return
         p = urlparse(self.path)
         try:
             n = int(self.headers.get("Content-Length", 0))

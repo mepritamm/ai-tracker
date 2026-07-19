@@ -3,8 +3,10 @@
 the page assembly (web/ inlining), cross-source search ranking, the standalone
 bundle, and a few pure helpers. Stdlib only."""
 import ast
+import base64
 import http.client
 import json
+import sys
 import os
 import runpy
 import tempfile
@@ -63,6 +65,13 @@ class TestBuildPage(unittest.TestCase):
         self.assertIn("function render", p)     # the JS made it in
         self.assertIn("AI Session Tracker", p)
         self.assertIn("rel=icon", p)            # the favicon
+        # installable-on-phone bits (Add to Home Screen -> fullscreen)
+        self.assertIn("apple-mobile-web-app-capable", p)
+        self.assertIn("rel=apple-touch-icon", p)
+        self.assertIn("rel=manifest", p)
+        self.assertIn("max-width:600px", p)    # the phone responsive block is baked in
+        self.assertIn("min-width:601px", p)    # the tablet master-detail block is baked in
+        self.assertIn(".remote .addflag", p)   # flag button hidden for remote (non-localhost) viewers
 
 
 class TestSearchAllRanking(unittest.TestCase):
@@ -144,6 +153,102 @@ class TestServerEndToEnd(unittest.TestCase):
     def test_unknown_route_404(self):
         st, _ = self._get("/api/nope")
         self.assertEqual(st, 404)
+
+
+class TestBasicAuth(unittest.TestCase):
+    """config.AUTH gates every route with HTTP Basic Auth; empty (default) lets all through."""
+
+    def setUp(self):
+        self.snap = _snap()
+        _empty_env()
+        self._auth0 = config.AUTH
+        config.AUTH = "alice:s3cret"          # read live by the Handler
+        self.srv = _server.Server(("127.0.0.1", 0), _server.Handler)
+        self.port = self.srv.server_address[1]
+        self.t = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.t.start()
+
+    def tearDown(self):
+        config.AUTH = self._auth0
+        self.srv.shutdown()
+        self.srv.server_close()
+        _restore(self.snap)
+
+    def _get(self, path, cred=None):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        hdr = {}
+        if cred is not None:
+            hdr["Authorization"] = "Basic " + base64.b64encode(cred.encode()).decode()
+        c.request("GET", path, headers=hdr)
+        r = c.getresponse()
+        r.read()
+        c.close()
+        return r.status, r.getheader("WWW-Authenticate")
+
+    def test_no_credentials_401(self):
+        st, wa = self._get("/")
+        self.assertEqual(st, 401)
+        self.assertIn("Basic", wa or "")        # prompts the browser for credentials
+
+    def test_wrong_credentials_401(self):
+        self.assertEqual(self._get("/api/list", "alice:wrong")[0], 401)
+
+    def test_correct_credentials_200(self):
+        self.assertEqual(self._get("/api/list", "alice:s3cret")[0], 200)
+
+    def test_default_off_lets_all_through(self):
+        config.AUTH = ""                        # simulate no TRACKER_AUTH set (the default)
+        self.assertEqual(self._get("/api/list")[0], 200)   # no creds, still served
+
+    def _raw(self, method, path, auth):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        hdr = {"Authorization": auth} if auth is not None else {}
+        if method == "POST":
+            hdr["Content-Type"] = "application/json"
+            c.request("POST", path, body="{}", headers=hdr)
+        else:
+            c.request(method, path, headers=hdr)
+        r = c.getresponse()
+        r.read()
+        c.close()
+        return r.status
+
+    def test_post_route_also_requires_auth(self):
+        # the guard is on do_POST too, not just do_GET — a mutation must not slip through
+        self.assertEqual(self._raw("POST", "/api/flags", None), 401)
+
+    def test_malformed_or_non_basic_header_401(self):
+        # a bad Authorization header must 401 cleanly (no 500), exercising the decode try/except
+        self.assertEqual(self._raw("GET", "/api/list", "Basic not_valid_base64!!"), 401)
+        self.assertEqual(self._raw("GET", "/api/list", "Bearer sometoken"), 401)
+
+
+class TestHostEnv(unittest.TestCase):
+    """cli honors HOST (default 127.0.0.1) and passes it to run() — default-localhost guards
+    against accidentally exposing the server; the env is what LAN/Tailscale setup relies on."""
+
+    def _run_main_capturing_host(self, host_env):
+        import aitracker.cli as cli
+        cap, orig, old_argv = {}, cli.run, sys.argv
+        old_host = os.environ.pop("HOST", None)
+        if host_env is not None:
+            os.environ["HOST"] = host_env
+        cli.run = lambda **kw: cap.update(kw)      # don't actually serve_forever
+        try:
+            sys.argv = ["ai-tracker"]              # no flags -> the serve path
+            cli.main()
+        finally:
+            cli.run, sys.argv = orig, old_argv
+            os.environ.pop("HOST", None)
+            if old_host is not None:
+                os.environ["HOST"] = old_host
+        return cap.get("host")
+
+    def test_defaults_to_localhost(self):
+        self.assertEqual(self._run_main_capturing_host(None), "127.0.0.1")
+
+    def test_host_env_is_honored(self):
+        self.assertEqual(self._run_main_capturing_host("0.0.0.0"), "0.0.0.0")
 
 
 class TestPortFallback(unittest.TestCase):

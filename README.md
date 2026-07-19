@@ -61,6 +61,14 @@ To keep it running in the background: `nohup python3 -m aitracker >/tmp/tracker.
 
 ---
 
+## View it on your phone or tablet
+
+Track your agents on the go. Reach the dashboard from a phone/tablet over a private **Tailscale** mesh, an **ngrok** tunnel, or your **LAN**; install it as a home-screen app (fullscreen, responsive phone/tablet layout); and require a password with `TRACKER_AUTH`. It's all opt-in — two env vars (`HOST`, `TRACKER_AUTH`), both off by default, so local use is unchanged.
+
+**→ [Remote & mobile access setup](docs/remote-access.md)**
+
+---
+
 ## What it shows
 
 **Sidebar** — every session across all your tools and projects, newest first, each with a source badge (Claude Desktop / Claude CLI / Claude SDK / Claude VS Code / Auggie), a live dot, and a short title.

@@ -1,7 +1,7 @@
 import difflib, glob, json, os, re, time
 from ..config import EDIT_TOOLS, LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, prs_sorted, pr_worked, PR_CREATE_RE
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, prs_sorted, pr_worked, PR_CREATE_RE
 from ..overview import build_overview
 from ..store import load_titles, load_tasks
 from .base import Provider
@@ -50,7 +50,7 @@ def _session_meta(path):
     hit = _META_CACHE.get(path)
     if hit and hit[0] == mt:
         return hit[1]
-    cwd = prompt = entry_head = ""
+    cwd = prompt = entry_head = first_ts = ""
     try:
         with open(path, encoding="utf-8") as fh:
             for i, line in enumerate(fh):
@@ -64,6 +64,8 @@ def _session_meta(path):
                     cwd = o["cwd"]
                 if not entry_head and o.get("entrypoint"):
                     entry_head = o["entrypoint"]
+                if not first_ts and o.get("timestamp"):
+                    first_ts = o["timestamp"]          # session start — used to attribute agents to their live orchestrator
                 if not prompt:
                     m = o.get("message")
                     if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str):
@@ -78,6 +80,7 @@ def _session_meta(path):
         "title": custom or ai or _short_title(prompt),
         "prompt": prompt,
         "source": entry or entry_head or "",
+        "first": _ts_epoch(first_ts),   # sub-second so same-second orchestrator/agent starts still order
     }
     _META_CACHE[path] = (mt, meta)
     return meta
@@ -108,28 +111,62 @@ def _worktree_name(cwd):
     return cwd.split(_WT_MARKER, 1)[1].split(os.sep)[0] if cwd and _WT_MARKER in cwd else ""
 
 
-def child_agent_sessions(cwd):
-    """The SDK/worktree agent sessions spawned from repo `cwd` — deterministic link:
-    their cwd is <cwd>/.claude/worktrees/... . A root session surfaces these so you can
-    jump straight into an agent from the background-agents panel. [] for agent sessions
-    themselves (they have no children) so the poll skips the projects scan."""
-    if not cwd or _WT_MARKER in cwd:
+def _pick_parent(agent_first, humans):
+    """Attribute an agent to its originating session: of the human sessions sharing its dir,
+    the one whose start-time is the latest <= the agent's start (the orchestrator that was
+    live when the agent spawned — correct across resume chains). Falls back to the earliest
+    KNOWN-start human when the agent predates them all. humans: [(id, first_epoch), ...].
+    Ties break by id, so the result is independent of the order humans are fed in — the
+    sidebar (mtime order) and the detail panel (glob order) can't disagree. A first==0
+    (start not yet written) is treated as unknown, never as 'earliest'."""
+    if not humans:
+        return ""
+    real = [h for h in humans if h[1]]                       # humans with a parsed start
+    if agent_first:
+        prev = [h for h in real if h[1] <= agent_first]
+        if prev:
+            return max(prev, key=lambda h: (h[1], h[0]))[0]  # latest start; id tie-break => order-independent
+    pool = real or humans
+    return min(pool, key=lambda h: (h[1] or 0, h[0]))[0]     # earliest known start; id tie-break
+
+
+def _same_dir_sessions(projdir):
+    """(humans, agents) whose session file lives in this project dir. An orchestrator and the
+    agents it spawned share the dir (the SDK writes each agent transcript beside the parent),
+    even when their cwd *fields* differ — a repo-root orchestrator's file still lands in the
+    worktree's project dir. humans=[(id, first)], agents=[(id, path, meta)]."""
+    humans, agents = [], []
+    for f in glob.glob(os.path.join(projdir, "*.jsonl")):
+        sm = _session_meta(f)
+        fid = os.path.basename(f)[:-6]
+        if sm["source"] == "sdk-cli":
+            agents.append((fid, f, sm))
+        else:
+            humans.append((fid, sm["first"]))
+    return humans, agents
+
+
+def child_agent_sessions(sid, projdir):
+    """The agent (sdk-cli) sessions this session originated — same project dir, and this session
+    won the _pick_parent attribution. Surfaced in the parent's background-agents panel to jump
+    straight into an agent. Scans just this one dir (agents live beside their orchestrator), so
+    it uses the SAME candidate set list_sessions does — the two views can't disagree."""
+    humans, agents = _same_dir_sessions(projdir)
+    if not agents:
         return []
-    prefix = os.path.join(cwd, ".claude", "worktrees") + os.sep
     titles = load_titles()
     out = []
-    for f in glob.glob(os.path.join(config.PROJECTS, "*", "*.jsonl")):
-        sm = _session_meta(f)
-        if sm["source"] == "sdk-cli" and (sm["cwd"] or "").startswith(prefix):
-            sid = os.path.basename(f)[:-6]
-            mt = _active_mtime(f)
-            out.append({
-                "id": sid,
-                "title": titles.get(sid) or sm["title"],
-                "wt": _worktree_name(sm["cwd"]),
-                "running": (time.time() - mt) < LIVE_WINDOW,
-                "mtime": mt,
-            })
+    for fid, f, sm in agents:
+        if _pick_parent(sm["first"], humans) != sid:
+            continue
+        mt = _active_mtime(f)
+        out.append({
+            "id": fid,
+            "title": titles.get(fid) or sm["title"],
+            "wt": _worktree_name(sm["cwd"]),
+            "running": (time.time() - mt) < LIVE_WINDOW,
+            "mtime": mt,
+        })
     out.sort(key=lambda r: r["mtime"], reverse=True)
     return out
 
@@ -138,11 +175,24 @@ def list_sessions(limit=200):
     fs = glob.glob(os.path.join(config.PROJECTS, "*", "*.jsonl"))
     fs.sort(key=os.path.getmtime, reverse=True)
     titles = load_titles()
+    metas = {f: _session_meta(f) for f in fs}   # cached; cheap on repeat
+    # candidate orchestrators per project dir, over ALL sessions (not just the top-N shown) so the
+    # sidebar nesting and each session's agent_sessions panel attribute from the identical set.
+    humans_by_dir = {}
+    for f in fs:
+        sm = metas[f]
+        if sm["source"] != "sdk-cli":
+            humans_by_dir.setdefault(os.path.dirname(f), []).append((os.path.basename(f)[:-6], sm["first"]))
     out = []
     for f in fs[:limit]:
-        sm = _session_meta(f)
+        sm = metas[f]
         sid = os.path.basename(f)[:-6]
         gkey, glabel = _agent_group(sm["cwd"], sm["source"])
+        parent = ""
+        if sm["source"] == "sdk-cli":
+            cands = humans_by_dir.get(os.path.dirname(f))   # a repo-root orchestrator's file lives here too
+            if cands:
+                parent = _pick_parent(sm["first"], cands)
         out.append({
             "id": sid,
             "project": os.path.basename(sm["cwd"]) if sm["cwd"] else os.path.basename(os.path.dirname(f)),
@@ -150,8 +200,9 @@ def list_sessions(limit=200):
             "title": titles.get(sid) or sm["title"],
             "prompt": sm["prompt"],
             "source": sm["source"],
-            "agent": sm["source"] == "sdk-cli",     # background-agent session -> 🤖, folded under its repo
-            "group": gkey, "groupLabel": glabel,     # sidebar nesting bucket (repo); "" for non-agents
+            "agent": sm["source"] == "sdk-cli",     # background-agent session -> 🤖
+            "group": gkey, "groupLabel": glabel,     # fallback bucket (repo/sandbox) for orphan agents
+            "parentId": parent,                      # the originating session it nests under; "" -> bucket
             "mtime": _active_mtime(f),  # counts background-agent activity too
         })
     return out
@@ -753,7 +804,7 @@ def parse_session(path):
         "requests": requests,
         "agents": agents[::-1],
         "agents_bg": agents_bg,
-        "agent_sessions": child_agent_sessions(meta.get("cwd")),  # spawned SDK/worktree sessions — click to open
+        "agent_sessions": child_agent_sessions(os.path.basename(path)[:-6], os.path.dirname(path)),  # agents this session originated — click to open
         "shells": shells,
         # open decisions first, then most-recent — so a pending question is at the top
         "decisions": sorted(asks.values(), key=lambda a: (a["open"], a["t"] or ""), reverse=True),

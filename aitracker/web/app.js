@@ -1,4 +1,10 @@
 let cur=localStorage.getItem("sid")||"", timer=null;
+// Flagging is a local-only action: hide "🚩 Flag an issue or gap" when the dashboard is viewed from a
+// phone/tablet (tunnel/LAN/Tailscale). location.hostname is the reliable signal — an ngrok tunnel reaches
+// the server *from* localhost, so the server can't tell; the browser's own URL can. Set synchronously
+// (script is at end of <body>) so the button never flashes before hiding.
+const LOCAL=["localhost","127.0.0.1","::1","[::1]"].includes(location.hostname);
+if(!LOCAL)document.documentElement.classList.add("remote");
 const $=id=>document.getElementById(id);
 const esc=s=>(s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 // tiny inline markdown for narration/requests: escape first, then `code`,
@@ -81,59 +87,97 @@ function renderSide(){
   let shown=liveOnly?sessions.filter(s=>now-s.mtime<LIVE):sessions;
   // never let the selected session fall off (top-N cap or live filter) — pin it so the selection persists
   if(cur && !shown.some(s=>s.id===cur) && selEntry && selEntry.id===cur) shown=[selEntry,...shown];
-  // fold background-agent (SDK) sessions into a collapsible per-repo group; normal sessions stay flat.
-  // Each group sorts by its newest child's mtime, so it interleaves with normal rows by recency.
-  const buckets={}, items=[];
+  // Nest each background-agent (SDK) session under its originating session (server attributes it
+  // by worktree + who was live when it spawned). Orphans — no such parent in view — fall into a
+  // per-repo/sandbox bucket so nothing is hidden. Both parent rows and buckets collapse by default.
+  const shownIds=new Set(shown.map(s=>s.id));
+  const kids={}, buckets={}, items=[];
   shown.forEach(s=>{
-    if(s.agent && s.group){
-      (buckets[s.group]||(buckets[s.group]={key:s.group,label:s.groupLabel||s.group,kids:[]})).kids.push(s);
-    }else items.push({t:"s",mtime:s.mtime,s});
+    // a pinned agent floats to the top like any pinned session — don't bury it in nesting/buckets
+    if(!s.pinned && s.agent && s.parentId && shownIds.has(s.parentId)){ (kids[s.parentId]||(kids[s.parentId]=[])).push(s); return; }
+    if(!s.pinned && s.agent && s.group){ (buckets[s.group]||(buckets[s.group]={key:s.group,label:s.groupLabel||s.group,kids:[]})).kids.push(s); return; }
+    items.push({t:"s",mtime:s.mtime,s,pinned:s.pinned});
   });
+  // parents carry their children; a live agent bubbles its parent up the recency sort.
+  items.forEach(it=>{ if(it.t==="s" && kids[it.s.id]){ it.kids=kids[it.s.id];
+    it.mtime=Math.max(it.mtime,...it.kids.map(k=>k.mtime)); }});
   Object.values(buckets).forEach(b=>{
     b.mtime=Math.max(...b.kids.map(k=>k.mtime));
     b.live=b.kids.filter(k=>now-k.mtime<LIVE).length;
-    if(cur && b.kids.some(k=>k.id===cur)) expandedGroups.add(b.key);   // keep the selected agent visible
-    items.push({t:"g",mtime:b.mtime,b});
+    items.push({t:"g",mtime:b.mtime,b,pinned:false});
   });
-  items.sort((a,b)=>b.mtime-a.mtime);
+  items.sort((a,b)=>(b.pinned?1:0)-(a.pinned?1:0) || b.mtime-a.mtime);   // pinned first, then newest (matches the server)
+  // Auto-expand the selected agent's container ONCE per selection change — covers page-load restore,
+  // not just click, and uses the same `shown`-derived nesting the render does (so the live filter can't
+  // point it at the wrong container). Fires once (guarded by autoExpandedFor) so the chevron stays
+  // collapsible and this never persists — no localStorage growth from rendering.
+  if(cur && cur!==autoExpandedFor){
+    const cs=shown.find(x=>x.id===cur);
+    if(cs && cs.agent){ const k=(cs.parentId&&shownIds.has(cs.parentId))?"sess:"+cs.parentId:cs.group; if(k)expandedGroups.add(k); }
+    autoExpandedFor=cur;
+  }
+  // prune persisted keys for sessions/groups that no longer exist, so agrpOpen can't grow without bound
+  const liveGroups=new Set(sessions.filter(s=>s.agent&&s.group).map(s=>s.group)), liveIds=new Set(sessions.map(s=>s.id));
+  let pruned=false;
+  for(const k of [...expandedGroups]){ if(!(k.startsWith("sess:")?liveIds.has(k.slice(5)):liveGroups.has(k))){ expandedGroups.delete(k); pruned=true; } }
+  if(pruned) localStorage.setItem("agrpOpen",JSON.stringify([...expandedGroups]));
+  const kidsBlock=ks=>`<div class=agrpkids>${ks.slice().sort((x,y)=>y.mtime-x.mtime).map(k=>sessionRow(k,now)).join("")}</div>`;
   $("slist").innerHTML=items.length?items.map(it=>{
-    if(it.t==="s") return sessionRow(it.s,now);
+    if(it.t==="s"){
+      if(!it.kids) return sessionRow(it.s,now);
+      const gk="sess:"+it.s.id, open=expandedGroups.has(gk);
+      const liveK=it.kids.filter(k=>now-k.mtime<LIVE).length;
+      return sessionRow(it.s,now,{gk,open,n:it.kids.length,live:liveK})+(open?kidsBlock(it.kids):"");
+    }
     const b=it.b, open=expandedGroups.has(b.key);
     return `<div class="agrp ${open?'open':''}">`+
       `<div class=agrphdr onclick="toggleGroup('${encodeURIComponent(b.key)}')" title="${esc(b.key)}">`+
         `<span class=agrpchev>${open?"▾":"▸"}</span><span class=agrpname>🤖 Agents · ${esc(b.label)}</span>`+
         `<span class=agrpn>${b.live?b.live+" live / ":""}${b.kids.length}</span></div>`+
-      (open?`<div class=agrpkids>${b.kids.slice().sort((x,y)=>y.mtime-x.mtime).map(k=>sessionRow(k,now)).join("")}</div>`:"")+
+      (open?kidsBlock(b.kids):"")+
       `</div>`;
   }).join(""):`<div class=empty>${liveOnly?"no live sessions":"no sessions"}</div>`;
   if(sl)sl.scrollTop=sc;
 }
-// one session row — shared by the flat list and the agent-group children. Agent rows get a 🤖 marker.
-function sessionRow(s,now){
+// one session row — shared by the flat list, agent-group children, and expandable parents.
+// ex (optional) = {gk,open,n,live}: this session originated N agents; render an expander + count.
+function sessionRow(s,now,ex){
   const live=now-s.mtime<LIVE;
   const label=s.title||s.project||s.id.slice(0,8);
   const bits=[`<span class=proj>${s.title?esc(s.project):s.id.slice(0,8)}</span>`];
   if(s.source)bits.push(srcLabel(s.source));
   bits.push(ago(now-s.mtime));
-  return `<div class="sitem ${s.id===cur?'active':''}${s.pinned?' pinned':''}${s.agent?' agentrow':''}" onclick="pick('${s.id}')" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
-    `<div class=srow1><span class="dot ${live?'live':''}"></span><span class=nm>${s.agent?'🤖 ':''}${esc(label)}</span>`+
+  const chev=ex?`<span class="agtoggle${ex.open?' open':''}" onclick="toggleGroup('${encodeURIComponent(ex.gk)}');event.stopPropagation()" title="${ex.open?'Collapse':'Expand'} agent sessions">🤖</span>`:"";
+  const kidchip=ex?` · <span class=agentbadge title="agent sessions this one spawned">🤖 ${ex.live?ex.live+" live / ":""}${ex.n} agent${ex.n==1?"":"s"}</span>`:"";
+  // a parent row: clicking the title toggles its agents too (not just the 🤖 button) while still opening it
+  const onclick=ex?`pickToggle('${s.id}','${encodeURIComponent(ex.gk)}')`:`pick('${s.id}')`;
+  return `<div class="sitem ${s.id===cur?'active':''}${s.pinned?' pinned':''}${s.agent?' agentrow':''}${ex?' hasagents':''}" onclick="${onclick}" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
+    `<div class=srow1>${chev}<span class="dot ${live?'live':''}"></span><span class=nm>${s.agent?'🤖 ':''}${esc(label)}</span>`+
     `<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">📌</span>`+
     `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename this session">✎</span></div>`+
-    `<div class=smeta>${s.agent?'<span class=agentbadge>🤖 Agent</span> · ':''}${bits.join(" · ")}</div></div>`;
+    `<div class=smeta>${s.agent?'<span class=agentbadge>🤖 Agent</span> · ':''}${bits.join(" · ")}${kidchip}</div></div>`;
 }
 let expandedGroups=new Set(JSON.parse(localStorage.getItem("agrpOpen")||"[]"));
+let autoExpandedFor=null;   // last selection we auto-expanded a container for (fires once per change)
 function toggleGroup(k){
   k=decodeURIComponent(k);
   if(expandedGroups.has(k))expandedGroups.delete(k); else expandedGroups.add(k);
   localStorage.setItem("agrpOpen",JSON.stringify([...expandedGroups]));
   renderSide();
 }
+// clicking an originating session's title both opens it and toggles its agent list
+function pickToggle(id,encGk){
+  const k=decodeURIComponent(encGk);
+  if(expandedGroups.has(k))expandedGroups.delete(k); else expandedGroups.add(k);
+  localStorage.setItem("agrpOpen",JSON.stringify([...expandedGroups]));
+  pick(id);   // pick() re-renders
+}
 function toggleLiveOnly(){liveOnly=!liveOnly;renderSide();}
 async function loadSide(){
   try{sessions=await(await fetch("/api/list")).json();}catch(e){return}
   renderSide();
 }
-function pick(id){$("sid").value=id;track();renderSide();}
+function pick(id){$("sid").value=id;track();renderSide();}   // renderSide auto-expands the selected agent's container (once per selection)
 async function doSearch(){
   const q=$("q").value.trim();
   if(!q){clearSearch();return}
@@ -162,6 +206,7 @@ async function togglePin(e,id){
   await loadSide();   // server re-sorts pinned-first; scroll is preserved by renderSide
 }
 async function start(){
+  const _hl=$("hostlbl");if(_hl)_hl.textContent=location.host;   // real host, not the baked "localhost:8787" (matters on phone/tunnel)
   await loadSide();
   // fall back to the newest session if nothing is stored or the stored id is stale
   if((!cur||!sessions.some(s=>s.id===cur))&&sessions[0])cur=sessions[0].id;
@@ -294,12 +339,19 @@ function render(d){
     $("bgc").textContent=runN?`${runN} running`:"all finished";
     let html="";
     if(asx.length){
-      html+=asx.map(a=>
+      // live agent sessions shown; finished ones tucked behind a disclosure (they can number in the dozens)
+      const asCard=a=>
         `<div class="agent clk agentrow" onclick="pick('${a.id}')" title="Open this agent session">`+
         `<div class=top><span class="dot ${a.running?'live':''}"></span><span class=nm>🤖 ${esc(a.title||a.wt||a.id.slice(0,8))}</span>`+
         (a.wt?` <span class=tag>${esc(a.wt.slice(0,16))}</span>`:"")+`<span class=chev>open ›</span></div>`+
         `<div class=ft><span>agent session</span><span>·</span><span style=color:${a.running?'#3fb950':'#6b7585'}>${a.running?'running':'done'}</span>`+
-        `${a.mtime?"<span>·</span><span>"+ago(d.now-a.mtime)+"</span>":""}</div></div>`).join("");
+        `${a.mtime?"<span>·</span><span>"+ago(d.now-a.mtime)+"</span>":""}</div></div>`;
+      const asRun=asx.filter(a=>a.running), asDone=asx.filter(a=>!a.running);
+      html+=asRun.map(asCard).join("");
+      if(asDone.length){
+        html+=`<div class=disclosure onclick=toggleAgentSessDone()>${showAgentSessDone?"▾ Hide":"▸ Show"} ${asDone.length} finished agent session${asDone.length==1?"":"s"}</div>`;
+        if(showAgentSessDone)html+=asDone.map(asCard).join("");
+      }
     }
     const card=(a,i)=>
       `<div class="agent clk" onclick="openAgent(${i})"><div class=top><span class="dot ${a.running?'amber':''}"></span><span class=nm>${esc(a.task||a.id)}</span>`+
@@ -635,9 +687,10 @@ async function openCmd(i){
     (d.out?`<pre class=cmdout>${esc(d.out)}</pre>`:"<div class=empty>no output captured</div>");
 }
 let curShells=[], curAgents=[], curTodos=[];
-let showAgentsDone=false, showShellsDone=false;
+let showAgentsDone=false, showShellsDone=false, showAgentSessDone=false;
 function toggleAgentsDone(){showAgentsDone=!showAgentsDone; if(lastData)render(lastData);}
 function toggleShellsDone(){showShellsDone=!showShellsDone; if(lastData)render(lastData);}
+function toggleAgentSessDone(){showAgentSessDone=!showAgentSessDone; if(lastData)render(lastData);}
 function openTodo(i){
   const t=curTodos[i]; if(!t)return;
   _setNav(openTodo,i,curTodos.length);
