@@ -779,15 +779,13 @@ def parse_session(path):
     # merge background-agent file edits into the shared files shape so they show in
     # the Files panel (and the counts) — e.g. an agent editing inside a worktree.
     for fp, ae in agent_files.items():
-        existed = fp in files
         e = files.setdefault(fp, {"path": fp, "ops": 0, "created": ae["created"]})
         e["ops"] += ae["ops"]
         if ae.get("last") and (not e.get("last") or ae["last"] > e["last"]):
             e["last"] = ae["last"]
         if ae["created"]:
             e["created"] = True
-        if not existed:
-            e["agent"] = True                     # only the main session never touched it
+        e["agent"] = True     # a background agent created/updated it — mark it even if the main session also touched it
     shells = parse_shells(path)
     meta["title"] = (load_titles().get(sid) or meta.get("customTitle") or meta.get("aiTitle")
                      or (_short_title(requests[0]["text"]) if requests else ""))

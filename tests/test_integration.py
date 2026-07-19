@@ -538,5 +538,75 @@ class TestBundle(unittest.TestCase):
         self.assertNotIn("from .", src)         # no leftover intra-package imports
 
 
+class TestCoverageGaps(unittest.TestCase):
+    """High-value gaps across modules: liveness-constant parity, provider isolation,
+    multi-pin ordering, atomic store writes, and Claude search AND-semantics."""
+
+    def setUp(self):
+        self.snap = _snap(); _empty_env()
+
+    def tearDown(self):
+        _restore(self.snap)
+
+    def test_live_constant_matches_server(self):
+        # the one-liveness-constant invariant: the page's LIVE must equal server LIVE_WINDOW
+        import re
+        m = re.search(r"const\s+LIVE\s*=\s*(\d+)", build_page())
+        self.assertIsNotNone(m, "LIVE const must be present in the served page")
+        self.assertEqual(int(m.group(1)), int(config.LIVE_WINDOW))
+
+    def test_broken_provider_isolated(self):
+        # one provider raising in list() must not sink the whole session list
+        from aitracker.registry import all_sessions, PROVIDERS
+        _write_auggie("ok1", "Good one")
+
+        class _Boom:
+            def available(self): return True
+            def list(self): raise RuntimeError("boom")
+        saved = list(PROVIDERS)
+        try:
+            PROVIDERS.append(_Boom())
+            ids = [s["id"] for s in all_sessions()]
+            self.assertIn("auggie:ok1", ids)          # the survivor is still listed
+        finally:
+            PROVIDERS[:] = saved
+
+    def test_multiple_pins_keep_recency(self):
+        from aitracker.registry import all_sessions
+        config.PINS_FILE = os.path.join(tempfile.mkdtemp(), "pins.json")
+        for sid, mod in [("a", "2026-07-16T10:00:00Z"), ("b", "2026-07-16T11:00:00Z"), ("c", "2026-07-16T12:00:00Z")]:
+            json.dump({"sessionId": sid, "modified": mod, "customTitle": sid,
+                       "chatHistory": [{"finishedAt": mod, "exchange": {"request_message": "hi", "response_text": "ok"}}]},
+                      open(os.path.join(config.AUGGIE_SESSIONS, sid + ".json"), "w"))
+        _auggie._AUGGIE_LIST_CACHE.clear()
+        json.dump(["auggie:a", "auggie:c"], open(config.PINS_FILE, "w"))
+        ids = [s["id"] for s in all_sessions()]
+        self.assertLess(ids.index("auggie:c"), ids.index("auggie:a"))   # among pinned, newest first
+        self.assertLess(ids.index("auggie:a"), ids.index("auggie:b"))   # both pinned above the unpinned one
+
+    def test_store_roundtrip_and_corrupt_tolerance(self):
+        from aitracker.store import _save_json, _load_json
+        p = os.path.join(tempfile.mkdtemp(), "d.json")
+        _save_json(p, {"x": [1, 2]})
+        self.assertEqual(_load_json(p, None), {"x": [1, 2]})
+        self.assertFalse(os.path.exists(p + ".tmp"))            # atomic: the temp file is swapped away
+        open(p, "w").write("{ not valid json")
+        self.assertEqual(_load_json(p, "DEFAULT"), "DEFAULT")   # corrupt file -> default, never throws
+
+    def test_claude_search_and_semantics(self):
+        from aitracker.registry import search_all
+        d = os.path.join(config.PROJECTS, "p"); os.makedirs(d)
+        def _wr(name, text):
+            open(os.path.join(d, name + ".jsonl"), "w").write(json.dumps(
+                {"cwd": "/p", "entrypoint": "cli", "timestamp": "2026-06-01T00:00:00Z",
+                 "message": {"role": "user", "content": text}}) + "\n")
+        _wr("aaa", "please fix the auth bug now")
+        _wr("bbb", "unrelated deploy notes")
+        _claude._META_CACHE.clear()
+        ids = [r["id"] for r in search_all("auth bug")]
+        self.assertIn("aaa", ids)                # both terms present -> match
+        self.assertNotIn("bbb", ids)             # a term missing -> excluded (AND semantics)
+
+
 if __name__ == "__main__":
     unittest.main()

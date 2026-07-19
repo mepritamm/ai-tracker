@@ -112,6 +112,17 @@ def _run():
     assert len(ds["agents_bg"]) == 1 and "background agent" in ds["overview"]["now"], ds["overview"]["now"]
     afile = next((x for x in ds["files"] if x["path"] == "/x/.worktrees/wt/auth.py"), None)
     assert afile and afile.get("agent"), "agent-edited file must surface in files, tagged"  # the gap
+    # a file BOTH the main session and an agent touch must STILL carry the 🤖 marker
+    # ("created OR updated by the agent") — not only files the main session never touched.
+    with open(spath, "a") as f:
+        f.write(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Write", "input": {"file_path": "/x/shared.py"}}]}}) + "\n")
+    with open(os.path.join(adir, "agent-deadbeef00.jsonl"), "a") as f:
+        f.write(json.dumps({"type": "assistant", "timestamp": "2026-06-22T10:02:00Z", "message": {"content": [
+            {"type": "tool_use", "name": "Edit",
+             "input": {"file_path": "/x/shared.py", "old_string": "a", "new_string": "b"}}]}}) + "\n")
+    shared = next((x for x in parse_session(spath)["files"] if x["path"] == "/x/shared.py"), None)
+    assert shared and shared.get("agent"), "a file touched by BOTH main and an agent stays tagged 🤖"  # the fix
 
     # live window: activity within 5 min counts as live; older does not
     af = os.path.join(adir, "agent-deadbeef00.jsonl")
@@ -194,6 +205,14 @@ def _run():
     assert _agent_group("/repo/x", "cli") == ("", ""), "human sessions are never agents"
     assert _pick_parent(500, [("A", 100), ("B", 400), ("C", 900)]) == "B", "latest start <= agent"
     assert _pick_parent(50, [("A", 100), ("B", 400)]) == "A", "predates all -> earliest human"
+    # order-independent on ties, so the sidebar (mtime order) and the detail panel (glob order) agree;
+    # and a start-less session (first==0, its first line not yet written) is 'unknown', never 'earliest'
+    assert _pick_parent(500, [("a", 100), ("b", 100)]) == _pick_parent(500, [("b", 100), ("a", 100)]), "tie must not depend on feed order"
+    assert _pick_parent(100, [("hnew", 0.0), ("hreal", 500)]) == "hreal", "a first=0 session is not the earliest fallback"
+    from aitracker.util import _ts_epoch, _iso_epoch as _ie
+    assert _ts_epoch("2026-06-01T00:00:00.750Z") > _ts_epoch("2026-06-01T00:00:00.100Z"), "_ts_epoch keeps sub-second order"
+    assert _ie("2026-06-01T00:00:00.750Z") == _ie("2026-06-01T00:00:00.100Z"), "_iso_epoch floors to the whole second"
+    assert _ts_epoch("") == 0.0 and _ts_epoch("nonsense") == 0.0, "_ts_epoch tolerates junk"
     pdir = tempfile.mkdtemp(); config.PROJECTS = pdir
     WT = "/repo/x/.claude/worktrees/wt-a"
     d1 = os.path.join(pdir, "-repo-x--claude-worktrees-wt-a"); os.makedirs(d1)
