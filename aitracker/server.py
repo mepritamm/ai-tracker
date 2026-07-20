@@ -5,8 +5,8 @@ from . import config                       # referenced live (config.AUTH) so te
 from .config import LIVE_WINDOW, NARR_PAGE
 from .page import build_page
 from .registry import all_sessions, parse_any, search_all
-from .store import load_flags, save_flags, load_titles, load_pins, _load_json, _save_json
-from .config import TITLES_FILE, FLAGS_FILE, PINS_FILE
+from .store import load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, _load_json, _save_json
+from .config import TITLES_FILE, FLAGS_FILE, PINS_FILE, NOTES_FILE
 from .providers.claude import find_session, file_diffs, command_output, shell_output, agent_detail
 
 
@@ -211,6 +211,32 @@ class Handler(BaseHTTPRequestHandler):
         elif p.path == "/api/flags/delete":
             save_flags([f for f in flags if f["id"] != body.get("id")])
             self._json({"ok": True})
+        elif p.path == "/api/notes":
+            sid = body.get("session", "")
+            text = (body.get("text") or "").strip()
+            if not sid or not text:
+                self._json({"error": "session and text required"}, 400)
+                return
+            notes = load_notes()
+            notes.setdefault(sid, []).append(text[:2000])
+            save_notes(notes)
+            self._json({"ok": True, "notes": notes[sid]})
+        elif p.path == "/api/notes/delete":
+            sid = body.get("session", "")
+            idx = body.get("index")
+            if not sid or idx is None:
+                self._json({"error": "session and index required"}, 400)
+                return
+            notes = load_notes()
+            stack = notes.get(sid, [])
+            if isinstance(idx, int) and 0 <= idx < len(stack):
+                stack.pop(idx)
+                if stack:
+                    notes[sid] = stack
+                else:
+                    notes.pop(sid, None)
+                save_notes(notes)
+            self._json({"ok": True, "notes": notes.get(sid, [])})
         else:
             self.send_error(404)
 

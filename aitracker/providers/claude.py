@@ -3,7 +3,7 @@ from ..config import EDIT_TOOLS, LIVE_WINDOW, NARRATION_CAP
 from .. import config
 from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, prs_sorted, pr_worked, PR_CREATE_RE
 from ..overview import build_overview
-from ..store import load_titles, load_tasks
+from ..store import load_titles, load_tasks, load_notes
 from .base import Provider
 
 
@@ -821,6 +821,7 @@ def parse_session(path):
         },
         "mtime": max(st.st_mtime, newest_agent),  # background agents keep it "live"
         "now": time.time(),
+        "notes": load_notes().get(os.path.basename(path)[:-6], []),
     }
     result["overview"] = build_overview(result, todos, result["files"], cmds, commits,
                                          tests, agents, requests, narrative, agents_bg,

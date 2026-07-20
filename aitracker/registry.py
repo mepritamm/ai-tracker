@@ -1,6 +1,6 @@
 from .providers.claude import ClaudeProvider
 from .providers.auggie import AuggieProvider
-from .store import load_pins
+from .store import load_pins, load_notes
 
 
 PROVIDERS = [ClaudeProvider(), AuggieProvider()]
@@ -16,8 +16,11 @@ def all_sessions():
         except Exception:
             pass  # one broken provider must not sink the whole list
     pins = set(load_pins())                       # user-pinned ids, read live
+    notes = load_notes()                          # per-session note stacks, read live
     for s in out:
-        s["pinned"] = s.get("id") in pins
+        sid = s.get("id", "")
+        s["pinned"] = sid in pins
+        s["note_count"] = len(notes.get(sid, []))
     out.sort(key=lambda s: (not s.get("pinned"), -s.get("mtime", 0)))   # pinned first, then newest
     return out
 

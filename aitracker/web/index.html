@@ -83,6 +83,16 @@
     <h2><span>Progress</span><span class=cnt id=todoc></span></h2>
     <div class=cbody style="padding:6px 8px;max-height:300px" id=todos><div class=empty>—</div></div>
   </div>
+  <div class=card id=notespanel>
+    <h2><span>📝 Notes</span><span class=cnt id=notec style=color:#a78bfa></span></h2>
+    <div class=cbody style=max-height:320px>
+      <div class=flagwrap id=notes_list><div class=empty>no notes yet</div></div>
+      <div class=noteadd>
+        <textarea id=noteinput placeholder="Plan ahead — type a note for this session…" rows=2></textarea>
+        <button class=addflag onclick=addNote()>📝 Add note</button>
+      </div>
+    </div>
+  </div>
   <div class=card>
     <h2><span>🚩 Flags</span><span class=cnt id=flagc style=color:#f85149></span></h2>
     <div class=cbody style=max-height:300px>

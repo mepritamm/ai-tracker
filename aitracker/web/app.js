@@ -151,9 +151,10 @@ function sessionRow(s,now,ex){
   const kidchip=ex?` · <span class=agentbadge title="agent sessions this one spawned">🤖 ${ex.live?ex.live+" live / ":""}${ex.n} agent${ex.n==1?"":"s"}</span>`:"";
   // a parent row: clicking the title toggles its agents too (not just the 🤖 button) while still opening it
   const onclick=ex?`pickToggle('${s.id}','${encodeURIComponent(ex.gk)}')`:`pick('${s.id}')`;
+  const noteBadge=s.note_count?`<span class=notebadge title="${s.note_count} note${s.note_count==1?'':'s'}">📝${s.note_count}</span>`:"";
   return `<div class="sitem ${s.id===cur?'active':''}${s.pinned?' pinned':''}${s.agent?' agentrow':''}${ex?' hasagents':''}" onclick="${onclick}" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
     `<div class=srow1>${chev}<span class="dot ${live?'live':''}"></span><span class=nm>${s.agent?'🤖 ':''}${esc(label)}</span>`+
-    `<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">📌</span>`+
+    `${noteBadge}<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">📌</span>`+
     `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename this session">✎</span></div>`+
     `<div class=smeta>${s.agent?'<span class=agentbadge>🤖 Agent</span> · ':''}${bits.join(" · ")}${kidchip}</div></div>`;
 }
@@ -393,6 +394,9 @@ function render(d){
 
   $("srcnote").style.display=d.note?"block":"none";
   $("srcnote").textContent=d.note||"";
+
+  // per-session notes stack (plan-ahead notes the user wrote, newest-first display)
+  renderNotes(d.notes||[]);
 
   // summary (markdown + click to read full)
   const ov=d.overview||{};
@@ -760,6 +764,47 @@ function flashTo(id){
   setTimeout(()=>el.classList.remove("flash"),1400);
 }
 document.addEventListener("keydown",e=>{if(e.key==="Escape"){closeDiff();closeMsg();}});
+// ---- per-session notes stack ----
+function renderNotes(notes){
+  const el=$("notes_list"), nc=$("notec");
+  if(!el)return;
+  nc.textContent=notes.length||"";
+  // display newest-first (server stores in append order; reverse for display)
+  const rev=[...notes].reverse();
+  el.innerHTML=rev.length?rev.map((txt,ri)=>{
+    const idx=notes.length-1-ri;   // actual index in the server's array (for delete)
+    return `<div class=noteitem>`+
+      `<div class=ntxt>${esc(txt)}</div>`+
+      `<div class=nft>`+
+        `<span class="link blue" onclick="copyNote(${idx})" title="Copy to clipboard">⧉ copy</span>`+
+        `<span class="link grey" onclick="removeNote(${idx})">✕ remove</span>`+
+      `</div></div>`;
+  }).join(""):`<div class=empty>no notes yet</div>`;
+}
+async function addNote(){
+  if(!cur){alert("Pick a session first");return}
+  const inp=$("noteinput");
+  const text=(inp.value||"").trim();
+  if(!text)return;
+  const r=await fetch("/api/notes",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({session:cur,text})});
+  if(r.ok){inp.value="";if(lastData)lastData.notes=(await r.json()).notes||[];renderNotes(lastData.notes||[]);renderSide();}
+}
+async function removeNote(idx){
+  if(!cur)return;
+  const r=await fetch("/api/notes/delete",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({session:cur,index:idx})});
+  if(r.ok){const j=await r.json();if(lastData)lastData.notes=j.notes||[];renderNotes(lastData.notes||[]);renderSide();}
+}
+function copyNote(idx){
+  if(!lastData)return;
+  const txt=(lastData.notes||[])[idx]||"";
+  if(!txt)return;
+  const done=()=>{};
+  if(navigator.clipboard){navigator.clipboard.writeText(txt).catch(()=>{});}
+  else{const el=document.createElement("textarea");el.value=txt;document.body.appendChild(el);el.select();try{document.execCommand("copy");}catch(e){}document.body.removeChild(el);}
+  toast("Note copied","");
+}
 let flags=[];
 async function loadFlags(){try{flags=await(await fetch("/api/flags")).json()}catch(e){return}renderFlags()}
 function renderFlags(){

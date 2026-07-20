@@ -73,3 +73,13 @@ def load_flags():
 def save_flags(flags):
     # ponytail: full rewrite, no locking — fine for a single-user local tool.
     _save_json(config.FLAGS_FILE, flags)
+
+
+def load_notes():
+    """Per-session note stacks: {session_id: [note_text, ...]} — read live."""
+    d = _load_json(config.NOTES_FILE, {})
+    return d if isinstance(d, dict) else {}
+
+
+def save_notes(notes):
+    _save_json(config.NOTES_FILE, notes)

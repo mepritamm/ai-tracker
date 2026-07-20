@@ -22,7 +22,7 @@ from aitracker.util import _first_line, _iso_epoch
 from aitracker.providers import auggie as _auggie
 from aitracker.providers import claude as _claude
 
-_PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "TASKS_DIR")
+_PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "TASKS_DIR", "NOTES_FILE")
 
 
 def _snap():
@@ -42,6 +42,7 @@ def _empty_env():
     config.AUGMENT_DIR = tempfile.mkdtemp()
     config.AUGGIE_SESSIONS = os.path.join(config.AUGMENT_DIR, "sessions")
     os.makedirs(config.AUGGIE_SESSIONS)
+    config.NOTES_FILE = tempfile.mktemp(suffix=".json")
     _auggie._AUGGIE_LIST_CACHE.clear()
     _claude._META_CACHE.clear()
 
@@ -72,6 +73,8 @@ class TestBuildPage(unittest.TestCase):
         self.assertIn("max-width:600px", p)    # the phone responsive block is baked in
         self.assertIn("min-width:601px", p)    # the tablet master-detail block is baked in
         self.assertIn(".remote .addflag", p)   # flag button hidden for remote (non-localhost) viewers
+        self.assertIn("notes_list", p)          # notes stack panel baked into page
+        self.assertIn("addNote", p)             # notes JS function present
 
 
 class TestSearchAllRanking(unittest.TestCase):
@@ -121,6 +124,15 @@ class TestServerEndToEnd(unittest.TestCase):
         c.close()
         return r.status, body
 
+    def _post(self, path, payload):
+        body = json.dumps(payload).encode()
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("POST", path, body=body, headers={"Content-Type": "application/json", "Content-Length": str(len(body))})
+        r = c.getresponse()
+        resp = r.read()
+        c.close()
+        return r.status, json.loads(resp)
+
     def test_serves_page(self):
         st, body = self._get("/")
         self.assertEqual(st, 200)
@@ -153,6 +165,41 @@ class TestServerEndToEnd(unittest.TestCase):
     def test_unknown_route_404(self):
         st, _ = self._get("/api/nope")
         self.assertEqual(st, 404)
+
+    def test_notes_add_and_delete(self):
+        # add two notes
+        st, j = self._post("/api/notes", {"session": "sess-x", "text": "first plan"})
+        self.assertEqual(st, 200)
+        self.assertEqual(j["notes"], ["first plan"])
+
+        st, j = self._post("/api/notes", {"session": "sess-x", "text": "second plan"})
+        self.assertEqual(st, 200)
+        self.assertEqual(j["notes"], ["first plan", "second plan"])
+
+        # delete index 0 (first note)
+        st, j = self._post("/api/notes/delete", {"session": "sess-x", "index": 0})
+        self.assertEqual(st, 200)
+        self.assertEqual(j["notes"], ["second plan"])
+
+        # delete the last note — stack cleaned up
+        st, j = self._post("/api/notes/delete", {"session": "sess-x", "index": 0})
+        self.assertEqual(st, 200)
+        self.assertEqual(j["notes"], [])
+
+    def test_notes_empty_text_rejected(self):
+        st, j = self._post("/api/notes", {"session": "sess-y", "text": "   "})
+        self.assertEqual(st, 400)
+
+    def test_notes_missing_session_rejected(self):
+        st, j = self._post("/api/notes", {"text": "oops"})
+        self.assertEqual(st, 400)
+
+    def test_notes_invalid_index_is_noop(self):
+        self._post("/api/notes", {"session": "sess-z", "text": "note"})
+        # out-of-range index: no crash, note still there
+        st, j = self._post("/api/notes/delete", {"session": "sess-z", "index": 99})
+        self.assertEqual(st, 200)
+        self.assertEqual(j["notes"], ["note"])
 
 
 class TestBasicAuth(unittest.TestCase):

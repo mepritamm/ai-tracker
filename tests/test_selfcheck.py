@@ -10,7 +10,7 @@ import unittest
 
 from aitracker import config
 from aitracker.util import _short_title, _window, _git_branch
-from aitracker.store import load_flags, save_flags, load_titles, load_tasks, _save_json
+from aitracker.store import load_flags, save_flags, load_titles, load_tasks, load_notes, save_notes, _save_json
 from aitracker.registry import parse_any
 from aitracker.providers.claude import (
     parse_session, parse_agents, parse_shells, _match_content, _active_mtime,
@@ -358,4 +358,27 @@ def _run():
     _save_json(config.TITLES_FILE, {"sess-1": "My Custom Name"})
     assert load_titles()["sess-1"] == "My Custom Name"
     os.unlink(config.TITLES_FILE)
+
+    # notes stack round-trip
+    config.NOTES_FILE = tempfile.mktemp(suffix=".json")
+    assert load_notes() == {}                                         # missing file -> empty dict
+    save_notes({"sess-a": ["plan step 1", "plan step 2"]})
+    ns = load_notes()
+    assert ns["sess-a"] == ["plan step 1", "plan step 2"], ns
+    ns["sess-a"].pop(0)                                               # remove first note
+    save_notes(ns)
+    assert load_notes()["sess-a"] == ["plan step 2"]
+    os.unlink(config.NOTES_FILE)
+
+    # parse_session includes notes key
+    config.NOTES_FILE = tempfile.mktemp(suffix=".json")
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+        f.write(json.dumps({"type": "user", "cwd": "/x", "message": {"role": "user", "content": "go"}}) + "\n")
+        note_sid = os.path.basename(f.name)[:-6]
+        note_path = f.name
+    save_notes({note_sid: ["remember this"]})
+    dn = parse_session(note_path)
+    os.unlink(note_path)
+    os.unlink(config.NOTES_FILE)
+    assert dn["notes"] == ["remember this"], dn.get("notes")
     print("selfcheck ok")
