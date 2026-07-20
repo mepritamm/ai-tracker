@@ -193,7 +193,10 @@ async function loadSide(){
   try{sessions=await(await fetch("/api/list")).json();}catch(e){return}
   renderSide();
 }
-function pick(id){$("sid").value=id;track();renderSide();}   // renderSide auto-expands the selected agent's container (once per selection)
+function pick(id){$("sid").value=id;track();renderSide();closeDrawer();}   // renderSide auto-expands the selected agent's container; closeDrawer no-ops off-phone
+// mobile Sessions drawer (phones only; CSS gates the affordances to ≤600px)
+function toggleDrawer(){document.querySelector(".app").classList.toggle("draweropen");}
+function closeDrawer(){document.querySelector(".app").classList.remove("draweropen");}
 async function doSearch(){
   const q=$("q").value.trim();
   if(!q){clearSearch();return}

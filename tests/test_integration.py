@@ -74,6 +74,10 @@ class TestBuildPage(unittest.TestCase):
         self.assertIn("min-width:601px", p)    # the tablet master-detail block is baked in
         self.assertIn(".remote .addflag", p)   # flag button hidden for remote (non-localhost) viewers
         self.assertIn("notes_list", p)          # notes stack panel baked into page
+        # mobile: Sessions is a left slide-in drawer (hamburger + scrim + off-canvas rule)
+        self.assertIn("toggleDrawer", p)
+        self.assertIn("id=scrim", p)
+        self.assertIn(".app.draweropen .side", p)
         self.assertIn("addNote", p)             # notes JS function present
 
 

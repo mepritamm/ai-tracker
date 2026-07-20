@@ -256,6 +256,10 @@ a{color:#4c8dff}
 .dectime{margin-top:6px;font-size:11px;color:#6b7585;font-family:'JetBrains Mono',monospace}
 .diffexp{cursor:pointer;color:#4c8dff;background:#0d1622;border-top:1px solid #1c2330;border-bottom:1px solid #1c2330;padding:2px 12px;font-size:11px;user-select:none}
 .diffexp:hover{background:#12203a}
+/* mobile "Sessions" drawer affordances — hidden off-phone, activated in the ≤600 block below */
+.hbtn{display:none;align-items:center;justify-content:center;width:38px;height:38px;flex:0 0 auto;background:#10141c;border:1px solid #2c333f;border-radius:9px;color:#c9d4e0;font-size:17px;cursor:pointer;margin-bottom:12px;line-height:1}
+.hbtn:hover{border-color:#4c8dff;color:#fff}
+.scrim{display:none;position:fixed;inset:0;background:rgba(4,6,10,.55);z-index:55;opacity:0;pointer-events:none;transition:opacity .25s}
 @media(max-width:900px){.app{flex-direction:column}.side{width:100%;flex:none;max-height:38vh}}
 /* tablets (portrait ~768–834, iPad/Android): keep the sidebar beside content (master-detail),
    not the phone top-strip. After the 900 rule so it wins in the 601–900 overlap. */
@@ -270,7 +274,12 @@ a{color:#4c8dff}
   .htop h2{font-size:17px}
   .body{padding:12px 12px 24px;gap:12px}
   .card h2{padding:10px 12px}
-  .side{max-height:32vh}
+  /* Sessions becomes a left slide-in drawer (was a top strip) */
+  .side{position:fixed;left:0;top:0;bottom:0;z-index:60;width:86vw;max-width:320px;max-height:none;flex:none;transform:translateX(-100%);transition:transform .25s ease;box-shadow:2px 0 18px rgba(0,0,0,.5)}
+  .app.draweropen .side{transform:none}
+  .scrim{display:block}
+  .app.draweropen .scrim{opacity:1;pointer-events:auto}
+  .hbtn{display:flex}
   .overlay{padding:6px}
   .modal{max-height:94vh}
   .modal .mh{flex-wrap:wrap;gap:7px;padding:11px 12px}
