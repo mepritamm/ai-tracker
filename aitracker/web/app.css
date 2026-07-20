@@ -161,9 +161,12 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid #1c2330}
 .flag .ctx{color:#6b7585;font-size:11px;font-style:italic;margin-top:3px}
 .flag .ft{font-family:'JetBrains Mono',monospace;font-size:10.5px;color:#5b6573;margin-top:6px;display:flex;gap:9px}
 .link{cursor:pointer}.link.blue{color:#4c8dff}.link.grey{color:#6b7585}.link:hover{text-decoration:underline}
-.addflag{width:100%;margin-top:2px;background:#10141c;border:1px dashed #2c333f;color:#8b949e;padding:9px;border-radius:9px;font-family:'Source Sans 3',sans-serif;font-size:12.5px;cursor:pointer}
+.addflag,.addnote{width:100%;margin-top:2px;background:#10141c;border:1px dashed #2c333f;color:#8b949e;padding:9px;border-radius:9px;font-family:'Source Sans 3',sans-serif;font-size:12.5px;cursor:pointer}
 .addflag:hover{border-color:#f85149}
-.remote .addflag{display:none}   /* flagging is local-only — hidden on phone/tablet (non-localhost) */
+.addnote:hover{border-color:#a78bfa}
+/* flagging is local-only (it feeds /fix-flags, which runs the AI on this machine) → hidden on
+   phone/tablet. Notes are plain user data, useful from anywhere → NOT hidden on .remote. */
+.remote .addflag{display:none}
 
 /* narration */
 .narr{display:flex;gap:12px;padding:9px 9px;border-bottom:1px solid #161c27;cursor:pointer;border-radius:8px}

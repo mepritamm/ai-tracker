@@ -79,6 +79,12 @@ class TestBuildPage(unittest.TestCase):
         self.assertIn("id=scrim", p)
         self.assertIn(".app.draweropen .side", p)
         self.assertIn("addNote", p)             # notes JS function present
+        # notes must be addable from mobile/tablet (remote host): the Add-note button uses its own
+        # `addnote` class, so the `.remote .addflag{display:none}` rule (local-only flagging) never
+        # hides it. Regression guard for the mobile "can't add a note" bug.
+        self.assertIn("class=addnote", p)                   # note button has its own class
+        self.assertNotIn(".remote .addnote", p)             # …and is NOT hidden on remote
+        self.assertIn(".remote .addflag", p)                # flagging stays local-only (unchanged)
 
 
 class TestSearchAllRanking(unittest.TestCase):

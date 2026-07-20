@@ -42,14 +42,26 @@ next gap.
   `shells` (background bash) are **parallel** panels (`#bgpanel`/`#shpanel`, same `.bggrid`,
   live-first + "Show N finished" + completion toasts). A capability touching one almost always touches
   both — do them together.
+- **Desktop vs mobile/tablet** — the SPA tags the page with a `.remote` class when the host isn't
+  localhost (`location.hostname`), and ships a phone block (`max-width:600px`) + a tablet master-detail
+  block (`min-width:601px`/`max-width:900px`), with Sessions as a slide-in drawer on phones. `.remote`
+  deliberately hides **local-only** actions — 🚩 flagging feeds `/fix-flags`, which runs the AI *on this
+  machine*, so it's pointless from a phone. But a **user-data** capability (rename, 📌 pin, 📝 notes —
+  anything the user merely records) must **not** be gated behind `.remote`: it's exactly what you reach
+  for on a phone. A capability with a button/input isn't done until it works in **all three** viewports —
+  desktop, tablet, phone — served to a *remote* host, not just on localhost desktop. Verify by resizing to
+  a mobile/tablet viewport (or adding the `.remote` class) — a control hidden or unusable there is
+  half-shipped (the exact bug that hid 📝-note entry on mobile: it reused the `.addflag` class the
+  `.remote` rule hides).
 
 ## Step 1 — Frame the gap (name the capability + find the asymmetry)
 Before touching code, state in plain terms:
 1. **The capability, in one line** — what the app should now do, over *all* in-scope sessions/panels
    (not one source, one session, one panel). Quote the source: the user's ask.
 2. **The asymmetry** — does it exist for **Claude** sessions but not **Auggie**? On the **server** but not
-   the **client** (or vice-versa)? For **agents** but not **shells**? Name which side has it and which
-   lacks it. If it exists nowhere, you're adding it to the shared shape/renderer and lighting up all.
+   the **client** (or vice-versa)? For **agents** but not **shells**? On **desktop** but not
+   **mobile/tablet** (hidden by `.remote`, or unusable in the phone/tablet layout)? Name which side has it
+   and which lacks it. If it exists nowhere, you're adding it to the shared shape/renderer and lighting up all.
 3. **The consumers it must reach** — the concrete server hook (a key on the session/result dict, a new
    `/api/*` route) **and** the concrete client hook (`renderSide` for list, `render` for detail, a
    modal). Write both down now; Step 3 wires both, Step 4 proves both.
