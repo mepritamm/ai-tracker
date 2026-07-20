@@ -26,6 +26,16 @@ def _run():
         {"type": "user", "cwd": "/x/proj", "gitBranch": "main", "version": "1.0",
          "message": {"role": "user", "content": "build the thing"}},
         {"type": "user", "message": {"role": "user", "content": "<command-name>/foo</command-name>"}},
+        # a real typed prompt with a pasted image → content is a LIST of blocks; must be captured
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "image", "source": {}},
+            {"type": "text", "text": "fix the parser"}]}},
+        # a slash-command/skill expansion is a separate user message tagged isMeta → NOT a prompt
+        {"type": "user", "isMeta": True, "message": {"role": "user", "content": [
+            {"type": "text", "text": "Base directory for this skill: /x/skills/foo"}]}},
+        # isMeta system notices arrive as a plain STRING too (skill reload, /context) → NOT a prompt
+        {"type": "user", "isMeta": True,
+         "message": {"role": "user", "content": "Skill /foo is already loaded above; instructions unchanged."}},
         {"type": "assistant", "timestamp": "2026-06-22T10:00:00.000Z",
          "message": {"usage": {"input_tokens": 100, "output_tokens": 20},
                      "content": [
@@ -66,11 +76,12 @@ def _run():
     assert c["created"] == 1 and c["read"] == 1, c
     assert d["commits"][0]["msg"] == "add foo", d["commits"]
     assert c["tests"] == 1 and c["tests_failed"] == 1, "failed pytest via is_error link"
-    assert [r["text"] for r in d["requests"]] == ["build the thing"], d["requests"]
+    # string prompt + list-form prompt captured; <command-name>, isMeta expansion, tool_result excluded
+    assert [r["text"] for r in d["requests"]] == ["build the thing", "fix the parser"], d["requests"]
     assert d["tokens"]["in"] == 100
     assert [n["text"] for n in d["narrative"]] == ["starting"], d["narrative"]
     ov = d["overview"]
-    assert ov["goal"] == "build the thing", ov
+    assert ov["goal"] == "fix the parser", ov  # goal = latest prompt (now incl. list-form)
     assert ov["now"] == "▶ doing b", ov
     assert "ouched 1 file(s) (foo.py)" in ov["sofar"], ov
     assert "ran 2 command(s)" in ov["sofar"] and "1 commit" in ov["sofar"], ov

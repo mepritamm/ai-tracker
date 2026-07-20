@@ -698,13 +698,31 @@ def parse_session(path):
             if msg.get("model"):
                 meta["model"] = msg["model"]
             content = msg.get("content")
-            # user prompts arrive as a plain string (tool results are lists)
-            if msg.get("role") == "user" and isinstance(content, str):
-                s = content.strip()
-                if s and not s.startswith("<") and not s.startswith("Caveat:"):
-                    requests.append({"t": ts, "text": s[:8000]})  # full prompt; list clamps preview
-                    collect_prs(prs, s, ts)                        # a PR pasted into a prompt counts
-                continue
+            # user prompts arrive as a plain string, OR — when the message carries an
+            # image/paste/slash-command — as a LIST of blocks (text + maybe image).
+            # Skill/command expansions are separate user messages tagged isMeta; tool
+            # returns are tool_result blocks. Capture the real typed text from either
+            # shape; let tool_result lists fall through to the block loop below.
+            if msg.get("role") == "user":
+                is_toolresult = isinstance(content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+                if not is_toolresult:
+                    # isMeta tags injected system text — skill reloads, /context output,
+                    # command re-invocations — in EITHER string or list shape; never a prompt.
+                    if o.get("isMeta"):
+                        s = ""
+                    elif isinstance(content, str):
+                        s = content.strip()
+                    elif isinstance(content, list):
+                        s = "\n".join(b.get("text", "") for b in content
+                                      if isinstance(b, dict) and b.get("type") == "text").strip()
+                    else:
+                        s = ""
+                    if s and not s.startswith("<") and not s.startswith("Caveat:") \
+                            and not s.startswith("[Request interrupted"):
+                        requests.append({"t": ts, "text": s[:8000]})  # full prompt; list clamps preview
+                        collect_prs(prs, s, ts)                        # a PR pasted into a prompt counts
+                    continue
             if not isinstance(content, list):
                 continue
             for b in content:
