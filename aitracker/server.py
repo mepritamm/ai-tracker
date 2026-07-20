@@ -59,6 +59,11 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                # The whole SPA is inlined here and rebuilt at each server start, so a
+                # restart bakes a new page. Without this, browsers heuristically cache the
+                # doc and a plain reload serves the OLD page (new panels/JS never show until
+                # a hard refresh). no-store => every reload fetches the current page.
+                self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)

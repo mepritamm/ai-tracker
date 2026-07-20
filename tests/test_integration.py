@@ -139,6 +139,17 @@ class TestServerEndToEnd(unittest.TestCase):
         self.assertIn(b"<!doctype", body.lower())
         self.assertIn(b"AI Session Tracker", body)
 
+    def test_page_is_not_cached(self):
+        # the page is rebuilt at each restart; without no-store a plain reload serves the
+        # stale cached doc and new UI never shows. Assert the freshness header is present.
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", "/")
+        r = c.getresponse()
+        r.read()
+        cc = r.getheader("Cache-Control")
+        c.close()
+        self.assertEqual(cc, "no-store")
+
     def test_api_list_is_json(self):
         st, body = self._get("/api/list")
         self.assertEqual(st, 200)
