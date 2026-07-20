@@ -41,6 +41,7 @@ html,body{margin:0;height:100%;background:#0c0f15;color:#e6edf3;font-family:'Sou
 .smeta{display:flex;align-items:center;gap:6px;color:#6b7585;font-size:11px;font-family:'JetBrains Mono',monospace;flex-wrap:wrap}
 .smeta .proj{color:#7d8898}
 .agentbadge{color:#f5b443;background:rgba(245,180,67,.12);border-radius:4px;padding:0 5px;font-size:10px}
+.agentbadge.runs{flex:0 0 auto;font-family:'JetBrains Mono',monospace}
 /* collapsible per-repo group of background-agent (SDK) sessions in the sidebar */
 .agrp{margin-bottom:4px}
 .agrphdr{display:flex;align-items:center;gap:7px;padding:9px 12px;border-radius:10px;cursor:pointer;color:#c9d4e0;user-select:none;border:1px solid transparent}

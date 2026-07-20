@@ -155,19 +155,26 @@ def child_agent_sessions(sid, projdir):
     if not agents:
         return []
     titles = load_titles()
-    out = []
+    # Collapse re-runs of the SAME agent: an orchestrator re-spawns a finding many times (one sdk-cli
+    # session each), which inflated the count. Group by task (the agent's first prompt) so each distinct
+    # agent is one entry — representative = the most recent run (the open target) — with runs=N executions.
+    groups = {}
     for fid, f, sm in agents:
         if _pick_parent(sm["first"], humans) != sid:
             continue
         mt = _active_mtime(f)
-        out.append({
-            "id": fid,
-            "title": titles.get(fid) or sm["title"],
-            "wt": _worktree_name(sm["cwd"]),
-            "running": (time.time() - mt) < LIVE_WINDOW,
-            "mtime": mt,
-        })
-    out.sort(key=lambda r: r["mtime"], reverse=True)
+        running = (time.time() - mt) < LIVE_WINDOW
+        key = sm["prompt"] or sm["title"] or fid
+        g = groups.get(key)
+        if g is None:
+            groups[key] = {"id": fid, "title": titles.get(fid) or sm["title"], "wt": _worktree_name(sm["cwd"]),
+                           "running": running, "mtime": mt, "runs": 1}
+        else:
+            g["runs"] += 1
+            g["running"] = g["running"] or running
+            if mt >= g["mtime"]:                       # newest run represents the group
+                g["mtime"] = mt; g["id"] = fid; g["title"] = titles.get(fid) or sm["title"]
+    out = sorted(groups.values(), key=lambda r: r["mtime"], reverse=True)
     return out
 
 

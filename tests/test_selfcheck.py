@@ -239,9 +239,19 @@ def _run():
     assert not ls["orchR"]["agent"] and ls["orchR"]["parentId"] == "", ls["orchR"]
     kb = child_agent_sessions("orchB", d1)           # detail uses the SAME dir-scoped set as the sidebar
     assert [k["id"] for k in kb] == ["ag_late"] and kb[0]["wt"] == "wt-a", kb
+    assert kb[0]["runs"] == 1, kb                    # a single-run agent reports runs=1
     assert [k["id"] for k in child_agent_sessions("orchA", d1)] == ["ag_mid"], "each orchestrator gets its own agents"
     assert [k["id"] for k in child_agent_sessions("orchR", d3)] == ["ag_root"], "repo-root orchestrator surfaces its agent"
     assert child_agent_sessions("ag_late", d1) == [], "an agent is not the orchestrator of its siblings"
+    # re-runs of the SAME agent (identical task/first-prompt) collapse to ONE entry so the count isn't
+    # inflated; the most-recently-active run represents the group (the open target) and runs=N counts them.
+    _mk(d1, "ag_late2.jsonl", WT, "sdk-cli", "2026-06-01T13:00:00Z", "finding 1")  # re-run of ag_late's task
+    _mk(d1, "ag_late3.jsonl", WT, "sdk-cli", "2026-06-01T12:45:00Z", "finding 1")  # a third run
+    for fn, age in [("ag_late.jsonl", 300), ("ag_late3.jsonl", 200), ("ag_late2.jsonl", 100)]:
+        os.utime(os.path.join(d1, fn), (time.time() - age, time.time() - age))     # ag_late2 = newest active
+    dup = child_agent_sessions("orchB", d1)
+    assert [k["id"] for k in dup] == ["ag_late2"], "same task collapses; the freshest run represents it"
+    assert dup[0]["runs"] == 3, dup                     # three executions counted, one row
 
     # auggie (Augment CLI) sessions from ~/.augment/sessions + todos from task-storage
     config.AUGMENT_DIR = tempfile.mkdtemp()

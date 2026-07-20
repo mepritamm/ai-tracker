@@ -98,10 +98,12 @@ function renderSide(){
     if(!s.pinned && s.agent && s.group){ (buckets[s.group]||(buckets[s.group]={key:s.group,label:s.groupLabel||s.group,kids:[]})).kids.push(s); return; }
     items.push({t:"s",mtime:s.mtime,s,pinned:s.pinned});
   });
-  // parents carry their children; a live agent bubbles its parent up the recency sort.
-  items.forEach(it=>{ if(it.t==="s" && kids[it.s.id]){ it.kids=kids[it.s.id];
+  // parents carry their children; a live agent bubbles its parent up the recency sort. Collapse re-runs
+  // of the same agent (same task) so the count isn't inflated — one row per task, ×N runs, newest opens.
+  items.forEach(it=>{ if(it.t==="s" && kids[it.s.id]){ it.kids=collapseAgents(kids[it.s.id]);
     it.mtime=Math.max(it.mtime,...it.kids.map(k=>k.mtime)); }});
   Object.values(buckets).forEach(b=>{
+    b.kids=collapseAgents(b.kids);
     b.mtime=Math.max(...b.kids.map(k=>k.mtime));
     b.live=b.kids.filter(k=>now-k.mtime<LIVE).length;
     items.push({t:"g",mtime:b.mtime,b,pinned:false});
@@ -154,9 +156,22 @@ function sessionRow(s,now,ex){
   const noteBadge=s.note_count?`<span class=notebadge title="${s.note_count} note${s.note_count==1?'':'s'}">📝${s.note_count}</span>`:"";
   return `<div class="sitem ${s.id===cur?'active':''}${s.pinned?' pinned':''}${s.agent?' agentrow':''}${ex?' hasagents':''}" onclick="${onclick}" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
     `<div class=srow1>${chev}<span class="dot ${live?'live':''}"></span><span class=nm>${s.agent?'🤖 ':''}${esc(label)}</span>`+
-    `${noteBadge}<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">📌</span>`+
+    `${noteBadge}`+
+    (s._runs>1?`<span class="agentbadge runs" title="ran ${s._runs}× — collapsed; opens the latest">×${s._runs}</span>`:"")+
+    `<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">📌</span>`+
     `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename this session">✎</span></div>`+
     `<div class=smeta>${s.agent?'<span class=agentbadge>🤖 Agent</span> · ':''}${bits.join(" · ")}${kidchip}</div></div>`;
+}
+// collapse agent sessions that are re-runs of the same task (first prompt) into one row, newest as
+// representative, with _runs=N — so a finding re-executed 12× shows once, not twelve times.
+function collapseAgents(arr){
+  const by=new Map();
+  for(const s of arr){
+    const key=s.prompt||s.title||s.id, g=by.get(key);
+    if(!g){ by.set(key,Object.assign({},s,{_runs:1})); }
+    else { const r=g._runs+1; if(s.mtime>=g.mtime)Object.assign(g,s); g._runs=r; }
+  }
+  return [...by.values()];
 }
 let expandedGroups=new Set(JSON.parse(localStorage.getItem("agrpOpen")||"[]"));
 let autoExpandedFor=null;   // last selection we auto-expanded a container for (fires once per change)
@@ -342,8 +357,9 @@ function render(d){
     if(asx.length){
       // live agent sessions shown; finished ones tucked behind a disclosure (they can number in the dozens)
       const asCard=a=>
-        `<div class="agent clk agentrow" onclick="pick('${a.id}')" title="Open this agent session">`+
+        `<div class="agent clk agentrow" onclick="pick('${a.id}')" title="Open this agent session${a.runs>1?' ('+a.runs+' runs — opens the latest)':''}">`+
         `<div class=top><span class="dot ${a.running?'live':''}"></span><span class=nm>🤖 ${esc(a.title||a.wt||a.id.slice(0,8))}</span>`+
+        (a.runs>1?` <span class=tag title="ran ${a.runs}× — collapsed">×${a.runs}</span>`:"")+
         (a.wt?` <span class=tag>${esc(a.wt.slice(0,16))}</span>`:"")+`<span class=chev>open ›</span></div>`+
         `<div class=ft><span>agent session</span><span>·</span><span style=color:${a.running?'#3fb950':'#6b7585'}>${a.running?'running':'done'}</span>`+
         `${a.mtime?"<span>·</span><span>"+ago(d.now-a.mtime)+"</span>":""}</div></div>`;
