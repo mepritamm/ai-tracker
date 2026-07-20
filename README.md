@@ -77,6 +77,7 @@ Track your agents on the go. Reach the dashboard from a phone/tablet over a priv
 - **Search** by keyword — matches your prompts and the conversation (not the boilerplate); sessions whose *name* matches rank first.
 - **✎ rename** any session to a title that means something to you (saved to `titles.json`).
 - **📌 pin** any session to keep it at the top of the list, above recency (saved to `pins.json`).
+- Sessions with notes show a **📝 N** badge (see the Notes panel below).
 
 **Main view** for the selected session:
 - **Session summary** — Goal, what it's doing *Now*, and a one-line "So far", with stat chips (files, commands, reads, commits, tests, tokens, git branch).
@@ -86,6 +87,7 @@ Track your agents on the go. Reach the dashboard from a phone/tablet over a priv
 - **Narration** — the assistant's own words, step by step, with full markdown rendering (tables, code, lists) in the pop-out modal, and prev/next arrows plus a jump-to-latest (⤒) button across every entry. History is unbounded — older entries page in from the server as you scroll. An open entry stays live: it follows the newest message, or holds your place if you've paged back into history.
 - **Todos**, **Files** (a diff per edit, with GitHub-style **up/down context expansion** and an **Expand all** toggle to reveal the whole file around every edit, plus a Diff ⇄ Rendered-markdown toggle and an "open in new tab" button), **Commands** (with ✓/✗ for Claude), and **Requests**. Files a background agent wrote — e.g. editing inside a git worktree — show too, tagged **🤖 agent**, and stay diffable.
 - Every list panel loads a window and reveals older entries as you scroll to the bottom.
+- **📝 Notes** — a per-session stack of plan-ahead notes: jot what you want to do once an answer lands (or while you wait on another session), and it stays with the session. Add as many as you like; **copy** one back when you need it, **remove** it when done. Sessions with notes carry a **📝 N** badge in the sidebar. Saved to `notes.json`, read live (no restart). Works for every session, any tool.
 - **🚩 Flag** anything you want to fix later — see [Skills](#skills).
 
 ---
@@ -112,7 +114,7 @@ Both providers emit the **same result shape**, so the browser renders them ident
 | Decisions & open questions | ✅ (`AskUserQuestion`) | ✅ (`ask-user` — answer from the next turn's tool result) |
 | Background agents & shells | ✅ | ➖ Auggie has no such model |
 
-**Data files** — `flags.json` (your flags) and `titles.json` (your renames) are read **live** (no restart). Everything else is baked into the page at startup, so **editing `aitracker/` or `web/` needs a server restart** to show.
+**Data files** — `flags.json` (your flags), `titles.json` (your renames), `pins.json` (pinned sessions), and `notes.json` (your notes) are read **live** (no restart). Everything else is baked into the page at startup, so **editing `aitracker/` or `web/` needs a server restart** to show.
 
 ---
 
@@ -190,7 +192,7 @@ CLAUDE.md / AGENTS.md          context for AI agents working in this repo
 .claude/skills/fix-flags/      skill: fix issues you 🚩-flag in the app
 .claude/skills/tracker-gap/    skill: add a capability at the shared seam
 .claude/skills/tracker-push/   skill: commit + publish workflow
-flags.json / titles.json / pins.json   your local data (git-ignored)
+flags.json / titles.json / pins.json / notes.json   your local data (git-ignored)
 ```
 
 ## Testing (mandatory)

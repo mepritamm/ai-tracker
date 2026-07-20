@@ -5,6 +5,7 @@ pins.json
 notes.json
 .claude/launch.json
 .claude/skills/tracker-push/
+.claude/worktrees/
 
 # Python
 __pycache__/
