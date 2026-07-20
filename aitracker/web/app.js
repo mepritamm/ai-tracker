@@ -694,7 +694,7 @@ function openLastFile(e){
           setTimeout(()=>el.classList.remove("flash"), 1500); }
   openDiff(0);                          // curFiles[0] = most recently updated file
 }
-function openReq(i){const r=curReqs[i]; if(!r)return; _setNav(openReq,i,curReqs.length,{len:()=>curReqs.length,live:true}); openText("Request",tago(r.t),r.text);}
+function openReq(i){const r=curReqs[i]; if(!r)return; _setNav(openReq,i,curReqs.length,{len:()=>curReqs.length,live:true}); openText("Prompt",tago(r.t),r.text);}
 async function openCmd(i){
   const x=curCmds[i]; if(!x||!cur)return;
   _setNav(openCmd,i,curCmds.length);
