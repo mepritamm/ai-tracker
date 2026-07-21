@@ -156,9 +156,14 @@ function sessionRow(s,now,ex){
   // a parent row: clicking the title toggles its agents too (not just the 🤖 button) while still opening it
   const onclick=ex?`pickToggle('${s.id}','${encodeURIComponent(ex.gk)}')`:`pick('${s.id}')`;
   const noteBadge=s.note_count?`<span class=notebadge title="${s.note_count} note${s.note_count==1?'':'s'}">📝${s.note_count}</span>`:"";
-  return `<div class="sitem ${s.id===cur?'active':''}${s.pinned?' pinned':''}${s.agent?' agentrow':''}${ex?' hasagents':''}" onclick="${onclick}" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
+  // end-state: waiting on your answer (wins, even while still live) > completed its last run (idle only)
+  const status=s.waiting?"waiting":(s.ended&&!live?"done":"");
+  const statusBadge=status==="waiting"
+    ?`<span class="statusbadge waiting" title="waiting for your answer — respond in the session">⏳ answer</span>`
+    :status==="done"?`<span class="statusbadge done" title="completed its last run">✅ done</span>`:"";
+  return `<div class="sitem ${s.id===cur?'active':''}${s.pinned?' pinned':''}${s.agent?' agentrow':''}${ex?' hasagents':''}${status?' '+status:''}" onclick="${onclick}" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
     `<div class=srow1>${chev}<span class="dot ${live?'live':''}"></span><span class=nm>${s.agent?'🤖 ':''}${esc(label)}</span>`+
-    `${noteBadge}`+
+    `${statusBadge}${noteBadge}`+
     (s._runs>1?`<span class="agentbadge runs" title="ran ${s._runs}× — collapsed; opens the latest">×${s._runs}</span>`:"")+
     `<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">📌</span>`+
     `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename this session">✎</span></div>`+

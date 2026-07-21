@@ -99,6 +99,28 @@ def _auggie_first_request(chat):
     return ""
 
 
+def _auggie_state(chat):
+    """(waiting, ended) for the sidebar — parity with Claude's _tail_fields. `waiting`:
+    an ask-user is still unanswered. `ended`: the last exchange finished with an assistant
+    response (Auggie's 'completed last run'). Answers to ask-user arrive as a later
+    exchange's request_nodes tool_result_node."""
+    open_asks, last_resp = set(), False
+    for m in chat or []:
+        ex = m.get("exchange") or {}
+        for rn in ex.get("request_nodes") or []:
+            trn = rn.get("tool_result_node") if isinstance(rn, dict) else None
+            if isinstance(trn, dict):
+                open_asks.discard(trn.get("tool_use_id"))     # the user answered -> closed
+        for rn in ex.get("response_nodes") or []:
+            call = rn.get("tool_use")
+            if isinstance(call, dict) and call.get("tool_name") == "ask-user":
+                open_asks.add(call.get("tool_use_id"))
+        resp = ex.get("response_text")
+        last_resp = isinstance(resp, str) and bool(resp.strip())
+    waiting = bool(open_asks)
+    return waiting, (not waiting) and last_resp
+
+
 def _auggie_todos_for(root_uuid):
     if not root_uuid:
         return []
@@ -127,10 +149,12 @@ def list_auggie():
                 continue
             sid = d.get("sessionId") or os.path.basename(f)[:-5]
             req = _auggie_first_request(d.get("chatHistory"))
+            waiting, ended = _auggie_state(d.get("chatHistory"))
             e = {"sid": sid,
                  "title": d.get("customTitle") or (_short_title(req) if req else "Auggie session"),
                  "prompt": req,
                  "cwd": _auggie_ide_cwd(d),   # real per-session working dir (like Claude)
+                 "waiting": waiting, "ended": ended,
                  "mtime": _iso_epoch(d.get("modified")) or mt}
             _AUGGIE_LIST_CACHE[f] = (mt, e)
         gid = "auggie:" + e["sid"]
@@ -140,6 +164,7 @@ def list_auggie():
             "title": titles.get(gid) or e["title"],
             "prompt": e["prompt"], "source": "auggie", "mtime": e["mtime"],
             "agent": False, "group": "", "groupLabel": "", "parentId": "", "bg": 0, "first": 0,   # Auggie has no background-agent/SDK model
+            "waiting": e.get("waiting", False), "ended": e.get("ended", False),
         })
     return out
 

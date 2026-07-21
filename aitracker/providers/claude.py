@@ -18,8 +18,13 @@ _META_CACHE = {}
 
 def _tail_fields(path, nbytes=96000):
     """aiTitle/customTitle/entrypoint live on metadata lines written as the
-    session evolves — read the tail to get the current values cheaply."""
+    session evolves — read the tail to get the current values cheaply. The same
+    pass yields the session's end-state for the sidebar: `waiting` (an
+    AskUserQuestion is still unanswered) and `ended` (the last real turn was the
+    assistant finishing — 'completed last run'). A waiting question always sits at
+    the tail, so the 96 KB window sees it; a giant single turn is the only miss."""
     ai = custom = entry = None
+    open_asks, last = set(), ""
     try:
         sz = os.path.getsize(path)
         with open(path, "rb") as fh:
@@ -36,9 +41,37 @@ def _tail_fields(path, nbytes=96000):
             ai = o.get("aiTitle", ai)
             custom = o.get("customTitle", custom)
             entry = o.get("entrypoint", entry)
+            m = o.get("message")
+            if not isinstance(m, dict):
+                continue
+            c = m.get("content")
+            if o.get("type") == "assistant":
+                blocks = c if isinstance(c, list) else []
+                has_tool = False
+                for b in blocks:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        has_tool = True
+                        if b.get("name") == "AskUserQuestion" and b.get("id"):
+                            open_asks.add(b["id"])          # opened; a matching tool_result answers it
+                last = "assistant_tool" if has_tool else "assistant_text"
+            elif m.get("role") == "user":
+                if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+                    for b in c:                              # the user's answer closes the question
+                        if isinstance(b, dict) and b.get("type") == "tool_result":
+                            open_asks.discard(b.get("tool_use_id"))
+                    last = "tool_result"
+                elif o.get("isMeta"):
+                    pass                                     # injected system text (task-notification, skill reload) — not a turn
+                else:
+                    s = c.strip() if isinstance(c, str) else "\n".join(
+                        b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text").strip() if isinstance(c, list) else ""
+                    if s and not s.startswith("<"):
+                        last = "user_prompt"                 # user typed; assistant hasn't answered -> working
     except OSError:
         pass
-    return ai, custom, entry
+    waiting = bool(open_asks)
+    ended = (not waiting) and last == "assistant_text"
+    return ai, custom, entry, waiting, ended
 
 
 def _session_meta(path):
@@ -46,7 +79,7 @@ def _session_meta(path):
     try:
         mt = os.path.getmtime(path)
     except OSError:
-        return {"cwd": "", "title": "", "source": ""}
+        return {"cwd": "", "title": "", "source": "", "prompt": "", "first": 0, "waiting": False, "ended": False}
     hit = _META_CACHE.get(path)
     if hit and hit[0] == mt:
         return hit[1]
@@ -74,13 +107,15 @@ def _session_meta(path):
                             prompt = s[:140]
     except OSError:
         pass
-    ai, custom, entry = _tail_fields(path)
+    ai, custom, entry, waiting, ended = _tail_fields(path)
     meta = {
         "cwd": cwd,
         "title": custom or ai or _short_title(prompt),
         "prompt": prompt,
         "source": entry or entry_head or "",
         "first": _ts_epoch(first_ts),   # sub-second so same-second orchestrator/agent starts still order
+        "waiting": waiting,             # an AskUserQuestion is unanswered -> sidebar ⏳
+        "ended": ended,                 # last real turn was the assistant finishing -> sidebar ✅ (completed)
     }
     _META_CACHE[path] = (mt, meta)
     return meta
@@ -212,6 +247,8 @@ def list_sessions(limit=200):
             "group": gkey, "groupLabel": glabel,     # fallback bucket (repo/sandbox) for orphan agents
             "parentId": parent,                      # the originating session it nests under; "" -> bucket
             "bg": bg,                                # in-transcript background agents live now -> 🤖 sidebar badge
+            "waiting": sm["waiting"],                # unanswered AskUserQuestion -> ⏳ sidebar highlight
+            "ended": sm["ended"],                    # last turn was the assistant finishing -> ✅ completed
             "mtime": mt,  # counts background-agent activity too
         })
     return out

@@ -15,9 +15,9 @@ from aitracker.registry import parse_any
 from aitracker.providers.claude import (
     parse_session, parse_agents, parse_shells, _match_content, _active_mtime,
     file_diffs, command_output, shell_output, agent_detail, _redirect_log,
-    list_sessions, child_agent_sessions, _agent_group, _pick_parent, _mtime_and_bg)
+    list_sessions, child_agent_sessions, _agent_group, _pick_parent, _mtime_and_bg, _tail_fields)
 from aitracker.providers.auggie import (
-    list_auggie, parse_auggie, search_auggie, _AUGGIE_LIST_CACHE)
+    list_auggie, parse_auggie, search_auggie, _AUGGIE_LIST_CACHE, _auggie_state)
 
 
 def _run():
@@ -262,6 +262,41 @@ def _run():
     assert kb[0]["runs"] == 1, kb                    # a single-run agent reports runs=1
     assert [k["id"] for k in child_agent_sessions("orchA", d1)] == ["ag_mid"], "each orchestrator gets its own agents"
     assert [k["id"] for k in child_agent_sessions("orchR", d3)] == ["ag_root"], "repo-root orchestrator surfaces its agent"
+
+    # sidebar end-state (Claude): waiting = unanswered AskUserQuestion; ended = last real turn is assistant text
+    d4 = os.path.join(pdir, "-repo-x-state"); os.makedirs(d4)   # PROJECTS/*/*.jsonl -> needs a subdir to be listed
+    def _mklines(fn, rows):
+        p = os.path.join(d4, fn + ".jsonl")
+        with open(p, "w") as fh:
+            for r in rows: fh.write(json.dumps(r) + "\n")
+        return p
+    UMSG = {"cwd": "/repo/x", "entrypoint": "cli", "timestamp": "2026-06-01T10:00:00Z",
+            "type": "user", "message": {"role": "user", "content": "go"}}
+    ASK = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "q1", "name": "AskUserQuestion", "input": {"questions": []}}]}}
+    ANS = {"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "q1", "content": "picked A"}]}}
+    TXT = {"type": "assistant", "message": {"content": [{"type": "text", "text": "all done ✅"}]}}
+    assert _tail_fields(_mklines("s_wait", [UMSG, ASK]))[3:] == (True, False), "open question -> waiting, not ended"
+    assert _tail_fields(_mklines("s_done", [UMSG, TXT]))[3:] == (False, True), "assistant finished -> ended"
+    assert _tail_fields(_mklines("s_answered", [UMSG, ASK, ANS, TXT]))[3:] == (False, True), "answered then replied -> ended, not waiting"
+    assert _tail_fields(_mklines("s_mid", [UMSG, ASK, ANS]))[3:] == (False, False), "stopped on a tool_result -> neither"
+    # ignore a trailing task-notification (isMeta / <...> system text) — a completed session stays 'ended'
+    NOTE = {"type": "user", "isMeta": True, "message": {"role": "user", "content": "<task-notification>x</task-notification>"}}
+    assert _tail_fields(_mklines("s_note", [UMSG, TXT, NOTE]))[3:] == (False, True), "trailing notification doesn't unset ended"
+    ls2 = {s["id"]: s for s in list_sessions()}
+    assert ls2["s_wait"]["waiting"] and not ls2["s_wait"]["ended"], ls2["s_wait"]   # wired onto the list dict
+    assert ls2["s_done"]["ended"] and not ls2["s_done"]["waiting"], ls2["s_done"]
+
+    # sidebar end-state (Auggie): same capability off ask-user / response_text — parity with Claude
+    def _ex(**kw): return {"exchange": kw}
+    waiting_chat = [_ex(request_message="go", response_text="thinking",
+                        response_nodes=[{"tool_use": {"tool_name": "ask-user", "tool_use_id": "a1"}}])]
+    assert _auggie_state(waiting_chat) == (True, False), "open ask-user -> waiting"
+    answered_chat = waiting_chat + [_ex(request_nodes=[{"tool_result_node": {"tool_use_id": "a1"}}],
+                                        response_text="here you go")]
+    assert _auggie_state(answered_chat) == (False, True), "answered ask-user then replied -> ended"
+    assert _auggie_state([_ex(request_message="go", response_text="done")]) == (False, True), "plain reply -> ended"
     assert child_agent_sessions("ag_late", d1) == [], "an agent is not the orchestrator of its siblings"
     # re-runs of the SAME agent (identical task/first-prompt) collapse to ONE entry so the count isn't
     # inflated; the most-recently-active run represents the group (the open target) and runs=N counts them.
