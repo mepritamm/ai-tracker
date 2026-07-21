@@ -73,11 +73,12 @@ Track your agents on the go. Reach the dashboard from a phone/tablet over a priv
 
 **Sidebar** — every session across all your tools and projects, newest first, each with a source badge (Claude Desktop / Claude CLI / Claude SDK / Claude VS Code / Auggie), a live dot, and a short title.
 - **Background-agent sessions** (SDK-spawned, e.g. into a git worktree) are marked **🤖 Agent** and folded into a collapsible **🤖 Agents · &lt;repo&gt;** group per repo — so they don't bury your own sessions in the flat list. Click the group to expand its agents.
+- A session running **in-transcript background agents** (Task/Workflow subagents — which spawn no separate session) carries a **🤖 N running** badge, so you can see it's busy without opening it.
 - **Click "N live"** to filter to only active sessions (live = touched in the last 5 minutes).
 - **Search** by keyword — matches your prompts and the conversation (not the boilerplate); sessions whose *name* matches rank first.
 - **✎ rename** any session to a title that means something to you (saved to `titles.json`).
 - **📌 pin** any session to keep it at the top of the list, above recency (saved to `pins.json`).
-- Sessions with notes show a **📝 N** badge (see the Notes panel below).
+- Sessions with notes show a **📝 N** badge (see the Plan-on-the-go panel below).
 
 **Main view** for the selected session:
 - **Session summary** — Goal, what it's doing *Now*, and a one-line "So far", with stat chips (files, commands, reads, commits, tests, tokens, git branch).
@@ -85,9 +86,9 @@ Track your agents on the go. Reach the dashboard from a phone/tablet over a priv
 - **Background agents & shells** — running ones shown; finished ones one click away. Click one to read its full prompt and narration/output; while it's still running that view stays live, refreshing in place every 2 s. A repo's spawned **agent sessions** are listed here too (with their worktree name) — live ones shown, finished ones behind a **Show N finished** disclosure — click **open ›** to jump straight into that agent's own session. Re-runs of the same agent (identical task) collapse into one row tagged **×N**, opening the latest run — so the count reflects distinct agents, not every retry. When one completes you get a toast + sound, plus a desktop notification if the tab is in the background (so you're alerted even while working elsewhere — allow notifications on first click; toggle with the 🔔 bell). *(Claude Code only — Auggie has no background-work model.)*
 - **Pull requests** — the PRs a session actually *generated* (created via `gh pr create` or the GitHub MCP tool), as clickable links; PRs it merely referenced are left out.
 - **Narration** — the assistant's own words, step by step, with full markdown rendering (tables, code, lists) in the pop-out modal, and prev/next arrows plus a jump-to-latest (⤒) button across every entry. History is unbounded — older entries page in from the server as you scroll. An open entry stays live: it follows the newest message, or holds your place if you've paged back into history.
-- **Todos**, **Files** (a diff per edit, with GitHub-style **up/down context expansion** and an **Expand all** toggle to reveal the whole file around every edit, plus a Diff ⇄ Rendered-markdown toggle and an "open in new tab" button), **Commands** (with ✓/✗ for Claude), and **Prompts**. Files a background agent wrote — e.g. editing inside a git worktree — show too, tagged **🤖 agent**, and stay diffable.
+- **Todos**, **Files** (a diff per edit, with GitHub-style **up/down context expansion** and an **Expand all** toggle to reveal the whole file around every edit, plus a Diff ⇄ Rendered-markdown toggle and an "open in new tab" button), **Commands** (with ✓/✗ for Claude), and **Prompts** (every prompt you typed, slash-command invocations like `/foo args` included). Files a background agent wrote — e.g. editing inside a git worktree — show too, tagged **🤖 agent**, and stay diffable.
 - Every list panel loads a window and reveals older entries as you scroll to the bottom.
-- **📝 Notes** — a per-session stack of plan-ahead notes: jot what you want to do once an answer lands (or while you wait on another session), and it stays with the session. Add as many as you like; **copy** one back when you need it, **remove** it when done. Sessions with notes carry a **📝 N** badge in the sidebar. Saved to `notes.json`, read live (no restart). Works for every session, any tool — and you can add notes from your phone or tablet too (unlike 🚩 flagging, which is local-only).
+- **🧭 Plan on the go** — a per-session stack of small plan-ahead notes: jot what you want to do once an answer lands (or while you wait on another session), and it stays with the session. Add as many as you like; **copy** one back when you need it, **remove** it when done. Sessions with notes carry a **📝 N** badge in the sidebar. Saved to `notes.json`, read live (no restart). Works for every session, any tool — and you can add notes from your phone or tablet too (unlike 🚩 flagging, which is local-only).
 - **🚩 Flag** anything you want to fix later — see [Skills](#skills).
 
 ---

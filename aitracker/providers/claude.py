@@ -200,6 +200,7 @@ def list_sessions(limit=200):
             cands = humans_by_dir.get(os.path.dirname(f))   # a repo-root orchestrator's file lives here too
             if cands:
                 parent = _pick_parent(sm["first"], cands)
+        mt, bg = _mtime_and_bg(f)
         out.append({
             "id": sid,
             "project": os.path.basename(sm["cwd"]) if sm["cwd"] else os.path.basename(os.path.dirname(f)),
@@ -210,7 +211,8 @@ def list_sessions(limit=200):
             "agent": sm["source"] == "sdk-cli",     # background-agent session -> 🤖
             "group": gkey, "groupLabel": glabel,     # fallback bucket (repo/sandbox) for orphan agents
             "parentId": parent,                      # the originating session it nests under; "" -> bucket
-            "mtime": _active_mtime(f),  # counts background-agent activity too
+            "bg": bg,                                # in-transcript background agents live now -> 🤖 sidebar badge
+            "mtime": mt,  # counts background-agent activity too
         })
     return out
 
@@ -335,6 +337,24 @@ def _agent_files(path):
     return glob.glob(os.path.join(base, "**", "agent-*.jsonl"), recursive=True)
 
 
+_CMD_NAME_RE = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.S)
+_CMD_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.S)
+
+def _slash_prompt(s):
+    """A slash-command invocation is logged as a `<command-name>/foo</command-name> …
+    <command-args>bar</command-args>` wrapper string. Render it back to the `/foo bar` the
+    user actually typed so it shows as a prompt — the alternative (drop everything starting
+    with `<`) silently swallowed every slash command. Non-command `<...>` noise
+    (task-notification, system-reminder) has no <command-name> and returns ""."""
+    m = _CMD_NAME_RE.search(s)
+    if not m:
+        return ""
+    name = m.group(1).strip()
+    a = _CMD_ARGS_RE.search(s)
+    args = a.group(1).strip() if a else ""
+    return (name + (" " + args if args else "")).strip()
+
+
 def _active_mtime(path):
     """Newest activity across the main file AND any background-agent files —
     this is what tells us a session is live even when only sub-agents are working."""
@@ -349,6 +369,23 @@ def _active_mtime(path):
         except OSError:
             pass
     return m
+
+
+def _mtime_and_bg(path):
+    """(_active_mtime, # background-agent files live right now). One glob+stat pass so the
+    sidebar can badge a session with running in-transcript agents — those spawn no separate
+    agent session, so parentId nesting never surfaces them."""
+    m = os.path.getmtime(path) if os.path.exists(path) else 0.0
+    now, bg = time.time(), 0
+    for af in _agent_files(path):
+        try:
+            amt = os.path.getmtime(af)
+        except OSError:
+            continue
+        m = max(m, amt)
+        if now - amt < LIVE_WINDOW:
+            bg += 1
+    return m, bg
 
 
 def parse_agents(path):
@@ -718,6 +755,8 @@ def parse_session(path):
                                       if isinstance(b, dict) and b.get("type") == "text").strip()
                     else:
                         s = ""
+                    if s.startswith("<") and "<command-name>" in s:   # slash command -> the "/foo args" typed
+                        s = _slash_prompt(s)
                     if s and not s.startswith("<") and not s.startswith("Caveat:") \
                             and not s.startswith("[Request interrupted"):
                         requests.append({"t": ts, "text": s[:8000]})  # full prompt; list clamps preview

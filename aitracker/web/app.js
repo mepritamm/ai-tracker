@@ -151,6 +151,8 @@ function sessionRow(s,now,ex){
   bits.push(ago(now-s.mtime));
   const chev=ex?`<span class="agtoggle${ex.open?' open':''}" onclick="toggleGroup('${encodeURIComponent(ex.gk)}');event.stopPropagation()" title="${ex.open?'Collapse':'Expand'} agent sessions">🤖</span>`:"";
   const kidchip=ex?` · <span class=agentbadge title="agent sessions this one spawned">🤖 ${ex.live?ex.live+" live / ":""}${ex.n} agent${ex.n==1?"":"s"}</span>`:"";
+  // in-transcript background agents (Task/Workflow) running now — they spawn no separate session, so this is their only sidebar cue
+  const bgchip=s.bg?` · <span class="agentbadge live" title="${s.bg} background agent${s.bg==1?'':'s'} running now">🤖 ${s.bg} running</span>`:"";
   // a parent row: clicking the title toggles its agents too (not just the 🤖 button) while still opening it
   const onclick=ex?`pickToggle('${s.id}','${encodeURIComponent(ex.gk)}')`:`pick('${s.id}')`;
   const noteBadge=s.note_count?`<span class=notebadge title="${s.note_count} note${s.note_count==1?'':'s'}">📝${s.note_count}</span>`:"";
@@ -160,7 +162,7 @@ function sessionRow(s,now,ex){
     (s._runs>1?`<span class="agentbadge runs" title="ran ${s._runs}× — collapsed; opens the latest">×${s._runs}</span>`:"")+
     `<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">📌</span>`+
     `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename this session">✎</span></div>`+
-    `<div class=smeta>${s.agent?'<span class=agentbadge>🤖 Agent</span> · ':''}${bits.join(" · ")}${kidchip}</div></div>`;
+    `<div class=smeta>${s.agent?'<span class=agentbadge>🤖 Agent</span> · ':''}${bits.join(" · ")}${kidchip}${bgchip}</div></div>`;
 }
 // collapse agent sessions that are re-runs of the same task (first prompt) into one row, newest as
 // representative, with _runs=N — so a finding re-executed 12× shows once, not twelve times.

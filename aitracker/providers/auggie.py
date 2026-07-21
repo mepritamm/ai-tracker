@@ -139,7 +139,7 @@ def list_auggie():
             "id": gid, "project": os.path.basename(cwd) if cwd else "Augment", "cwd": cwd,
             "title": titles.get(gid) or e["title"],
             "prompt": e["prompt"], "source": "auggie", "mtime": e["mtime"],
-            "agent": False, "group": "", "groupLabel": "", "parentId": "", "first": 0,   # Auggie has no background-agent/SDK model
+            "agent": False, "group": "", "groupLabel": "", "parentId": "", "bg": 0, "first": 0,   # Auggie has no background-agent/SDK model
         })
     return out
 

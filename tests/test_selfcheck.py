@@ -15,7 +15,7 @@ from aitracker.registry import parse_any
 from aitracker.providers.claude import (
     parse_session, parse_agents, parse_shells, _match_content, _active_mtime,
     file_diffs, command_output, shell_output, agent_detail, _redirect_log,
-    list_sessions, child_agent_sessions, _agent_group, _pick_parent)
+    list_sessions, child_agent_sessions, _agent_group, _pick_parent, _mtime_and_bg)
 from aitracker.providers.auggie import (
     list_auggie, parse_auggie, search_auggie, _AUGGIE_LIST_CACHE)
 
@@ -25,7 +25,12 @@ def _run():
     rows = [
         {"type": "user", "cwd": "/x/proj", "gitBranch": "main", "version": "1.0",
          "message": {"role": "user", "content": "build the thing"}},
-        {"type": "user", "message": {"role": "user", "content": "<command-name>/foo</command-name>"}},
+        # a slash-command invocation is a <command-...> wrapper STRING → shows as the "/foo args" typed
+        {"type": "user", "message": {"role": "user", "content":
+            "<command-message>smasher-gap</command-message>\n<command-name>/smasher-gap</command-name>\n<command-args>fix the parser bug</command-args>"}},
+        # non-command <...> noise (task-notification, system-reminder) has no <command-name> → excluded
+        {"type": "user", "message": {"role": "user", "content":
+            "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"}},
         # a real typed prompt with a pasted image → content is a LIST of blocks; must be captured
         {"type": "user", "message": {"role": "user", "content": [
             {"type": "image", "source": {}},
@@ -76,8 +81,9 @@ def _run():
     assert c["created"] == 1 and c["read"] == 1, c
     assert d["commits"][0]["msg"] == "add foo", d["commits"]
     assert c["tests"] == 1 and c["tests_failed"] == 1, "failed pytest via is_error link"
-    # string prompt + list-form prompt captured; <command-name>, isMeta expansion, tool_result excluded
-    assert [r["text"] for r in d["requests"]] == ["build the thing", "fix the parser"], d["requests"]
+    # string prompt + slash-command + list-form prompt captured; task-notification, isMeta expansion, tool_result excluded
+    assert [r["text"] for r in d["requests"]] == \
+        ["build the thing", "/smasher-gap fix the parser bug", "fix the parser"], d["requests"]
     assert d["tokens"]["in"] == 100
     assert [n["text"] for n in d["narrative"]] == ["starting"], d["narrative"]
     ov = d["overview"]
@@ -119,6 +125,9 @@ def _run():
     assert ags[0]["wf"] == "wf_abc123", ags
     assert "/x/.worktrees/wt/auth.py" in afiles, afiles         # agent file edit captured
     assert _active_mtime(spath) >= os.path.getmtime(spath)
+    # a live in-transcript agent -> bg count so the sidebar can badge it (no separate agent session)
+    mt_bg, bg_n = _mtime_and_bg(spath)
+    assert bg_n == 1 and mt_bg == _active_mtime(spath), (bg_n, mt_bg)
     ds = parse_session(spath)
     assert len(ds["agents_bg"]) == 1 and "background agent" in ds["overview"]["now"], ds["overview"]["now"]
     afile = next((x for x in ds["files"] if x["path"] == "/x/.worktrees/wt/auth.py"), None)

@@ -42,6 +42,7 @@ html,body{margin:0;height:100%;background:#0c0f15;color:#e6edf3;font-family:'Sou
 .smeta .proj{color:#7d8898}
 .agentbadge{color:#f5b443;background:rgba(245,180,67,.12);border-radius:4px;padding:0 5px;font-size:10px}
 .agentbadge.runs{flex:0 0 auto;font-family:'JetBrains Mono',monospace}
+.agentbadge.live{color:#3fb950;background:rgba(63,185,80,.12)}
 /* collapsible per-repo group of background-agent (SDK) sessions in the sidebar */
 .agrp{margin-bottom:4px}
 .agrphdr{display:flex;align-items:center;gap:7px;padding:9px 12px;border-radius:10px;cursor:pointer;color:#c9d4e0;user-select:none;border:1px solid transparent}
@@ -110,6 +111,7 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid #1c2330}
 .card{background:#0e121a;border:1px solid #1c2330;border-radius:12px;display:flex;flex-direction:column;min-height:0;min-width:0}
 .card h2{margin:0;padding:11px 16px;border-bottom:1px solid #1c2330;display:flex;align-items:center;justify-content:space-between;font-size:11.5px;letter-spacing:.5px;text-transform:uppercase;color:#8b949e;font-weight:700}
 .card h2 .cnt{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:400}
+.notesub{padding:6px 16px 0;font-size:11px;color:#8b949e}
 .cbody{overflow:auto;max-height:46vh}
 .mini{background:#10141c;border:1px solid #2c333f;color:#8b949e;font-size:11px;padding:3px 8px;border-radius:6px;cursor:pointer;font-family:inherit}
 .mini:hover{border-color:#4c8dff}
