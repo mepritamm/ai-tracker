@@ -97,6 +97,23 @@ class TestBuildPage(unittest.TestCase):
         self.assertIn("class=actcol", p)
         self.assertIn("◐ State", p)
         self.assertIn("secband", p)
+        # Pull requests panel lives in the State column (before Activity), right after Progress
+        self.assertIn("id=prpanel", p)
+        self.assertLess(p.index("id=card_todos"), p.index("id=prpanel"))   # after Progress
+        self.assertLess(p.index("id=prpanel"), p.index("class=actcol"))    # …still in the State column
+        # Flags panel is opt-in: hidden card revealed by the header "🚩 Flag an issue" toggle,
+        # and it sits above the State|Activity split.
+        self.assertIn("id=flagbtn", p)
+        self.assertIn("toggleFlags", p)
+        self.assertIn("id=flagcard", p)
+        self.assertLess(p.index("id=flagcard"), p.index("class=statecol"))  # above the split
+        self.assertRegex(p, r"id=flagcard[^>]*style=display:none")          # hidden until toggled
+        # Background-work drawer adopts the sidebar's warm --side surface (palette parity, both themes)
+        self.assertIn(".bgdrawer .card{background:var(--side)}", p)
+        self.assertIn(".bgdrawer .agent{background:var(--side)}", p)
+        # popped-out "New tab" page carries the current theme + is tokenised (no hardcoded dark colours)
+        self.assertIn("html${theme}", p)                # popOut stamps html.light onto the new tab
+        self.assertIn(".pw h1{font:600 15px/1.3 inherit;color:var(--text)", p)
 
 
 class TestSearchAllRanking(unittest.TestCase):

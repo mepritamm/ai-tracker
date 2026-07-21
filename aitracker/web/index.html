@@ -41,7 +41,7 @@
       <div class=ringctr><div class=ringpct><span id=ringpct>0</span><span>%</span></div><div class=ringsub id=ringsub>0 of 0 tasks</div></div>
     </div>
     <div class=htitle>
-      <div class=htop><h2 id=htitle>Pick a session</h2><span class=activebadge id=activebadge style=display:none><span class=dot></span>active</span></div>
+      <div class=htop><h2 id=htitle>Pick a session</h2><span class=activebadge id=activebadge style=display:none><span class=dot></span>active</span><button class=flagbtn id=flagbtn onclick=toggleFlags() title="Flag an issue or gap in this session">🚩 Flag an issue<span id=flagbtnc></span></button></div>
       <div class=hmeta id=hmeta>Pick a recent session or search on the left.</div>
       <div class=chips id=chips></div>
     </div>
@@ -57,11 +57,22 @@
   <div class=srcnote id=srcnote style=display:none></div>
 </header>
 <div class=body>
+  <div class="card span2" id=flagcard style=display:none>
+    <h2><span>🚩 Flag an issue — report a gap in this session</span><span class=cnt id=flagc style=color:var(--red)></span></h2>
+    <div class=cbody style=max-height:300px>
+      <div class=flagwrap id=flags><div class=empty>—</div></div>
+      <button class=addflag onclick=addFlag()>🚩 Flag an issue or gap</button>
+    </div>
+  </div>
   <div class=statecol>
     <div class=band>◐ State</div>
     <div class=card id=card_todos>
       <h2><span>Progress</span><span class=cnt id=todoc></span></h2>
       <div class=cbody style="padding:6px 8px;max-height:300px" id=todos><div class=empty>—</div></div>
+    </div>
+    <div class=card id=prpanel style=display:none>
+      <h2><span>🔀 Pull requests</span><span class=cnt id=prc style=color:var(--amber)></span></h2>
+      <div class=cbody style="padding:6px 8px;max-height:230px" id=prs><div class=empty>—</div></div>
     </div>
     <div class=card id=notespanel>
       <h2><span>🧭 Plan on the go</span><span class=cnt id=notec style=color:var(--violet)></span></h2>
@@ -103,20 +114,9 @@
       <h2><span>Files</span><span class=cnt id=filec></span></h2>
       <div class=cbody id=files><div class=empty>—</div></div>
     </div>
-    <div class=card id=prpanel style=display:none>
-      <h2><span>🔀 Pull requests</span><span class=cnt id=prc style=color:var(--amber)></span></h2>
-      <div class=cbody style="padding:6px 8px;max-height:230px" id=prs><div class=empty>—</div></div>
-    </div>
     <div class=card id=card_cmds>
       <h2><span>Commands</span><span class=cnt id=cmdc></span></h2>
       <div class=cbody id=cmds><div class=empty>—</div></div>
-    </div>
-  </div>
-  <div class="card span2">
-    <h2><span>🚩 Flags</span><span class=cnt id=flagc style=color:var(--red)></span></h2>
-    <div class=cbody style=max-height:300px>
-      <div class=flagwrap id=flags><div class=empty>—</div></div>
-      <button class=addflag onclick=addFlag()>🚩 Flag an issue or gap</button>
     </div>
   </div>
 </div>

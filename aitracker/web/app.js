@@ -795,8 +795,9 @@ function popOut(titleId,bodyId){
   const head=[...document.querySelectorAll("style, link[rel=stylesheet]")].map(e=>e.outerHTML).join("");
   const w=window.open("","_blank");
   if(!w){alert("Popup blocked — allow popups for this page to open in a new tab.");return;}
+  const theme=document.documentElement.classList.contains("light")?" class=light":"";   // carry dark/light into the new tab
   w.document.write(
-    `<!doctype html><html><head><meta charset=utf-8><title>${esc(title)}</title>${head}`+
+    `<!doctype html><html${theme}><head><meta charset=utf-8><title>${esc(title)}</title>${head}`+
     `</head>`+
     `<body><div class=pw><h1>${esc(title)}</h1><div class="${body.className}" style="overflow:visible;max-height:none">${body.innerHTML}</div></div></body></html>`);
   w.document.close();
@@ -856,6 +857,7 @@ function renderFlags(){
   const mine=flags.filter(f=>f.session===cur).sort((a,b)=>(a.resolved-b.resolved)||b.ts-a.ts);
   const open=mine.filter(f=>!f.resolved).length;
   $("flagc").textContent=mine.length?`${open} open / ${mine.length}`:"";
+  const bc=$("flagbtnc"); if(bc)bc.textContent=open?" · "+open:"";   // header button shows the open-flag count
   const now=Date.now()/1000;
   $("flags").innerHTML=mine.length?mine.map(f=>
     `<div class="flag ${f.resolved?'done':'open'}"><div class=note>${f.resolved?'✓ ':'🚩 '}${esc(f.note)}</div>`+
@@ -877,6 +879,14 @@ async function addFlag(){
 async function flagAction(path,id){
   await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});
   loadFlags();
+}
+// the Flags panel is opt-in: hidden until the header "🚩 Flag an issue" button reveals it
+function toggleFlags(){
+  const c=$("flagcard"); if(!c)return;
+  const show=c.style.display==="none";
+  c.style.display=show?"":"none";
+  const b=$("flagbtn"); if(b)b.classList.toggle("on",show);
+  if(show)c.scrollIntoView({behavior:"smooth",block:"nearest"});
 }
 function resolveFlag(id){flagAction("/api/flags/resolve",id)}
 function delFlag(id){if(confirm("Delete this flag?"))flagAction("/api/flags/delete",id)}
