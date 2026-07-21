@@ -1,10 +1,4 @@
 let cur=localStorage.getItem("sid")||"", timer=null;
-// Flagging is a local-only action: hide "🚩 Flag an issue or gap" when the dashboard is viewed from a
-// phone/tablet (tunnel/LAN/Tailscale). location.hostname is the reliable signal — an ngrok tunnel reaches
-// the server *from* localhost, so the server can't tell; the browser's own URL can. Set synchronously
-// (script is at end of <body>) so the button never flashes before hiding.
-const LOCAL=["localhost","127.0.0.1","::1","[::1]"].includes(location.hostname);
-if(!LOCAL)document.documentElement.classList.add("remote");
 // Dark (default) / Light theme — the class is set pre-paint by the <head> script; sync button + meta here.
 function setTheme(t){document.documentElement.classList.toggle("light",t==="light");try{localStorage.theme=t}catch(e){}var b=document.getElementById("themebtn");if(b)b.textContent=t==="light"?"🌙":"☀️";var m=document.getElementById("themecolor");if(m)m.content=t==="light"?"#f4efe3":"#0c0f15";}
 function toggleTheme(){setTheme(document.documentElement.classList.contains("light")?"dark":"light");}

@@ -72,19 +72,19 @@ class TestBuildPage(unittest.TestCase):
         self.assertIn("rel=manifest", p)
         self.assertIn("max-width:600px", p)    # the phone responsive block is baked in
         self.assertIn("min-width:601px", p)    # the tablet master-detail block is baked in
-        self.assertIn(".remote .addflag", p)   # flag button hidden for remote (non-localhost) viewers
+        self.assertNotIn(".remote", p)          # flags queue to the local server → usable from a tunnel/phone, not gated
         self.assertIn("notes_list", p)          # notes stack panel baked into page
         # mobile: Sessions is a left slide-in drawer (hamburger + scrim + off-canvas rule)
         self.assertIn("toggleDrawer", p)
         self.assertIn("id=scrim", p)
         self.assertIn(".app.draweropen .side", p)
         self.assertIn("addNote", p)             # notes JS function present
-        # notes must be addable from mobile/tablet (remote host): the Add-note button uses its own
-        # `addnote` class, so the `.remote .addflag{display:none}` rule (local-only flagging) never
-        # hides it. Regression guard for the mobile "can't add a note" bug.
-        self.assertIn("class=addnote", p)                   # note button has its own class
-        self.assertNotIn(".remote .addnote", p)             # …and is NOT hidden on remote
-        self.assertIn(".remote .addflag", p)                # flagging stays local-only (unchanged)
+        # both compose buttons must be addable from mobile/tablet (remote host): flags queue to the
+        # server's flags.json and are picked up by /fix-flags locally later, so flagging-while-away is
+        # the ideal phone workflow — neither button is gated on the (now-removed) .remote class.
+        self.assertIn("class=addnote", p)                   # note button present
+        self.assertIn("class=addflag", p)                   # flag button present
+        self.assertNotIn(".remote", p)                      # …and neither is hidden on remote hosts
         # touch devices have no :hover — pin/rename (hover-only) must stay usable on the phone/tablet drawer
         self.assertIn("@media(hover:none)", p)
         # design parity: Dark/Light theme system + toggle + pre-paint init

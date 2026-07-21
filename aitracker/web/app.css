@@ -184,9 +184,9 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid var(--line)}
 .addflag,.addnote{width:100%;margin-top:2px;background:var(--chipbg);border:1px dashed var(--line3);color:var(--muted);padding:9px;border-radius:9px;font-family:'Source Sans 3',sans-serif;font-size:12.5px;cursor:pointer}
 .addflag:hover{border-color:var(--red)}
 .addnote:hover{border-color:var(--violet)}
-/* flagging is local-only (it feeds /fix-flags, which runs the AI on this machine) → hidden on
-   phone/tablet. Notes are plain user data, useful from anywhere → NOT hidden on .remote. */
-.remote .addflag{display:none}
+/* Flags queue to the server's flags.json (where /fix-flags reads them); a flag raised from a phone/
+   tunnel is picked up by the AI on this machine later. So it's plain user data, useful from anywhere
+   — not gated by host (raising one while away is the whole point). Same for notes. */
 /* header "🚩 Flag an issue" toggle — reveals the (opt-in) Flags panel; amber when active */
 .flagbtn{margin-left:auto;display:inline-flex;align-items:center;gap:5px;font-family:inherit;font-size:12px;color:var(--muted);background:var(--chipbg);border:1px solid var(--line3);border-radius:20px;padding:5px 12px;cursor:pointer;white-space:nowrap;line-height:1}
 .flagbtn:hover{border-color:var(--red);color:var(--head)}
