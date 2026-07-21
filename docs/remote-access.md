@@ -6,7 +6,7 @@ tablet, install it as an app, and require a password.
 
 Three things combine here, each independent:
 
-1. **Connectivity** — how the phone reaches your Mac (Tailscale / ngrok / same-Wi-Fi).
+1. **Connectivity** — how the phone reaches your Mac (Tailscale / Cloudflare Tunnel / ngrok / same-Wi-Fi).
 2. **Auth** — an optional password on every route (`TRACKER_AUTH`).
 3. **Install & feel** — Add to Home Screen (PWA), responsive phone/tablet layout, local-only flagging.
 
@@ -28,6 +28,12 @@ TRACKER_AUTH="you:pick-a-strong-pass" HOST=0.0.0.0 make serve
 
 `HOST` and `TRACKER_AUTH` are **off by default** — local development is completely unchanged unless you
 opt in.
+
+> **On a restrictive / corporate network?** Many block VPN meshes (Tailscale) and ngrok outright.
+> **Cloudflare Tunnel** (Option D) usually still gets through — it rides Cloudflare's edge over 443/QUIC and
+> looks like ordinary web traffic. Blocks are often *domain*-specific, so if one provider is refused, try
+> another (Cloudflare, then `npx tunnelmole 8790`) before giving up. SSH-based tunnels (serveo, pinggy) tend
+> to be reset by the same firewalls.
 
 ---
 
@@ -102,6 +108,78 @@ Simplest, but only works while the phone is on the **same network** as the Mac (
 
 ---
 
+## Option D — Cloudflare Tunnel (free, gets through most corporate firewalls)
+
+A free public HTTPS tunnel over Cloudflare's edge. No account for a **quick tunnel**, no interstitial, and
+it commonly works where ngrok/Tailscale are blocked.
+
+1. Install once: `brew install cloudflared`.
+2. Start an **authed** tracker on a dedicated port (keeps your local `:8787` untouched):
+   ```bash
+   TRACKER_AUTH="you:pick-a-strong-pass" PORT=8790 python3 -m aitracker &
+   ```
+3. Open the quick tunnel — it prints a `https://<random>.trycloudflare.com` URL:
+   ```bash
+   cloudflared tunnel --url http://localhost:8790
+   ```
+4. Open that URL on the phone and enter the password.
+
+The quick-tunnel URL is **random each run** (rotates on restart) — for a stable one see **A permanent URL**
+below. Free backup with the same properties (also no account): `npx tunnelmole 8790`.
+
+---
+
+## Run it yourself — one-command start & stop
+
+The Makefile wraps the Cloudflare flow once `cloudflared` is installed:
+
+```bash
+TRACKER_AUTH="you:pick-a-strong-pass" make tunnel   # authed tracker (:8790) + Cloudflare tunnel; prints the URL
+make stop                                            # stops the tracker AND the tunnel
+```
+
+`make tunnel` refuses to start without `TRACKER_AUTH` (the URL is public). `make stop` tears down the local
+tracker, the authed `:8790` instance, and any `cloudflared` tunnel. Raw equivalents if you prefer:
+
+```bash
+# start
+TRACKER_AUTH="you:pass" PORT=8790 nohup python3 -m aitracker >/tmp/aitracker-tunnel.log 2>&1 &
+nohup cloudflared tunnel --url http://localhost:8790 >/tmp/cf.log 2>&1 &
+grep -m1 -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf.log   # your URL
+# stop
+pkill -f "cloudflared tunnel"; lsof -ti:8790 | xargs kill
+```
+
+To keep it alive while you're away, prevent the Mac sleeping: `caffeinate -i -s &` (Ctrl-C or `killall
+caffeinate` to release). Note the lid staying open / on power — closing the lid sleeps regardless.
+
+---
+
+## A permanent (non-rotating) URL
+
+Quick tunnels (Cloudflare, tunnelmole) mint a **new URL each run**, so a home-screen icon breaks after a
+restart. For a URL that never changes, use a Cloudflare **named tunnel** — free, but it needs a domain on
+your Cloudflare account plus a one-time browser login:
+
+```bash
+cloudflared tunnel login                              # one-time, opens a browser
+cloudflared tunnel create ai-tracker
+cloudflared tunnel route dns ai-tracker tracker.<yourdomain>
+# ~/.cloudflared/config.yml:
+#   tunnel: ai-tracker
+#   credentials-file: ~/.cloudflared/<UUID>.json
+#   ingress:
+#     - hostname: tracker.<yourdomain>
+#       service: http://localhost:8790
+#     - service: http_status:404
+cloudflared tunnel run ai-tracker                     # same URL every time (or: sudo cloudflared service install)
+```
+
+`https://tracker.<yourdomain>` never rotates — add it to the home screen once, keep `TRACKER_AUTH` on the
+tracker. No domain? `zrok` (free, needs an account) gives a reserved stable URL as an alternative.
+
+---
+
 ## Install it as an app (Add to Home Screen)
 
 Once the dashboard opens on the phone/tablet (any option above), install it so it launches fullscreen like
@@ -133,3 +211,7 @@ read-only, nothing-leaves-the-machine model.
 - **Home-Screen icon points at a dead URL:** you used ngrok's *random* URL; claim a static domain, or use
   Tailscale (its name is stable).
 - **Flag button missing on the phone:** that's intentional — flagging is local-only. Use the Mac.
+- **ngrok / Tailscale won't connect on this network:** it's blocked (common on corp/office Wi-Fi). Use
+  **Option D (Cloudflare Tunnel)** — it usually passes. If Cloudflare is also refused, try `npx tunnelmole 8790`.
+- **`make tunnel` says "set TRACKER_AUTH":** it won't start a public tunnel without a password. Prefix the
+  command: `TRACKER_AUTH="you:pass" make tunnel`.
