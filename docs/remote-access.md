@@ -14,8 +14,14 @@ Three things combine here, each independent:
 
 ## TL;DR
 
+**Just running it locally? `make serve` — done** (http://localhost:8787, no tunnel, no login). Everything
+below is only for reaching it from *another* device; the tracker stays localhost-only until you opt in.
+
 ```bash
-# Recommended: private mesh (Tailscale) + a password, reachable from anywhere
+# Free tunnel that works through most corporate firewalls (ngrok/Tailscale blocked): set a password, then
+TRACKER_AUTH="you:pick-a-strong-pass" make tunnel      # prints a https://…trycloudflare.com URL for your phone
+
+# Or a private Tailscale mesh (stable URL, no public exposure):
 TRACKER_AUTH="you:pick-a-strong-pass" HOST=0.0.0.0 make serve
 # then on the phone open  http://<your-mac-name>:8787  (Tailscale MagicDNS)
 ```

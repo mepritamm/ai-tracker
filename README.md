@@ -47,9 +47,10 @@ That's it. It starts a local server on **http://localhost:8787** and opens your 
 Prefer the Makefile — it restarts cleanly (frees a stuck port so UI changes always take effect):
 
 ```bash
-make serve            # start (or restart) the tracker on :8787
-make stop             # stop it
+make serve            # run locally on http://localhost:8787 — no tunnel, no login (the default)
+make stop             # stop the tracker (and any running tunnel)
 make serve PORT=9000  # use a different port
+make tunnel           # OPTIONAL — reach it from your phone via a Cloudflare tunnel (needs TRACKER_AUTH; see below)
 make check            # the gate: --selfcheck + unit tests (must be green)
 make test             # just the unit-test suite
 make hooks            # install the pre-commit gate (blocks commits that fail check)
@@ -59,11 +60,13 @@ Flags: `python3 -m aitracker --version` · `--help`. Set a port without the Make
 
 To keep it running in the background: `nohup python3 -m aitracker >/tmp/tracker.log 2>&1 &`.
 
+**Local by default.** `make serve` binds to `localhost` only, with no login — nothing leaves your machine and no tunnel is involved. Reaching it from a phone is entirely **opt-in** (`make tunnel`, or the other options in the guide below); until you choose one, it stays localhost-only.
+
 ---
 
 ## View it on your phone or tablet
 
-Track your agents on the go. Reach the dashboard from a phone/tablet over a private **Tailscale** mesh, an **ngrok** tunnel, or your **LAN**; install it as a home-screen app (fullscreen, responsive phone/tablet layout); and require a password with `TRACKER_AUTH`. It's all opt-in — two env vars (`HOST`, `TRACKER_AUTH`), both off by default, so local use is unchanged.
+Locally it's just `make serve` (localhost, no tunnel, no login). To reach it from a phone, pick a connectivity option — a free **Cloudflare tunnel** (`make tunnel`; works through most corporate firewalls where ngrok/Tailscale are blocked), a private **Tailscale** mesh, an **ngrok** tunnel, or your **LAN** — then install it as a home-screen app (fullscreen, responsive phone/tablet layout) and require a password with `TRACKER_AUTH`. It's all opt-in — the tracker stays localhost-only until you choose one.
 
 **→ [Remote & mobile access setup](docs/remote-access.md)**
 
