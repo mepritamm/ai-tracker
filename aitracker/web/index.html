@@ -56,31 +56,6 @@
   <div class=srcnote id=srcnote style=display:none></div>
 </header>
 <div class=body>
-  <div class="card span2" id=decpanel style=display:none>
-    <h2><span>🧭 Decisions &amp; open questions</span><span class=cnt id=decc style=color:#f5b443></span></h2>
-    <div class=cbody style="padding:8px 10px;max-height:340px" id=dec><div class=empty>—</div></div>
-  </div>
-  <div class="card span2" id=bgpanel style=display:none>
-    <h2><span>🤖 Background agents</span><span class=cnt id=bgc style=color:#f5b443></span></h2>
-    <div class=bggrid id=bg></div>
-  </div>
-  <div class="card span2" id=shpanel style=display:none>
-    <h2><span>⌨ Background shells</span><span class=cnt id=shc style=color:#f5b443></span></h2>
-    <div class=bggrid id=sh></div>
-  </div>
-  <div class="card span2" id=card_summary>
-    <h2>Session summary</h2>
-    <div class=ov>
-      <div class=ovrow><span class=ovk>Goal</span><span id=ov_goal class="ovv ovclk" onclick="openText('Goal','',curOv.goal||'')">—</span></div>
-      <div class=ovrow><span class=ovk>Now</span><span id=ov_now class=ovclk onclick="openNow()">—</span></div>
-      <div class=ovrow><span class=ovk>So far</span><span id=ov_sofar class=ovclk onclick="openText('So far','',curOv.sofar||'')">—</span></div>
-      <div class=ovrow id=ov_crow style=display:none><span class=ovk>Commits</span><span id=ov_commits class=ovv></span></div>
-    </div>
-  </div>
-  <div class="card span2" id=prpanel style=display:none>
-    <h2><span>🔀 Pull requests</span><span class=cnt id=prc style=color:#f5b443></span></h2>
-    <div class=cbody style="padding:6px 8px;max-height:230px" id=prs><div class=empty>—</div></div>
-  </div>
   <div class=card id=card_todos>
     <h2><span>Progress</span><span class=cnt id=todoc></span></h2>
     <div class=cbody style="padding:6px 8px;max-height:300px" id=todos><div class=empty>—</div></div>
@@ -96,11 +71,17 @@
       </div>
     </div>
   </div>
-  <div class=card>
-    <h2><span>🚩 Flags</span><span class=cnt id=flagc style=color:#f85149></span></h2>
-    <div class=cbody style=max-height:300px>
-      <div class=flagwrap id=flags><div class=empty>—</div></div>
-      <button class=addflag onclick=addFlag()>🚩 Flag an issue or gap</button>
+  <div class="card span2" id=decpanel style=display:none>
+    <h2><span>🧭 Decisions &amp; open questions</span><span class=cnt id=decc style=color:#f5b443></span></h2>
+    <div class=cbody style="padding:8px 10px;max-height:340px" id=dec><div class=empty>—</div></div>
+  </div>
+  <div class="card span2" id=card_summary>
+    <h2>Session summary</h2>
+    <div class=ov>
+      <div class=ovrow><span class=ovk>Goal</span><span id=ov_goal class="ovv ovclk" onclick="openText('Goal','',curOv.goal||'')">—</span></div>
+      <div class=ovrow><span class=ovk>Now</span><span id=ov_now class=ovclk onclick="openNow()">—</span></div>
+      <div class=ovrow><span class=ovk>So far</span><span id=ov_sofar class=ovclk onclick="openText('So far','',curOv.sofar||'')">—</span></div>
+      <div class=ovrow id=ov_crow style=display:none><span class=ovk>Commits</span><span id=ov_commits class=ovv></span></div>
     </div>
   </div>
   <div class="card span2" id=card_narr>
@@ -116,12 +97,41 @@
     <h2><span>Files</span><span class=cnt id=filec></span></h2>
     <div class=cbody id=files><div class=empty>—</div></div>
   </div>
+  <div class="card span2" id=prpanel style=display:none>
+    <h2><span>🔀 Pull requests</span><span class=cnt id=prc style=color:#f5b443></span></h2>
+    <div class=cbody style="padding:6px 8px;max-height:230px" id=prs><div class=empty>—</div></div>
+  </div>
+  <div class=card>
+    <h2><span>🚩 Flags</span><span class=cnt id=flagc style=color:#f85149></span></h2>
+    <div class=cbody style=max-height:300px>
+      <div class=flagwrap id=flags><div class=empty>—</div></div>
+      <button class=addflag onclick=addFlag()>🚩 Flag an issue or gap</button>
+    </div>
+  </div>
   <div class="card span2" id=card_cmds>
     <h2><span>Commands</span><span class=cnt id=cmdc></span></h2>
     <div class=cbody id=cmds><div class=empty>—</div></div>
   </div>
 </div>
-</main></div>
+</main>
+<div class=bgscrim id=bgscrim onclick=closeBgDrawer()></div>
+<aside class=bgdrawer id=bgdrawer data-tab=agents aria-label="Background work">
+  <div class=bgdh><span aria-hidden=true>🤖</span><div class=bgdtitle>Background work</div><span class=x onclick=closeBgDrawer() title="Close (Esc)">✕</span></div>
+  <div class=bgtabs>
+    <div class="bgtab on" id=bgtab_agents onclick="setBgTab('agents')">🤖 Agents</div>
+    <div class=bgtab id=bgtab_shells onclick="setBgTab('shells')">⌨ Shells</div>
+  </div>
+  <div class=bgdbody>
+    <div class="card span2" id=bgpanel style=display:none>
+      <h2><span>🤖 Background agents</span><span class=cnt id=bgc style=color:#f5b443></span></h2>
+      <div class=bggrid id=bg></div>
+    </div>
+    <div class="card span2" id=shpanel style=display:none>
+      <h2><span>⌨ Background shells</span><span class=cnt id=shc style=color:#f5b443></span></h2>
+      <div class=bggrid id=sh></div>
+    </div>
+  </div>
+</aside></div>
 <footer class=foot>Made with ❤️ in Bengaluru. Developed by <a href="https://tinyurl.com/pritamm93" target=_blank rel=noopener>Pritam</a>.</footer>
 <div class=toasts id=toasts></div>
 <div class=overlay id=diffmodal onclick="if(event.target===this)closeDiff()">

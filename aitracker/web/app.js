@@ -206,6 +206,12 @@ function pick(id){$("sid").value=id;track();renderSide();closeDrawer();}   // re
 // mobile Sessions drawer (phones only; CSS gates the affordances to ≤600px)
 function toggleDrawer(){document.querySelector(".app").classList.toggle("draweropen");}
 function closeDrawer(){document.querySelector(".app").classList.remove("draweropen");}
+// ---- Background-work drawer (agents + shells, relocated off the main column) ----
+let bgTab="agents";
+function openBgDrawer(tab){ bgTab=tab||bgTab; const d=$("bgdrawer"); if(!d)return; d.setAttribute("data-tab",bgTab); d.classList.add("open"); const sc=$("bgscrim"); if(sc)sc.classList.add("show"); setBgTabUI(); }
+function setBgTab(tab){ bgTab=tab; const d=$("bgdrawer"); if(d)d.setAttribute("data-tab",tab); setBgTabUI(); }
+function setBgTabUI(){ const a=$("bgtab_agents"),s=$("bgtab_shells"); if(a)a.classList.toggle("on",bgTab==="agents"); if(s)s.classList.toggle("on",bgTab==="shells"); }
+function closeBgDrawer(){ const d=$("bgdrawer"); if(d)d.classList.remove("open"); const sc=$("bgscrim"); if(sc)sc.classList.remove("show"); }
 async function doSearch(){
   const q=$("q").value.trim();
   if(!q){clearSearch();return}
@@ -350,11 +356,15 @@ function render(d){
   $("hmeta").innerHTML=meta.map(x=>`<span>${x}</span>`).join("");
 
   const chip=(n,v,cls,tgt)=>v?`<span class="chip ${cls||''} ${tgt?'clk':''}"${tgt?` onclick="flashTo('${tgt}')"`:''}><span class=lbl>${n}</span><b>${v}</b></span>`:"";
+  // agents & shells → open the right-side Background-work drawer (both already on the shared shape)
+  const bgchip=(n,v,tab,run)=>v?`<span class="chip bgchip clk" onclick="openBgDrawer('${tab}')" title="Open background ${tab}"><span class=lbl>${n}</span><b>${run?run+" / ":""}${v}</b></span>`:"";
+  const nAgents=(d.agents_bg||[]).length+(d.agent_sessions||[]).length, nAgentsRun=(d.agents_bg||[]).filter(a=>a.running).length+(d.agent_sessions||[]).filter(a=>a.running).length;
+  const nShells=(d.shells||[]).length, nShellsRun=(d.shells||[]).filter(s=>s.running).length;
   $("chips").innerHTML=
     chip("✓ done",`${c.done}/${c.todos}`,"good","card_todos")+chip("＋ created",c.created,"blue","card_files")+chip("✎ edited",c.edited,"","card_files")+
     chip("👁 read",c.read,"","card_files")+chip("⎇ commits",c.commits,"","card_cmds")+chip("tests",c.tests,"","card_cmds")+
     chip("✗ failed",c.tests_failed,"bad","card_cmds")+chip("⚠ errors",c.errors,"bad","card_cmds")+
-    chip("agents",c.agents,"","bgpanel")+chip("searches",c.searches);
+    bgchip("🤖 agents",nAgents,"agents",nAgentsRun)+bgchip("⌨ shells",nShells,"shells",nShellsRun)+chip("searches",c.searches);
 
   // background agents (click to read full narration)
   // background agents — running shown; finished tucked behind a disclosure
@@ -791,7 +801,7 @@ function flashTo(id){
   el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash");
   setTimeout(()=>el.classList.remove("flash"),1400);
 }
-document.addEventListener("keydown",e=>{if(e.key==="Escape"){closeDiff();closeMsg();}});
+document.addEventListener("keydown",e=>{if(e.key==="Escape"){closeDiff();closeMsg();closeBgDrawer();}});
 // ---- per-session notes stack ----
 function renderNotes(notes){
   const el=$("notes_list"), nc=$("notec");
