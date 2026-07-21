@@ -156,8 +156,10 @@ function sessionRow(s,now,ex){
   // a parent row: clicking the title toggles its agents too (not just the 🤖 button) while still opening it
   const onclick=ex?`pickToggle('${s.id}','${encodeURIComponent(ex.gk)}')`:`pick('${s.id}')`;
   const noteBadge=s.note_count?`<span class=notebadge title="${s.note_count} note${s.note_count==1?'':'s'}">📝${s.note_count}</span>`:"";
-  // end-state: waiting on your answer (wins, even while still live) > completed its last run (idle only)
-  const status=s.waiting?"waiting":(s.ended&&!live?"done":"");
+  // end-state: waiting on your answer (wins, even while still live) > completed its last run.
+  // "done" is gated to the live window (a session that JUST finished) — not every stale idle
+  // session — so the ✅ marks fresh completions instead of flooding the list green.
+  const status=s.waiting?"waiting":(s.ended&&live?"done":"");
   const statusBadge=status==="waiting"
     ?`<span class="statusbadge waiting" title="waiting for your answer — respond in the session">⏳ answer</span>`
     :status==="done"?`<span class="statusbadge done" title="completed its last run">✅ done</span>`:"";
