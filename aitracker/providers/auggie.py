@@ -1,7 +1,7 @@
 import glob, json, os, re, time
 from ..config import LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, prs_sorted, pr_worked, PR_CREATE_RE
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, PR_CREATE_RE
 from ..overview import build_overview
 from ..store import load_titles, load_tasks, load_notes
 from .base import Provider
@@ -180,12 +180,14 @@ def parse_auggie(session_id):
     requests, narrative, files, cmds, reads, commits = [], [], {}, [], {}, []
     asks = {}         # tool_use_id -> ask-user decision {t, open, answer, questions} (parity with Claude)
     prs = {}          # url -> entry : PR/MR links touched this session (parity with Claude)
+    pr_states = {}    # num -> "merged"/"closed" : state signals seen in logs (overlaid at the end)
     pr_creates = []   # exchange indices where a PR-create ran — Auggie logs no output URL, so we
     pr_first_ex = {}  # url -> exchange it first appeared in → attribute "created" by order, below
     tok_in = tok_out = 0
     def _cprs(text, narr=False):  # collect PRs + note which exchange each URL first showed up in
         before = set(prs)
         collect_prs(prs, text, ts, narr=narr)
+        note_pr_states(pr_states, text)               # `gh pr merge/close N`, merge-commit lines
         for u in prs:
             if u not in before:
                 pr_first_ex.setdefault(u, i)
@@ -216,6 +218,10 @@ def parse_auggie(session_id):
                 name = call.get("tool_name")
                 if name and "create_pull_request" in name:   # MCP PR creation in this exchange
                     pr_creates.append(i)
+                if name and "merge_pull_request" in name:     # MCP merge → that PR is merged
+                    pn = inp.get("pullNumber") or inp.get("pull_number")
+                    if pn:
+                        pr_states[str(pn)] = "merged"
                 if name == "launch-process" and inp.get("command"):   # ~ Claude's Bash
                     c = inp["command"]
                     k = cmd_kind(c)
@@ -288,7 +294,7 @@ def parse_auggie(session_id):
         "requests": requests, "agents": [], "agents_bg": [], "agent_sessions": [], "shells": [],
         # open decisions first, then most-recent — parity with Claude's AskUserQuestion panel
         "decisions": sorted(asks.values(), key=lambda a: (a["open"], a["t"] or ""), reverse=True),
-        "prs": [p for p in prs_sorted(prs) if pr_worked(p, cwd)],   # created or worked-on, not prompt-only references
+        "prs": [p for p in prs_sorted(prs, pr_states) if pr_worked(p, cwd)],   # created or worked-on, not prompt-only references
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": latest[:2000],
         "tokens": {"in": tok_in, "out": tok_out},

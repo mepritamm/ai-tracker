@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 import aitracker.config as config
-from aitracker.util import collect_prs, prs_sorted
+from aitracker.util import collect_prs, prs_sorted, note_pr_states
 from aitracker.providers.claude import parse_session
 from aitracker.providers import auggie as _auggie
 
@@ -60,6 +60,30 @@ class TestCollectPrs(unittest.TestCase):
         self.assertEqual(order, ["3", "2", "1"])           # created(#3) first, then #2 (newer ref) > #1
 
 
+class TestPrStates(unittest.TestCase):
+    def test_note_states_number_bearing_only(self):
+        st = {}
+        note_pr_states(st, "commit abc Merge pull request #42 from acme/feat")   # git-log subject
+        note_pr_states(st, "gh pr merge 7 --squash")                              # explicit merge
+        note_pr_states(st, "cd /repo && gh pr close 8")                           # explicit close (after &&)
+        note_pr_states(st, "these all merged: #99 #100")                          # bare mention → ignored
+        self.assertEqual(st, {"42": "merged", "7": "merged", "8": "closed"})
+
+    def test_merged_wins_over_closed(self):
+        st = {"5": "closed"}
+        note_pr_states(st, "Merge pull request #5 from x")
+        self.assertEqual(st["5"], "merged")                # merged is the meaningful state
+
+    def test_prs_sorted_overlays_state_by_num(self):
+        acc = {}
+        collect_prs(acc, "https://github.com/a/b/pull/42", "t", created=True)
+        out = prs_sorted(acc, {"42": "merged"})
+        self.assertEqual(out[0]["state"], "merged")
+        # a PR with no signal stays "" (renders as open)
+        self.assertEqual(prs_sorted({"u": {"url": "u", "num": "9", "created": False,
+                                           "narr": False, "state": "", "t": "t"}}, {})[0]["state"], "")
+
+
 def _write_jsonl(lines):
     fd, path = tempfile.mkstemp(suffix=".jsonl")
     with os.fdopen(fd, "w") as fh:
@@ -105,6 +129,27 @@ class TestClaudePrs(unittest.TestCase):
         os.unlink(path)
         self.assertEqual([p["num"] for p in d["prs"]], ["9"])
         self.assertTrue(d["prs"][0]["created"])
+
+    def test_merge_commit_line_marks_pr_merged(self):
+        # a created PR (#7); later a `git log` result carries its merge-commit subject → state=merged.
+        path = _write_jsonl([
+            {"type": "user", "cwd": "/x", "message": {"role": "user", "content": "ship it"}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "tu1", "name": "Bash",
+                 "input": {"command": "gh pr create --fill"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu1",
+                 "content": "https://github.com/acme/app/pull/7"}]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "g1", "name": "Bash", "input": {"command": "git log --oneline"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "g1",
+                 "content": "a575fc2 Merge pull request #7 from acme/feat"}]}},
+        ])
+        d = parse_session(path)
+        os.unlink(path)
+        self.assertEqual(d["prs"][0]["num"], "7")
+        self.assertEqual(d["prs"][0]["state"], "merged")
 
     def test_referenced_only_session_shows_none(self):
         # a session that only views/pastes PRs generates none -> empty panel.
@@ -168,6 +213,19 @@ class TestAuggiePrs(unittest.TestCase):
                            "response_text": "yes that one at https://github.com/acme/lib/pull/5"})
         d = _auggie.parse_auggie("s2")
         self.assertEqual(d["prs"], [])
+
+    def test_pr_state_merged_from_merge_command(self):
+        # parity with Claude: a created PR (#12) later merged via `gh pr merge 12` → state=merged.
+        self._write("s3", {
+            "request_message": "ship and merge it",
+            "response_nodes": [
+                {"tool_use": {"tool_name": "launch-process",
+                              "input_json": '{"command": "gh pr create --fill"}'}},
+                {"tool_use": {"tool_name": "launch-process",
+                              "input_json": '{"command": "gh pr merge 12 --squash"}'}}],
+            "response_text": "Opened https://github.com/acme/lib/pull/12"})
+        d = _auggie.parse_auggie("s3")
+        self.assertEqual([(p["num"], p["state"]) for p in d["prs"]], [("12", "merged")])
 
 
 if __name__ == "__main__":

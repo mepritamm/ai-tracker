@@ -1,7 +1,7 @@
 import difflib, glob, json, os, re, time
 from ..config import EDIT_TOOLS, LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, prs_sorted, pr_worked, PR_CREATE_RE
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, PR_CREATE_RE
 from ..overview import build_overview
 from ..store import load_titles, load_tasks, load_notes
 from .base import Provider
@@ -736,7 +736,8 @@ def parse_session(path):
     requests = []         # user asks {t, text}
     agents = []           # {t, type, desc}
     errors_by_id = {}     # tool_use_id -> True
-    prs = {}              # url -> {url, repo, num, created, t} : PRs touched this session
+    prs = {}              # url -> {url, repo, num, created, state, t} : PRs touched this session
+    pr_states = {}        # num -> "merged"/"closed" : state signals seen in logs (overlaid at the end)
     pr_create_ids = set() # tool_use_ids of `gh pr create` Bash calls (their result URL = created)
     asks = {}             # tool_use_id -> AskUserQuestion decision {t, open, answer, questions}
     narrative = []       # Claude's own text, in order: the blow-by-blow
@@ -824,12 +825,17 @@ def parse_session(path):
                         asks[rid]["answer"] = re.sub(r"^Your questions have been answered:\s*", "", rtext).strip()[:2000]
                         asks[rid]["open"] = False
                     collect_prs(prs, rtext, ts, rid in pr_create_ids)
+                    note_pr_states(pr_states, rtext)          # git-log "Merge pull request #N" etc.
                 elif bt == "tool_use":
                     name = b.get("name")
                     inp = b.get("input") or {}
                     bid = b.get("id")
                     if name and "create_pull_request" in name:   # GitHub MCP: result URL is a created PR
                         pr_create_ids.add(bid)
+                    if name and "merge_pull_request" in name:     # GitHub MCP merge → that PR is merged
+                        pn = inp.get("pullNumber") or inp.get("pull_number")
+                        if pn:
+                            pr_states[str(pn)] = "merged"
                     if name == "TodoWrite":
                         todos = inp.get("todos", todos)
                     elif name == "Write":
@@ -853,6 +859,7 @@ def parse_session(path):
                         if PR_CREATE_RE.search(c):       # its result URL is a created PR
                             pr_create_ids.add(bid)
                         collect_prs(prs, c, ts)                    # a command's PR ref alone isn't "worked on"
+                        note_pr_states(pr_states, c)               # `gh pr merge/close N`
                         if k == "commit":
                             m = COMMIT_MSG_RE.search(c)
                             commits.append({"t": ts, "msg": (m.group(2) if m else c)[:120]})
@@ -907,7 +914,7 @@ def parse_session(path):
         "shells": shells,
         # open decisions first, then most-recent — so a pending question is at the top
         "decisions": sorted(asks.values(), key=lambda a: (a["open"], a["t"] or ""), reverse=True),
-        "prs": [p for p in prs_sorted(prs) if pr_worked(p, meta.get("cwd"))],   # created or worked-on, not prompt-only references
+        "prs": [p for p in prs_sorted(prs, pr_states) if pr_worked(p, meta.get("cwd"))],   # created or worked-on, not prompt-only references
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": text_last[:2000],
         "tokens": {"in": tok_in, "out": tok_out},

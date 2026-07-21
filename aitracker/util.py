@@ -117,6 +117,11 @@ PR_URL_RE = re.compile(r"""https?://[^\s<>"'()\[\]]+?/(?:pull|pull-requests|merg
 # an ACTUAL `gh pr create` invocation — at a command boundary (start / after ; && | newline), so a
 # grep or script that merely mentions "pr create" doesn't get its output mislabelled as a created PR.
 PR_CREATE_RE = re.compile(r"(?:^|[\n;&|])\s*gh\s+pr\s+create\b")
+# NUMBER-BEARING state signals only — so we never guess a PR's fate from a bare "merged" that might
+# describe someone else's PR. A GitHub merge-commit subject (`Merge pull request #N from …`, seen in
+# git-log output) or an explicit `gh pr merge/close N`. Number is captured; matched to a PR by num.
+PR_MERGED_RE = re.compile(r"Merge pull request #(\d+)\b|(?:^|[\n;&|])\s*gh\s+pr\s+merge\s+#?(\d+)\b")
+PR_CLOSED_RE = re.compile(r"(?:^|[\n;&|])\s*gh\s+pr\s+close\s+#?(\d+)\b")
 
 
 def collect_prs(acc, text, ts, created=False, narr=False):
@@ -133,13 +138,28 @@ def collect_prs(acc, text, ts, created=False, narr=False):
         if not e:
             m = re.search(r"([^/]+/[^/]+)/(?:pull|pull-requests|merge_requests)/(\d+)", url)
             e = acc[url] = {"url": url, "repo": m.group(1) if m else "",
-                            "num": m.group(2) if m else "", "created": False, "narr": False, "t": ts}
+                            "num": m.group(2) if m else "", "created": False, "narr": False,
+                            "state": "", "t": ts}
         if created:
             e["created"] = True
         if narr:
             e["narr"] = True
         if ts and (not e["t"] or ts > e["t"]):
             e["t"] = ts
+
+
+def note_pr_states(states, text):
+    """Scan `text` for number-bearing merge/close signals and record num -> state in `states`.
+    Merged wins over closed (a merged PR is also closed, but 'merged' is the meaningful state)."""
+    if not text:
+        return
+    for a, b in PR_MERGED_RE.findall(text):
+        n = a or b
+        if n:
+            states[n] = "merged"
+    for n in PR_CLOSED_RE.findall(text):
+        if n and states.get(n) != "merged":
+            states[n] = "closed"
 
 
 def pr_worked(e, cwd):
@@ -153,8 +173,15 @@ def pr_worked(e, cwd):
     return bool(name) and any(s == name or s.startswith(name + "-") for s in cwd.split("/"))
 
 
-def prs_sorted(acc):
-    """Created PRs first, then most-recently-seen — the shared shape's `prs` list."""
+def prs_sorted(acc, states=None):
+    """Created PRs first, then most-recently-seen — the shared shape's `prs` list. Overlays merged/
+    closed state from `states` (num -> state) captured this session. ponytail: matched by num alone;
+    two repos sharing a PR number in one session would collide — add repo to the key if that bites."""
+    if states:
+        for e in acc.values():
+            st = states.get(e.get("num"))
+            if st:
+                e["state"] = st
     return sorted(acc.values(), key=lambda p: (p["created"], p["t"] or ""), reverse=True)
 
 

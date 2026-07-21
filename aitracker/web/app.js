@@ -490,11 +490,13 @@ function render(d){
   const prs=d.prs||[];
   $("prpanel").style.display=prs.length?"":"none";
   $("prc").textContent=prs.length||"";
-  winList("prs", prs, (p,i)=>
-    `<div class="item prrow"><a class=prlink href="${esc(p.url)}" target=_blank rel=noopener title="${esc(p.url)}">`+
-    `<span class="kind ${p.created?'new':''}">${p.created?'created':'worked on'}</span> `+
+  winList("prs", prs, (p,i)=>{
+    const st=p.state||"";  // "merged"/"closed" when the session's logs revealed it; else open
+    const badge=st?` <span class="prstate ${st}">${st}</span>`:"";
+    return `<div class="item prrow"><a class=prlink href="${esc(p.url)}" target=_blank rel=noopener title="${esc(p.url)}">`+
+    `<span class="kind ${p.created?'new':''}">${p.created?'created':'worked on'}</span>${badge} `+
     `<b>${esc((p.repo?p.repo+' ':'')+'#'+p.num)}</b><span class=prurl>${esc(p.url)}</span>`+
-    `<span class=prtime>${p.t?ago(d.now-Date.parse(p.t)/1000):""}</span><span class=chev>open ›</span></a></div>`,
+    `<span class=prtime>${p.t?ago(d.now-Date.parse(p.t)/1000):""}</span><span class=chev>${st||'open'} ›</span></a></div>`;},
     "no pull requests created in this session");
 
   // decisions / open questions the session asked the user for (Claude AskUserQuestion, Auggie ask-user)
