@@ -85,6 +85,8 @@ class TestBuildPage(unittest.TestCase):
         self.assertIn("class=addnote", p)                   # note button has its own class
         self.assertNotIn(".remote .addnote", p)             # …and is NOT hidden on remote
         self.assertIn(".remote .addflag", p)                # flagging stays local-only (unchanged)
+        # touch devices have no :hover — pin/rename (hover-only) must stay usable on the phone/tablet drawer
+        self.assertIn("@media(hover:none)", p)
 
 
 class TestSearchAllRanking(unittest.TestCase):

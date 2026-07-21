@@ -36,6 +36,8 @@ html,body{margin:0;height:100%;background:#0c0f15;color:#e6edf3;font-family:'Sou
 .pin{cursor:pointer;opacity:0;font-size:11px;flex:0 0 auto;filter:grayscale(1) opacity(.6)}
 .sitem:hover .pin{opacity:.6}.pin:hover{opacity:1;filter:none}
 .pin.on{opacity:1;filter:none}
+/* touch devices have no :hover — surface pin/rename (were hover-only → unusable on the phone/tablet drawer) */
+@media(hover:none){.ren{opacity:.75}.pin{opacity:.6}}
 .sitem.pinned{background:rgba(245,180,67,.06)}
 .sitem.pinned.active{background:rgba(76,141,255,.10)}
 .smeta{display:flex;align-items:center;gap:6px;color:#6b7585;font-size:11px;font-family:'JetBrains Mono',monospace;flex-wrap:wrap}
