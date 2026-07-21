@@ -5,6 +5,10 @@ let cur=localStorage.getItem("sid")||"", timer=null;
 // (script is at end of <body>) so the button never flashes before hiding.
 const LOCAL=["localhost","127.0.0.1","::1","[::1]"].includes(location.hostname);
 if(!LOCAL)document.documentElement.classList.add("remote");
+// Dark (default) / Light theme — the class is set pre-paint by the <head> script; sync button + meta here.
+function setTheme(t){document.documentElement.classList.toggle("light",t==="light");try{localStorage.theme=t}catch(e){}var b=document.getElementById("themebtn");if(b)b.textContent=t==="light"?"🌙":"☀️";var m=document.getElementById("themecolor");if(m)m.content=t==="light"?"#f4efe3":"#0c0f15";}
+function toggleTheme(){setTheme(document.documentElement.classList.contains("light")?"dark":"light");}
+setTheme(document.documentElement.classList.contains("light")?"light":"dark");
 const $=id=>document.getElementById(id);
 const esc=s=>(s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 // tiny inline markdown for narration/requests: escape first, then `code`,
@@ -124,15 +128,18 @@ function renderSide(){
   for(const k of [...expandedGroups]){ if(!(k.startsWith("sess:")?liveIds.has(k.slice(5)):liveGroups.has(k))){ expandedGroups.delete(k); pruned=true; } }
   if(pruned) localStorage.setItem("agrpOpen",JSON.stringify([...expandedGroups]));
   const kidsBlock=ks=>`<div class=agrpkids>${ks.slice().sort((x,y)=>y.mtime-x.mtime).map(k=>sessionRow(k,now)).join("")}</div>`;
+  const hasPin=items.some(x=>x.pinned); let _sec=null;   // Pinned / Recent section labels (only when there are pins)
+  const secDiv=it=>{ if(!hasPin)return ""; const s=it.pinned?"pin":"recent"; if(s===_sec)return ""; _sec=s; return `<div class=secband>${s==="pin"?"📌 Pinned":"Recent"}</div>`; };
   $("slist").innerHTML=items.length?items.map(it=>{
+    const _d=secDiv(it);
     if(it.t==="s"){
-      if(!it.kids) return sessionRow(it.s,now);
+      if(!it.kids) return _d+sessionRow(it.s,now);
       const gk="sess:"+it.s.id, open=expandedGroups.has(gk);
       const liveK=it.kids.filter(k=>now-k.mtime<LIVE).length;
-      return sessionRow(it.s,now,{gk,open,n:it.kids.length,live:liveK})+(open?kidsBlock(it.kids):"");
+      return _d+sessionRow(it.s,now,{gk,open,n:it.kids.length,live:liveK})+(open?kidsBlock(it.kids):"");
     }
     const b=it.b, open=expandedGroups.has(b.key);
-    return `<div class="agrp ${open?'open':''}">`+
+    return _d+`<div class="agrp ${open?'open':''}">`+
       `<div class=agrphdr onclick="toggleGroup('${encodeURIComponent(b.key)}')" title="${esc(b.key)}">`+
         `<span class=agrpchev>${open?"▾":"▸"}</span><span class=agrpname>🤖 Agents · ${esc(b.label)}</span>`+
         `<span class=agrpn>${b.live?b.live+" live / ":""}${b.kids.length}</span></div>`+
@@ -340,10 +347,10 @@ function render(d){
   if(!live){
     $("activebadge").style.display="inline-flex";
     $("activebadge").innerHTML='<span class=dot></span>idle '+ago(idle);
-    $("activebadge").style.color="#8b949e";$("activebadge").style.background="#10141c";$("activebadge").style.borderColor="#2c333f";
+    $("activebadge").style.color="var(--muted)";$("activebadge").style.background="var(--chipbg)";$("activebadge").style.borderColor="var(--line3)";
   }else{
     $("activebadge").innerHTML='<span class="dot live"></span>active';
-    $("activebadge").style.color="#29d398";$("activebadge").style.background="#0f2a20";$("activebadge").style.borderColor="#1c4634";
+    $("activebadge").style.color="var(--green)";$("activebadge").style.background="var(--green-deep)";$("activebadge").style.borderColor="var(--green-line)";
   }
 
   // meta line
@@ -383,7 +390,7 @@ function render(d){
         `<div class=top><span class="dot ${a.running?'live':''}"></span><span class=nm>🤖 ${esc(a.title||a.wt||a.id.slice(0,8))}</span>`+
         (a.runs>1?` <span class=tag title="ran ${a.runs}× — collapsed">×${a.runs}</span>`:"")+
         (a.wt?` <span class=tag>${esc(a.wt.slice(0,16))}</span>`:"")+`<span class=chev>open ›</span></div>`+
-        `<div class=ft><span>agent session</span><span>·</span><span style=color:${a.running?'#3fb950':'#6b7585'}>${a.running?'running':'done'}</span>`+
+        `<div class=ft><span>agent session</span><span>·</span><span style=color:${a.running?'var(--green2)':'var(--dim)'}>${a.running?'running':'done'}</span>`+
         `${a.mtime?"<span>·</span><span>"+ago(d.now-a.mtime)+"</span>":""}</div></div>`;
       const asRun=asx.filter(a=>a.running), asDone=asx.filter(a=>!a.running);
       html+=asRun.map(asCard).join("");
@@ -396,7 +403,7 @@ function render(d){
       `<div class="agent clk" onclick="openAgent(${i})"><div class=top><span class="dot ${a.running?'amber':''}"></span><span class=nm>${esc(a.task||a.id)}</span>`+
       (a.wf?` <span class=tag>${esc(a.wf.slice(0,12))}</span>`:"")+`<span class=chev>›</span></div>`+
       `<div class=last>${esc(a.last||"")}</div>`+
-      `<div class=ft><span>${a.tools} tools</span><span>·</span><span style=color:${a.running?'#f5b443':'#6b7585'}>${a.running?'running':'done'}</span>`+
+      `<div class=ft><span>${a.tools} tools</span><span>·</span><span style=color:${a.running?'var(--amber)':'var(--dim)'}>${a.running?'running':'done'}</span>`+
       `${a.ts?"<span>·</span><span>"+ago(d.now-Date.parse(a.ts)/1000)+"</span>":""}</div></div>`;
     const run=[],done=[];
     bg.forEach((a,i)=>(a.running?run:done).push(card(a,i)));
@@ -418,7 +425,7 @@ function render(d){
     const card=(s,i)=>
       `<div class="agent clk" onclick="openShell(${i})"><div class=top><span class="dot ${s.running?'amber':''}"></span><span class=nm>${esc(s.desc||s.cmd)}</span><span class=chev>›</span></div>`+
       `<div class="last mono" style=font-size:11px>${esc(s.last||s.cmd)}</div>`+
-      `<div class=ft><span>${esc(s.id)}</span><span>·</span><span style=color:${s.running?'#f5b443':'#6b7585'}>${s.running?'running':'done'}</span>`+
+      `<div class=ft><span>${esc(s.id)}</span><span>·</span><span style=color:${s.running?'var(--amber)':'var(--dim)'}>${s.running?'running':'done'}</span>`+
       `${s.ts?"<span>·</span><span>"+ago(d.now-Date.parse(s.ts)/1000)+"</span>":""}</div></div>`;
     const run=[],done=[];
     shl.forEach((s,i)=>(s.running?run:done).push(card(s,i)));
@@ -542,7 +549,7 @@ function render(d){
   $("cmdc").textContent=curCmds.length||"";
   winList("cmds", curCmds, (x,i)=>
     `<div class="item clk" onclick="openCmd(${i})"><span class="${x.ok?'ok':'bad'}">${x.ok?'✓':'✗'}</span> <span class=muted>${KICON[x.kind]||'$'}</span> `+
-    `<span class="cmd mono">${esc(x.cmd)}</span> <span class=chev style=float:right;color:#5b6573>output ›</span></div>`, "—");
+    `<span class="cmd mono">${esc(x.cmd)}</span> <span class=chev style=float:right;color:var(--dim)>output ›</span></div>`, "—");
 
   syncModal();   // keep an open narration/request modal live with this poll
 }

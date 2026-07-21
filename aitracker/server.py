@@ -1,4 +1,4 @@
-import json, os, sys, errno, webbrowser, base64, hmac
+import json, os, sys, errno, webbrowser, base64, hmac, hashlib, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from . import config                       # referenced live (config.AUTH) so tests/env see one source
@@ -8,6 +8,69 @@ from .registry import all_sessions, parse_any, search_all
 from .store import load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, _load_json, _save_json
 from .config import TITLES_FILE, FLAGS_FILE, PINS_FILE, NOTES_FILE
 from .providers.claude import find_session, file_diffs, command_output, shell_output, agent_detail
+
+# --- login gate: a styled login page + a signed-cookie session (routes accept the cookie OR HTTP Basic,
+# so curl -u still works). One credential — config.AUTH (TRACKER_AUTH) — compared in constant time. ---
+_COOKIE_TTL = 43200  # 12h
+
+def _sign(msg):
+    return hmac.new(config.AUTH.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+def _make_token(ttl=_COOKIE_TTL):
+    exp = str(int(time.time()) + ttl)
+    return exp + "." + _sign(exp)
+
+def _token_ok(tok):
+    try:
+        exp, sig = tok.split(".", 1)
+    except ValueError:
+        return False
+    if not hmac.compare_digest(sig, _sign(exp)):   # constant-time — a forged/edited cookie fails
+        return False
+    try:
+        return int(exp) > int(time.time())          # not expired
+    except ValueError:
+        return False
+
+# theme tokens duplicated here (the login page is server-rendered, outside the SPA's app.css) so it's
+# fully legible in Light too. Keep in sync with web/app.css :root / html.light.
+_LOGIN_CSS = """:root{--app:#0c0f15;--card:#0e121a;--line:#1c2330;--line3:#2c333f;--text:#e6edf3;--muted:#8b98a8;--dim:#6b7585;--blue:#4c8dff;--red:#f85149;--ring1:#4c8dff;--ring2:#29d398}
+html.light{--app:#f4efe3;--card:#fbf8f0;--line:#e3d9c4;--line3:#d8ccae;--text:#2b2820;--muted:#6f6754;--dim:#958c76;--blue:#2f6bd8;--red:#c53d2c;--ring1:#2f6bd8;--ring2:#1f9d6b}
+*{box-sizing:border-box}html,body{height:100%;margin:0;background:var(--app);color:var(--text);font-family:'Source Sans 3',system-ui,sans-serif;display:flex;align-items:center;justify-content:center}
+.lw{width:min(92vw,400px);padding:20px}
+.lc{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:30px 26px 24px;box-shadow:0 14px 44px rgba(0,0,0,.35);text-align:center}
+.lt{font-size:19px;font-weight:700;margin:12px 0 3px}.ls{font-size:12.5px;color:var(--muted);margin-bottom:22px}
+.lf{text-align:left;margin-bottom:13px}.lf label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim);margin-bottom:5px}
+.lf input{width:100%;background:var(--app);border:1px solid var(--line3);color:var(--text);border-radius:9px;padding:11px 12px;font-size:14px;outline:none}
+.lf input:focus{border-color:var(--blue)}
+.lb{width:100%;margin-top:6px;min-height:46px;padding:12px;border:0;border-radius:10px;background:linear-gradient(90deg,var(--ring1),var(--ring2));color:#fff;font-weight:700;font-size:14px;cursor:pointer}
+.lb:active{opacity:.9}.le{color:var(--red);font-size:12.5px;min-height:17px;margin-top:9px}
+.lfoot{margin-top:16px;font-size:11px;color:var(--dim);line-height:1.5}"""
+
+_LOGO = ("<svg viewBox='0 0 32 32' xmlns='http://www.w3.org/2000/svg' width=42 height=42>"
+  "<rect x='2.5' y='2.5' width='27' height='27' rx='8' fill='#11161f' stroke='#f5b443' stroke-width='2'/>"
+  "<path d='M6.5 18h3.6l2-5.6 3 10 2.2-6.3 1.5 1.9H25' fill='none' stroke='#f5b443' stroke-width='2.3' stroke-linecap='round' stroke-linejoin='round'/>"
+  "<circle cx='23.4' cy='9' r='3' fill='#29d398'/></svg>")
+
+def login_page():
+    return ("<!doctype html><html><head><meta charset=utf-8>"
+      "<meta name=viewport content='width=device-width,initial-scale=1'>"
+      "<title>AI Session Tracker — Sign in</title><meta name=theme-color content='#0c0f15'>"
+      "<script>try{if(localStorage.theme==='light')document.documentElement.classList.add('light')}catch(e){}</script>"
+      "<style>" + _LOGIN_CSS + "</style></head><body>"
+      "<div class=lw><form class=lc onsubmit='return doLogin(event)'>" + _LOGO +
+      "<div class=lt>AI Session Tracker</div><div class=ls>Private dashboard · protected access</div>"
+      "<div class=lf><label>Username</label><input id=lu autocomplete=username autofocus></div>"
+      "<div class=lf><label>Password</label><input id=lp type=password autocomplete=current-password></div>"
+      "<button class=lb type=submit>🔓 Unlock dashboard</button>"
+      "<div class=le id=lerr></div>"
+      "<div class=lfoot>HTTP Basic via <code>TRACKER_AUTH</code> · constant-time · read-only</div>"
+      "</form></div>"
+      "<script>async function doLogin(e){e.preventDefault();"
+      "var r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},"
+      "body:JSON.stringify({user:document.getElementById('lu').value,pass:document.getElementById('lp').value})});"
+      "if(r.ok){location.reload()}else{document.getElementById('lerr').textContent='Incorrect username or password'}"
+      "return false}</script></body></html>")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -24,11 +87,21 @@ class Handler(BaseHTTPRequestHandler):
             # this one, or the tab closed). Nothing to send; don't crash.
             pass
 
-    def _authed(self):
-        """True if the request may proceed. When config.AUTH is set, require matching
-        HTTP Basic credentials; otherwise send 401 and return False. Off by default."""
+    def _cookie_token(self):
+        for part in self.headers.get("Cookie", "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "ai_auth":
+                return v
+        return ""
+
+    def _authok(self):
+        """True if the request may proceed: no auth configured, a valid signed cookie, or valid HTTP
+        Basic (so curl -u keeps working). No side effects — the caller renders the response."""
         cred = config.AUTH
         if not cred:
+            return True
+        tok = self._cookie_token()
+        if tok and _token_ok(tok):
             return True
         got = self.headers.get("Authorization", "")
         if got.startswith("Basic "):
@@ -38,22 +111,46 @@ class Handler(BaseHTTPRequestHandler):
                 dec = ""
             if hmac.compare_digest(dec, cred):   # constant-time — don't leak length/prefix via ==
                 return True
-        body = b"authentication required"
+        return False
+
+    def _serve_login(self):
+        body = login_page().encode()
         try:
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="ai-tracker"')
-            self.send_header("Content-Type", "text/plain")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
-        return False
+
+    def _do_login(self):
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(n) or "{}")
+        except (ValueError, TypeError):
+            body = {}
+        creds = (body.get("user") or "") + ":" + (body.get("pass") or "")
+        if not config.AUTH or not hmac.compare_digest(creds, config.AUTH):
+            return self._json({"ok": False}, 401)
+        out = b'{"ok":true}'
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Set-Cookie",
+                             "ai_auth=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d" % (_make_token(), _COOKIE_TTL))
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_GET(self):
-        if not self._authed():
-            return
         p = urlparse(self.path)
+        if not self._authok():
+            # HTML routes -> styled login page; API -> 401 (the SPA's polls carry the cookie once in)
+            return self._json({"error": "auth required"}, 401) if p.path.startswith("/api") else self._serve_login()
         if p.path == "/":
             body = build_page().encode()
             try:
@@ -160,9 +257,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if not self._authed():
-            return
         p = urlparse(self.path)
+        if p.path == "/login":          # the only route reachable while unauthenticated
+            return self._do_login()
+        if not self._authok():
+            return self._json({"error": "auth required"}, 401)
         try:
             n = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(n) or "{}")

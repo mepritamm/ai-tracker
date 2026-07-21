@@ -87,6 +87,16 @@ class TestBuildPage(unittest.TestCase):
         self.assertIn(".remote .addflag", p)                # flagging stays local-only (unchanged)
         # touch devices have no :hover — pin/rename (hover-only) must stay usable on the phone/tablet drawer
         self.assertIn("@media(hover:none)", p)
+        # design parity: Dark/Light theme system + toggle + pre-paint init
+        self.assertIn("html.light", p)                 # Light-mode token block
+        self.assertIn("toggleTheme", p)                # theme toggle
+        self.assertIn("localStorage.theme", p)         # pre-paint init hook
+        self.assertNotIn("#8b949e", p)                 # a hardcoded grey is fully tokenised now
+        # State | Activity two-column body + Pinned/Recent sidebar bands
+        self.assertIn("class=statecol", p)
+        self.assertIn("class=actcol", p)
+        self.assertIn("◐ State", p)
+        self.assertIn("secband", p)
 
 
 class TestSearchAllRanking(unittest.TestCase):
@@ -251,14 +261,53 @@ class TestBasicAuth(unittest.TestCase):
             hdr["Authorization"] = "Basic " + base64.b64encode(cred.encode()).decode()
         c.request("GET", path, headers=hdr)
         r = c.getresponse()
-        r.read()
+        data = r.read()
         c.close()
-        return r.status, r.getheader("WWW-Authenticate")
+        return r.status, data
 
-    def test_no_credentials_401(self):
-        st, wa = self._get("/")
+    def test_unauth_html_serves_login_page(self):
+        st, body = self._get("/")                     # a styled page, NOT the browser Basic dialog
+        self.assertEqual(st, 200)
+        self.assertIn(b"Unlock dashboard", body)      # the login form
+        self.assertNotIn(b"Cloudflare", body)         # no transport name leaked
+        self.assertNotIn(b"Tunnel", body)
+
+    def test_unauth_api_is_401(self):
+        self.assertEqual(self._get("/api/list")[0], 401)
+
+    def test_basic_reaches_dashboard(self):
+        st, body = self._get("/", "alice:s3cret")     # curl -u path still works
+        self.assertEqual(st, 200)
+        self.assertIn(b"AI Session Tracker", body)
+        self.assertNotIn(b"Unlock dashboard", body)   # the app, not the login page
+
+    def test_login_cookie_flow(self):
+        # POST /login with good creds sets a signed cookie; the cookie alone then grants the dashboard.
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("POST", "/login", body=json.dumps({"user": "alice", "pass": "s3cret"}),
+                  headers={"Content-Type": "application/json"})
+        r = c.getresponse(); r.read(); setc = r.getheader("Set-Cookie"); c.close()
+        self.assertIn("ai_auth=", setc or "")
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", "/", headers={"Cookie": setc.split(";")[0]})
+        r = c.getresponse(); body = r.read(); st = r.status; c.close()
+        self.assertEqual(st, 200)
+        self.assertIn(b"AI Session Tracker", body)
+        self.assertNotIn(b"Unlock dashboard", body)
+
+    def test_login_bad_creds_401_no_cookie(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("POST", "/login", body=json.dumps({"user": "alice", "pass": "nope"}),
+                  headers={"Content-Type": "application/json"})
+        r = c.getresponse(); r.read(); setc = r.getheader("Set-Cookie"); st = r.status; c.close()
         self.assertEqual(st, 401)
-        self.assertIn("Basic", wa or "")        # prompts the browser for credentials
+        self.assertIsNone(setc)
+
+    def test_forged_cookie_rejected(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", "/api/list", headers={"Cookie": "ai_auth=99999999999.deadbeef"})
+        r = c.getresponse(); r.read(); st = r.status; c.close()
+        self.assertEqual(st, 401)
 
     def test_wrong_credentials_401(self):
         self.assertEqual(self._get("/api/list", "alice:wrong")[0], 401)
