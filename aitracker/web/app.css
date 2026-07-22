@@ -239,6 +239,9 @@ a{color:var(--blue)}
 .filerow{cursor:pointer}.filerow:hover{background:var(--selbg)}
 .filerow .chev{float:right;color:var(--dim);font-size:11px}
 .prstate{font-size:10px;padding:1px 6px;border-radius:4px;text-transform:uppercase;letter-spacing:.4px;flex:0 0 auto}
+/* PR-row badges must never shrink+wrap into a vertical column of letters (the long repo#num eats
+   the width) — pin them to their content and keep each on one line. */
+.prlink .kind,.prlink .agenttag,.prlink .prstate{flex:0 0 auto;white-space:nowrap}
 .prstate.merged{background:rgba(167,139,250,.16);color:var(--violet)}
 .prstate.closed{background:var(--red-bg);color:var(--red)}
 .prrow{padding:0}.prrow:hover{background:var(--selbg)}
