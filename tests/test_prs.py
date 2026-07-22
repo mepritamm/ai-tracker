@@ -181,6 +181,74 @@ class TestClaudePrs(unittest.TestCase):
         self.assertEqual(d["prs"], [])                     # #55 not created (grep) and cross-repo → hidden
 
 
+class TestAgentPrs(unittest.TestCase):
+    """A PR opened by a background subagent (`<sid>/**/agent-*.jsonl`) is attributed to the
+    session's `prs`, tagged agent, with its merge state — the flagged gap (only 2 of N showed)."""
+
+    def _session_with_agent(self, agent_lines, main_lines=None):
+        d = tempfile.mkdtemp()
+        spath = os.path.join(d, "sess.jsonl")
+        with open(spath, "w") as f:
+            for o in (main_lines or [{"type": "user", "cwd": "/x",
+                                      "message": {"role": "user", "content": "go"}}]):
+                f.write(json.dumps(o) + "\n")
+        adir = os.path.join(d, "sess", "subagents", "workflows", "wf_x")
+        os.makedirs(adir)
+        with open(os.path.join(adir, "agent-a0.jsonl"), "w") as f:
+            for o in agent_lines:
+                f.write(json.dumps(o) + "\n")
+        return spath
+
+    def test_agent_created_pr_surfaces_tagged(self):
+        spath = self._session_with_agent([
+            {"type": "assistant", "timestamp": "2026-06-22T10:00:00Z", "message": {"content": [
+                {"type": "tool_use", "id": "a1", "name": "Bash", "input": {"command": "gh pr create --fill"}}]}},
+            {"type": "user", "timestamp": "2026-06-22T10:00:30Z", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "a1",
+                 "content": "https://github.com/acme/app/pull/9"}]}},
+        ])
+        d = parse_session(spath)
+        pr = next((p for p in d["prs"] if p["num"] == "9"), None)
+        self.assertIsNotNone(pr)
+        self.assertTrue(pr["created"] and pr.get("agent"))     # attributed + agent-tagged
+
+    def test_agent_created_via_mcp_and_merge_state(self):
+        # created through the GitHub MCP tool, then merged via a git-log merge-commit line.
+        spath = self._session_with_agent([
+            {"type": "assistant", "timestamp": "2026-06-22T10:00:00Z", "message": {"content": [
+                {"type": "tool_use", "id": "m1", "name": "mcp__github__create_pull_request", "input": {}}]}},
+            {"type": "user", "timestamp": "2026-06-22T10:00:30Z", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "m1",
+                 "content": '{"html_url": "https://github.com/acme/app/pull/12"}'}]}},
+            {"type": "assistant", "timestamp": "2026-06-22T10:01:00Z", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "x",
+                 "content": "abc Merge pull request #12 from acme/feat"}]}},
+        ])
+        d = parse_session(spath)
+        pr = next((p for p in d["prs"] if p["num"] == "12"), None)
+        self.assertEqual((pr["created"], pr.get("agent"), pr["state"]), (True, True, "merged"))
+
+    def test_main_referenced_agent_created_dedup_and_promoted(self):
+        # main session only VIEWS #5 (referenced, would be filtered); the agent CREATED it.
+        # One row, promoted to created + agent-tagged (no duplicate).
+        spath = self._session_with_agent(
+            agent_lines=[
+                {"type": "assistant", "timestamp": "2026-06-22T10:00:00Z", "message": {"content": [
+                    {"type": "tool_use", "id": "a1", "name": "Bash", "input": {"command": "gh pr create --fill"}}]}},
+                {"type": "user", "timestamp": "2026-06-22T10:00:30Z", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "a1",
+                     "content": "https://github.com/acme/app/pull/5"}]}}],
+            main_lines=[
+                {"type": "user", "cwd": "/x", "message": {"role": "user", "content": "go"}},
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "v1", "name": "Bash",
+                     "input": {"command": "gh pr view https://github.com/acme/app/pull/5"}}]}}])
+        d = parse_session(spath)
+        rows = [p for p in d["prs"] if p["num"] == "5"]
+        self.assertEqual(len(rows), 1)                          # deduped by URL
+        self.assertTrue(rows[0]["created"] and rows[0].get("agent"))
+
+
 class TestAuggiePrs(unittest.TestCase):
     def setUp(self):
         self._sess = config.AUGGIE_SESSIONS

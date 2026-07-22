@@ -119,7 +119,7 @@ def _run():
             {"type": "tool_use", "name": "Edit",
              "input": {"file_path": "/x/.worktrees/wt/auth.py",
                        "old_string": "a", "new_string": "b"}}]}}) + "\n")
-    ags, newest, afiles = parse_agents(spath)
+    ags, newest, afiles, aprs, apst = parse_agents(spath)
     assert len(ags) == 1 and ags[0]["task"] == "Audit the auth module", ags
     assert ags[0]["last"] == "Scanning auth.py for issues" and ags[0]["tools"] == 2, ags
     assert ags[0]["wf"] == "wf_abc123", ags
@@ -143,6 +143,21 @@ def _run():
              "input": {"file_path": "/x/shared.py", "old_string": "a", "new_string": "b"}}]}}) + "\n")
     shared = next((x for x in parse_session(spath)["files"] if x["path"] == "/x/shared.py"), None)
     assert shared and shared.get("agent"), "a file touched by BOTH main and an agent stays tagged 🤖"  # the fix
+
+    # a PR a BACKGROUND AGENT opens (gh pr create in the subagent) is attributed to the session,
+    # tagged 🤖, and its merge state surfaces — else agent-generated PRs vanish (the flagged gap).
+    with open(os.path.join(adir, "agent-deadbeef00.jsonl"), "a") as f:
+        f.write(json.dumps({"type": "assistant", "timestamp": "2026-06-22T10:03:00Z", "message": {"content": [
+            {"type": "tool_use", "id": "aprc", "name": "Bash", "input": {"command": "gh pr create --fill"}}]}}) + "\n")
+        f.write(json.dumps({"type": "user", "timestamp": "2026-06-22T10:03:30Z", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "aprc",
+             "content": "https://github.com/acme/app/pull/77"}]}}) + "\n")
+        f.write(json.dumps({"type": "assistant", "timestamp": "2026-06-22T10:04:00Z", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "x",
+             "content": "abc Merge pull request #77 from acme/feat"}]}}) + "\n")
+    apr = next((x for x in parse_session(spath)["prs"] if x["num"] == "77"), None)
+    assert apr and apr["created"] and apr.get("agent"), "agent-opened PR must surface, tagged 🤖"  # the gap
+    assert apr["state"] == "merged", "the agent PR's merge state must surface too"
 
     # live window: activity within 5 min counts as live; older does not
     af = os.path.join(adir, "agent-deadbeef00.jsonl")
