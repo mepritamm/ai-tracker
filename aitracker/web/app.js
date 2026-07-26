@@ -250,6 +250,7 @@ async function start(){
 }
 function track(){
   cur=$("sid").value.trim();localStorage.setItem("sid",cur);
+  applyCollapsed();   // re-apply this session's per-pane collapse state to the shared panels
   if(timer)clearInterval(timer);
   if(!cur)return;
   poll();timer=setInterval(poll,2000);
@@ -893,7 +894,38 @@ function toggleRaw(){const r=$("raw");
 }
 $("q").addEventListener("keydown",e=>{if(e.key==="Enter")doSearch();if(e.key==="Escape")clearSearch();});
 setBell();
-start();
+// collapsible panels: a chevron in every body-card header (▾ open; rotates to ▴ collapsed).
+// per-session + in-memory: state is keyed by the viewed session (cur) and re-applied on every switch,
+// because all sessions share one panel DOM — so collapsing a pane in one session must NOT collapse it
+// in another. Keyed by panel index (card order is static). Resets on reload (no persistence).
+let collapsedBy={};
+function initCollapse(){
+  document.querySelectorAll(".body .card").forEach((card,i)=>{
+    const h=card.querySelector(":scope>h2"); if(!h)return;
+    card.dataset.ck=i;
+    const b=document.createElement("button");
+    b.className="cardchev";b.type="button";b.textContent="▾";
+    b.title="Collapse / expand";b.setAttribute("aria-expanded","true");
+    b.onclick=()=>{
+      const on=card.classList.toggle("collapsed");
+      const set=collapsedBy[cur]||(collapsedBy[cur]=new Set());
+      on?set.add(card.dataset.ck):set.delete(card.dataset.ck);
+      b.setAttribute("aria-expanded",String(!on));
+    };
+    h.appendChild(b);
+  });
+}
+// re-apply the viewed session's collapse state to the shared panels (called on each session switch)
+function applyCollapsed(){
+  const set=collapsedBy[cur];
+  document.querySelectorAll(".body .card").forEach(card=>{
+    const on=!!set&&set.has(card.dataset.ck);
+    card.classList.toggle("collapsed",on);
+    const b=card.querySelector(":scope>h2>.cardchev");
+    if(b)b.setAttribute("aria-expanded",String(!on));
+  });
+}
+initCollapse();start();
 
 document.addEventListener("keydown",e=>{
   const open=$("msgmodal").style.display==="flex"||$("diffmodal").style.display==="flex";
