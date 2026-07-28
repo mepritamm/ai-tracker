@@ -906,6 +906,10 @@ def parse_session(path):
     tasks = load_tasks(sid)  # newer sessions use the task store, not in-transcript TodoWrite
     if tasks:
         todos = tasks
+    # A malformed TodoWrite can set `todos` to a non-list (seen: the string "[]") or a
+    # list with stray non-dict entries; keep only dict todos so one bad session can't
+    # crash the parse (which closed the socket -> a 502 through a tunnel on every poll).
+    todos = [t for t in todos if isinstance(t, dict)] if isinstance(todos, list) else []
     done_todos = [t for t in todos if t.get("status") == "completed"]
     agents_bg, newest_agent, agent_files, agent_prs, agent_pr_states = parse_agents(path)
     # merge PRs a background agent generated into the session's prs (created stickies, agent-flagged),

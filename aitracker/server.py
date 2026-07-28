@@ -1,4 +1,4 @@
-import json, os, sys, errno, webbrowser, base64, hmac, hashlib, time
+import json, os, sys, errno, webbrowser, base64, hmac, hashlib, time, traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from . import config                       # referenced live (config.AUTH) so tests/env see one source
@@ -222,7 +222,12 @@ class Handler(BaseHTTPRequestHandler):
             sid = parse_qs(p.query).get("id", [""])[0]
             try:
                 data = parse_any(sid)          # routes to the owning provider
-            except OSError as e:
+            except Exception as e:
+                # A malformed session must not crash the handler: an unhandled
+                # exception closes the socket with no response, which a tunnel
+                # (cloudflared) reports to the browser as 502 on every 2s poll.
+                # Degrade to a clean JSON 500; keep the trace in the server log.
+                traceback.print_exc()
                 self._json({"error": str(e)}, 500)
                 return
             if data:
@@ -245,7 +250,8 @@ class Handler(BaseHTTPRequestHandler):
                 off, lim = 0, NARR_PAGE
             try:
                 data = parse_any(sid)
-            except OSError as e:
+            except Exception as e:
+                traceback.print_exc()
                 self._json({"error": str(e)}, 500)
                 return
             if not data:
