@@ -17,13 +17,16 @@
 <div class=app>
 <aside class=side>
   <div class=sidehead>
-    <div class=sidetop><span class=logo aria-hidden=true title="AI Session Tracker"><svg viewBox='0 0 32 32' xmlns='http://www.w3.org/2000/svg'><rect x='2.5' y='2.5' width='27' height='27' rx='8' fill='#11161f' stroke='#f5b443' stroke-width='2'/><path d='M6.5 18h3.6l2-5.6 3 10 2.2-6.3 1.5 1.9H25' fill='none' stroke='#f5b443' stroke-width='2.3' stroke-linecap='round' stroke-linejoin='round'/><circle cx='23.4' cy='9' r='3' fill='#29d398'/></svg></span><div class=ttl>Sessions</div><div class=livebadge id=livecount onclick=toggleLiveOnly() title="Click to show live sessions only">0 live</div><span class=themetoggle id=themebtn onclick=toggleTheme() title="Toggle light / dark" role=button aria-label="Toggle theme">☀️</span><span class=bell id=bell onclick=toggleSound() title="Completion sound: on">🔔</span></div>
+    <div class=sidetop><span class=logo aria-hidden=true title="AI Session Tracker"><svg viewBox='0 0 32 32' xmlns='http://www.w3.org/2000/svg'><rect x='2.5' y='2.5' width='27' height='27' rx='8' fill='#11161f' stroke='#f5b443' stroke-width='2'/><path d='M6.5 18h3.6l2-5.6 3 10 2.2-6.3 1.5 1.9H25' fill='none' stroke='#f5b443' stroke-width='2.3' stroke-linecap='round' stroke-linejoin='round'/><circle cx='23.4' cy='9' r='3' fill='#29d398'/></svg></span><div class=ttl>Sessions</div><div class=livebadge id=livecount onclick=toggleLiveOnly() title="Click to show live sessions only">0 live</div><span class=themetoggle id=themebtn onclick=toggleTheme() title="Toggle light / dark" role=button aria-label="Toggle theme">☀️</span><span class=bell id=bell onclick=toggleSound() title="Completion sound: on">🔔</span><span class=allflagsbtn id=allflagsbtn onclick=toggleAllFlags() title="Open flags across every session" role=button aria-label="All flags">🚩<span class=n id=allflagsn></span></span></div>
     <div class=searchbox>
       <span class=ic onclick=doSearch()>⌕</span>
       <input id=q placeholder="search sessions…" autocomplete=off>
       <span class=ic id=qclear onclick=clearSearch() style=display:none>✕</span>
     </div>
   </div>
+  <!-- every session's flags in one place: a flag raised on a session you're not looking at
+       was invisible before this panel existed. Opt-in via the 🚩 button in the sidebar header. -->
+  <div class=allflags id=allflags style=display:none><div class=empty>no flags yet</div></div>
   <div class=slist id=slist><div class=empty>loading…</div></div>
   <div class=sidefoot><span id=hostlbl>localhost:8787</span><span style=color:var(--green)>● connected</span></div>
 </aside>

@@ -1,6 +1,6 @@
 from .providers.claude import ClaudeProvider
 from .providers.auggie import AuggieProvider
-from .store import load_pins, load_notes
+from .store import load_pins, load_notes, load_flags
 
 
 PROVIDERS = [ClaudeProvider(), AuggieProvider()]
@@ -17,10 +17,15 @@ def all_sessions():
             pass  # one broken provider must not sink the whole list
     pins = set(load_pins())                       # user-pinned ids, read live
     notes = load_notes()                          # per-session note stacks, read live
+    open_flags = {}                               # session id -> unresolved 🚩 count, read live
+    for f in load_flags():
+        if not f.get("resolved"):
+            open_flags[f.get("session", "")] = open_flags.get(f.get("session", ""), 0) + 1
     for s in out:
         sid = s.get("id", "")
         s["pinned"] = sid in pins
         s["note_count"] = len(notes.get(sid, []))
+        s["open_flags"] = open_flags.get(sid, 0)  # 🚩 badge + the cross-session flag list
     out.sort(key=lambda s: (not s.get("pinned"), -s.get("mtime", 0)))   # pinned first, then newest
     return out
 

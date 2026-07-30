@@ -157,6 +157,9 @@ function sessionRow(s,now,ex){
   // a parent row: clicking the title toggles its agents too (not just the 🤖 button) while still opening it
   const onclick=ex?`pickToggle('${s.id}','${encodeURIComponent(ex.gk)}')`:`pick('${s.id}')`;
   const noteBadge=s.note_count?`<span class=notebadge title="${s.note_count} note${s.note_count==1?'':'s'}">📝${s.note_count}</span>`:"";
+  // open 🚩 count (server-owned, from flags.json) — without it a flag on a session you aren't
+  // looking at is invisible, which is how two of them sat unnoticed.
+  const flagBadge=s.open_flags?`<span class=flagbadge title="${s.open_flags} open flag${s.open_flags==1?'':'s'}">🚩${s.open_flags}</span>`:"";
   // end-state: waiting on your answer (wins, even while still live) > completed its last run.
   // "done" is gated to the live window (a session that JUST finished) — not every stale idle
   // session — so the ✅ marks fresh completions instead of flooding the list green.
@@ -164,9 +167,9 @@ function sessionRow(s,now,ex){
   const statusBadge=status==="waiting"
     ?`<span class="statusbadge waiting" title="waiting for your answer — respond in the session">⏳ answer</span>`
     :status==="done"?`<span class="statusbadge done" title="completed its last run">✅ done</span>`:"";
-  return `<div class="sitem ${s.id===cur?'active':''}${s.pinned?' pinned':''}${s.agent?' agentrow':''}${ex?' hasagents':''}${status?' '+status:''}" onclick="${onclick}" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
+  return `<div class="sitem ${s.id===cur?'active':''}${s.pinned?' pinned':''}${s.agent?' agentrow':''}${ex?' hasagents':''}${status?' '+status:''}${s.open_flags?' flagged':''}" onclick="${onclick}" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
     `<div class=srow1>${chev}<span class="dot ${live?'live':''}"></span><span class=nm>${s.agent?'🤖 ':''}${esc(label)}</span>`+
-    `${statusBadge}${noteBadge}`+
+    `${statusBadge}${flagBadge}${noteBadge}`+
     (s._runs>1?`<span class="agentbadge runs" title="ran ${s._runs}× — collapsed; opens the latest">×${s._runs}</span>`:"")+
     `<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">📌</span>`+
     `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename this session">✎</span></div>`+
@@ -202,6 +205,7 @@ function toggleLiveOnly(){liveOnly=!liveOnly;renderSide();}
 async function loadSide(){
   try{sessions=await(await fetch("/api/list")).json();}catch(e){return}
   renderSide();
+  loadFlags();   // flags were only fetched by poll(), i.e. never until a session was selected
 }
 function pick(id){$("sid").value=id;track();renderSide();closeDrawer();}   // renderSide auto-expands the selected agent's container; closeDrawer no-ops off-phone
 // mobile Sessions drawer (phones only; CSS gates the affordances to ≤600px)
@@ -335,11 +339,15 @@ function render(d){
   $("ringpct").textContent=pct;
   $("ringsub").textContent=`${c.done||0} of ${c.todos||0} tasks`;
 
-  // title + active badge
+  // title + active badge. Server-owned `waiting` (an unanswered question) wins over both
+  // live and idle — the same precedence the sidebar ⏳ uses. A session blocked on the user
+  // isn't idle, and calling it "idle 26m ago" is what hid that it needed an answer.
   $("htitle").textContent=title;
-  $("activebadge").style.display=live?"inline-flex":"none";
-  if(!live){
-    $("activebadge").style.display="inline-flex";
+  $("activebadge").style.display="inline-flex";
+  if(d.waiting){
+    $("activebadge").innerHTML='<span class="dot amber"></span>⏳ waiting on you · '+ago(idle).replace(" ago","");
+    $("activebadge").style.color="var(--amber)";$("activebadge").style.background="var(--amber-deep)";$("activebadge").style.borderColor="var(--amber-line)";
+  }else if(!live){
     $("activebadge").innerHTML='<span class=dot></span>idle '+ago(idle);
     $("activebadge").style.color="var(--muted)";$("activebadge").style.background="var(--chipbg)";$("activebadge").style.borderColor="var(--line3)";
   }else{
@@ -448,13 +456,14 @@ function render(d){
   $("ov_commits").textContent=ocm.join("  ·  ");
 
   // now banner: live → what it's working on (blue, blinking cursor); idle → the last thing
-  // it completed (green, no cursor). Click opens the newest narration entry in the
-  // live-following modal — so an active session is tracked as it works.
+  // it completed (green, no cursor); waiting → it stopped ON a question, so neither label
+  // fits ("Completed last task" reads as finished when it's actually blocked on you).
   $("nowbanner").style.display=ov.now?"flex":"none";
-  $("nowbanner").classList.toggle("done",!live);
-  const nowClean=(ov.now||"").replace(/^(?:▶|⚙|✓)\s+/,"").replace(/^Idle — last said:\s*/,"");
-  $("nowlbl").textContent=live?"Now working on":"Completed last task";
-  $("nowtext").innerHTML=(live?"▶ ":"✓ ")+md(nowClean)+(live?'<span class=cursor>▍</span>':"");
+  $("nowbanner").classList.toggle("done",!live&&!d.waiting);
+  $("nowbanner").classList.toggle("waiting",!!d.waiting);
+  const nowClean=(ov.now||"").replace(/^(?:▶|⚙|✓|⏳)\s+/,"").replace(/^Idle — last said:\s*/,"");
+  $("nowlbl").textContent=d.waiting?"Waiting on your answer":(live?"Now working on":"Completed last task");
+  $("nowtext").innerHTML=(d.waiting?"⏳ ":live?"▶ ":"✓ ")+md(nowClean)+(live&&!d.waiting?'<span class=cursor>▍</span>':"");
   // the last file touched — click jumps to the Files panel and opens its diff
   const lastFile=(d.files||[])[0];
   $("nowfile").style.display=lastFile?"":"none";
@@ -848,21 +857,63 @@ function copyNote(idx){
   else{const el=document.createElement("textarea");el.value=txt;document.body.appendChild(el);el.select();try{document.execCommand("copy");}catch(e){}document.body.removeChild(el);}
   toast("Note copied","");
 }
-let flags=[];
+let flags=[], flagRevealedFor=null;   // which session we've already auto-revealed the panel for
 async function loadFlags(){try{flags=await(await fetch("/api/flags")).json()}catch(e){return}renderFlags()}
+// one flag row — shared by the per-session panel and the cross-session list, so both
+// inherit resolve/reopen/delete instead of the list growing its own half-working copy.
+function flagRow(f,now,withWho){
+  const s=sessions.find(x=>x.id===f.session);
+  const who=withWho?`<div class=who onclick="jumpToFlag('${f.session}')" title="Open this session">`+
+    `${esc((s&&(s.title||s.project))||f.project||f.session.slice(0,8))}</div>`:"";
+  return `<div class="flag ${f.resolved?'done':'open'}">${who}`+
+    `<div class=note>${f.resolved?'✓ ':'🚩 '}${esc(f.note)}</div>`+
+    (f.context?`<div class=ctx>while: ${esc(f.context)}</div>`:"")+
+    `<div class=ft><span>${ago(now-f.ts)}</span>`+
+    `<span class="link blue" onclick="resolveFlag(${f.id})">${f.resolved?'reopen':'✓ resolve'}</span>`+
+    `<span class="link grey" onclick="delFlag(${f.id})">delete</span></div></div>`;
+}
 function renderFlags(){
   const mine=flags.filter(f=>f.session===cur).sort((a,b)=>(a.resolved-b.resolved)||b.ts-a.ts);
   const open=mine.filter(f=>!f.resolved).length;
   $("flagc").textContent=mine.length?`${open} open / ${mine.length}`:"";
   const bc=$("flagbtnc"); if(bc)bc.textContent=open?" · "+open:"";   // header button shows the open-flag count
   const now=Date.now()/1000;
-  $("flags").innerHTML=mine.length?mine.map(f=>
-    `<div class="flag ${f.resolved?'done':'open'}"><div class=note>${f.resolved?'✓ ':'🚩 '}${esc(f.note)}</div>`+
-    (f.context?`<div class=ctx>while: ${esc(f.context)}</div>`:"")+
-    `<div class=ft><span>${ago(now-f.ts)}</span>`+
-    `<span class="link blue" onclick="resolveFlag(${f.id})">${f.resolved?'reopen':'✓ resolve'}</span>`+
-    `<span class="link grey" onclick="delFlag(${f.id})">delete</span></div></div>`).join(""):
+  $("flags").innerHTML=mine.length?mine.map(f=>flagRow(f,now,false)).join(""):
     "<div class=empty>no flags yet</div>";
+  // an open flag on the session you're looking at shouldn't need a click to find: reveal the
+  // (otherwise opt-in) panel. ONCE per selection — guarded like autoExpandedFor, else the 2s
+  // poll would keep re-opening a panel you just closed.
+  if(open&&cur&&flagRevealedFor!==cur){
+    flagRevealedFor=cur;
+    const c=$("flagcard"); if(c&&c.style.display==="none"){c.style.display="";const b=$("flagbtn"); if(b)b.classList.add("on");}
+  }
+  renderAllFlags();
+}
+// every session's flags in one list — the panel that makes a flag findable at all.
+function renderAllFlags(){
+  const openN=flags.filter(f=>!f.resolved).length;
+  const n=$("allflagsn"); if(n)n.textContent=openN?openN:"";
+  const btn=$("allflagsbtn"); if(btn){btn.classList.toggle("has",!!openN);
+    btn.title=openN?`${openN} open flag${openN==1?'':'s'} across all sessions`:"Open flags across every session";}
+  const box=$("allflags"); if(!box)return;
+  const now=Date.now()/1000;
+  const all=flags.slice().sort((a,b)=>(a.resolved-b.resolved)||b.ts-a.ts);
+  box.innerHTML=all.length?all.map(f=>flagRow(f,now,true)).join(""):
+    "<div class=empty>no flags yet</div>";
+}
+// jump from the cross-session list to the flagged session (and open its Flags panel)
+function jumpToFlag(sid){
+  pick(sid);
+  closeDrawer();
+  const c=$("flagcard"); if(c){c.style.display="";const b=$("flagbtn"); if(b)b.classList.add("on");
+    c.scrollIntoView({behavior:"smooth",block:"nearest"});}
+}
+function toggleAllFlags(){
+  const box=$("allflags"); if(!box)return;
+  const show=box.style.display==="none";
+  box.style.display=show?"":"none";
+  const b=$("allflagsbtn"); if(b)b.classList.toggle("on",show);
+  if(show)renderAllFlags();
 }
 async function addFlag(){
   if(!cur){alert("Pick a session first");return}

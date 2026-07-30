@@ -959,6 +959,9 @@ def parse_session(path):
         "shells": shells,
         # open decisions first, then most-recent — so a pending question is at the top
         "decisions": sorted(asks.values(), key=lambda a: (a["open"], a["t"] or ""), reverse=True),
+        # an unanswered AskUserQuestion: the session isn't idle, it's blocked on the user.
+        # Same signal the sidebar's ⏳ uses, off the whole transcript instead of the tail.
+        "waiting": any(a["open"] for a in asks.values()),
         "prs": [p for p in prs_sorted(prs, pr_states) if pr_worked(p, meta.get("cwd"))],   # created or worked-on, not prompt-only references
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": text_last[:2000],

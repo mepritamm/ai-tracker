@@ -11,7 +11,7 @@ import unittest
 from aitracker import config
 from aitracker.util import _short_title, _window, _git_branch
 from aitracker.store import load_flags, save_flags, load_titles, load_tasks, load_notes, save_notes, _save_json
-from aitracker.registry import parse_any
+from aitracker.registry import parse_any, all_sessions
 from aitracker.providers.claude import (
     parse_session, parse_agents, parse_shells, _match_content, _active_mtime,
     file_diffs, command_output, shell_output, agent_detail, _redirect_log,
@@ -302,6 +302,10 @@ def _run():
     ls2 = {s["id"]: s for s in list_sessions()}
     assert ls2["s_wait"]["waiting"] and not ls2["s_wait"]["ended"], ls2["s_wait"]   # wired onto the list dict
     assert ls2["s_done"]["ended"] and not ls2["s_done"]["waiting"], ls2["s_done"]
+    # …and onto the DETAIL dict too, so the header can say "waiting on you" instead of "idle 26m ago"
+    assert parse_session(_mklines("s_wait", [UMSG, ASK]))["waiting"] is True, "unanswered question -> detail waiting"
+    assert parse_session(_mklines("s_answered", [UMSG, ASK, ANS, TXT]))["waiting"] is False, "answered -> not waiting"
+    assert parse_session(_mklines("s_none", [UMSG, TXT]))["waiting"] is False, "no question at all -> not waiting"
 
     # sidebar end-state (Auggie): same capability off ask-user / response_text — parity with Claude
     def _ex(**kw): return {"exchange": kw}
@@ -375,7 +379,36 @@ def _run():
     assert pa["commits"] and pa["commits"][0]["msg"] == "fix it", pa["commits"]
     assert pa["reads"][0]["path"] == "app.py", pa["reads"]
     assert "gitBranch" in pa["meta"], "auggie meta must carry gitBranch like Claude"
+    assert pa["waiting"] is False, "no open ask-user -> not waiting"
     assert parse_auggie("missing") is None
+
+    # detail-dict `waiting` spans BOTH providers — an unanswered ask-user must reach parse_auggie
+    # the same way an unanswered AskUserQuestion reaches parse_session (one capability, one shape).
+    with open(os.path.join(config.AUGGIE_SESSIONS, "sess_wait.json"), "w") as fh:
+        json.dump({"sessionId": "sess_wait", "modified": "2026-06-27T05:48:03Z", "customTitle": "Blocked",
+                   "chatHistory": [{"finishedAt": "2026-06-27T05:47:50Z",
+                                    "exchange": {"request_message": "which one?", "response_text": "asking",
+                                                 "response_nodes": [{"tool_use": {"tool_name": "ask-user",
+                                                                     "tool_use_id": "w1"}}]}}]}, fh)
+    assert parse_auggie("sess_wait")["waiting"] is True, "auggie: open ask-user -> detail waiting"
+    _AUGGIE_LIST_CACHE.clear()
+
+    # 🚩 open-flag counts land on the shared list dict in registry.all_sessions(), so BOTH
+    # providers inherit the badge — a flag on a session you aren't viewing must still be findable.
+    _flag_snap = config.FLAGS_FILE
+    config.FLAGS_FILE = tempfile.mktemp(suffix=".json")
+    save_flags([{"id": 1, "session": "s_wait", "note": "open one", "resolved": False},
+                {"id": 2, "session": "s_wait", "note": "another", "resolved": False},
+                {"id": 3, "session": "s_wait", "note": "already handled", "resolved": True},
+                {"id": 4, "session": "auggie:sess1", "note": "auggie gap", "resolved": False}])
+    byid = {s["id"]: s for s in all_sessions()}
+    assert byid["s_wait"]["open_flags"] == 2, byid["s_wait"]            # resolved ones don't count
+    assert byid["auggie:sess1"]["open_flags"] == 1, byid["auggie:sess1"]  # namespaced id matches too
+    assert byid["s_done"]["open_flags"] == 0, byid["s_done"]            # unflagged -> 0, never missing
+    os.unlink(config.FLAGS_FILE)
+    config.FLAGS_FILE = _flag_snap
+    assert all_sessions()[0].get("open_flags") == 0, "no flags file -> every session still reports 0"
+    _AUGGIE_LIST_CACHE.clear()
 
     # _git_branch reads a normal repo and a worktree (Auggie's git branch source)
     gdir = tempfile.mkdtemp()

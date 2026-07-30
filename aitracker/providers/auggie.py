@@ -294,6 +294,8 @@ def parse_auggie(session_id):
         "requests": requests, "agents": [], "agents_bg": [], "agent_sessions": [], "shells": [],
         # open decisions first, then most-recent — parity with Claude's AskUserQuestion panel
         "decisions": sorted(asks.values(), key=lambda a: (a["open"], a["t"] or ""), reverse=True),
+        "waiting": any(a["open"] for a in asks.values()),   # unanswered ask-user -> blocked on the user, not idle
+
         "prs": [p for p in prs_sorted(prs, pr_states) if pr_worked(p, cwd)],   # created or worked-on, not prompt-only references
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": latest[:2000],

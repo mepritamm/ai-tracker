@@ -70,6 +70,9 @@ html,body{margin:0;height:100%;background:var(--app);color:var(--text);font-fami
 .statusbadge{flex:0 0 auto;font-size:10px;border-radius:4px;padding:0 5px;margin-left:2px;font-weight:600}
 .statusbadge.waiting{color:var(--amber);background:var(--amber-bg)}
 .statusbadge.done{color:var(--green2);background:var(--green-bg)}
+/* open 🚩 count on a row — red so it reads as "needs attention", unlike the amber end-state */
+.sitem.flagged{border-left:3px solid var(--red)}
+.flagbadge{flex:0 0 auto;font-size:10px;border-radius:4px;padding:0 5px;margin-left:2px;font-weight:600;color:var(--red);background:var(--chipbg)}
 .ssnip{color:var(--dim);font-size:11px;margin-top:6px;line-height:1.35;font-family:'JetBrains Mono',monospace;overflow-wrap:anywhere}
 .ssnip b{color:var(--text);background:var(--hl);border-radius:2px}
 .smatch{color:var(--green)}
@@ -191,6 +194,17 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid var(--line)}
 .flagbtn{margin-left:auto;display:inline-flex;align-items:center;gap:5px;font-family:inherit;font-size:12px;color:var(--muted);background:var(--chipbg);border:1px solid var(--line3);border-radius:20px;padding:5px 12px;cursor:pointer;white-space:nowrap;line-height:1}
 .flagbtn:hover{border-color:var(--red);color:var(--head)}
 .flagbtn.on{color:var(--amber);background:var(--amber-bg);border-color:var(--amber)}
+/* sidebar 🚩 button + the cross-session flag list it reveals. Plain user data read from the
+   server's flags.json, so it works from a phone/tunnel exactly like the per-session panel. */
+.allflagsbtn{cursor:pointer;user-select:none;font-size:13px;flex:0 0 auto;filter:grayscale(1) opacity(.6)}
+.allflagsbtn.has,.allflagsbtn.on{filter:none}
+.allflagsbtn .n{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;color:var(--red);margin-left:1px}
+.allflags{max-height:42vh;overflow:auto;padding:8px;border-bottom:1px solid var(--line);background:var(--app)}
+.allflags .flag{margin-bottom:6px}
+.allflags .who{font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--blue);cursor:pointer;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.allflags .who:hover{text-decoration:underline}
+/* header badge when the session is blocked on your answer (amber, matching the sidebar ⏳) */
+.nowbanner.waiting{border-color:var(--amber-line);background:var(--amber-deep)}
 
 /* narration */
 .narr{display:flex;gap:12px;padding:9px 9px;border-bottom:1px solid var(--line2);cursor:pointer;border-radius:8px}

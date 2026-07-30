@@ -108,6 +108,21 @@ class TestBuildPage(unittest.TestCase):
         self.assertIn("id=flagcard", p)
         self.assertLess(p.index("id=flagcard"), p.index("class=statecol"))  # above the split
         self.assertRegex(p, r"id=flagcard[^>]*style=display:none")          # hidden until toggled
+        # Cross-session flag list: a flag raised on a session you aren't viewing was unreachable
+        # before this panel. Lives in the sidebar (above the session list), opened by its own 🚩.
+        self.assertIn("id=allflagsbtn", p)
+        self.assertIn("toggleAllFlags", p)
+        self.assertIn("id=allflags", p)
+        self.assertLess(p.index("id=allflags "), p.index("id=slist"))        # above the session list
+        self.assertRegex(p, r"id=allflags[^>]*style=display:none")           # opt-in, like the session panel
+        self.assertIn("jumpToFlag", p)                                       # a row opens its session
+        self.assertIn("class=flagbadge", p)                                  # 🚩N on a flagged sidebar row
+        self.assertIn("open_flags", p)                                       # …fed by the server field, not re-derived
+        # a session blocked on an unanswered question reads as waiting, never as "idle 26m ago"
+        self.assertIn("waiting on you", p)
+        self.assertIn("d.waiting", p)
+        # every flag control stays usable from a phone/tunnel — flags are plain user data
+        self.assertNotIn(".remote", p)
         # Background-work drawer adopts the sidebar's warm --side surface (palette parity, both themes)
         self.assertIn(".bgdrawer .card{background:var(--side)}", p)
         self.assertIn(".bgdrawer .agent{background:var(--side)}", p)
@@ -243,6 +258,60 @@ class TestServerEndToEnd(unittest.TestCase):
     def test_notes_missing_session_rejected(self):
         st, j = self._post("/api/notes", {"text": "oops"})
         self.assertEqual(st, 400)
+
+    def test_flag_open_count_reaches_the_session_list(self):
+        """The whole 🚩 wiring over real HTTP: raise → counted on /api/list → resolve → uncounted.
+
+        _empty_env() does NOT repoint FLAGS_FILE, so set it here — otherwise this test would
+        write into the user's own flags.json.
+        """
+        config.FLAGS_FILE = tempfile.mktemp(suffix=".json")
+        os.makedirs(os.path.join(config.AUGMENT_DIR, "task-storage", "tasks"))
+        open(os.path.join(config.AUGMENT_DIR, "settings.json"), "w").write('{"indexingAllowDirs":["/x"]}')
+        _write_auggie("s", "Hello world")
+
+        def _entry():
+            _auggie._AUGGIE_LIST_CACHE.clear()
+            st, body = self._get("/api/list")
+            self.assertEqual(st, 200)
+            return {s["id"]: s for s in json.loads(body)}["auggie:s"]
+
+        self.assertEqual(_entry()["open_flags"], 0)            # present and zero before any flag
+
+        st, flag = self._post("/api/flags", {"session": "auggie:s", "project": "x", "note": "a gap"})
+        self.assertEqual(st, 201)
+        self.assertEqual(_entry()["open_flags"], 1)            # the id the client posts == the list id
+
+        st, _ = self._post("/api/flags/resolve", {"id": flag["id"]})
+        self.assertEqual(st, 200)
+        self.assertEqual(_entry()["open_flags"], 0)            # resolved flags stop counting
+
+        st, body = self._get("/api/flags")                     # …but stay listable cross-session
+        self.assertEqual([f["note"] for f in json.loads(body)], ["a gap"])
+
+    def test_api_session_carries_waiting(self):
+        """`waiting` must be on the DETAIL dict for both providers — the header renders off it."""
+        os.makedirs(os.path.join(config.AUGMENT_DIR, "task-storage", "tasks"))
+        open(os.path.join(config.AUGMENT_DIR, "settings.json"), "w").write('{"indexingAllowDirs":["/x"]}')
+        _write_auggie("plain", "Nothing pending")
+        st, body = self._get("/api/session?id=auggie:plain")
+        self.assertEqual(st, 200)
+        self.assertIs(json.loads(body)["waiting"], False)
+
+        json.dump({"sessionId": "blocked", "modified": "2026-06-27T05:48:03Z", "customTitle": "Blocked",
+                   "chatHistory": [{"finishedAt": "2026-06-27T05:47:50Z",
+                                    "exchange": {"request_message": "which?", "response_text": "asking",
+                                                 "response_nodes": [{"tool_use": {"tool_name": "ask-user",
+                                                                     "tool_use_id": "w1"}}]}}]},
+                  open(os.path.join(config.AUGGIE_SESSIONS, "blocked.json"), "w"))
+        st, body = self._get("/api/session?id=auggie:blocked")
+        self.assertEqual(st, 200)
+        self.assertIs(json.loads(body)["waiting"], True)
+
+        _write_claude("csess", 2)
+        st, body = self._get("/api/session?id=csess")
+        self.assertEqual(st, 200)
+        self.assertIs(json.loads(body)["waiting"], False)   # Claude fills the same key
 
     def test_notes_invalid_index_is_noop(self):
         self._post("/api/notes", {"session": "sess-z", "text": "note"})
