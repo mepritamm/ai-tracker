@@ -114,14 +114,19 @@ COMMIT_MSG_RE = re.compile(r"-m\s+(['\"])(.+?)\1", re.S)
 # GitLab /merge_requests/N. Scanned out of assistant text + command output so the
 # app can list them as clickable links (see collect_prs).
 PR_URL_RE = re.compile(r"""https?://[^\s<>"'()\[\]]+?/(?:pull|pull-requests|merge_requests)/\d+""")
-# an ACTUAL `gh pr create` invocation — at a command boundary (start / after ; && | newline), so a
-# grep or script that merely mentions "pr create" doesn't get its output mislabelled as a created PR.
-PR_CREATE_RE = re.compile(r"(?:^|[\n;&|])\s*gh\s+pr\s+create\b")
+# Where a real command can START: line start, a separator (`;` `&` `|`), or an opener that begins a
+# NESTED command — `$( … )` / a subshell / backtick, or a loop-or-conditional body (`do`/`then`/`else`).
+# Anchoring here keeps a script that merely MENTIONS "gh pr create" from having its output mislabelled
+# as a created PR, while still catching the real invocation the bare-line anchor missed:
+# `url=$(gh pr create …)` inside a `for r in …; do … done` fan-out over sibling repos.
+_CMD_START = r"(?:^|[\n;&|(`]|\b(?:do|then|else)\s)\s*"
+# an ACTUAL `gh pr create` invocation (its result URL is a PR this session created).
+PR_CREATE_RE = re.compile(_CMD_START + r"gh\s+pr\s+create\b")
 # NUMBER-BEARING state signals only — so we never guess a PR's fate from a bare "merged" that might
 # describe someone else's PR. A GitHub merge-commit subject (`Merge pull request #N from …`, seen in
 # git-log output) or an explicit `gh pr merge/close N`. Number is captured; matched to a PR by num.
-PR_MERGED_RE = re.compile(r"Merge pull request #(\d+)\b|(?:^|[\n;&|])\s*gh\s+pr\s+merge\s+#?(\d+)\b")
-PR_CLOSED_RE = re.compile(r"(?:^|[\n;&|])\s*gh\s+pr\s+close\s+#?(\d+)\b")
+PR_MERGED_RE = re.compile(r"Merge pull request #(\d+)\b|" + _CMD_START + r"gh\s+pr\s+merge\s+#?(\d+)\b")
+PR_CLOSED_RE = re.compile(_CMD_START + r"gh\s+pr\s+close\s+#?(\d+)\b")
 
 
 def collect_prs(acc, text, ts, created=False, narr=False):

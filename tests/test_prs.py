@@ -7,7 +7,8 @@ import tempfile
 import unittest
 
 import aitracker.config as config
-from aitracker.util import collect_prs, prs_sorted, note_pr_states
+from aitracker.util import (collect_prs, prs_sorted, note_pr_states,
+                            PR_CREATE_RE, PR_MERGED_RE, PR_CLOSED_RE)
 from aitracker.providers.claude import parse_session
 from aitracker.providers import auggie as _auggie
 
@@ -179,6 +180,58 @@ class TestClaudePrs(unittest.TestCase):
         d = parse_session(path)
         os.unlink(path)
         self.assertEqual(d["prs"], [])                     # #55 not created (grep) and cross-repo → hidden
+
+    def test_pr_create_in_loop_substitution_marks_all_output_urls_created(self):
+        # THE FLAGGED GAP: a companion fan-out opens one PR per sibling repo with
+        # `url=$(gh pr create …)` inside `for … do … done`. The old bare-line anchor missed it, so
+        # 3 of 4 PRs were only "narrated" and pr_worked() dropped them as cross-repo — the narration
+        # said 4 PRs, the panel showed 1. Every URL the real invocation printed is a created PR.
+        path = _write_jsonl([
+            {"type": "user", "cwd": "/w/app", "message": {"role": "user", "content": "open the companions"}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command":
+                    'for r in ai client mesh; do\n'
+                    '  url=$(gh pr create --repo "acme/$r" --base develop --fill | tail -1)\n'
+                    '  printf "%s %s\\n" "$r" "$url"\n'
+                    'done'}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "b1", "content":
+                    "ai     https://github.com/acme/ai/pull/611\n"
+                    "client https://github.com/acme/client/pull/186\n"
+                    "mesh   https://github.com/acme/mesh/pull/243\n"}]}},
+        ])
+        d = parse_session(path)
+        os.unlink(path)
+        # all three surface despite living in sibling repos, not the session's own cwd
+        self.assertEqual(sorted(p["num"] for p in d["prs"]), ["186", "243", "611"])
+        self.assertTrue(all(p["created"] for p in d["prs"]))
+
+
+class TestCmdBoundary(unittest.TestCase):
+    """`gh pr create/merge/close` is recognised at every real command start — and only there.
+    One shared `_CMD_START` boundary, so all three signals inherit the same rule."""
+
+    def test_nested_command_starts_match(self):
+        for cmd in ('url=$(gh pr create --fill)',            # command substitution
+                    'u=`gh pr create --fill`',               # backticks
+                    '(gh pr create --fill)',                 # subshell
+                    'for r in a b; do gh pr create --fill; done',
+                    'if [ -n "$x" ]; then gh pr create --fill; fi',
+                    'gh pr create --fill',                   # the plain case still works
+                    'git push && gh pr create --fill'):
+            self.assertTrue(PR_CREATE_RE.search(cmd), cmd)
+
+    def test_mentions_still_do_not_match(self):
+        for cmd in ("grep -rn 'gh pr create' ~/.claude",
+                    'echo "run gh pr create when ready"',
+                    "man gh pr create"):
+            self.assertIsNone(PR_CREATE_RE.search(cmd), cmd)
+
+    def test_merge_and_close_inherit_the_boundary(self):
+        self.assertEqual(PR_MERGED_RE.findall('o=$(gh pr merge 63 --squash)'), [("", "63")])
+        self.assertEqual(PR_CLOSED_RE.findall('for n in 9; do gh pr close 9; done'), ["9"])
+        # a mention is still not a signal
+        self.assertEqual(PR_MERGED_RE.findall("echo 'use gh pr merge 63'"), [])
 
 
 class TestAgentPrs(unittest.TestCase):
