@@ -53,3 +53,49 @@ def search_all(q):
             pass
     out.sort(key=lambda r: (not r.get("titleMatch"), not r.get("inQuery"), -r.get("mtime", 0)))
     return out
+
+
+# in-session search: scan ONE opened session's own content. Operates on the shared
+# detail shape (the dict both parsers emit), so Claude and Auggie are covered by one
+# implementation — no per-provider fork. Every item already carries full text, so the
+# client opens a hit with the existing modals (openText/openDiff/openCmd) — no indices.
+_SEARCH_KINDS = (   # (result kind, detail-dict key, field holding the searchable text)
+    ("narration", "narrative", "text"),
+    ("prompt",    "requests",  "text"),
+    ("file",      "files",     "path"),
+    ("command",   "commands",  "cmd"),
+    ("todo",      "todos",     "content"),
+)
+
+
+def _snip(s, terms, width=160):
+    """A ~one-line window around the first matched term, newlines flattened."""
+    low = s.lower()
+    hits = [low.find(t) for t in terms if low.find(t) >= 0]
+    pos = min(hits) if hits else 0
+    start = max(0, pos - 30)
+    out = " ".join(s[start:start + width].split())
+    return ("…" if start else "") + out + ("…" if start + width < len(s) else "")
+
+
+def search_detail(d, q):
+    """Filter a parsed detail dict `d` for q (keyword AND, case-insensitive) across
+    its narration, prompts, files, commands and todos. Pure — the testable seam."""
+    ql = (q or "").strip().lower()
+    if not ql:
+        return {"q": q or "", "total": 0, "hits": []}
+    terms = ql.split()
+    hits = []
+    for kind, key, field in _SEARCH_KINDS:
+        for x in (d.get(key) or []):
+            s = x.get(field) or ""
+            if s and all(t in s.lower() for t in terms):
+                hits.append({"kind": kind, "t": x.get("t"), "text": s, "snippet": _snip(s, terms)})
+    return {"q": q or "", "total": len(hits), "hits": hits}
+
+
+def search_session(sid, q):
+    """In-session search over the owning provider's parsed detail (shared shape)."""
+    if not (q or "").strip():
+        return {"q": q or "", "total": 0, "hits": []}
+    return search_detail(parse_any(sid) or {}, q)

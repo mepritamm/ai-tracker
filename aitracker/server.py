@@ -4,7 +4,7 @@ from urllib.parse import urlparse, parse_qs
 from . import config                       # referenced live (config.AUTH) so tests/env see one source
 from .config import LIVE_WINDOW, NARR_PAGE
 from .page import build_page
-from .registry import all_sessions, parse_any, search_all
+from .registry import all_sessions, parse_any, search_all, search_session
 from .store import load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, _load_json, _save_json
 from .config import TITLES_FILE, FLAGS_FILE, PINS_FILE, NOTES_FILE
 from .providers.claude import find_session, file_diffs, command_output, shell_output, agent_detail
@@ -259,6 +259,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             full = data.get("narrative") or []
             self._json({"items": full[off:off + lim], "total": len(full), "offset": off})
+        elif p.path == "/api/session_search":
+            # search WITHIN one opened session (narration/prompts/files/commands/todos).
+            qs = parse_qs(p.query)
+            try:
+                self._json(search_session(qs.get("id", [""])[0], qs.get("q", [""])[0]))
+            except Exception as e:
+                traceback.print_exc()
+                self._json({"error": str(e)}, 500)
         else:
             self.send_error(404)
 

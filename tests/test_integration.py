@@ -126,6 +126,24 @@ class TestBuildPage(unittest.TestCase):
         # Background-work drawer adopts the sidebar's warm --side surface (palette parity, both themes)
         self.assertIn(".bgdrawer .card{background:var(--side)}", p)
         self.assertIn(".bgdrawer .agent{background:var(--side)}", p)
+        # in-session search: box in the Activity column + results card + click-through wiring,
+        # served from the local endpoint (usable on phone/tunnel — no host gating)
+        self.assertIn("id=dq", p)                       # the in-session search input
+        self.assertIn("id=dresults", p)                 # its results container
+        self.assertIn("session_search", p)              # client calls the endpoint
+        self.assertIn("function openHit", p)            # a hit opens the existing modal
+        # it's revealed by a 🔍 toggle next to the active badge (hidden until clicked, like the flag panel)
+        self.assertIn("id=dsearchbtn", p)
+        self.assertIn("toggleDetailSearch", p)
+        self.assertLess(p.index("id=activebadge"), p.index("id=dsearchbtn"))   # button sits by the active status
+        self.assertLess(p.index("id=dsearchbtn"), p.index("class=statecol"))   # …in the header, above the body
+        # the search card spans BOTH columns above the State|Activity split, like the flag card
+        self.assertIn('class="card span2" id=dsearchcard', p)                  # full-width card
+        self.assertLess(p.index("id=dsearchcard"), p.index("class=statecol"))  # above the split
+        self.assertRegex(p, r"id=dsearchcard[^>]*style=display:none")          # hidden until toggled
+        self.assertLess(p.index("id=dq"), p.index("class=statecol"))           # the input lives in that card, not the columns
+        # phone modal is a bottom sheet (full-width, anchored to the bottom edge), not a floating band
+        self.assertIn("align-items:flex-end", p)
         # popped-out "New tab" page carries the current theme + is tokenised (no hardcoded dark colours)
         self.assertIn("html${theme}", p)                # popOut stamps html.light onto the new tab
         self.assertIn(".pw h1{font:600 15px/1.3 inherit;color:var(--text)", p)
@@ -226,6 +244,25 @@ class TestServerEndToEnd(unittest.TestCase):
         st, body = self._get("/api/search?q=zzznotfound")
         self.assertEqual(st, 200)
         self.assertEqual(json.loads(body), [])
+
+    def test_api_session_search_finds_prompt(self):
+        # end-to-end over parse_any: an Auggie session's own prompt is searchable in-session
+        _write_auggie("ss", "Widget", req="deploy the widget now", resp="done")
+        st, body = self._get("/api/session_search?id=auggie:ss&q=deploy%20widget")
+        self.assertEqual(st, 200)
+        hits = json.loads(body)["hits"]
+        self.assertTrue(any(h["kind"] == "prompt" and "widget" in h["text"] for h in hits))
+
+    def test_api_session_search_empty_query_is_empty(self):
+        _write_auggie("ss2", "Widget", req="deploy the widget", resp="done")
+        st, body = self._get("/api/session_search?id=auggie:ss2&q=")
+        self.assertEqual(st, 200)
+        self.assertEqual(json.loads(body)["hits"], [])
+
+    def test_api_session_search_missing_session_is_empty(self):
+        st, body = self._get("/api/session_search?id=no-such-xyz&q=hello")
+        self.assertEqual(st, 200)          # parse_any returns None -> clean empty result, not a 500
+        self.assertEqual(json.loads(body)["hits"], [])
 
     def test_unknown_route_404(self):
         st, _ = self._get("/api/nope")

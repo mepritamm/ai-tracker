@@ -194,6 +194,9 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid var(--line)}
 .flagbtn{margin-left:auto;display:inline-flex;align-items:center;gap:5px;font-family:inherit;font-size:12px;color:var(--muted);background:var(--chipbg);border:1px solid var(--line3);border-radius:20px;padding:5px 12px;cursor:pointer;white-space:nowrap;line-height:1}
 .flagbtn:hover{border-color:var(--red);color:var(--head)}
 .flagbtn.on{color:var(--amber);background:var(--amber-bg);border-color:var(--amber)}
+.srchbtn{display:inline-flex;align-items:center;justify-content:center;font-size:12px;color:var(--muted);background:var(--chipbg);border:1px solid var(--line3);border-radius:20px;padding:4px 10px;margin-left:2px;cursor:pointer;line-height:1}
+.srchbtn:hover{border-color:var(--blue);color:var(--head)}
+.srchbtn.on{color:var(--blue);background:var(--blue-deep);border-color:var(--blue-line)}
 /* sidebar 🚩 button + the cross-session flag list it reveals. Plain user data read from the
    server's flags.json, so it works from a phone/tunnel exactly like the per-session panel. */
 .allflagsbtn{cursor:pointer;user-select:none;font-size:13px;flex:0 0 auto;filter:grayscale(1) opacity(.6)}
@@ -265,6 +268,16 @@ a{color:var(--blue)}
 .prtime{color:var(--dim);font-size:11px;font-family:'JetBrains Mono',monospace;flex:0 0 auto;white-space:nowrap}
 .prlink .chev{color:var(--dim);font-size:11px;flex:0 0 auto}
 .prlink:hover .chev{color:var(--blue)}
+/* in-session search */
+.dsearch{margin:10px 12px}
+#dresults{border-top:1px solid var(--line)}
+.dsr{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px;cursor:pointer}
+.dsr:hover{background:var(--selbg)}
+.dsrk{font-size:10px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);flex:0 0 auto}
+.dsrt{font-size:11px;color:var(--dim);font-family:'JetBrains Mono',monospace;flex:0 0 auto;margin-left:auto}
+.dsrsnip{flex:1 1 100%;font-size:12px;color:var(--muted);word-break:break-word}
+.dsr .chev{color:var(--dim);font-size:12px;flex:0 0 auto}
+mark{background:var(--amber-deep,rgba(245,180,67,.28));color:var(--text);border-radius:3px;padding:0 2px}
 /* diff modal */
 .overlay{position:fixed;inset:0;background:rgba(4,6,10,.72);display:none;align-items:center;justify-content:center;z-index:50;padding:24px}
 .modal{background:var(--card);border:1px solid var(--line);border-radius:12px;width:min(960px,100%);max-height:88vh;display:flex;flex-direction:column;overflow:hidden}
@@ -327,8 +340,10 @@ a{color:var(--blue)}
   .scrim{display:block}
   .app.draweropen .scrim{opacity:1;pointer-events:auto}
   .hbtn{display:flex}
-  .overlay{padding:6px}
-  .modal{max-height:94vh}
+  /* modal = bottom sheet on phones: full-width, anchored to the bottom edge, grows to fit
+     content up to 90vh (a short message no longer floats as a tiny centred band) */
+  .overlay{padding:0;align-items:flex-end}
+  .modal{width:100%;max-width:none;max-height:90vh;border-radius:14px 14px 0 0;border-left:0;border-right:0;border-bottom:0}
   .modal .mh{flex-wrap:wrap;gap:7px;padding:11px 12px}
   /* PR rows: let a long title shrink+ellipsize and drop the redundant raw URL (else the row overflows) */
   .prlink b{min-width:0;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

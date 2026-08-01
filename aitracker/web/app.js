@@ -227,6 +227,53 @@ async function doSearch(){
   renderSide();
 }
 function clearSearch(){searchResults=null;$("q").value="";$("qclear").style.display="none";renderSide();}
+
+// in-session search — find text across THIS session's narration/prompts/files/commands/todos.
+// Server searches the full parsed detail (both providers, one endpoint); each hit carries full
+// text so a click opens the existing modal (diff/output for files/commands, text otherwise).
+let dHits=null, dSid=null, dTimer=null;
+const DKIND={narration:"💬 narration",prompt:"⌨ prompt",file:"📄 file",command:"$ command",todo:"○ todo"};
+function doDetailSearch(){ clearTimeout(dTimer); dTimer=setTimeout(runDetailSearch,180); }
+async function runDetailSearch(){
+  const q=$("dq").value.trim();
+  $("dqclear").style.display=q?"":"none";
+  if(!q||!cur){ dHits=null; $("dsc").textContent=""; $("dresults").style.display="none"; return; }
+  $("dresults").style.display="";
+  $("dresults").innerHTML="<div class=empty>searching…</div>";
+  try{ const r=await(await fetch(`/api/session_search?id=${encodeURIComponent(cur)}&q=${encodeURIComponent(q)}`)).json(); dHits=r.hits||[]; }
+  catch(e){ dHits=[]; }
+  renderDetailSearch(q);
+}
+function renderDetailSearch(q){
+  if(dHits===null){ $("dsc").textContent=""; $("dresults").style.display="none"; return; }
+  $("dresults").style.display="";
+  $("dsc").textContent=dHits.length?`${dHits.length} match${dHits.length==1?"":"es"}`:"";
+  if(!dHits.length){ $("dresults").innerHTML=`<div class=empty>no matches for “${esc(q)}” in this session</div>`; return; }
+  $("dresults").innerHTML=dHits.map((h,i)=>
+      `<div class="item dsr clk" onclick="openHit(${i})"><span class=dsrk>${DKIND[h.kind]||h.kind}</span>`+
+      `<span class=dsrt>${h.t?ago(Math.floor(Date.now()/1000)-Date.parse(h.t)/1000):""}</span>`+
+      `<div class=dsrsnip>${dhl(h.snippet,q)}</div><span class=chev>›</span></div>`).join("");
+}
+function openHit(i){
+  const h=dHits[i]; if(!h)return;
+  if(h.kind==="file"){ const j=curFiles.findIndex(f=>f.path===h.text); if(j>=0)return openDiff(j); }
+  if(h.kind==="command"){ const j=curCmds.findIndex(c=>c.cmd===h.text); if(j>=0)return openCmd(j); }
+  openText(DKIND[h.kind]?DKIND[h.kind].replace(/^\S+\s/,""):h.kind, h.t?tago(h.t):"", h.text);
+}
+function clearDetailSearch(){ $("dq").value=""; dHits=null; $("dqclear").style.display="none"; $("dsc").textContent=""; $("dresults").style.display="none"; }
+function toggleDetailSearch(){   // header 🔍 reveals/hides the full-width search card, like the flag card
+  const c=$("dsearchcard"); if(!c)return;
+  const show=c.style.display==="none";
+  c.style.display=show?"":"none";
+  const b=$("dsearchbtn"); if(b)b.classList.toggle("on",show);
+  if(show){ c.scrollIntoView({behavior:"smooth",block:"nearest"}); $("dq").focus(); }
+  else clearDetailSearch();
+}
+function dhl(s,q){   // highlight matched terms inside an escaped snippet
+  let out=esc(s);
+  q.trim().split(/\s+/).forEach(t=>{ if(t){ const re=new RegExp("("+t.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")+")","ig"); out=out.replace(re,"<mark>$1</mark>"); } });
+  return out;
+}
 async function renameSession(e,id){
   e.stopPropagation();
   const s=sessions.find(x=>x.id===id)||{};
@@ -325,6 +372,12 @@ async function poll(){
 }
 const KICON={commit:"⎇",test:"✓",install:"⬇",build:"🔨",git:"⎇",cmd:"$"};
 function render(d){
+  if(dSid!==cur){   // switching sessions closes the search card and drops stale results
+    clearDetailSearch();
+    const c=$("dsearchcard"); if(c)c.style.display="none";
+    const sb=$("dsearchbtn"); if(sb)sb.classList.remove("on");
+    dSid=cur;
+  }
   const idle=d.now-d.mtime, live=idle<LIVE;
   const m=d.meta||{}, c=d.counts||{};
   const title=m.title||m.customTitle||m.aiTitle||cur.slice(0,8);
@@ -943,6 +996,7 @@ function toggleRaw(){const r=$("raw");
   else r.style.display="none";
 }
 $("q").addEventListener("keydown",e=>{if(e.key==="Enter")doSearch();if(e.key==="Escape")clearSearch();});
+$("dq").addEventListener("keydown",e=>{if(e.key==="Escape"){clearDetailSearch();e.stopPropagation();}});
 setBell();
 start();
 
