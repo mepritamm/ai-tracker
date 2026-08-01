@@ -23,7 +23,7 @@ function mdBlock(s){
   while(i<L.length){
     const l=L[i];
     if(/^\s*```/.test(l)){ i++; const b=[]; while(i<L.length&&!/^\s*```/.test(L[i])){b.push(L[i]);i++;} i++;
-      out.push(`<pre class=mdpre><code>${esc(b.join("\n"))}</code></pre>`); continue; }
+      out.push(`<div class=cblock><button class=codecopy onclick="copyCode(this)" title="Copy this block">⧉ Copy</button><pre class=mdpre><code>${esc(b.join("\n"))}</code></pre></div>`); continue; }
     const hm=l.match(/^(#{1,6})\s+(.*)$/);
     if(hm){ const lv=Math.min(hm[1].length,4)+1; out.push(`<h${lv} class=mdh>${md(hm[2])}</h${lv}>`); i++; continue; }
     if(l.includes("|")&&i+1<L.length&&sep(L[i+1])){
@@ -847,6 +847,15 @@ function fallbackCopy(el,done){
   const s=getSelection();s.removeAllRanges();s.addRange(r);
   try{document.execCommand("copy");done();}catch(e){}
   s.removeAllRanges();
+}
+// per-code-block copy button (like docs sites) — copies just that block's raw text
+function copyCode(btn){
+  const code=btn.parentNode.querySelector("code")||btn.parentNode.querySelector(".mdpre");
+  if(!code)return;
+  const text=code.innerText||code.textContent||"";
+  const done=()=>{const o=btn.innerHTML;btn.classList.add("ok");btn.innerHTML="✓ Copied";setTimeout(()=>{btn.innerHTML=o;btn.classList.remove("ok");},1200);};
+  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(()=>fallbackCopy(code,done));}
+  else fallbackCopy(code,done);
 }
 function popOut(titleId,bodyId){
   const body=$(bodyId); if(!body)return;

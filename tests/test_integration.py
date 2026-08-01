@@ -150,6 +150,9 @@ class TestBuildPage(unittest.TestCase):
         # the modal body is the scroll region (min-height:0), so the header stays pinned & visible
         self.assertRegex(p, r"\.msgbody\{[^}]*min-height:0")
         self.assertRegex(p, r"\.modal \.mb\{[^}]*min-height:0")
+        # each rendered code block carries its own ⧉ Copy button (like docs sites)
+        self.assertIn("class=codecopy", p)          # the button markup in mdBlock's code-fence output
+        self.assertIn("function copyCode", p)       # its click handler
         # popped-out "New tab" page carries the current theme + is tokenised (no hardcoded dark colours)
         self.assertIn("html${theme}", p)                # popOut stamps html.light onto the new tab
         # …and declares a viewport, else a large narration opened in a new tab renders at desktop width on mobile

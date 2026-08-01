@@ -224,6 +224,11 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid var(--line)}
 .msgbody .mdp{margin:0 0 11px}
 .msgbody .mdul{margin:0 0 11px;padding-left:22px}
 .msgbody .mdul li{margin:3px 0}
+.msgbody .cblock{position:relative;margin:0 0 11px}
+.msgbody .cblock .mdpre{margin:0}
+.codecopy{position:absolute;top:6px;right:6px;z-index:2;font:600 11px/1 'JetBrains Mono',monospace;color:var(--muted);background:var(--card);border:1px solid var(--line3);border-radius:6px;padding:5px 8px;cursor:pointer;opacity:.9}
+.codecopy:hover{opacity:1;border-color:var(--blue);color:var(--head)}
+.codecopy.ok{color:var(--green);border-color:var(--green-line);opacity:1}
 .msgbody .mdpre{background:var(--side);border:1px solid var(--line);border-radius:8px;padding:11px 13px;overflow:auto;margin:0 0 11px;white-space:pre}
 .msgbody .mdpre code{background:none;border:0;padding:0;margin:0;color:var(--head)}
 .msgbody .mdt{border-collapse:collapse;margin:4px 0 14px;font-size:13px;display:block;overflow-x:auto}
