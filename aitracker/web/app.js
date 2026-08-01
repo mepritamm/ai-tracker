@@ -856,7 +856,9 @@ function popOut(titleId,bodyId){
   if(!w){alert("Popup blocked — allow popups for this page to open in a new tab.");return;}
   const theme=document.documentElement.classList.contains("light")?" class=light":"";   // carry dark/light into the new tab
   w.document.write(
-    `<!doctype html><html${theme}><head><meta charset=utf-8><title>${esc(title)}</title>${head}`+
+    `<!doctype html><html${theme}><head><meta charset=utf-8>`+
+    `<meta name=viewport content="width=device-width, initial-scale=1">`+   // else mobile renders the tab at desktop width
+    `<title>${esc(title)}</title>${head}`+
     `</head>`+
     `<body><div class=pw><h1>${esc(title)}</h1><div class="${body.className}" style="overflow:visible;max-height:none">${body.innerHTML}</div></div></body></html>`);
   w.document.close();

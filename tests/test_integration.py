@@ -146,6 +146,9 @@ class TestBuildPage(unittest.TestCase):
         self.assertIn("align-items:flex-end", p)
         # popped-out "New tab" page carries the current theme + is tokenised (no hardcoded dark colours)
         self.assertIn("html${theme}", p)                # popOut stamps html.light onto the new tab
+        # …and declares a viewport, else a large narration opened in a new tab renders at desktop width on mobile
+        _po = p.index("html${theme}")
+        self.assertIn("name=viewport", p[_po:_po + 220])
         self.assertIn(".pw h1{font:600 15px/1.3 inherit;color:var(--text)", p)
 
 
