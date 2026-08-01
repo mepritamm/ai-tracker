@@ -216,7 +216,7 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid var(--line)}
 .narr .x{flex:1;min-width:0;font-size:13px;color:var(--head);line-height:1.45;white-space:pre-wrap;word-break:break-word;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .narr .chev{flex:0 0 auto;color:var(--dim);font-size:12px;align-self:center}
 /* message modal — full text, readable */
-.msgbody{padding:18px 22px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65;font-size:14px;color:var(--text)}
+.msgbody{flex:1 1 auto;min-height:0;padding:18px 22px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65;font-size:14px;color:var(--text)}
 .msgbody.cmdmode{white-space:normal}
 .msgbody.mdmode{white-space:normal}
 .msgbody .mdh{font-size:15px;font-weight:700;margin:18px 0 8px;color:var(--text)}
@@ -281,12 +281,12 @@ mark{background:var(--amber-deep,rgba(245,180,67,.28));color:var(--text);border-
 /* diff modal */
 .overlay{position:fixed;inset:0;background:rgba(4,6,10,.72);display:none;align-items:center;justify-content:center;z-index:50;padding:24px}
 .modal{background:var(--card);border:1px solid var(--line);border-radius:12px;width:min(960px,100%);max-height:88vh;display:flex;flex-direction:column;overflow:hidden}
-.modal .mh{padding:13px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+.modal .mh{flex:0 0 auto;padding:13px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
 .modal .mh .fn{font-weight:700;font-size:14px}
 .modal .mh .pp{color:var(--dim);font-size:11px;font-family:'JetBrains Mono',monospace;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .modal .mh .x{cursor:pointer;color:var(--muted);font-size:18px;line-height:1;padding:2px 6px;border-radius:6px}
 .modal .mh .x:hover{background:var(--line);color:var(--text)}
-.modal .mb{overflow:auto;padding:8px 0}
+.modal .mb{flex:1 1 auto;min-height:0;overflow:auto;padding:8px 0}
 .mh .mdbtn{cursor:pointer;color:var(--muted);font-size:11px;border:1px solid var(--line3);border-radius:6px;padding:3px 9px;white-space:nowrap;flex:0 0 auto}
 .mh .mdbtn:hover{color:var(--text);border-color:var(--blue)}
 .mh .mnav{display:flex;align-items:center;gap:4px;flex:0 0 auto}
@@ -341,9 +341,12 @@ mark{background:var(--amber-deep,rgba(245,180,67,.28));color:var(--text);border-
   .app.draweropen .scrim{opacity:1;pointer-events:auto}
   .hbtn{display:flex}
   /* modal = bottom sheet on phones: full-width, anchored to the bottom edge, grows to fit
-     content up to 90vh (a short message no longer floats as a tiny centred band) */
-  .overlay{padding:0;align-items:flex-end}
-  .modal{width:100%;max-width:none;max-height:90vh;border-radius:14px 14px 0 0;border-left:0;border-right:0;border-bottom:0}
+     content up to the visible height (a short message no longer floats as a tiny centred band).
+     dvh, not vh: on mobile Safari vh is the LARGE viewport (behind the toolbars), so a
+     bottom-anchored 90vh sheet pushed its own header up off the top of the screen. dvh is the
+     actual visible height, so the header always stays on-screen. vh first as the fallback. */
+  .overlay{padding:0;align-items:flex-end;inset:0 0 auto 0;height:100vh;height:100dvh}
+  .modal{width:100%;max-width:none;max-height:90vh;max-height:90dvh;border-radius:14px 14px 0 0;border-left:0;border-right:0;border-bottom:0}
   .modal .mh{flex-wrap:wrap;gap:7px;padding:11px 12px}
   /* PR rows: let a long title shrink+ellipsize and drop the redundant raw URL (else the row overflows) */
   .prlink b{min-width:0;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

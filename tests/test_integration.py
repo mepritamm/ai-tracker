@@ -144,6 +144,12 @@ class TestBuildPage(unittest.TestCase):
         self.assertLess(p.index("id=dq"), p.index("class=statecol"))           # the input lives in that card, not the columns
         # phone modal is a bottom sheet (full-width, anchored to the bottom edge), not a floating band
         self.assertIn("align-items:flex-end", p)
+        # …sized in dvh (the actual visible height), so a large narration's header can't be pushed off the top
+        self.assertIn("100dvh", p)
+        self.assertIn("90dvh", p)
+        # the modal body is the scroll region (min-height:0), so the header stays pinned & visible
+        self.assertRegex(p, r"\.msgbody\{[^}]*min-height:0")
+        self.assertRegex(p, r"\.modal \.mb\{[^}]*min-height:0")
         # popped-out "New tab" page carries the current theme + is tokenised (no hardcoded dark colours)
         self.assertIn("html${theme}", p)                # popOut stamps html.light onto the new tab
         # …and declares a viewport, else a large narration opened in a new tab renders at desktop width on mobile
