@@ -13,6 +13,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 
 import aitracker.config as config
@@ -369,7 +370,8 @@ class TestServerEndToEnd(unittest.TestCase):
         self._post("/api/notes", {"session": "hooked", "text": "deliver me"})
         self._post("/api/notes/push", {"session": "hooked", "index": 1})
 
-        rc, out = self._hook({"session_id": "hooked", "stop_hook_active": False})
+        rc, out = self._hook({"session_id": "hooked", "hook_event_name": "Stop",
+                              "stop_hook_active": False})
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out), {"decision": "block", "reason": "deliver me"})
 
@@ -379,6 +381,29 @@ class TestServerEndToEnd(unittest.TestCase):
         # the un-pushed note is still sitting in the stack, untouched
         st, j = self._post("/api/notes/delete", {"session": "hooked", "index": 99})
         self.assertEqual(_texts(j), ["kept quiet"])
+
+    def test_wake_hooks_reach_a_session_that_stop_never_will(self):
+        """The bug this closes: an IDLE session ends no further turn, so Stop alone leaves a
+        pushed note queued forever. UserPromptSubmit/SessionStart are the wake paths, and they
+        inject context (not a turn decision) — a different output shape off the same drain."""
+        for event in ("UserPromptSubmit", "SessionStart"):
+            self._post("/api/notes", {"session": "idle", "text": "look at %s" % event})
+            self._post("/api/notes/push", {"session": "idle", "index": 0})
+            rc, out = self._hook({"session_id": "idle", "hook_event_name": event})
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out), {"hookSpecificOutput": {
+                "hookEventName": event,
+                "additionalContext": "Queued note from the ai-tracker dashboard: look at %s" % event}})
+            # one drain per wake — the note is gone, not re-injected on the next prompt
+            self.assertEqual(self._hook({"session_id": "idle", "hook_event_name": event}), (0, ""))
+
+    def test_hook_ignores_events_it_was_not_wired_for(self):
+        # a stray registration (PreToolUse, a future event) must not silently eat a queued note
+        self._post("/api/notes", {"session": "stray", "text": "still mine"})
+        self._post("/api/notes/push", {"session": "stray", "index": 0})
+        self.assertEqual(self._hook({"session_id": "stray", "hook_event_name": "PreToolUse"}), (0, ""))
+        st, j = self._post("/api/notes/next", {"session": "stray"})
+        self.assertEqual(j["note"], "still mine")   # never drained by the wrong event
 
     def test_stop_hook_stays_silent_on_every_no_op(self):
         self._post("/api/notes", {"session": "quiet", "text": "never pushed"})
@@ -397,6 +422,27 @@ class TestServerEndToEnd(unittest.TestCase):
         dead.close()
         self.assertEqual(self._hook({"session_id": "x"}, port=port), (0, ""))
         self.assertEqual(self._hook("not json at all"), (0, ""))
+
+    def test_push_when_tells_the_truth_per_session(self):
+        """The UI must not promise 'lands this turn' to a session with no turn in flight —
+        so the DETAIL dict carries the delivery expectation, for both providers."""
+        os.makedirs(os.path.join(config.AUGMENT_DIR, "task-storage", "tasks"))
+        open(os.path.join(config.AUGMENT_DIR, "settings.json"), "w").write('{"indexingAllowDirs":["/x"]}')
+        _write_auggie("aw", "Auggie one")
+        _write_claude("live", 1)
+        _write_claude("idle", 1)
+        stale = time.time() - (config.LIVE_WINDOW + 60)
+        os.utime(os.path.join(config.PROJECTS, "proj", "idle.jsonl"), (stale, stale))
+        _claude._META_CACHE.clear()
+
+        def when(sid):
+            st, body = self._get("/api/session?id=" + sid)
+            self.assertEqual(st, 200)
+            return json.loads(body)["push_when"]
+
+        self.assertEqual(when("live"), "turn")        # live -> its next turn-end delivers
+        self.assertEqual(when("idle"), "wake")        # idle -> waits for the next prompt/resume
+        self.assertEqual(when("auggie:aw"), "none")   # no hook at all -> deliver by hand
 
     def test_note_count_on_the_shared_list_dict(self):
         """The sidebar 📝 badge reads note_count off the LIST dict — filled for both producers,

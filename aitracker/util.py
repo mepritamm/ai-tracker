@@ -1,5 +1,7 @@
 import datetime, os, re, subprocess
 
+from .config import LIVE_WINDOW
+
 
 def _dur(a, b):
     if not (a and b):
@@ -188,6 +190,20 @@ def prs_sorted(acc, states=None):
             if st:
                 e["state"] = st
     return sorted(acc.values(), key=lambda p: (p["created"], p["t"] or ""), reverse=True)
+
+
+def push_when(has_drain, mtime, now):
+    """When a ▶ pushed note will actually reach this session — the server owns this policy,
+    the client only renders it. One helper, both providers.
+
+    "turn" — the session is live, so its next turn-end hook delivers within seconds.
+    "wake" — it's idle: no turn is in flight to end, so the note waits for the next prompt
+             or resume. Real, but not imminent — the UI must not promise "this turn".
+    "none" — the tool has no drain hook at all; the note queues but you deliver it by hand.
+    """
+    if not has_drain:
+        return "none"
+    return "turn" if (now - mtime) < LIVE_WINDOW else "wake"
 
 
 def cmd_kind(c):

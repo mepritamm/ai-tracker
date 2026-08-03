@@ -881,16 +881,31 @@ function flashTo(id){
 }
 document.addEventListener("keydown",e=>{if(e.key==="Escape"){closeDiff();closeMsg();closeBgDrawer();}});
 // ---- per-session notes stack ----
+// What the server says will actually happen to a pushed note — never guessed here.
+// "turn" = live, its next turn-end delivers; "wake" = idle, waits for the next prompt
+// or resume; "none" = this tool has no drain hook at all.
+const PUSH_SAYS={
+  turn:{toast:"Queued — lands when the session finishes this turn",
+        tip:"Queued — the session picks it up when it finishes this turn. Click to un-queue.",
+        chip:"⏳ queued"},
+  wake:{toast:"Queued — this session is idle, so it lands the next time it runs",
+        tip:"Queued — this session is idle. It has no turn to finish, so the note lands the next time you prompt it or resume it. Click to un-queue.",
+        chip:"⏳ queued · on wake"},
+  none:{toast:"Queued — this tool can't auto-deliver, use ⧉ copy",
+        tip:"Queued, but this tool has no hook to deliver it — use ⧉ copy. Click to un-queue.",
+        chip:"⏳ queued · copy it"}};
+function pushSays(){return PUSH_SAYS[(lastData&&lastData.push_when)||"turn"]||PUSH_SAYS.turn}
 function renderNotes(notes){
   const el=$("notes_list"), nc=$("notec");
   if(!el)return;
   nc.textContent=notes.length||"";
+  const says=pushSays();
   // display newest-first (server stores in append order; reverse for display)
   const rev=[...notes].reverse();
   el.innerHTML=rev.length?rev.map((n,ri)=>{
     const idx=notes.length-1-ri;   // actual index in the server's array (for delete)
     const push=n.pushed
-      ?`<span class="link amber" onclick="pushNote(${idx})" title="Queued — the session picks it up when it finishes this turn. Click to un-queue.">⏳ queued</span>`
+      ?`<span class="link amber" onclick="pushNote(${idx})" title="${esc(says.tip)}">${says.chip}</span>`
       :`<span class="link green" onclick="pushNote(${idx})" title="Send this into the live session">▶ push</span>`;
     return `<div class="noteitem${n.pushed?" queued":""}">`+
       `<div class=ntxt>${esc(n.text||"")}</div>`+
@@ -925,9 +940,7 @@ async function pushNote(idx){
   if(lastData)lastData.notes=j.notes||[];
   renderNotes(lastData?lastData.notes||[]:[]);renderSide();
   const now=(j.notes||[])[idx];
-  if(now&&now.pushed) toast(lastData&&lastData.push_ok===false
-    ?"Queued — this tool has no drain hook, use ⧉ copy"
-    :"Queued — lands when the session finishes this turn","");
+  if(now&&now.pushed) toast(pushSays().toast,"");
 }
 function copyNote(idx){
   if(!lastData)return;

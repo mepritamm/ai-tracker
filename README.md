@@ -96,7 +96,7 @@ Locally it's just `make serve` (localhost, no tunnel, no login). To reach it fro
 - **Todos**, **Files** (a diff per edit, with GitHub-style **up/down context expansion** and an **Expand all** toggle to reveal the whole file around every edit, plus a Diff ⇄ Rendered-markdown toggle and an "open in new tab" button), **Commands** (with ✓/✗ for Claude), and **Prompts** (every prompt you typed, slash-command invocations like `/foo args` included). Files a background agent wrote — e.g. editing inside a git worktree — show too, tagged **🤖 agent**, and stay diffable.
 - Every list panel loads a window and reveals older entries as you scroll to the bottom.
 - **🧭 Plan on the go** — a per-session stack of small plan-ahead notes: jot what you want to do once an answer lands (or while you wait on another session), and it stays with the session. Add as many as you like; **copy** one back when you need it, **push** it into the live session, **remove** it when done.
-  **▶ push** queues a note for delivery: the session picks it up the moment it finishes its current turn, so you never have to interrupt it or paste anything. Delivery needs a turn-end hook — Claude Code has one; wire up [`hooks/drain-notes.py`](hooks/drain-notes.py) as a `Stop` hook (instructions in the file) and pushed notes arrive on their own. Tools without such a hook (Auggie today) still queue, but you deliver by **⧉ copy**. Sessions with notes carry a **📝 N** badge in the sidebar. Saved to `notes.json`, read live (no restart). Works for every session, any tool — and you can add notes from your phone or tablet too, just like 🚩 flagging.
+  **▶ push** queues a note for delivery and the session collects it itself, so you never have to interrupt it or paste anything. The chip tells you *when* it will land, because that depends on what the session is doing: a **live** session picks it up the moment it finishes its current turn (**⏳ queued**); an **idle** one has no turn to finish, so it lands the next time you prompt or resume it (**⏳ queued · on wake**); a tool with no hook at all just holds it (**⏳ queued · copy it**). Delivery needs hooks — Claude Code has them; wire [`hooks/drain-notes.py`](hooks/drain-notes.py) into `Stop`, `UserPromptSubmit` and `SessionStart` (instructions in the file) and pushed notes arrive on their own. `Stop` alone only ever reaches a session that's mid-turn. Tools without hooks (Auggie today) still queue, but you deliver by **⧉ copy**. Sessions with notes carry a **📝 N** badge in the sidebar. Saved to `notes.json`, read live (no restart). Works for every session, any tool — and you can add notes from your phone or tablet too, just like 🚩 flagging.
 - **🚩 Flag** anything you want to fix later — see [Skills](#skills).
 
 ---
@@ -123,7 +123,7 @@ Both providers emit the **same result shape**, so the browser renders them ident
 | Decisions & open questions | ✅ (`AskUserQuestion`) | ✅ (`ask-user` — answer from the next turn's tool result) |
 | Background agents & shells | ✅ | ➖ Auggie has no such model |
 | 📝 Notes — write, ⧉ copy, 📝 N badge | ✅ | ✅ |
-| ▶ push a note into the live session | ✅ (via the `Stop` hook in `hooks/`) | ➖ queues fine, but Auggie has no turn-end hook to deliver it — use ⧉ copy |
+| ▶ push a note into the session | ✅ live → next turn-end; idle → next prompt/resume (`Stop` + `UserPromptSubmit` + `SessionStart` hooks) | ➖ queues fine, but Auggie has no hooks to deliver it — use ⧉ copy |
 
 **Data files** — `flags.json` (your flags), `titles.json` (your renames), `pins.json` (pinned sessions), and `notes.json` (your notes) are read **live** (no restart). Everything else is baked into the page at startup, so **editing `aitracker/` or `web/` needs a server restart** to show.
 
@@ -183,7 +183,7 @@ The repo ships Claude Code skills under [`.claude/skills/`](.claude/skills/). In
 ## Good to know
 
 - **Restart to see UI/parse changes.** The page and parsers are loaded at startup; only `flags.json` / `titles.json` are read live. After editing `aitracker/` or `web/`, run `make serve` (or restart the process).
-- **Auggie / Augment now reads the full local transcript** (`~/.augment/sessions/`) — summary, tokens, narration, files, commands, reads, working folder, and git branch — at near-Claude parity. The only gaps are background agents/shells (Auggie has no such model), command exit status (Auggie doesn't record it, so its commands render as ✓), and **▶ push** delivery (Auggie has no turn-end hook — the note still queues, you deliver it with ⧉ copy).
+- **Auggie / Augment now reads the full local transcript** (`~/.augment/sessions/`) — summary, tokens, narration, files, commands, reads, working folder, and git branch — at near-Claude parity. The only gaps are background agents/shells (Auggie has no such model), command exit status (Auggie doesn't record it, so its commands render as ✓), and **▶ push** delivery (Auggie has no hooks — the note still queues, you deliver it with ⧉ copy).
 - **"Live" is a 5-minute window** since the last activity. Background-agent completion is inferred from that window, so an agent-finished notification can lag a few minutes; background shells with real process state notify promptly.
 - **Everything stays on your machine.** Read-only against the tool logs, no outbound network, no telemetry.
 
@@ -196,7 +196,7 @@ aitracker/                     the app package (stdlib only): providers/, web/, 
 web assets in aitracker/web/    index.html · app.css · app.js (inlined at serve time)
 tests/                unit tests + evals — the mandatory gate
 hooks/pre-commit               runs the gate before every commit (make hooks)
-hooks/drain-notes.py           optional Claude Code Stop hook: delivers ▶ pushed notes
+hooks/drain-notes.py           optional Claude Code hook: delivers ▶ pushed notes (3 events)
 Makefile                       make serve / stop / check / test / hooks
 docs/screenshot.png            the dashboard screenshot in this README
 CLAUDE.md / AGENTS.md          context for AI agents working in this repo

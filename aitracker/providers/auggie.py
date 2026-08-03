@@ -1,7 +1,7 @@
 import glob, json, os, re, time
 from ..config import LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, PR_CREATE_RE
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE
 from ..overview import build_overview
 from ..store import load_titles, load_tasks, load_notes
 from .base import Provider
@@ -314,9 +314,9 @@ def parse_auggie(session_id):
         "mtime": _iso_epoch(d.get("modified")) or os.path.getmtime(f),
         "now": time.time(),
         "notes": load_notes().get("auggie:" + session_id, []),
-        # ponytail: auggie has no turn-end hook (--queue needs --print), so nothing drains the
-        # queue yet. Push still queues; flip this to True the day a drain exists.
-        "push_ok": False,
+        # ponytail: auggie has no hook of any kind (--queue needs --print), so nothing drains the
+        # queue. Push still queues; pass True here the day a drain exists.
+        "push_when": push_when(False, 0, 0),
     }
 
 

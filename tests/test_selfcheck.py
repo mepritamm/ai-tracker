@@ -9,7 +9,8 @@ import time
 import unittest
 
 from aitracker import config
-from aitracker.util import _short_title, _window, _git_branch
+from aitracker.config import LIVE_WINDOW
+from aitracker.util import _short_title, _window, _git_branch, push_when
 from aitracker.store import load_flags, save_flags, load_titles, load_tasks, load_notes, save_notes, _save_json
 from aitracker.registry import parse_any, all_sessions
 from aitracker.providers.claude import (
@@ -499,7 +500,13 @@ def _run():
     os.unlink(config.NOTES_FILE)
     assert [n["text"] for n in dn["notes"]] == ["remember this"], dn.get("notes")
     assert dn["notes"][0]["pushed"] is True, "queued state must reach the client"
-    # `push_ok` spans BOTH providers — the client renders the server's answer, never guesses it
-    assert dn["push_ok"] is True, "claude: Stop hook can drain the queue"
-    assert pa["push_ok"] is False, "auggie: no turn-end hook yet -> push queues but can't deliver"
+    # `push_when` spans BOTH providers — the client renders the server's answer, never guesses it.
+    # The fixture jsonl was written just now, so Claude's session is live -> delivered this turn.
+    assert dn["push_when"] == "turn", dn.get("push_when")
+    assert pa["push_when"] == "none", "auggie: no hook at all -> push queues but can't deliver"
+    # …and the same helper says "wake" once that session goes quiet, which is what stops the UI
+    # promising "this turn" to a session with no turn in flight.
+    assert push_when(True, 0, LIVE_WINDOW) == "wake", "idle claude session -> lands on wake"
+    assert push_when(True, 1, LIVE_WINDOW) == "turn", "just inside the live window -> this turn"
+    assert push_when(False, LIVE_WINDOW, LIVE_WINDOW) == "none", "no drain beats liveness"
     print("selfcheck ok")
