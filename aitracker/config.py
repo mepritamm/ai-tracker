@@ -25,6 +25,12 @@ NOTES_FILE = os.path.join(_HERE, "notes.json")
 PORT_FILE = os.path.join(_HERE, "port")
 
 
+# A credential for local, non-browser callers (the notes drain hook), written at startup only
+# when TRACKER_AUTH is set. Hooks are spawned by the AI tool, not by your shell, so they never
+# inherit TRACKER_AUTH — without this the drain just gets a 401 and silently delivers nothing.
+TOKEN_FILE = os.path.join(_HERE, "token")
+
+
 AUGMENT_DIR = os.path.expanduser("~/.augment")
 
 

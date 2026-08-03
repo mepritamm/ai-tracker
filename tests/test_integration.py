@@ -25,7 +25,7 @@ from aitracker.util import _first_line, _iso_epoch
 from aitracker.providers import auggie as _auggie
 from aitracker.providers import claude as _claude
 
-_PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "TASKS_DIR", "NOTES_FILE", "PORT_FILE")
+_PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "TASKS_DIR", "NOTES_FILE", "PORT_FILE", "TOKEN_FILE")
 
 
 def _texts(resp):
@@ -404,7 +404,7 @@ class TestServerEndToEnd(unittest.TestCase):
         self._post("/api/notes/push", {"session": "moved", "index": 0})
 
         config.PORT_FILE = tempfile.mktemp()
-        _server.publish_port(self.port)                      # what run() does at startup
+        _server.publish_endpoint(self.port)                  # what run() does at startup
         self.assertEqual(open(config.PORT_FILE).read(), str(self.port))
 
         # no PORT env at all — discovery has to come from the published file
@@ -429,10 +429,37 @@ class TestServerEndToEnd(unittest.TestCase):
             else:
                 os.remove(real)
 
-    def test_publish_port_survives_an_unwritable_location(self):
-        # a read-only install must still serve — publishing the port is best-effort only
-        config.PORT_FILE = os.path.join(tempfile.mkdtemp(), "no-such-dir", "port")
-        _server.publish_port(1234)          # must not raise
+    def test_publish_endpoint_survives_an_unwritable_location(self):
+        # a read-only install must still serve — publishing is best-effort only
+        d = os.path.join(tempfile.mkdtemp(), "no-such-dir")
+        config.PORT_FILE, config.TOKEN_FILE = os.path.join(d, "port"), os.path.join(d, "token")
+        _server.publish_endpoint(1234)      # must not raise
+
+    def test_hook_logs_why_a_delivery_failed_instead_of_vanishing(self):
+        """Silence toward the turn is correct; silence toward the user is what made three
+        separate faults each look like 'nothing queued'. A failed attempt must say why."""
+        script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "hooks", "drain-notes.py")
+        log = os.path.join(os.path.dirname(script), "..", "aitracker", "drain.log")
+        before = open(log).read() if os.path.exists(log) else None
+        dead = socket.socket(); dead.bind(("127.0.0.1", 0))
+        port = dead.getsockname()[1]; dead.close()
+        try:
+            if os.path.exists(log):
+                os.remove(log)
+            env = dict(os.environ, PORT=str(port))
+            env.pop("TRACKER_AUTH", None)
+            p = subprocess.run([sys.executable, script],
+                               input=json.dumps({"session_id": "s", "hook_event_name": "Stop"}).encode(),
+                               capture_output=True, env=env, timeout=20)
+            self.assertEqual((p.returncode, p.stdout.decode().strip()), (0, ""))   # still silent to the turn
+            self.assertIn("cannot reach", open(log).read())                        # …but not to the user
+        finally:
+            if before is None:
+                if os.path.exists(log):
+                    os.remove(log)
+            else:
+                open(log, "w").write(before)
 
     def test_hook_ignores_events_it_was_not_wired_for(self):
         # a stray registration (PreToolUse, a future event) must not silently eat a queued note
@@ -676,6 +703,9 @@ class TestBasicAuth(unittest.TestCase):
         config.AUTH = ""                        # simulate no TRACKER_AUTH set (the default)
         self.assertEqual(self._get("/api/list")[0], 200)   # no creds, still served
 
+    def _auth_off(self):
+        config.AUTH = ""
+
     def _raw(self, method, path, auth):
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         hdr = {"Authorization": auth} if auth is not None else {}
@@ -692,6 +722,37 @@ class TestBasicAuth(unittest.TestCase):
     def test_post_route_also_requires_auth(self):
         # the guard is on do_POST too, not just do_GET — a mutation must not slip through
         self.assertEqual(self._raw("POST", "/api/flags", None), 401)
+
+    def test_drain_hook_authenticates_with_the_published_token(self):
+        """The failure that made push look broken: with a login configured, the hook 401s —
+        it's spawned by the AI tool, so it never inherits TRACKER_AUTH from a shell. The server
+        publishes a token for exactly this caller."""
+        config.PORT_FILE, config.TOKEN_FILE = tempfile.mktemp(), tempfile.mktemp()
+        _server.publish_endpoint(self.port)
+        self.assertTrue(os.path.exists(config.TOKEN_FILE), "a login is set -> publish a token")
+        self.assertEqual(oct(os.stat(config.TOKEN_FILE).st_mode)[-3:], "600", "owner-only")
+
+        tok = open(config.TOKEN_FILE).read().strip()
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("POST", "/api/notes/next", body="{}",
+                  headers={"Content-Type": "application/json", "Cookie": "ai_auth=" + tok})
+        r = c.getresponse(); r.read(); st = r.status; c.close()
+        self.assertEqual(st, 200, "the published token must open the drain")
+
+        # …and it is a real credential, not a bypass: a forged one still 401s
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("POST", "/api/notes/next", body="{}",
+                  headers={"Content-Type": "application/json", "Cookie": "ai_auth=9999999999.beef"})
+        r = c.getresponse(); r.read(); st = r.status; c.close()
+        self.assertEqual(st, 401)
+
+    def test_no_token_published_when_no_login_is_configured(self):
+        config.PORT_FILE, config.TOKEN_FILE = tempfile.mktemp(), tempfile.mktemp()
+        open(config.TOKEN_FILE, "w").write("stale-from-when-auth-was-on")
+        self._auth_off()
+        _server.publish_endpoint(self.port)
+        self.assertFalse(os.path.exists(config.TOKEN_FILE),
+                         "login turned off -> the live credential must not linger on disk")
 
     def test_note_drain_requires_auth(self):
         # /api/notes/next hands a note to whoever asks — it's the one route an *external* process

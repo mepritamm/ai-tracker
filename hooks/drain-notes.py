@@ -23,8 +23,14 @@ A queued note must never be able to break the session it was meant to help.
 
 Finding the tracker: PORT env if set, else the port the server wrote at startup
 (`aitracker/port` — it falls back past 8787 when something else already holds it), else 8787.
+If the tracker requires a login, it also writes `aitracker/token` and this hook presents it —
+a hook is spawned by the AI tool, so it never inherits TRACKER_AUTH from your shell.
 
-Env: PORT (override), TRACKER_AUTH ("user:pass", only if the tracker requires it).
+Delivery is silent by design, but a *failed* attempt is written to `aitracker/drain.log` —
+otherwise a misconfigured hook is indistinguishable from an empty queue. Read that file first
+when a note stays stuck at "queued".
+
+Env: PORT (override), TRACKER_AUTH ("user:pass", overrides the published token).
 """
 import base64
 import json
@@ -47,30 +53,64 @@ sid = hook.get("session_id")
 if not sid or event not in ("Stop", "UserPromptSubmit", "SessionStart"):
     sys.exit(0)
 
-def _port():
-    """PORT env wins; otherwise the port the server actually bound (it falls back past 8787
-    when something else holds it — assuming 8787 silently queries the wrong app forever)."""
-    if os.environ.get("PORT"):
-        return os.environ["PORT"]
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _published(name, default=""):
+    """Read a file the server writes at startup next to its own data (port, token)."""
     try:
-        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                               "aitracker", "port")) as fh:
-            return str(int(fh.read().strip()))
-    except (OSError, ValueError):
-        return "8787"
+        with open(os.path.join(HERE, "aitracker", name)) as fh:
+            return fh.read().strip()
+    except OSError:
+        return default
 
 
-url = "http://127.0.0.1:%s/api/notes/next" % _port()
+def _note(msg):
+    """Record why a delivery attempt failed. Silence is right for the *turn* — a queued note
+    must never break the session it was meant to help — but silence for the *user* means a
+    misconfigured hook looks identical to an empty queue, which is how three separate faults
+    (no hook, wrong event, wrong port) each went unnoticed. Only failures land here, never the
+    ordinary 'nothing queued', or it would write on every turn."""
+    try:
+        p = os.path.join(HERE, "aitracker", "drain.log")
+        old = ""
+        if os.path.exists(p) and os.path.getsize(p) < 64000:
+            with open(p) as fh:
+                old = fh.read()
+        with open(p, "w") as fh:
+            fh.write(old + msg + "\n")
+    except OSError:
+        pass
+
+
+port = os.environ.get("PORT") or _published("port") or "8787"
+url = "http://127.0.0.1:%s/api/notes/next" % port
 req = urllib.request.Request(url, data=json.dumps({"session": sid}).encode(),
                              headers={"Content-Type": "application/json"})
+
 cred = os.environ.get("TRACKER_AUTH", "")
+token = _published("token")
 if cred:
     req.add_header("Authorization", "Basic " + base64.b64encode(cred.encode()).decode())
+elif token:
+    # The server hands local callers this when a login is configured — a hook is spawned by the
+    # AI tool, so it never inherits TRACKER_AUTH from your shell.
+    req.add_header("Cookie", "ai_auth=" + token)
 
 try:
     # ponytail: short timeout — a wedged tracker must never stall a turn or a session start.
     note = json.load(urllib.request.urlopen(req, timeout=2)).get("note")
-except Exception:
+except Exception as e:
+    code = getattr(e, "code", None)
+    if code == 401:
+        _note("%s: 401 from %s — the tracker wants a login and this hook has no usable "
+              "credential. Restart the tracker so it republishes aitracker/token, or set "
+              "TRACKER_AUTH for the hook." % (event, url))
+    elif code:
+        _note("%s: HTTP %s from %s" % (event, code, url))
+    else:
+        _note("%s: cannot reach %s (%s) — is the tracker running, and is aitracker/port "
+              "current?" % (event, url, e))
     sys.exit(0)
 
 if not note:

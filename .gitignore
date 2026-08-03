@@ -4,6 +4,8 @@ titles.json
 pins.json
 notes.json
 port
+token
+drain.log
 .claude/launch.json
 .claude/skills/tracker-push/
 .claude/skills/tracker-add-contributor/

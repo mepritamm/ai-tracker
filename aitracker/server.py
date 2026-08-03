@@ -413,12 +413,33 @@ def bind(host="127.0.0.1", port=8787, tries=20):
             raise
 
 
-def publish_port(actual):
-    """Record the port we actually got, so out-of-browser callers (the notes drain hook) can
-    find us after a fallback. Best-effort: a read-only install must still serve."""
+_LOCAL_TTL = 30 * 86400   # ponytail: long-lived because it's rewritten at every startup and a
+                          # tracker can run for weeks; the ceiling is that a leaked token file is
+                          # good for a month — narrow it if this ever leaves the local disk.
+
+
+def publish_endpoint(actual):
+    """Tell local, non-browser callers (the notes drain hook) how to reach us: the port we
+    actually got — bind() walks past a busy 8787 — and, when a login is configured, a signed
+    token they can present. A hook is spawned by the AI tool, so it inherits neither the URL
+    nor TRACKER_AUTH; without both it silently 401s and delivers nothing.
+
+    Loopback is deliberately NOT treated as trusted instead: a tunnel terminates locally, so
+    remote requests also arrive from 127.0.0.1.
+
+    Best-effort throughout — a read-only install must still serve."""
     try:
         with open(config.PORT_FILE, "w") as fh:
             fh.write(str(actual))
+    except OSError:
+        pass
+    try:
+        if config.AUTH:
+            fd = os.open(config.TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(_make_token(_LOCAL_TTL))
+        elif os.path.exists(config.TOKEN_FILE):
+            os.remove(config.TOKEN_FILE)      # login turned off — don't leave a live credential
     except OSError:
         pass
 
@@ -426,7 +447,7 @@ def publish_port(actual):
 def run(host="127.0.0.1", port=8787, open_browser=True):
     srv = bind(host, port)
     actual = srv.server_address[1]
-    publish_port(actual)
+    publish_endpoint(actual)
     if actual != port:
         print(f"port {port} is in use → using {actual}")
     url = f"http://localhost:{actual}"
