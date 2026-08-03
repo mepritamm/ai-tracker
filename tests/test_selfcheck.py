@@ -475,12 +475,16 @@ def _run():
     # notes stack round-trip
     config.NOTES_FILE = tempfile.mktemp(suffix=".json")
     assert load_notes() == {}                                         # missing file -> empty dict
-    save_notes({"sess-a": ["plan step 1", "plan step 2"]})
+    save_notes({"sess-a": [{"text": "plan step 1", "pushed": False},
+                           {"text": "plan step 2", "pushed": False}]})
     ns = load_notes()
-    assert ns["sess-a"] == ["plan step 1", "plan step 2"], ns
+    assert [n["text"] for n in ns["sess-a"]] == ["plan step 1", "plan step 2"], ns
     ns["sess-a"].pop(0)                                               # remove first note
     save_notes(ns)
-    assert load_notes()["sess-a"] == ["plan step 2"]
+    assert [n["text"] for n in load_notes()["sess-a"]] == ["plan step 2"]
+    # bare strings are the pre-push on-disk format — they must upgrade, not crash
+    _save_json(config.NOTES_FILE, {"sess-b": ["written by an older build"]})
+    assert load_notes()["sess-b"] == [{"text": "written by an older build", "pushed": False}]
     os.unlink(config.NOTES_FILE)
 
     # parse_session includes notes key
@@ -489,9 +493,13 @@ def _run():
         f.write(json.dumps({"type": "user", "cwd": "/x", "message": {"role": "user", "content": "go"}}) + "\n")
         note_sid = os.path.basename(f.name)[:-6]
         note_path = f.name
-    save_notes({note_sid: ["remember this"]})
+    save_notes({note_sid: [{"text": "remember this", "pushed": True}]})
     dn = parse_session(note_path)
     os.unlink(note_path)
     os.unlink(config.NOTES_FILE)
-    assert dn["notes"] == ["remember this"], dn.get("notes")
+    assert [n["text"] for n in dn["notes"]] == ["remember this"], dn.get("notes")
+    assert dn["notes"][0]["pushed"] is True, "queued state must reach the client"
+    # `push_ok` spans BOTH providers — the client renders the server's answer, never guesses it
+    assert dn["push_ok"] is True, "claude: Stop hook can drain the queue"
+    assert pa["push_ok"] is False, "auggie: no turn-end hook yet -> push queues but can't deliver"
     print("selfcheck ok")

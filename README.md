@@ -95,7 +95,8 @@ Locally it's just `make serve` (localhost, no tunnel, no login). To reach it fro
 - **Narration** — the assistant's own words, step by step, with full markdown rendering (tables, code, lists) in the pop-out modal — each code block has its own one-click **⧉ Copy** button — plus prev/next arrows and a jump-to-latest (⤒) button across every entry. History is unbounded — older entries page in from the server as you scroll. An open entry stays live: it follows the newest message, or holds your place if you've paged back into history.
 - **Todos**, **Files** (a diff per edit, with GitHub-style **up/down context expansion** and an **Expand all** toggle to reveal the whole file around every edit, plus a Diff ⇄ Rendered-markdown toggle and an "open in new tab" button), **Commands** (with ✓/✗ for Claude), and **Prompts** (every prompt you typed, slash-command invocations like `/foo args` included). Files a background agent wrote — e.g. editing inside a git worktree — show too, tagged **🤖 agent**, and stay diffable.
 - Every list panel loads a window and reveals older entries as you scroll to the bottom.
-- **🧭 Plan on the go** — a per-session stack of small plan-ahead notes: jot what you want to do once an answer lands (or while you wait on another session), and it stays with the session. Add as many as you like; **copy** one back when you need it, **remove** it when done. Sessions with notes carry a **📝 N** badge in the sidebar. Saved to `notes.json`, read live (no restart). Works for every session, any tool — and you can add notes from your phone or tablet too, just like 🚩 flagging.
+- **🧭 Plan on the go** — a per-session stack of small plan-ahead notes: jot what you want to do once an answer lands (or while you wait on another session), and it stays with the session. Add as many as you like; **copy** one back when you need it, **push** it into the live session, **remove** it when done.
+  **▶ push** queues a note for delivery: the session picks it up the moment it finishes its current turn, so you never have to interrupt it or paste anything. Delivery needs a turn-end hook — Claude Code has one; wire up [`hooks/drain-notes.py`](hooks/drain-notes.py) as a `Stop` hook (instructions in the file) and pushed notes arrive on their own. Tools without such a hook (Auggie today) still queue, but you deliver by **⧉ copy**. Sessions with notes carry a **📝 N** badge in the sidebar. Saved to `notes.json`, read live (no restart). Works for every session, any tool — and you can add notes from your phone or tablet too, just like 🚩 flagging.
 - **🚩 Flag** anything you want to fix later — see [Skills](#skills).
 
 ---
@@ -121,6 +122,8 @@ Both providers emit the **same result shape**, so the browser renders them ident
 | Pull requests — created **or** worked on | ✅ (created via `gh pr create` / MCP; worked-on = narrated about **and** in the session's own repo) | ✅ (Auggie logs no command output, so a created PR is tied to the first URL after `gh pr create`; worked-on = narrated about **and** in its own repo) |
 | Decisions & open questions | ✅ (`AskUserQuestion`) | ✅ (`ask-user` — answer from the next turn's tool result) |
 | Background agents & shells | ✅ | ➖ Auggie has no such model |
+| 📝 Notes — write, ⧉ copy, 📝 N badge | ✅ | ✅ |
+| ▶ push a note into the live session | ✅ (via the `Stop` hook in `hooks/`) | ➖ queues fine, but Auggie has no turn-end hook to deliver it — use ⧉ copy |
 
 **Data files** — `flags.json` (your flags), `titles.json` (your renames), `pins.json` (pinned sessions), and `notes.json` (your notes) are read **live** (no restart). Everything else is baked into the page at startup, so **editing `aitracker/` or `web/` needs a server restart** to show.
 
@@ -180,7 +183,7 @@ The repo ships Claude Code skills under [`.claude/skills/`](.claude/skills/). In
 ## Good to know
 
 - **Restart to see UI/parse changes.** The page and parsers are loaded at startup; only `flags.json` / `titles.json` are read live. After editing `aitracker/` or `web/`, run `make serve` (or restart the process).
-- **Auggie / Augment now reads the full local transcript** (`~/.augment/sessions/`) — summary, tokens, narration, files, commands, reads, working folder, and git branch — at near-Claude parity. The only gaps are background agents/shells (Auggie has no such model) and command exit status (Auggie doesn't record it, so its commands render as ✓).
+- **Auggie / Augment now reads the full local transcript** (`~/.augment/sessions/`) — summary, tokens, narration, files, commands, reads, working folder, and git branch — at near-Claude parity. The only gaps are background agents/shells (Auggie has no such model), command exit status (Auggie doesn't record it, so its commands render as ✓), and **▶ push** delivery (Auggie has no turn-end hook — the note still queues, you deliver it with ⧉ copy).
 - **"Live" is a 5-minute window** since the last activity. Background-agent completion is inferred from that window, so an agent-finished notification can lag a few minutes; background shells with real process state notify promptly.
 - **Everything stays on your machine.** Read-only against the tool logs, no outbound network, no telemetry.
 
@@ -193,6 +196,7 @@ aitracker/                     the app package (stdlib only): providers/, web/, 
 web assets in aitracker/web/    index.html · app.css · app.js (inlined at serve time)
 tests/                unit tests + evals — the mandatory gate
 hooks/pre-commit               runs the gate before every commit (make hooks)
+hooks/drain-notes.py           optional Claude Code Stop hook: delivers ▶ pushed notes
 Makefile                       make serve / stop / check / test / hooks
 docs/screenshot.png            the dashboard screenshot in this README
 CLAUDE.md / AGENTS.md          context for AI agents working in this repo

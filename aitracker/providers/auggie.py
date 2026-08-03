@@ -314,6 +314,9 @@ def parse_auggie(session_id):
         "mtime": _iso_epoch(d.get("modified")) or os.path.getmtime(f),
         "now": time.time(),
         "notes": load_notes().get("auggie:" + session_id, []),
+        # ponytail: auggie has no turn-end hook (--queue needs --print), so nothing drains the
+        # queue yet. Push still queues; flip this to True the day a drain exists.
+        "push_ok": False,
     }
 
 

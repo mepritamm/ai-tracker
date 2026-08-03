@@ -76,9 +76,15 @@ def save_flags(flags):
 
 
 def load_notes():
-    """Per-session note stacks: {session_id: [note_text, ...]} — read live."""
+    """Per-session note stacks: {session_id: [{"text": …, "pushed": bool}, …]} — read live.
+    `pushed` means "queued for delivery into the live session"; the drain (/api/notes/next)
+    pops the oldest pushed note. Bare strings (the pre-push format) upgrade on read."""
     d = _load_json(config.NOTES_FILE, {})
-    return d if isinstance(d, dict) else {}
+    if not isinstance(d, dict):
+        return {}
+    return {sid: [n if isinstance(n, dict) else {"text": n, "pushed": False}
+                  for n in stack]
+            for sid, stack in d.items() if isinstance(stack, list)}
 
 
 def save_notes(notes):

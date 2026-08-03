@@ -978,6 +978,7 @@ def parse_session(path):
         "mtime": max(st.st_mtime, newest_agent),  # background agents keep it "live"
         "now": time.time(),
         "notes": load_notes().get(os.path.basename(path)[:-6], []),
+        "push_ok": True,      # Claude Code's Stop hook can drain /api/notes/next into the live turn
     }
     result["overview"] = build_overview(result, todos, result["files"], cmds, commits,
                                          tests, agents, requests, narrative, agents_bg,

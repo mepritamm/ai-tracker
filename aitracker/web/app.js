@@ -887,12 +887,16 @@ function renderNotes(notes){
   nc.textContent=notes.length||"";
   // display newest-first (server stores in append order; reverse for display)
   const rev=[...notes].reverse();
-  el.innerHTML=rev.length?rev.map((txt,ri)=>{
+  el.innerHTML=rev.length?rev.map((n,ri)=>{
     const idx=notes.length-1-ri;   // actual index in the server's array (for delete)
-    return `<div class=noteitem>`+
-      `<div class=ntxt>${esc(txt)}</div>`+
+    const push=n.pushed
+      ?`<span class="link amber" onclick="pushNote(${idx})" title="Queued — the session picks it up when it finishes this turn. Click to un-queue.">⏳ queued</span>`
+      :`<span class="link green" onclick="pushNote(${idx})" title="Send this into the live session">▶ push</span>`;
+    return `<div class="noteitem${n.pushed?" queued":""}">`+
+      `<div class=ntxt>${esc(n.text||"")}</div>`+
       `<div class=nft>`+
         `<span class="link blue" onclick="copyNote(${idx})" title="Copy to clipboard">⧉ copy</span>`+
+        push+
         `<span class="link grey" onclick="removeNote(${idx})">✕ remove</span>`+
       `</div></div>`;
   }).join(""):`<div class=empty>no notes yet</div>`;
@@ -912,9 +916,22 @@ async function removeNote(idx){
     body:JSON.stringify({session:cur,index:idx})});
   if(r.ok){const j=await r.json();if(lastData)lastData.notes=j.notes||[];renderNotes(lastData.notes||[]);renderSide();}
 }
+async function pushNote(idx){
+  if(!cur)return;
+  const r=await fetch("/api/notes/push",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({session:cur,index:idx})});
+  if(!r.ok)return;
+  const j=await r.json();
+  if(lastData)lastData.notes=j.notes||[];
+  renderNotes(lastData?lastData.notes||[]:[]);renderSide();
+  const now=(j.notes||[])[idx];
+  if(now&&now.pushed) toast(lastData&&lastData.push_ok===false
+    ?"Queued — this tool has no drain hook, use ⧉ copy"
+    :"Queued — lands when the session finishes this turn","");
+}
 function copyNote(idx){
   if(!lastData)return;
-  const txt=(lastData.notes||[])[idx]||"";
+  const txt=((lastData.notes||[])[idx]||{}).text||"";
   if(!txt)return;
   const done=()=>{};
   if(navigator.clipboard){navigator.clipboard.writeText(txt).catch(()=>{});}

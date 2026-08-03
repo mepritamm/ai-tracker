@@ -9,6 +9,8 @@ import json
 import sys
 import os
 import runpy
+import socket
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -23,6 +25,10 @@ from aitracker.providers import auggie as _auggie
 from aitracker.providers import claude as _claude
 
 _PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "TASKS_DIR", "NOTES_FILE")
+
+
+def _texts(resp):
+    return [n["text"] for n in resp["notes"]]
 
 
 def _snap():
@@ -79,6 +85,7 @@ class TestBuildPage(unittest.TestCase):
         self.assertIn("id=scrim", p)
         self.assertIn(".app.draweropen .side", p)
         self.assertIn("addNote", p)             # notes JS function present
+        self.assertIn("pushNote", p)            # push-to-live-session wired into the inlined SPA
         # both compose buttons must be addable from mobile/tablet (remote host): flags queue to the
         # server's flags.json and are picked up by /fix-flags locally later, so flagging-while-away is
         # the ideal phone workflow — neither button is gated on the (now-removed) .remote class.
@@ -284,21 +291,153 @@ class TestServerEndToEnd(unittest.TestCase):
         # add two notes
         st, j = self._post("/api/notes", {"session": "sess-x", "text": "first plan"})
         self.assertEqual(st, 200)
-        self.assertEqual(j["notes"], ["first plan"])
+        self.assertEqual(_texts(j), ["first plan"])
 
         st, j = self._post("/api/notes", {"session": "sess-x", "text": "second plan"})
         self.assertEqual(st, 200)
-        self.assertEqual(j["notes"], ["first plan", "second plan"])
+        self.assertEqual(_texts(j), ["first plan", "second plan"])
 
         # delete index 0 (first note)
         st, j = self._post("/api/notes/delete", {"session": "sess-x", "index": 0})
         self.assertEqual(st, 200)
-        self.assertEqual(j["notes"], ["second plan"])
+        self.assertEqual(_texts(j), ["second plan"])
 
         # delete the last note — stack cleaned up
         st, j = self._post("/api/notes/delete", {"session": "sess-x", "index": 0})
         self.assertEqual(st, 200)
-        self.assertEqual(j["notes"], [])
+        self.assertEqual(_texts(j), [])
+
+    def test_notes_push_then_drain(self):
+        for t in ("one", "two", "three"):
+            self._post("/api/notes", {"session": "sess-p", "text": t})
+
+        # nothing queued yet -> the drain hands back nothing
+        st, j = self._post("/api/notes/next", {"session": "sess-p"})
+        self.assertEqual((st, j["note"]), (200, None))
+
+        # queue the 2nd and 3rd; the drain serves them oldest-first, not click-order
+        self._post("/api/notes/push", {"session": "sess-p", "index": 2})
+        st, j = self._post("/api/notes/push", {"session": "sess-p", "index": 1})
+        self.assertEqual([n["pushed"] for n in j["notes"]], [False, True, True])
+
+        st, j = self._post("/api/notes/next", {"session": "sess-p"})
+        self.assertEqual(j["note"], "two")                       # oldest queued wins
+        st, j = self._post("/api/notes/next", {"session": "sess-p"})
+        self.assertEqual(j["note"], "three")
+        st, j = self._post("/api/notes/next", {"session": "sess-p"})
+        self.assertIsNone(j["note"])                             # delivered notes leave the stack
+
+        # the un-pushed one is untouched
+        st, j = self._post("/api/notes/delete", {"session": "sess-p", "index": 99})
+        self.assertEqual(_texts(j), ["one"])
+
+    def test_notes_push_toggles_off(self):
+        self._post("/api/notes", {"session": "sess-q", "text": "maybe"})
+        self._post("/api/notes/push", {"session": "sess-q", "index": 0})
+        st, j = self._post("/api/notes/push", {"session": "sess-q", "index": 0})
+        self.assertEqual([n["pushed"] for n in j["notes"]], [False])
+        st, j = self._post("/api/notes/next", {"session": "sess-q"})
+        self.assertIsNone(j["note"])                             # un-queued stays put
+
+    def test_notes_push_bad_input_rejected(self):
+        self._post("/api/notes", {"session": "sess-r", "text": "n"})
+        for bad in ({"session": "sess-r", "index": 9},            # past the end
+                    {"session": "sess-r", "index": -1},           # negative
+                    {"session": "sess-r", "index": "0"},          # not an int
+                    {"session": "sess-r"},                        # no index at all
+                    {"index": 0},                                 # no session
+                    {"session": "never-seen", "index": 0}):       # unknown session
+            st, _ = self._post("/api/notes/push", bad)
+            self.assertEqual(st, 400, bad)
+        # …and the note it couldn't touch is unchanged, still un-queued
+        st, j = self._post("/api/notes/delete", {"session": "sess-r", "index": 99})
+        self.assertEqual(j["notes"], [{"text": "n", "pushed": False}])
+
+    def _hook(self, payload, port=None):
+        """Run the real Stop hook against this test server, exactly as Claude Code would:
+        hook JSON on stdin, decision JSON on stdout."""
+        env = dict(os.environ, PORT=str(port if port is not None else self.port))
+        env.pop("TRACKER_AUTH", None)
+        script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "hooks", "drain-notes.py")
+        p = subprocess.run([sys.executable, script], input=json.dumps(payload).encode(),
+                           capture_output=True, env=env, timeout=20)
+        return p.returncode, p.stdout.decode().strip()
+
+    def test_stop_hook_delivers_a_pushed_note(self):
+        self._post("/api/notes", {"session": "hooked", "text": "kept quiet"})
+        self._post("/api/notes", {"session": "hooked", "text": "deliver me"})
+        self._post("/api/notes/push", {"session": "hooked", "index": 1})
+
+        rc, out = self._hook({"session_id": "hooked", "stop_hook_active": False})
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out), {"decision": "block", "reason": "deliver me"})
+
+        # delivered once and only once — the next turn ends normally
+        rc, out = self._hook({"session_id": "hooked", "stop_hook_active": False})
+        self.assertEqual((rc, out), (0, ""))
+        # the un-pushed note is still sitting in the stack, untouched
+        st, j = self._post("/api/notes/delete", {"session": "hooked", "index": 99})
+        self.assertEqual(_texts(j), ["kept quiet"])
+
+    def test_stop_hook_stays_silent_on_every_no_op(self):
+        self._post("/api/notes", {"session": "quiet", "text": "never pushed"})
+        for payload, why in (
+                ({"session_id": "quiet", "stop_hook_active": False}, "queued nothing"),
+                ({"session_id": "quiet", "stop_hook_active": True}, "already inside an injected turn"),
+                ({"stop_hook_active": False}, "no session_id"),
+                ({}, "empty payload")):
+            self.assertEqual(self._hook(payload), (0, ""), why)
+
+    def test_stop_hook_never_stalls_a_turn_when_tracker_is_down(self):
+        # closed port: the hook must fail open (exit 0, no output), not hang or error the turn
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        port = dead.getsockname()[1]
+        dead.close()
+        self.assertEqual(self._hook({"session_id": "x"}, port=port), (0, ""))
+        self.assertEqual(self._hook("not json at all"), (0, ""))
+
+    def test_note_count_on_the_shared_list_dict(self):
+        """The sidebar 📝 badge reads note_count off the LIST dict — filled for both producers,
+        and it must survive the stored-note shape (a drain drops the count back)."""
+        os.makedirs(os.path.join(config.AUGMENT_DIR, "task-storage", "tasks"))
+        open(os.path.join(config.AUGMENT_DIR, "settings.json"), "w").write('{"indexingAllowDirs":["/x"]}')
+        _write_auggie("an", "Auggie one")
+        _write_claude("cl", 1)
+
+        def counts():
+            _auggie._AUGGIE_LIST_CACHE.clear()
+            _claude._META_CACHE.clear()
+            st, body = self._get("/api/list")
+            self.assertEqual(st, 200)
+            return {s["id"]: s["note_count"] for s in json.loads(body)}
+
+        self.assertEqual(counts(), {"auggie:an": 0, "cl": 0})   # present and zero for both
+        for sid in ("auggie:an", "cl"):
+            self._post("/api/notes", {"session": sid, "text": "a"})
+            self._post("/api/notes", {"session": sid, "text": "b"})
+            self._post("/api/notes/push", {"session": sid, "index": 0})
+        self.assertEqual(counts(), {"auggie:an": 2, "cl": 2})   # queued notes still count
+        for sid in ("auggie:an", "cl"):
+            self._post("/api/notes/next", {"session": sid})
+        self.assertEqual(counts(), {"auggie:an": 1, "cl": 1})   # delivered ones stop counting
+
+    def test_notes_drain_unknown_session_is_empty(self):
+        # the hook fires at the end of EVERY turn, so the no-notes case is the common one
+        st, j = self._post("/api/notes/next", {"session": "never-seen"})
+        self.assertEqual((st, j["note"]), (200, None))
+        st, j = self._post("/api/notes/next", {})
+        self.assertEqual((st, j["note"]), (200, None))
+
+    def test_notes_legacy_strings_upgrade(self):
+        # notes.json written before push existed: bare strings, not dicts
+        with open(config.NOTES_FILE, "w") as fh:
+            json.dump({"sess-old": ["written by an older build"]}, fh)
+        st, j = self._post("/api/notes/push", {"session": "sess-old", "index": 0})
+        self.assertEqual(st, 200)
+        st, j = self._post("/api/notes/next", {"session": "sess-old"})
+        self.assertEqual(j["note"], "written by an older build")
 
     def test_notes_empty_text_rejected(self):
         st, j = self._post("/api/notes", {"session": "sess-y", "text": "   "})
@@ -367,7 +506,7 @@ class TestServerEndToEnd(unittest.TestCase):
         # out-of-range index: no crash, note still there
         st, j = self._post("/api/notes/delete", {"session": "sess-z", "index": 99})
         self.assertEqual(st, 200)
-        self.assertEqual(j["notes"], ["note"])
+        self.assertEqual(_texts(j), ["note"])
 
 
 class TestBasicAuth(unittest.TestCase):
@@ -470,6 +609,14 @@ class TestBasicAuth(unittest.TestCase):
     def test_post_route_also_requires_auth(self):
         # the guard is on do_POST too, not just do_GET — a mutation must not slip through
         self.assertEqual(self._raw("POST", "/api/flags", None), 401)
+
+    def test_note_drain_requires_auth(self):
+        # /api/notes/next hands a note to whoever asks — it's the one route an *external* process
+        # (the Stop hook) calls, so an unauthenticated caller must never drain someone's queue.
+        self.assertEqual(self._raw("POST", "/api/notes/next", None), 401)
+        self.assertEqual(self._raw("POST", "/api/notes/push", None), 401)
+        good = "Basic " + base64.b64encode(b"alice:s3cret").decode()
+        self.assertEqual(self._raw("POST", "/api/notes/next", good), 200)   # the hook's -u path works
 
     def test_malformed_or_non_basic_header_401(self):
         # a bad Authorization header must 401 cleanly (no 500), exercising the decode try/except

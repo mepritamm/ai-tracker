@@ -336,9 +336,38 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "session and text required"}, 400)
                 return
             notes = load_notes()
-            notes.setdefault(sid, []).append(text[:2000])
+            notes.setdefault(sid, []).append({"text": text[:2000], "pushed": False})
             save_notes(notes)
             self._json({"ok": True, "notes": notes[sid]})
+        elif p.path == "/api/notes/push":
+            # Queue a note for delivery into the live session. Delivery itself is the tool's
+            # job: a turn-end hook drains /api/notes/next. Queuing is provider-agnostic.
+            sid, idx = body.get("session", ""), body.get("index")
+            notes = load_notes()
+            stack = notes.get(sid, [])
+            if not (isinstance(idx, int) and 0 <= idx < len(stack)):
+                self._json({"error": "session and index required"}, 400)
+                return
+            stack[idx]["pushed"] = not stack[idx].get("pushed")   # click again to un-queue
+            save_notes(notes)
+            self._json({"ok": True, "notes": stack})
+        elif p.path == "/api/notes/next":
+            # The drain: hand the oldest queued note to the session that asks for it, once.
+            # Delivered notes leave the stack — from here on they live in the session's own log.
+            sid = body.get("session", "")
+            notes = load_notes()
+            stack = notes.get(sid, [])
+            hit = next((i for i, n in enumerate(stack) if n.get("pushed")), None)
+            if hit is None:
+                self._json({"note": None})
+                return
+            note = stack.pop(hit)
+            if stack:
+                notes[sid] = stack
+            else:
+                notes.pop(sid, None)
+            save_notes(notes)
+            self._json({"note": note["text"]})
         elif p.path == "/api/notes/delete":
             sid = body.get("session", "")
             idx = body.get("index")
