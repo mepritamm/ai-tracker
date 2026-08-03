@@ -3,6 +3,7 @@ flags.json
 titles.json
 pins.json
 notes.json
+port
 .claude/launch.json
 .claude/skills/tracker-push/
 .claude/skills/tracker-add-contributor/

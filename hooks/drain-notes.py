@@ -21,7 +21,10 @@ so this script picks the shape from `hook_event_name`.
 Anything unexpected — no tracker, no notes, bad stdin, an unknown event — exits 0 silently.
 A queued note must never be able to break the session it was meant to help.
 
-Env: PORT (default 8787), TRACKER_AUTH ("user:pass", only if the tracker requires it).
+Finding the tracker: PORT env if set, else the port the server wrote at startup
+(`aitracker/port` — it falls back past 8787 when something else already holds it), else 8787.
+
+Env: PORT (override), TRACKER_AUTH ("user:pass", only if the tracker requires it).
 """
 import base64
 import json
@@ -44,7 +47,20 @@ sid = hook.get("session_id")
 if not sid or event not in ("Stop", "UserPromptSubmit", "SessionStart"):
     sys.exit(0)
 
-url = "http://127.0.0.1:%s/api/notes/next" % os.environ.get("PORT", "8787")
+def _port():
+    """PORT env wins; otherwise the port the server actually bound (it falls back past 8787
+    when something else holds it — assuming 8787 silently queries the wrong app forever)."""
+    if os.environ.get("PORT"):
+        return os.environ["PORT"]
+    try:
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "aitracker", "port")) as fh:
+            return str(int(fh.read().strip()))
+    except (OSError, ValueError):
+        return "8787"
+
+
+url = "http://127.0.0.1:%s/api/notes/next" % _port()
 req = urllib.request.Request(url, data=json.dumps({"session": sid}).encode(),
                              headers={"Content-Type": "application/json"})
 cred = os.environ.get("TRACKER_AUTH", "")

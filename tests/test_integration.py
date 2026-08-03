@@ -25,7 +25,7 @@ from aitracker.util import _first_line, _iso_epoch
 from aitracker.providers import auggie as _auggie
 from aitracker.providers import claude as _claude
 
-_PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "TASKS_DIR", "NOTES_FILE")
+_PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "TASKS_DIR", "NOTES_FILE", "PORT_FILE")
 
 
 def _texts(resp):
@@ -396,6 +396,43 @@ class TestServerEndToEnd(unittest.TestCase):
                 "additionalContext": "Queued note from the ai-tracker dashboard: look at %s" % event}})
             # one drain per wake — the note is gone, not re-injected on the next prompt
             self.assertEqual(self._hook({"session_id": "idle", "hook_event_name": event}), (0, ""))
+
+    def test_hook_finds_a_server_that_fell_back_off_8787(self):
+        """bind() walks past a busy 8787, so the hook must read the port the server actually
+        published — assuming the default silently queries whatever else owns 8787, forever."""
+        self._post("/api/notes", {"session": "moved", "text": "found you"})
+        self._post("/api/notes/push", {"session": "moved", "index": 0})
+
+        config.PORT_FILE = tempfile.mktemp()
+        _server.publish_port(self.port)                      # what run() does at startup
+        self.assertEqual(open(config.PORT_FILE).read(), str(self.port))
+
+        # no PORT env at all — discovery has to come from the published file
+        script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "hooks", "drain-notes.py")
+        real = os.path.join(os.path.dirname(script), "..", "aitracker", "port")
+        os.makedirs(os.path.dirname(real), exist_ok=True)
+        had = os.path.exists(real)
+        prev = open(real).read() if had else None
+        try:
+            open(real, "w").write(str(self.port))
+            env = {k: v for k, v in os.environ.items() if k not in ("PORT", "TRACKER_AUTH")}
+            p = subprocess.run([sys.executable, script],
+                               input=json.dumps({"session_id": "moved",
+                                                 "hook_event_name": "Stop"}).encode(),
+                               capture_output=True, env=env, timeout=20)
+            self.assertEqual(json.loads(p.stdout.decode()),
+                             {"decision": "block", "reason": "found you"})
+        finally:
+            if had:
+                open(real, "w").write(prev)
+            else:
+                os.remove(real)
+
+    def test_publish_port_survives_an_unwritable_location(self):
+        # a read-only install must still serve — publishing the port is best-effort only
+        config.PORT_FILE = os.path.join(tempfile.mkdtemp(), "no-such-dir", "port")
+        _server.publish_port(1234)          # must not raise
 
     def test_hook_ignores_events_it_was_not_wired_for(self):
         # a stray registration (PreToolUse, a future event) must not silently eat a queued note

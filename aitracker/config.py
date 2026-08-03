@@ -19,6 +19,12 @@ PINS_FILE = os.path.join(_HERE, "pins.json")
 NOTES_FILE = os.path.join(_HERE, "notes.json")
 
 
+# Where the server is actually listening, written at startup. `run()` falls back to the next
+# free port when 8787 is taken, so anything outside the browser (the notes drain hook) has to
+# be told the real one rather than assume the default.
+PORT_FILE = os.path.join(_HERE, "port")
+
+
 AUGMENT_DIR = os.path.expanduser("~/.augment")
 
 

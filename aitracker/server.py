@@ -413,9 +413,20 @@ def bind(host="127.0.0.1", port=8787, tries=20):
             raise
 
 
+def publish_port(actual):
+    """Record the port we actually got, so out-of-browser callers (the notes drain hook) can
+    find us after a fallback. Best-effort: a read-only install must still serve."""
+    try:
+        with open(config.PORT_FILE, "w") as fh:
+            fh.write(str(actual))
+    except OSError:
+        pass
+
+
 def run(host="127.0.0.1", port=8787, open_browser=True):
     srv = bind(host, port)
     actual = srv.server_address[1]
+    publish_port(actual)
     if actual != port:
         print(f"port {port} is in use → using {actual}")
     url = f"http://localhost:{actual}"
