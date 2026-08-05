@@ -1041,6 +1041,14 @@ $("dq").addEventListener("keydown",e=>{if(e.key==="Escape"){clearDetailSearch();
 setBell();
 start();
 
+// Collapsible panels: the chevron in each card header toggles its body. State lives on the
+// static .card element, so it survives the 2s re-render (which only rewrites inner content) —
+// no persistence needed. One delegated handler covers every panel: State, Activity, background.
+function toggleCard(h){const on=h.parentElement.classList.toggle("collapsed");h.setAttribute("aria-expanded",!on);}
+document.querySelectorAll(".card>h2").forEach(h=>{h.tabIndex=0;h.setAttribute("role","button");h.setAttribute("aria-expanded","true");});
+document.addEventListener("click",e=>{if(e.target.closest("button,a,input,textarea,select"))return;const h=e.target.closest(".card>h2");if(h)toggleCard(h);});
+document.addEventListener("keydown",e=>{if(e.key!=="Enter"&&e.key!==" ")return;const h=e.target.closest&&e.target.closest(".card>h2");if(h&&e.target===h){e.preventDefault();toggleCard(h);}});
+
 document.addEventListener("keydown",e=>{
   const open=$("msgmodal").style.display==="flex"||$("diffmodal").style.display==="flex";
   if(!open)return;

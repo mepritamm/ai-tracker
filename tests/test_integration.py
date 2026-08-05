@@ -167,6 +167,13 @@ class TestBuildPage(unittest.TestCase):
         _po = p.index("html${theme}")
         self.assertIn("name=viewport", p[_po:_po + 220])
         self.assertIn(".pw h1{font:600 15px/1.3 inherit;color:var(--text)", p)
+        # Collapsible panels: every card header carries a chevron and toggles its own body.
+        # One shared CSS rule + one delegated handler cover all panels (State/Activity/background) —
+        # no per-panel duplication, and state lives on the static .card so it survives re-renders.
+        self.assertIn(".card.collapsed>:not(h2){display:none", p)   # collapsed hides the body, keeps the header
+        self.assertIn(".card>h2::before", p)                        # the chevron affordance
+        self.assertIn("function toggleCard", p)                     # the shared toggle
+        self.assertIn('.card>h2")', p)                              # delegated to every card header, not one panel
 
 
 class TestSearchAllRanking(unittest.TestCase):
