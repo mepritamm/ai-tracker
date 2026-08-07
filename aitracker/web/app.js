@@ -22,8 +22,12 @@ function mdBlock(s){
   const cells=l=>l.trim().replace(/^\|/,"").replace(/\|$/,"").split("|").map(c=>c.trim());
   while(i<L.length){
     const l=L[i];
-    if(/^\s*```/.test(l)){ i++; const b=[]; while(i<L.length&&!/^\s*```/.test(L[i])){b.push(L[i]);i++;} i++;
-      out.push(`<div class=cblock><button class=codecopy onclick="copyCode(this)" title="Copy this block">⧉ Copy</button><pre class=mdpre><code>${esc(b.join("\n"))}</code></pre></div>`); continue; }
+    const fm=l.match(/^\s*```\s*([A-Za-z0-9_+-]*)/);
+    if(fm){ i++; const b=[]; while(i<L.length&&!/^\s*```/.test(L[i])){b.push(L[i]);i++;} i++;
+      const src=b.join("\n");
+      if(/^mermaid$/i.test(fm[1])){ const g=mermaidSvg(src);   // unsupported diagram → falls through to the code block
+        if(g){ out.push(`<div class=mmd>${g}</div>`); continue; } }
+      out.push(`<div class=cblock><button class=codecopy onclick="copyCode(this)" title="Copy this block">⧉ Copy</button><pre class=mdpre><code>${esc(src)}</code></pre></div>`); continue; }
     const hm=l.match(/^(#{1,6})\s+(.*)$/);
     if(hm){ const lv=Math.min(hm[1].length,4)+1; out.push(`<h${lv} class=mdh>${md(hm[2])}</h${lv}>`); i++; continue; }
     if(l.includes("|")&&i+1<L.length&&sep(L[i+1])){
@@ -43,6 +47,161 @@ function mdBlock(s){
     out.push(`<p class=mdp>${md(p.join(" "))}</p>`);
   }
   return out.join("");
+}
+// ---- Mermaid → inline SVG, hand-rolled. No mermaid.js, no CDN: the whole app is
+// one zero-dependency file and `make bundle` inlines web/ verbatim, so a 3 MB vendored
+// library is off the table. Covers the `flowchart|graph` subset that shows up in
+// narration (node shapes, edge labels, classDef colours); every other diagram type
+// returns null and mdBlock renders the fence as code, unchanged.
+// ponytail: layered layout, straight bezier edges — no crossing minimisation.
+const MMDSH={"[[":"rect","((":"circle","([":"stadium","[":"rect","(":"round","{":"diamond",">":"rect"};
+const MMDW=13, MMDCW=6.9, MMDLH=17, MMDPX=14, MMDPY=9, MMDGX=26, MMDGY=56, MMDMAX=44;
+function _mmdLines(s){
+  const out=[];
+  (s||"").replace(/<br\s*\/?>/gi,"\n").replace(/<\/?[a-z][^>]*>/gi,"").replace(/^\s*["'`]|["'`]\s*$/g,"")
+   .split("\n").forEach(raw=>{
+     let t=raw.trim(); if(!t){return;}
+     while(t.length>MMDMAX){                       // soft-wrap on a word boundary
+       let c=t.lastIndexOf(" ",MMDMAX); if(c<MMDMAX*0.5)c=MMDMAX;
+       out.push(t.slice(0,c).trim()); t=t.slice(c).trim();
+     }
+     out.push(t);
+   });
+  return out.length?out:[""];
+}
+function _mmdStyle(s){
+  const o={};
+  (s||"").split(",").forEach(kv=>{ const j=kv.indexOf(":"); if(j>0)o[kv.slice(0,j).trim().toLowerCase()]=kv.slice(j+1).trim(); });
+  return o;
+}
+function _mmdNode(tok,nodes,order){
+  tok=(tok||"").trim(); if(!tok)return null;
+  let cls=null; const cm=tok.match(/:::([A-Za-z0-9_-]+)\s*$/);
+  if(cm){ cls=cm[1]; tok=tok.slice(0,cm.index).trim(); }
+  const m=tok.match(/^([A-Za-z0-9_.-]+)\s*(\[\[|\(\(|\(\[|\[|\(|\{|>)([\s\S]*)$/);
+  let id=tok, shape="rect", label=null;
+  if(m){ id=m[1]; shape=MMDSH[m[2]]||"rect"; label=m[3].replace(/(\]\]|\)\)|\]\)|\]|\)|\})\s*$/,""); }
+  else { id=tok.split(/\s/)[0]; }
+  if(!/^[A-Za-z0-9_.-]+$/.test(id))return null;
+  let n=nodes[id];
+  if(!n){ n=nodes[id]={id:id,shape:shape,lines:_mmdLines(label==null?id:label),cls:cls}; order.push(id); }
+  else { if(label!=null){ n.lines=_mmdLines(label); n.shape=shape; } if(cls)n.cls=cls; }
+  return n;
+}
+const MMDARR=/^([\s\S]*?)\s*(-\.->|-\.-|={2,}>|={2,}|-{2,}>|--[xo]|-{2,})\s*(?:\|([^|]*)\|\s*)?/;
+function mermaidSvg(src){ try{ return _mermaidSvg(src); }catch(e){ return null; } }
+function _mermaidSvg(src){
+  const nodes={}, order=[], edges=[], classes={}, assign={};
+  let dir="TD", started=false;
+  for(const rawline of (src||"").replace(/\r/g,"").split("\n")){
+    let l=rawline.replace(/%%.*$/,"").trim();
+    if(!l)continue;
+    if(!started){
+      const h=l.match(/^(?:flowchart|graph)(?:\s+(TD|TB|LR|RL|BT))?\b/i);
+      if(!h)return null;                                   // not a flowchart → caller falls back to code
+      dir=(h[1]||"TD").toUpperCase(); started=true;
+      l=l.slice(h[0].length).trim(); if(!l)continue;
+    }
+    if(/^(subgraph\b|end\b|direction\b|linkStyle\b|style\b|click\b|accTitle\b|accDescr\b)/i.test(l))continue;
+    const cd=l.match(/^classDef\s+(\S+)\s+(.*)$/i);
+    if(cd){ cd[1].split(",").forEach(n=>{classes[n.trim()]=_mmdStyle(cd[2])}); continue; }
+    const ca=l.match(/^class\s+([A-Za-z0-9_.,\s-]+?)\s+(\S+)\s*$/i);
+    if(ca){ ca[1].split(",").forEach(n=>{assign[n.trim()]=ca[2]}); continue; }
+    l=l.replace(/\s-{2,}\s+([^>|]+?)\s+-{2,}>/g," -->|$1|").replace(/\s-\.\s*([^>|]+?)\s*\.->/g," -.->|$1|");
+    const seg=[], lab=[], sty=[]; let rest=l, m, guard=0;
+    while((m=rest.match(MMDARR))&&guard++<32){ seg.push(m[1]); sty.push(m[2]); lab.push(m[3]||""); rest=rest.slice(m[0].length); }
+    if(!seg.length){ _mmdNode(l,nodes,order); continue; }   // a bare node declaration
+    seg.push(rest);
+    for(let k=0;k<seg.length-1;k++){
+      const a=_mmdNode(seg[k],nodes,order), b=_mmdNode(seg[k+1],nodes,order);
+      if(a&&b)edges.push({a:a.id,b:b.id,label:lab[k].trim(),dash:sty[k].includes("."),thick:sty[k].includes("="),head:/[>xo]$/.test(sty[k])});
+    }
+  }
+  const ids=order.filter(id=>nodes[id]);
+  if(!started||!ids.length)return null;
+  Object.keys(assign).forEach(id=>{ if(nodes[id])nodes[id].cls=assign[id]; });
+
+  ids.forEach(id=>{ const n=nodes[id];
+    n.w=Math.max(56,Math.max.apply(null,n.lines.map(t=>t.length))*MMDCW+MMDPX*2);
+    n.h=n.lines.length*MMDLH+MMDPY*2;
+    if(n.shape==="diamond"){ n.w+=26; n.h+=12; }
+    if(n.shape==="circle"){ n.w=n.h=Math.max(n.w,n.h); }
+  });
+  const rank={}; ids.forEach(id=>rank[id]=0);
+  for(let pass=0;pass<=ids.length;pass++){ let ch=false;
+    edges.forEach(e=>{ if(rank[e.b]<rank[e.a]+1&&rank[e.a]+1<=ids.length){ rank[e.b]=rank[e.a]+1; ch=true; } });
+    if(!ch)break;
+  }
+  const rows={}; ids.forEach(id=>{ (rows[rank[id]]=rows[rank[id]]||[]).push(id); });
+  const keys=Object.keys(rows).map(Number).sort((a,b)=>a-b);
+  const vert=(dir==="TD"||dir==="TB"||dir==="BT");
+  // the gap after a rank has to hold that rank's edge labels: stacked (TD) or side by side (LR)
+  const lab={}; edges.forEach(e=>{ if(e.label)(lab[rank[e.a]]=lab[rank[e.a]]||[]).push(e); });
+  const gapOf=k=>{ const n=(lab[k]||[]).length; if(!n)return MMDGY;
+    return vert?Math.max(MMDGY,26+22*n):Math.max(MMDGY,Math.max.apply(null,lab[k].map(e=>e.label.length*6+10))+22); };
+  const gapAt={};
+  let W=0,H=0,at=0;
+  keys.forEach(k=>{
+    const row=rows[k], gap=gapOf(k);
+    if(vert){
+      const rh=Math.max.apply(null,row.map(id=>nodes[id].h));
+      let x=0; row.forEach(id=>{ const n=nodes[id]; n.x=x; n.y=at+(rh-n.h)/2; x+=n.w+MMDGX; });
+      W=Math.max(W,x-MMDGX); gapAt[k]=at+rh; at+=rh+gap;
+    }else{
+      const rw=Math.max.apply(null,row.map(id=>nodes[id].w));
+      let y=0; row.forEach(id=>{ const n=nodes[id]; n.y=y; n.x=at+(rw-n.w)/2; y+=n.h+MMDGX; });
+      H=Math.max(H,y-MMDGX); gapAt[k]=at+rw; at+=rw+gap;
+    }
+    if(k===keys[keys.length-1]){ if(vert)H=at-gap; else W=at-gap; }
+  });
+  keys.forEach(k=>{ const row=rows[k];                       // centre each rank on the long axis
+    if(vert){ const rw=row.reduce((s,id)=>s+nodes[id].w,0)+MMDGX*(row.length-1); row.forEach(id=>nodes[id].x+=(W-rw)/2); }
+    else { const rh=row.reduce((s,id)=>s+nodes[id].h,0)+MMDGX*(row.length-1); row.forEach(id=>nodes[id].y+=(H-rh)/2); }
+  });
+  const P=18, sw=W+P*2, sh=H+P*2, g=[], labels=[];
+  const seen={};
+  edges.forEach(e=>{
+    const a=nodes[e.a], b=nodes[e.b]; if(!a||!b)return;
+    let x1,y1,x2,y2,c1,c2;
+    if(vert){ x1=a.x+a.w/2; y1=a.y+a.h; x2=b.x+b.w/2; y2=b.y; c1=`${x1},${y1+Math.abs(y2-y1)/2}`; c2=`${x2},${y2-Math.abs(y2-y1)/2}`; }
+    else { x1=a.x+a.w; y1=a.y+a.h/2; x2=b.x; y2=b.y+b.h/2; c1=`${x1+Math.abs(x2-x1)/2},${y1}`; c2=`${x2-Math.abs(x2-x1)/2},${y2}`; }
+    g.push(`<path class="mmde${e.dash?" dash":""}${e.thick?" thick":""}" d="M${x1},${y1} C${c1} ${c2} ${x2},${y2}"${e.head?' marker-end="url(#mmdarrow)"':""}/>`);
+    if(!e.label)return;
+    // park the label in its rank's gap — one slot per label, so a fan-out's labels
+    // ladder down the gap instead of piling onto each other or onto the target node
+    const k=rank[e.a], j=(seen[k]=(seen[k]||0)+1)-1;
+    let x,y;
+    if(vert){ y=gapAt[k]+13+22*j; const t=y2===y1?0.5:Math.max(0,Math.min(1,(y-y1)/(y2-y1))); x=x1+(x2-x1)*t; }
+    else { x=gapAt[k]+(gapOf(k)-2)/2; const t=x2===x1?0.5:Math.max(0,Math.min(1,(x-x1)/(x2-x1))); y=y1+(y2-y1)*t; }
+    labels.push({x:x, y:y, w:e.label.length*6+10, text:e.label});
+  });
+  ids.forEach(id=>{ const n=nodes[id], st=classes[n.cls]||{};
+    // inline style, not a fill= attribute: the .mmdn stylesheet rule would win over a
+    // presentation attribute and silently drop every classDef colour
+    const box=(st.fill?"fill:"+esc(st.fill)+";":"")+(st.stroke?"stroke:"+esc(st.stroke)+";":"");
+    const bs=box?` style="${box}"`:"", tf=st.color?` style="fill:${esc(st.color)}"`:"";
+    if(n.shape==="diamond"){
+      const cx=n.x+n.w/2, cy=n.y+n.h/2;
+      g.push(`<polygon class=mmdn points="${cx},${n.y} ${n.x+n.w},${cy} ${cx},${n.y+n.h} ${n.x},${cy}"${bs}/>`);
+    } else {
+      const rx=n.shape==="stadium"||n.shape==="circle"?n.h/2:(n.shape==="round"?12:6);
+      g.push(`<rect class=mmdn x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="${rx}"${bs}/>`);
+    }
+    const top=n.y+n.h/2-(n.lines.length-1)*MMDLH/2+4;
+    n.lines.forEach((t,j)=>g.push(`<text class=mmdt x="${(n.x+n.w/2).toFixed(1)}" y="${(top+j*MMDLH).toFixed(1)}"${tf}>${esc(t)}</text>`));
+  });
+  labels.forEach((l,j)=>{                                     // edge labels last: on top of the nodes, and nudged apart where they collide
+    for(let tries=0;tries<8;tries++){
+      const hit=labels.slice(0,j).some(o=>Math.abs(o.x-l.x)<(o.w+l.w)/2&&Math.abs(o.y-l.y)<20);
+      if(!hit)break;
+      l.y+=vert?20:-20;
+    }
+    g.push(`<rect class=mmdlb x="${(l.x-l.w/2).toFixed(1)}" y="${(l.y-9).toFixed(1)}" width="${l.w}" height="18" rx="4"/>`+
+           `<text class=mmdlt x="${l.x.toFixed(1)}" y="${(l.y+4).toFixed(1)}">${esc(l.text)}</text>`);
+  });
+  return `<svg class=mmdsvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${sw.toFixed(0)} ${sh.toFixed(0)}" width="${sw.toFixed(0)}" height="${sh.toFixed(0)}" role=img aria-label="diagram">`+
+    `<defs><marker id=mmdarrow markerWidth="9" markerHeight="7" refX="8.5" refY="3.5" orient=auto><path d="M0,0 L9,3.5 L0,7 z"/></marker></defs>`+
+    `<g transform="translate(${P},${P})" font-size="${MMDW}">${g.join("")}</g></svg>`;
 }
 function ago(sec){sec=Math.max(0,sec|0);if(sec<60)return sec+"s ago";if(sec<3600)return(sec/60|0)+"m ago";if(sec<86400)return(sec/3600|0)+"h ago";return(sec/86400|0)+"d ago"}
 function base(p){return (p||"").split("/").pop()}

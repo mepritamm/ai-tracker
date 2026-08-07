@@ -174,6 +174,12 @@ class TestBuildPage(unittest.TestCase):
         self.assertIn(".card>h2::before", p)                        # the chevron affordance
         self.assertIn("function toggleCard", p)                     # the shared toggle
         self.assertIn('.card>h2")', p)                              # delegated to every card header, not one panel
+        # Mermaid fences render as diagrams, everywhere mdBlock renders markdown.
+        # Hand-rolled SVG — no mermaid.js, no CDN (zero-dep + `make bundle` inlines web/ verbatim).
+        self.assertIn("function mermaidSvg", p)                     # the renderer is baked into the page
+        self.assertIn("mermaidSvg(src)", p)                         # …and mdBlock's fence branch calls it
+        self.assertIn(".mmd .mmdsvg{", p)                           # its styling came along
+        self.assertIn(".mmdsvg .mmdn{fill:var(--card)", p)          # tokenised → readable in light and dark
 
 
 class TestSearchAllRanking(unittest.TestCase):
