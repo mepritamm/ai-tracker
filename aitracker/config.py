@@ -52,6 +52,21 @@ NARR_PAGE = 60          # narration entries per /api/session page + per /api/nar
 AUGGIE_SESSIONS = os.path.join(AUGMENT_DIR, "sessions")
 
 
+# Augment VSCode / Cursor extension state — one dir per workspace, containing
+# `Augment.vscode-augment/augment-user-assets/{task-storage,agent-edits}/…`.
+# macOS paths; overridable via env for tests / non-mac hosts. Empty = provider disabled.
+VSCODE_WS_ROOT = os.environ.get(
+    "TRACKER_VSCODE_WS_ROOT",
+    os.path.expanduser("~/Library/Application Support/Code/User/workspaceStorage"),
+)
+
+
+CURSOR_WS_ROOT = os.environ.get(
+    "TRACKER_CURSOR_WS_ROOT",
+    os.path.expanduser("~/Library/Application Support/Cursor/User/workspaceStorage"),
+)
+
+
 # HTTP Basic Auth for the whole server. Empty = off (default; localhost dev unaffected).
 # Set TRACKER_AUTH="user:pass" to require a login on every route — the one gate that covers
 # every access path (localhost, LAN, Tailscale, ngrok), so remote viewers must authenticate.

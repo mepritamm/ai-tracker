@@ -30,7 +30,10 @@ cd ai-tracker
 **Nothing else to configure.** The tracker auto-discovers your local session data:
 
 - **Claude Code** → `~/.claude/projects/**/*.jsonl` (Desktop, CLI, and VS Code)
-- **Auggie / Augment** → `~/.augment/sessions/*.json`
+- **Auggie / Augment** — three surfaces:
+  - **Auggie CLI** → `~/.augment/sessions/*.json`
+  - **Augment VS Code** extension → `~/Library/Application Support/Code/User/workspaceStorage/**/Augment.vscode-augment/`
+  - **Augment Cursor** extension → `~/Library/Application Support/Cursor/User/workspaceStorage/**/Augment.vscode-augment/`
 
 A tool only appears if its data exists on the machine — install nothing, it just lights up what you already have.
 
@@ -74,7 +77,7 @@ Locally it's just `make serve` (localhost, no tunnel, no login). To reach it fro
 
 ## What it shows
 
-**Sidebar** — every session across all your tools and projects, newest first, each with a source badge (Claude Desktop / Claude CLI / Claude SDK / Claude VS Code / Auggie), a live dot, and a short title.
+**Sidebar** — every session across all your tools and projects, newest first, each with a source badge (Claude Desktop / Claude CLI / Claude SDK / Claude VS Code / Auggie / Augment VS Code / Augment Cursor), a live dot, and a short title.
 - **Background-agent sessions** (SDK-spawned, e.g. into a git worktree) are marked **🤖 Agent** and folded into a collapsible **🤖 Agents · &lt;repo&gt;** group per repo — so they don't bury your own sessions in the flat list. Click the group to expand its agents.
 - A session running **in-transcript background agents** (Task/Workflow subagents — which spawn no separate session) carries a **🤖 N running** badge, so you can see it's busy without opening it.
 - **End-state at a glance** — a session **waiting on your answer** (an unanswered `AskUserQuestion` / Auggie `ask-user`) is flagged **⏳ answer** with an amber highlight so you know to go respond; one that **just completed its last run** (the last turn was the assistant finishing, within the live window) shows a subtle **✅ done** — gated to fresh completions so it flags what just landed rather than every stale session. Both work for every tool.
@@ -111,20 +114,20 @@ Every supported tool writes an append-only session log to disk. The tracker only
 
 Each tool plugs in as a **provider** (a small adapter). The registry — `PROVIDERS` in `aitracker/registry.py` — merges every available provider's sessions into one list and routes each session id (namespaced by prefix, e.g. `auggie:`) to the adapter that owns it. One broken provider can't sink the list.
 
-Both providers emit the **same result shape**, so the browser renders them identically. Where a tool records the data, the tracker surfaces it:
+All providers emit the **same result shape**, so the browser renders them identically. Where a tool records the data, the tracker surfaces it:
 
-| Data | Claude Code | Auggie / Augment |
-|------|-------------|------------------|
-| Summary, todos, prompts, narration, files, tokens | ✅ | ✅ |
-| Commands, reads, commits, tests | ✅ | ✅ (from `launch-process` / `view` tools) |
-| Working folder + git branch (worktree-aware) | ✅ (from the log) | ✅ (folder from IDE state; branch from `.git/HEAD`) |
-| Command exit status (✓/✗) | ✅ | ➖ Auggie stores none — commands show as ✓ |
-| Pull requests — created **or** worked on | ✅ (created via `gh pr create` / MCP; worked-on = narrated about **and** in the session's own repo) | ✅ (Auggie logs no command output, so a created PR is tied to the first URL after `gh pr create`; worked-on = narrated about **and** in its own repo) |
-| Decisions & open questions | ✅ (`AskUserQuestion`) | ✅ (`ask-user` — answer from the next turn's tool result) |
-| Background agents & shells | ✅ | ➖ Auggie has no such model |
-| Markdown rendering, incl. ` ```mermaid ` fences drawn as diagrams | ✅ | ✅ (shared renderer — one seam, both sources) |
-| 📝 Notes — write, ⧉ copy, 📝 N badge | ✅ | ✅ |
-| ▶ push a note into the session | ✅ live → next turn-end; idle → next prompt/resume (`Stop` + `UserPromptSubmit` + `SessionStart` hooks) | ➖ queues fine, but Auggie has no hooks to deliver it — use ⧉ copy |
+| Data | Claude Code | Auggie CLI | Augment VS Code / Cursor extension |
+|------|-------------|------------|------------------------------------|
+| Summary, todos, prompts, narration, files, tokens | ✅ | ✅ | ➖ **todos + files touched only** — the chat transcript lives in a per-workspace LevelDB (`augment-kv-store`) the tracker can't read stdlib-only. The narration panel says so honestly, then shows what IS on disk. |
+| Commands, reads, commits, tests | ✅ | ✅ (from `launch-process` / `view` tools) | ➖ (in LevelDB, same reason) |
+| Working folder + git branch (worktree-aware) | ✅ (from the log) | ✅ (folder from IDE state; branch from `.git/HEAD`) | ✅ folder (from `workspace.json`); ➖ branch |
+| Command exit status (✓/✗) | ✅ | ➖ Auggie stores none — commands show as ✓ | ➖ n/a |
+| Pull requests — created **or** worked on | ✅ (created via `gh pr create` / MCP; worked-on = narrated about **and** in the session's own repo) | ✅ (Auggie logs no command output, so a created PR is tied to the first URL after `gh pr create`; worked-on = narrated about **and** in its own repo) | ➖ n/a |
+| Decisions & open questions | ✅ (`AskUserQuestion`) | ✅ (`ask-user` — answer from the next turn's tool result) | ➖ n/a |
+| Background agents & shells | ✅ | ➖ Auggie has no such model | ➖ n/a |
+| Markdown rendering, incl. ` ```mermaid ` fences drawn as diagrams | ✅ | ✅ (shared renderer — one seam, both sources) | ✅ (same shared renderer) |
+| 📝 Notes — write, ⧉ copy, 📝 N badge | ✅ | ✅ | ✅ |
+| ▶ push a note into the session | ✅ live → next turn-end; idle → next prompt/resume (`Stop` + `UserPromptSubmit` + `SessionStart` hooks) | ➖ queues fine, but Auggie has no hooks to deliver it — use ⧉ copy | ➖ same — no hook, use ⧉ copy |
 
 **Data files** — `flags.json` (your flags), `titles.json` (your renames), `pins.json` (pinned sessions), and `notes.json` (your notes) are read **live** (no restart). Everything else is baked into the page at startup, so **editing `aitracker/` or `web/` needs a server restart** to show.
 
@@ -135,11 +138,13 @@ Both providers emit the **same result shape**, so the browser renders them ident
 | Tool | Source on disk | Status |
 |------|----------------|--------|
 | **Claude Code** (Desktop / CLI / VS Code) | `~/.claude/projects/**/*.jsonl` | ✅ built in |
-| **Auggie / Augment** | `~/.augment/sessions/*.json` | ✅ built in |
-| Cursor, OpenAI Codex | SQLite databases | ⚙️ needs an adapter (format-specific reader) |
+| **Auggie CLI** | `~/.augment/sessions/*.json` | ✅ built in |
+| **Augment VS Code extension** | `~/Library/Application Support/Code/User/workspaceStorage/**/Augment.vscode-augment/` (JSON) + LevelDB (skipped) | ✅ built in (todos + files touched; chat transcript degraded — see the parity table above) |
+| **Augment Cursor extension** | `~/Library/Application Support/Cursor/User/workspaceStorage/**/Augment.vscode-augment/` (JSON) + LevelDB (skipped) | ✅ built in (same as VS Code) |
+| Cursor's own AI, OpenAI Codex | SQLite databases | ⚙️ needs an adapter (format-specific reader) |
 | GitHub Copilot CLI | binary LMDB blobs | ⚙️ needs an adapter |
 
-Only tools that keep a **readable local transcript** can be adapted. Claude and Auggie write plain JSON/JSONL; others use SQLite or binary stores that each need their own reader.
+Only tools that keep a **readable local transcript** can be adapted. Claude, Auggie CLI, and the JSON portion of the Augment extensions write plain JSON/JSONL; others use SQLite or binary stores that each need their own reader (the extensions' chat transcript is one such binary store — LevelDB — which is why those two rows sit at partial parity rather than full).
 
 ## Adding a tool
 
@@ -184,7 +189,8 @@ The repo ships Claude Code skills under [`.claude/skills/`](.claude/skills/). In
 ## Good to know
 
 - **Restart to see UI/parse changes.** The page and parsers are loaded at startup; only `flags.json` / `titles.json` are read live. After editing `aitracker/` or `web/`, run `make serve` (or restart the process).
-- **Auggie / Augment now reads the full local transcript** (`~/.augment/sessions/`) — summary, tokens, narration, files, commands, reads, working folder, and git branch — at near-Claude parity. The only gaps are background agents/shells (Auggie has no such model), command exit status (Auggie doesn't record it, so its commands render as ✓), and **▶ push** delivery (Auggie has no hooks — the note still queues, you deliver it with ⧉ copy).
+- **Auggie CLI** reads the full local transcript (`~/.augment/sessions/`) — summary, tokens, narration, files, commands, reads, working folder, and git branch — at near-Claude parity. The only gaps are background agents/shells (Auggie has no such model), command exit status (Auggie doesn't record it, so its commands render as ✓), and **▶ push** delivery (Auggie has no hooks — the note still queues, you deliver it with ⧉ copy).
+- **Augment VS Code / Cursor extensions** are read from per-workspace IDE storage (`workspaceStorage/**/Augment.vscode-augment/`) — **todos + files-touched only**, honestly degraded. The chat transcript lives in an `augment-kv-store` LevelDB that stdlib can't decode, so the narration panel says exactly that instead of pretending it's empty. Everything the SPA does render (todos, files, source badge, live filter, search, 📝 notes, 🚩 flags, rename, pin) works for these sessions the same way it does for the other two.
 - **"Live" is a 5-minute window** since the last activity. Background-agent completion is inferred from that window, so an agent-finished notification can lag a few minutes; background shells with real process state notify promptly.
 - **Everything stays on your machine.** Read-only against the tool logs, no outbound network, no telemetry.
 

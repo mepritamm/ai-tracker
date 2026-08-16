@@ -1,9 +1,11 @@
 from .providers.claude import ClaudeProvider
 from .providers.auggie import AuggieProvider
+from .providers.augment_ext import AugmentVscodeProvider, AugmentCursorProvider
 from .store import load_pins, load_notes, load_flags
 
 
-PROVIDERS = [ClaudeProvider(), AuggieProvider()]
+PROVIDERS = [ClaudeProvider(), AuggieProvider(),
+             AugmentVscodeProvider(), AugmentCursorProvider()]
 
 
 def all_sessions():

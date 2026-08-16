@@ -49,6 +49,10 @@ def _empty_env():
     config.AUGMENT_DIR = tempfile.mkdtemp()
     config.AUGGIE_SESSIONS = os.path.join(config.AUGMENT_DIR, "sessions")
     os.makedirs(config.AUGGIE_SESSIONS)
+    # Augment VSCode / Cursor extension roots — same pattern: repoint to empty temp
+    # dirs so the providers see nothing on this machine when tests build their fixtures.
+    config.VSCODE_WS_ROOT = tempfile.mkdtemp()
+    config.CURSOR_WS_ROOT = tempfile.mkdtemp()
     config.NOTES_FILE = tempfile.mktemp(suffix=".json")
     _auggie._AUGGIE_LIST_CACHE.clear()
     _claude._META_CACHE.clear()
