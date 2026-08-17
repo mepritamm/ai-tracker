@@ -264,6 +264,12 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid var(--line)}
 /* override the global "marker path{fill:muted}" for open/x/async heads that need
    stroke, not fill, or they'd render as filled blobs */
 .mmdsvg marker#mmsarrowo path,.mmdsvg marker#mmsarrowx path,.mmdsvg marker#mmsarrowc path{fill:none;stroke:var(--muted)}
+/* Fallback tag for a ` ```mermaid ` fence whose diagram type has no dedicated renderer —
+   the source stays visible in a code block, but the tag makes the intent obvious (the reader
+   sees an intended mermaid <type>, not a mislabelled code fence). */
+.msgbody .cblock.mmdfall{position:relative}
+.msgbody .cblock .mmdftag{position:absolute;top:6px;left:10px;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.4px;color:var(--amber);background:var(--amber-bg,rgba(245,158,11,.12));border:1px solid var(--amber,#f59e0b);border-radius:5px;padding:4px 8px;z-index:2}
+.msgbody .cblock.mmdfall .mdpre{padding-top:32px}
 .msgbody .mdpre{background:var(--side);border:1px solid var(--line);border-radius:8px;padding:11px 13px;overflow:auto;margin:0 0 11px;white-space:pre}
 .msgbody .mdpre code{background:none;border:0;padding:0;margin:0;color:var(--head)}
 .msgbody .mdt{border-collapse:collapse;margin:4px 0 14px;font-size:13px;display:block;overflow-x:auto}

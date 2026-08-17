@@ -109,9 +109,18 @@ class TestMermaidRender(unittest.TestCase):
         self.assertGreater(lw, lh)          # LR flows: wider than tall
 
     def test_unsupported_diagram_types_return_null(self):
-        # sequenceDiagram used to sit here — it now has its own renderer (TestSequenceDiagram).
-        for src in ("pie title X\n  \"a\": 5", "gantt\n  title x",
-                    "erDiagram\n  A ||--o{ B : has", "", "just some prose"):
+        # sequenceDiagram/pie/erDiagram/stateDiagram/classDiagram/journey/quadrantChart used
+        # to sit here — they now each have their own renderer (see the classes below).
+        # Only the diagram types with no renderer at all still return null, so mdBlock can
+        # tag them with 🧜 and show the source (see TestMdBlockFences.test_unsupported_*).
+        for src in ("gantt\n  title x\n  section A\n    a : a1, 2014-01-01, 30d",
+                    "mindmap\n  root((r))\n    child",
+                    "timeline\n  title x\n  2020 : a",
+                    "gitGraph\n  commit\n  branch feat\n  commit",
+                    "xychart-beta\n  title X\n  x-axis [a,b]",
+                    "requirementDiagram\n  requirement X {\n  }",
+                    "sankey-beta\n  A,B,10",
+                    "", "just some prose"):
             self.assertIsNone(_js(src), src[:20])
 
     def test_malformed_input_never_throws(self):
@@ -144,12 +153,28 @@ class TestMdBlockFences(unittest.TestCase):
         self.assertIn("codecopy", h)
         self.assertNotIn("class=mmd>", h)
 
-    def test_unsupported_mermaid_falls_back_to_the_source(self):
-        # `gantt` isn't supported; the fence stays a readable code block instead of vanishing.
-        h = _js("```mermaid\ngantt\n  title x\n```", fn="mdBlock")
+    def test_unsupported_mermaid_falls_back_to_the_source_with_a_tag(self):
+        # `gantt` still has no renderer; the fence stays a readable code block but is
+        # tagged so the reader sees the intent (a diagram, not a mislabelled code fence).
+        h = _js("```mermaid\ngantt\n  title x\n  section A\n    a : a1, 2014-01-01, 30d\n```", fn="mdBlock")
         self.assertNotIn("<svg", h)
         self.assertIn("class=mdpre", h)                 # you still get to read the diagram source
         self.assertIn("gantt", h)
+        # …and the diagram-type tag is present, so the intent is visible without rendering
+        self.assertIn("mmdfall", h)
+        self.assertIn("mmdftag", h)
+        self.assertIn("mermaid: gantt", h)              # the type label is what the reader sees
+
+    def test_fallback_tag_extracts_the_diagram_type_even_with_comments(self):
+        # Leading %%-comments and blank lines must not throw off the type-name sniff.
+        h = _js("```mermaid\n%% a comment\n%% another\n\ngitGraph\n  commit\n```", fn="mdBlock")
+        self.assertIn("mermaid: gitGraph", h)
+
+    def test_plain_code_fence_gets_no_mermaid_tag(self):
+        # Non-mermaid fences must not be re-labelled with the diagram tag by accident.
+        h = _js("```python\nprint('hi')\n```", fn="mdBlock")
+        self.assertNotIn("mmdfall", h)
+        self.assertNotIn("mmdftag", h)
 
     def test_sequence_fence_renders_a_diagram(self):
         h = _js("intro\n\n```mermaid\nsequenceDiagram\n  A->>B: hi\n```\n\nafter", fn="mdBlock")
@@ -271,6 +296,327 @@ class TestSequenceDiagram(unittest.TestCase):
                     "sequenceDiagram\n alt\n end\n end",  "sequenceDiagram\n end\n end",
                     "sequenceDiagram\n loop", "sequenceDiagram\n participant"):
             _js(src)                     # a throw surfaces as a non-zero exit / load: error
+
+
+# ---- The six additional renderers (state / class / er / journey / pie / quadrant).
+# Every diagram type that agent-generated markdown routinely reaches for now renders in
+# place instead of falling through to raw code. State/class/er/journey are translated
+# to flowchart syntax under the hood — the tests below assert the OBSERVABLE payload
+# (nodes, edge labels, escaping, malformed-input safety), not the translation trick.
+STATE = """stateDiagram-v2
+    [*] --> NoFocus
+    NoFocus --> HH: HOUSEHOLD turn resolves a household
+    HH --> HHACC: account-level turn resolves an account
+    HHACC --> HH: zoom up to a household-level turn
+    HH --> NoFocus: PRACTICE turn, acted=practice clears the tree
+    HH --> NoFocus: explicit verbal reset
+    HH --> HH: CLARIFY / OOS / HELP / EDUCATE / DECLINE
+    HHACC --> HHACC: CLARIFY / OOS / HELP / EDUCATE / DECLINE
+"""
+
+
+@unittest.skipUnless(NODE, "node not installed — JS evals skipped")
+class TestStateDiagram(unittest.TestCase):
+    def test_state_diagram_v2_from_the_screenshot_renders_as_svg(self):
+        # The concrete case the user flagged: a stateDiagram-v2 block that used to fall
+        # through to raw code now becomes a diagram, every state and transition present.
+        s = _js(STATE)
+        self.assertIsNotNone(s)
+        self.assertTrue(s.startswith("<svg"), s[:60])
+        for state in ("NoFocus", "HH", "HHACC"):
+            self.assertIn(">%s<" % state, s)
+        for label in ("HOUSEHOLD turn resolves a household",
+                      "account-level turn resolves an account",
+                      "zoom up to a household-level turn",
+                      "explicit verbal reset",
+                      "CLARIFY / OOS / HELP / EDUCATE / DECLINE"):
+            self.assertIn(label, s)
+
+    def test_start_pseudostate_becomes_a_filled_dot(self):
+        # `[*]` renders as a distinct circle with the classDef fill, so the reader can
+        # tell a start/end pseudostate apart from a regular state.
+        s = _js("stateDiagram-v2\n [*] --> A\n A --> [*]")
+        self.assertIsNotNone(s)
+        self.assertIn(">A<", s)
+        self.assertIn("fill:#5b6474", s)                     # the pseudostate class fill
+        # both pseudostates rendered (one before A, one after)
+        self.assertGreaterEqual(s.count("fill:#5b6474"), 2)
+
+    def test_plain_stateDiagram_keyword_also_matches(self):
+        s = _js("stateDiagram\n A --> B: go")
+        self.assertIsNotNone(s)
+        self.assertIn(">go<", s)
+
+    def test_aliased_state_uses_the_long_label(self):
+        s = _js('stateDiagram-v2\n state "Zoomed Up" as ZU\n [*] --> ZU')
+        self.assertIsNotNone(s)
+        self.assertIn(">Zoomed Up<", s)
+        self.assertNotIn(">ZU<", s)                          # id is internal only
+
+    def test_composite_state_is_flattened_not_a_crash(self):
+        # Nested state blocks don't render as a border, but the inner transitions still
+        # appear — beats returning null and falling back to raw code.
+        s = _js("stateDiagram-v2\n state Composite {\n  X --> Y\n }\n Composite --> Done")
+        self.assertIsNotNone(s)
+        self.assertIn(">X<", s); self.assertIn(">Y<", s); self.assertIn(">Done<", s)
+
+    def test_transition_label_is_escaped(self):
+        s = _js('stateDiagram-v2\n A --> B: <script>alert(1)</script> & co')
+        self.assertIsNotNone(s)
+        self.assertNotIn("<script>", s)
+        self.assertIn("&amp; co", s)
+
+    def test_direction_lr_lays_out_horizontally(self):
+        td = _js("stateDiagram-v2\n [*] --> A\n A --> B\n B --> [*]")
+        lr = _js("stateDiagram-v2 LR\n [*] --> A\n A --> B\n B --> [*]")
+        self.assertIsNotNone(td); self.assertIsNotNone(lr)
+        vb = lambda s: [float(x) for x in s.split('viewBox="0 0 ', 1)[1].split('"', 1)[0].split()]
+        tw, th = vb(td); lw, lh = vb(lr)
+        self.assertGreater(th, tw)
+        self.assertGreater(lw, lh)
+
+    def test_malformed_input_never_throws(self):
+        for src in ("stateDiagram-v2", "stateDiagram-v2\n foo bar baz",
+                    "stateDiagram-v2\n --> A",  "stateDiagram-v2\n [*] -->",
+                    "stateDiagram-v2\n state {\n }", "stateDiagram-v2\n }"):
+            _js(src)                          # a throw surfaces as a non-zero exit / load: error
+
+
+CLASSD = """classDiagram
+    Animal <|-- Duck
+    Animal <|-- Fish
+    Animal : +int age
+    Animal : +String gender
+    Animal : +isMammal()
+    Duck : +String beakColor
+    Duck : +swim()
+    Fish : -int sizeInFeet
+"""
+
+
+@unittest.skipUnless(NODE, "node not installed — JS evals skipped")
+class TestClassDiagram(unittest.TestCase):
+    def test_every_class_and_member_reaches_the_svg(self):
+        s = _js(CLASSD)
+        self.assertIsNotNone(s); self.assertTrue(s.startswith("<svg"), s[:60])
+        for cls in ("Animal", "Duck", "Fish"):
+            self.assertIn(">%s<" % cls, s)
+        for m in ("+int age", "+String gender", "+isMammal()", "+String beakColor", "+swim()", "-int sizeInFeet"):
+            self.assertIn(m, s)
+
+    def test_inheritance_arrow_points_from_subclass_to_base(self):
+        # `Animal <|-- Duck` means Duck extends Animal — arrow should end at Animal.
+        # We can't easily assert direction from SVG alone, but we can assert BOTH
+        # sides of the relationship exist as separate nodes with an edge between them.
+        s = _js("classDiagram\n Animal <|-- Duck")
+        self.assertIsNotNone(s)
+        self.assertIn(">Animal<", s); self.assertIn(">Duck<", s)
+        self.assertIn('marker-end="url(#mmdarrow)"', s)      # a directed edge was drawn
+
+    def test_class_block_body_lists_members(self):
+        s = _js("classDiagram\n class Foo {\n  +int x\n  -bool y\n  +method()\n }")
+        self.assertIsNotNone(s)
+        self.assertIn(">Foo<", s); self.assertIn("+int x", s)
+        self.assertIn("-bool y", s); self.assertIn("+method()", s)
+
+    def test_cardinality_labels_ride_the_edge(self):
+        # Cardinality bookends + verb collapse into ONE edge label so the reader sees the
+        # relationship in one glance ("1 has *") instead of three separate scraps of text.
+        s = _js('classDiagram\n Order "1" --> "*" LineItem : has')
+        self.assertIsNotNone(s)
+        self.assertIn(">Order<", s); self.assertIn(">LineItem<", s)
+        self.assertIn("has", s); self.assertIn("1", s); self.assertIn("*", s)
+
+    def test_member_text_is_escaped(self):
+        s = _js("classDiagram\n Foo : +<script>alert(1)</script>")
+        self.assertIsNotNone(s)
+        self.assertNotIn("<script>", s)
+
+    def test_malformed_input_never_throws(self):
+        for src in ("classDiagram", "classDiagram\n foo bar",
+                    "classDiagram\n <|--", "classDiagram\n class Bare {",
+                    "classDiagram\n }"):
+            _js(src)
+
+
+ER = """erDiagram
+    CUSTOMER ||--o{ ORDER : places
+    ORDER ||--|{ LINE-ITEM : contains
+    CUSTOMER {
+        string name
+        string email
+    }
+"""
+
+
+@unittest.skipUnless(NODE, "node not installed — JS evals skipped")
+class TestErDiagram(unittest.TestCase):
+    def test_entities_relationships_and_attributes_render(self):
+        s = _js(ER)
+        self.assertIsNotNone(s); self.assertTrue(s.startswith("<svg"), s[:60])
+        for ent in ("CUSTOMER", "ORDER", "LINE-ITEM"):
+            self.assertIn(">%s<" % ent, s)
+        for verb in ("places", "contains"):
+            self.assertIn(verb, s)
+        for attr in ("string name", "string email"):
+            self.assertIn(attr, s)
+
+    def test_cardinality_is_translated_to_readable_prose(self):
+        # ||--o{ means "one to zero-or-more" — the reader shouldn't have to know ER shorthand
+        s = _js("erDiagram\n A ||--o{ B : has")
+        self.assertIsNotNone(s)
+        self.assertIn("one", s)
+        self.assertIn("zero-or-more", s)
+
+    def test_relationship_without_a_verb_still_renders(self):
+        s = _js("erDiagram\n A ||--|| B")
+        self.assertIsNotNone(s)
+        self.assertIn(">A<", s); self.assertIn(">B<", s)
+
+    def test_malformed_input_never_throws(self):
+        for src in ("erDiagram", "erDiagram\n foo bar",
+                    "erDiagram\n A B", "erDiagram\n A {\n bad", "erDiagram\n }"):
+            _js(src)
+
+
+JOURNEY = """journey
+    title My working day
+    section Go to work
+      Make tea: 5: Me
+      Go upstairs: 3: Me
+      Do work: 1: Me, Cat
+    section Go home
+      Go downstairs: 5: Me
+      Sit down: 5: Me
+"""
+
+
+@unittest.skipUnless(NODE, "node not installed — JS evals skipped")
+class TestJourneyDiagram(unittest.TestCase):
+    def test_sections_and_tasks_render(self):
+        s = _js(JOURNEY)
+        self.assertIsNotNone(s); self.assertTrue(s.startswith("<svg"), s[:60])
+        for sec in ("Go to work", "Go home"):
+            self.assertIn(">%s<" % sec, s)
+        for task in ("Make tea", "Go upstairs", "Do work", "Go downstairs", "Sit down"):
+            self.assertIn(task, s)
+
+    def test_happiness_score_becomes_a_face_and_number(self):
+        s = _js(JOURNEY)
+        # score 5 → 😊, score 3 → 😐, score 1 → 😞 — all three appear at least once
+        self.assertIn("😊", s); self.assertIn("😐", s); self.assertIn("😞", s)
+
+    def test_userJourney_alias_also_matches(self):
+        s = _js("userJourney\n section S\n  Task: 4: Me")
+        self.assertIsNotNone(s)
+        self.assertIn(">S<", s); self.assertIn("Task", s)
+
+    def test_actors_are_preserved(self):
+        s = _js(JOURNEY)
+        self.assertIn("Me, Cat", s)                          # multi-actor task
+
+    def test_malformed_input_never_throws(self):
+        for src in ("journey", "journey\n title x", "journey\n section",
+                    "journey\n section S\n bad : notanumber : Me"):
+            _js(src)
+
+
+PIE = """pie title Sales by Region
+    "North" : 45
+    "South" : 30
+    "East" : 15
+    "West" : 10
+"""
+
+
+@unittest.skipUnless(NODE, "node not installed — JS evals skipped")
+class TestPieChart(unittest.TestCase):
+    def test_renders_svg_with_a_slice_per_entry(self):
+        s = _js(PIE)
+        self.assertIsNotNone(s); self.assertTrue(s.startswith("<svg"), s[:60])
+        self.assertIn('aria-label="pie chart"', s)
+        self.assertEqual(4, s.count("<path"))                # four slices → four arc paths
+        for lbl in ("North", "South", "East", "West"):
+            self.assertIn(lbl, s)
+        # percentages appear in the legend
+        for pct in ("45.0%", "30.0%", "15.0%", "10.0%"):
+            self.assertIn(pct, s)
+
+    def test_title_is_rendered_above_the_pie(self):
+        s = _js(PIE)
+        self.assertIn(">Sales by Region<", s)
+
+    def test_single_slice_pie_renders_a_full_circle(self):
+        # A single 100% slice can't be drawn as an arc (start=end sweep) — fall back to a full circle
+        s = _js('pie\n "Only" : 42')
+        self.assertIsNotNone(s)
+        self.assertIn("<circle", s)
+        self.assertIn("100.0%", s)
+
+    def test_showData_keyword_is_accepted(self):
+        s = _js('pie showData\n "A" : 1\n "B" : 2')
+        self.assertIsNotNone(s)
+        self.assertEqual(2, s.count("<path"))
+
+    def test_label_text_is_escaped(self):
+        s = _js('pie\n "<script>bad</script>" : 5')
+        self.assertIsNotNone(s)
+        self.assertNotIn("<script>", s)
+
+    def test_malformed_input_never_throws(self):
+        for src in ("pie", "pie title x", 'pie\n "a" : notanumber',
+                    'pie\n "a" : 0\n "b" : 0'):        # zero total → null, not throw
+            _js(src)
+
+
+QUAD = """quadrantChart
+    title Reach and engagement of campaigns
+    x-axis Low Reach --> High Reach
+    y-axis Low Engagement --> High Engagement
+    quadrant-1 We should expand
+    quadrant-2 Need to promote
+    quadrant-3 Re-evaluate
+    quadrant-4 May be improved
+    Campaign A: [0.3, 0.6]
+    Campaign B: [0.45, 0.23]
+    Campaign C: [0.57, 0.69]
+    Campaign D: [0.78, 0.34]
+"""
+
+
+@unittest.skipUnless(NODE, "node not installed — JS evals skipped")
+class TestQuadrantChart(unittest.TestCase):
+    def test_axes_quadrants_and_points_render(self):
+        s = _js(QUAD)
+        self.assertIsNotNone(s); self.assertTrue(s.startswith("<svg"), s[:60])
+        self.assertIn(">Reach and engagement of campaigns<", s)
+        # The axis directional arrow `-->` is HTML-escaped once it lands in the SVG text node.
+        for ax in ("Low Reach --&gt; High Reach", "Low Engagement --&gt; High Engagement"):
+            self.assertIn(ax, s)
+        for q in ("We should expand", "Need to promote", "Re-evaluate", "May be improved"):
+            self.assertIn(q, s)
+        for pt in ("Campaign A", "Campaign B", "Campaign C", "Campaign D"):
+            self.assertIn(pt, s)
+        # one dot per plotted point
+        self.assertEqual(4, s.count("<circle"))
+
+    def test_out_of_range_points_are_clamped_not_crashed(self):
+        # a rogue [1.4, -0.2] still renders — just clipped to the axes
+        s = _js("quadrantChart\n Bad: [1.4, -0.2]")
+        self.assertIsNotNone(s)
+        self.assertIn(">Bad<", s)
+
+    def test_point_label_is_escaped(self):
+        s = _js("quadrantChart\n <script>x</script>: [0.5, 0.5]")
+        self.assertIsNotNone(s)
+        self.assertNotIn("<script>", s)
+
+    def test_malformed_input_never_throws(self):
+        for src in ("quadrantChart", "quadrantChart\n foo bar",
+                    "quadrantChart\n A: [x, y]", "quadrantChart\n A: [0.5]"):
+            _js(src)
+
+
 
 
 if __name__ == "__main__":

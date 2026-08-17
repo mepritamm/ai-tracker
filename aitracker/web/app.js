@@ -25,8 +25,12 @@ function mdBlock(s){
     const fm=l.match(/^\s*```\s*([A-Za-z0-9_+-]*)/);
     if(fm){ i++; const b=[]; while(i<L.length&&!/^\s*```/.test(L[i])){b.push(L[i]);i++;} i++;
       const src=b.join("\n");
-      if(/^mermaid$/i.test(fm[1])){ const g=mermaidSvg(src);   // unsupported diagram → falls through to the code block
-        if(g){ out.push(`<div class=mmd>${g}</div>`); continue; } }
+      if(/^mermaid$/i.test(fm[1])){ const g=mermaidSvg(src);
+        if(g){ out.push(`<div class=mmd>${g}</div>`); continue; }
+        // unsupported diagram type — still readable, but LABEL it so the reader can see
+        // it was an intended diagram (not a plain code fence) whose renderer isn't baked in yet
+        const t=(src.match(/^\s*(?:%%.*\n)*\s*([A-Za-z][A-Za-z0-9_-]*)/)||[,""])[1]||"unknown";
+        out.push(`<div class="cblock mmdfall"><div class=mmdftag>🧜 mermaid: ${esc(t)}</div><button class=codecopy onclick="copyCode(this)" title="Copy this block">⧉ Copy</button><pre class=mdpre><code>${esc(src)}</code></pre></div>`); continue; }
       out.push(`<div class=cblock><button class=codecopy onclick="copyCode(this)" title="Copy this block">⧉ Copy</button><pre class=mdpre><code>${esc(src)}</code></pre></div>`); continue; }
     const hm=l.match(/^(#{1,6})\s+(.*)$/);
     if(hm){ const lv=Math.min(hm[1].length,4)+1; out.push(`<h${lv} class=mdh>${md(hm[2])}</h${lv}>`); i++; continue; }
@@ -50,11 +54,22 @@ function mdBlock(s){
 }
 // ---- Mermaid → inline SVG, hand-rolled. No mermaid.js, no CDN: the whole app is
 // one zero-dependency file and `make bundle` inlines web/ verbatim, so a 3 MB vendored
-// library is off the table. Covers the two diagram types that show up in narration:
-// `flowchart|graph` (node shapes, edge labels, classDef colours — _mermaidSvgFlow)
-// and `sequenceDiagram` (participants, messages, notes, alt/opt/loop/par blocks —
-// _mermaidSeqSvg). mermaidSvg() dispatches by the first non-blank keyword; every
-// other diagram type returns null and mdBlock renders the fence as code, unchanged.
+// library is off the table. Covers the diagram families that actually show up in
+// agent-generated markdown, so a `stateDiagram-v2` or `classDiagram` no longer lands
+// as raw code beside a rendered `flowchart`:
+//   • flowchart|graph           (node shapes, edge labels, classDef colours — _mermaidSvgFlow)
+//   • sequenceDiagram           (participants, messages, notes, alt/opt/loop/par — _mermaidSeqSvg)
+//   • stateDiagram(-v2)         (states, [*] pseudostates, labelled transitions   — _mermaidStateSvg)
+//   • classDiagram              (classes with members, typed relationships        — _mermaidClassSvg)
+//   • erDiagram                 (entities with attributes, cardinality on edges   — _mermaidErSvg)
+//   • journey                   (sections with tasks + happiness scores           — _mermaidJourneySvg)
+//   • pie                       (labelled slices with legend + percentages        — _mermaidPieSvg)
+//   • quadrantChart             (2×2 axes with plotted points                     — _mermaidQuadrantSvg)
+// mermaidSvg() dispatches by the first non-blank keyword; state/class/er/journey are
+// translated to flowchart syntax and reuse _mermaidSvgFlow so their labelled edges and
+// layered layout come for free. Anything else (gantt, mindmap, timeline, gitGraph, …)
+// returns null and mdBlock renders the fence as code with a "🧜 mermaid: <type>" tag —
+// still readable, but visibly an intended diagram whose renderer isn't baked in yet.
 // ponytail: layered layout, straight bezier edges — no crossing minimisation.
 const MMDSH={"[[":"rect","((":"circle","([":"stadium","[":"rect","(":"round","{":"diamond",">":"rect"};
 const MMDW=13, MMDCW=6.9, MMDLH=17, MMDPX=14, MMDPY=9, MMDGX=26, MMDGY=56, MMDMAX=44;
@@ -92,9 +107,16 @@ function _mmdNode(tok,nodes,order){
 }
 const MMDARR=/^([\s\S]*?)\s*(-\.->|-\.-|={2,}>|={2,}|-{2,}>|--[xo]|-{2,})\s*(?:\|([^|]*)\|\s*)?/;
 // Dispatch by diagram type — the shared seam every markdown surface calls through mdBlock.
+// The order matters only where prefixes could overlap; keyword tests are anchored so they don't.
 function mermaidSvg(src){ try{
   const s=(src||"").replace(/^\s*(?:%%.*\n)*/,"").trimStart();
-  if(/^sequenceDiagram\b/i.test(s)) return _mermaidSeqSvg(src);
+  if(/^sequenceDiagram\b/i.test(s))          return _mermaidSeqSvg(src);
+  if(/^stateDiagram(?:-v2)?\b/i.test(s))     return _mermaidStateSvg(src);
+  if(/^classDiagram(?:-v2)?\b/i.test(s))     return _mermaidClassSvg(src);
+  if(/^erDiagram\b/i.test(s))                return _mermaidErSvg(src);
+  if(/^(?:journey|userJourney)\b/i.test(s))  return _mermaidJourneySvg(src);
+  if(/^pie\b/i.test(s))                      return _mermaidPieSvg(src);
+  if(/^quadrantChart\b/i.test(s))            return _mermaidQuadrantSvg(src);
   return _mermaidSvgFlow(src);
 }catch(e){ return null; } }
 function _mermaidSvgFlow(src){
@@ -356,6 +378,310 @@ function _mermaidSeqSvg(src){
     defs+`<g transform="translate(${MMSMARGIN},0)" font-size="${MMSFS}">`+
     blkOut.join("")+staticOut.join("")+noteOut.join("")+msgOut.join("")+`</g></svg>`;
 }
+
+// ---- stateDiagram / stateDiagram-v2 → translate to flowchart syntax, then hand off to
+// _mermaidSvgFlow. States are nodes, transitions are directed edges — semantically identical
+// to a flowchart — so we get labelled edges, layered layout and (via classDef) themed
+// start/end pseudostates for free. `[*]` becomes a small filled circle; `state "Long" as X`
+// becomes an aliased node; composite `state Foo { ... }` blocks are flattened (the nested
+// members render alongside the parent) so the diagram at least appears, even if the
+// composite border is dropped — beats the raw fence, which was the alternative.
+function _mermaidStateSvg(src){
+  const lines=(src||"").replace(/\r/g,"").split("\n");
+  let started=false, dir="TD", spN=0; const outL=[], psps=[];
+  const psp=()=>{ const id=`__sp${spN++}`; psps.push(id); return id; };
+  const nodeIdRe=/^(\[\*\]|[A-Za-z0-9_.-]+)$/;
+  for(let raw of lines){
+    let l=raw.replace(/%%.*$/,"").trim(); if(!l)continue;
+    if(!started){
+      const h=l.match(/^stateDiagram(?:-v2)?\b\s*(?:(TD|TB|LR|RL|BT))?\s*$/i);
+      if(!h)return null;
+      dir=(h[1]||"TD").toUpperCase(); started=true; continue;
+    }
+    // ignore lines the flow renderer can't use and mermaid-state's own decoration
+    if(/^(note\b|hide\s|scale\b|accTitle|accDescr|classDef\b|class\s|link\b|click\b|style\b)/i.test(l))continue;
+    if(/^direction\s+(TD|TB|LR|RL|BT)\b/i.test(l)){ dir=RegExp.$1.toUpperCase(); continue; }
+    if(/^--\s*$/.test(l))continue;                     // composite-state separator
+    if(/^\}\s*$/.test(l))continue;                     // closing brace of composite — flatten
+    let m;
+    // `state "Long label" as ID` — aliased state → single-quoted flowchart label preserves punctuation
+    if((m=l.match(/^state\s+"([^"]+)"\s+as\s+([A-Za-z0-9_.-]+)\s*$/i))){
+      outL.push(`${m[2]}["${m[1].replace(/"/g,"'")}"]`); continue;
+    }
+    // `state Name` or `state Name {` — bare declaration (flatten the opening brace)
+    if((m=l.match(/^state\s+([A-Za-z0-9_.-]+)\s*\{?\s*$/i))){
+      outL.push(m[1]); continue;
+    }
+    // Transition: `A --> B` or `A --> B : label`   (with optional whitespace / dotted arrow)
+    if((m=l.match(/^(\[\*\]|[A-Za-z0-9_.-]+)\s*(-{2,}>|-\.->)\s*(\[\*\]|[A-Za-z0-9_.-]+)\s*(?::\s*(.+))?$/))){
+      let a=m[1], b=m[3], arrow=m[2], label=(m[4]||"").trim();
+      if(a==="[*]") a=psp();
+      if(b==="[*]") b=psp();
+      const arr=arrow==="-.->"?"-.->":"-->";
+      // Edge label lives between pipes for the flowchart parser — strip `|` from the payload
+      // so the parser can't misread the delimiter, and don't wrap in quotes (they'd render literally).
+      if(label){ outL.push(`${a} ${arr}|${label.replace(/\|/g,"/")}| ${b}`); }
+      else     { outL.push(`${a} ${arr} ${b}`); }
+      continue;
+    }
+    // Bare state id on its own line (auto-declares it as a node)
+    if(nodeIdRe.test(l) && l!=="[*]"){ outL.push(l); continue; }
+    // Unknown line — swallow rather than kill the diagram (mirrors _mermaidSeqSvg)
+  }
+  if(!started||!outL.length)return null;
+  const flow=[`flowchart ${dir}`, ...outL];
+  if(psps.length){                                     // dot-style pseudostates: dark filled circle
+    flow.push(`classDef ssp fill:#5b6474,stroke:#2b323e,color:#fff`);
+    flow.push(`class ${psps.join(",")} ssp`);
+    psps.forEach(id=>flow.push(`${id}(("·"))`));       // circle shape, tiny centre-dot label
+  }
+  return _mermaidSvgFlow(flow.join("\n"));
+}
+
+// ---- classDiagram → flowchart. Each class becomes a multi-line rectangle carrying its
+// members (attributes + methods), and every relationship — inheritance, composition,
+// aggregation, association, dependency, realisation — becomes a directed edge whose
+// arrowhead points at the *base* class (mermaid draws A<|--B as B extending A, so we
+// emit B → A). Cardinality / role labels ride the edge as its label. Internal attribute
+// details (visibility markers, types) are preserved verbatim in the box.
+function _mermaidClassSvg(src){
+  const lines=(src||"").replace(/\r/g,"").split("\n");
+  let started=false, curCls=null;
+  const members={}, edges=[], seen=new Set();
+  const touch=id=>{ if(!members[id]){ members[id]=[]; seen.add(id); } };
+  for(let raw of lines){
+    let l=raw.replace(/%%.*$/,"").trim(); if(!l)continue;
+    if(!started){ if(!/^classDiagram(?:-v2)?\b/i.test(l))return null;
+      started=true; continue; }
+    if(/^(direction\b|namespace\b|link\b|click\b|style\b|cssClass\b|note\b|accTitle|accDescr)/i.test(l))continue;
+    if(curCls){                                                       // inside `class X { ... }` block
+      if(/^\}\s*$/.test(l)){ curCls=null; continue; }
+      members[curCls].push(l.replace(/^[+#\-~]?\s*/, m=>m)); continue;
+    }
+    let m;
+    if((m=l.match(/^class\s+([A-Za-z0-9_.]+)(?:\s*<<[^>]+>>)?\s*(\{)?\s*$/i))){
+      touch(m[1]); if(m[2]) curCls=m[1]; continue;
+    }
+    // `ClassName : member text`  — attribute or method line
+    if((m=l.match(/^([A-Za-z0-9_.]+)\s*:\s*(.+)$/))){
+      touch(m[1]); members[m[1]].push(m[2].trim()); continue;
+    }
+    // Relationship: A <op> B  [: label]. Cardinality ("1", "*", "0..1") may sit before/after
+    // each side; strip and preserve as label context. Supported ops:
+    //   <|-- --|>   (inheritance)     *-- --*   (composition)   o-- --o   (aggregation)
+    //   <..  ..>    (dep. realise)    <|..  ..|>  (realisation) --   ..   (link, no arrow)
+    const relRe=/^([A-Za-z0-9_.]+)(?:\s+"([^"]*)")?\s*(<\|--|--\|>|<\|\.\.|\.\.\|>|\*--|--\*|o--|--o|<--|-->|<\.\.|\.\.>|--|\.\.)\s*(?:"([^"]*)"\s+)?([A-Za-z0-9_.]+)(?:\s*:\s*(.+))?$/;
+    if((m=l.match(relRe))){
+      const a=m[1], cardA=m[2]||"", op=m[3], cardB=m[4]||"", b=m[5], lab=(m[6]||"").trim();
+      const reverse=["<|--","<--","<|..","<.."].includes(op);        // arrow lands on left side
+      const from=reverse?b:a, to=reverse?a:b;
+      const parts=[]; if(cardA) parts.push(reverse?cardB:cardA);
+      if(lab) parts.push(lab);
+      if(cardB) parts.push(reverse?cardA:cardB);
+      touch(a); touch(b);
+      edges.push({from,to,label:parts.filter(Boolean).join(" ")});
+      continue;
+    }
+  }
+  if(!started||!seen.size)return null;
+  const flow=[`flowchart TD`];
+  seen.forEach(id=>{
+    const mems=(members[id]||[]).filter(Boolean);
+    const label=mems.length?`${id}<br/>${mems.join("<br/>")}`:id;
+    flow.push(`${id}["${label.replace(/"/g,"'")}"]`);
+  });
+  edges.forEach(e=>{
+    // Same rule as the state renderer: don't quote the edge label — quotes would render literally
+    if(e.label) flow.push(`${e.from} -->|${e.label.replace(/\|/g,"/")}| ${e.to}`);
+    else        flow.push(`${e.from} --> ${e.to}`);
+  });
+  return _mermaidSvgFlow(flow.join("\n"));
+}
+
+// ---- erDiagram → flowchart. Entities are boxes carrying their attributes; the cardinality
+// shorthand (`||--o{`) rides the edge label alongside the verb so the reader still sees
+// "one-to-many" (or its symbolic equivalent) without a dedicated marker library.
+function _mermaidErSvg(src){
+  const lines=(src||"").replace(/\r/g,"").split("\n");
+  let started=false, curEnt=null;
+  const attrs={}, edges=[], seen=new Set();
+  const touch=id=>{ if(!attrs[id]){ attrs[id]=[]; seen.add(id); } };
+  for(let raw of lines){
+    let l=raw.replace(/%%.*$/,"").trim(); if(!l)continue;
+    if(!started){ if(!/^erDiagram\b/i.test(l))return null;
+      started=true; continue; }
+    if(curEnt){
+      if(/^\}\s*$/.test(l)){ curEnt=null; continue; }
+      // an attribute line is: `type name [PK|FK|UK] [ "comment" ]` — keep the whole thing
+      attrs[curEnt].push(l.replace(/\s+/g," ")); continue;
+    }
+    if(/^(accTitle|accDescr)/i.test(l))continue;
+    let m;
+    if((m=l.match(/^([A-Za-z0-9_-]+)\s*\{\s*$/))){ touch(m[1]); curEnt=m[1]; continue; }
+    // Relationship: NAME  <card><arrow><card>  NAME  [: verb]
+    //   valid cardinality bookends: |o  o|  ||  }o  o{  }|  |{
+    if((m=l.match(/^([A-Za-z0-9_-]+)\s+([|o}]{1,2})(--|\.\.)([|o{]{1,2})\s+([A-Za-z0-9_-]+)\s*(?::\s*(.+))?$/))){
+      const a=m[1], cardA=m[2], line=m[3], cardB=m[4], b=m[5], verb=(m[6]||"").trim();
+      touch(a); touch(b);
+      const readable={"||":"one","|o":"zero-or-one","o|":"zero-or-one","}o":"zero-or-more","o{":"zero-or-more","}|":"one-or-more","|{":"one-or-more"};
+      const card=`${readable[cardA]||cardA} → ${readable[cardB]||cardB}`;
+      const label=verb?`${verb} · ${card}`:card;
+      edges.push({from:a,to:b,label,dash:line==="."});
+      continue;
+    }
+  }
+  if(!started||!seen.size)return null;
+  const flow=[`flowchart LR`];
+  seen.forEach(id=>{
+    const at=(attrs[id]||[]).filter(Boolean);
+    const label=at.length?`${id}<br/>${at.join("<br/>")}`:id;
+    flow.push(`${id}["${label.replace(/"/g,"'")}"]`);
+  });
+  edges.forEach(e=>{
+    // Same rule as the other translators: no quote-wrap on edge labels — they'd render literally.
+    const arr=e.dash?"-.->":"-->";
+    if(e.label) flow.push(`${e.from} ${arr}|${e.label.replace(/\|/g,"/")}| ${e.to}`);
+    else        flow.push(`${e.from} ${arr} ${e.to}`);
+  });
+  return _mermaidSvgFlow(flow.join("\n"));
+}
+
+// ---- journey → flowchart. Each `section` becomes a header node, and every task under it
+// becomes a chained node carrying its happiness score (1-5) as a face emoji. Sections
+// render as separate horizontal chains so the reader sees each phase as its own row.
+function _mermaidJourneySvg(src){
+  const lines=(src||"").replace(/\r/g,"").split("\n");
+  let started=false, secN=0, taskN=0, curSec=null;
+  const outL=[], secIds=[];
+  const face=s=>({5:"😊",4:"🙂",3:"😐",2:"😕",1:"😞"}[s]||"·");
+  for(let raw of lines){
+    let l=raw.replace(/%%.*$/,"").trim(); if(!l)continue;
+    if(!started){ if(!/^(journey|userJourney)\b/i.test(l))return null;
+      started=true; continue; }
+    if(/^title\s/i.test(l))continue;
+    let m;
+    if((m=l.match(/^section\s+(.+)$/i))){
+      const sid=`__sec${secN++}`; secIds.push(sid); curSec={id:sid,prev:sid};
+      outL.push(`${sid}["${m[1].replace(/"/g,"'")}"]`); continue;
+    }
+    // task line: `TaskName : score : actor1, actor2`
+    if((m=l.match(/^(.+?)\s*:\s*(\d+)\s*:\s*(.+)$/))){
+      if(!curSec)continue;
+      const name=m[1].trim(), score=parseInt(m[2],10), actors=m[3].trim();
+      const tid=`__tk${taskN++}`;
+      const label=`${name.replace(/"/g,"'")}<br/>${face(score)} ${score}<br/>${actors.replace(/"/g,"'")}`;
+      outL.push(`${tid}["${label}"]`);
+      outL.push(`${curSec.prev} --> ${tid}`);
+      curSec.prev=tid; continue;
+    }
+  }
+  if(!started||!outL.length)return null;
+  const flow=[`flowchart LR`, ...outL];
+  if(secIds.length){
+    flow.push(`classDef jsec fill:#334155,stroke:#334155,color:#f8fafc`);
+    flow.push(`class ${secIds.join(",")} jsec`);
+  }
+  return _mermaidSvgFlow(flow.join("\n"));
+}
+
+// ---- pie → dedicated small SVG (no flowchart reuse — a proportional slice with a percent
+// legend is nothing the flow layout would give). Colours cycle a fixed palette so a
+// repeated diagram stays visually stable; slice text goes to the legend, not the arc, so
+// long labels don't overflow the wedge.
+const MPIE_C=["#5b8def","#f59e0b","#22c55e","#a78bfa","#ec4899","#14b8a6","#ef4444","#eab308","#0ea5e9","#f97316"];
+function _mermaidPieSvg(src){
+  const lines=(src||"").replace(/\r/g,"").split("\n");
+  let started=false, title="", slices=[];
+  for(let raw of lines){
+    let l=raw.replace(/%%.*$/,"").trim(); if(!l)continue;
+    if(!started){
+      const h=l.match(/^pie(?:\s+showData)?\s*(?:title\s+(.+))?$/i);
+      if(!h)return null;
+      if(h[1]) title=h[1].trim(); started=true; continue;
+    }
+    let m;
+    if((m=l.match(/^title\s+(.+)$/i))){ title=m[1].trim(); continue; }
+    if((m=l.match(/^"([^"]*)"\s*:\s*([0-9.]+)\s*$/))){
+      slices.push({label:m[1], value:parseFloat(m[2])}); continue;
+    }
+  }
+  if(!started||!slices.length)return null;
+  const total=slices.reduce((s,x)=>s+x.value,0); if(total<=0)return null;
+  const R=90, cx=110, cy=118;
+  const arcs=[]; let angle=-Math.PI/2;
+  slices.forEach((s,i)=>{
+    const sweep=(s.value/total)*Math.PI*2;
+    const x1=cx+R*Math.cos(angle), y1=cy+R*Math.sin(angle);
+    const x2=cx+R*Math.cos(angle+sweep), y2=cy+R*Math.sin(angle+sweep);
+    const large=sweep>Math.PI?1:0, fill=MPIE_C[i%MPIE_C.length];
+    // Guard: a single-slice pie can't be drawn as an arc — render the full circle instead
+    if(slices.length===1){ arcs.push(`<circle class=mmdn cx="${cx}" cy="${cy}" r="${R}" fill="${fill}"/>`); }
+    else { arcs.push(`<path class=mmdn d="M${cx},${cy} L${x1.toFixed(1)},${y1.toFixed(1)} A${R},${R} 0 ${large} 1 ${x2.toFixed(1)},${y2.toFixed(1)} Z" fill="${fill}" stroke-width="1.5"/>`); }
+    angle+=sweep;
+  });
+  const legX=225; let legY=32;
+  const legend=slices.map((s,i)=>{
+    const pct=(s.value/total*100).toFixed(1), fill=MPIE_C[i%MPIE_C.length];
+    const row=`<rect x="${legX}" y="${legY-11}" width="14" height="14" fill="${fill}" rx="3"/>`+
+              `<text class=mmdt x="${legX+20}" y="${legY+0}" text-anchor="start">${esc(s.label)} — ${pct}%</text>`;
+    legY+=22; return row;
+  }).join("");
+  const W=Math.max(430, legX + 40 + Math.max.apply(null, slices.map(s=>s.label.length*7+70)));
+  const H=Math.max(240, legY+16);
+  const t=title?`<text class=mmdt x="${(W/2).toFixed(1)}" y="22" font-weight="700" font-size="14">${esc(title)}</text>`:"";
+  return `<svg class=mmdsvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role=img aria-label="pie chart">`+
+    t + arcs.join("") + legend + `</svg>`;
+}
+
+// ---- quadrantChart → dedicated small SVG. Axes carry their labels, each quadrant its
+// title, points drop as labelled dots at their [x,y] in the [0,1]² space (0,0 is bottom-left).
+function _mermaidQuadrantSvg(src){
+  const lines=(src||"").replace(/\r/g,"").split("\n");
+  let started=false, title="", xAxis="", yAxis="", quads=["","","",""], points=[];
+  for(let raw of lines){
+    let l=raw.replace(/%%.*$/,"").trim(); if(!l)continue;
+    if(!started){ if(!/^quadrantChart\b/i.test(l))return null;
+      started=true; continue; }
+    let m;
+    if((m=l.match(/^title\s+(.+)$/i))){ title=m[1].trim(); continue; }
+    if((m=l.match(/^x-axis\s+(.+)$/i))){ xAxis=m[1].trim(); continue; }
+    if((m=l.match(/^y-axis\s+(.+)$/i))){ yAxis=m[1].trim(); continue; }
+    if((m=l.match(/^quadrant-([1-4])\s+(.+)$/i))){ quads[parseInt(m[1],10)-1]=m[2].trim(); continue; }
+    // point: `Label: [0.3, 0.7]`  (label may be quoted; values accept a leading `-` so a
+    // rogue out-of-range coordinate still parses — the render pass clamps to the axes).
+    if((m=l.match(/^"?([^":]+?)"?\s*:\s*\[\s*(-?[0-9.]+)\s*,\s*(-?[0-9.]+)\s*\]\s*$/))){
+      points.push({label:m[1].trim(), x:parseFloat(m[2]), y:parseFloat(m[3])}); continue;
+    }
+  }
+  if(!started)return null;
+  const P=44, W=520, H=380, ix=P, iy=32+P, iw=W-P*2, ih=H-P*2-32;
+  const cx=ix+iw/2, cy=iy+ih/2;
+  const parts=[];
+  if(title) parts.push(`<text class=mmdt x="${(W/2).toFixed(1)}" y="22" font-weight="700" font-size="14">${esc(title)}</text>`);
+  // outer box + quadrant divider lines
+  parts.push(`<rect class=mmdn x="${ix}" y="${iy}" width="${iw}" height="${ih}" fill="none"/>`);
+  parts.push(`<line class=mmde x1="${cx.toFixed(1)}" y1="${iy}" x2="${cx.toFixed(1)}" y2="${(iy+ih).toFixed(1)}"/>`);
+  parts.push(`<line class=mmde x1="${ix}" y1="${cy.toFixed(1)}" x2="${(ix+iw).toFixed(1)}" y2="${cy.toFixed(1)}"/>`);
+  // quadrant labels (top-right=1, top-left=2, bottom-left=3, bottom-right=4 per mermaid docs)
+  const qc=[{x:cx+iw/4,y:iy+ih/4},{x:cx-iw/4,y:iy+ih/4},{x:cx-iw/4,y:cy+ih/4},{x:cx+iw/4,y:cy+ih/4}];
+  quads.forEach((q,i)=>{ if(q) parts.push(`<text class=mmdt x="${qc[i].x.toFixed(1)}" y="${qc[i].y.toFixed(1)}" font-size="12">${esc(q)}</text>`); });
+  // axis labels
+  if(xAxis) parts.push(`<text class=mmdt x="${cx.toFixed(1)}" y="${(iy+ih+26).toFixed(1)}" font-size="12">${esc(xAxis)}</text>`);
+  if(yAxis){
+    const ty=(cy).toFixed(1), tx=(ix-18).toFixed(1);
+    parts.push(`<text class=mmdt x="${tx}" y="${ty}" font-size="12" transform="rotate(-90 ${tx} ${ty})">${esc(yAxis)}</text>`);
+  }
+  // points — y is inverted (mermaid's 0 is at bottom, SVG's is at top)
+  points.forEach(pt=>{
+    const px=ix+Math.max(0,Math.min(1,pt.x))*iw;
+    const py=iy+ih-Math.max(0,Math.min(1,pt.y))*ih;
+    parts.push(`<circle cx="${px.toFixed(1)}" cy="${py.toFixed(1)}" r="5" fill="#5b8def"/>`);
+    parts.push(`<text class=mmdt x="${(px+9).toFixed(1)}" y="${(py+4).toFixed(1)}" text-anchor="start" font-size="11">${esc(pt.label)}</text>`);
+  });
+  return `<svg class=mmdsvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role=img aria-label="quadrant chart">`+
+    parts.join("") + `</svg>`;
+}
+
 
 function ago(sec){sec=Math.max(0,sec|0);if(sec<60)return sec+"s ago";if(sec<3600)return(sec/60|0)+"m ago";if(sec<86400)return(sec/3600|0)+"h ago";return(sec/86400|0)+"d ago"}
 function base(p){return (p||"").split("/").pop()}
