@@ -184,6 +184,9 @@ class TestBuildPage(unittest.TestCase):
         self.assertIn("mermaidSvg(src)", p)                         # …and mdBlock's fence branch calls it
         self.assertIn(".mmd .mmdsvg{", p)                           # its styling came along
         self.assertIn(".mmdsvg .mmdn{fill:var(--card)", p)          # tokenised → readable in light and dark
+        # Sequence diagrams share the dispatcher — same seam, second diagram type
+        self.assertIn("function _mermaidSeqSvg", p)                 # the sequence renderer is baked in too
+        self.assertIn(".mmdsvg .mmsp{fill:var(--card)", p)          # its participant boxes are tokenised
 
 
 class TestSearchAllRanking(unittest.TestCase):

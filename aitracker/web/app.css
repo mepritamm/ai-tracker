@@ -247,6 +247,23 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid var(--line)}
 .mmdsvg marker path{fill:var(--muted)}
 .mmdsvg .mmdlb{fill:var(--side);stroke:var(--line);stroke-width:1}
 .mmdsvg .mmdlt{fill:var(--muted);text-anchor:middle;font-size:11px}
+/* mermaid sequence diagrams — same tokenised palette; classes are namespaced
+   .mms* so they don't collide with the flowchart's .mmd* rules */
+.mmdsvg .mmsp{fill:var(--card);stroke:var(--line3);stroke-width:1.4}
+.mmdsvg .mmspt{fill:var(--head);text-anchor:middle;font-weight:600;dominant-baseline:auto}
+.mmdsvg .mmsll{stroke:var(--line3);stroke-dasharray:3 4;stroke-width:1;fill:none}
+.mmdsvg .mmsm{fill:none;stroke:var(--muted);stroke-width:1.4}
+.mmdsvg .mmsm.dash{stroke-dasharray:5 4}
+.mmdsvg .mmsmt{fill:var(--head);text-anchor:middle;font-size:12px}
+.mmdsvg .mmsnote{fill:#f3d580;stroke:#a37a1c;stroke-width:1}
+.mmdsvg .mmsnt{fill:#3b2600;text-anchor:middle;font-size:12px}
+.mmdsvg .mmsblk{fill:none;stroke:var(--line3);stroke-width:1.2;stroke-dasharray:4 3}
+.mmdsvg .mmsblkb{fill:var(--raised);stroke:var(--line3);stroke-width:1}
+.mmdsvg .mmsblkt{fill:var(--head);text-anchor:middle;font-size:11px;font-weight:600}
+.mmdsvg .mmsblkls{stroke:var(--line3);stroke-width:1;stroke-dasharray:3 3;fill:none}
+/* override the global "marker path{fill:muted}" for open/x/async heads that need
+   stroke, not fill, or they'd render as filled blobs */
+.mmdsvg marker#mmsarrowo path,.mmdsvg marker#mmsarrowx path,.mmdsvg marker#mmsarrowc path{fill:none;stroke:var(--muted)}
 .msgbody .mdpre{background:var(--side);border:1px solid var(--line);border-radius:8px;padding:11px 13px;overflow:auto;margin:0 0 11px;white-space:pre}
 .msgbody .mdpre code{background:none;border:0;padding:0;margin:0;color:var(--head)}
 .msgbody .mdt{border-collapse:collapse;margin:4px 0 14px;font-size:13px;display:block;overflow-x:auto}

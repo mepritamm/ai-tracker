@@ -109,8 +109,9 @@ class TestMermaidRender(unittest.TestCase):
         self.assertGreater(lw, lh)          # LR flows: wider than tall
 
     def test_unsupported_diagram_types_return_null(self):
-        for src in ("sequenceDiagram\n  A->>B: hi", "pie title X\n  \"a\": 5",
-                    "gantt\n  title x", "", "just some prose"):
+        # sequenceDiagram used to sit here — it now has its own renderer (TestSequenceDiagram).
+        for src in ("pie title X\n  \"a\": 5", "gantt\n  title x",
+                    "erDiagram\n  A ||--o{ B : has", "", "just some prose"):
             self.assertIsNone(_js(src), src[:20])
 
     def test_malformed_input_never_throws(self):
@@ -144,10 +145,132 @@ class TestMdBlockFences(unittest.TestCase):
         self.assertNotIn("class=mmd>", h)
 
     def test_unsupported_mermaid_falls_back_to_the_source(self):
-        h = _js("```mermaid\nsequenceDiagram\n  A->>B: hi\n```", fn="mdBlock")
+        # `gantt` isn't supported; the fence stays a readable code block instead of vanishing.
+        h = _js("```mermaid\ngantt\n  title x\n```", fn="mdBlock")
         self.assertNotIn("<svg", h)
         self.assertIn("class=mdpre", h)                 # you still get to read the diagram source
-        self.assertIn("sequenceDiagram", h)
+        self.assertIn("gantt", h)
+
+    def test_sequence_fence_renders_a_diagram(self):
+        h = _js("intro\n\n```mermaid\nsequenceDiagram\n  A->>B: hi\n```\n\nafter", fn="mdBlock")
+        self.assertIn("<div class=mmd><svg", h)
+        self.assertNotIn("mdpre", h)                    # the fence became a diagram, not a code block
+        self.assertIn("<p class=mdp>intro</p>", h)      # surrounding markdown still renders
+        self.assertIn(">A<", h)
+        self.assertIn(">B<", h)
+        self.assertIn(">hi<", h)
+
+
+# ---- Sequence-diagram renderer (_mermaidSeqSvg): the sibling that lets `sequenceDiagram`
+# fences render inline instead of falling through to code. Same shared seam (mermaidSvg) —
+# mdBlock dispatches by diagram type, so every markdown surface (narration, notes, .md view,
+# agent/shell output) inherits both flowchart AND sequence support without a second wiring.
+SEQ = """sequenceDiagram
+    participant C as Caller (BFF)
+    participant G as graph_run_turn
+    participant CP as Checkpointer
+    C->>G: utterance + thread_id
+    G->>G: state = {utterance}
+    Note over G: usage=None resets accumulator
+    G->>CP: get_state(config)
+    alt first turn of this thread
+      CP-->>G: empty
+      G->>G: seed SessionContext
+    else existing thread
+      CP-->>G: restores SessionContext
+    end
+    G-->>C: TurnTrace
+"""
+
+
+@unittest.skipUnless(NODE, "node not installed — JS evals skipped")
+class TestSequenceDiagram(unittest.TestCase):
+    def test_renders_svg_with_every_participant_and_message(self):
+        s = _js(SEQ)
+        self.assertIsNotNone(s)
+        self.assertTrue(s.startswith("<svg"), s[:60])
+        self.assertIn('aria-label="sequence diagram"', s)
+        # participants are drawn top AND bottom (mirror) — exactly twice each, using the `as` label
+        for lab in ("Caller (BFF)", "graph_run_turn", "Checkpointer"):
+            self.assertEqual(2, s.count(">%s<" % lab), lab)
+        # every message text present
+        for t in ("utterance + thread_id", "state = {utterance}", "get_state(config)",
+                  "empty", "seed SessionContext", "restores SessionContext", "TurnTrace"):
+            self.assertIn(t, s)
+        self.assertIn("<defs>", s)
+
+    def test_message_arrow_kinds_map_to_the_right_marker(self):
+        # ->> is a filled solid arrow (mmsarrow); -->> is filled dashed
+        s = _js("sequenceDiagram\n A->>B: req\n B-->>A: resp")
+        self.assertIsNotNone(s)
+        self.assertIn("mmsm dash", s)                            # the return arrow is dashed
+        self.assertEqual(2, s.count('marker-end="url(#mmsarrow)"'))  # both use the filled head
+        # -x is the terminator "x"; -) is async open-arc
+        s2 = _js("sequenceDiagram\n A-xB: lost\n A-)B: async")
+        self.assertIsNotNone(s2)
+        self.assertIn('marker-end="url(#mmsarrowx)"', s2)
+        self.assertIn('marker-end="url(#mmsarrowc)"', s2)
+
+    def test_note_over_becomes_a_yellow_note_box(self):
+        s = _js(SEQ)
+        self.assertIn("class=mmsnote", s)
+        self.assertIn("usage=None resets accumulator", s)
+
+    def test_note_scopes_left_and_right_of(self):
+        s = _js("sequenceDiagram\n participant A\n Note left of A: L\n Note right of A: R")
+        self.assertIsNotNone(s)
+        self.assertEqual(2, s.count("class=mmsnote"))
+        self.assertIn(">L<", s)
+        self.assertIn(">R<", s)
+
+    def test_alt_block_renders_with_title_tab_and_else_divider(self):
+        s = _js(SEQ)
+        self.assertIn('class="mmsblk d0"', s)                    # depth-0 block box
+        self.assertIn("ALT", s)                                   # kind uppercased in the tab
+        self.assertIn("first turn of this thread", s)             # its condition preserved
+        self.assertIn("class=mmsblkls", s)                        # the else divider
+        self.assertIn("ELSE  existing thread", s)                 # else's condition preserved
+
+    def test_self_message_uses_a_bracket_path_not_a_line(self):
+        s = _js("sequenceDiagram\n A->>A: recurse")
+        self.assertIsNotNone(s)
+        self.assertIn('<path class="mmsm"', s)                    # self-loop is a path
+        self.assertIn(">recurse<", s)
+
+    def test_participants_are_auto_declared_on_first_use(self):
+        s = _js("sequenceDiagram\n A->>B: hi")
+        self.assertIsNotNone(s)
+        self.assertEqual(2, s.count(">A<"))                       # header + footer
+        self.assertEqual(2, s.count(">B<"))
+
+    def test_message_text_is_escaped(self):
+        s = _js("sequenceDiagram\n A->>B: <script>alert(1)</script> & co")
+        self.assertIsNotNone(s)
+        self.assertNotIn("<script>", s)
+        self.assertIn("&amp; co", s)
+
+    def test_lifelines_span_every_participant(self):
+        s = _js(SEQ)
+        # one dashed lifeline per participant column (C, G, CP)
+        self.assertEqual(3, s.count("class=mmsll"))
+
+    def test_nested_blocks_get_distinct_depth_classes(self):
+        s = _js("sequenceDiagram\n A->>B: x\n opt outer\n loop inner\n A->>B: y\n end\n end")
+        self.assertIsNotNone(s)
+        self.assertIn('class="mmsblk d0"', s)   # outer opt
+        self.assertIn('class="mmsblk d1"', s)   # inner loop
+
+    def test_autonumber_and_activate_are_ignored_not_fatal(self):
+        s = _js("sequenceDiagram\n autonumber\n activate A\n A->>B: x\n deactivate A")
+        self.assertIsNotNone(s)
+        self.assertIn(">x<", s)
+
+    def test_malformed_input_never_throws(self):
+        for src in ("sequenceDiagram", "sequenceDiagram\n foo bar baz",
+                    "sequenceDiagram\n A->>",  "sequenceDiagram\n Note over : empty",
+                    "sequenceDiagram\n alt\n end\n end",  "sequenceDiagram\n end\n end",
+                    "sequenceDiagram\n loop", "sequenceDiagram\n participant"):
+            _js(src)                     # a throw surfaces as a non-zero exit / load: error
 
 
 if __name__ == "__main__":

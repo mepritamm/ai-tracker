@@ -50,9 +50,11 @@ function mdBlock(s){
 }
 // ---- Mermaid → inline SVG, hand-rolled. No mermaid.js, no CDN: the whole app is
 // one zero-dependency file and `make bundle` inlines web/ verbatim, so a 3 MB vendored
-// library is off the table. Covers the `flowchart|graph` subset that shows up in
-// narration (node shapes, edge labels, classDef colours); every other diagram type
-// returns null and mdBlock renders the fence as code, unchanged.
+// library is off the table. Covers the two diagram types that show up in narration:
+// `flowchart|graph` (node shapes, edge labels, classDef colours — _mermaidSvgFlow)
+// and `sequenceDiagram` (participants, messages, notes, alt/opt/loop/par blocks —
+// _mermaidSeqSvg). mermaidSvg() dispatches by the first non-blank keyword; every
+// other diagram type returns null and mdBlock renders the fence as code, unchanged.
 // ponytail: layered layout, straight bezier edges — no crossing minimisation.
 const MMDSH={"[[":"rect","((":"circle","([":"stadium","[":"rect","(":"round","{":"diamond",">":"rect"};
 const MMDW=13, MMDCW=6.9, MMDLH=17, MMDPX=14, MMDPY=9, MMDGX=26, MMDGY=56, MMDMAX=44;
@@ -89,8 +91,13 @@ function _mmdNode(tok,nodes,order){
   return n;
 }
 const MMDARR=/^([\s\S]*?)\s*(-\.->|-\.-|={2,}>|={2,}|-{2,}>|--[xo]|-{2,})\s*(?:\|([^|]*)\|\s*)?/;
-function mermaidSvg(src){ try{ return _mermaidSvg(src); }catch(e){ return null; } }
-function _mermaidSvg(src){
+// Dispatch by diagram type — the shared seam every markdown surface calls through mdBlock.
+function mermaidSvg(src){ try{
+  const s=(src||"").replace(/^\s*(?:%%.*\n)*/,"").trimStart();
+  if(/^sequenceDiagram\b/i.test(s)) return _mermaidSeqSvg(src);
+  return _mermaidSvgFlow(src);
+}catch(e){ return null; } }
+function _mermaidSvgFlow(src){
   const nodes={}, order=[], edges=[], classes={}, assign={};
   let dir="TD", started=false;
   for(const rawline of (src||"").replace(/\r/g,"").split("\n")){
@@ -203,6 +210,153 @@ function _mermaidSvg(src){
     `<defs><marker id=mmdarrow markerWidth="9" markerHeight="7" refX="8.5" refY="3.5" orient=auto><path d="M0,0 L9,3.5 L0,7 z"/></marker></defs>`+
     `<g transform="translate(${P},${P})" font-size="${MMDW}">${g.join("")}</g></svg>`;
 }
+// ---- Sequence-diagram sibling of _mermaidSvgFlow. Same zero-dep principle. Covers
+// participant/actor decls, →/⇒/dashed/x/) message arrows, self-loops, Note over/left of/
+// right of, alt/else/opt/loop/par/critical/break/rect blocks (nested — inner blocks
+// tighten to the columns their events touch). Unknown lines are ignored so a stray
+// mermaid extension doesn't kill the whole diagram. Autonumber/activate/deactivate skipped.
+const MMSCW=6.9,MMSFS=13,MMSPH=30,MMSLANE=36,MMSSELF=52,MMSNPAD=10,MMSPX=14,MMSGAP=28,MMSBLKPAD=10,MMSMARGIN=22,MMSHEADGAP=18;
+function _mmsLabel(s){return (s||"").replace(/<br\s*\/?>/gi," ").replace(/<\/?[a-z][^>]*>/gi,"").replace(/^\s*["'`]|["'`]\s*$/g,"").trim();}
+function _mmsPart(pmap,order,id,label){
+  if(!pmap[id]){ pmap[id]={id:id,label:label||id}; order.push(id); }
+  else if(label&&pmap[id].label===pmap[id].id){ pmap[id].label=label; }
+}
+function _mermaidSeqSvg(src){
+  const pmap={},order=[],events=[],stack=[]; let started=false;
+  for(const raw of (src||"").replace(/\r/g,"").split("\n")){
+    let l=raw.replace(/%%.*$/,"").trim(); if(!l)continue;
+    if(!started){ if(!/^sequenceDiagram\b/i.test(l))return null;
+      started=true; l=l.replace(/^sequenceDiagram\b\s*/i,""); if(!l)continue; }
+    if(/^(autonumber|activate|deactivate|title|accTitle|accDescr|links|link|properties|details|box|end box)\b/i.test(l))continue;
+    let m;
+    if((m=l.match(/^(participant|actor)\s+([A-Za-z0-9_.-]+)(?:\s+as\s+(.+))?$/i))){
+      _mmsPart(pmap,order,m[2],_mmsLabel(m[3])); continue; }
+    if((m=l.match(/^Note\s+(over|left of|right of)\s+([^:]+?)\s*:\s*(.*)$/i))){
+      const scope=m[1].toLowerCase().replace(/\s+/g,"_");
+      const ids=m[2].split(",").map(s=>s.trim()).filter(Boolean);
+      if(!ids.length)continue;
+      ids.forEach(id=>_mmsPart(pmap,order,id,null));
+      events.push({type:"note",scope:scope,ids:ids,text:_mmsLabel(m[3])}); continue; }
+    if((m=l.match(/^(alt|opt|loop|par|critical|break|rect)\b\s*(.*)$/i))){
+      events.push({type:"bstart",kind:m[1].toLowerCase(),cond:_mmsLabel(m[2])}); continue; }
+    if((m=l.match(/^(?:else|and|option)\b\s*(.*)$/i))){
+      events.push({type:"belse",cond:_mmsLabel(m[1])}); continue; }
+    if(/^end\b\s*$/i.test(l)){ events.push({type:"bend"}); continue; }
+    // messages: A->B / A-->B / A->>B / A-->>B / A-xB / A--xB / A-)B / A--)B.
+    // The id charset forbids a trailing `-` (segment must end in a non-hyphen), so `CP-->>G`
+    // parses as CP + `--` + `>>` + G, not as `CP-` + `-` + `>>` + G — a subtle greedy-`-` trap
+    // that would otherwise turn every dashed-reply into an extra participant and drop the dash class.
+    if((m=l.match(/^([A-Za-z0-9_.]+(?:-[A-Za-z0-9_.]+)*)\s*(-{1,2})(>{1,2}|[x)])[+-]?\s*([A-Za-z0-9_.]+(?:-[A-Za-z0-9_.]+)*)\s*:\s*(.*)$/))){
+      _mmsPart(pmap,order,m[1],null); _mmsPart(pmap,order,m[4],null);
+      events.push({type:"msg",from:m[1],to:m[4],dash:m[2].length===2,head:m[3],text:_mmsLabel(m[5])}); continue; }
+    // unknown line — swallow rather than crash; keeps rendering robust to mermaid extensions
+  }
+  if(!started||!order.length)return null;
+
+  const cols=order.map(id=>{ const n=pmap[id]; const w=Math.max(80,n.label.length*MMSCW+MMSPX*2);
+    return {id:id,label:n.label,w:w}; });
+  let cx=0; cols.forEach(c=>{ c.x=cx; c.cx=cx+c.w/2; cx+=c.w+MMSGAP; });
+  const totalW=cx-MMSGAP; const colIx={}; cols.forEach((c,i)=>colIx[c.id]=i);
+
+  const headBottom=MMSMARGIN+MMSPH; let y=headBottom+MMSHEADGAP;
+  const blkStack=[];                                   // {ev,startY,minCol,maxCol,depth,elses:[]}
+  events.forEach(ev=>{
+    if(ev.type==="msg"){
+      ev.y=y; y+=ev.from===ev.to?MMSSELF:MMSLANE;
+      const a=colIx[ev.from],b=colIx[ev.to];
+      blkStack.forEach(bl=>{ bl.minCol=Math.min(bl.minCol,a,b); bl.maxCol=Math.max(bl.maxCol,a,b); });
+    } else if(ev.type==="note"){
+      ev.y=y; ev.h=MMSPH; y+=ev.h+MMSNPAD;
+      const idxs=ev.ids.map(id=>colIx[id]);
+      blkStack.forEach(bl=>{ bl.minCol=Math.min.apply(null,[bl.minCol].concat(idxs));
+                             bl.maxCol=Math.max.apply(null,[bl.maxCol].concat(idxs)); });
+    } else if(ev.type==="bstart"){
+      const bl={ev:ev,startY:y,minCol:cols.length,maxCol:-1,depth:blkStack.length,elses:[]};
+      blkStack.push(bl); y+=22;                        // room for the label tab
+    } else if(ev.type==="belse"){
+      const bl=blkStack[blkStack.length-1]; if(bl){ ev.y=y; bl.elses.push({y:y,cond:ev.cond}); y+=22; }
+    } else if(ev.type==="bend"){
+      const bl=blkStack.pop(); if(bl){ ev.b=bl; ev.endY=y; y+=MMSBLKPAD; }
+    }
+  });
+  const footTop=y+6; const H=footTop+MMSPH+MMSMARGIN; const W=totalW+MMSMARGIN*2;
+
+  const blkOut=[],staticOut=[],noteOut=[],msgOut=[];
+  // lifelines first (dashed, behind everything)
+  cols.forEach(c=>staticOut.push(`<line class=mmsll x1="${c.cx.toFixed(1)}" y1="${headBottom}" x2="${c.cx.toFixed(1)}" y2="${footTop.toFixed(1)}"/>`));
+  // participant boxes — mirrored top and bottom
+  const drawPBox=yTop=>cols.forEach(c=>{
+    staticOut.push(`<rect class=mmsp x="${c.x.toFixed(1)}" y="${yTop}" width="${c.w.toFixed(1)}" height="${MMSPH}" rx="4"/>`);
+    staticOut.push(`<text class=mmspt x="${c.cx.toFixed(1)}" y="${(yTop+MMSPH/2+4).toFixed(1)}">${esc(c.label)}</text>`);
+  });
+  drawPBox(MMSMARGIN); drawPBox(footTop);
+
+  events.forEach(ev=>{
+    if(ev.type==="bend"&&ev.b){
+      const bl=ev.b;
+      const minC=bl.maxCol<0?0:bl.minCol, maxC=bl.maxCol<0?cols.length-1:bl.maxCol;
+      const bx=cols[minC].x-MMSBLKPAD, bw=(cols[maxC].x+cols[maxC].w)-cols[minC].x+MMSBLKPAD*2;
+      const by=bl.startY, bh=ev.endY-by;
+      blkOut.push(`<rect class="mmsblk d${bl.depth}" x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" rx="4"/>`);
+      const ttl=bl.ev.kind.toUpperCase()+(bl.ev.cond?"  "+bl.ev.cond:"");
+      const tw=ttl.length*MMSCW+14;
+      blkOut.push(`<rect class=mmsblkb x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${tw.toFixed(1)}" height="18" rx="4"/>`);
+      blkOut.push(`<text class=mmsblkt x="${(bx+tw/2).toFixed(1)}" y="${(by+13).toFixed(1)}">${esc(ttl)}</text>`);
+      bl.elses.forEach(el=>{
+        blkOut.push(`<line class=mmsblkls x1="${bx.toFixed(1)}" y1="${el.y.toFixed(1)}" x2="${(bx+bw).toFixed(1)}" y2="${el.y.toFixed(1)}"/>`);
+        if(el.cond){ const et="ELSE  "+el.cond, etw=et.length*MMSCW+10;
+          blkOut.push(`<rect class=mmsblkb x="${bx.toFixed(1)}" y="${el.y.toFixed(1)}" width="${etw.toFixed(1)}" height="18" rx="4"/>`);
+          blkOut.push(`<text class=mmsblkt x="${(bx+etw/2).toFixed(1)}" y="${(el.y+13).toFixed(1)}">${esc(et)}</text>`);
+        }
+      });
+    } else if(ev.type==="note"){
+      const ixs=ev.ids.map(id=>colIx[id]).sort((a,b)=>a-b);
+      let nx,nw;
+      if(ev.scope==="over"){
+        nx=cols[ixs[0]].cx-30;
+        nw=cols[ixs[ixs.length-1]].cx-cols[ixs[0]].cx+60;
+        nw=Math.max(nw,ev.text.length*MMSCW+MMSPX*2);
+      } else if(ev.scope==="left_of"){
+        nw=Math.max(80,ev.text.length*MMSCW+MMSPX*2);
+        nx=cols[ixs[0]].cx-20-nw;
+      } else {                                          // right_of
+        nw=Math.max(80,ev.text.length*MMSCW+MMSPX*2);
+        nx=cols[ixs[0]].cx+20;
+      }
+      // Note width already scales to the text (see the width computation above), so no truncation.
+      noteOut.push(`<rect class=mmsnote x="${nx.toFixed(1)}" y="${ev.y.toFixed(1)}" width="${nw.toFixed(1)}" height="${ev.h}" rx="3"/>`);
+      noteOut.push(`<text class=mmsnt x="${(nx+nw/2).toFixed(1)}" y="${(ev.y+ev.h/2+4).toFixed(1)}">${esc(ev.text)}</text>`);
+    } else if(ev.type==="msg"){
+      const a=cols[colIx[ev.from]], b=cols[colIx[ev.to]];
+      const marker=ev.head===">>"?"mmsarrow":ev.head===">"?"mmsarrowo":ev.head==="x"?"mmsarrowx":"mmsarrowc";
+      const dashCls=ev.dash?" dash":"";
+      // Message text is emitted in full — no truncation. Real mermaid also lets
+      // labels overflow the gap; the outer .mmd container is overflow-x:auto so a wide
+      // diagram scrolls, and truncating here would silently drop information a search
+      // over the modal expects to find.
+      if(ev.from===ev.to){
+        const cxs=a.cx, halfW=30, yMid=ev.y+14, yBot=ev.y+34;
+        msgOut.push(`<path class="mmsm${dashCls}" d="M${cxs.toFixed(1)},${yMid.toFixed(1)} L${(cxs+halfW).toFixed(1)},${yMid.toFixed(1)} L${(cxs+halfW).toFixed(1)},${yBot.toFixed(1)} L${cxs.toFixed(1)},${yBot.toFixed(1)}" fill="none" marker-end="url(#${marker})"/>`);
+        msgOut.push(`<text class=mmsmt x="${(cxs+halfW+6).toFixed(1)}" y="${(yMid+4).toFixed(1)}" text-anchor="start">${esc(ev.text)}</text>`);
+      } else {
+        const x1=a.cx, x2=b.cx, yTop=ev.y+18;
+        msgOut.push(`<line class="mmsm${dashCls}" x1="${x1.toFixed(1)}" y1="${yTop.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${yTop.toFixed(1)}" marker-end="url(#${marker})"/>`);
+        msgOut.push(`<text class=mmsmt x="${((x1+x2)/2).toFixed(1)}" y="${(yTop-5).toFixed(1)}">${esc(ev.text)}</text>`);
+      }
+    }
+  });
+
+  const defs=`<defs>`+
+    `<marker id=mmsarrow markerWidth="9" markerHeight="7" refX="8.5" refY="3.5" orient=auto><path d="M0,0 L9,3.5 L0,7 z"/></marker>`+
+    `<marker id=mmsarrowo markerWidth="9" markerHeight="7" refX="8.5" refY="3.5" orient=auto><path d="M0,0 L9,3.5 L0,7" fill="none" stroke-width="1.4"/></marker>`+
+    `<marker id=mmsarrowx markerWidth="10" markerHeight="10" refX="5" refY="5" orient=auto><path d="M1,1 L9,9 M9,1 L1,9" fill="none" stroke-width="1.4"/></marker>`+
+    `<marker id=mmsarrowc markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient=auto><path d="M0,1 A4 4 0 0 1 8,4.5 A4 4 0 0 1 0,8" fill="none" stroke-width="1.4"/></marker>`+
+    `</defs>`;
+  return `<svg class=mmdsvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W.toFixed(0)} ${H.toFixed(0)}" width="${W.toFixed(0)}" height="${H.toFixed(0)}" role=img aria-label="sequence diagram">`+
+    defs+`<g transform="translate(${MMSMARGIN},0)" font-size="${MMSFS}">`+
+    blkOut.join("")+staticOut.join("")+noteOut.join("")+msgOut.join("")+`</g></svg>`;
+}
+
 function ago(sec){sec=Math.max(0,sec|0);if(sec<60)return sec+"s ago";if(sec<3600)return(sec/60|0)+"m ago";if(sec<86400)return(sec/3600|0)+"h ago";return(sec/86400|0)+"d ago"}
 function base(p){return (p||"").split("/").pop()}
 const SRC={"claude-desktop":"🖥 Desktop","cli":"⌨ CLI","sdk-cli":"⚙ SDK","claude-vscode":"⧉ VS Code","auggie":"◆ Auggie","augment-vscode":"◆ Augment (VS Code)","augment-cursor":"◆ Augment (Cursor)"};
