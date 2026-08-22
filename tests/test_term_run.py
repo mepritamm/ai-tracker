@@ -4,6 +4,7 @@ The load-bearing one is TestParseCmd.test_injection_semicolon: this feature is o
 because there is no shell, and the allowlist is what keeps it that way.
 """
 import os
+import threading
 import time
 import unittest
 
@@ -364,7 +365,8 @@ class TestCaps(unittest.TestCase):
         self.assertFalse(job.feed(b"x" * (term_run.MAX_BYTES + 4096)))
         self.assertTrue(job.truncated)
         self.assertIn(b"output truncated", bytes(job.buf))
-        self.assertEqual(len(job.buf), term_run.MAX_BYTES + len(term_run.TRUNC_MARK))
+        # MAX_BYTES is a HARD ceiling: the marker is counted inside the budget, not added to it.
+        self.assertEqual(len(job.buf), term_run.MAX_BYTES)
 
     def test_byte_cap_across_many_small_feeds(self):
         job = term_run.Job(jid="cap-test-2")
@@ -380,6 +382,14 @@ class TestCaps(unittest.TestCase):
         self.assertEqual(term_run.MAX_BYTES, 256 * 1024)
         self.assertEqual(term_run.MAX_JOBS, 3)
         self.assertEqual(term_run.TIMEOUT, 300)
+        self.assertEqual(term_run.MAX_STREAMS, 24)
+
+    def test_many_small_feeds_never_exceed_the_hard_ceiling(self):
+        job = term_run.Job(jid="cap-test-3")
+        while job.feed(b"z" * 1000):
+            pass
+        self.assertLessEqual(len(job.buf), term_run.MAX_BYTES)
+        self.assertIn(b"output truncated", bytes(job.buf))
 
 
 class TestRoutes(unittest.TestCase):
@@ -447,6 +457,218 @@ class TestRoutes(unittest.TestCase):
         h = _FakeHandler()
         term_run.kill(h, None, {"job": "nope"})
         self.assertEqual(h.calls[-1][1], 404)
+
+
+class _StreamHandler(_FakeHandler):
+    """A handler backed by one end of a real socketpair, so stream() can run its SSE loop and
+    _peer_gone() can see the client actually go away."""
+
+    def __init__(self):
+        import socket as _s
+        _FakeHandler.__init__(self)
+        self.connection, self.peer = _s.socketpair()
+        self.wfile = self.connection.makefile("wb")
+
+    def send_response(self, code):
+        pass
+
+    def send_header(self, k, v):
+        pass
+
+    def end_headers(self):
+        pass
+
+    def close_peer(self):
+        try:
+            self.peer.close()
+        except OSError:
+            pass
+
+    def close(self):
+        self.close_peer()
+        for sock in (self.wfile, self.connection):
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+class TestStreamAccounting(unittest.TestCase):
+    """MAX_STREAMS (thread exhaustion) and the per-job viewer refcount (premature `end`)."""
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._jobs0 = dict(term_run.JOBS)
+        term_run.JOBS.clear()
+        term_run._STREAMS = 0
+        self._allow0 = os.environ.pop("TRACKER_TERM_ALLOW", None)
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        for j in list(term_run.JOBS.values()):
+            j.kill()
+        term_run.JOBS.clear()
+        term_run.JOBS.update(self._jobs0)
+        term_run._STREAMS = 0
+        os.environ.pop("TRACKER_TERM_ALLOW", None)
+        if self._allow0 is not None:
+            os.environ["TRACKER_TERM_ALLOW"] = self._allow0
+
+    class _Q:
+        def __init__(self, q):
+            self.query = q
+
+    def test_stream_429s_past_max_streams(self):
+        # MAX_JOBS bounds CHILDREN; nothing bounded CONNECTIONS, and each one pins a server
+        # thread. Unbounded, enough of them take the whole dashboard down.
+        term_run.JOBS["j1"] = term_run.Job(jid="j1")
+        term_run._STREAMS = term_run.MAX_STREAMS
+        h = _FakeHandler()
+        term_run.stream(h, self._Q("job=j1"))
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 429)
+        self.assertIn("too many", obj["error"])
+        self.assertEqual(term_run.JOBS["j1"].viewers, 0)      # a refused viewer takes no slot
+        self.assertEqual(term_run._STREAMS, term_run.MAX_STREAMS)
+
+    def test_unknown_job_holds_no_stream_slot(self):
+        h = _FakeHandler()
+        term_run.stream(h, self._Q("job=nope"))
+        self.assertEqual(h.calls[-1][1], 404)
+        self.assertEqual(term_run._STREAMS, 0)
+
+    def test_finished_stream_releases_its_slot(self):
+        job = term_run.Job(jid="done1")
+        job.done, job.rc = True, 0
+        term_run.JOBS["done1"] = job
+        h = _StreamHandler()
+        term_run.stream(h, self._Q("job=done1"))
+        self.assertEqual(term_run._STREAMS, 0)
+        self.assertEqual(job.viewers, 0)
+        h.close()
+
+    def test_one_viewer_leaving_does_not_end_the_other(self):
+        # Deterministic reproduction of the premature-`end` bug: two viewers on one job, close
+        # only the first, and the second used to be handed rc=-9 immediately.
+        os.environ["TRACKER_TERM_ALLOW"] = "sleep"
+        job = term_run.spawn(os.getcwd(), term_run.parse_cmd("sleep 30"))
+        term_run.JOBS[job.id] = job
+        a, b = _StreamHandler(), _StreamHandler()
+        ta = threading.Thread(target=term_run.stream, args=(a, self._Q("job=" + job.id)))
+        tb = threading.Thread(target=term_run.stream, args=(b, self._Q("job=" + job.id)))
+        ta.daemon = tb.daemon = True
+        ta.start(); tb.start()
+        end = time.time() + 5
+        while job.viewers < 2 and time.time() < end:
+            time.sleep(0.02)
+        self.assertEqual(job.viewers, 2, "both viewers should be counted")
+        try:
+            a.close_peer()
+            ta.join(5)
+            self.assertFalse(ta.is_alive())
+            time.sleep(0.5)
+            self.assertEqual(job.viewers, 1)
+            self.assertFalse(job.done, "the surviving viewer was cut off")
+            self.assertIsNone(job.rc)
+            self.assertTrue(tb.is_alive(), "viewer B ended early")
+            b.close_peer()                       # ... and the LAST viewer leaving does kill it
+            tb.join(5)
+            _drain(job, 5)
+            self.assertTrue(job.done)
+            self.assertEqual(job.rc, -9)
+        finally:
+            job.kill()
+            a.close(); b.close()
+        self.assertEqual(term_run._STREAMS, 0)
+
+
+class TestProcessGroupKill(unittest.TestCase):
+    def setUp(self):
+        self._allow0 = os.environ.pop("TRACKER_TERM_ALLOW", None)
+
+    def tearDown(self):
+        os.environ.pop("TRACKER_TERM_ALLOW", None)
+        if self._allow0 is not None:
+            os.environ["TRACKER_TERM_ALLOW"] = self._allow0
+
+    def test_kill_reaches_a_grandchild_that_ignores_sighup(self):
+        """Signalling one pid was clean only by ACCIDENT.
+
+        pty.fork() makes the child a session leader, so its death sends SIGHUP to the foreground
+        process group -- and grandchildren happened to die of that. One that ignores SIGHUP (an
+        ordinary test-runner worker or watcher) survived the "kill" and kept running. killpg
+        reaches the whole group.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            pidfile = os.path.join(td, "grandchild.pid")
+            script = os.path.join(td, "escaper.py")
+            with open(script, "w") as f:
+                f.write(
+                    "import os, signal, sys, time\n"
+                    "if os.fork() == 0:\n"
+                    "    signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+                    "    open(%r, 'w').write(str(os.getpid()))\n"
+                    "    time.sleep(60)\n"
+                    "    os._exit(0)\n"
+                    "time.sleep(60)\n" % pidfile)
+            os.environ["TRACKER_TERM_ALLOW"] = "python3"
+            job = term_run.spawn(td, term_run.parse_cmd("python3 " + script))
+            end = time.time() + 10
+            while not os.path.exists(pidfile) and time.time() < end:
+                time.sleep(0.05)
+            self.assertTrue(os.path.exists(pidfile), "grandchild never started")
+            with open(pidfile) as f:
+                gpid = int(f.read())
+            try:
+                job.kill()
+                _drain(job, 10)
+                gone, end = False, time.time() + 5
+                while time.time() < end:
+                    try:
+                        os.kill(gpid, 0)
+                    except ProcessLookupError:
+                        gone = True
+                        break
+                    time.sleep(0.05)
+                self.assertTrue(gone, "grandchild %d survived the kill" % gpid)
+            finally:
+                try:
+                    os.kill(gpid, 9)
+                except OSError:
+                    pass
+
+
+class TestEviction(unittest.TestCase):
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._jobs0 = dict(term_run.JOBS)
+        term_run.JOBS.clear()
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        term_run.JOBS.clear()
+        term_run.JOBS.update(self._jobs0)
+
+    def _stale(self):
+        job = term_run.Job(jid="stale")
+        job.done = True
+        job.started = time.time() - 1200          # older than the 10-minute TTL
+        job.buf.extend(b"x" * 1000)
+        term_run.JOBS["stale"] = job
+
+    def test_every_route_sweeps_finished_jobs(self):
+        # The sweep used to run only on submit, so "use the panel once and never again" pinned a
+        # finished job's buffer for the life of the process.
+        for call in (lambda h: term_run.status(h, None),
+                     lambda h: term_run.kill(h, None, {"job": "nope"}),
+                     lambda h: term_run.stream(h, TestStreamAccounting._Q("job=nope"))):
+            self._stale()
+            self.assertIn("stale", term_run.JOBS)
+            call(_FakeHandler())
+            self.assertNotIn("stale", term_run.JOBS)
 
 
 if __name__ == "__main__":

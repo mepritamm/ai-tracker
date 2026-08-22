@@ -19,9 +19,12 @@ The five properties that make it defensible — none of them are negotiable:
    that would undo them; `spawn` neutralises the env-selected programs. And `cat`/`ls` would
    otherwise be an arbitrary file read as the server uid, so `check_paths` confines their path
    arguments to the session's own cwd.
-3. **Bounded everywhere.** MAX_BYTES per job (truncated with a visible marker), MAX_JOBS
-   concurrent (a 4th gets 429), TIMEOUT seconds then SIGKILL. Each SSE stream pins a
-   ThreadingHTTPServer thread; these caps are what stop a tab-refresh loop exhausting the pool.
+3. **Bounded everywhere.** MAX_BYTES per job (a hard ceiling -- the truncation marker is counted
+   inside it), MAX_JOBS concurrent children (a 4th gets 429), MAX_STREAMS concurrent SSE
+   connections (the 25th gets 429), TIMEOUT seconds then SIGKILL of the whole process group. Each
+   SSE stream pins a ThreadingHTTPServer thread, and bounding the CHILDREN never bounded the
+   CONNECTIONS: unbounded, 900 held streams drove the process into its thread ceiling, where no
+   request of any kind can get a thread -- the whole dashboard, not just this panel.
 4. **Reap on disconnect.** Every write+flush sits inside the repo's BrokenPipeError/
    ConnectionResetError guard (conventions rule 8), and a disconnect kills the job instead of
    leaking a process. The reader thread always `waitpid`s, so no zombies.
@@ -49,6 +52,7 @@ from . import server
 
 MAX_BYTES = 256 * 1024      # per job
 MAX_JOBS = 3                # concurrent
+MAX_STREAMS = 24            # concurrent SSE connections, across all jobs
 TIMEOUT = 300               # seconds, then SIGKILL
 
 TRUNC_MARK = b"\r\n\x1b[33m\xe2\x80\xa6 output truncated\x1b[0m\r\n"
@@ -100,21 +104,39 @@ _GIT_BANNED = ("--ext-diff", "--textconv", "--exec-path", "--upload-pack", "--re
                "-c", "--config-env", "--git-dir", "--work-tree", "--output")
 
 # Repo-local `.git/config` keys that name a PROGRAM for git to run, injected as `-c key=value`
-# global options so the working tree's own values lose. This list is an ENUMERATION, and an
-# enumeration is never provably complete -- git has no "ignore the local config" switch
-# (GIT_CONFIG_NOSYSTEM covers /etc/gitconfig only). What is covered and why:
-#   core.fsmonitor   runs a program on `git status` -- demonstrated against this module
-#   core.hooksPath   redirects hooks; `git status` fires post-index-change -- demonstrated
+# global options -- AFTER the allowlist has passed, so a caller writing `git -c ...` themselves
+# still fails the prefix test -- so that the working tree's own values lose.
+#
+# READ THIS BEFORE TRUSTING IT. Running git inside a repository whose `.git/config` you do not
+# control is CODE EXECUTION BY GIT'S OWN DESIGN, and an allowlist cannot make it otherwise. git
+# has no "ignore the local config" switch (GIT_CONFIG_NOSYSTEM covers /etc/gitconfig only). What
+# follows is an ENUMERATION of the exec points reachable from the allowlisted subcommands, and an
+# enumeration is never proven complete.
+#
+# Closed here, each one demonstrated firing before the override was added:
+#   core.fsmonitor   runs a program on `git status`
+#   core.hooksPath   redirects hooks; `git status` fires post-index-change
 #   diff.external    the repo-wide external diff driver (--no-ext-diff also kills it; belt)
-#   core.pager / core.editor  belt to the PAGER/GIT_PAGER/GIT_EDITOR env vars set in spawn()
-#   gpg.program      runs on `git log --show-signature`, which is an allowlisted prefix
-# NOT covered, honestly: `filter.<name>.clean/smudge` is keyed by a driver NAME chosen in the
-# tree's .gitattributes, so there is no fixed key to override. A hostile `.git/config` remains
-# the residual risk of running git at all; the flags and keys here remove the known paths.
+#   core.pager       belt to the PAGER/GIT_PAGER env vars set in spawn()
+#   core.editor      runs on `git branch --edit-description`; belt to GIT_EDITOR
+#   gpg.program      runs on `git log --show-signature`, an allowlisted prefix
+# Closed by argv instead: the external diff driver and textconv filter, via _harden_git's
+# --no-ext-diff/--no-textconv, plus the _GIT_BANNED refusal of the flags that would undo them.
+#
+# NOT closed, and named rather than implied away: `filter.<name>.clean/smudge` is keyed by a
+# driver NAME the tree's own .gitattributes chooses, so there is no fixed key to override;
+# `core.sshCommand`, `credential.helper`, `core.gitProxy` and `uploadpack.packObjectsHook` need a
+# network subcommand that is not allowlisted today, but they are one allowlist entry away.
+#
+# THE THREAT MODEL, plainly. The cwd comes from the user's own session logs, so this is not a
+# path an anonymous caller picks. The realistic exposure is a maliciously-crafted repository the
+# user has cloned, plus someone holding the tracker password -- and Tier 1 established that
+# `make tunnel` can put that password on the public internet. Narrow, but real.
 _GIT_SAFE_CONFIG = ("core.fsmonitor=false", "core.hooksPath=/dev/null", "diff.external=",
                     "core.pager=cat", "core.editor=true", "gpg.program=false")
 
 JOBS = {}                   # id -> Job
+_STREAMS = 0                # open SSE connections; guarded by _LOCK
 _LOCK = threading.Lock()
 
 
@@ -238,6 +260,7 @@ class Job:
         self.rc = None
         self.truncated = False
         self.started = time.time()
+        self.viewers = 0        # open SSE connections; guarded by _LOCK, not self.lock
         self.lock = threading.Lock()
 
     def feed(self, data):
@@ -246,7 +269,9 @@ class Job:
         with self.lock:
             if self.truncated:
                 return False
-            room = MAX_BYTES - len(self.buf)
+            # The marker is counted INSIDE the budget, so MAX_BYTES is a hard ceiling on
+            # len(buf) rather than a ceiling plus 33 bytes.
+            room = MAX_BYTES - len(self.buf) - len(TRUNC_MARK)
             if len(data) < room:
                 self.buf.extend(data)
                 return True
@@ -257,10 +282,26 @@ class Job:
         return False
 
     def kill(self):
-        """SIGKILL the child if it is still ours to kill. Reaping happens in the reader thread."""
+        """SIGKILL the child's whole PROCESS GROUP. Reaping happens in the reader thread.
+
+        Signalling the single pid was only ever clean by accident: pty.fork() makes the child a
+        session leader, so when it dies the kernel sends SIGHUP to the foreground group -- and the
+        grandchildren happened to die of that. A grandchild that ignores SIGHUP (ordinary for a
+        test-runner worker pool or a watcher) survived and kept running after the job was marked
+        done. killpg reaches the whole group.
+
+        Honest limit: a grandchild that calls setsid() leaves this process group entirely, and
+        nothing here can follow it. Containing a deliberate daemoniser needs a sandbox this module
+        does not have; what is fixed is the common case of a multi-process tree that merely
+        declines to die of SIGHUP.
+        """
         if self.pid > 0 and not self.done:
             try:
-                os.kill(self.pid, signal.SIGKILL)
+                os.killpg(os.getpgid(self.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                os.kill(self.pid, signal.SIGKILL)       # belt, if getpgid already failed
             except (ProcessLookupError, PermissionError, OSError):
                 pass
 
@@ -357,7 +398,14 @@ def _live_count():
 
 
 def _reap_old():
-    """Drop finished jobs older than 10 minutes so JOBS cannot grow without bound."""
+    """Drop finished jobs older than 10 minutes so JOBS cannot grow without bound.
+
+    Called from EVERY terminal route, not just run(). When it only ran on submit, a finished job's
+    buffer stayed pinned until someone happened to start another job -- "use the panel once, never
+    again" held up to MAX_BYTES for the life of the process. The ceiling is still
+    MAX_JOBS-in-flight plus whatever finished within the last 10 minutes; nothing sweeps in the
+    background, because a daemon thread for this would be more machinery than the bound is worth.
+    """
     cut = time.time() - 600
     for jid in [j.id for j in JOBS.values() if j.done and j.started < cut]:
         JOBS.pop(jid, None)
@@ -373,8 +421,10 @@ def status(handler, parsed):
     leaks nothing a caller past guard() couldn't get by trying commands one at a time."""
     if not term_gate.guard(handler):
         return
+    with _LOCK:
+        _reap_old()
     handler._json({"ok": True, "allow": allowlist(), "max_bytes": MAX_BYTES,
-                   "max_jobs": MAX_JOBS, "timeout": TIMEOUT})
+                   "max_jobs": MAX_JOBS, "max_streams": MAX_STREAMS, "timeout": TIMEOUT})
 
 
 def run(handler, parsed, body):
@@ -422,26 +472,67 @@ def _peer_gone(handler):
 
 
 def _write(handler, job, text):
-    """One SSE write+flush inside the repo's disconnect guard (conventions rule 8). A dead client
-    means the job has no audience: kill it rather than leak a process for the full TIMEOUT."""
+    """One SSE write+flush inside the repo's disconnect guard (conventions rule 8). Returns False
+    once this client is gone.
+
+    It does NOT kill the job: killing is stream()'s job, and only once the LAST viewer has left.
+    The old version killed on any writer's disconnect, so with two viewers on one job, closing one
+    tab handed the other a premature `event: end` with rc=-9."""
     try:
         handler.wfile.write(text.encode())
         handler.wfile.flush()
         return True
     except (BrokenPipeError, ConnectionResetError):
-        job.kill()
         return False
 
 
 def stream(handler, parsed):
-    """GET /api/term/stream?job=<id> -> text/event-stream of the job's output, then `end`."""
+    """GET /api/term/stream?job=<id> -> text/event-stream of the job's output, then `end`.
+
+    Two accounting jobs happen here, both under _LOCK:
+
+    * **A slot out of MAX_STREAMS.** MAX_JOBS bounds how many CHILDREN run; nothing bounded how
+      many SSE CONNECTIONS were open, and each one pins a ThreadingHTTPServer thread for its whole
+      life. Measured, 900 connections held open against one job: unbounded, all 900 were accepted
+      and the process plateaued at its hard thread ceiling (512 on this machine), so further
+      handler threads could not start at all; with the cap, 24 are served and 876 get an immediate
+      429, leaving 27 threads. A tab-refresh loop reaches those numbers on its own.
+      Honest note: /api/list latency itself did NOT visibly degrade in that harness (~0.1s either
+      way). The failure being prevented is thread exhaustion, not slow responses.
+    * **A viewer refcount on the job.** The child is killed when the LAST viewer leaves, not the
+      first: with two tabs open on one job, closing one used to hand the other `event: end` with
+      rc=-9 at once. A tab refresh raced the same way.
+    """
+    global _STREAMS
     if not term_gate.guard(handler):
         return
     from urllib.parse import parse_qs
     jid = parse_qs(parsed.query).get("job", [""])[0]
-    job = JOBS.get(jid)
-    if not job:
+    with _LOCK:
+        _reap_old()
+        job = JOBS.get(jid)
+        busy = job is not None and _STREAMS >= MAX_STREAMS
+        if job is not None and not busy:
+            _STREAMS += 1
+            job.viewers += 1
+    if job is None:                                  # returns in ~5ms, holds no thread
         return handler._json({"error": "no such job", "job": jid}, 404)
+    if busy:
+        return handler._json({"error": "too many open output streams (max %d)" % MAX_STREAMS}, 429)
+    try:
+        _stream_body(handler, job)
+    finally:
+        with _LOCK:
+            _STREAMS -= 1
+            job.viewers -= 1
+            last = job.viewers <= 0
+        if last:                                     # no audience left: don't leak the process
+            job.kill()
+
+
+def _stream_body(handler, job):
+    """The SSE loop itself. Returns on client disconnect or on the job's `end` event; the caller
+    owns the stream slot and the viewer refcount, so this never kills anything."""
     try:
         handler.send_response(200)
         handler.send_header("Content-Type", "text/event-stream")
@@ -449,7 +540,6 @@ def stream(handler, parsed):
         handler.send_header("Connection", "close")      # no Content-Length: the body is open-ended
         handler.end_headers()
     except (BrokenPipeError, ConnectionResetError):
-        job.kill()
         return
     off, quiet = 0, time.time()
     while True:
@@ -458,6 +548,9 @@ def stream(handler, parsed):
         if chunk:
             off += len(chunk)
             quiet = time.time()
+            # A multi-byte character split across two PTY reads decodes to U+FFFD here. That is
+            # mojibake on one character, never an exception -- errors="replace" is the ceiling we
+            # accept rather than carrying a decoder's partial state across chunks.
             payload = json.dumps({"b": chunk.decode("utf-8", "replace")})
             if not _write(handler, job, "data: %s\n\n" % payload):
                 return
@@ -467,7 +560,6 @@ def stream(handler, parsed):
             return
         else:
             if _peer_gone(handler):                      # instant: the tab closed
-                job.kill()
                 return
             if time.time() - quiet > 10:                 # heartbeat: keeps proxies from idling us
                 quiet = time.time()                      # out, and is the backstop detector
@@ -480,7 +572,9 @@ def kill(handler, parsed, body):
     """POST /api/term/kill {job} -> {ok}."""
     if not term_gate.guard(handler):
         return
-    job = JOBS.get(body.get("job") or "")
+    with _LOCK:
+        _reap_old()
+        job = JOBS.get(body.get("job") or "")
     if not job:
         return handler._json({"error": "no such job"}, 404)
     job.kill()
