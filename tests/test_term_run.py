@@ -53,16 +53,20 @@ class _NoInheritedGit:
     Not hygiene theatre: this suite is run by the repo's pre-commit hook, and git exports GIT_DIR
     and GIT_INDEX_FILE into a hook's environment. A test that shells out to `git` in a temp repo
     would then operate on THIS repository instead -- which is exactly what happened once, landing
-    a stray commit. term_run.spawn() hands the child os.environ, so the same applies to it.
+    a stray commit. term_run.spawn() hands the child os.environ, so the same applies to it, which
+    is why the fix lives in the product (strip_git_env) and not only here.
+
+    The scrub itself is term_run.strip_git_env -- the same call spawn() makes, so there is one
+    source of truth for "what git environment must not survive" rather than two lists that drift.
     """
 
     def __enter__(self):
         self.saved = {k: v for k, v in os.environ.items() if k.startswith("GIT_")}
-        for k in self.saved:
-            os.environ.pop(k, None)
+        term_run.strip_git_env(os.environ)
         return self
 
     def __exit__(self, *exc):
+        term_run.strip_git_env(os.environ)      # also drops anything the block itself set
         os.environ.update(self.saved)
         return False
 
@@ -341,6 +345,44 @@ class TestSpawn(unittest.TestCase):
             touch()
             _drain(term_run.spawn(repo, term_run.parse_cmd("git status")))
             self.assertFalse(fired(), "core.hooksPath hook ran")
+
+    def test_spawn_drops_an_inherited_git_dir(self):
+        """An inherited GIT_DIR must not decide which repository a job acts on.
+
+        Without strip_git_env the child inherits the parent's GIT_DIR and `git log` reports the
+        DECOY's history while the panel claims it ran in the session's cwd.
+        """
+        import subprocess
+        import tempfile
+        with _NoInheritedGit(), tempfile.TemporaryDirectory() as td:
+            clean = dict(os.environ)                 # already GIT_*-free
+            clean["GIT_CONFIG_GLOBAL"] = "/dev/null"
+            clean["GIT_CONFIG_SYSTEM"] = "/dev/null"
+
+            def mkrepo(name, subject):
+                repo = os.path.join(td, name)
+                os.mkdir(repo)
+                for a in (("init", "-q"), ("config", "user.email", "s@s"),
+                          ("config", "user.name", "s")):
+                    subprocess.run(("git", "-C", repo) + a, check=True, env=clean,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                with open(os.path.join(repo, "f"), "w") as f:
+                    f.write(name)
+                for a in (("add", "f"), ("commit", "-qm", subject)):
+                    subprocess.run(("git", "-C", repo) + a, check=True, env=clean,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return repo
+
+            real = mkrepo("real", "REAL-COMMIT-SUBJECT")
+            decoy = mkrepo("decoy", "DECOY-COMMIT-SUBJECT")
+            os.environ["GIT_DIR"] = os.path.join(decoy, ".git")   # as a git hook would set it
+            os.environ["GIT_WORK_TREE"] = decoy
+            job = _drain(term_run.spawn(real, term_run.parse_cmd("git log --oneline -1")))
+            out = bytes(job.buf)
+            self.assertIn(b"REAL-COMMIT-SUBJECT", out,
+                          "job did not act on its own cwd: %r" % out[:200])
+            self.assertNotIn(b"DECOY-COMMIT-SUBJECT", out,
+                             "inherited GIT_DIR retargeted the job: %r" % out[:200])
 
     def test_no_zombie_left_behind(self):
         os.environ["TRACKER_TERM_ALLOW"] = "echo"

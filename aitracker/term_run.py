@@ -132,6 +132,29 @@ _GIT_BANNED = ("--ext-diff", "--textconv", "--exec-path", "--upload-pack", "--re
 # path an anonymous caller picks. The realistic exposure is a maliciously-crafted repository the
 # user has cloned, plus someone holding the tracker password -- and Tier 1 established that
 # `make tunnel` can put that password on the public internet. Narrow, but real.
+def strip_git_env(env):
+    """Drop every INHERITED `GIT_*` variable from `env`, in place. The single source of truth for
+    "what git environment must not survive into a job" -- the test suite's own scrub calls this.
+
+    Why the product needs it, not just the tests. git exports GIT_DIR, GIT_INDEX_FILE, GIT_PREFIX
+    and friends into the environment of any hook it runs. If this server is ever started from
+    inside a hook (or from any shell that has them set), a `git` job would inherit them and quietly
+    operate on THAT repository instead of the session's cwd -- the panel would say one directory
+    and git would act on another, and `check_paths`' confinement would be describing a cwd the git
+    child is not using. This is not hypothetical: the same inheritance, reaching the test suite
+    through the repo's pre-commit hook, once redirected the suite's throwaway `git config` calls
+    onto the real repository and corrupted it.
+
+    Scrubbing by PREFIX rather than by a list of names is deliberate: a list is a second thing to
+    keep in sync, and the prefix also catches the env-side exec vectors (GIT_EXTERNAL_DIFF,
+    GIT_SSH, GIT_ASKPASS) for free. Nothing is lost -- no allowlisted command does network work,
+    and spawn() sets the few GIT_* it actually wants AFTER calling this.
+    """
+    for k in [k for k in env if k.startswith("GIT_")]:
+        env.pop(k, None)
+    return env
+
+
 _GIT_SAFE_CONFIG = ("core.fsmonitor=false", "core.hooksPath=/dev/null", "diff.external=",
                     "core.pager=cat", "core.editor=true", "gpg.program=false")
 
@@ -342,6 +365,9 @@ def spawn(cwd, argv):
             os.environ["TERM"] = "xterm-256color"
             os.environ["COLUMNS"] = "120"
             os.environ["LINES"] = "30"
+            # Inherited GIT_* would silently retarget a git job at another repository -- see
+            # strip_git_env. Everything below this line is deliberately set, so it must come first.
+            strip_git_env(os.environ)
             # A PTY makes git/less think they are interactive; without these, `git log` would sit
             # in the pager forever and the job would only end at TIMEOUT.
             os.environ["PAGER"] = "cat"
