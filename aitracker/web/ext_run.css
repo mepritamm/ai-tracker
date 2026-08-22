@@ -1,0 +1,31 @@
+/* Tier 2 — command runner pane. Reuses app.css tokens (--card/--line/--muted/…) so the panel is
+   indistinguishable from the native cards in both themes; only the output pane and the SGR
+   colour classes are new. */
+.runbar{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.runinput{flex:1;min-width:0;background:var(--chipbg);border:1px solid var(--line3);border-radius:6px;
+  color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px;padding:6px 9px;outline:0}
+.runinput:focus{border-color:var(--blue)}
+.runhint{color:var(--dim);font-size:10.5px;font-family:'JetBrains Mono',monospace;margin-bottom:8px;overflow-wrap:anywhere}
+.runout{margin:0;padding:10px 12px;max-height:320px;overflow:auto;background:var(--app);
+  border:1px solid var(--line);border-radius:8px;color:var(--text);
+  font-family:'JetBrains Mono',monospace;font-size:11.5px;line-height:1.45;
+  white-space:pre-wrap;overflow-wrap:anywhere}
+.runout:empty{display:none}
+
+/* SGR classes emitted by ext_run.js — nothing else in the output becomes markup. */
+.runout .ab{font-weight:700}
+.runout .ai{font-style:italic}
+.runout .au{text-decoration:underline}
+.runout .ar{background:var(--text);color:var(--app)}
+.runout .a30,.runout .a90{color:var(--dim)}
+.runout .a31,.runout .a91{color:var(--red)}
+.runout .a32,.runout .a92{color:var(--green)}
+.runout .a33,.runout .a93{color:var(--amber)}
+.runout .a34,.runout .a94{color:var(--blue)}
+.runout .a35,.runout .a95{color:var(--violet)}
+.runout .a36,.runout .a96{color:var(--ring2)}
+.runout .a37,.runout .a97{color:var(--head)}
+.runout .a41{background:var(--red-bg)}
+.runout .a42{background:var(--green-bg)}
+.runout .a43{background:var(--amber-bg)}
+.runout .a44{background:var(--blue-deep)}
