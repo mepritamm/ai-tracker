@@ -15,7 +15,7 @@ the source badge distinguishes the IDE — mirrors Claude's per-surface
 import glob, json, os, time, urllib.parse
 from .. import config
 from ..store import load_titles, load_notes, _load_json
-from ..util import _first_line, push_when
+from ..util import _first_line, push_when, _window, _git_branch
 from .base import Provider
 
 
@@ -219,7 +219,7 @@ def _parse(kind, prefix, src_label, sid):
 
     return {
         "meta": {"cwd": folder, "title": title, "source": src_label, "entrypoint": src_label,
-                 "gitBranch": "", "model": ""},
+                 "gitBranch": _git_branch(folder), "model": ""},
         "todos": todos,
         "files": files, "reads": [], "commands": [], "commits": [], "tests": [],
         "requests": [], "agents": [], "agents_bg": [], "agent_sessions": [], "shells": [],
@@ -248,27 +248,41 @@ def _parse(kind, prefix, src_label, sid):
 
 
 def _search(kind, prefix, src_label, q, limit=500):
-    """Match task name/description and touched-file paths; same shape as search_auggie()."""
+    """Match task name/description; emits the FULL shared search-result shape —
+    {id, project, title, agent, matches, snippet, inQuery, titleMatch, mtime} —
+    same as ClaudeProvider.search()/search_auggie(), so renderSide() (web/app.js)
+    can draw an augment-ext hit exactly like any other source."""
     ql = (q or "").strip().lower()
     if not ql:
         return []
     terms = ql.split()
     hits = []
     for ws, aug_dir, folder in _scan_workspaces(kind):
-        allmap = {u: t for u, t, _ in _iter_tasks(aug_dir)}
-        # per-task title + description
         for uu, task, mt_file in _iter_tasks(aug_dir):
             title = _title_for(task, folder)
-            body = " ".join([(task.get("name") or ""), (task.get("description") or "")])
-            hay = (title + " " + body).lower()
-            if all(t in hay for t in terms):
-                gid = "%s%s:%s" % (prefix, ws, uu)
-                hits.append({"id": gid, "titleMatch": all(t in title.lower() for t in terms),
-                             "inQuery": all(t in body.lower() for t in terms),
-                             "mtime": _mtime_of(task, aug_dir) or mt_file,
-                             "text": title, "source": src_label})
-                if len(hits) >= limit:
-                    return hits
+            body = task.get("description") or ""
+            tl, bl = title.lower(), body.lower()
+            hay = tl + " " + bl
+            if not all(t in hay for t in terms):
+                continue
+            title_match = all(t in tl for t in terms)
+            in_query = bool(body) and all(t in bl for t in terms)
+            count = sum(hay.count(t) for t in terms)
+            if ql in bl:
+                snippet = _window(body, ql)
+            else:
+                hit = next((t for t in terms if t in bl), None)
+                snippet = _window(body, hit) if hit else ""
+            gid = "%s%s:%s" % (prefix, ws, uu)
+            hits.append({
+                "id": gid, "project": os.path.basename(folder) if folder else "Augment",
+                "title": title, "agent": False,
+                "matches": count, "snippet": snippet, "inQuery": in_query,
+                "titleMatch": title_match,
+                "mtime": _mtime_of(task, aug_dir) or mt_file,
+            })
+            if len(hits) >= limit:
+                return hits
     return hits
 
 

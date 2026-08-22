@@ -199,6 +199,69 @@ class TestProviderEndToEnd(unittest.TestCase):
         self.assertFalse(p.available())
         self.assertEqual(p.list(), [])
 
+    def test_search_result_shape_matches_shared_contract(self):
+        """search() must emit the FULL shared search-result shape — {id, project,
+        title, agent, matches, snippet, inQuery, titleMatch, mtime} — the same keys
+        ClaudeProvider.search()/search_auggie() emit. It used to emit {id, titleMatch,
+        inQuery, mtime, text, source} instead, so renderSide() (web/app.js), which
+        reads s.title/s.project/s.matches/s.snippet, drew "undefined×" search rows
+        for every augment-vscode/augment-cursor hit."""
+        _mk_workspace(config.VSCODE_WS_ROOT, "wshash2", "file:///Users/me/proj%20two",
+                      tasks=[
+                          {"uuid": "t1", "name": "fix the parser bug", "state": "NOT_STARTED",
+                           "description": "root cause was a stray token in the lexer",
+                           "lastUpdated": 1700000000000},
+                      ])
+        p = AugmentVscodeProvider()
+        expected_keys = {"id", "project", "title", "agent", "matches", "snippet",
+                          "inQuery", "titleMatch", "mtime"}
+
+        # term only in the title, not the description -> no snippet, inQuery False
+        hits = p.search("parser")
+        self.assertEqual(len(hits), 1)
+        h = hits[0]
+        self.assertEqual(set(h.keys()), expected_keys)
+        self.assertEqual(h["id"], "augment-vscode:wshash2:t1")
+        self.assertEqual(h["project"], "proj two")           # URL-decoded workspace folder basename
+        self.assertEqual(h["title"], "fix the parser bug")
+        self.assertIs(h["agent"], False)
+        self.assertTrue(h["titleMatch"])
+        self.assertFalse(h["inQuery"], "term only in the title, not the description")
+        self.assertEqual(h["snippet"], "")
+
+        # term only in the description -> inQuery True, a real snippet around the hit
+        hits2 = p.search("lexer")
+        self.assertEqual(len(hits2), 1)
+        h2 = hits2[0]
+        self.assertEqual(set(h2.keys()), expected_keys)
+        self.assertFalse(h2["titleMatch"])
+        self.assertTrue(h2["inQuery"])
+        self.assertEqual(h2["matches"], 1)
+        self.assertIn("lexer", h2["snippet"])
+
+    def test_gitbranch_filled_from_folder_like_auggie(self):
+        """meta.gitBranch used to be hardcoded "" even though the workspace folder
+        is known — now reads the real branch via util._git_branch(folder), the same
+        helper AuggieProvider already uses (providers/auggie.py) to reach parity."""
+        tmp = tempfile.mkdtemp()
+        repo = os.path.join(tmp, "repo")
+        os.makedirs(os.path.join(repo, ".git"))
+        with open(os.path.join(repo, ".git", "HEAD"), "w") as f:
+            f.write("ref: refs/heads/feature-x\n")
+        _mk_workspace(config.VSCODE_WS_ROOT, "wshash3", "file://" + repo,
+                      tasks=[{"uuid": "root", "name": "Current Task List", "state": "NOT_STARTED",
+                              "lastUpdated": 1700000000000}])
+        p = AugmentVscodeProvider()
+        d = p.parse("augment-vscode:wshash3:root")
+        self.assertEqual(d["meta"]["gitBranch"], "feature-x")
+
+        # a workspace folder with no .git at all -> empty string, no crash
+        _mk_workspace(config.VSCODE_WS_ROOT, "wshash4", "file:///no/such/repo",
+                      tasks=[{"uuid": "root", "name": "Current Task List", "state": "NOT_STARTED",
+                              "lastUpdated": 1700000000000}])
+        d2 = p.parse("augment-vscode:wshash4:root")
+        self.assertEqual(d2["meta"]["gitBranch"], "")
+
 
 if __name__ == "__main__":
     unittest.main()
