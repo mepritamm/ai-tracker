@@ -1,0 +1,15 @@
+/* Tier 1 launch buttons — reuses .mini's existing tokens (chipbg/line3/muted/blue) rather than
+   inventing a new button style. */
+#ext_launch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: -6px 0 4px;
+}
+#ext_launch:empty {
+  display: none;
+}
+.extlaunchbtn {
+  padding: 6px 12px;
+  font-size: 12px;
+}
