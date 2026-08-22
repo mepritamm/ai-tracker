@@ -4,10 +4,9 @@ from urllib.parse import urlparse, parse_qs
 from . import config                       # referenced live (config.AUTH) so tests/env see one source
 from .config import LIVE_WINDOW, NARR_PAGE
 from .page import build_page
-from .registry import all_sessions, parse_any, search_all, search_session
+from .registry import all_sessions, parse_any, search_all, search_session, drill
 from .store import load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, _load_json, _save_json
 from .config import TITLES_FILE, FLAGS_FILE, PINS_FILE, NOTES_FILE
-from .providers.claude import find_session, file_diffs, command_output, shell_output, agent_detail
 
 # ponytail: route seam for optional feature modules (the terminal tiers). A module registers its
 # own routes here on import instead of server.py forking a per-feature elif chain. See the loader
@@ -181,11 +180,11 @@ class Handler(BaseHTTPRequestHandler):
         elif p.path == "/api/diff":
             qs = parse_qs(p.query)
             sid, fp = qs.get("id", [""])[0], qs.get("file", [""])[0]
-            path = find_session(sid)
-            if not path:
+            ops = drill(sid, "diff", fp)          # provider seam, not one source's lookup
+            if ops is None:
                 self._json({"error": "session not found", "id": sid}, 404)
                 return
-            self._json({"file": fp, "ops": file_diffs(path, fp)})
+            self._json({"file": fp, "ops": ops})
         elif p.path == "/api/file":
             # ponytail: local single-user tool — reads the file at the given path
             # (paths come from the session's own edits) with a size cap.
@@ -203,27 +202,27 @@ class Handler(BaseHTTPRequestHandler):
         elif p.path == "/api/output":
             qs = parse_qs(p.query)
             sid, cid = qs.get("id", [""])[0], qs.get("cmd", [""])[0]
-            path = find_session(sid)
-            if not path:
+            d = drill(sid, "output", cid)
+            if d is None:
                 self._json({"error": "session not found", "id": sid}, 404)
                 return
-            self._json(command_output(path, cid))
+            self._json(d)
         elif p.path == "/api/shell":
             qs = parse_qs(p.query)
             sid, shid = qs.get("id", [""])[0], qs.get("shell", [""])[0]
-            path = find_session(sid)
-            if not path:
+            d = drill(sid, "shell", shid)
+            if d is None:
                 self._json({"error": "session not found", "id": sid}, 404)
                 return
-            self._json(shell_output(path, shid))
+            self._json(d)
         elif p.path == "/api/agent":
             qs = parse_qs(p.query)
             sid, aid = qs.get("id", [""])[0], qs.get("agent", [""])[0]
-            path = find_session(sid)
-            if not path:
+            d = drill(sid, "agent", aid)
+            if d is None:
                 self._json({"error": "session not found", "id": sid}, 404)
                 return
-            self._json(agent_detail(path, aid))
+            self._json(d)
         elif p.path == "/api/session":
             sid = parse_qs(p.query).get("id", [""])[0]
             try:

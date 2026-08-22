@@ -1,7 +1,7 @@
 import glob, json, os, re, time
 from ..config import LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified
 from ..overview import build_overview
 from ..store import load_titles, load_tasks, load_notes
 from .base import Provider
@@ -169,15 +169,85 @@ def list_auggie():
     return out
 
 
-def parse_auggie(session_id):
+def _tool_input(call):
+    """A tool_use's input_json — Auggie writes it as a JSON *string* in real logs
+    (a dict in older ones / fixtures). Always hand back a dict."""
+    inp = call.get("input_json")
+    if isinstance(inp, str):
+        try:
+            inp = json.loads(inp)
+        except ValueError:
+            inp = {}
+    return inp if isinstance(inp, dict) else {}
+
+
+def _edit_pairs(inp):
+    """The (old, new) string pairs of one str-replace-editor call, in order.
+    Auggie numbers multi-edits `old_str_1/new_str_1 … old_str_N/new_str_N`; some
+    calls use the unnumbered `old_str/new_str`, and `command:"insert"` supplies
+    only `new_str_N` (an insertion — nothing removed)."""
+    pairs = []
+    if "old_str" in inp or "new_str" in inp:
+        pairs.append((inp.get("old_str") or "", inp.get("new_str") or ""))
+    n = 1
+    while ("old_str_%d" % n) in inp or ("new_str_%d" % n) in inp:
+        pairs.append((inp.get("old_str_%d" % n) or "", inp.get("new_str_%d" % n) or ""))
+        n += 1
+    return pairs
+
+
+def _abs(p, cwd):
+    """Auggie logs most edit paths RELATIVE to the session's cwd (397 of 427
+    str-replace-editor calls on this machine). Anchor them so the Files panel and
+    its /api/file full-text lookup point at a real path, like Claude's absolute ones."""
+    if not p:
+        return p
+    return p if os.path.isabs(p) else (os.path.join(cwd, p) if cwd else p)
+
+
+def _touch(files, path, ts, created=False):
+    """Record one edit on the shared files entry ({path, ops, created, last}) —
+    the same shape parse_session() builds for Claude, so one renderer serves both."""
+    e = files.setdefault(path, {"path": path, "ops": 0, "created": created})
+    e["ops"] += 1
+    e["last"] = ts
+    if created:
+        e["created"] = True
+    return e
+
+
+def _load_auggie(session_id):
     f = os.path.join(config.AUGGIE_SESSIONS, session_id + ".json")
     if not os.path.isfile(f):
-        return None
+        return None, None
     try:
-        d = json.load(open(f, encoding="utf-8"))
+        return json.load(open(f, encoding="utf-8")), f
     except (OSError, ValueError):
+        return None, None
+
+
+def _auggie_results(d):
+    """tool_use_id -> tool_result_node. Auggie files every tool result under the
+    NEXT exchange's `request_nodes`, and every one of them carries `is_error` and
+    the verbatim `content` — the join that gives commands their ok flag and their
+    output (Claude's `errors_by_id` equivalent)."""
+    out = {}
+    for m in d.get("chatHistory") or []:
+        for rn in (m.get("exchange") or {}).get("request_nodes") or []:
+            trn = rn.get("tool_result_node") if isinstance(rn, dict) else None
+            if isinstance(trn, dict) and trn.get("tool_use_id"):
+                out[trn["tool_use_id"]] = trn
+    return out
+
+
+def parse_auggie(session_id):
+    d, f = _load_auggie(session_id)
+    if d is None:
         return None
     requests, narrative, files, cmds, reads, commits = [], [], {}, [], {}, []
+    agents = []       # sub-agent-* dispatches (~ Claude's Task) — {t, type, desc}
+    errors_by_id = {} # tool_use_id -> True, from tool_result_node.is_error (~ Claude's map)
+    ide_cwd = _auggie_ide_cwd(d)   # needed inside the loop to anchor relative edit paths
     asks = {}         # tool_use_id -> ask-user decision {t, open, answer, questions} (parity with Claude)
     prs = {}          # url -> entry : PR/MR links touched this session (parity with Claude)
     pr_states = {}    # num -> "merged"/"closed" : state signals seen in logs (overlaid at the end)
@@ -194,9 +264,13 @@ def parse_auggie(session_id):
     for i, m in enumerate(d.get("chatHistory") or []):
         ex = m.get("exchange") or {}
         ts = m.get("finishedAt")
-        for rn in ex.get("request_nodes") or []:              # the user's answer to a prior ask-user lands here
+        for rn in ex.get("request_nodes") or []:              # every tool RESULT lands here
             trn = rn.get("tool_result_node") if isinstance(rn, dict) else None
-            if isinstance(trn, dict) and trn.get("tool_use_id") in asks:
+            if not isinstance(trn, dict):
+                continue
+            if trn.get("is_error"):                           # Auggie DOES store exit status
+                errors_by_id[trn.get("tool_use_id")] = True
+            if trn.get("tool_use_id") in asks:                # the user's answer to a prior ask-user
                 c = trn.get("content") or ""
                 asks[trn["tool_use_id"]]["answer"] = re.sub(r"^User responded:\s*", "", c).strip()[:2000]
                 asks[trn["tool_use_id"]]["open"] = False
@@ -208,13 +282,7 @@ def parse_auggie(session_id):
                 tok_out += tu.get("output_tokens") or 0
             call = rn.get("tool_use")               # commands/reads, from Auggie's tools
             if isinstance(call, dict):
-                inp = call.get("input_json")
-                if isinstance(inp, str):
-                    try:
-                        inp = json.loads(inp)
-                    except ValueError:
-                        inp = {}
-                inp = inp if isinstance(inp, dict) else {}
+                inp = _tool_input(call)
                 name = call.get("tool_name")
                 if name and "create_pull_request" in name:   # MCP PR creation in this exchange
                     pr_creates.append(i)
@@ -226,13 +294,24 @@ def parse_auggie(session_id):
                     c = inp["command"]
                     k = cmd_kind(c)
                     cmds.append({"id": call.get("tool_use_id"), "t": ts, "cmd": c[:200],
-                                 "kind": k, "ok": True})   # Auggie stores no exit status
+                                 "kind": k})    # `ok` joined from tool_result_node.is_error below
                     if PR_CREATE_RE.search(c):
                         pr_creates.append(i)
                     _cprs(c)                              # a command's PR ref alone isn't "worked on"
                     if k == "commit":
                         mm = COMMIT_MSG_RE.search(c)
                         commits.append({"t": ts, "msg": (mm.group(2) if mm else c)[:120]})
+                elif name == "save-file" and inp.get("path"):          # ~ Claude's Write
+                    _touch(files, _abs(inp["path"], ide_cwd), ts, created=True)
+                elif name == "str-replace-editor" and inp.get("path"):  # ~ Claude's Edit/MultiEdit
+                    _touch(files, _abs(inp["path"], ide_cwd), ts)
+                elif name == "remove-files":                            # deleted files are touched files
+                    for p in inp.get("file_paths") or []:
+                        if isinstance(p, str) and p:
+                            _touch(files, _abs(p, ide_cwd), ts)
+                elif name and name.startswith("sub-agent-"):   # ~ Claude's Task
+                    agents.append({"t": ts, "type": (name[len("sub-agent-"):] or "agent"),
+                                   "desc": (inp.get("name") or inp.get("instruction") or "")[:80]})
                 elif name == "view" and inp.get("path") and inp.get("type") != "directory":
                     reads[inp["path"]] = ts           # ~ Claude's Read
                 elif name == "ask-user":              # Auggie's user-question tool (~ Claude's AskUserQuestion)
@@ -248,20 +327,24 @@ def parse_auggie(session_id):
         if isinstance(resp, str) and resp.strip():
             narrative.append({"t": ts, "text": resp.strip()[:NARRATION_CAP]})
             _cprs(resp, narr=True)                        # PR the assistant narrates about (shown if same-repo)
-        for cf in m.get("changedFiles") or []:
+        # legacy/optional: some builds also summarise the exchange's edits here. Empty in
+        # every session on this machine (0 across 85), so the tool branches above are the
+        # real source — this stays only so a build that does emit it isn't ignored.
+        for cf in (m.get("changedFiles") or []) + (ex.get("changedFiles") or []):
             p = cf if isinstance(cf, str) else (cf.get("path") or cf.get("filePath") or cf.get("file"))
             if p:
-                fe = files.setdefault(p, {"path": p, "ops": 0, "created": False})
-                fe["ops"] += 1
-                fe["last"] = ts
-    # Auggie logs no command output, and a created PR's URL only appears in a later narration
-    # line — so tie each `gh pr create` to the first new PR URL at or after its exchange.
+                _touch(files, _abs(p, ide_cwd), ts)
+    # annotate commands with pass/fail from the error map — same join as Claude's
+    for c in cmds:
+        c["ok"] = not errors_by_id.get(c["id"], False)
+    # a created PR's URL only appears in a later narration line — so tie each
+    # `gh pr create` to the first new PR URL at or after its exchange.
     for cx in sorted(pr_creates):
         cand = sorted((u for u, fx in pr_first_ex.items() if fx >= cx and not prs[u]["created"]),
                       key=lambda u: pr_first_ex[u])
         if cand:
             prs[cand[0]]["created"] = True
-    cwd = _auggie_ide_cwd(d) or _auggie_cwd(list(files.keys()))   # real cwd, like Claude's
+    cwd = ide_cwd or _auggie_cwd(list(files.keys()))   # real cwd, like Claude's
     branch = _git_branch(cwd)
     tests = [c for c in cmds if c["kind"] == "test"]
     todos = _auggie_todos_for(d.get("rootTaskUuid"))
@@ -276,6 +359,8 @@ def parse_auggie(session_id):
         so.append("touched %d file(s)" % len(files))
     if cmds:
         so.append("ran %d command(s)" % len(cmds))
+    if agents:
+        so.append("dispatched %d sub-agent(s)" % len(agents))   # same line Claude's overview builds
     if todos:
         so.append("%d/%d tasks done" % (done, len(todos)))
     if requests:
@@ -291,7 +376,7 @@ def parse_auggie(session_id):
         "commands": cmds[-60:][::-1],
         "commits": commits[::-1],
         "tests": tests[::-1],
-        "requests": requests, "agents": [], "agents_bg": [], "agent_sessions": [], "shells": [],
+        "requests": requests, "agents": agents[::-1], "agents_bg": [], "agent_sessions": [], "shells": [],
         # open decisions first, then most-recent — parity with Claude's AskUserQuestion panel
         "decisions": sorted(asks.values(), key=lambda a: (a["open"], a["t"] or ""), reverse=True),
         "waiting": any(a["open"] for a in asks.values()),   # unanswered ask-user -> blocked on the user, not idle
@@ -300,9 +385,13 @@ def parse_auggie(session_id):
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": latest[:2000],
         "tokens": {"in": tok_in, "out": tok_out},
-        "counts": {"done": done, "todos": len(todos), "created": 0, "edited": len(files),
+        "counts": {"done": done, "todos": len(todos),
+                   "created": sum(1 for x in files.values() if x.get("created")),
+                   "edited": sum(1 for x in files.values() if not x.get("created")),
                    "read": len(reads), "commits": len(commits), "tests": len(tests),
-                   "tests_failed": 0, "errors": 0, "agents": 0, "searches": 0},
+                   "tests_failed": sum(1 for t in tests if not t["ok"]),
+                   "errors": sum(1 for c in cmds if not c["ok"]),
+                   "agents": len(agents), "searches": 0},
         "overview": {
             "where": os.path.basename(cwd) if cwd else "Augment",
             "goal": requests[-1]["text"] if requests else "",
@@ -388,6 +477,50 @@ def search_auggie(q, limit=500):
     return out
 
 
+def command_output(session_id, cmd_id):
+    """Fetched on click: the full command for `cmd_id` and its captured output.
+    Auggie keeps the command on the tool_use and the verbatim result text on the
+    matching tool_result_node — the same join that gives a command its ok flag."""
+    d, _ = _load_auggie(session_id)
+    if d is None:
+        return None
+    cmd = ""
+    for m in d.get("chatHistory") or []:
+        for rn in (m.get("exchange") or {}).get("response_nodes") or []:
+            call = rn.get("tool_use") if isinstance(rn, dict) else None
+            if isinstance(call, dict) and call.get("tool_use_id") == cmd_id:
+                cmd = _tool_input(call).get("command") or ""
+    trn = _auggie_results(d).get(cmd_id) or {}
+    return {"cmd": cmd[:4000], "out": (trn.get("content") or "")[:20000],
+            "ok": not trn.get("is_error")}
+
+
+def file_diffs(session_id, target):
+    """Reconstruct every edit to `target`, oldest-first. The tool inputs ARE the
+    diff, exactly as for Claude: save-file = full content written (a creation),
+    str-replace-editor = the old/new string pairs it swapped."""
+    d, _ = _load_auggie(session_id)
+    if d is None:
+        return None
+    cwd = _auggie_ide_cwd(d)
+    ops = []
+    for m in d.get("chatHistory") or []:
+        ts = m.get("finishedAt")
+        for rn in (m.get("exchange") or {}).get("response_nodes") or []:
+            call = rn.get("tool_use") if isinstance(rn, dict) else None
+            if not isinstance(call, dict):
+                continue
+            name, inp = call.get("tool_name"), _tool_input(call)
+            if name == "save-file" and _abs(inp.get("path") or "", cwd) == target:
+                ops.append({"ts": ts, "kind": "created",
+                            "diff": unified("", inp.get("file_content") or "")})
+            elif name == "str-replace-editor" and _abs(inp.get("path") or "", cwd) == target:
+                parts = [unified(o, n) for o, n in _edit_pairs(inp)]
+                ops.append({"ts": ts, "kind": "edited",
+                            "diff": "\n".join(p for p in parts if p)})
+    return ops
+
+
 class AuggieProvider(Provider):
     prefix = "auggie:"
 
@@ -402,3 +535,10 @@ class AuggieProvider(Provider):
 
     def search(self, q):
         return search_auggie(q)
+
+    # drill-downs — reached through registry.drill(), like Claude's
+    def output(self, sid, cmd_id):
+        return command_output(sid[len(self.prefix):], cmd_id)
+
+    def diff(self, sid, target):
+        return file_diffs(sid[len(self.prefix):], target)

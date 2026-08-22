@@ -350,7 +350,6 @@ def _run():
                    "chatHistory": [{"finishedAt": "2026-06-27T05:47:50Z",
                                     "exchange": {"request_message": "list the dir",
                                                  "response_text": "I'll list it. " + "Z" * 2000,
-                                                 "changedFiles": ["/x/myrepo/app.py"],
                                                  "request_nodes": [{"ide_state_node": {"current_terminal": {
                                                      "current_working_directory": "/work/dw-stack"}}}],
                                                  "response_nodes": [
@@ -361,7 +360,25 @@ def _run():
                                                      {"tool_use": {"tool_name": "launch-process", "tool_use_id": "c2",
                                                                    "input_json": {"command": "pytest -q"}}},
                                                      {"tool_use": {"tool_name": "view", "tool_use_id": "v1",
-                                                                   "input_json": {"path": "app.py", "type": "file"}}}]}}]}, fh)
+                                                                   "input_json": {"path": "app.py", "type": "file"}}},
+                                                     # the REAL edit shape: input_json is a JSON *string*,
+                                                     # str-replace-editor paths are usually cwd-relative
+                                                     {"tool_use": {"tool_name": "save-file", "tool_use_id": "w1",
+                                                                   "input_json": json.dumps({"path": "/work/dw-stack/new.py",
+                                                                                             "file_content": "hello\n"})}},
+                                                     {"tool_use": {"tool_name": "str-replace-editor", "tool_use_id": "w2",
+                                                                   "input_json": json.dumps({"command": "str_replace", "path": "app.py",
+                                                                                             "old_str_1": "old", "new_str_1": "new"})}},
+                                                     {"tool_use": {"tool_name": "sub-agent-explore", "tool_use_id": "sa1",
+                                                                   "input_json": json.dumps({"action": "run", "name": "find the seam",
+                                                                                             "instruction": "read it"})}}]}},
+                                   # results arrive the NEXT exchange, keyed by tool_use_id, each with is_error
+                                   {"finishedAt": "2026-06-27T05:48:10Z",
+                                    "exchange": {"response_text": "done",
+                                                 "request_nodes": [
+                                                     {"tool_result_node": {"tool_use_id": "c1", "content": "ok", "is_error": False}},
+                                                     {"tool_result_node": {"tool_use_id": "c2", "is_error": True,
+                                                                           "content": "<return-code>\n1\n</return-code>\n1 failed"}}]}}]}, fh)
     al = list_auggie()
     assert len(al) == 1 and al[0]["id"] == "auggie:sess1", al
     # real IDE cwd wins over the indexed-root/changed-file fallback (matches Claude's per-session cwd)
@@ -370,8 +387,9 @@ def _run():
     pa = parse_auggie("sess1")
     assert pa and pa["counts"]["done"] == 1 and pa["counts"]["todos"] == 2, pa   # todos via rootTaskUuid
     assert [r["text"] for r in pa["requests"]] == ["list the dir"], pa["requests"]
-    assert pa["narrative"] and "list it" in pa["narrative"][0]["text"].lower()
-    assert len(pa["narrative"][0]["text"]) > 2000, "narration must keep the full message, not cap at 900"
+    _narr = next((n for n in pa["narrative"] if "list it" in n["text"].lower()), None)
+    assert _narr, pa["narrative"]
+    assert len(_narr["text"]) > 2000, "narration must keep the full message, not cap at 900"
     assert pa["tokens"] == {"in": 110, "out": 20}, pa["tokens"]          # input + cache, like Claude
     assert pa["meta"]["cwd"] == "/work/dw-stack", pa["meta"]["cwd"]      # real IDE cwd, like Claude
     # parity: commands (launch-process), reads (view), commits + tests — like Claude
@@ -379,6 +397,25 @@ def _run():
     assert pa["counts"]["commits"] == 1 and pa["counts"]["tests"] == 1, pa["counts"]
     assert pa["commits"] and pa["commits"][0]["msg"] == "fix it", pa["commits"]
     assert pa["reads"][0]["path"] == "app.py", pa["reads"]
+    # parity: files, sub-agents and command exit status — the three Auggie used to drop.
+    # `changedFiles` is empty in every real session; the edit TOOLS are the source of truth.
+    byf = {x["path"]: x for x in pa["files"]}
+    assert byf["/work/dw-stack/new.py"]["created"], "save-file == Write -> created"      # (C)
+    assert "/work/dw-stack/app.py" in byf, byf     # str-replace-editor path anchored to the cwd
+    assert not byf["/work/dw-stack/app.py"]["created"], byf
+    assert (pa["counts"]["created"], pa["counts"]["edited"]) == (1, 1), pa["counts"]
+    assert [(a["type"], a["desc"]) for a in pa["agents"]] == [("explore", "find the seam")], pa["agents"]   # (B)
+    assert pa["counts"]["agents"] == 1, pa["counts"]
+    ok_by = {c["id"]: c["ok"] for c in pa["commands"]}                                    # (A)
+    assert ok_by == {"c1": True, "c2": False}, "tool_result_node.is_error must reach the command"
+    assert (pa["counts"]["errors"], pa["counts"]["tests_failed"]) == (1, 1), pa["counts"]
+    # the drill-downs behind those panels, routed through the provider seam (not find_session)
+    from aitracker.registry import drill
+    assert drill("auggie:sess1", "output", "c2")["out"].endswith("1 failed"), "auggie command output"
+    assert drill("auggie:sess1", "diff", "/work/dw-stack/app.py")[0]["kind"] == "edited"
+    assert drill("auggie:sess1", "output", "nope") == {"cmd": "", "out": "", "ok": True}
+    assert drill("auggie:missing", "output", "c1") is None, "unknown session -> the route 404s"
+    assert drill("auggie:sess1", "shell", "x") == {"cmd": "", "out": "", "running": False}  # safe default
     assert "gitBranch" in pa["meta"], "auggie meta must carry gitBranch like Claude"
     assert pa["waiting"] is False, "no open ask-user -> not waiting"
     assert parse_auggie("missing") is None
