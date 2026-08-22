@@ -71,3 +71,9 @@ CURSOR_WS_ROOT = os.environ.get(
 # Set TRACKER_AUTH="user:pass" to require a login on every route — the one gate that covers
 # every access path (localhost, LAN, Tailscale, ngrok), so remote viewers must authenticate.
 AUTH = os.environ.get("TRACKER_AUTH", "")
+
+
+# Terminal features (Tiers 1-3) are OFF unless explicitly enabled. They turn the tracker from a
+# read-only viewer into something that can start processes, so they require BOTH this flag and a
+# configured TRACKER_AUTH — see term_gate.allowed().
+TERMINAL = os.environ.get("TRACKER_TERMINAL", "") == "1"

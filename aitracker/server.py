@@ -9,6 +9,12 @@ from .store import load_flags, save_flags, load_titles, load_pins, load_notes, s
 from .config import TITLES_FILE, FLAGS_FILE, PINS_FILE, NOTES_FILE
 from .providers.claude import find_session, file_diffs, command_output, shell_output, agent_detail
 
+# ponytail: route seam for optional feature modules (the terminal tiers). A module registers its
+# own routes here on import instead of server.py forking a per-feature elif chain. See the loader
+# at the bottom of this file.
+EXTRA_GET = {}    # path -> fn(handler, parsed_url)
+EXTRA_POST = {}   # path -> fn(handler, parsed_url, body)
+
 # --- login gate: a styled login page + a signed-cookie session (routes accept the cookie OR HTTP Basic,
 # so curl -u still works). One credential — config.AUTH (TRACKER_AUTH) — compared in constant time. ---
 _COOKIE_TTL = 43200  # 12h
@@ -267,6 +273,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 traceback.print_exc()
                 self._json({"error": str(e)}, 500)
+        elif p.path in EXTRA_GET:
+            EXTRA_GET[p.path](self, p)
         else:
             self.send_error(404)
 
@@ -384,6 +392,8 @@ class Handler(BaseHTTPRequestHandler):
                     notes.pop(sid, None)
                 save_notes(notes)
             self._json({"ok": True, "notes": notes.get(sid, [])})
+        elif p.path in EXTRA_POST:
+            EXTRA_POST[p.path](self, p, body)
         else:
             self.send_error(404)
 
@@ -458,3 +468,15 @@ def run(host="127.0.0.1", port=8787, open_browser=True):
         except Exception:
             pass
     srv.serve_forever()
+
+
+# ponytail: optional feature modules register their own routes into EXTRA_GET/EXTRA_POST on
+# import. Listed by name (not globbed) so a stray file can't mount a route. A module that isn't
+# present yet is skipped -- that's what lets the three terminal tiers be built in parallel.
+# Ceiling: only a genuinely-absent module is swallowed; a real ImportError inside one still raises.
+for _m in ("term_launch", "term_run", "term_vt"):
+    try:
+        __import__("%s.%s" % (__package__, _m))
+    except ModuleNotFoundError as e:
+        if e.name != "%s.%s" % (__package__, _m):
+            raise

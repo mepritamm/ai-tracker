@@ -691,6 +691,7 @@ const CIRC=2*Math.PI*51; // progress-ring circumference
 
 let sessions=[], searchResults=null, liveOnly=false;
 const LIVE=300; // seconds since last activity a session stays "live" (5 min)
+const EXT=[];   // feature modules (web/ext_*.js) push a fn(d); called at the end of every render
 function hl(text,q){
   const e=esc(text); if(!q)return e;
   const re=new RegExp("("+q.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")+")","ig");
@@ -1250,6 +1251,8 @@ function render(d){
     `<span class="cmd mono">${esc(x.cmd)}</span> <span class=chev style=float:right;color:var(--dim)>output ›</span></div>`, "—");
 
   syncModal();   // keep an open narration/request modal live with this poll
+
+  EXT.forEach(f=>{try{f(d)}catch(e){console.error("ext render",e)}});
 }
 let curFiles=[], curDiffFile=null, curDiffOps=[], diffMode="diff", diffExpand=[], curDiffText=null, diffAllExpanded=false;
 const isMd=p=>/\.(md|markdown|mdx)$/i.test(p||"");
