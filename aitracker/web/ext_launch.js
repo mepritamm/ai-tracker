@@ -6,28 +6,62 @@
   // ponytail: deliberate, user-approved exception to the "never gate behaviour by host" rule in
   // .claude/rules/conventions.md. Every other feature in this app works the same over a tunnel
   // as on localhost; this one launches an OS process on whatever machine is running the server,
-  // so it must never be offered to a remote viewer even though /api/term/open also refuses any
-  // caller whose client_address isn't 127.0.0.1. Do not "fix" this to match the usual rule.
+  // so it must never be OFFERED to a remote viewer. It is cosmetics only — curl ignores it, and
+  // the server is what actually refuses (term_launch._local_caller). Do not "fix" it to match
+  // the usual rule, and do not mistake it for the security boundary.
   function localOnly() {
     return location.hostname === "localhost" || location.hostname === "127.0.0.1";
   }
 
-  // Resume is Claude-only server-side (term_launch._is_claude); this mirrors that just to keep
-  // the button from appearing where it would always 400 — the server call is the real gate.
+  // Server owns policy (conventions rule 5): whether the terminal routes exist at all is
+  // TRACKER_TERMINAL + TRACKER_AUTH, which only the server knows. Tier 2 is concurrently adding
+  // GET /api/term/status, so we must not invent a route here — instead we ask the route we
+  // already have: a POST with an empty session runs term_gate.guard() FIRST, so it comes back
+  // 403 when the feature is off and 400 ("session required") when it is on. Nothing is launched
+  // either way. One probe per page load; any later 403 (e.g. proxied) latches the buttons off.
+  var allowed = null;                   // null = not asked yet, true/false = the server's answer
+  var probing = null;
+
+  function post(payload) {
+    return fetch("/api/term/open", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  function probe() {
+    if (!probing) {
+      probing = post({ session: "" })
+        .then(function (r) { allowed = r.status !== 403; })
+        .catch(function () { allowed = false; });
+    }
+    return probing;
+  }
+
+  // Resume is Claude-only server-side (term_launch._is_claude, which reads registry.PROVIDERS —
+  // that list is the source of truth for these prefixes; this copy only keeps a button from
+  // appearing where it would always 400, and the server call is the real gate).
   function isClaudeId(sid) {
     return !!sid && !/^(auggie|augment-vscode|augment-cursor):/.test(sid);
+  }
+
+  function hide(el) {
+    el.style.display = "none";
+    el.innerHTML = "";
   }
 
   async function openTerm(mode) {
     if (!cur) return;
     try {
-      const r = await fetch("/api/term/open", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session: cur, mode: mode }),
-      });
+      const r = await post({ session: cur, mode: mode });
       const j = await r.json().catch(() => ({}));
       if (!r.ok || j.error) {
+        if (r.status === 403) {         // feature off, or the server refused us as remote
+          allowed = false;
+          const el = document.getElementById("ext_launch");
+          if (el) hide(el);
+        }
         alert(j.error || "failed to open terminal");
         return;
       }
@@ -40,9 +74,10 @@
   function render(d) {
     const el = document.getElementById("ext_launch");
     if (!el) return;
-    if (!localOnly()) {
-      el.style.display = "none";
-      el.innerHTML = "";
+    if (!localOnly() || allowed === false) return hide(el);
+    if (allowed === null) {             // not answered yet: stay hidden, then draw if allowed
+      hide(el);
+      probe().then(function () { if (allowed) render(d); });
       return;
     }
     el.style.display = "";

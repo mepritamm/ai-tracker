@@ -2,13 +2,15 @@
 
 `build_script` is pure (bytes/strings in, AppleScript string out) so the quoting/escaping rules
 are tested directly with no subprocess involved. `open_terminal`'s gating (resume is Claude-only,
-same-machine only, term_gate first) is tested with a fake handler; none of these tests reach
-`subprocess.run(["osascript", ...])` -- every path exercised here returns an error response
-*before* that call, so running this suite never pops an actual Terminal/iTerm window.
+proxied requests refused, term_gate first) is tested with a fake handler. No test here ever runs
+a real `osascript`: every path either returns an error response *before* that call, or patches
+`term_launch.subprocess.run` -- so running this suite never pops a Terminal/iTerm window.
 """
+import os
 import re
 import shlex
 import unittest
+from unittest import mock
 
 from aitracker import config, term_gate, term_launch
 
@@ -149,7 +151,176 @@ class TestOpenTerminalGating(_TerminalEnabled):
         term_launch.open_terminal(h, None, {"session": "abc-123", "mode": "cwd"})
         obj, code = h.calls[-1]
         self.assertEqual(code, 403)
-        self.assertIn("local-only", obj.get("error", ""))
+        self.assertIn("refused", obj.get("error", ""))
+
+    def test_error_string_does_not_claim_local_only(self):
+        """The route cannot honour a "local-only" promise (a tunnel dials it over loopback), so
+        it must not print one. It says what is actually true: this request was refused."""
+        h = _FakeHandler(client_ip="10.0.0.5")
+        term_launch.open_terminal(h, None, {"session": "abc-123", "mode": "cwd"})
+        self.assertNotIn("local-only", h.calls[-1][0].get("error", ""))
+
+
+class TestProxiedRequestRefused(_TerminalEnabled):
+    """Defect 1. `make tunnel` runs `cloudflared tunnel --url http://localhost:<port>`, so the
+    tunnel terminates on this machine and EVERY public request arrives with client_address[0]
+    == "127.0.0.1". The peer address therefore proves nothing; the proxy's own headers do."""
+
+    def test_each_proxy_header_is_refused_from_loopback(self):
+        for h_name in term_launch._PROXY_HEADERS:
+            with self.subTest(header=h_name):
+                h = _FakeHandler(client_ip="127.0.0.1", headers={h_name: "203.0.113.9"})
+                term_launch.open_terminal(h, None, {"session": "abc-123", "mode": "cwd"})
+                obj, code = h.calls[-1]
+                self.assertEqual(code, 403)
+                self.assertIn("proxied", obj.get("error", ""))
+
+    def test_cloudflared_shaped_request_is_refused(self):
+        """The literal header set cloudflared puts in front of the origin server."""
+        h = _FakeHandler(client_ip="127.0.0.1", headers={
+            "Host": "some-name.trycloudflare.com",
+            "X-Forwarded-For": "192.168.1.5",
+            "X-Forwarded-Proto": "https",
+            "CF-Connecting-IP": "192.168.1.5",
+            "CF-Ray": "8f0c1e2d3a4b5c6d-SJC",
+        })
+        term_launch.open_terminal(h, None, {"session": "abc-123", "mode": "cwd"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 403)
+        self.assertIn("proxied", obj.get("error", ""))
+
+    def test_plain_loopback_request_is_not_refused_as_proxied(self):
+        """Belt and braces must not become a brick: a genuine local fetch still gets past the
+        remote check (it fails later, on the session lookup, not with a 403)."""
+        h = _FakeHandler(client_ip="127.0.0.1")
+        term_launch.open_terminal(h, None, {"session": "no-such-session-xyz", "mode": "cwd"})
+        obj, code = h.calls[-1]
+        self.assertNotEqual(code, 403)
+
+    def test_proxy_header_list_covers_cloudflare_and_the_x_forwarded_family(self):
+        for h_name in ("X-Forwarded-For", "X-Forwarded-Host", "Forwarded",
+                       "CF-Connecting-IP", "CF-Ray", "X-Real-IP"):
+            self.assertIn(h_name, term_launch._PROXY_HEADERS)
+
+
+class TestSidShape(unittest.TestCase):
+    """Defect 2. providers.claude.find_session globs "<PROJECTS>/*/<sid>.jsonl", so an
+    unvalidated sid of "*" opens whichever session sorts first, and it normalises the sid
+    (strip + drop ".jsonl") while build_script used the raw one."""
+
+    def test_glob_metacharacters_are_rejected(self):
+        for bad in ("*", "?", "abc*", "[a-z]", "ab[c]d", "*.jsonl"):
+            with self.subTest(sid=bad):
+                self.assertEqual(term_launch.normalize_sid(bad), "")
+
+    def test_path_separators_are_rejected(self):
+        for bad in ("../../etc/passwd", "a/b", "a\\b", "/abs"):
+            with self.subTest(sid=bad):
+                self.assertEqual(term_launch.normalize_sid(bad), "")
+
+    def test_surrounding_whitespace_is_rejected(self):
+        for bad in ("abc-123  ", "  abc-123", "\tabc-123", "abc-123\n"):
+            with self.subTest(sid=repr(bad)):
+                self.assertEqual(term_launch.normalize_sid(bad), "")
+
+    def test_jsonl_suffix_is_normalised_away(self):
+        self.assertEqual(term_launch.normalize_sid("abc-123.jsonl"), "abc-123")
+
+    def test_plain_and_prefixed_ids_survive(self):
+        self.assertEqual(term_launch.normalize_sid("abc-123"), "abc-123")
+        self.assertEqual(term_launch.normalize_sid("auggie:xyz"), "auggie:xyz")
+        self.assertEqual(term_launch.normalize_sid("augment-vscode:ws:uu"), "augment-vscode:ws:uu")
+
+    def test_non_string_is_rejected(self):
+        for bad in (None, 5, ["a"], {"a": 1}):
+            with self.subTest(sid=bad):
+                self.assertEqual(term_launch.normalize_sid(bad), "")
+
+
+class TestSidShapeAtTheRoute(_TerminalEnabled):
+    def test_glob_session_is_400_and_never_launches(self):
+        with mock.patch.object(term_launch.subprocess, "run") as run:
+            h = _FakeHandler()
+            term_launch.open_terminal(h, None, {"session": "*", "mode": "resume"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 400)
+        self.assertIn("bad session id", obj.get("error", ""))
+        run.assert_not_called()
+
+    def test_trailing_space_session_is_400_and_never_launches(self):
+        with mock.patch.object(term_launch.subprocess, "run") as run:
+            h = _FakeHandler()
+            term_launch.open_terminal(h, None, {"session": "abc-123  ", "mode": "resume"})
+        self.assertEqual(h.calls[-1][1], 400)
+        run.assert_not_called()
+
+    def test_resume_argv_uses_the_normalised_sid_not_the_raw_one(self):
+        """"<uuid>.jsonl" resolves to <uuid>; `claude --resume` must get <uuid>, not the
+        filename the caller happened to type."""
+        with mock.patch.object(term_gate, "session_cwd", return_value="/tmp"), \
+             mock.patch.object(term_launch.subprocess, "run") as run:
+            h = _FakeHandler()
+            term_launch.open_terminal(h, None, {"session": "abc-123.jsonl", "mode": "resume"})
+        self.assertEqual(h.calls[-1], ({"ok": True}, 200))
+        script = run.call_args[0][0][-1]
+        self.assertIn("claude --resume abc-123", script)
+        self.assertNotIn("abc-123.jsonl", script)
+
+
+class TestBodyShape(_TerminalEnabled):
+    """Defect 3. server.do_POST json.loads()es ANY JSON value, so the body can be a string, a
+    list or null -- .get() on those is an AttributeError and a RemoteDisconnected for the client."""
+
+    def test_string_body_is_400_not_an_exception(self):
+        h = _FakeHandler()
+        term_launch.open_terminal(h, None, "just-a-string")
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 400)
+        self.assertIn("JSON object", obj.get("error", ""))
+
+    def test_list_and_scalar_bodies_are_400(self):
+        for bad in (["session"], 42, True, "x"):
+            with self.subTest(body=bad):
+                h = _FakeHandler()
+                term_launch.open_terminal(h, None, bad)
+                self.assertEqual(h.calls[-1][1], 400)
+
+    def test_none_body_is_still_a_clean_400(self):
+        h = _FakeHandler()
+        term_launch.open_terminal(h, None, None)
+        self.assertEqual(h.calls[-1][1], 400)
+
+
+_EXT_LAUNCH_JS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "aitracker", "web", "ext_launch.js")
+
+
+class TestButtonsFollowServerPolicy(unittest.TestCase):
+    """Defect 4. config.TERMINAL is server-side only, so on a default install the buttons used to
+    render and 403 on click (conventions rule 5 inverted). Tier 2 owns GET /api/term/status and
+    server.py/app.js are off-limits here, so the SPA asks the route it already has and latches
+    off on a 403. Asserted against the asset's source: there is no JS engine in the stdlib."""
+
+    def setUp(self):
+        self.src = open(_EXT_LAUNCH_JS, encoding="utf-8").read()
+
+    def test_it_probes_the_existing_route_and_not_a_new_one(self):
+        self.assertIn('post({ session: "" })', self.src)
+        # Tier 2 owns that path; the comment may name it, but nothing here may CALL it.
+        self.assertNotIn('"/api/term/status"', self.src)
+
+    def test_a_403_latches_the_buttons_off(self):
+        self.assertIn("r.status === 403", self.src)
+        self.assertIn("allowed = false", self.src)
+
+    def test_buttons_are_not_drawn_before_the_server_has_answered(self):
+        self.assertIn("allowed === null", self.src)
+        self.assertIn("allowed === false", self.src)
+        # the probe must resolve before any button markup is produced
+        self.assertLess(self.src.index("allowed === null"), self.src.index("extopenbtn"))
+
+    def test_prefix_mirror_points_at_the_source_of_truth(self):
+        self.assertIn("registry.PROVIDERS", self.src)    # defect 5: one-line pointer, by choice
 
 
 class TestOpenTerminalGuardFirst(unittest.TestCase):
