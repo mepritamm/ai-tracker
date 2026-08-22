@@ -32,15 +32,45 @@ def all_sessions():
     return out
 
 
-def parse_any(sid):
-    """Route a namespaced session id to the provider that owns it."""
+def provider_for(sid):
+    """The provider that owns a namespaced session id (longest prefix wins;
+    the unprefixed provider is the fallback)."""
     for p in sorted(PROVIDERS, key=lambda x: len(x.prefix), reverse=True):
         if p.prefix and sid.startswith(p.prefix):
-            return p.parse(sid)
+            return p
     for p in PROVIDERS:  # default: the unprefixed provider (Claude)
         if p.prefix == "":
-            return p.parse(sid)
+            return p
     return None
+
+
+def parse_any(sid):
+    """Route a namespaced session id to the provider that owns it."""
+    p = provider_for(sid)
+    return p.parse(sid) if p else None
+
+
+DRILLS = ("output", "diff", "shell", "agent")
+
+
+def drill(sid, kind, arg):
+    """One drill-down view (output/diff/shell/agent) on ONE session, routed to the
+    owning provider. This is the seam the /api/output|diff|shell|agent routes call —
+    they must never reach into a single provider's session lookup, or every
+    namespaced id 404s. None => the session doesn't exist (checked via exists()
+    BEFORE calling the drill method, so a bogus id can't reach a provider's empty
+    default and read back as 200)."""
+    if kind not in DRILLS:
+        return None
+    p = provider_for(sid)
+    if not p:
+        return None
+    try:
+        if not p.exists(sid):
+            return None
+        return getattr(p, kind)(sid, arg)
+    except Exception:
+        return None   # one broken session must not close the socket mid-poll
 
 
 def search_all(q):

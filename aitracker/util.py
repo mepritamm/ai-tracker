@@ -1,4 +1,4 @@
-import datetime, os, re, subprocess
+import datetime, difflib, os, re, subprocess
 
 from .config import LIVE_WINDOW
 
@@ -219,3 +219,12 @@ def cmd_kind(c):
     if re.match(r"\s*git\b", c):
         return "git"
     return "cmd"
+
+
+def unified(old, new, cap=20000):
+    """Unified diff between two strings, each capped to keep payloads sane.
+    Shared by every provider that reconstructs an edit from the tool input it
+    logged (Claude: Write/Edit/MultiEdit; Auggie: save-file/str-replace-editor)."""
+    old, new = (old or "")[:cap], (new or "")[:cap]
+    return "\n".join(difflib.unified_diff(
+        old.splitlines(), new.splitlines(), "before", "after", lineterm=""))

@@ -1,7 +1,7 @@
-import difflib, glob, json, os, re, time
+import glob, json, os, re, time
 from ..config import EDIT_TOOLS, LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified as _unified
 from ..overview import build_overview
 from ..store import load_titles, load_tasks, load_notes
 from .base import Provider
@@ -520,13 +520,6 @@ def parse_agents(path):
     return out, newest, agent_files, agent_prs, agent_pr_states
 
 
-def _unified(old, new, cap=20000):
-    """Unified diff between two strings, each capped to keep payloads sane."""
-    old, new = (old or "")[:cap], (new or "")[:cap]
-    return "\n".join(difflib.unified_diff(
-        old.splitlines(), new.splitlines(), "before", "after", lineterm=""))
-
-
 def file_diffs(path, target):
     """Reconstruct every Write/Edit to `target`, in order — from the main transcript
     AND the session's background-agent transcripts (so agent edits are diffable too).
@@ -1003,3 +996,24 @@ class ClaudeProvider(Provider):
 
     def search(self, q):
         return search_sessions(q)
+
+    def exists(self, sid):
+        # cheap: just the file lookup, not a full parse
+        return find_session(sid) is not None
+
+    # drill-downs — same lookup as parse(), reached through registry.drill()
+    def output(self, sid, cmd_id):
+        path = find_session(sid)
+        return command_output(path, cmd_id) if path else None
+
+    def diff(self, sid, target):
+        path = find_session(sid)
+        return file_diffs(path, target) if path else None
+
+    def shell(self, sid, shell_id):
+        path = find_session(sid)
+        return shell_output(path, shell_id) if path else None
+
+    def agent(self, sid, aid):
+        path = find_session(sid)
+        return agent_detail(path, aid) if path else None
