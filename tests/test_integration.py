@@ -65,6 +65,20 @@ def _write_auggie(sid, title, req="the request", resp="the reply"):
               open(os.path.join(config.AUGGIE_SESSIONS, sid + ".json"), "w"))
 
 
+def _mk_augment_task(root, ws_hash, folder, uuid, description):
+    """Minimal Augment.vscode-augment workspace + one task — matches the real
+    layout (augment-user-assets/task-storage/tasks/<uuid>.json + workspace.json)
+    that aitracker.providers.augment_ext._scan_workspaces()/_iter_tasks() read."""
+    ws_dir = os.path.join(root, ws_hash)
+    tasks_dir = os.path.join(ws_dir, "Augment.vscode-augment",
+                              "augment-user-assets", "task-storage", "tasks")
+    os.makedirs(tasks_dir)
+    json.dump({"folder": "file://" + folder}, open(os.path.join(ws_dir, "workspace.json"), "w"))
+    json.dump({"uuid": uuid, "name": "Current Task List", "description": description,
+               "state": "NOT_STARTED", "lastUpdated": 1700000000000},
+              open(os.path.join(tasks_dir, uuid + ".json"), "w"))
+
+
 class TestBuildPage(unittest.TestCase):
     """page.py assembles web/index.html + app.css + app.js into one document."""
 
@@ -210,6 +224,34 @@ class TestSearchAllRanking(unittest.TestCase):
 
     def test_no_match_is_empty(self):
         self.assertEqual(search_all("zzznotfoundzzz"), [])
+
+    def test_search_result_shape_identical_across_providers(self):
+        """Every provider's search hit must carry the SAME keys. This is the exact
+        shape that drifted: augment_ext used to emit {id, titleMatch, inQuery, mtime,
+        text, source} while ClaudeProvider/AuggieProvider emitted {id, project, title,
+        agent, matches, snippet, inQuery, titleMatch, mtime} — renderSide() (web/app.js)
+        reads the latter, so the former rendered as "undefined×" search rows."""
+        term = "reply"
+        _write_claude("cq", 1)                                   # assistant text: "reply number 0"
+        _write_auggie("aq2", "Some other title", req="do a reply please", resp="ok")
+        _mk_augment_task(config.VSCODE_WS_ROOT, "wsx", "/tmp/projx", "tux", "please reply soon")
+
+        res = search_all(term)
+        by_source = {}
+        for r in res:
+            if r["id"].startswith("auggie:"):
+                by_source.setdefault("auggie", r)
+            elif r["id"].startswith("augment-vscode:"):
+                by_source.setdefault("augment-vscode", r)
+            elif r["id"] == "cq":
+                by_source.setdefault("claude", r)
+
+        self.assertEqual(set(by_source), {"claude", "auggie", "augment-vscode"},
+                          "fixture must be found via all three providers")
+        expected = {"id", "project", "title", "agent", "matches", "snippet",
+                    "inQuery", "titleMatch", "mtime"}
+        for name, r in by_source.items():
+            self.assertEqual(set(r.keys()), expected, "shape mismatch for %s" % name)
 
 
 class TestServerEndToEnd(unittest.TestCase):
