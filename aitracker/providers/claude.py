@@ -997,6 +997,10 @@ class ClaudeProvider(Provider):
     def search(self, q):
         return search_sessions(q)
 
+    def exists(self, sid):
+        # cheap: just the file lookup, not a full parse
+        return find_session(sid) is not None
+
     # drill-downs — same lookup as parse(), reached through registry.drill()
     def output(self, sid, cmd_id):
         path = find_session(sid)

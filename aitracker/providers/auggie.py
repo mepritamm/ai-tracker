@@ -216,7 +216,24 @@ def _touch(files, path, ts, created=False):
     return e
 
 
+def _safe_session_id(session_id):
+    """Reject a session id that could escape AUGGIE_SESSIONS once joined into a
+    filesystem path (`../../etc/passwd`-style traversal, an absolute path smuggled
+    in, or a NUL byte) — the id portion of `auggie:<id>` is untrusted, sourced
+    straight from the URL. Legit ids are bare filenames with no separators."""
+    if not session_id or "\x00" in session_id:
+        return None
+    if "/" in session_id or "\\" in session_id or os.sep in session_id:
+        return None
+    if (os.altsep and os.altsep in session_id) or ".." in session_id:
+        return None
+    return session_id
+
+
 def _load_auggie(session_id):
+    session_id = _safe_session_id(session_id)
+    if session_id is None:
+        return None, None
     f = os.path.join(config.AUGGIE_SESSIONS, session_id + ".json")
     if not os.path.isfile(f):
         return None, None
@@ -313,7 +330,7 @@ def parse_auggie(session_id):
                     agents.append({"t": ts, "type": (name[len("sub-agent-"):] or "agent"),
                                    "desc": (inp.get("name") or inp.get("instruction") or "")[:80]})
                 elif name == "view" and inp.get("path") and inp.get("type") != "directory":
-                    reads[inp["path"]] = ts           # ~ Claude's Read
+                    reads[_abs(inp["path"], ide_cwd)] = ts   # ~ Claude's Read, anchored like `files`
                 elif name == "ask-user":              # Auggie's user-question tool (~ Claude's AskUserQuestion)
                     opts = [o[:120] for o in (inp.get("suggested_responses") or []) if isinstance(o, str)]
                     asks[call.get("tool_use_id")] = {"t": ts, "open": True, "answer": "",
@@ -327,13 +344,6 @@ def parse_auggie(session_id):
         if isinstance(resp, str) and resp.strip():
             narrative.append({"t": ts, "text": resp.strip()[:NARRATION_CAP]})
             _cprs(resp, narr=True)                        # PR the assistant narrates about (shown if same-repo)
-        # legacy/optional: some builds also summarise the exchange's edits here. Empty in
-        # every session on this machine (0 across 85), so the tool branches above are the
-        # real source — this stays only so a build that does emit it isn't ignored.
-        for cf in (m.get("changedFiles") or []) + (ex.get("changedFiles") or []):
-            p = cf if isinstance(cf, str) else (cf.get("path") or cf.get("filePath") or cf.get("file"))
-            if p:
-                _touch(files, _abs(p, ide_cwd), ts)
     # annotate commands with pass/fail from the error map — same join as Claude's
     for c in cmds:
         c["ok"] = not errors_by_id.get(c["id"], False)
@@ -535,6 +545,12 @@ class AuggieProvider(Provider):
 
     def search(self, q):
         return search_auggie(q)
+
+    def exists(self, sid):
+        # cheap: a sanitised file-existence check, not a full JSON parse
+        session_id = _safe_session_id(sid[len(self.prefix):])
+        return bool(session_id) and os.path.isfile(
+            os.path.join(config.AUGGIE_SESSIONS, session_id + ".json"))
 
     # drill-downs — reached through registry.drill(), like Claude's
     def output(self, sid, cmd_id):

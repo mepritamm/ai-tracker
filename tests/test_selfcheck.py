@@ -355,12 +355,15 @@ def _run():
                                                  "response_nodes": [
                                                      {"token_usage": {"input_tokens": 10, "output_tokens": 20,
                                                                       "cache_read_input_tokens": 100}},
+                                                     # input_json is a JSON *string* in every real log (0/3882
+                                                     # nodes on this machine carry it as a dict) — these three
+                                                     # match that real shape like the edit-tool nodes below do.
                                                      {"tool_use": {"tool_name": "launch-process", "tool_use_id": "c1",
-                                                                   "input_json": {"command": "git commit -m \"fix it\""}}},
+                                                                   "input_json": json.dumps({"command": "git commit -m \"fix it\""})}},
                                                      {"tool_use": {"tool_name": "launch-process", "tool_use_id": "c2",
-                                                                   "input_json": {"command": "pytest -q"}}},
+                                                                   "input_json": json.dumps({"command": "pytest -q"})}},
                                                      {"tool_use": {"tool_name": "view", "tool_use_id": "v1",
-                                                                   "input_json": {"path": "app.py", "type": "file"}}},
+                                                                   "input_json": json.dumps({"path": "app.py", "type": "file"})}},
                                                      # the REAL edit shape: input_json is a JSON *string*,
                                                      # str-replace-editor paths are usually cwd-relative
                                                      {"tool_use": {"tool_name": "save-file", "tool_use_id": "w1",
@@ -396,9 +399,11 @@ def _run():
     assert len(pa["commands"]) == 2 and pa["counts"]["read"] == 1, (pa["commands"], pa["counts"])
     assert pa["counts"]["commits"] == 1 and pa["counts"]["tests"] == 1, pa["counts"]
     assert pa["commits"] and pa["commits"][0]["msg"] == "fix it", pa["commits"]
-    assert pa["reads"][0]["path"] == "app.py", pa["reads"]
+    # `view`'s path is anchored to the cwd, like `files` — 13/85 real sessions carry both
+    # relative and absolute read paths for the same tree, so an un-anchored `reads` entry
+    # can double-count against `files` and the two panels visibly disagree on one file.
+    assert pa["reads"][0]["path"] == "/work/dw-stack/app.py", pa["reads"]
     # parity: files, sub-agents and command exit status — the three Auggie used to drop.
-    # `changedFiles` is empty in every real session; the edit TOOLS are the source of truth.
     byf = {x["path"]: x for x in pa["files"]}
     assert byf["/work/dw-stack/new.py"]["created"], "save-file == Write -> created"      # (C)
     assert "/work/dw-stack/app.py" in byf, byf     # str-replace-editor path anchored to the cwd

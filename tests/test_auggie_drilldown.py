@@ -297,6 +297,37 @@ class TestAuggieDrillDowns(_AuggieEnv):
             self.assertTrue(A.file_diffs("s1", f["path"]), f["path"])
 
 
+# --------------------------------------------------- session-id path-traversal guard
+
+class TestSessionIdSanitisation(_AuggieEnv):
+    """`auggie:<id>` is unsanitised user input straight from the URL — the id
+    portion must not be able to escape AUGGIE_SESSIONS via `..`/separators to read
+    an arbitrary `.json` file on the filesystem (pre-existing hole on
+    /api/session at 85a21bf; this branch put it on 4 routes, so it's fixed here)."""
+
+    def test_traversal_id_cannot_read_an_arbitrary_json_file(self):
+        secret = os.path.join(config.AUGMENT_DIR, "secret.json")
+        with open(secret, "w") as fh:
+            json.dump({"sessionId": "secret", "chatHistory": [
+                {"finishedAt": "t", "exchange": {
+                    "response_nodes": [_tu("x", "launch-process",
+                                            {"command": "SECRET-COMMAND-LEAKED"})]}},
+                {"finishedAt": "t2", "exchange": {"request_nodes": [
+                    _tr("x", "SECRET-OUTPUT-LEAKED")]}},
+            ]}, fh)
+        traversal_id = "../secret"    # AUGGIE_SESSIONS/../secret.json == AUGMENT_DIR/secret.json
+        self.assertIsNone(A.command_output(traversal_id, "x"),
+                          "must not read outside AUGGIE_SESSIONS")
+        self.assertIsNone(A.file_diffs(traversal_id, "/a.py"))
+        self.assertIsNone(registry.drill("auggie:" + traversal_id, "output", "x"))
+        self.assertFalse(A.AuggieProvider().exists("auggie:" + traversal_id))
+
+    def test_separators_and_traversal_and_nul_bytes_are_rejected(self):
+        for bad in ("../x", "a/b", "a\\b", "a\x00b", ".."):
+            self.assertIsNone(A._safe_session_id(bad), bad)
+        self.assertEqual(A._safe_session_id("s1"), "s1")   # a normal id passes through
+
+
 # -------------------------------------------------------------- (D) the route seam
 
 class TestRegistryDrillSeam(_AuggieEnv):
@@ -320,18 +351,53 @@ class TestRegistryDrillSeam(_AuggieEnv):
         self.assertIsNone(registry.drill("auggie:s1", "parse", "x"))
 
     def test_unsupported_view_degrades_to_empty_not_404(self):
-        """Auggie has no background shells/agents of its own — the base default
-        answers with an empty view so the modal says 'nothing', not 'error'."""
+        """Auggie has no background shells/agents of its own — for a session that
+        DOES exist (s1, written in setUp), the base default answers with an empty
+        view so the modal says 'nothing', not 'error'."""
         self.assertEqual(registry.drill("auggie:s1", "shell", "sh1"),
                          {"cmd": "", "out": "", "running": False})
         self.assertEqual(registry.drill("auggie:s1", "agent", "a1"), {})
 
+    def test_missing_auggie_session_404s_on_every_drill_kind(self):
+        """A bogus auggie id must 404 on ALL FOUR drill kinds — including shell/agent,
+        which AuggieProvider never overrides. Before registry.drill() checked
+        exists() first, a bogus id fell through to the base class's empty default
+        (200) on shell/agent instead of 404 — output/diff already 404'd because
+        _load_auggie() itself returns None, but shell/agent silently did not."""
+        for kind, arg in (("output", "c1"), ("diff", "/a.py"), ("shell", "sh1"), ("agent", "a1")):
+            self.assertIsNone(registry.drill("auggie:nope", kind, arg), kind)
+
     def test_augment_ext_ids_do_not_fall_off_the_seam(self):
-        """The VSCode/Cursor providers emit a files panel but record no diffs —
-        they must return the base default, never None (which the route 404s)."""
-        self.assertEqual(registry.drill("augment-vscode:ws:uu", "diff", "/a.py"), [])
-        self.assertEqual(registry.drill("augment-cursor:ws:uu", "output", "c1"),
-                         {"cmd": "", "out": "", "ok": True})
+        """The VSCode/Cursor providers emit a files panel but record no diffs, and
+        never override output/diff/shell/agent — for a REAL session (a task file
+        that actually exists on disk) they must return the base default, never None
+        (which the route 404s). For a session that does NOT exist on disk, they must
+        404 like every other provider — registry.drill() calls exists() (the base
+        default: a full parse()) before ever reaching the empty default, so a bogus
+        augment-vscode/-cursor id can no longer read back as 200+empty."""
+        orig_vs, orig_cur = config.VSCODE_WS_ROOT, config.CURSOR_WS_ROOT
+        config.VSCODE_WS_ROOT = tempfile.mkdtemp()
+        config.CURSOR_WS_ROOT = tempfile.mkdtemp()
+        try:
+            for root in (config.VSCODE_WS_ROOT, config.CURSOR_WS_ROOT):
+                aug = os.path.join(root, "ws", "Augment.vscode-augment")
+                tasks_dir = os.path.join(aug, "augment-user-assets", "task-storage", "tasks")
+                os.makedirs(tasks_dir)
+                with open(os.path.join(root, "ws", "workspace.json"), "w") as fh:
+                    json.dump({"folder": "file:///repo/x"}, fh)
+                with open(os.path.join(tasks_dir, "uu.json"), "w") as fh:
+                    json.dump({"uuid": "uu", "name": "a real task"}, fh)
+
+            # a REAL session (task "uu" exists in workspace "ws") -> the base default
+            # answers, not None
+            self.assertEqual(registry.drill("augment-vscode:ws:uu", "diff", "/a.py"), [])
+            self.assertEqual(registry.drill("augment-cursor:ws:uu", "output", "c1"),
+                             {"cmd": "", "out": "", "ok": True})
+            # no such workspace/task on disk -> the route 404s, same as every provider
+            self.assertIsNone(registry.drill("augment-vscode:ws:nope", "diff", "/a.py"))
+            self.assertIsNone(registry.drill("augment-cursor:x:y", "output", "c1"))
+        finally:
+            config.VSCODE_WS_ROOT, config.CURSOR_WS_ROOT = orig_vs, orig_cur
 
 
 class TestClaudeDrillStillWorks(unittest.TestCase):
