@@ -65,7 +65,8 @@ next gap.
 one checkout, so an in-place edit interleaves with another session's WIP and forces a `git add -A` that
 sweeps their unfinished work. Before touching a file: create a git worktree (EnterWorktree, based on local
 HEAD — this repo has **no `origin` remote**, only `personal`), do **all** edits there, get `make check`
-green **in the worktree**, and only then move to the main checkout / push to `personal`.
+green **in the worktree**, and only then move to the main checkout / push to `personal`. Mirrors
+bug-smasher's `smasher-gap` Worktree-discipline thesis.
 
 ## Step 1 — Frame the gap (name the capability + find the asymmetry)
 Before touching code, state in plain terms:
