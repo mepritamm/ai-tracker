@@ -4,8 +4,14 @@ Every assertion here is pure: bytes in, grid out, no PTY, no server, no browser.
 correctness (an escape sequence or a UTF-8 character arriving across two feed() calls) is the
 single most likely real-world bug, so it gets its own dedicated section.
 """
+import base64
+import json
+import os
+import threading
+import time
 import unittest
 
+from aitracker import config, term_gate, term_vt
 from aitracker.term_vt import Screen
 
 
@@ -337,6 +343,59 @@ class TestSplitFeeds(unittest.TestCase):
         self.assertEqual(rows[0][1], "AFTER")
 
 
+class TestResize(unittest.TestCase):
+    """Screen.resize -- the Screen-side half of Tier 3's TIOCSWINSZ rule."""
+
+    def test_grow_pads_and_shrink_crops(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"abcdefghij")            # fills row 0 exactly
+        s.resize(20, 3)
+        rows = _rows(s.snapshot(-1))
+        self.assertEqual(rows[0][1], "abcdefghij")   # preserved, not corrupted by the grow
+        self.assertEqual(s.cols, 20)
+        s.resize(5, 3)
+        rows = _rows(s.snapshot(-1))
+        self.assertEqual(rows[0][1], "abcde")         # cropped to the new width, not wrapped
+
+    def test_row_count_changes(self):
+        s = Screen(cols=10, rows=5)
+        s.feed(b"row0\r\nrow1\r\nrow2")
+        s.resize(10, 2)                   # shrink rows: row 2 is gone
+        self.assertEqual(s.rows, 2)
+        snap = s.snapshot(-1)
+        self.assertEqual(len(snap["rows"]), 2)
+        s.resize(10, 5)                   # grow back: new rows are blank, not garbage
+        rows = _rows(s.snapshot(-1))
+        self.assertEqual(rows[2][1], "")
+        self.assertEqual(rows[2][2], [])
+
+    def test_cursor_and_scroll_region_clamped(self):
+        s = Screen(cols=20, rows=10)
+        s.feed(b"\x1b[3;8r")              # scroll region rows 3-8
+        s.feed(b"\x1b[9;15H")             # cursor at row 9 (0-based 8), col 15 (0-based 14)
+        s.resize(10, 5)
+        self.assertLess(s.cur_r, 5)
+        self.assertLess(s.cur_c, 10)
+        self.assertEqual((s.scroll_top, s.scroll_bot), (0, 4))
+
+    def test_resize_forces_full_redraw_on_next_snapshot(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"hi")
+        v0 = s.snapshot(-1)["v"]
+        snap_before = s.snapshot(v0)
+        self.assertEqual(snap_before["rows"], [])     # nothing changed since v0 yet
+        s.resize(20, 3)
+        snap_after = s.snapshot(v0)
+        self.assertEqual(len(snap_after["rows"]), 3)  # every row redrawn, not just the resized one
+
+    def test_noop_when_dimensions_unchanged(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"x")
+        v0 = s.v
+        s.resize(10, 3)
+        self.assertEqual(s.v, v0)          # no spurious version bump / dirty-all
+
+
 class TestOutOfScopeConsumed(unittest.TestCase):
     def test_mouse_reporting_modes_are_noop(self):
         s = Screen(cols=20, rows=3)
@@ -372,6 +431,562 @@ class TestOutOfScopeConsumed(unittest.TestCase):
         self.assertEqual(s.title, "window title")
         s.feed(b"\x1b]2;icon title\x1b\\")
         self.assertEqual(s.title, "icon title")
+
+
+class _FakeHeaders:
+    def __init__(self, headers=None):
+        self._h = dict(headers or {})
+
+    def get(self, key, default=""):
+        return self._h.get(key, default)
+
+
+class _FakeHandler:
+    """Stands in for the real Handler: records the one _json() call a route makes."""
+
+    def __init__(self, headers=None):
+        self.headers = _FakeHeaders(headers)
+        self.calls = []
+
+    def _json(self, obj, code=200):
+        self.calls.append((obj, code))
+
+
+class _Q:
+    """Stands in for urlparse's result -- only `.query` is used by screen_stream."""
+
+    def __init__(self, q):
+        self.query = q
+
+
+def _drain(pt, timeout=10.0):
+    """Wait for the reader thread to finish the PTY (it owns the waitpid)."""
+    end = time.time() + timeout
+    while not pt.done and time.time() < end:
+        time.sleep(0.02)
+    return pt
+
+
+def _wait_for(pred, timeout=10.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return pred()
+
+
+class TestClampAndIsClaude(unittest.TestCase):
+    def test_clamp_int_within_bounds(self):
+        self.assertEqual(term_vt._clamp_int(80, 20, 500, 100), 80)
+
+    def test_clamp_int_clamps_out_of_range(self):
+        self.assertEqual(term_vt._clamp_int(5, 20, 500, 100), 20)
+        self.assertEqual(term_vt._clamp_int(99999, 20, 500, 100), 500)
+
+    def test_clamp_int_falls_back_on_garbage(self):
+        self.assertEqual(term_vt._clamp_int("nope", 20, 500, 100), 100)
+        self.assertEqual(term_vt._clamp_int(None, 20, 500, 100), 100)
+
+    def test_is_claude_true_for_unprefixed_id(self):
+        self.assertTrue(term_vt._is_claude("170670c5-f8c1-4ac9-90aa-a1706021166a"))
+
+    def test_is_claude_false_for_a_provider_prefix(self):
+        from aitracker.registry import PROVIDERS
+        prefixed = [p for p in PROVIDERS if p.prefix]
+        if not prefixed:
+            self.skipTest("no prefixed provider registered")
+        self.assertFalse(term_vt._is_claude(prefixed[0].prefix + "some-id"))
+
+
+class TestSpawnAndScreen(unittest.TestCase):
+    """Real pty.fork() + a real Screen -- the feasibility spike for Tier 3's plumbing."""
+
+    def setUp(self):
+        self._ptys = []
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"        # test_..._keys_route goes through guard()
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        for pt in self._ptys:
+            pt.kill()
+            _drain(pt, 5)
+
+    def _spawn(self, argv, cwd=None, cols=80, rows=24):
+        pt = term_vt.spawn(cwd or os.getcwd(), argv, cols, rows)
+        self._ptys.append(pt)
+        return pt
+
+    def test_spawn_feed_keys_snapshot_shows_the_echo(self):
+        """THE load-bearing one: a real shell, real keystrokes written through the `keys` route,
+        and the resulting output showing up in Screen.snapshot() -- proving the pty -> reader
+        thread -> Screen.feed() -> snapshot() pipeline actually works end to end."""
+        shell = os.environ.get("SHELL", "/bin/bash")
+        pt = self._spawn([shell, "-l"])
+        term_vt.PTYS[pt.id] = pt
+        h = _FakeHandler()
+        payload = base64.b64encode(b"echo hi-from-tier3\n").decode()
+        term_vt.keys(h, None, {"tty": pt.id, "data": payload})
+        self.assertEqual(h.calls[-1], ({"ok": True}, 200))
+
+        def seen():
+            with pt.lock:
+                snap = pt.screen.snapshot(-1)
+            return any("hi-from-tier3" in r[1] for r in snap["rows"])
+
+        self.assertTrue(_wait_for(seen, 10), "echo never showed up in the Screen snapshot")
+        del term_vt.PTYS[pt.id]
+
+    def test_resize_applies_tiocswinsz_and_the_screen(self):
+        pt = self._spawn(["cat"])
+        self.assertEqual((pt.screen.cols, pt.screen.rows), (80, 24))
+        term_vt._set_winsize(pt.fd, 40, 120)
+        with pt.lock:
+            pt.screen.resize(120, 40)
+        self.assertEqual((pt.screen.cols, pt.screen.rows), (120, 40))
+        import fcntl
+        import struct as _struct
+        import termios
+        packed = fcntl.ioctl(pt.fd, termios.TIOCGWINSZ, _struct.pack("HHHH", 0, 0, 0, 0))
+        got_rows, got_cols = _struct.unpack("HHHH", packed)[:2]
+        self.assertEqual((got_rows, got_cols), (40, 120))
+
+    def test_no_zombie_left_behind(self):
+        pt = self._spawn(["echo", "bye"])
+        _drain(pt)
+        self.assertIsNotNone(pt.rc)            # the reader thread reaped it
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(pt.pid, 0)              # a second waitpid finds nothing
+
+    def test_kill_stops_a_running_child(self):
+        pt = self._spawn(["sleep", "30"])
+        time.sleep(0.3)
+        pt.kill()
+        _drain(pt)
+        self.assertTrue(pt.done)
+        self.assertEqual(pt.rc, -9)            # SIGKILL, reported as a negative signal number
+
+
+class TestProcessGroupKill(unittest.TestCase):
+    def test_kill_reaches_a_grandchild_that_ignores_sighup(self):
+        """Signalling one pid was clean only by ACCIDENT -- see Pty.kill's docstring. A grandchild
+        that ignores SIGHUP (an ordinary TUI worker/watcher) survives a bare `kill` and keeps
+        running after the PTY is marked dead; killpg reaches the whole process group."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            pidfile = os.path.join(td, "grandchild.pid")
+            script = os.path.join(td, "escaper.py")
+            with open(script, "w") as f:
+                f.write(
+                    "import os, signal, sys, time\n"
+                    "if os.fork() == 0:\n"
+                    "    signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+                    "    open(%r, 'w').write(str(os.getpid()))\n"
+                    "    time.sleep(60)\n"
+                    "    os._exit(0)\n"
+                    "time.sleep(60)\n" % pidfile)
+            pt = term_vt.spawn(td, ["python3", script], 80, 24)
+            try:
+                self.assertTrue(_wait_for(lambda: os.path.exists(pidfile), 10),
+                                 "grandchild never started")
+                with open(pidfile) as f:
+                    gpid = int(f.read())
+                try:
+                    pt.kill()
+                    _drain(pt, 10)
+
+                    def gone():
+                        try:
+                            os.kill(gpid, 0)
+                            return False
+                        except ProcessLookupError:
+                            return True
+
+                    self.assertTrue(_wait_for(gone, 5), "grandchild %d survived the kill" % gpid)
+                finally:
+                    try:
+                        os.kill(gpid, 9)
+                    except OSError:
+                        pass
+            finally:
+                pt.kill()
+                _drain(pt, 5)
+
+
+class TestRoutes(unittest.TestCase):
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        self._session_cwd0 = term_gate.session_cwd
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        # kill only -- no _drain(): most PTYS here are fake placeholders (pid=0, never spawned,
+        # so `done` never flips) and draining each would burn its whole timeout for nothing. A
+        # real spawned pty's reader thread is a daemon and reaps itself off-thread; kill() alone
+        # is enough to stop it running, and this loop does not need to wait for that to finish.
+        for pt in list(term_vt.PTYS.values()):
+            pt.kill()
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+        term_gate.session_cwd = self._session_cwd0
+
+    def test_routes_are_registered(self):
+        from aitracker import server
+        self.assertIs(server.EXTRA_POST["/api/term/pty"], term_vt.open_pty)
+        self.assertIs(server.EXTRA_POST["/api/term/keys"], term_vt.keys)
+        self.assertIs(server.EXTRA_POST["/api/term/resize"], term_vt.resize_pty)
+        self.assertIs(server.EXTRA_GET["/api/term/screen"], term_vt.screen_stream)
+
+    def test_pty_403s_when_terminal_disabled(self):
+        config.TERMINAL = False
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {"session": "x", "cols": 80, "rows": 24})
+        self.assertEqual(h.calls[-1][1], 403)
+        self.assertFalse(term_gate.allowed())
+
+    def test_pty_400s_a_non_dict_body(self):
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, "not a dict")
+        self.assertEqual(h.calls[-1][1], 400)
+
+    def test_pty_400s_missing_session(self):
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 400)
+        self.assertIn("session", obj["error"])
+
+    def test_pty_400s_bad_mode(self):
+        term_gate.session_cwd = lambda sid: "/tmp"
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {"session": "x", "mode": "sudo"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 400)
+        self.assertIn("mode", obj["error"])
+
+    def test_pty_400s_resume_for_a_non_claude_session(self):
+        from aitracker.registry import PROVIDERS
+        prefixed = [p for p in PROVIDERS if p.prefix]
+        if not prefixed:
+            self.skipTest("no prefixed provider registered")
+        term_gate.session_cwd = lambda sid: "/tmp"
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {"session": prefixed[0].prefix + "x", "mode": "resume"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 400)
+        self.assertIn("Claude-only", obj["error"])
+
+    def test_pty_404s_when_session_has_no_cwd(self):
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {"session": "no-such-session-id"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 404)
+
+    def test_fifth_concurrent_pty_gets_429(self):
+        for i in range(term_vt.MAX_PTYS):
+            term_vt.PTYS["fake%d" % i] = term_vt.Pty(tid="fake%d" % i)  # pid 0, done False
+        term_gate.session_cwd = lambda sid: "/tmp"
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {"session": "x"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 429)
+        self.assertIn("too many", obj["error"])
+
+    def test_open_pty_spawns_a_real_shell_and_registers_it(self):
+        term_gate.session_cwd = lambda sid: "/tmp"
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {"session": "x", "cols": 40, "rows": 10, "mode": "cwd"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200)
+        self.assertIn(obj["tty"], term_vt.PTYS)
+        pt = term_vt.PTYS[obj["tty"]]
+        self.assertEqual((pt.screen.cols, pt.screen.rows), (40, 10))
+
+    def test_keys_404s_an_unknown_tty(self):
+        h = _FakeHandler()
+        term_vt.keys(h, None, {"tty": "nope", "data": ""})
+        self.assertEqual(h.calls[-1][1], 404)
+
+    def test_keys_400s_bad_base64(self):
+        term_vt.PTYS["p1"] = term_vt.Pty(tid="p1", pid=0, fd=-1)
+        h = _FakeHandler()
+        term_vt.keys(h, None, {"tty": "p1", "data": "not-valid-base64!!"})
+        self.assertEqual(h.calls[-1][1], 400)
+
+    def test_resize_404s_an_unknown_tty(self):
+        h = _FakeHandler()
+        term_vt.resize_pty(h, None, {"tty": "nope", "cols": 80, "rows": 24})
+        self.assertEqual(h.calls[-1][1], 404)
+
+    def test_screen_404s_an_unknown_tty(self):
+        h = _FakeHandler()
+        term_vt.screen_stream(h, _Q("tty=nope"))
+        self.assertEqual(h.calls[-1][1], 404)
+
+
+class _StreamHandler(_FakeHandler):
+    """A handler backed by one end of a real socketpair, so screen_stream() can run its SSE loop
+    and _peer_gone() can see the client actually go away. Mirrors term_run's own _StreamHandler."""
+
+    def __init__(self):
+        import socket as _s
+        _FakeHandler.__init__(self)
+        self.connection, self.peer = _s.socketpair()
+        self.wfile = self.connection.makefile("wb")
+
+    def send_response(self, code):
+        pass
+
+    def send_header(self, k, v):
+        pass
+
+    def end_headers(self):
+        pass
+
+    def close_peer(self):
+        try:
+            self.peer.close()
+        except OSError:
+            pass
+
+    def close(self):
+        self.close_peer()
+        for sock in (self.wfile, self.connection):
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+class TestStreamAccounting(unittest.TestCase):
+    """MAX_STREAMS (thread exhaustion) and the per-PTY viewer refcount (premature teardown)."""
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        term_vt._STREAMS = 0
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        # kill only -- see TestRoutes.tearDown's comment: draining fake (pid=0) placeholders
+        # would burn the full timeout on each one for nothing.
+        for pt in list(term_vt.PTYS.values()):
+            pt.kill()
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+        term_vt._STREAMS = 0
+
+    def test_stream_429s_past_max_streams(self):
+        term_vt.PTYS["p1"] = term_vt.Pty(tid="p1")
+        term_vt._STREAMS = term_vt.MAX_STREAMS
+        h = _FakeHandler()
+        term_vt.screen_stream(h, _Q("tty=p1"))
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 429)
+        self.assertIn("too many", obj["error"])
+        self.assertEqual(term_vt.PTYS["p1"].viewers, 0)       # a refused viewer takes no slot
+        self.assertEqual(term_vt._STREAMS, term_vt.MAX_STREAMS)
+
+    def test_unknown_tty_holds_no_stream_slot(self):
+        h = _FakeHandler()
+        term_vt.screen_stream(h, _Q("tty=nope"))
+        self.assertEqual(h.calls[-1][1], 404)
+        self.assertEqual(term_vt._STREAMS, 0)
+
+    def test_one_viewer_leaving_does_not_kill_the_pty_for_the_other(self):
+        """Deterministic reproduction of the bug Tier 2 shipped first: two viewers on one PTY,
+        close only the first, and the second must NOT be cut off. Unlike Tier 2's one-shot jobs,
+        the PTY must also survive the LAST viewer leaving (it is a persistent shell a client is
+        meant to reattach to) -- see screen_stream's docstring for why that difference is
+        deliberate."""
+        pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
+        term_vt.PTYS[pt.id] = pt
+        a, b = _StreamHandler(), _StreamHandler()
+        ta = threading.Thread(target=term_vt.screen_stream, args=(a, _Q("tty=" + pt.id)))
+        tb = threading.Thread(target=term_vt.screen_stream, args=(b, _Q("tty=" + pt.id)))
+        ta.daemon = tb.daemon = True
+        ta.start(); tb.start()
+        try:
+            self.assertTrue(_wait_for(lambda: pt.viewers >= 2, 5),
+                             "both viewers should be counted")
+            a.close_peer()
+            ta.join(5)
+            self.assertFalse(ta.is_alive())
+            self.assertTrue(_wait_for(lambda: pt.viewers == 1, 5))
+            self.assertFalse(pt.done, "the surviving viewer was cut off")
+            self.assertTrue(tb.is_alive(), "viewer B ended early")
+            b.close_peer()
+            tb.join(5)
+            self.assertTrue(_wait_for(lambda: pt.viewers == 0, 5))
+            time.sleep(0.3)
+            self.assertFalse(pt.done, "the PTY must survive its last viewer leaving")
+        finally:
+            pt.kill()
+            _drain(pt, 5)
+            a.close(); b.close()
+        self.assertEqual(term_vt._STREAMS, 0)
+
+    def test_finished_stream_releases_its_slot(self):
+        pt = term_vt.Pty(tid="done1")
+        pt.done, pt.rc = True, 0
+        term_vt.PTYS["done1"] = pt
+        h = _StreamHandler()
+        term_vt.screen_stream(h, _Q("tty=done1"))
+        self.assertEqual(term_vt._STREAMS, 0)
+        self.assertEqual(pt.viewers, 0)
+        h.close()
+
+
+class TestWireFormat(unittest.TestCase):
+    """The two integration bugs neither TestRoutes nor TestStreamAccounting can see on their own:
+    a named `event:` frame that EventSource.onmessage silently swallows, and a shared (rather
+    than per-viewer) `since` that would starve whichever viewer attached second. The client half
+    of this wire format is already built and committed, so this shape is FIXED -- these tests
+    exist to keep the server from drifting away from it."""
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        term_vt._STREAMS = 0
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        for pt in list(term_vt.PTYS.values()):
+            pt.kill()
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+        term_vt._STREAMS = 0
+
+    def test_stream_frames_carry_no_event_name(self):
+        pt = term_vt.Pty(tid="fmt1")
+        pt.screen = Screen(cols=10, rows=2)
+        pt.screen.feed(b"hi")
+        term_vt.PTYS["fmt1"] = pt
+        h = _StreamHandler()
+        t = threading.Thread(target=term_vt.screen_stream, args=(h, _Q("tty=fmt1")))
+        t.daemon = True
+        t.start()
+        try:
+            self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
+            h.peer.settimeout(3)
+            captured = h.peer.recv(65536)
+        finally:
+            h.close_peer()
+            t.join(5)
+            h.close()
+        # EventSource.onmessage only fires for UNNAMED events -- a stray `event: <name>` line
+        # here would go permanently, silently dark on the client with no error anywhere.
+        self.assertIn(b"data: ", captured)
+        self.assertNotIn(b"event:", captured)
+        payload = json.loads(captured.split(b"data: ", 1)[1].split(b"\n\n", 1)[0])
+        self.assertEqual(set(payload.keys()), {"v", "rows", "cursor", "alt"})
+
+    def test_second_viewer_attaching_to_a_live_tty_gets_a_full_repaint(self):
+        pt = term_vt.Pty(tid="fmt2")
+        pt.screen = Screen(cols=10, rows=2)
+        pt.screen.feed(b"AAAAAAAAAA")           # fills row 0 -- unmistakable in a captured frame
+        term_vt.PTYS["fmt2"] = pt
+
+        a = _StreamHandler()
+        ta = threading.Thread(target=term_vt.screen_stream, args=(a, _Q("tty=fmt2")))
+        ta.daemon = True
+        ta.start()
+        b = None
+        tb = None
+        try:
+            self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
+            a.peer.settimeout(3)
+            first = a.peer.recv(65536)
+            self.assertIn(b"AAAAAAAAAA", first)     # viewer A's `since` has now moved past 0
+
+            # A second viewer, attaching AFTER A has already "seen" and consumed this content,
+            # must still get its own full repaint -- `since` is per-connection, not shared, or
+            # whichever viewer attaches second would starve on an empty diff forever.
+            b = _StreamHandler()
+            tb = threading.Thread(target=term_vt.screen_stream, args=(b, _Q("tty=fmt2")))
+            tb.daemon = True
+            tb.start()
+            self.assertTrue(_wait_for(lambda: pt.viewers >= 2, 5))
+            b.peer.settimeout(3)
+            second = b.peer.recv(65536)
+            self.assertIn(b"AAAAAAAAAA", second)
+        finally:
+            a.close_peer()
+            ta.join(5)
+            a.close()
+            if b is not None:
+                b.close_peer()
+                tb.join(5)
+                b.close()
+
+
+class TestIdleTimeout(unittest.TestCase):
+    """No keystrokes AND no viewers for IDLE_TIMEOUT -> the reader thread reaps the PTY."""
+
+    def test_idle_pty_is_reaped(self):
+        real_timeout = term_vt.IDLE_TIMEOUT
+        term_vt.IDLE_TIMEOUT = 0.2
+        try:
+            pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
+            try:
+                self.assertTrue(_drain(pt, 5).done, "idle PTY with no viewers was never reaped")
+                self.assertIsNotNone(pt.rc)
+            finally:
+                pt.kill()
+        finally:
+            term_vt.IDLE_TIMEOUT = real_timeout
+
+    def test_active_viewer_prevents_idle_reap(self):
+        real_timeout = term_vt.IDLE_TIMEOUT
+        term_vt.IDLE_TIMEOUT = 0.2
+        try:
+            pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
+            pt.viewers = 1                     # simulate an attached viewer, no route needed
+            try:
+                time.sleep(0.6)
+                self.assertFalse(pt.done, "a PTY with an active viewer must not be idle-reaped")
+            finally:
+                pt.viewers = 0
+                pt.kill()
+                _drain(pt, 5)
+        finally:
+            term_vt.IDLE_TIMEOUT = real_timeout
+
+
+class TestEviction(unittest.TestCase):
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+
+    def _stale(self):
+        pt = term_vt.Pty(tid="stale")
+        pt.done = True
+        pt.ended = time.time() - 1200          # older than the 10-minute linger window
+        term_vt.PTYS["stale"] = pt
+
+    def test_every_route_sweeps_finished_ptys(self):
+        for call in (lambda h: term_vt.keys(h, None, {"tty": "nope", "data": ""}),
+                     lambda h: term_vt.resize_pty(h, None, {"tty": "nope"}),
+                     lambda h: term_vt.screen_stream(h, _Q("tty=nope"))):
+            self._stale()
+            self.assertIn("stale", term_vt.PTYS)
+            call(_FakeHandler())
+            self.assertNotIn("stale", term_vt.PTYS)
 
 
 if __name__ == "__main__":

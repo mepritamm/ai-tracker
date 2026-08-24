@@ -68,7 +68,58 @@ byte boundary. `feed()` keeps unconsumed trailing bytes in `self._pending` and r
 the next call, so an escape sequence or a UTF-8 code point split across two `feed()` calls parses
 identically to one that arrived whole. Malformed UTF-8 is decoded with `errors="replace"` rather
 than raising.
+
+## The PTY routes below -- an UNRESTRICTED shell, and that is deliberate
+
+`Screen` above is pure and safe by construction: bytes in, grid out, no side effects. Everything
+below it is not. `POST /api/term/pty` starts a REAL shell (or `claude --resume <sid>`) on the
+machine running this server; `POST /api/term/keys` writes whatever bytes the caller sends straight
+into that shell's stdin. There is no allowlist here -- unlike Tier 2 (`term_run.py`), an allowlist
+would defeat the entire point of a terminal -- so once a caller can reach these routes they can run
+anything this server's own OS user can run.
+
+**The only thing standing between a caller and that shell is `term_gate.guard()`**:
+`TRACKER_TERMINAL=1` *and* a configured `TRACKER_AUTH`, plus a same-origin check on POSTs. There is
+DELIBERATELY NO loopback / `127.0.0.1` check here, and no `TRACKER_TERMINAL_REMOTE` escape hatch
+either -- both appeared in the original plan (docs/terminal-tiers-plan.md Sec 5 rule 4) and both
+were removed on an explicit, informed decision, recorded in that same file's ERRATA section: a
+loopback check is not a security boundary once `make tunnel` is in the picture, because
+`cloudflared` terminates on this machine and dials the server over loopback, so EVERY request that
+arrives through the public tunnel also presents `client_address[0] == "127.0.0.1"` and would sail
+straight through such a check. Tier 1 demonstrated this concretely with an equivalent forwarder
+before Tier 3 was built. Adding the check back "to be safe" would not make anything safer; it would
+only make it easier for the next reader to believe there is a network boundary here where there is
+none, which is worse than having no check at all.
+
+**What this means concretely.** Anyone who can reach this server's HTTP port AND knows
+`TRACKER_AUTH` gets a real, interactive shell as this server's own user -- the same whether they
+are on localhost, on the LAN, or on the far end of a Cloudflare tunnel. `TRACKER_AUTH` is not "a
+login" here; while `TRACKER_TERMINAL=1` is set, it is the entire perimeter, and it deserves the
+seriousness of a root password, not a dashboard password. The user was told this in exactly these
+terms and chose it anyway, on the stated grounds that the tunnel URL and the credential are both
+rotated regularly. That tradeoff is theirs to make; do not silently "fix" it back.
 """
+
+import base64
+import json
+import os
+import pty
+import select
+import signal
+import socket
+import struct
+import threading
+import time
+import uuid
+
+from . import server, term_gate, term_run
+# Circular by design, exactly like term_run's own import of `server` -- see that module's
+# docstring comment. server.py's bottom-of-file loader imports this module by name, and this
+# module registers its routes back into server.EXTRA_GET/EXTRA_POST. Safe because those two dicts
+# are created near the top of server.py, long before the loader runs. term_run is imported for its
+# strip_git_env -- the single source of truth for "what git environment must not survive into a
+# spawned child" -- reused here rather than duplicated (see strip_git_env's own docstring for why
+# duplicating it would be a bug waiting to happen).
 
 TAB_STOP = 8
 
@@ -152,6 +203,49 @@ class Screen:
             if self.row_v[r] > since:
                 rows_out.append(self._row_entry(r))
         return {"v": self.v, "rows": rows_out, "cursor": [self.cur_r, self.cur_c], "alt": self.alt}
+
+    def resize(self, cols, rows):
+        """Change the grid dimensions in place, preserving whatever fits from the top-left.
+
+        The PTY side of a resize is `TIOCSWINSZ` (see term_vt's `_set_winsize`); this is the
+        Screen-side half of the same operation, and both must happen together or the emulator's
+        idea of the grid's shape silently diverges from the real pty's. Not a real xterm's resize
+        semantics (a real terminal reflows text and can scroll its viewport) -- this is the same
+        kind of deliberate simplification as the "wide characters" gap documented above: each
+        existing row is cropped or space-padded to the new column count, rows beyond the new row
+        count are dropped and short grids are padded with blank rows, the cursor and scroll region
+        are clamped into the new bounds, and every row is marked dirty so the next `snapshot()`
+        (at ANY `since`) redraws the whole grid rather than trying to describe a resize as a diff.
+        """
+        if cols == self.cols and rows == self.rows:
+            return
+
+        def _resized(grid):
+            out = []
+            for r in range(rows):
+                if r < len(grid):
+                    row = grid[r]
+                    row = row[:cols] if cols <= len(row) else row + _blank_row(cols - len(row))
+                else:
+                    row = _blank_row(cols)
+                out.append(row)
+            return out
+
+        self.primary = _resized(self.primary)
+        if self.alt_grid is not None:
+            self.alt_grid = _resized(self.alt_grid)
+        self.grid = self.alt_grid if self.alt else self.primary
+
+        self.cols, self.rows = cols, rows
+        self.cur_r = min(self.cur_r, rows - 1)
+        self.cur_c = min(self.cur_c, cols - 1)
+        self.pending_wrap = False
+        self.scroll_top, self.scroll_bot = 0, rows - 1
+        pr, pc = self._primary_cursor
+        self._primary_cursor = (min(pr, rows - 1), min(pc, cols - 1))
+
+        self.v += 1
+        self.row_v = [self.v] * rows
 
     # ------------------------------------------------------------- internals
 
@@ -617,3 +711,452 @@ class Screen:
     def _reset(self):
         cols, rows = self.cols, self.rows
         self.__init__(cols, rows)
+
+
+# ============================================================================================
+# Tier 3's PTY session table + the four routes. See the module docstring above ("The PTY routes
+# below") for the security stance -- read it before touching anything past this line.
+# ============================================================================================
+
+DEFAULT_COLS, DEFAULT_ROWS = 100, 30
+MIN_COLS, MAX_COLS = 20, 500
+MIN_ROWS, MAX_ROWS = 5, 200
+
+MAX_PTYS = 4            # concurrent shells -- each pins a Screen grid + a reader thread
+MAX_STREAMS = 24         # concurrent SSE /api/term/screen connections, across all PTYs -- see
+                          # term_run.stream's docstring for the thread-exhaustion measurement this
+                          # cap exists to prevent (same ThreadingHTTPServer, same failure mode).
+IDLE_TIMEOUT = 1800       # seconds of no keystrokes AND no viewers before a PTY is reaped (30 min)
+_REAP_LINGER = 600        # seconds a FINISHED pty's record (its final rc) lingers in PTYS before
+                          # being dropped, mirroring term_run._reap_old's 10-minute window.
+
+PTYS = {}                # id -> Pty
+_STREAMS = 0              # open SSE connections across all PTYs; guarded by _LOCK
+_LOCK = threading.Lock()
+
+
+def _clamp_int(v, lo, hi, default):
+    """`int(v)` clamped to [lo, hi], or `default` if `v` isn't an int-like value at all. Used for
+    cols/rows from the client -- never trust a browser-supplied size directly into a struct.pack."""
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, v))
+
+
+def _is_claude(sid):
+    """True when `sid` belongs to the unprefixed (Claude) provider.
+
+    Mirrors term_launch._is_claude's logic exactly (registry.PROVIDERS' prefixes are the single
+    source of truth for this) but is its own copy rather than a shared import: the three terminal
+    tiers are deliberately file-disjoint past Step 0 (docs/terminal-tiers-plan.md Sec 6: "After
+    Step 0 there is no shared file between the three tiers"), so this five-line predicate is
+    duplicated on purpose rather than becoming the one cross-tier coupling.
+    """
+    from .registry import PROVIDERS
+    for p in PROVIDERS:
+        if p.prefix and sid.startswith(p.prefix):
+            return False
+    return True
+
+
+def _set_winsize(fd, rows, cols):
+    """`TIOCSWINSZ` -- without this a TUI renders at its compiled-in default (usually 80x24)
+    forever, no matter how big the browser's pane actually is. Called on create AND on every
+    resize (rule 1) -- best effort, exactly like term_run._set_winsize."""
+    try:
+        import fcntl
+        import termios
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    except Exception:
+        pass
+
+
+class Pty:
+    """One live (or just-finished) PTY session: the master fd, the child pid, and the `Screen`
+    that turns its output into a grid.
+
+    `lock` guards `screen` -- `feed()` (from the reader thread) and `snapshot()` (from a viewer's
+    SSE loop) must never run concurrently, since both mutate/read the same grid and version
+    counter. Everything else here (`viewers`, `done`, `rc`, `last_active`) is only ever touched
+    under the MODULE-level `_LOCK`, exactly like term_run.Job's fields.
+    """
+
+    def __init__(self, tid=None, pid=0, fd=-1, screen=None, cwd="", cmd=""):
+        self.id = tid or uuid.uuid4().hex[:12]
+        self.pid = pid
+        self.fd = fd
+        self.screen = screen
+        self.cwd = cwd
+        self.cmd = cmd
+        self.viewers = 0           # open SSE /api/term/screen connections; guarded by _LOCK
+        self.done = False
+        self.rc = None
+        self.ended = 0.0           # time.time() when finish() ran; 0.0 while still live
+        self.started = time.time()
+        self.last_active = self.started   # last keystroke, or last viewer leaving -- idle clock
+        self.lock = threading.Lock()      # guards `screen` only
+
+    def touch(self):
+        self.last_active = time.time()
+
+    def kill(self):
+        """SIGKILL the whole process group, not just `pid`.
+
+        pty.fork() makes the child a session leader, so signalling the bare pid was only ever
+        clean by accident (the kernel's own SIGHUP to the foreground group happened to take
+        grandchildren down with it). A grandchild that ignores SIGHUP -- an ordinary TUI's worker
+        thread/process, a watcher -- survives a bare `kill` and keeps running after the PTY is
+        marked dead. See term_run.Job.kill's docstring for the fuller account and
+        TestProcessGroupKill below for the reproduction this guards against.
+        """
+        if self.pid > 0 and not self.done:
+            try:
+                os.killpg(os.getpgid(self.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                os.kill(self.pid, signal.SIGKILL)     # belt, if getpgid already failed
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+    def finish(self):
+        """Close the master fd and reap the child -- always called from the reader thread, so
+        `waitpid()` happens exactly once and nothing is left as a zombie."""
+        if self.fd >= 0:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = -1
+        if self.pid > 0:
+            try:
+                _, status = os.waitpid(self.pid, 0)
+                self.rc = -os.WTERMSIG(status) if os.WIFSIGNALED(status) else os.WEXITSTATUS(status)
+            except (ChildProcessError, OSError):
+                pass
+        self.done = True
+        self.ended = time.time()
+
+
+def spawn(cwd, argv, cols, rows):
+    """pty.fork() + execvp in `cwd`, sized to (cols, rows) from the very first ioctl (rule 1).
+
+    No shell anywhere on the "resume" path: argv is `["claude", "--resume", sid]`, executed
+    directly by execvp, exactly like term_run's own no-shell policy. The "cwd" (plain shell) path
+    IS a shell -- the user's own login shell -- because an interactive terminal that cannot run a
+    shell is not a terminal; that is the feature this tier exists to provide, not a gap in it.
+
+    Child setup below mirrors term_run.spawn()'s almost line for line -- see that function's own
+    comments for why each piece is there (strip_git_env, PAGER/GIT_EDITOR hardening). The only
+    difference: COLUMNS/LINES are set to the REAL negotiated size instead of term_run's fixed
+    120x30, since a Screen already tracks the true size and there is no reason to lie to the child
+    about it.
+    """
+    pid, fd = pty.fork()
+    if pid == 0:                                        # child
+        try:
+            os.chdir(cwd or "/")
+            os.environ["TERM"] = "xterm-256color"
+            os.environ["COLUMNS"] = str(cols)
+            os.environ["LINES"] = str(rows)
+            # Inherited GIT_* would silently retarget a `git` invocation at another repository --
+            # see term_run.strip_git_env's docstring for the concrete failure this closes.
+            term_run.strip_git_env(os.environ)
+            os.environ["GIT_TERMINAL_PROMPT"] = "0"
+            os.execvp(argv[0], argv)                     # <-- the only exec on this path
+        except Exception:
+            pass
+        os._exit(127)                                    # execvp only returns on failure
+    _set_winsize(fd, rows, cols)
+    screen = Screen(cols=cols, rows=rows)
+    pt = Pty(pid=pid, fd=fd, screen=screen, cwd=cwd, cmd=" ".join(argv))
+    t = threading.Thread(target=_reader, args=(pt,), daemon=True)
+    t.start()
+    return pt
+
+
+def _reader(pt):
+    """Drain the pty into `pt.screen` via `feed()` until EOF, or until the idle timeout fires with
+    nobody attached. Owns the reap: the thread that reads the fd is the thread that `waitpid()`s
+    it, so there is exactly one waitpid per child and never a zombie (mirrors term_run._reader).
+
+    The idle check lives in this loop (rather than a separate timer thread) because `select`'s own
+    timeout already wakes this thread once a second regardless of PTY activity -- a second thread
+    would be more machinery than the bound is worth, exactly the reasoning term_run._reap_old uses
+    for not running a background sweep.
+    """
+    try:
+        while True:
+            if pt.viewers <= 0 and (time.time() - pt.last_active) > IDLE_TIMEOUT:
+                pt.kill()
+                break
+            try:
+                r, _, _ = select.select([pt.fd], [], [], 1.0)
+            except (OSError, ValueError):
+                break
+            if not r:
+                continue
+            try:
+                data = os.read(pt.fd, 65536)
+            except OSError:                              # EIO == child closed the pty (exited)
+                break
+            if not data:
+                break
+            with pt.lock:
+                pt.screen.feed(data)
+            pt.touch()
+    finally:
+        pt.finish()
+
+
+def _live_count():
+    return sum(1 for p in PTYS.values() if not p.done)
+
+
+def _reap():
+    """Drop finished PTYs older than `_REAP_LINGER` so PTYS cannot grow without bound. Called from
+    EVERY route, not just `open_pty()` -- see term_run._reap_old's docstring for why an
+    open-once-only sweep leaves a pinned record for the life of the process."""
+    cut = time.time() - _REAP_LINGER
+    for tid in [t.id for t in PTYS.values() if t.done and t.ended < cut]:
+        PTYS.pop(tid, None)
+
+
+def _peer_gone(handler):
+    """True once the SSE client has closed its end. See term_run._peer_gone's docstring for why a
+    failed write alone is not a reliable detector (the first send after a peer vanishes lands in
+    the kernel buffer; only the SECOND write raises) -- same reasoning, same technique, here."""
+    try:
+        r, _, _ = select.select([handler.connection], [], [], 0)
+        return bool(r) and handler.connection.recv(1, socket.MSG_PEEK) == b""
+    except OSError:
+        return True
+
+
+def _write(handler, text):
+    """One SSE write+flush inside the repo's BrokenPipeError/ConnectionResetError guard
+    (conventions rule 8). Returns False once this client is gone."""
+    try:
+        handler.wfile.write(text.encode())
+        handler.wfile.flush()
+        return True
+    except (BrokenPipeError, ConnectionResetError):
+        return False
+
+
+# --------------------------------------------------------------------------- routes
+
+def open_pty(handler, parsed, body):
+    """POST /api/term/pty {session, cols, rows, mode} -> {tty}.
+
+    `mode` follows term_launch's own naming (`"cwd"` = a plain login shell in the session's
+    working directory; `"resume"` = `claude --resume <sid>`) so the two buttons this route serves
+    stay consistent with Tier 1's. `"resume"` is refused for a non-Claude session id, exactly like
+    term_launch.open_terminal -- see `_is_claude`.
+    """
+    if not term_gate.guard(handler):
+        return
+    if not isinstance(body, dict):      # do_POST accepts ANY JSON value, "a string" included
+        return handler._json({"error": "bad body: expected a JSON object"}, 400)
+    sid = body.get("session") or ""
+    if not sid:
+        return handler._json({"error": "session required"}, 400)
+    mode = body.get("mode", "cwd")
+    if mode not in ("cwd", "resume"):
+        return handler._json({"error": "bad mode"}, 400)
+    if mode == "resume" and not _is_claude(sid):
+        return handler._json({"error": "resume is Claude-only"}, 400)
+    cwd = term_gate.session_cwd(sid)
+    if not cwd:
+        return handler._json({"error": "session not found or its cwd no longer exists"}, 404)
+    with _LOCK:
+        _reap()
+        if _live_count() >= MAX_PTYS:
+            return handler._json({"error": "too many running terminals (max %d)" % MAX_PTYS}, 429)
+    cols = _clamp_int(body.get("cols"), MIN_COLS, MAX_COLS, DEFAULT_COLS)
+    rows = _clamp_int(body.get("rows"), MIN_ROWS, MAX_ROWS, DEFAULT_ROWS)
+    if mode == "resume":
+        argv = ["claude", "--resume", sid]
+    else:
+        argv = [os.environ.get("SHELL", "/bin/bash"), "-l"]
+    try:
+        pt = spawn(cwd, argv, cols, rows)
+    except OSError as e:
+        return handler._json({"error": "spawn failed: %s" % e}, 500)
+    with _LOCK:
+        PTYS[pt.id] = pt
+    handler._json({"tty": pt.id})
+
+
+def keys(handler, parsed, body):
+    """POST /api/term/keys {tty, data} (data: base64) -> {ok: true}.
+
+    Writes raw bytes to the PTY's stdin -- this IS the "unrestricted shell" surface described in
+    the module docstring: whatever bytes arrive here are typed at a real shell (or `claude
+    --resume`) as this server's own OS user, with no allowlist and no interpretation.
+    """
+    if not term_gate.guard(handler):
+        return
+    if not isinstance(body, dict):
+        return handler._json({"error": "bad body: expected a JSON object"}, 400)
+    tid = body.get("tty") or ""
+    with _LOCK:
+        _reap()
+        pt = PTYS.get(tid)
+    if pt is None or pt.done:
+        return handler._json({"error": "no such terminal"}, 404)
+    try:
+        data = base64.b64decode(body.get("data") or "", validate=False)
+    except Exception:
+        return handler._json({"error": "bad base64"}, 400)
+    pt.touch()
+    try:
+        os.write(pt.fd, data)
+    except OSError as e:
+        return handler._json({"error": "write failed: %s" % e}, 500)
+    handler._json({"ok": True})
+
+
+def resize_pty(handler, parsed, body):
+    """POST /api/term/resize {tty, cols, rows} -> {ok: true}.
+
+    Rule 1: `TIOCSWINSZ` on the real pty AND a matching `Screen.resize()` -- without both, either
+    the child's own idea of the terminal size never changes (it keeps wrapping at whatever size it
+    started at), or the Screen's grid silently disagrees with what the pty is actually producing.
+    """
+    if not term_gate.guard(handler):
+        return
+    if not isinstance(body, dict):
+        return handler._json({"error": "bad body: expected a JSON object"}, 400)
+    tid = body.get("tty") or ""
+    with _LOCK:
+        _reap()
+        pt = PTYS.get(tid)
+    if pt is None or pt.done:
+        return handler._json({"error": "no such terminal"}, 404)
+    cols = _clamp_int(body.get("cols"), MIN_COLS, MAX_COLS, pt.screen.cols)
+    rows = _clamp_int(body.get("rows"), MIN_ROWS, MAX_ROWS, pt.screen.rows)
+    pt.touch()
+    _set_winsize(pt.fd, rows, cols)
+    with pt.lock:
+        pt.screen.resize(cols, rows)
+    handler._json({"ok": True})
+
+
+def screen_stream(handler, parsed):
+    """GET /api/term/screen?tty=<id> -> SSE of `Screen.snapshot(since)` payloads, one connection
+    per viewer.
+
+    Two accounting jobs happen here, both under `_LOCK`, mirroring term_run.stream()'s almost
+    exactly -- see that function's docstring for the thread-exhaustion measurement `MAX_STREAMS`
+    prevents (unbounded SSE connections each pin a ThreadingHTTPServer thread; enough of them and
+    the whole dashboard, not just this panel, stops answering ANY request) and for the
+    premature-teardown bug the per-PTY viewer refcount fixes (closing one of two open tabs on the
+    same session must not cut the other one off).
+
+    The one deliberate difference from Tier 2: `term_run.stream()` kills its job the instant the
+    LAST viewer disconnects, because a finished one-shot command has nothing left to show anyone.
+    A PTY here is a persistent shell -- the whole point of `tty` being a stable id the client can
+    reattach to is that closing every tab and coming back later finds the SAME session still
+    running -- so the last viewer leaving only calls `pt.touch()`, starting the `IDLE_TIMEOUT`
+    clock, rather than killing anything. `_reader()` is what actually reaps an abandoned PTY.
+    """
+    global _STREAMS
+    if not term_gate.guard(handler):
+        return
+    from urllib.parse import parse_qs
+    tid = parse_qs(parsed.query).get("tty", [""])[0]
+    with _LOCK:
+        _reap()
+        pt = PTYS.get(tid)
+        busy = pt is not None and _STREAMS >= MAX_STREAMS
+        if pt is not None and not busy:
+            _STREAMS += 1
+            pt.viewers += 1
+            pt.touch()
+    if pt is None:                                       # returns fast, holds no thread
+        return handler._json({"error": "no such terminal", "tty": tid}, 404)
+    if busy:
+        return handler._json({"error": "too many open screen streams (max %d)" % MAX_STREAMS}, 429)
+    try:
+        _screen_stream_body(handler, pt)
+    finally:
+        with _LOCK:
+            _STREAMS -= 1
+            pt.viewers -= 1
+            pt.touch()                                   # last-viewer-leaves starts the idle clock
+
+
+def _screen_stream_body(handler, pt):
+    """The SSE loop itself. Polls Screen state under `pt.lock` (`feed()` from the reader thread
+    and `snapshot()` from here must never run concurrently) and sends only what changed since the
+    last send -- rule 3, never a whole grid except the very first message (`since=-1`, per
+    `Screen.snapshot`'s own documented contract). A poll that produced no new rows but a moved
+    cursor (e.g. arrow-key navigation with nothing printed) still counts as a change: the cursor
+    and `alt` fields are always current in `snapshot()`'s output regardless of `since`, so this
+    loop tracks them itself to decide whether there is anything worth sending.
+
+    The wire format is FIXED by the already-built, already-committed client and must not drift:
+
+    * Every data frame is a PLAIN, UNNAMED `data: <json>\\n\\n` line -- never `event: <name>`.
+      The client's `EventSource.onmessage` only fires for unnamed events; one named `event:`
+      frame and the terminal goes permanently, silently dark. (Tier 2's `term_run.stream()` right
+      next door DOES send `event: end` -- that pattern is Tier 2-only, deliberately not mirrored
+      here.) The `: ping\\n\\n` heartbeat is a comment line, not a `data:`/`event:` frame, so
+      EventSource ignores it for free -- that one is safe as-is.
+    * The JSON object carries EXACTLY the four keys `Screen.snapshot()` returns -- `v`, `rows`,
+      `cursor`, `alt` -- verbatim, unpadded. No wrapping, no extra keys, ever.
+    * `since` is a LOCAL variable of this call, i.e. per-viewer: two viewers on the same `tty`
+      (the deliberately-supported "New tab, same session" case) each start their own SSE
+      connection, each running its own `_screen_stream_body()`, each with its own `since = -1` --
+      so each gets its own full repaint on attach, and neither one's progress starves the other's.
+    * There is no special "the PTY ended" frame. If the PTY's last output changed the grid, that
+      change is sent as an ordinary data frame in the same iteration `done` is observed (the
+      snapshot and the done/rc flags are read together under one lock, so nothing after the last
+      byte is ever lost) -- then the loop just returns and the SSE connection closes. A client
+      that wants to know "did the shell exit" reads that from the connection closing, not from a
+      distinguished payload shape.
+
+    Returns on client disconnect or once the PTY has finished; the caller owns the stream slot and
+    the viewer refcount, so this never kills anything and never mutates PTYS.
+    """
+    try:
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Connection", "close")       # no Content-Length: body is open-ended
+        handler.end_headers()
+    except (BrokenPipeError, ConnectionResetError):
+        return
+    since = -1
+    last_cursor, last_alt = None, None
+    quiet = time.time()
+    while True:
+        with pt.lock:
+            snap = pt.screen.snapshot(since)
+            done = pt.done
+        cursor = tuple(snap["cursor"])
+        changed = snap["rows"] or since == -1 or cursor != last_cursor or snap["alt"] != last_alt
+        if changed:
+            since = snap["v"]
+            last_cursor, last_alt = cursor, snap["alt"]
+            if not _write(handler, "data: %s\n\n" % json.dumps(snap)):
+                return
+            quiet = time.time()
+        if done:
+            return
+        if _peer_gone(handler):                          # instant: the tab closed
+            return
+        if time.time() - quiet > 10:                     # heartbeat: keeps proxies from idling us
+            quiet = time.time()
+            if not _write(handler, ": ping\n\n"):
+                return
+        time.sleep(0.05)
+
+
+server.EXTRA_POST["/api/term/pty"] = open_pty
+server.EXTRA_POST["/api/term/keys"] = keys
+server.EXTRA_POST["/api/term/resize"] = resize_pty
+server.EXTRA_GET["/api/term/screen"] = screen_stream
