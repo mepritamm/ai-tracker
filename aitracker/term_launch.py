@@ -120,11 +120,12 @@ def build_script(cwd: str, sid: str, mode: str, app: str, resume_argv=None) -> s
     and retry -- see term_vt._resume_backstop), this route hands off to `osascript` and never
     sees the spawned Terminal/iTerm tab again, so there is nothing here to retry AFTER the fact.
     The fallback is built into the command ITSELF instead: when `resume_argv` does not already
-    include `--fork-session` (the fast path didn't classify this as a background agent), the
-    inner shell command becomes `(<resume> || <resume> --fork-session)` -- if the plain resume
-    is refused (exits non-zero), the shell's own `||` retries with the flag, with no ai-tracker
-    process involved at all. When `resume_argv` already forks (the fast path caught it), there
-    is nothing to fall back to, so the plain single command is used unchanged. There is no
+    include `--fork-session` (today: always -- see term_gate.resume_argv's docstring for why the
+    fast path stopped guessing), the inner shell command becomes
+    `(<resume> || <resume> --fork-session)` -- if the plain resume is refused (exits non-zero),
+    the shell's own `||` retries with the flag, with no ai-tracker process involved at all. If
+    `resume_argv` ever forks up front again, there would be nothing to fall back to, so the plain
+    single command would be used unchanged -- that branch is kept for exactly that case. There is no
     Tier-1 equivalent of the missing-transcript notice (term_vt.Screen) -- an external Terminal/
     iTerm tab is opaque to this server once launched, so that case is left to the CLI's own
     already-observed behaviour (silently starts a fresh conversation; see

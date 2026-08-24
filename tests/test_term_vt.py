@@ -2498,9 +2498,10 @@ def _bare_pty(tid="bt", cwd="/tmp"):
 
 class _ResumeModeRoutes(unittest.TestCase):
     """Shared fixture for mode="resume" open_pty tests: an isolated config.PROJECTS (so
-    is_bg_agent's classification is test-controlled by whichever session files this test
-    writes), terminal enabled, PTYS cleared, session_cwd stubbed (the on-disk cwd check
-    is not what's under test here)."""
+    the badge classifier -- providers/claude.py's _is_bg_agent, which term_gate.
+    resume_argv no longer consults -- is test-controlled by whichever session files this
+    test writes), terminal enabled, PTYS cleared, session_cwd stubbed (the on-disk cwd
+    check is not what's under test here)."""
 
     def setUp(self):
         from aitracker.providers import claude as _claude
@@ -2526,8 +2527,10 @@ class _ResumeModeRoutes(unittest.TestCase):
         term_gate.session_cwd = self._session_cwd0
 
     def _write_bg_session(self, sid):
-        """A minimal session file this instance's is_bg_agent will classify True (entrypoint
-        sdk-cli) -- see providers/claude.py's _is_bg_agent."""
+        """A minimal session file the BADGE classifier (providers/claude.py's
+        _is_bg_agent) will classify True (entrypoint sdk-cli) -- used to prove
+        term_gate.resume_argv() no longer forks on it, since that classifier now feeds
+        only the sidebar's 🤖 badge, not this decision."""
         d = os.path.join(config.PROJECTS, "proj")
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, sid + ".jsonl"), "w") as fh:
@@ -2540,9 +2543,17 @@ class TestOpenPtyForkedAndNoticeFields(_ResumeModeRoutes):
     """The client contract: POST /api/term/pty gains exactly `forked` (bool) and `notice`
     (str|null). Both are answered from what open_pty knows BEFORE the spawned child has
     produced any output -- see that route's own docstring -- so `notice` is always None
-    here; only `forked` varies, and only with the fast-path classification."""
+    here. `forked` no longer varies with the session's transcript at all: term_gate.
+    resume_argv() stopped guessing proactively (see its docstring for why a transcript-
+    based guess turned out to be over-broad), so `forked` is now False for EVERY
+    mode="resume" open, background-agent session or not -- see
+    TestResumeBackstopFiresOnRefusal below for the mechanism that now forks it instead."""
 
-    def test_forked_true_for_a_background_agent_session(self):
+    def test_forked_false_for_a_background_agent_session_too(self):
+        """The regression test for the over-broad-detection bug: a session whose
+        transcript claims sessionKind=="bg"/entrypoint=="sdk-cli" must NOT be forked
+        proactively any more -- only term_vt's backstop (on an actual CLI refusal) may
+        fork it now."""
         self._write_bg_session("bg-sess")
         original_spawn = term_vt.spawn
         term_vt.spawn = lambda cwd, argv, cols, rows: term_vt.Pty(tid="pf1")
@@ -2554,12 +2565,14 @@ class TestOpenPtyForkedAndNoticeFields(_ResumeModeRoutes):
             term_vt.spawn = original_spawn
         obj, code = h.calls[-1]
         self.assertEqual(code, 200, obj)
-        self.assertTrue(obj["forked"])
+        self.assertFalse(obj["forked"])
         self.assertIsNone(obj["notice"])
 
     def test_forked_false_for_an_ordinary_session(self):
-        """No session file written for "plain" at all -- find_session() finds nothing, so
-        is_bg_agent is naturally False, exactly like a real non-agent id would resolve."""
+        """No session file written for "plain" at all -- find_session() finds nothing,
+        exactly like a real non-agent id would resolve. Same False result as the
+        background-agent case above -- both go through the identical un-classified path
+        now."""
         original_spawn = term_vt.spawn
         term_vt.spawn = lambda cwd, argv, cols, rows: term_vt.Pty(tid="pf2")
         try:
@@ -2590,6 +2603,11 @@ class TestOpenPtyForkedAndNoticeFields(_ResumeModeRoutes):
             term_vt.spawn = original_spawn
 
     def test_resume_mode_starts_the_backstop_with_the_right_args(self):
+        """`already_forked` (the 3rd positional arg _resume_backstop gets) reflects the
+        fast-path decision -- which is now always False, even for a session whose
+        transcript claims to be a background agent, since resume_argv() no longer forks
+        proactively. This is exactly why the backstop must run unconditionally: it is now
+        the ONLY thing that can fork a genuine background-agent resume for this tier."""
         self._write_bg_session("bg-sess2")
         original_spawn = term_vt.spawn
         term_vt.spawn = lambda cwd, argv, cols, rows: term_vt.Pty(tid="pf4")
@@ -2603,7 +2621,7 @@ class TestOpenPtyForkedAndNoticeFields(_ResumeModeRoutes):
             term_vt.spawn = original_spawn
         pt_arg, sid_arg, forked_arg, cols_arg, rows_arg = backstop.call_args[0]
         self.assertEqual(sid_arg, "bg-sess2")
-        self.assertTrue(forked_arg)
+        self.assertFalse(forked_arg)
         self.assertEqual((cols_arg, rows_arg), (77, 21))
 
 

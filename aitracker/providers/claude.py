@@ -134,10 +134,20 @@ def _session_meta(path):
 
 
 def _is_bg_agent(sm):
-    """Determine if a session is a background agent. Checks for either:
-    1. Real background agents (claude --bg): sessionKind == "bg"
-    2. SDK-spawned agents: entrypoint == "sdk-cli"
-    Both are shown as 🤖 agents in the sidebar."""
+    """True when a session's OWN TRANSCRIPT claims to be a background agent -- either a
+    real `claude --bg` agent (sessionKind == "bg") or an SDK-spawned one (source ==
+    "sdk-cli"). Drives ONLY the sidebar's 🤖 badge (list_sessions/search_sessions,
+    below) -- a session that WAS a background agent should stay badged as one forever,
+    which is exactly why this is transcript-based rather than live: a finished agent's
+    transcript still says so long after `claude` itself has forgotten it.
+
+    Do NOT reuse this to decide whether `claude --resume <sid>` needs --fork-session.
+    It used to be reused for exactly that (via a since-removed ClaudeProvider.is_bg_agent
+    / registry.is_bg_agent seam) and that was WRONG: this field stays true long after
+    `claude agents --json` has stopped listing the session as forkable, so using it to
+    fork pre-emptively handed the user a COPY under a new session id when a plain resume
+    would have reopened their real conversation. See term_gate.resume_argv's docstring
+    for what that decision relies on now instead."""
     return sm.get("sessionKind") == "bg" or sm.get("source") == "sdk-cli"
 
 
@@ -1044,13 +1054,3 @@ class ClaudeProvider(Provider):
     def agent(self, sid, aid):
         path = find_session(sid)
         return agent_detail(path, aid) if path else None
-
-    def is_bg_agent(self, sid):
-        # Resolves THIS ONE sid directly (one glob via find_session + a bounded read of
-        # that single file via _session_meta), never by scanning list_sessions()'s
-        # top-N-by-mtime output — see registry.is_bg_agent, the seam term_gate.py calls,
-        # for why that distinction is the whole point. Reuses the exact classifier
-        # list_sessions()/search_sessions() already use (_is_bg_agent on _session_meta's
-        # result) so there is exactly one place that knows what a background agent is.
-        path = find_session(sid)
-        return bool(path) and _is_bg_agent(_session_meta(path))

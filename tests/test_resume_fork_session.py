@@ -1,25 +1,43 @@
-"""Tests for the fork-session usability fix.
+"""Tests for the fork-session usability fix -- and its correction.
 
 Claude Code's OWN CLI refuses a plain `claude --resume <sid>` against a session it
 considers "currently running as a background agent (bg)." -- that refusal happens
 inside the `claude` binary itself, not in ai-tracker. docs/claude-resume-command-matrix.md
 (live PTY tests against the real CLI) found this refusal fires for EVERY background-agent
-status tested ("blocked" and "done" alike, not just "running"), independent of recency --
-so the fix is: append `--fork-session` to the resume argv whenever `sid` names a
-background-agent session, full stop, no liveness condition.
+status tested ("blocked" and "done" alike, not just "running"), independent of recency.
 
-The single seam is `term_gate.resume_argv()` (and the `is_bg_agent()` it calls, which in
-turn calls `registry.is_bg_agent()` -- the seam that resolves ONE session id DIRECTLY
-through its owning provider, rather than scanning `all_sessions()`'s top-N-by-mtime list,
-which would miss a background agent outside that recency window). Both terminal tiers --
-term_vt.open_pty (the in-browser PTY) and term_launch.open_terminal/build_script (the
-external Terminal/iTerm launch) -- must go through it, so this file proves both the
-seam's own logic AND that the two call sites actually use it and agree.
+The FIRST fix appended `--fork-session` to the resume argv proactively, whenever the
+SESSION'S OWN TRANSCRIPT claimed to be a background agent (sessionKind == "bg" or
+entrypoint == "sdk-cli"). That turned out to be OVER-BROAD: a live proof against this
+machine's real `claude` binary found a session that still carried sessionKind == "bg" in
+its transcript, yet a plain `claude --resume <id>` opened it normally -- because `claude`
+had already deregistered it as a background agent (confirmed via `claude agents --json`
+no longer listing it). Proactively forking that session would have handed the user a COPY
+under a new session id when a plain resume would have reopened their actual conversation
+-- silently losing continuity, which is worse than a recoverable refusal.
 
-`is_bg_agent` was previously named `is_live_agent` and additionally required the session
-to be inside `config.LIVE_WINDOW` -- see TestIsBgAgent for the tests proving that gate is
-gone (a stale background-agent session still forks) and TestIsBgAgentResolvesDirectly for
-the top-N-list bug this rename also fixes.
+The CORRECTED behaviour (this file): `term_gate.resume_argv()` no longer appends
+`--fork-session` proactively AT ALL -- see that function's docstring for the measured
+`claude agents --json` latency (750-960ms/call on this machine) that ruled out a live
+registry cross-check as a synchronous fast path too. Correctness now rests entirely on
+two independent backstops that already run unconditionally on every `mode="resume"`
+open, regardless of anything term_gate.resume_argv decides:
+  - term_vt.py's `_resume_backstop` (Tier 2, in-browser PTY): watches the child's own
+    output for the refusal and retries once with --fork-session.
+  - term_launch.py's `build_script` (Tier 3, external Terminal/iTerm): always wraps a
+    resume argv lacking --fork-session in a shell-level
+    `(<resume> || <resume> --fork-session)` fallback.
+
+Both terminal tiers -- term_vt.open_pty and term_launch.open_terminal/build_script --
+call term_gate.resume_argv() as the single seam, so this file proves both the seam's own
+(now much simpler) logic AND that the two call sites actually use it and agree, never
+re-deriving the decision themselves.
+
+The transcript classifier that used to feed the fork decision (providers/claude.py's
+`_is_bg_agent`) still exists and is still correct -- it now drives ONLY the sidebar's 🤖
+badge (see tests/test_selfcheck.py), a DIFFERENT concern with a DIFFERENT correctness
+requirement: a session that WAS a background agent should stay badged as one forever,
+which is exactly why the badge stays transcript-based while the fork decision could not.
 """
 import json
 import os
@@ -36,7 +54,9 @@ def _write_session(sid, entrypoint=None, session_kind=None, age_seconds=5, cwd="
     """A minimal Claude session file under config.PROJECTS, with a controlled filesystem
     mtime. `entrypoint` models an SDK-spawned agent (source == "sdk-cli"); `session_kind`
     models a REAL `claude --bg` agent (sessionKind == "bg") -- providers/claude.py's
-    _is_bg_agent() treats either as a background agent."""
+    _is_bg_agent() treats either as a background agent for BADGE purposes. Neither any
+    longer has any bearing on term_gate.resume_argv()'s fork decision -- that's the
+    behaviour this file pins."""
     d = os.path.join(config.PROJECTS, "proj")
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, sid + ".jsonl")
@@ -67,83 +87,36 @@ class _ResumeArgvBase(unittest.TestCase):
         _claude._META_CACHE.clear()
 
 
-class TestIsBgAgent(_ResumeArgvBase):
-    def test_sdk_cli_session_is_bg_agent(self):
-        _write_session("live-agent", entrypoint="sdk-cli", age_seconds=5)
-        self.assertTrue(term_gate.is_bg_agent("live-agent"))
+class TestResumeArgvNeverForksProactively(_ResumeArgvBase):
+    """The core regression test for the over-broad-detection bug: resume_argv() must
+    return the plain resume argv for EVERY session -- an sdk-cli agent, a real
+    `sessionKind:"bg"` agent, a stale one of either, an ordinary session, and an unknown
+    one -- since the transcript can no longer be trusted to mean "still forkable". This
+    is intentionally the OPPOSITE of what this suite asserted before the correction."""
 
-    def test_sessionKind_bg_session_is_bg_agent(self):
-        """A REAL `claude --bg` agent (sessionKind == "bg"), not just an SDK-spawned one --
-        the matrix found this is the field that actually drives the refusal on this
-        machine's real background-agent sessions, distinct from entrypoint=sdk-cli."""
-        _write_session("real-bg-agent", entrypoint="cli", session_kind="bg", age_seconds=5)
-        self.assertTrue(term_gate.is_bg_agent("real-bg-agent"))
-
-    def test_stale_agent_session_is_still_bg_agent(self):
-        """The liveness gate is GONE: the matrix found the refusal fires for a "blocked" or
-        "done" background agent exactly as much as a "running" one, so an agent session
-        older than LIVE_WINDOW must still fork -- this is the opposite assertion of the
-        old (now-wrong) is_live_agent behaviour."""
-        _write_session("stale-agent", entrypoint="sdk-cli", age_seconds=config.LIVE_WINDOW + 600)
-        self.assertTrue(term_gate.is_bg_agent("stale-agent"))
-
-    def test_stale_real_bg_agent_is_still_bg_agent(self):
-        _write_session("stale-real-bg", session_kind="bg", age_seconds=config.LIVE_WINDOW + 600)
-        self.assertTrue(term_gate.is_bg_agent("stale-real-bg"))
-
-    def test_plain_session_is_not_bg_agent(self):
-        _write_session("live-human", entrypoint="cli", age_seconds=5)
-        self.assertFalse(term_gate.is_bg_agent("live-human"))
-
-    def test_unknown_session_is_not_bg_agent(self):
-        self.assertFalse(term_gate.is_bg_agent("no-such-session"))
-
-
-class TestIsBgAgentResolvesDirectlyNotViaTopN(_ResumeArgvBase):
-    """The other half of the bug this rename fixes: the old implementation scanned
-    registry.all_sessions() (top-N by mtime) looking for a matching id, so a background
-    agent outside that window was invisible and silently answered False. is_bg_agent must
-    resolve the ONE session id directly through its owning provider instead."""
-
-    def test_ignores_all_sessions_entirely(self):
-        _write_session("outside-any-list", entrypoint="sdk-cli", age_seconds=5)
-        from aitracker import registry
-        original = registry.all_sessions
-        # Simulate "invisible to the top-N list" -- if is_bg_agent depended on this, it
-        # would now answer False no matter what the on-disk session actually is.
-        registry.all_sessions = lambda: []
-        try:
-            self.assertTrue(term_gate.is_bg_agent("outside-any-list"))
-        finally:
-            registry.all_sessions = original
-
-    def test_provider_is_bg_agent_called_with_the_exact_sid(self):
-        from aitracker import registry
-        calls = []
-        with mock.patch.object(registry.ClaudeProvider, "is_bg_agent",
-                                lambda self, sid: calls.append(sid) or True):
-            self.assertTrue(registry.is_bg_agent("some-sid"))
-        self.assertEqual(calls, ["some-sid"])
-
-    def test_non_claude_provider_defaults_to_false(self):
-        from aitracker.registry import PROVIDERS
-        prefixed = [p for p in PROVIDERS if p.prefix]
-        if not prefixed:
-            self.skipTest("no prefixed provider registered")
-        from aitracker import registry
-        self.assertFalse(registry.is_bg_agent(prefixed[0].prefix + "whatever"))
-
-
-class TestResumeArgv(_ResumeArgvBase):
-    def test_bg_agent_session_yields_fork_session(self):
+    def test_sdk_cli_session_does_not_fork(self):
         _write_session("live-agent", entrypoint="sdk-cli", age_seconds=5)
         self.assertEqual(term_gate.resume_argv("live-agent"),
-                          ["claude", "--resume", "live-agent", "--fork-session"])
+                          ["claude", "--resume", "live-agent"])
 
-    def test_stale_agent_session_still_forks(self):
+    def test_sessionKind_bg_session_does_not_fork(self):
+        """A REAL `claude --bg` agent (sessionKind == "bg") -- the matrix found this is
+        the field that drives the refusal WHILE the CLI still has it registered, but a
+        live proof against this machine found sessionKind alone outlives that
+        registration, so it must not trigger a proactive fork either."""
+        _write_session("real-bg-agent", entrypoint="cli", session_kind="bg", age_seconds=5)
+        self.assertEqual(term_gate.resume_argv("real-bg-agent"),
+                          ["claude", "--resume", "real-bg-agent"])
+
+    def test_stale_agent_session_does_not_fork(self):
         _write_session("stale-agent", entrypoint="sdk-cli", age_seconds=config.LIVE_WINDOW + 600)
         self.assertEqual(term_gate.resume_argv("stale-agent"),
-                          ["claude", "--resume", "stale-agent", "--fork-session"])
+                          ["claude", "--resume", "stale-agent"])
+
+    def test_stale_real_bg_agent_does_not_fork(self):
+        _write_session("stale-real-bg", session_kind="bg", age_seconds=config.LIVE_WINDOW + 600)
+        self.assertEqual(term_gate.resume_argv("stale-real-bg"),
+                          ["claude", "--resume", "stale-real-bg"])
 
     def test_plain_session_does_not_fork(self):
         _write_session("live-human", entrypoint="cli", age_seconds=5)
@@ -154,11 +127,51 @@ class TestResumeArgv(_ResumeArgvBase):
         self.assertEqual(term_gate.resume_argv("no-such-session"),
                           ["claude", "--resume", "no-such-session"])
 
+    def test_resume_argv_does_not_touch_the_filesystem_at_all(self):
+        """The whole point of dropping the transcript classifier: resume_argv() no
+        longer needs to read anything about `sid` to decide -- it's a pure function of
+        the id now. Proven by pointing config.PROJECTS at an empty dir (no session file
+        for `sid` exists anywhere) and getting the identical plain argv back."""
+        self.assertEqual(term_gate.resume_argv("anything-at-all"),
+                          ["claude", "--resume", "anything-at-all"])
+
+
+class TestTranscriptClassifierNoLongerReachableFromTheFastPath(_ResumeArgvBase):
+    """The seam this bug lived in is GONE, not just bypassed: `registry.is_bg_agent`,
+    `Provider.is_bg_agent` and `ClaudeProvider.is_bg_agent` were removed outright (they
+    existed solely to serve term_gate's fork decision), so nothing can wire the
+    transcript classifier back into resume_argv by simply calling an existing seam --
+    reintroducing it now requires writing new code, not un-commenting a call."""
+
+    def test_term_gate_has_no_is_bg_agent(self):
+        self.assertFalse(hasattr(term_gate, "is_bg_agent"))
+
+    def test_registry_has_no_is_bg_agent(self):
+        from aitracker import registry
+        self.assertFalse(hasattr(registry, "is_bg_agent"))
+
+    def test_provider_base_has_no_is_bg_agent(self):
+        from aitracker.providers.base import Provider
+        self.assertFalse(hasattr(Provider, "is_bg_agent"))
+
+    def test_claude_provider_has_no_is_bg_agent(self):
+        from aitracker.registry import ClaudeProvider
+        self.assertFalse(hasattr(ClaudeProvider, "is_bg_agent"))
+
+    def test_badge_classifier_is_unaffected(self):
+        """providers/claude.py's `_is_bg_agent` -- the 🤖 badge classifier -- must still
+        exist and still work exactly as before; only the FORK decision changed."""
+        _write_session("badge-agent", entrypoint="sdk-cli", age_seconds=5)
+        sm = _claude._session_meta(_claude.find_session("badge-agent"))
+        self.assertTrue(_claude._is_bg_agent(sm))
+
 
 class TestBothCallSitesAgree(_ResumeArgvBase):
     """The whole point: term_vt (PTY) and term_launch (external Terminal/iTerm) must
     produce the SAME resume command for the SAME session -- not two forks of this
-    decision that can drift out of step."""
+    decision that can drift out of step. Post-correction, that command is identical
+    (the plain resume) for every session; what still differs, correctly, is that each
+    tier's OWN backstop is what can fork it later."""
 
     def setUp(self):
         super().setUp()
@@ -178,33 +191,39 @@ class TestBothCallSitesAgree(_ResumeArgvBase):
         term_gate.session_cwd = self._session_cwd0
         super().tearDown()
 
-    def test_term_vt_pty_argv_matches_term_gate_resume_argv(self):
+    def test_term_vt_pty_argv_matches_term_gate_resume_argv_and_does_not_fork(self):
         _write_session("live-agent", entrypoint="sdk-cli", age_seconds=5)
         spawned = []
         original_spawn = term_vt.spawn
         term_vt.spawn = lambda cwd, argv, cols, rows: spawned.append(argv) or term_vt.Pty(tid="t1")
         try:
-            h = _FakeHandler()
-            term_vt.open_pty(h, None, {"session": "live-agent", "mode": "resume"})
+            with mock.patch.object(term_vt, "_resume_backstop"):
+                h = _FakeHandler()
+                term_vt.open_pty(h, None, {"session": "live-agent", "mode": "resume"})
             obj, code = h.calls[-1]
             self.assertEqual(code, 200, obj)
         finally:
             term_vt.spawn = original_spawn
         self.assertEqual(spawned, [term_gate.resume_argv("live-agent")])
-        self.assertIn("--fork-session", spawned[0])
-        self.assertTrue(obj["forked"])
+        self.assertNotIn("--fork-session", spawned[0])
+        self.assertFalse(obj["forked"])
 
-    def test_term_launch_build_script_argv_matches_term_gate_resume_argv(self):
+    def test_term_launch_build_script_still_carries_the_fork_fallback(self):
+        """resume_argv() no longer forks, so build_script's OWN `(<resume> || <resume>
+        --fork-session)` fallback (Tier 3's independent backstop, unaffected by this
+        correction) must still be present -- this is what actually protects a real
+        background-agent resume through the external-Terminal tier now."""
         _write_session("live-agent", entrypoint="sdk-cli", age_seconds=5)
         expected = term_gate.resume_argv("live-agent")
+        self.assertNotIn("--fork-session", expected)
         script = term_launch.build_script("/tmp", "live-agent", "resume", "Terminal", expected)
         self.assertIn(" ".join(expected), script.replace("\\\\", "\\"))  # unescape the doubled backslash-noop
-        self.assertIn("--fork-session", script)
+        self.assertIn("--fork-session", script)  # the || fallback, not a proactive fork
 
     def test_term_launch_open_terminal_computes_the_same_resume_argv(self):
         """open_terminal itself must call term_gate.resume_argv -- not re-derive the
         fork decision -- so this is patched at the point of use and asserted called
-        with the exact sid, then the produced script is checked for the flag."""
+        with the exact sid, then the produced script is checked for the fallback."""
         _write_session("live-agent", entrypoint="sdk-cli", age_seconds=5)
         calls = []
         real = term_gate.resume_argv
@@ -231,7 +250,7 @@ class TestBothCallSitesAgree(_ResumeArgvBase):
             term_gate.resume_argv = real
             term_launch.subprocess.run = original_run
         self.assertEqual(calls, ["live-agent"])
-        self.assertIn("--fork-session", captured["script"])
+        self.assertIn("--fork-session", captured["script"])  # the || fallback
 
     def test_plain_session_neither_call_site_forks(self):
         _write_session("plain-session", entrypoint="cli", age_seconds=5)
@@ -239,8 +258,9 @@ class TestBothCallSitesAgree(_ResumeArgvBase):
         original_spawn = term_vt.spawn
         term_vt.spawn = lambda cwd, argv, cols, rows: spawned.append(argv) or term_vt.Pty(tid="t2")
         try:
-            h = _FakeHandler()
-            term_vt.open_pty(h, None, {"session": "plain-session", "mode": "resume"})
+            with mock.patch.object(term_vt, "_resume_backstop"):
+                h = _FakeHandler()
+                term_vt.open_pty(h, None, {"session": "plain-session", "mode": "resume"})
             obj, _ = h.calls[-1]
         finally:
             term_vt.spawn = original_spawn
@@ -268,7 +288,8 @@ class TestBothCallSitesAgree(_ResumeArgvBase):
 class TestRefusalAndMissingTranscriptMarkers(unittest.TestCase):
     """Pins the exact wording docs/claude-resume-command-matrix.md captured from the real
     CLI, so a future wording change fails this suite loudly instead of silently disabling
-    term_vt.py's Option-C backstop (see that module's _resume_backstop)."""
+    term_vt.py's Option-C backstop (see that module's _resume_backstop) -- which, post-
+    correction, is the ONLY thing that decides a fork for the in-browser PTY tier."""
 
     # Verbatim from the matrix's "Verbatim captured output" section, including its
     # original line-wrapping -- proves the whitespace-normalising match survives that wrap.

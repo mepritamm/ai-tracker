@@ -1469,14 +1469,16 @@ def _write(handler, text):
 
 # ------------------------------------------------------ Option C: the resume backstop
 #
-# term_gate.resume_argv() (Option A, the fast path) appends --fork-session up front for any
-# session registry.is_bg_agent() recognises. When that classification misses -- or simply can't
-# be known, e.g. the missing-transcript case below -- the CLI's own EARLY OUTPUT is the only
-# remaining signal, and it can only arrive AFTER open_pty() has already spawned the child. Both
+# term_gate.resume_argv() (Option A, the fast path) no longer guesses --fork-session up front
+# at all -- see that function's docstring for why a transcript-based guess turned out to be
+# over-broad, and why a live registry cross-check measured too slow (750-960ms/call on this
+# machine) to run synchronously on every resume. So EVERY `mode="resume"` open relies on this
+# backstop now, not just the ones the fast path missed. The CLI's own EARLY OUTPUT is the only
+# signal left, and it can only arrive AFTER open_pty() has already spawned the child. Both
 # functions below therefore run in a background thread, started by open_pty() right after spawn,
 # and are the one legitimate reason a "late fork" exists: the POST /api/term/pty response (see
 # open_pty()'s own docstring) has necessarily already gone out with `forked` reflecting only the
-# fast-path decision by the time either of these could fire.
+# fast-path decision (today: always False) by the time either of these could fire.
 
 BACKSTOP_WINDOW = 2.5
 """Total seconds `_resume_backstop` watches a fresh `mode="resume"` child's output for either
@@ -1516,9 +1518,9 @@ def _retry_with_fork(pt, sid, cols, rows):
     argv = term_gate.resume_argv(sid)
     if "--fork-session" not in argv:
         argv.append("--fork-session")
-    # The one log line this whole backstop exists to justify: if Option A (registry.is_bg_agent)
-    # is classifying correctly, this line should NEVER print -- its presence is the detector for
-    # that classification having broken (see the module's task-level docstring in term_gate.py).
+    # The line every genuine background-agent resume now prints once, since Option A no longer
+    # forks proactively (see term_gate.resume_argv's docstring) -- this backstop firing is the
+    # EXPECTED path for those, not a failure detector any more.
     print("[ai-tracker] terminal %s: resume refusal backstop fired for session %s -- "
           "retrying with --fork-session" % (pt.id, sid))
     pid, fd = _fork_child(pt.cwd, argv, cols, rows)
@@ -1605,8 +1607,9 @@ def open_pty(handler, parsed, body):
     spawned child has produced a single byte of output** (spawn() returns as soon as pty.fork()
     has happened; nothing about the child's own behaviour -- refused, silently started fresh, or
     genuinely resumed -- is observable yet). So in this response: `forked` reflects ONLY the
-    fast-path decision (term_gate.resume_argv/is_bg_agent, computed before spawning) and
-    `notice` is ALWAYS null. A `mode="resume"` spawn also starts `_resume_backstop` as a
+    fast-path decision (term_gate.resume_argv, computed before spawning -- today that decision
+    never forks proactively, see that function's docstring, so `forked` is always False here)
+    and `notice` is ALWAYS null. A `mode="resume"` spawn also starts `_resume_backstop` as a
     background daemon thread (see the section above) that can, seconds later, retry with
     --fork-session on a refusal or set a notice on a missing transcript -- but by definition
     AFTER this response was already sent. That late outcome is communicated the only way it can
@@ -1637,8 +1640,8 @@ def open_pty(handler, parsed, body):
     rows = _clamp_int(body.get("rows"), MIN_ROWS, MAX_ROWS, DEFAULT_ROWS)
     forked = False
     if mode == "resume":
-        argv = term_gate.resume_argv(sid)   # appends --fork-session for a background agent,
-        forked = "--fork-session" in argv   # any status -- see term_gate.is_bg_agent
+        argv = term_gate.resume_argv(sid)   # today always ["claude", "--resume", sid] -- no
+        forked = "--fork-session" in argv   # proactive fork; see term_gate.resume_argv's docstring
     elif mode == "new":
         argv = ["claude"]
     else:
