@@ -5,8 +5,10 @@ correctness (an escape sequence or a UTF-8 character arriving across two feed() 
 single most likely real-world bug, so it gets its own dedicated section.
 """
 import base64
+import importlib
 import json
 import os
+import queue
 import threading
 import time
 import unittest
@@ -2143,6 +2145,345 @@ class TestInjectEndToEnd(unittest.TestCase):
         print("\n[end-to-end] inject() route result: %r" % obj)
         print("[end-to-end] matching snapshot row(s): %r" % matching)
         self.assertTrue(matching)
+
+
+# ============================================================================================
+# TRACKER_TERM_RENDERER: the second, switchable xterm.js raw-byte path -- see the big comment
+# above term_vt.raw_stream() for the full rationale (a deliberate exception to conventions rule
+# 4). Covers: the config default/fallback, the server-owned "which renderer" reporting (open_pty's
+# response + the dedicated GET route), the raw byte tee itself (real PTY -> real bytes on the
+# wire), and the vendored static assets being served.
+# ============================================================================================
+
+class TestTermRendererConfigDefault(unittest.TestCase):
+    """config.TERM_RENDERER's actual env-parsing/fallback logic -- NOT covered by the other
+    classes below, which (like every other terminal test in this file) monkeypatch
+    config.TERM_RENDERER directly rather than exercising os.environ. importlib.reload() re-runs
+    config.py's module body under a controlled TRACKER_TERM_RENDERER, then reloads once more in
+    tearDown to restore the module to whatever the real process environment says -- confined to
+    this one test method's window, same as every other test here saves/restores config.* directly."""
+
+    def setUp(self):
+        self._env0 = os.environ.get("TRACKER_TERM_RENDERER")
+
+    def tearDown(self):
+        if self._env0 is None:
+            os.environ.pop("TRACKER_TERM_RENDERER", None)
+        else:
+            os.environ["TRACKER_TERM_RENDERER"] = self._env0
+        importlib.reload(config)
+
+    def _reload_with(self, value):
+        if value is None:
+            os.environ.pop("TRACKER_TERM_RENDERER", None)
+        else:
+            os.environ["TRACKER_TERM_RENDERER"] = value
+        importlib.reload(config)
+        return config.TERM_RENDERER
+
+    def test_default_is_grid_when_unset(self):
+        self.assertEqual(self._reload_with(None), "grid")
+
+    def test_xterm_is_honoured(self):
+        self.assertEqual(self._reload_with("xterm"), "xterm")
+
+    def test_grid_is_honoured_explicitly(self):
+        self.assertEqual(self._reload_with("grid"), "grid")
+
+    def test_garbage_value_falls_back_to_grid_rather_than_breaking(self):
+        self.assertEqual(self._reload_with("nonsense"), "grid")
+
+
+class TestRendererIsServerOwned(unittest.TestCase):
+    """The client is TOLD the renderer, never asked (conventions rule 5) -- open_pty()'s response
+    carries it, and GET /api/term/renderer serves the same value standalone (for a reconnecting
+    ?tty= tab that never calls open_pty() again). Both routes read config.TERM_RENDERER live, so
+    monkeypatching it here (exactly like every other test in this file monkeypatches
+    config.TERMINAL/config.AUTH) is the direct, correct way to prove that -- see
+    TestTermRendererConfigDefault above for the env-var half of the contract."""
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        self._renderer0 = config.TERM_RENDERER
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        self._session_cwd0 = term_gate.session_cwd
+        term_gate.session_cwd = lambda sid: os.getcwd()
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        config.TERM_RENDERER = self._renderer0
+        for pt in list(term_vt.PTYS.values()):
+            pt.kill()
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+        term_gate.session_cwd = self._session_cwd0
+
+    def test_renderer_route_is_registered(self):
+        from aitracker import server
+        self.assertIs(server.EXTRA_GET["/api/term/renderer"], term_vt.renderer_info)
+
+    def test_renderer_route_defaults_to_grid(self):
+        config.TERM_RENDERER = "grid"
+        h = _FakeHandler()
+        term_vt.renderer_info(h, None)
+        self.assertEqual(h.calls[-1], ({"renderer": "grid"}, 200))
+
+    def test_renderer_route_reports_xterm_when_configured(self):
+        config.TERM_RENDERER = "xterm"
+        h = _FakeHandler()
+        term_vt.renderer_info(h, None)
+        self.assertEqual(h.calls[-1], ({"renderer": "xterm"}, 200))
+
+    def test_renderer_route_403s_when_terminal_disabled(self):
+        config.TERMINAL = False
+        h = _FakeHandler()
+        term_vt.renderer_info(h, None)
+        self.assertEqual(h.calls[-1][1], 403)
+
+    def test_open_pty_response_carries_the_current_renderer(self):
+        config.TERM_RENDERER = "xterm"
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {"session": "x", "cols": 80, "rows": 24, "mode": "cwd"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200)
+        self.assertEqual(obj.get("renderer"), "xterm")
+        self.assertIn("tty", obj)
+        term_vt.PTYS[obj["tty"]].kill()
+
+    def test_open_pty_response_defaults_to_grid(self):
+        config.TERM_RENDERER = "grid"
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {"session": "x", "cols": 80, "rows": 24, "mode": "cwd"})
+        obj, code = h.calls[-1]
+        self.assertEqual(obj.get("renderer"), "grid")
+        term_vt.PTYS[obj["tty"]].kill()
+
+
+class TestRawStreamRoute(unittest.TestCase):
+    """GET /api/term/raw -- the xterm.js raw-byte counterpart to screen_stream(). Reuses PTYS,
+    _LOCK, _STREAMS/MAX_STREAMS and the per-Pty viewers refcount exactly like screen_stream() --
+    these tests pin that sharing, not a second accounting system."""
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        term_vt._STREAMS = 0
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        for pt in list(term_vt.PTYS.values()):
+            pt.kill()
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+        term_vt._STREAMS = 0
+
+    def test_route_is_registered(self):
+        from aitracker import server
+        self.assertIs(server.EXTRA_GET["/api/term/raw"], term_vt.raw_stream)
+
+    def test_403s_when_terminal_disabled(self):
+        config.TERMINAL = False
+        h = _FakeHandler()
+        term_vt.raw_stream(h, _Q("tty=nope"))
+        self.assertEqual(h.calls[-1][1], 403)
+
+    def test_404s_an_unknown_tty(self):
+        h = _FakeHandler()
+        term_vt.raw_stream(h, _Q("tty=nope"))
+        self.assertEqual(h.calls[-1][1], 404)
+        self.assertEqual(term_vt._STREAMS, 0)
+
+    def test_429s_past_max_streams(self):
+        term_vt.PTYS["p1"] = term_vt.Pty(tid="p1")
+        term_vt._STREAMS = term_vt.MAX_STREAMS
+        h = _FakeHandler()
+        term_vt.raw_stream(h, _Q("tty=p1"))
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 429)
+        self.assertEqual(term_vt.PTYS["p1"].viewers, 0)
+
+    def test_shares_the_stream_budget_with_screen_stream(self):
+        """A raw viewer and a grid viewer draw from the SAME `_STREAMS` counter -- proving there
+        is no separate, unbounded accounting system for the new path."""
+        term_vt.PTYS["p1"] = term_vt.Pty(tid="p1")
+        term_vt.PTYS["p1"].screen = Screen(cols=10, rows=2)
+        term_vt._STREAMS = term_vt.MAX_STREAMS - 1
+        h_grid = _StreamHandler()
+        t = threading.Thread(target=term_vt.screen_stream, args=(h_grid, _Q("tty=p1")))
+        t.daemon = True
+        t.start()
+        try:
+            self.assertTrue(_wait_for(lambda: term_vt._STREAMS == term_vt.MAX_STREAMS, 5))
+            h_raw = _FakeHandler()
+            term_vt.raw_stream(h_raw, _Q("tty=p1"))   # the shared budget is already exhausted
+            self.assertEqual(h_raw.calls[-1][1], 429)
+        finally:
+            h_grid.close_peer()
+            t.join(5)
+            h_grid.close()
+        term_vt.PTYS["p1"].kill()
+
+    def test_raw_bytes_tee_from_a_real_pty_to_the_sse_wire(self):
+        """The load-bearing one: a real shell, real keystrokes through keys(), and the exact raw
+        bytes showing up base64-framed on the /api/term/raw SSE connection -- proving the tee in
+        _reader() actually delivers, not just that the route accepts a connection."""
+        shell = os.environ.get("SHELL", "/bin/bash")
+        pt = term_vt.spawn(os.getcwd(), [shell, "-l"], 80, 24)
+        term_vt.PTYS[pt.id] = pt
+        h = _StreamHandler()
+        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("tty=" + pt.id)))
+        t.daemon = True
+        t.start()
+        try:
+            self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
+            payload = base64.b64encode(b"echo raw-tee-ok\n").decode()
+            hk = _FakeHandler()
+            term_vt.keys(hk, None, {"tty": pt.id, "data": payload})
+
+            h.peer.settimeout(10)
+            seen = b""
+            deadline = time.time() + 10
+            while b"raw-tee-ok" not in seen and time.time() < deadline:
+                try:
+                    chunk = h.peer.recv(65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                seen += chunk
+            self.assertIn(b"data: ", seen, "no SSE frame arrived at all")
+            frames = [ln[len(b"data: "):] for ln in seen.split(b"\n\n") if ln.startswith(b"data: ")]
+            decoded = b""
+            for f in frames:
+                try:
+                    decoded += base64.b64decode(f, validate=True)
+                except Exception:
+                    pass   # a partial trailing frame cut off mid-recv() -- ignore, not a real one
+            self.assertIn(b"raw-tee-ok", decoded,
+                          "the raw byte tee did not deliver the real PTY output")
+        finally:
+            h.close_peer()
+            t.join(5)
+            h.close()
+            pt.kill()
+            _drain(pt, 5)
+
+    def test_viewer_leaving_removes_its_queue_but_the_pty_survives(self):
+        pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
+        term_vt.PTYS[pt.id] = pt
+        h = _StreamHandler()
+        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("tty=" + pt.id)))
+        t.daemon = True
+        t.start()
+        try:
+            self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
+            self.assertTrue(_wait_for(lambda: len(pt.raw_queues) == 1, 5))
+            h.close_peer()
+            t.join(5)
+            self.assertTrue(_wait_for(lambda: pt.viewers == 0, 5))
+            self.assertTrue(_wait_for(lambda: len(pt.raw_queues) == 0, 5))
+            time.sleep(0.3)
+            self.assertFalse(pt.done, "the PTY must survive its last raw viewer leaving")
+        finally:
+            h.close()
+            pt.kill()
+            _drain(pt, 5)
+
+
+class TestRawQueueOverflow(unittest.TestCase):
+    """RAW_QUEUE_MAXLEN's drop-oldest overflow policy -- a slow/stalled raw viewer must not grow
+    its queue without bound, and must not block _reader()'s single write-side thread either."""
+
+    def test_full_queue_drops_the_oldest_chunk_not_the_newest(self):
+        pt = term_vt.Pty(tid="ovf1")
+        pt.screen = Screen(cols=10, rows=2)
+        q = queue.Queue(maxsize=3)
+        pt.raw_queues.append(q)
+        for i in range(5):
+            chunk = ("%d" % i).encode()
+            try:
+                q.put_nowait(chunk)
+            except Exception:
+                try:
+                    q.get_nowait()
+                except Exception:
+                    pass
+                q.put_nowait(chunk)
+        drained = []
+        while True:
+            try:
+                drained.append(q.get_nowait())
+            except Exception:
+                break
+        self.assertEqual(drained, [b"2", b"3", b"4"])   # 0 and 1 were dropped, newest kept
+
+
+class TestVendoredXtermAssets(unittest.TestCase):
+    """The vendored xterm.js/css/addon-fit.js static files -- served plain (not inlined into the
+    baked page, see the route's own docstring for why), lazily fetched only by the client's
+    _loadXtermAssets() the first time the xterm renderer is actually used."""
+
+    def test_routes_are_registered(self):
+        from aitracker import server
+        for path in ("/vendor/xterm.js", "/vendor/xterm.css", "/vendor/addon-fit.js"):
+            self.assertIn(path, server.EXTRA_GET, "%s not registered" % path)
+
+    def _serve(self, fname, ctype):
+        import io
+
+        class _Cap:
+            def __init__(self):
+                self.status = None
+                self.hdrs = {}
+                self.wfile = io.BytesIO()
+
+            def send_response(self, code):
+                self.status = code
+
+            def send_header(self, k, v):
+                self.hdrs[k] = v
+
+            def end_headers(self):
+                pass
+
+            def send_error(self, code):
+                self.status = code
+
+        h = _Cap()
+        term_vt._serve_vendor(h, None, fname, ctype)
+        return h
+
+    def test_xterm_js_is_served_with_its_licence_header_and_a_js_content_type(self):
+        h = self._serve("xterm.js", "application/javascript; charset=utf-8")
+        self.assertEqual(h.status, 200)
+        self.assertEqual(h.hdrs.get("Content-Type"), "application/javascript; charset=utf-8")
+        body = h.wfile.getvalue()
+        self.assertIn(b"MIT", body[:2000])
+        self.assertIn(b"xterm.js", body[:2000])
+        self.assertGreater(len(body), 100000)   # the real minified bundle, not a stub
+
+    def test_xterm_css_is_served(self):
+        h = self._serve("xterm.css", "text/css; charset=utf-8")
+        self.assertEqual(h.status, 200)
+        self.assertEqual(h.hdrs.get("Content-Type"), "text/css; charset=utf-8")
+        self.assertIn(b"MIT", h.wfile.getvalue()[:2000])
+
+    def test_addon_fit_js_is_served(self):
+        h = self._serve("addon-fit.js", "application/javascript; charset=utf-8")
+        self.assertEqual(h.status, 200)
+        self.assertIn(b"MIT", h.wfile.getvalue()[:2000])
+
+    def test_missing_vendor_file_404s_instead_of_crashing(self):
+        h = self._serve("does-not-exist.js", "application/javascript")
+        self.assertEqual(h.status, 404)
+
+    def test_vendor_files_carry_a_long_lived_cache_header(self):
+        h = self._serve("xterm.js", "application/javascript; charset=utf-8")
+        self.assertIn("immutable", h.hdrs.get("Cache-Control", ""))
 
 
 if __name__ == "__main__":

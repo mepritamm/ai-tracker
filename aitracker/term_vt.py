@@ -151,6 +151,7 @@ import collections
 import json
 import os
 import pty
+import queue
 import select
 import signal
 import socket
@@ -159,7 +160,7 @@ import threading
 import time
 import uuid
 
-from . import server, term_gate, term_run
+from . import config, server, term_gate, term_run
 # Circular by design, exactly like term_run's own import of `server` -- see that module's
 # docstring comment. server.py's bottom-of-file loader imports this module by name, and this
 # module registers its routes back into server.EXTRA_GET/EXTRA_POST. Safe because those two dicts
@@ -1177,6 +1178,15 @@ IDLE_TIMEOUT = 1800       # seconds of no keystrokes AND no viewers before a PTY
 _REAP_LINGER = 600        # seconds a FINISHED pty's record (its final rc) lingers in PTYS before
                           # being dropped, mirroring term_run._reap_old's 10-minute window.
 
+RAW_QUEUE_MAXLEN = 512
+"""Per-viewer cap on un-drained chunks in a `Pty.raw_queues` entry (see `raw_stream()` below). A
+slow/stalled SSE consumer must not grow this without bound -- past the cap, `_reader()` drops the
+OLDEST queued chunk to make room for the newest one, the same "give up on the old thing, not on
+the stream" tradeoff `SCROLLBACK_MAX`/`MAX_REPLIES`/`MAX_PENDING` already make above. A dropped
+chunk is a real, visible gap in that one viewer's xterm.js buffer -- there is no resend -- but the
+alternative (blocking `_reader()`'s single write-side thread on a wedged reader) would stall the
+Screen/grid path too, since both are fed from the same `feed()` call under the same lock."""
+
 PTYS = {}                # id -> Pty
 _STREAMS = 0              # open SSE connections across all PTYs; guarded by _LOCK
 _LOCK = threading.Lock()
@@ -1238,6 +1248,10 @@ class Pty:
         self.cwd = cwd
         self.cmd = cmd
         self.viewers = 0           # open SSE /api/term/screen connections; guarded by _LOCK
+        self.raw_queues = []       # queue.Queue per open /api/term/raw viewer -- see raw_stream()
+                                    # and the TRACKER_TERM_RENDERER switch comment below. Mutated
+                                    # only under `self.lock` (same lock _reader() already holds
+                                    # while it tees into these), never PTYS's module-level _LOCK.
         self.done = False
         self.rc = None
         self.ended = 0.0           # time.time() when finish() ran; 0.0 while still live
@@ -1364,6 +1378,23 @@ def _reader(pt):
             with pt.lock:
                 pt.screen.feed(data)
                 reply = pt.screen.pop_replies()
+                # TEE, not a second read of the fd (rule: "the existing reader thread already
+                # feeds Screen; tee the bytes rather than reading the fd twice" -- reading the
+                # same fd from two threads would race and split each PTY write unpredictably
+                # between them). Every raw_stream() viewer gets the SAME bytes Screen just
+                # parsed, unparsed -- see RAW_QUEUE_MAXLEN for the overflow policy.
+                for q in pt.raw_queues:
+                    try:
+                        q.put_nowait(data)
+                    except queue.Full:
+                        try:
+                            q.get_nowait()          # drop the oldest queued chunk...
+                        except queue.Empty:
+                            pass
+                        try:
+                            q.put_nowait(data)       # ...to make room for this one
+                        except queue.Full:
+                            pass
             if reply:
                 # The child asked the terminal a question (`ESC[6n`, `ESC[>c`) and is BLOCKING on
                 # the answer -- `vim` sends both while starting up. Screen owns no fd, so this
@@ -1460,7 +1491,11 @@ def open_pty(handler, parsed, body):
         return handler._json({"error": "spawn failed: %s" % e}, 500)
     with _LOCK:
         PTYS[pt.id] = pt
-    handler._json({"tty": pt.id})
+    # `renderer` is server-owned policy handed to the client, never asked of it (conventions rule
+    # 5) -- see the TRACKER_TERM_RENDERER switch comment above raw_stream() below. Riding along on
+    # the response that already exists (rather than a forced extra round trip) is what lets the
+    # modal open its Terminal/XtermTerminal without waiting on anything else.
+    handler._json({"tty": pt.id, "renderer": config.TERM_RENDERER})
 
 
 def keys(handler, parsed, body):
@@ -1885,9 +1920,175 @@ def inject(handler, parsed, body):
     handler._json({"ok": True, "quiescent": True, "cr_attempts": cr_attempts, "submitted": submitted})
 
 
+# ============================================================================================
+# The TRACKER_TERM_RENDERER switch -- a raw-byte path for xterm.js, alongside term_vt.Screen.
+#
+# THIS IS A DELIBERATE, KNOWING EXCEPTION TO conventions rule 4 ("a capability must hold for
+# every provider / land it on the shared seam, never two parallel implementations"). It does not
+# apply here because the two things below are not two implementations of ONE capability -- they
+# are two RENDERERS the user explicitly asked to keep BOTH of, switchable, after hitting
+# rendering-fidelity problems with the hand-written Screen/JS painter above and wanting the
+# battle-tested xterm.js (already used in their other project, link-page) as an alternative, not
+# a replacement. `screen_stream()` above serves term_vt.Screen's PARSED rows; `raw_stream()`
+# below serves the SAME PTY's RAW bytes, undecoded, straight from the tee `_reader()` performs
+# into `Pty.raw_queues` (see that field's own comment) -- so xterm.js's own VT100 engine, not
+# Screen, does the interpreting. Both read the SAME `Pty` from the SAME `PTYS` table, share the
+# SAME viewer-refcount/`_STREAMS` accounting and the SAME `term_gate.guard()` perimeter -- the
+# only thing duplicated is the row-vs-byte INTERPRETATION, not the session/PTY plumbing.
+#
+# The switch is `config.TERM_RENDERER` (env `TRACKER_TERM_RENDERER=grid|xterm`, default "grid" --
+# see config.py's own comment on that constant). It is resolved ONCE, server-side, at read time
+# here -- `open_pty()` above hands it to the client in its response (`renderer` key) and
+# `renderer_info()` just below serves it standalone (for a reconnecting `?tty=` tab, which never
+# calls `open_pty()` again) -- so the CLIENT NEVER DECIDES which renderer to build; it only reads
+# what the server already chose (conventions rule 5). ext_vt.js's `openVT()`/`bootStandalone()`
+# are the two places that branch on it.
+# ============================================================================================
+
+def renderer_info(handler, parsed):
+    """GET /api/term/renderer -> {"renderer": "grid"|"xterm"}.
+
+    The one other place (besides `open_pty()`'s response) the client learns which renderer to
+    build -- needed because a reconnecting standalone `?tty=` tab (bootStandalone() in ext_vt.js)
+    attaches to an EXISTING tty without ever calling `open_pty()` again, so it has no other way to
+    learn the server's choice short of guessing.
+    """
+    if not term_gate.guard(handler):
+        return
+    handler._json({"renderer": config.TERM_RENDERER})
+
+
+def raw_stream(handler, parsed):
+    """GET /api/term/raw?tty=<id> -> SSE of base64-encoded RAW PTY output bytes, one connection
+    per viewer -- the xterm.js counterpart to `screen_stream()` above. Same guard, same `PTYS`
+    lookup, same `_STREAMS`/`MAX_STREAMS` cap and the same per-`Pty` `viewers` refcount as
+    `screen_stream()` -- a raw viewer and a grid viewer draw from the exact same shared budget,
+    because both pin the same kind of resource (an SSE connection, a ThreadingHTTPServer thread).
+
+    Wire format: `data: <base64>\\n\\n`, one chunk per frame, in the exact order `_reader()` read
+    them off the pty -- xterm.js's `Terminal.write()` accepts the decoded bytes directly and does
+    its own VT100 interpretation, so unlike `screen_stream()` there is no JSON envelope and no
+    `since`/versioning concept here at all: this is a plain byte tee, not a diffed snapshot.
+
+    KNOWN GAP (see the module docstring's "raw byte tee" section above and the build report this
+    shipped with): there is no raw-byte scrollback. `screen_stream()` can always answer a fresh
+    viewer with a full `since=-1` repaint because `Screen` retains the interpreted grid; this
+    route only tees bytes emitted AFTER the connection opens, so a second tab (or a reconnect)
+    opened against a PTY that already has content on screen starts on a BLANK xterm.js buffer
+    until the next write -- there is nothing here to replay.
+    """
+    global _STREAMS
+    if not term_gate.guard(handler):
+        return
+    from urllib.parse import parse_qs
+    tid = parse_qs(parsed.query).get("tty", [""])[0]
+    q = queue.Queue(maxsize=RAW_QUEUE_MAXLEN)
+    with _LOCK:
+        _reap()
+        pt = PTYS.get(tid)
+        busy = pt is not None and _STREAMS >= MAX_STREAMS
+        if pt is not None and not busy:
+            _STREAMS += 1
+            pt.viewers += 1
+            pt.touch()
+    if pt is None:                                       # returns fast, holds no thread
+        return handler._json({"error": "no such terminal", "tty": tid}, 404)
+    if busy:
+        return handler._json({"error": "too many open screen streams (max %d)" % MAX_STREAMS}, 429)
+    with pt.lock:
+        pt.raw_queues.append(q)
+    try:
+        _raw_stream_body(handler, pt, q)
+    finally:
+        with pt.lock:
+            if q in pt.raw_queues:
+                pt.raw_queues.remove(q)
+        with _LOCK:
+            _STREAMS -= 1
+            pt.viewers -= 1
+            pt.touch()                                   # last-viewer-leaves starts the idle clock
+
+
+def _raw_stream_body(handler, pt, q):
+    """The SSE loop for one `raw_stream()` viewer. Blocks on its own `queue.Queue` (fed by
+    `_reader()`'s tee, see `Pty.raw_queues`) rather than polling `Screen` like
+    `_screen_stream_body()` does -- there is no shared version counter to diff against here, just
+    bytes arriving in order. Mirrors that function's peer-gone check and 10s ping heartbeat.
+    """
+    try:
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+    except (BrokenPipeError, ConnectionResetError):
+        return
+    quiet = time.time()
+    while True:
+        try:
+            data = q.get(timeout=0.2)
+        except queue.Empty:
+            data = None
+        if data:
+            b64 = base64.b64encode(data).decode("ascii")
+            if not _write(handler, "data: %s\n\n" % b64):
+                return
+            quiet = time.time()
+        elif pt.done:                                    # nothing left queued and the pty is gone
+            return
+        if _peer_gone(handler):                           # instant: the tab closed
+            return
+        if time.time() - quiet > 10:                      # heartbeat: keeps proxies from idling us
+            quiet = time.time()
+            if not _write(handler, ": ping\n\n"):
+                return
+
+
+# ---- vendored xterm.js static assets --------------------------------------------------------
+# Served as plain files, NOT inlined into the baked page (unlike ext_vt.js/css -- see page.py's
+# read_ext()): xterm.js alone is ~480KB minified, and the default renderer is "grid" (config.
+# TERM_RENDERER), so every page load paying for it unconditionally would be dead weight for
+# anyone who never opts into TRACKER_TERM_RENDERER=xterm. ext_vt.js's `_loadXtermAssets()` fetches
+# these lazily, exactly once, only the first time an xterm-rendered terminal is actually opened.
+# Gated by the SAME `_authok()` every other non-`/api` path already goes through in
+# `Handler.do_GET` (see server.py) -- no separate check needed here.
+_VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "vendor")
+_VENDOR_FILES = {
+    "/vendor/xterm.js": ("xterm.js", "application/javascript; charset=utf-8"),
+    "/vendor/xterm.css": ("xterm.css", "text/css; charset=utf-8"),
+    "/vendor/addon-fit.js": ("addon-fit.js", "application/javascript; charset=utf-8"),
+}
+
+
+def _serve_vendor(handler, parsed, fname, ctype):
+    path = os.path.join(_VENDOR_DIR, fname)
+    try:
+        with open(path, "rb") as fh:
+            body = fh.read()
+    except OSError:
+        handler.send_error(404)
+        return
+    try:
+        handler.send_response(200)
+        handler.send_header("Content-Type", ctype)
+        # These are pinned, vendored, version-named-in-the-header-comment files that never change
+        # under a running server -- safe to cache hard, unlike "/" (see server.py's no-store
+        # comment on why THAT must never be cached).
+        handler.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
 server.EXTRA_POST["/api/term/pty"] = open_pty
 server.EXTRA_POST["/api/term/keys"] = keys
 server.EXTRA_POST["/api/term/resize"] = resize_pty
 server.EXTRA_POST["/api/term/inject"] = inject
 server.EXTRA_GET["/api/term/screen"] = screen_stream
 server.EXTRA_GET["/api/term/scrollback"] = term_scrollback
+server.EXTRA_GET["/api/term/renderer"] = renderer_info
+server.EXTRA_GET["/api/term/raw"] = raw_stream
+for _path, (_fname, _ctype) in _VENDOR_FILES.items():
+    server.EXTRA_GET[_path] = (lambda h, p, fn=_fname, ct=_ctype: _serve_vendor(h, p, fn, ct))

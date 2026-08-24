@@ -92,3 +92,19 @@ BIND_HOST = "127.0.0.1"
 # TRACKER_AUTH, and `make tunnel` already requires TRACKER_AUTH on its own regardless.
 # See term_gate.allowed() for the exact gate logic.
 TERMINAL = os.environ.get("TRACKER_TERMINAL", "") != "0"
+
+
+# TWO renderer implementations exist for the in-browser terminal (Tier 3): "grid" (default) is
+# term_vt.Screen, a server-side VT100 emulator streaming parsed rows over SSE to a hand-written JS
+# painter; "xterm" hands the PTY's raw bytes straight to a vendored xterm.js in the browser. This
+# is a DELIBERATE exception to conventions rule 4 ("land a capability at the shared seam, never
+# two forked implementations") -- see the big comment above term_vt.raw_stream() (search
+# "TRACKER_TERM_RENDERER switch" in term_vt.py) for why the user chose "both, switchable" instead
+# of a straight replacement, and for exactly what each path does and does not support.
+# Server-owned (conventions rule 5): the client learns this from POST /api/term/pty's response or
+# GET /api/term/renderer, never decides it locally. Default "grid" so nothing changes for existing
+# users until they opt in; any value other than "grid"/"xterm" falls back to "grid" rather than
+# breaking the terminal outright.
+TERM_RENDERER = os.environ.get("TRACKER_TERM_RENDERER", "grid")
+if TERM_RENDERER not in ("grid", "xterm"):
+    TERM_RENDERER = "grid"
