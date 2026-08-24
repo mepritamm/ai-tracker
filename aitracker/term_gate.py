@@ -79,32 +79,6 @@ def session_cwd(sid):
     return cwd if cwd and os.path.isdir(cwd) else ""
 
 
-def is_bg_agent(sid):
-    """True when `sid` names a background-agent session, in ANY status.
-
-    Previously named `is_live_agent` and additionally required the session to be inside
-    `config.LIVE_WINDOW` -- that liveness condition was wrong and is now GONE.
-    docs/claude-resume-command-matrix.md (live PTY tests against the real `claude` CLI)
-    found the "currently running as a background agent" refusal fires for a background
-    agent whose `claude agents --json` status is `"blocked"` OR `"done"` -- i.e.
-    unconditionally on `sessionKind == "bg"`, never on recency. Gating this on
-    LIVE_WINDOW meant a bg-agent session older than 5 minutes silently got NO
-    `--fork-session` and hit the refusal anyway -- see resume_argv() below, the seam that
-    acts on this.
-
-    Resolved via registry.is_bg_agent(sid), which asks the OWNING PROVIDER directly for
-    THIS ONE sid (for Claude: one glob + a bounded read of that single file) rather than
-    scanning registry.all_sessions()'s top-N-by-mtime list -- a background agent outside
-    that recency window used to be invisible to a lookup keyed off that list and silently
-    answered False, which was the other half of this bug. This is the shared seam
-    (conventions rule 3): term_gate does not reimplement providers/claude.py's own
-    classifier (`sessionKind == "bg"` OR `entrypoint == "sdk-cli"`, fixed independently in
-    that module) -- it calls it. Late import: registry pulls in every provider, and this
-    module is imported from server at startup."""
-    from .registry import is_bg_agent as _registry_is_bg_agent
-    return _registry_is_bg_agent(sid)
-
-
 REFUSAL_MARKER = "is currently running as a background agent (bg)"
 """Substring of the CLI's verbatim refusal (docs/claude-resume-command-matrix.md):
 
@@ -139,11 +113,11 @@ def _normalize_output(output) -> str:
 def looks_like_bg_refusal(output) -> bool:
     """True if `output` (raw bytes/str captured from a `claude --resume` child) contains
     the "currently running as a background agent" refusal -- the ONE signal Option C's
-    backstop (term_vt.py) uses to retry once with --fork-session when the fast-path
-    classification (is_bg_agent, above) missed. This is what makes the fast path the
-    normal case and the string match only a safety net: a future wording change makes
-    this stop matching, which degrades to today's behaviour (no retry) rather than
-    breaking anything."""
+    backstop (term_vt.py) uses to retry once with --fork-session. resume_argv() no longer
+    guesses proactively at all (see its docstring), so this is now the ONLY thing that
+    decides a fork for the in-browser PTY tier, not a safety net for a fast path that
+    missed. A future wording change makes this stop matching, which degrades to no retry
+    at all (a bare refusal shown to the user) rather than breaking anything."""
     return REFUSAL_MARKER in _normalize_output(output)
 
 
@@ -155,22 +129,48 @@ def looks_like_missing_transcript(output) -> bool:
 
 
 def resume_argv(sid):
-    """The argv for `claude --resume <sid>`, with `--fork-session` appended when
-    `is_bg_agent(sid)` -- the ONE place both terminal tiers decide this (term_vt.open_pty
-    uses the list directly; term_launch.open_terminal passes it into build_script), so the
-    two call sites can't drift (conventions rule 4).
+    """The argv for `claude --resume <sid>`. Deliberately does NOT append
+    `--fork-session` proactively any more -- both terminal tiers (term_vt.open_pty uses
+    the list directly; term_launch.open_terminal passes it into build_script) call this
+    ONE function, so whatever it decides can't drift between them (conventions rule 4);
+    what changed is what it decides.
 
-    Why this is the honest fix and not a full one: `--fork-session` branches a COPY of the
-    agent's conversation -- it does NOT attach to the actually-running agent. Claude Code's
-    refusal message also suggests `claude agents`, which WOULD attach to the live session,
-    but that's an interactive picker with no argv that could drive it non-interactively.
-    Between "refuse to open a terminal at all" and "open one on a deliberate copy", this
-    picks the copy -- and callers should say so where they surface the result (a fork was
-    the trade-off, not a mistake). This is the FAST path (Option A); when it misses (a
-    background agent this classification failed to recognise), term_vt.py's Option-C
-    backstop -- retry once with --fork-session on seeing REFUSAL_MARKER -- is the safety
-    net, not a second decision point here."""
-    argv = ["claude", "--resume", sid]
-    if is_bg_agent(sid):
-        argv.append("--fork-session")
-    return argv
+    CORRECTED: this used to append --fork-session whenever the session's own TRANSCRIPT
+    claimed to be a background agent (sessionKind == "bg" or entrypoint == "sdk-cli" --
+    providers/claude.py's `_is_bg_agent`, which still drives the unrelated sidebar 🤖
+    badge, just not this any more). That was measured live and found OVER-BROAD: a
+    session keeps sessionKind == "bg" in its transcript forever, even long after `claude`
+    itself has deregistered it as a background agent -- and once deregistered, a plain
+    `claude --resume <sid>` opens it normally, no refusal at all. Forking pre-emptively in
+    that case handed the user a COPY under a brand-new session id when a plain resume
+    would have reopened their actual conversation -- silently losing continuity, which is
+    worse than the refusal this file's backstops already recover from automatically.
+
+    The signal that actually tracks the refusal is the LIVE `claude agents --json`
+    registry (an id is forkable only while that command still lists it), not the
+    transcript -- but timed on this machine, `claude agents --json` took 750-960ms per
+    call across 5 consecutive runs, with no warm-start speedup between them. That is too
+    slow to shell out for synchronously on EVERY `mode="resume"` open -- not just
+    background-agent ones, since this function can't know which a session is without
+    asking. So the proactive guess is dropped entirely; correctness now rests solely on
+    the two backstops that already run unconditionally, independently of anything decided
+    here:
+      - term_vt.py's `_resume_backstop` (Tier 2, in-browser PTY): watches the just-
+        spawned child's own output for REFUSAL_MARKER and retries once with
+        --fork-session -- see looks_like_bg_refusal() below.
+      - term_launch.py's `build_script` (Tier 3, external Terminal.app/iTerm): always
+        wraps a resume argv lacking --fork-session in a shell-level
+        `(<resume> || <resume> --fork-session)` fallback, so a refusal falls back with no
+        ai-tracker process even watching.
+    The cost of dropping the fast path is a visible refusal flash plus one respawn on a
+    genuine background-agent resume, and NOTHING on every other session -- trading a
+    recoverable, visible delay for never silently mis-forking a live conversation.
+
+    `--fork-session` (whichever path appends it) branches a COPY of the agent's
+    conversation -- it does not attach to the actually-running agent. Claude Code's
+    refusal message also suggests `claude agents`, which WOULD attach to the live
+    session, but that's an interactive picker with no argv that could drive it
+    non-interactively. Between "refuse to open a terminal at all" and "open one on a
+    deliberate copy", this picks the copy -- and callers should say so where they surface
+    the result (a fork was the trade-off, not a mistake)."""
+    return ["claude", "--resume", sid]
