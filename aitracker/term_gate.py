@@ -1,15 +1,47 @@
 """Shared gate for the terminal features (Tiers 1-3).
 
-These routes start processes on the host. `make tunnel` deliberately puts this server on the
-public internet, so "it's only localhost" is never true here -- a tunnel terminates locally and
-its requests also arrive from 127.0.0.1. Hence: opt-in flag AND a configured login, always.
+These routes start processes on the host, and are enabled by default. `HOST=0.0.0.0 make serve`
+(LAN/Tailscale — see cli.py's HOST env var) and `make tunnel` are both supported, documented ways
+to expose this server beyond loopback, and both require TRACKER_AUTH before the terminal is
+usable off-loopback — see allowed() below. A loopback-only `make serve` (the default) needs no
+TRACKER_AUTH. Cross-origin requests are still rejected as a belt-and-braces protection.
+
+IMPORTANT: On a server that IS reachable and has a password, anyone with TRACKER_AUTH gets an
+unrestricted shell as this OS user.
 """
-from . import config
+import ipaddress
 from urllib.parse import urlparse
 
+from . import config
+
+_LOOPBACK_NAMES = {"localhost"}
+
+
+def _is_loopback(host):
+    """True if `host` can only ever mean "this machine talking to itself". Evaluated against
+    the server's *bind* address (config.BIND_HOST) — never a request's peer address, since a
+    tunnel terminates locally and its requests also arrive from 127.0.0.1 even though the
+    tunnel makes the server reachable from anywhere. Unknown/unparseable input is treated as
+    NOT loopback: the safe default is to require auth, not to wave it through."""
+    if not host:
+        return False
+    if host.lower() in _LOOPBACK_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def allowed():
-    """True if terminal routes may run at all. Both conditions are required."""
-    return bool(config.TERMINAL) and bool(config.AUTH)
+    """True if terminal routes may run at all. Terminal is ON by default; set
+    TRACKER_TERMINAL=0 to disable. When the server is bound beyond loopback — HOST=0.0.0.0, a
+    LAN/Tailscale IP, anything `make tunnel` fronts — TRACKER_AUTH is also required, since
+    without it the terminal would hand an unauthenticated, unrestricted shell to anyone who can
+    reach the server."""
+    if not config.TERMINAL:
+        return False
+    return bool(config.AUTH) or _is_loopback(config.BIND_HOST)
 
 def _origin_ok(handler):
     """Reject cross-site POSTs. The signed cookie is SameSite=Lax, which already blocks
@@ -24,8 +56,11 @@ def _origin_ok(handler):
 def guard(handler):
     """Call first in every terminal route. Returns True if the request may proceed;
     otherwise it has already written the response."""
+    if not config.TERMINAL:
+        handler._json({"error": "terminal disabled — unset TRACKER_TERMINAL or set it to anything other than 0"}, 403)
+        return False
     if not allowed():
-        handler._json({"error": "terminal disabled — set TRACKER_TERMINAL=1 and TRACKER_AUTH"}, 403)
+        handler._json({"error": "terminal disabled: this server is reachable on the network, so it needs TRACKER_AUTH"}, 403)
         return False
     if not _origin_ok(handler):
         handler._json({"error": "cross-origin refused"}, 403)

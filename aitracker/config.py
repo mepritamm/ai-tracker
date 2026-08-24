@@ -73,7 +73,22 @@ CURSOR_WS_ROOT = os.environ.get(
 AUTH = os.environ.get("TRACKER_AUTH", "")
 
 
-# Terminal features (Tiers 1-3) are OFF unless explicitly enabled. They turn the tracker from a
-# read-only viewer into something that can start processes, so they require BOTH this flag and a
-# configured TRACKER_AUTH — see term_gate.allowed().
-TERMINAL = os.environ.get("TRACKER_TERMINAL", "") == "1"
+# The address the server is actually bound to, written by server.run() once the real bind host
+# is known (default here is the loopback fallback for anything that reads this before run() has
+# executed, e.g. tests, or a caller that imports the package without ever serving). term_gate
+# reads this — not a request's peer address — to decide whether TRACKER_AUTH is required: a
+# tunnel terminates locally, so a request that arrived through `make tunnel` still shows up with
+# a loopback peer address even though the tunnel makes the server reachable from anywhere.
+BIND_HOST = "127.0.0.1"
+
+
+# Terminal features (Tiers 1-3) are ON by default. Set TRACKER_TERMINAL=0 to disable them.
+# They turn the tracker from a read-only viewer into something that can start processes.
+# `HOST=0.0.0.0 make serve` (see cli.py's HOST env var) is a supported, documented way to reach
+# this server from a LAN or over Tailscale — it is not just a `make tunnel` thing. Exposing the
+# terminal that way with no TRACKER_AUTH would hand an unauthenticated, unrestricted shell to
+# anyone who can reach the box, so term_gate.allowed() additionally requires TRACKER_AUTH
+# whenever config.BIND_HOST is not loopback. A loopback-only `make serve` (the default) needs no
+# TRACKER_AUTH, and `make tunnel` already requires TRACKER_AUTH on its own regardless.
+# See term_gate.allowed() for the exact gate logic.
+TERMINAL = os.environ.get("TRACKER_TERMINAL", "") != "0"
