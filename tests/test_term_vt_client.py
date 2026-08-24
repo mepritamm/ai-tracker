@@ -116,6 +116,30 @@ class TestNoRawHtmlInsertion(unittest.TestCase):
         self.assertIn("esc(_padSpaces(", body)
 
 
+class TestStandaloneMountEscapesTheHiddenApp(unittest.TestCase):
+    """Caught by driving the real browser against the real server, not by any assertion here.
+
+    The `#ext_vt` mount lives inside `.app`, and `.vt-standalone` hides `.app` with
+    `display:none !important`. A `display:none` ancestor removes its whole subtree from
+    rendering -- `position:fixed; inset:0` on the descendant does NOT rescue it. So the
+    standalone tab built a completely correct DOM (25 rows, right text, right colours) and
+    laid it out at 0x0: the user saw a black screen and nothing in the console.
+
+    The bootstrap must therefore reparent the mount to <body> BEFORE it takes over the window."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_standalone_reparents_the_mount_out_of_app(self):
+        self.assertIn("document.body.appendChild(mount)", self.src)
+
+    def test_reparent_happens_before_the_fullscreen_class(self):
+        reparent = self.src.index("document.body.appendChild(mount)")
+        vtfull = self.src.index('mount.classList.add("vtfull")')
+        self.assertLess(reparent, vtfull,
+                        "reparent must precede the fullscreen layout, or the first paint is 0x0")
+
+
 class TestRightTrimmedRowsArePadded(unittest.TestCase):
     """The coordinator's correction: Screen.snapshot() RIGHT-TRIMS `text` (drops trailing cells
     that are both a plain space and default-styled) -- it does not pad/truncate to `cols`. A row

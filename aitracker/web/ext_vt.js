@@ -487,6 +487,11 @@
     document.title = "Terminal — AI Tracker";
     var mount = document.getElementById("ext_vt");
     if (!mount) return;
+    // The mount lives inside .app, which .vt-standalone hides with display:none -- and a
+    // display:none ancestor removes the whole subtree from rendering no matter that we are
+    // position:fixed. Reparent to <body> so the fullscreen layout actually has a box; without
+    // this the standalone tab renders a correct DOM at 0x0 and the user sees a black screen.
+    document.body.appendChild(mount);
     mount.classList.add("vtfull");
     var term = new Terminal(mount, tty);
     var status = document.createElement("div");
