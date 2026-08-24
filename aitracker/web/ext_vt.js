@@ -84,6 +84,15 @@
 //   `d.tokens = {in, out}` (the session-CUMULATIVE total, monotonically increasing -- a
 //   DIFFERENT number with a different meaning) already ships today in every provider and is
 //   read directly in ContextBar.prototype._applySessionData, not through readContextUsage().
+//
+// ===== SECOND RENDER PATH (this session): TRACKER_TERM_RENDERER =========================
+//   POST /api/term/pty's response gained a `renderer` key ("grid"|"xterm", server-owned -- see
+//   config.TERM_RENDERER / term_vt.py's big comment above raw_stream()). GET /api/term/renderer
+//   -> {"renderer": ...} serves the same value for a reconnecting standalone ?tty= tab, which
+//   never calls /api/term/pty again. GET /api/term/raw?tty=<id> is the xterm.js counterpart to
+//   /api/term/screen: SSE of `data: <base64 of raw PTY bytes>\n\n`, no JSON envelope, no
+//   since/versioning -- see XtermTerminal below (search "SECOND, switchable render path") for the
+//   client half and its own documented gaps vs. the grid renderer.
 (function () {
   var esc = window.esc || function (s) { return (s || "").replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); };
 
@@ -196,6 +205,28 @@
     };
   }
 
+  // ===== shared zoom toolbar: ITS OWN flex row, ABOVE the pane -- never an overlay on top of
+  // terminal output. LAYOUT-BUG FIX (see ext_vt.css's .vttoolbar comment for the full story): the
+  // A-/A+ controls used to be absolutely positioned inside .vtpane's top-right corner, overlapping
+  // row 0's real content. Both renderers (Terminal below and XtermTerminal further down) build
+  // this the same way and append it as a sibling BEFORE their own pane, so the fix covers both
+  // paths from one place rather than being reimplemented per-renderer. =====
+  function buildToolbar(onZoomOut, onZoomIn, onAfterZoom) {
+    var bar = document.createElement("div");
+    bar.className = "vttoolbar";
+    var zoomOut = document.createElement("span");
+    zoomOut.className = "vtzoombtn";
+    zoomOut.textContent = "A−"; zoomOut.title = "Smaller (Ctrl/Cmd -)";
+    var zoomIn = document.createElement("span");
+    zoomIn.className = "vtzoombtn";
+    zoomIn.textContent = "A+"; zoomIn.title = "Larger (Ctrl/Cmd +)";
+    zoomOut.addEventListener("click", function () { onZoomOut(); onAfterZoom(); });
+    zoomIn.addEventListener("click", function () { onZoomIn(); onAfterZoom(); });
+    bar.appendChild(zoomOut);
+    bar.appendChild(zoomIn);
+    return bar;
+  }
+
   // ===== Terminal: one live grid + key capture, mounted into any container =====
   function Terminal(container, ttyId) {
     this.ttyId = ttyId;
@@ -226,6 +257,12 @@
     this._scrollReqSeq = 0;
 
     container.innerHTML = "";
+    var self = this;
+    var toolbarEl = buildToolbar(
+      function () { self._zoom(-1); },
+      function () { self._zoom(1); },
+      function () { input.focus(); }
+    );
     var pane = document.createElement("div");
     pane.className = "vtpane";
     var rowsEl = document.createElement("div");
@@ -240,14 +277,6 @@
     var scrollThumbEl = document.createElement("div");
     scrollThumbEl.className = "vtscrollthumb";
     scrollbarEl.appendChild(scrollThumbEl);
-    var zoomEl = document.createElement("div");
-    zoomEl.className = "vtzoom";
-    var zoomOut = document.createElement("span");
-    zoomOut.textContent = "A−"; zoomOut.title = "Smaller (Ctrl/Cmd -)";
-    var zoomIn = document.createElement("span");
-    zoomIn.textContent = "A+"; zoomIn.title = "Larger (Ctrl/Cmd +)";
-    zoomEl.appendChild(zoomOut);
-    zoomEl.appendChild(zoomIn);
     // Deliberately NOT covering the pane (that was v1's whole selection blocker): a tiny,
     // off-screen textarea still captures every keystroke/paste/IME composition, but leaves the
     // real .vtrow text nodes underneath free for the browser's native mouse selection.
@@ -262,14 +291,13 @@
     pane.appendChild(cursorEl);
     pane.appendChild(scrollbarEl);
     pane.appendChild(newOutEl);
-    pane.appendChild(zoomEl);
     pane.appendChild(input);
+    container.appendChild(toolbarEl);
     container.appendChild(pane);
 
     this.pane = pane; this.rowsEl = rowsEl; this.cursorEl = cursorEl; this.input = input;
     this.newOutEl = newOutEl; this.scrollbarEl = scrollbarEl; this.scrollThumbEl = scrollThumbEl;
 
-    var self = this;
     this._scrollHistoryDebounced = debounce(function (offset) { self._scrollHistory(offset); }, 30);
     // No preventDefault here (requirement 2's whole point): blocking the mousedown default is
     // what stops native text selection from ever starting. Focusing the capture textarea on the
@@ -279,8 +307,6 @@
     pane.addEventListener("mousedown", function () { input.focus(); });
     pane.addEventListener("wheel", function (ev) { self._onWheel(ev); }, { passive: false });
     newOutEl.addEventListener("click", function () { self._scrollToBottom(); input.focus(); });
-    zoomOut.addEventListener("click", function () { self._zoom(-1); input.focus(); });
-    zoomIn.addEventListener("click", function () { self._zoom(1); input.focus(); });
     input.addEventListener("focus", function () { self.focused = true; pane.classList.add("vtfocused"); });
     input.addEventListener("blur", function () { self.focused = false; pane.classList.remove("vtfocused"); });
     input.addEventListener("keydown", function (ev) { self._onKeyDown(ev); });
@@ -498,6 +524,12 @@
   Terminal.prototype.destroy = function () {
     if (this.es) { this.es.close(); this.es = null; }
   };
+  // Generic focus entry point shared with XtermTerminal (see that class's own .focus) -- so
+  // ContextBar's getInput() callback can hand back the TERMINAL object itself, one interface for
+  // either renderer, instead of a DOM node whose shape differs between the two.
+  Terminal.prototype.focus = function () {
+    try { this.input.focus(); } catch (e) { }
+  };
 
   // ===== mouse wheel: scrollback on the primary screen, arrow keys on the alt screen ==========
   // Full-screen programs (vim/less/top/…) own the alt screen and read arrow keys for their own
@@ -650,9 +682,208 @@
     }
   };
 
+  // ===== XtermTerminal: the SECOND, switchable render path =============================
+  // Hands raw PTY bytes (GET /api/term/raw, base64-framed) straight to vendored xterm.js instead
+  // of painting term_vt.Screen's parsed rows -- see term_vt.py's big comment above raw_stream()
+  // and config.py's TERM_RENDERER for the full story of why TWO renderer implementations coexist
+  // (a deliberate, documented exception to conventions rule 4). Chosen server-side per the
+  // TRACKER_TERM_RENDERER env var; ext_vt.js never decides this itself (conventions rule 5) --
+  // openVT()/bootStandalone() below just read what the server already picked and construct
+  // either this class or `Terminal` above. Exposes the SAME public interface `Terminal` does
+  // (attach/measureAndResize/destroy/focus/_onStatusChange) so neither call site needs an
+  // if/else past the point of picking which constructor to use.
+  //
+  // KNOWN GAPS vs the grid (`Terminal`) renderer -- read before assuming parity:
+  //   - NO repaint of a PTY's pre-existing screen content on attach/reconnect. `/api/term/raw`
+  //     only tees bytes emitted AFTER the SSE connection opens (there is no raw-byte scrollback
+  //     server-side, unlike Screen's parsed grid+history) -- opening a second tab, or reconnecting,
+  //     against a session that already has output on screen starts on a BLANK xterm.js buffer
+  //     until the next write. See raw_stream()'s own docstring for the same note server-side.
+  //   - NO custom "▼ new output" badge or the grid renderer's own scrollbar indicator -- xterm.js
+  //     has its own internal scrollback buffer and its own (invisible-until-scrolled) viewport,
+  //     used as-is; there is no server round trip for history here at all (no scrollback route is
+  //     called), so behaviour while scrolled back is entirely xterm.js's own, not this file's.
+  //   - The zoom control changes xterm's `fontSize` option + re-fits; xterm.js's internal row
+  //     metrics are not pixel-identical to the grid painter's CSS line-height, so the two panes'
+  //     exact row count at the "same" zoom step can differ by one row.
+  //   - Selection copy-on-Ctrl+C is reimplemented here (xterm.js sends \x03 for a plain Ctrl+C
+  //     UNCONDITIONALLY by default, selection or not -- there is no built-in copy-on-select/
+  //     copy-on-Ctrl+C) via `attachCustomKeyEventHandler`, mirroring Terminal's own copyCombo
+  //     check as closely as the two input models allow.
+  var _xtermAssetsPromise = null;
+  function _loadXtermAssets() {
+    if (_xtermAssetsPromise) return _xtermAssetsPromise;
+    _xtermAssetsPromise = new Promise(function (resolve, reject) {
+      if (window.Terminal && window.FitAddon) { resolve(); return; }   // already loaded (2nd open)
+      var link = document.createElement("link");
+      link.rel = "stylesheet";
+      link.href = "/vendor/xterm.css";
+      document.head.appendChild(link);
+      var s1 = document.createElement("script");
+      s1.src = "/vendor/xterm.js";
+      s1.onload = function () {
+        var s2 = document.createElement("script");
+        s2.src = "/vendor/addon-fit.js";
+        s2.onload = function () { resolve(); };
+        s2.onerror = function () { reject(new Error("failed to load /vendor/addon-fit.js")); };
+        document.head.appendChild(s2);
+      };
+      s1.onerror = function () { reject(new Error("failed to load /vendor/xterm.js")); };
+      document.head.appendChild(s1);
+    });
+    return _xtermAssetsPromise;
+  }
+
+  function _b64ToBytes(b64) {
+    var bin = atob(b64);
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  // xterm.js takes an explicit JS colour theme, not CSS -- read the app's own custom properties
+  // once so both light/dark themes (app.css's html.light) carry straight over instead of a second,
+  // hardcoded palette drifting from the SGR classes in ext_vt.css.
+  function _xtermTheme() {
+    var cs = getComputedStyle(document.documentElement);
+    function v(name, fallback) { var val = cs.getPropertyValue(name); return val ? val.trim() : fallback; }
+    return {
+      background: v("--app", "#0c0f15"), foreground: v("--text", "#e6edf3"),
+      cursor: v("--ring2", "#29d398"), selectionBackground: "rgba(76,141,255,.35)",
+    };
+  }
+
+  function XtermTerminal(container, ttyId) {
+    this.ttyId = ttyId;
+    this.es = null;
+    this.term = null;
+    this.fitAddon = null;
+    this._onStatusChange = null;
+    this._fontSize = 12.5;   // matches .vtpane's default font-size in ext_vt.css
+    var self = this;
+    this._resizeDebounced = debounce(function () { self._doResize(); }, 150);
+
+    container.innerHTML = "";
+    var toolbarEl = buildToolbar(
+      function () { self._zoom(-1); },
+      function () { self._zoom(1); },
+      function () { self.focus(); }
+    );
+    var pane = document.createElement("div");
+    pane.className = "vtpane vtxpane";
+    container.appendChild(toolbarEl);
+    container.appendChild(pane);
+    this.pane = pane;
+    this.container = container;
+  }
+
+  XtermTerminal.prototype.attach = function () {
+    var self = this;
+    if (self._onStatusChange) self._onStatusChange("loading xterm.js…");
+    _loadXtermAssets().then(function () { self._build(); }, function (err) {
+      if (self._onStatusChange) self._onStatusChange("failed to load xterm.js" + (err ? ": " + err.message : ""));
+      if (typeof toast === "function") toast("Couldn't load the xterm renderer", String(err && err.message || err));
+    });
+  };
+
+  XtermTerminal.prototype._build = function () {
+    var self = this;
+    var term = new window.Terminal({
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: this._fontSize,
+      cursorBlink: true,
+      scrollback: 5000,
+      theme: _xtermTheme(),
+    });
+    var fit = new window.FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(this.pane);
+    this.term = term; this.fitAddon = fit;
+    try { fit.fit(); } catch (e) { }
+
+    // Ctrl+C/Cmd+C copies the selection instead of sending SIGINT -- see this class's own header
+    // comment ("Selection copy-on-Ctrl+C is reimplemented here") for why xterm.js needs this at
+    // all: it sends \x03 for a plain Ctrl+C UNCONDITIONALLY otherwise, selection or not. Mirrors
+    // Terminal.prototype._onKeyDown's copyCombo check; the Ctrl/Cmd +/- zoom shortcut is folded
+    // into the same handler since both need to run BEFORE xterm's own key handling.
+    term.attachCustomKeyEventHandler(function (ev) {
+      if (ev.type !== "keydown") return true;
+      var k = ev.key;
+      var copyCombo = (ev.metaKey && !ev.ctrlKey && !ev.altKey && (k === "c" || k === "C")) ||
+                       (ev.ctrlKey && ev.shiftKey && !ev.metaKey && !ev.altKey && (k === "c" || k === "C"));
+      if (copyCombo && term.hasSelection()) {
+        var sel = term.getSelection();
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(sel).catch(function () { _fallbackCopy(sel); });
+        } else {
+          _fallbackCopy(sel);
+        }
+        return false;   // swallow -- do not also send \x03
+      }
+      if ((ev.metaKey || ev.ctrlKey) && !ev.shiftKey && !ev.altKey && (k === "+" || k === "=" || k === "-" || k === "_")) {
+        self._zoom(k === "-" || k === "_" ? -1 : 1);
+        return false;
+      }
+      return true;
+    });
+
+    term.onData(function (data) { postKeys(self.ttyId, data); });
+    term.onResize(function (sz) { postResize(self.ttyId, sz.cols, sz.rows); });
+
+    window.addEventListener("resize", self._resizeDebounced);
+    this._ro = null;
+    if (window.ResizeObserver) {
+      this._ro = new ResizeObserver(function () { self._resizeDebounced(); });
+      this._ro.observe(this.pane);
+    }
+    try { term.focus(); } catch (e) { }
+    this._openStream();
+  };
+
+  XtermTerminal.prototype._doResize = function () {
+    if (!this.fitAddon) return;
+    try { this.fitAddon.fit(); } catch (e) { }   // onResize above POSTs /api/term/resize itself
+  };
+
+  XtermTerminal.prototype._zoom = function (dir) {
+    var newFs = Math.max(8, Math.min(28, this._fontSize + dir));
+    if (newFs === this._fontSize) return;
+    this._fontSize = newFs;
+    if (this.term) { this.term.options.fontSize = newFs; this._doResize(); }
+  };
+
+  XtermTerminal.prototype._openStream = function () {
+    var self = this;
+    if (self.es) self.es.close();
+    if (self._onStatusChange) self._onStatusChange("connecting…");
+    self.es = new EventSource("/api/term/raw?tty=" + encodeURIComponent(self.ttyId));
+    self.es.onopen = function () { if (self._onStatusChange) self._onStatusChange("connected"); };
+    self.es.onmessage = function (ev) {
+      if (!self.term) return;
+      try { self.term.write(_b64ToBytes(ev.data)); } catch (e) { }
+    };
+    self.es.onerror = function () { if (self._onStatusChange) self._onStatusChange("reconnecting…"); };
+  };
+
+  // Same public name as Terminal.prototype.measureAndResize -- called identically by openVT's
+  // window-resize handler and bootStandalone's, regardless of which renderer is active.
+  XtermTerminal.prototype.measureAndResize = function () { this._doResize(); };
+
+  XtermTerminal.prototype.focus = function () {
+    if (this.term) { try { this.term.focus(); } catch (e) { } }
+  };
+
+  XtermTerminal.prototype.destroy = function () {
+    if (this.es) { this.es.close(); this.es = null; }
+    if (this._ro) { this._ro.disconnect(); this._ro = null; }
+    window.removeEventListener("resize", this._resizeDebounced);
+    if (this.term) { this.term.dispose(); this.term = null; }
+  };
+
   // ===== the modal (reuses app.css's .overlay/.modal/.mh/.mb/.x — no second modal system) =====
   var overlay = null, modalTitleEl = null, modalStatusEl = null, modalBodyEl = null;
   var activeTerm = null, activeTty = null, activeSid = null, activeMode = null, activeBar = null;
+  var activeRenderer = null;   // "grid" | "xterm" -- server-owned (see openVT below), never guessed
 
   function buildOverlay(mount) {
     overlay = document.createElement("div");
@@ -991,14 +1222,22 @@
             return;
           }
           activeTty = res.j.tty;
+          // Server-owned (conventions rule 5): the client reads which renderer to build off the
+          // response `open_pty()` already sent, never decides it locally -- see term_vt.py's
+          // TRACKER_TERM_RENDERER switch comment. An unrecognized/missing value falls back to
+          // "grid", same as config.TERM_RENDERER's own server-side fallback.
+          activeRenderer = (res.j.renderer === "xterm") ? "xterm" : "grid";
           modalStatusEl.textContent = "tty " + activeTty;
-          var term = new Terminal(modalBodyEl, activeTty);
+          var Cls = activeRenderer === "xterm" ? XtermTerminal : Terminal;
+          var term = new Cls(modalBodyEl, activeTty);
           term._onStatusChange = function (s) { if (activeTerm === term) modalStatusEl.textContent = "tty " + activeTty + " · " + s; };
           activeTerm = term;
-          // Built AFTER the Terminal (which does container.innerHTML = "" in its own
+          // Built AFTER the Terminal/XtermTerminal (both do container.innerHTML = "" in their own
           // constructor) so the bar's own DOM survives — appended as a sibling of .vtpane inside
           // the same flex-column .vtmb, so it docks to the bottom without any CSS shuffling.
-          activeBar = new ContextBar(modalBodyEl, sid, activeTty, mode, function () { return term.input; });
+          // getInput hands back the TERMINAL OBJECT itself (both classes expose .focus()), not a
+          // raw DOM node -- see Terminal.prototype.focus / XtermTerminal.prototype.focus.
+          activeBar = new ContextBar(modalBodyEl, sid, activeTty, mode, function () { return term; });
           activeBar.start();
           term.attach();
         })
@@ -1014,16 +1253,20 @@
     if (overlay) overlay.style.display = "none";
     if (activeTerm) { activeTerm.destroy(); activeTerm = null; }
     if (activeBar) { activeBar.destroy(); activeBar = null; }
-    activeTty = null; activeSid = null; activeMode = null;
+    activeTty = null; activeSid = null; activeMode = null; activeRenderer = null;
   }
 
   function openNewTab() {
     if (!activeTty) return;
-    // sid/mode are carried into the new tab's own URL (this app's own scheme, not a server
-    // contract) purely so bootStandalone() below can build its own ContextBar there too — the
-    // standalone view otherwise only knows the tty id.
+    // sid/mode/renderer are carried into the new tab's own URL (this app's own scheme, not a
+    // server contract) purely so bootStandalone() below can build its own ContextBar/Terminal
+    // there too — the standalone view otherwise only knows the tty id. `renderer` is a value the
+    // SERVER already chose (see openVT's res.j.renderer) being relayed forward, not decided here
+    // — bootStandalone() also has its own fallback (GET /api/term/renderer) for a bookmarked
+    // ?tty= link with no renderer param at all.
     var url = location.origin + location.pathname + "?tty=" + encodeURIComponent(activeTty) +
-      "&sid=" + encodeURIComponent(activeSid || "") + "&mode=" + encodeURIComponent(activeMode || "");
+      "&sid=" + encodeURIComponent(activeSid || "") + "&mode=" + encodeURIComponent(activeMode || "") +
+      "&renderer=" + encodeURIComponent(activeRenderer || "grid");
     var w = window.open(url, "_blank");
     if (!w) alert("Popup blocked — allow popups for this page to open a new tab.");
   }
@@ -1061,6 +1304,11 @@
     // the context bar.
     var sid = qs.get("sid") || "";
     var mode = qs.get("mode") || "";
+    // `renderer` is this app's own URL addition too (see openNewTab() above), relaying a value
+    // the SERVER already picked -- never guessed here. A bare ?tty= link with no renderer param
+    // (bookmarked before this change, or typed by hand) falls back to GET /api/term/renderer
+    // below rather than silently assuming "grid" -- the server is still the one deciding.
+    var rendererParam = qs.get("renderer") || "";
     if (!tty) {
       var m = /[?&#]tty=([^&]+)/.exec(location.hash);
       if (m) tty = decodeURIComponent(m[1]);
@@ -1076,21 +1324,34 @@
     // this the standalone tab renders a correct DOM at 0x0 and the user sees a black screen.
     document.body.appendChild(mount);
     mount.classList.add("vtfull");
-    var term = new Terminal(mount, tty);
-    var bar = null;
-    if (sid) {
-      // Appended AFTER the Terminal (whose constructor does container.innerHTML = "") and
-      // BEFORE the status line below, so DOM order is pane -> context bar -> status -- the bar
-      // docks directly under the pane, with the tty/connection status as the very bottom line.
-      bar = new ContextBar(mount, sid, tty, mode, function () { return term.input; });
-      bar.start();
+
+    function boot(renderer) {
+      var Cls = renderer === "xterm" ? XtermTerminal : Terminal;
+      var term = new Cls(mount, tty);
+      var bar = null;
+      if (sid) {
+        // Appended AFTER the Terminal/XtermTerminal (whose constructor does
+        // container.innerHTML = "") and BEFORE the status line below, so DOM order is
+        // pane -> context bar -> status -- the bar docks directly under the pane, with the
+        // tty/connection status as the very bottom line.
+        bar = new ContextBar(mount, sid, tty, mode, function () { return term; });
+        bar.start();
+      }
+      var status = document.createElement("div");
+      status.className = "vtfullstatus";
+      status.textContent = "tty " + tty + " · connecting…";
+      mount.appendChild(status);
+      term._onStatusChange = function (s) { status.textContent = "tty " + tty + " · " + s; };
+      term.attach();
+      window.addEventListener("resize", debounce(function () { term.measureAndResize(); }, 150));
     }
-    var status = document.createElement("div");
-    status.className = "vtfullstatus";
-    status.textContent = "tty " + tty + " · connecting…";
-    mount.appendChild(status);
-    term._onStatusChange = function (s) { status.textContent = "tty " + tty + " · " + s; };
-    term.attach();
-    window.addEventListener("resize", debounce(function () { term.measureAndResize(); }, 150));
+
+    if (rendererParam === "grid" || rendererParam === "xterm") {
+      boot(rendererParam);
+    } else {
+      fetch("/api/term/renderer").then(function (r) { return r.json(); })
+        .then(function (j) { boot((j && j.renderer === "xterm") ? "xterm" : "grid"); })
+        .catch(function () { boot("grid"); });
+    }
   })();
 })();

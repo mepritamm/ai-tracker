@@ -370,7 +370,11 @@ class TestContextBarDocksToBottomOfBothMounts(unittest.TestCase):
         self.src = _read("ext_vt.js")
 
     def test_modal_builds_a_context_bar_after_the_terminal(self):
-        term_i = self.src.index("var term = new Terminal(modalBodyEl, activeTty);")
+        # ext_vt.js now picks between Terminal (grid) and XtermTerminal per the server-owned
+        # `renderer` -- see the TRACKER_TERM_RENDERER switch -- so the construction call is
+        # `new Cls(...)`, not a literal `new Terminal(...)`; the ordering guarantee this test
+        # pins (terminal built before the context bar) is unchanged.
+        term_i = self.src.index("var term = new Cls(modalBodyEl, activeTty);")
         bar_i = self.src.index("activeBar = new ContextBar(modalBodyEl, sid, activeTty, mode,")
         self.assertLess(term_i, bar_i)
 
@@ -434,6 +438,105 @@ class TestContextBarCss(unittest.TestCase):
         phone = phone[:phone.index("}\n\n") + 1] if "}\n\n" in phone else phone
         self.assertNotIn(".vtmodelbtn { display: none", phone)
         self.assertNotIn(".vtmodeldd { display: none", phone)
+
+
+class TestZoomControlOverlapFix(unittest.TestCase):
+    """The layout bug from the user's screenshot: the A-/A+ zoom controls used to be an
+    absolutely-positioned `.vtzoom` overlay pinned inside `.vtpane`'s own top-right corner
+    (top:4px;right:6px), sitting directly on top of row 0's real content. The fix moves it to its
+    own `.vttoolbar` flex row, appended as a sibling BEFORE the pane -- both in CSS (no more
+    position:absolute over the pane) and in JS (no more `pane.appendChild` of the zoom element),
+    for BOTH renderers."""
+
+    def setUp(self):
+        self.css = _read("ext_vt.css")
+        self.js = _read("ext_vt.js")
+
+    def test_old_overlapping_vtzoom_rule_is_gone(self):
+        # the OLD class name/selector must not appear at all -- this is the actual regression
+        # bar: if a future edit reintroduces `.vtzoom {` (the absolutely-positioned overlay), this
+        # fails even if everything else below still passes.
+        self.assertNotIn(".vtzoom {", self.css)
+        self.assertNotIn(".vtzoom span", self.css)
+
+    def test_new_toolbar_rule_exists_and_is_not_absolutely_positioned_over_the_pane(self):
+        self.assertIn(".vttoolbar {", self.css)
+        self.assertIn(".vtzoombtn {", self.css)
+        block = self.css[self.css.index(".vttoolbar {"):self.css.index(".vtzoombtn {")]
+        # the whole POINT of the fix: no `position: absolute` pinning it inside the pane's box.
+        self.assertNotIn("position: absolute", block)
+
+    def test_toolbar_is_built_once_and_shared_by_both_renderers(self):
+        self.assertIn("function buildToolbar(", self.js)
+        # both Terminal's and XtermTerminal's constructors call the SAME helper -- one fix, not
+        # two reimplementations that could drift back apart.
+        self.assertEqual(self.js.count("buildToolbar("), 3,   # 1 definition + 2 call sites
+                          "buildToolbar should be defined once and called from both renderers")
+
+    def test_zoom_element_is_no_longer_appended_inside_the_pane(self):
+        # the old bug, structurally: the toolbar used to be a CHILD of `.vtpane`.
+        self.assertNotIn("pane.appendChild(zoomEl)", self.js)
+        self.assertNotIn("var zoomEl = document.createElement", self.js)
+
+    def test_toolbar_is_appended_as_a_sibling_before_the_pane_in_both_constructors(self):
+        term_body = _function_body(self.js, "function Terminal(container, ttyId) {")
+        self.assertIn("container.appendChild(toolbarEl)", term_body)
+        self.assertIn("container.appendChild(pane)", term_body)
+        self.assertLess(term_body.index("container.appendChild(toolbarEl)"),
+                         term_body.index("container.appendChild(pane)"))
+
+        xterm_start = self.js.index("function XtermTerminal(container, ttyId) {")
+        xterm_body = self.js[xterm_start:self.js.index("XtermTerminal.prototype.attach")]
+        self.assertIn("container.appendChild(toolbarEl)", xterm_body)
+        self.assertIn("container.appendChild(pane)", xterm_body)
+
+
+class TestXtermRendererSwitch(unittest.TestCase):
+    """The client half of TRACKER_TERM_RENDERER: openVT()/bootStandalone() must read which
+    renderer to build from the SERVER (POST /api/term/pty's `renderer` field, or GET
+    /api/term/renderer for a reconnecting standalone tab) and never invent the choice locally
+    (conventions rule 5)."""
+
+    def setUp(self):
+        self.js = _read("ext_vt.js")
+
+    def test_xterm_terminal_class_exists(self):
+        self.assertIn("function XtermTerminal(container, ttyId)", self.js)
+        for method in ("attach", "measureAndResize", "destroy", "focus"):
+            self.assertIn("XtermTerminal.prototype.%s = function" % method, self.js)
+
+    def test_openvt_reads_renderer_from_the_pty_response_not_locally(self):
+        body = _function_body(self.js, "function openVT(sid, mode) {")
+        self.assertIn('res.j.renderer === "xterm"', body)
+        self.assertIn("var Cls = activeRenderer === \"xterm\" ? XtermTerminal : Terminal;", body)
+
+    def test_standalone_falls_back_to_the_dedicated_renderer_route(self):
+        body = _body_until(self.js, "function bootStandalone", ["})();\n})();"])
+        self.assertIn('fetch("/api/term/renderer")', body)
+        self.assertIn('renderer === "xterm" ? XtermTerminal : Terminal', body)
+
+    def test_new_tab_url_relays_the_server_chosen_renderer(self):
+        body = _body_until(self.js, "function openNewTab", ["window.ExtVT ="])
+        self.assertIn('"&renderer=" + encodeURIComponent(activeRenderer || "grid")', body)
+
+    def test_lazy_asset_loader_targets_the_vendored_paths_not_a_cdn(self):
+        body = _function_body(self.js, "function _loadXtermAssets() {") \
+            if "function _loadXtermAssets() {" in self.js else self.js
+        self.assertIn('"/vendor/xterm.js"', self.js)
+        self.assertIn('"/vendor/xterm.css"', self.js)
+        self.assertIn('"/vendor/addon-fit.js"', self.js)
+        for host in ("cdn.", "unpkg.com", "jsdelivr", "cdnjs"):
+            self.assertNotIn(host, self.js)
+
+    def test_raw_stream_uses_the_dedicated_raw_route(self):
+        self.assertIn('"/api/term/raw?tty="', self.js)
+
+    def test_context_bar_focus_works_for_either_renderer_object(self):
+        # ContextBar's getInput callback hands back the TERMINAL object (not a raw DOM node) at
+        # both call sites -- both Terminal and XtermTerminal expose .focus(), so _focusTerminal's
+        # existing `input.focus()` call works unmodified for either.
+        self.assertIn("function () { return term; }", self.js)
+        self.assertNotIn("function () { return term.input; }", self.js)
 
 
 if __name__ == "__main__":

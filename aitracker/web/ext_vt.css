@@ -114,19 +114,26 @@
 .vtscrollbar.show { opacity: 1; }
 .vtscrollthumb { position: absolute; left: 0; right: 0; background: var(--line3); border-radius: 3px; }
 
-/* ---- font-size control: small, always reachable in-pane (never gated by host/viewport) -- the
-   keyboard equivalent is Ctrl/Cmd +/-, see Terminal.prototype._zoom. ---- */
-.vtzoom {
-  position: absolute;
-  top: 4px; right: 6px;
-  z-index: 3;
+/* ---- font-size control: its own toolbar row ABOVE the pane, never floating over it -- the
+   keyboard equivalent is Ctrl/Cmd +/-, see Terminal.prototype._zoom / XtermTerminal.prototype._zoom.
+   LAYOUT-BUG FIX: this used to be `.vtzoom`, an absolutely-positioned overlay pinned to the pane's
+   top-right corner (top:4px;right:6px) -- which sat directly on top of row 0's rightmost columns,
+   so any real output reaching the right edge of the first row or two rendered UNDER the A-/A+
+   buttons (the overlap in the user's screenshot). Making it a normal-flow sibling BEFORE `.vtpane`
+   (both `.vtmb`/#ext_vt.vtfull are flex-column containers already -- see the modal/standalone
+   markup) reserves its own row instead of borrowing the terminal's, for BOTH renderers: the grid
+   painter's `Terminal` constructor and `XtermTerminal`'s constructor both call the same
+   `buildToolbar()` helper in ext_vt.js. Bonus: because it's outside `.vtpane`, it no longer
+   perturbs `computeColsRows()`'s cols/rows measurement of the pane itself. */
+.vttoolbar {
+  flex: 0 0 auto;
   display: flex;
+  justify-content: flex-end;
   gap: 2px;
-  opacity: .35;
-  transition: opacity .15s ease;
+  padding: 3px 6px 0;
+  background: var(--app);
 }
-.vtpane:hover .vtzoom, .vtpane.vtfocused .vtzoom { opacity: .85; }
-.vtzoom span {
+.vtzoombtn {
   cursor: pointer;
   -webkit-user-select: none;
   user-select: none;
@@ -136,8 +143,19 @@
   border: 1px solid var(--line3);
   border-radius: 4px;
   padding: 2px 6px;
+  opacity: .55;
+  transition: opacity .15s ease, color .15s ease, border-color .15s ease;
 }
-.vtzoom span:hover { color: var(--text); border-color: var(--blue); }
+.vtzoombtn:hover { opacity: 1; color: var(--text); border-color: var(--blue); }
+
+/* ---- xterm.js pane (the "xterm" TRACKER_TERM_RENDERER path -- see term_vt.py's big comment
+   above raw_stream() and config.py's TERM_RENDERER for why two renderers coexist). Reuses
+   .vtpane's box (flex/min-height/background/overflow) so it sits identically to the grid pane
+   under the same .vttoolbar/.vtctxbar siblings; xterm.js manages its own internal cell grid via
+   its <canvas>, so none of .vtpane's monospace/line-height text-layout rules apply here. ---- */
+.vtxpane { padding: 4px 6px; }
+.vtxpane .xterm { height: 100%; }
+.vtxpane .xterm-viewport { background: transparent !important; }   /* let .vtxpane's own --app show */
 
 /* ---- context bar: docked to the bottom of the terminal pane (see ContextBar in ext_vt.js) --
    a slim strip, NOT a second modal/toolbar system: same tokens (--chipbg/--line3/--dim/…) as
