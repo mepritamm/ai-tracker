@@ -62,6 +62,28 @@
 //   as a no-op private mode, so there is currently NO server signal for whether the running
 //   program wants pasted text wrapped in `ESC[200~ … ESC[201~`. Read defensively as
 //   `msg.bracketed_paste` (default false) rather than guessing a value with no server backing.
+//
+// ===== CONTEXT BAR (this session): two more contracts =================================
+//   POST /api/term/inject {tty, text, submit: true, clear_first: true} -> {ok: true, ...}
+//     Waits for the terminal to go quiet, types `text`, then sends Enter separately (re-sending
+//     it if the TUI swallows it). May not exist yet in this worktree — a non-2xx/non-{ok:true}
+//     response surfaces a toast (see ContextBar.prototype._pickModel below), never silently.
+//   GET /api/session?id=<sid> gains a `context` field. CONFIRMED (reconciled with the server
+//   agent mid-build -- the first draft of this file guessed `{used, limit}` with an
+//   auto-computed percentage; that guess is gone, this is the real, shipped shape):
+//     d.context = { current: <int|null, LATEST turn's usage only (in + cache_read +
+//                             cache_creation) -- "am I about to run out", not a running total>,
+//                   limit:   <int|null, the context window size, ONLY when the tool's own logs
+//                             state one -- Claude Code sessions never do (context_management is
+//                             null throughout), so this is routinely null for exactly the
+//                             sessions the terminal is most used with>,
+//                   pct:     <float|null, SERVER-COMPUTED, only when both of the above are known
+//                             and limit > 0 -- never fabricated here, never re-derived from
+//                             current/limit by this file> }
+//   See readContextUsage() below, the ONE function that reads it.
+//   `d.tokens = {in, out}` (the session-CUMULATIVE total, monotonically increasing -- a
+//   DIFFERENT number with a different meaning) already ships today in every provider and is
+//   read directly in ContextBar.prototype._applySessionData, not through readContextUsage().
 (function () {
   var esc = window.esc || function (s) { return (s || "").replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); };
 
@@ -630,7 +652,7 @@
 
   // ===== the modal (reuses app.css's .overlay/.modal/.mh/.mb/.x — no second modal system) =====
   var overlay = null, modalTitleEl = null, modalStatusEl = null, modalBodyEl = null;
-  var activeTerm = null, activeTty = null, activeSid = null;
+  var activeTerm = null, activeTty = null, activeSid = null, activeMode = null, activeBar = null;
 
   function buildOverlay(mount) {
     overlay = document.createElement("div");
@@ -686,14 +708,258 @@
     closeVT();
   });
 
+  // ===== context bar: docked to the bottom of the terminal pane, in both the modal and the
+  // standalone ?tty= view (ContextBar is instantiated from openVT() below and from
+  // bootStandalone() at the end of this file — same component, two mount points). Two controls,
+  // mirroring a reference implementation the user pointed at:
+  //   1. a model switcher — picking an entry types "/model <name>" into the running CLI. There
+  //      is no API for this: /model is a CLI slash command, not server-tracked state, so the
+  //      only way to "set" it is to type it, exactly the way a person would.
+  //   2. a context-window usage readout — see readContextUsage() below for the wire contract
+  //      this assumes (a PARALLEL agent is adding the field it reads).
+  // ======================================================================================
+
+  // The model ladder is HARDCODED, on purpose — mirroring the reference implementation, which
+  // does the same thing. This is the CLI's OWN slash-command ladder, not anything this app can
+  // discover from a session log or any API; if the CLI ever renames/adds a tier, this literal
+  // array is the one place to update.
+  var MODEL_LADDER = ["haiku", "sonnet", "opus", "fable"];
+
+  // Best-effort "which model is this" label for the switcher button/dropdown. There is no live,
+  // CLI-reported "current model" anywhere this app can read — meta.model (set in
+  // aitracker/providers/claude.py from the last transcript message's `message.model`) is only a
+  // snapshot of what generated the LAST reply, so this is a heuristic label, not a guarantee —
+  // it goes stale the instant /model is used without a further assistant message following it.
+  function _matchLadderModel(raw) {
+    if (!raw) return null;
+    var low = String(raw).toLowerCase();
+    for (var i = 0; i < MODEL_LADDER.length; i++) {
+      if (low.indexOf(MODEL_LADDER[i]) !== -1) return MODEL_LADDER[i];
+    }
+    return null;
+  }
+
+  function fmtTok(n) {
+    n = n || 0;
+    if (n >= 1000000) return (n / 1000000).toFixed(1).replace(/\.0$/, "") + "m";
+    if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
+    return String(n);
+  }
+
+  // ===== context-window usage: isolated in this ONE function because its wire shape comes from
+  // the shared session-detail dict served by GET /api/session (aitracker/providers/claude.py &
+  // auggie.py — NOT this worktree's files), landed by a PARALLEL agent. CONFIRMED CONTRACT (see
+  // the header comment at the top of this file for the full reconciliation note):
+  //   d.context = { current: <int|null, LATEST turn's usage only, not a running total>,
+  //                 limit:   <int|null, present only when the tool's own logs state a window
+  //                           size — routinely null for Claude sessions>,
+  //                 pct:     <float|null, SERVER-COMPUTED, present only when both of the above
+  //                           are known and limit > 0> }
+  // `current` is REQUIRED for anything to render — null (an Auggie/augment_ext session with no
+  // readable usage, or simply before this field existed) means "nothing to show", not a
+  // placeholder or a zero. `pct` gates the bar/percentage as an ENHANCEMENT on top of `current`,
+  // never the other way round: this file never computes its own percentage from current/limit —
+  // that would be exactly the "invent a denominator" the spec forbids, and it is also simply
+  // wrong for the common case (Claude sessions carry a `current` with no `limit` at all).
+  function readContextUsage(d) {
+    var c = d && d.context;
+    if (!c || typeof c.current !== "number" || !(c.current >= 0)) return null;
+    var limit = (typeof c.limit === "number" && c.limit > 0) ? c.limit : null;
+    var pct = (typeof c.pct === "number") ? c.pct : null;   // server's number, verbatim
+    return { current: c.current, limit: limit, pct: pct };
+  }
+
+  // ===== ContextBar: one instance per open terminal (modal or standalone), destroyed with it. ==
+  function ContextBar(container, sid, ttyId, mode, getInput) {
+    this.sid = sid; this.ttyId = ttyId; this.getInput = getInput;
+    // Only a Claude CLI is listening for "/model ..." — mode is "resume"|"new" for that, "cwd"
+    // for a plain shell. Typing a slash command at a bash prompt would just leave junk on the
+    // line, so the switcher is never merely disabled outside those two modes — it isn't built.
+    this.showSwitcher = (mode === "resume" || mode === "new");
+    this.dropdownOpen = false;
+    this.currentModel = null;
+    this._pollStop = null;
+    this._destroyed = false;
+
+    var self = this;
+    var bar = document.createElement("div");
+    bar.className = "vtctxbar";
+    this.el = bar;
+
+    if (this.showSwitcher) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "vtmodelbtn";
+      btn.textContent = "model ▾";
+      btn.title = "Switch model — types /model <name> into the CLI";
+      var dd = document.createElement("div");
+      dd.className = "vtmodeldd";
+      MODEL_LADDER.forEach(function (name) {
+        var item = document.createElement("div");
+        item.className = "vtmodelitem";
+        item.textContent = name;
+        item.setAttribute("data-model", name);
+        dd.appendChild(item);
+      });
+      bar.appendChild(btn);
+      bar.appendChild(dd);
+      this.modelBtn = btn; this.modelDd = dd;
+
+      // preventDefault on mousedown, not just handling click: a <button> takes native DOM focus
+      // on mousedown in most browsers, and this bar must never steal keyboard focus from the
+      // terminal's own capture textarea — not even for the instant between mousedown and click.
+      btn.addEventListener("mousedown", function (ev) { ev.preventDefault(); });
+      btn.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        if (self.dropdownOpen) self._closeDropdown(); else self._openDropdown();
+        self._focusTerminal();
+      });
+      dd.addEventListener("mousedown", function (ev) { ev.preventDefault(); });
+      dd.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        var name = ev.target && ev.target.getAttribute && ev.target.getAttribute("data-model");
+        if (!name) return;
+        self._pickModel(name);
+      });
+      this._onDocClick = function (ev) {
+        if (!self.dropdownOpen || bar.contains(ev.target)) return;
+        self._closeDropdown();
+      };
+      document.addEventListener("click", this._onDocClick);
+    }
+
+    var readout = document.createElement("div");
+    readout.className = "vtctxreadout";
+    bar.appendChild(readout);
+    this.readoutEl = readout;
+
+    // Nothing to show yet (no switcher, no data fetched) — stay invisible rather than showing an
+    // empty docked strip; _renderReadout() reveals it the moment there's real content.
+    bar.style.display = this.showSwitcher ? "" : "none";
+
+    container.appendChild(bar);
+  }
+
+  ContextBar.prototype._focusTerminal = function () {
+    var input = this.getInput && this.getInput();
+    if (input) { try { input.focus(); } catch (e) { } }
+  };
+
+  ContextBar.prototype._openDropdown = function () {
+    this.dropdownOpen = true;
+    this.modelDd.classList.add("show");
+    var items = this.modelDd.children;
+    for (var i = 0; i < items.length; i++) {
+      items[i].classList.toggle("cur", items[i].getAttribute("data-model") === this.currentModel);
+    }
+  };
+  ContextBar.prototype._closeDropdown = function () {
+    this.dropdownOpen = false;
+    if (this.modelDd) this.modelDd.classList.remove("show");
+  };
+
+  // Sends "/model <name>" via the inject route another agent is building in parallel:
+  //   POST /api/term/inject {tty, text, submit: true, clear_first: true} -> {ok: true, ...}
+  // That route may not exist yet in this worktree — a 404/400 (or any non-ok response) surfaces
+  // a toast rather than failing silently, per the spec.
+  ContextBar.prototype._pickModel = function (name) {
+    this._closeDropdown();
+    this._focusTerminal();
+    fetch("/api/term/inject", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tty: this.ttyId, text: "/model " + name, submit: true, clear_first: true })
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
+    }).then(function (res) {
+      if (res.ok && res.j && res.j.ok === true) return;
+      var reason = (res.j && res.j.error) ||
+        (res.status === 404 ? "the model-switch route isn't available in this build yet" :
+         res.status === 400 ? "the terminal rejected that request" :
+         "the terminal didn't confirm the switch");
+      if (typeof toast === "function") toast("Couldn't switch model", reason);
+    }).catch(function () {
+      if (typeof toast === "function") toast("Couldn't reach the server", "the model switch wasn't sent");
+    });
+  };
+
+  ContextBar.prototype._applySessionData = function (d) {
+    var meta = (d && d.meta) || {};
+    this.currentModel = _matchLadderModel(meta.model);
+    if (this.modelBtn) this.modelBtn.textContent = (this.currentModel || "model") + " ▾";
+
+    var usage = readContextUsage(d);
+    // Session-CUMULATIVE total (all turns, all time, monotonically increasing) — a DIFFERENT
+    // number from `usage.current` (latest-turn occupancy) with a different meaning. This field
+    // already ships today for every provider (aitracker/providers/claude.py, auggie.py,
+    // augment_ext.py), unlike `d.context` above, so it's read directly here rather than through
+    // readContextUsage(). Labelled "Σ" in the readout so the two are never misread as one figure.
+    var cumulative = (d && d.tokens) ? ((d.tokens.in | 0) + (d.tokens.out | 0)) : 0;
+    this._renderReadout(usage, cumulative);
+  };
+
+  // Leads with `current` (shown whenever present, on its own for the common Claude-session case
+  // where there's no honest denominator) and treats the bar/percentage as an ENHANCEMENT layered
+  // on top, gated strictly on `usage.pct` being non-null — never on `usage.limit` alone, and
+  // never computed here (see readContextUsage's comment). Renders nothing at all when `current`
+  // is null: no empty chrome, no "0", no placeholder bar.
+  ContextBar.prototype._renderReadout = function (usage, cumulative) {
+    var el = this.readoutEl;
+    if (el) {
+      if (!usage) {
+        el.innerHTML = "";
+      } else {
+        var html = '<span class="vtctxused" title="tokens in context right now">' + esc(fmtTok(usage.current)) + '</span>';
+        if (usage.pct !== null) {
+          var barPct = Math.max(0, Math.min(100, usage.pct));            // defensive clamp for the bar's CSS width only
+          var pctLabel = Math.round(usage.pct);                          // the printed number is still the server's own pct
+          var title = fmtTok(usage.current) + (usage.limit !== null ? (" / " + fmtTok(usage.limit) + " tokens") : "") + " (" + pctLabel + "%)";
+          html += '<span class="vtctxbarwrap" title="' + esc(title) + '">' +
+                    '<span class="vtctxbarfill" style="width:' + barPct + '%"></span>' +
+                  '</span>' +
+                  '<span class="vtctxpct">' + pctLabel + '%</span>';
+        }
+        if (cumulative > 0) {
+          html += '<span class="vtctxcum" title="cumulative tokens, this session">Σ ' + esc(fmtTok(cumulative)) + '</span>';
+        }
+        el.innerHTML = html;
+      }
+    }
+    // Hide the whole bar when it would have nothing to show at all (no switcher AND no usage
+    // data) — a visible-but-empty docked strip is worse than no strip.
+    this.el.style.display = (this.showSwitcher || !!usage) ? "" : "none";
+  };
+
+  ContextBar.prototype.start = function () {
+    var self = this;
+    function tick() {
+      if (self._destroyed) return;
+      fetch("/api/session?id=" + encodeURIComponent(self.sid))
+        .then(function (r) { return r.json(); })
+        .then(function (d) { if (!self._destroyed && d && !d.error) self._applySessionData(d); })
+        .catch(function () { });
+    }
+    tick();
+    var timer = setInterval(tick, 2000);   // mirrors app.js's own 2s poll cadence
+    this._pollStop = function () { clearInterval(timer); };
+  };
+
+  ContextBar.prototype.destroy = function () {
+    this._destroyed = true;
+    if (this._pollStop) { this._pollStop(); this._pollStop = null; }
+    if (this._onDocClick) { document.removeEventListener("click", this._onDocClick); this._onDocClick = null; }
+    if (this.el && this.el.parentNode) this.el.parentNode.removeChild(this.el);
+  };
+
   function openVT(sid, mode) {
     if (!sid) return;
     var mount = document.getElementById("ext_vt");
     if (!mount) return;
     if (!overlay) buildOverlay(mount);
     if (activeTerm) { activeTerm.destroy(); activeTerm = null; }
+    if (activeBar) { activeBar.destroy(); activeBar = null; }
     activeTty = null;
     activeSid = sid;
+    activeMode = mode;
 
     modalTitleEl.textContent = "Terminal — " + (mode === "resume" ? "resume · " : "") + sid;
     modalStatusEl.textContent = "connecting…";
@@ -729,6 +995,11 @@
           var term = new Terminal(modalBodyEl, activeTty);
           term._onStatusChange = function (s) { if (activeTerm === term) modalStatusEl.textContent = "tty " + activeTty + " · " + s; };
           activeTerm = term;
+          // Built AFTER the Terminal (which does container.innerHTML = "" in its own
+          // constructor) so the bar's own DOM survives — appended as a sibling of .vtpane inside
+          // the same flex-column .vtmb, so it docks to the bottom without any CSS shuffling.
+          activeBar = new ContextBar(modalBodyEl, sid, activeTty, mode, function () { return term.input; });
+          activeBar.start();
           term.attach();
         })
         .catch(function (e) {
@@ -742,12 +1013,17 @@
   function closeVT() {
     if (overlay) overlay.style.display = "none";
     if (activeTerm) { activeTerm.destroy(); activeTerm = null; }
-    activeTty = null; activeSid = null;
+    if (activeBar) { activeBar.destroy(); activeBar = null; }
+    activeTty = null; activeSid = null; activeMode = null;
   }
 
   function openNewTab() {
     if (!activeTty) return;
-    var url = location.origin + location.pathname + "?tty=" + encodeURIComponent(activeTty);
+    // sid/mode are carried into the new tab's own URL (this app's own scheme, not a server
+    // contract) purely so bootStandalone() below can build its own ContextBar there too — the
+    // standalone view otherwise only knows the tty id.
+    var url = location.origin + location.pathname + "?tty=" + encodeURIComponent(activeTty) +
+      "&sid=" + encodeURIComponent(activeSid || "") + "&mode=" + encodeURIComponent(activeMode || "");
     var w = window.open(url, "_blank");
     if (!w) alert("Popup blocked — allow popups for this page to open a new tab.");
   }
@@ -775,7 +1051,16 @@
   // rest of the baked SPA via CSS (ext_vt.css's .vt-standalone rules) -- no server round-trip to
   // create a NEW pty, this attaches to the SAME tty id the opening modal already created. =====
   (function bootStandalone() {
-    var tty = new URLSearchParams(location.search).get("tty");
+    var qs = new URLSearchParams(location.search);
+    var tty = qs.get("tty");
+    // sid/mode are this app's own addition to the URL (see openNewTab() above) -- the ORIGINAL
+    // plan's ?tty= contract only carried the tty id, which is all the terminal itself needs, but
+    // the context bar needs to know which session this tty belongs to (for /api/session polling)
+    // and whether it's a Claude CLI (for the model switcher). Both are optional: a bare ?tty=
+    // link (e.g. one bookmarked before this change) still opens the terminal fine, just without
+    // the context bar.
+    var sid = qs.get("sid") || "";
+    var mode = qs.get("mode") || "";
     if (!tty) {
       var m = /[?&#]tty=([^&]+)/.exec(location.hash);
       if (m) tty = decodeURIComponent(m[1]);
@@ -792,6 +1077,14 @@
     document.body.appendChild(mount);
     mount.classList.add("vtfull");
     var term = new Terminal(mount, tty);
+    var bar = null;
+    if (sid) {
+      // Appended AFTER the Terminal (whose constructor does container.innerHTML = "") and
+      // BEFORE the status line below, so DOM order is pane -> context bar -> status -- the bar
+      // docks directly under the pane, with the tty/connection status as the very bottom line.
+      bar = new ContextBar(mount, sid, tty, mode, function () { return term.input; });
+      bar.start();
+    }
     var status = document.createElement("div");
     status.className = "vtfullstatus";
     status.textContent = "tty " + tty + " · connecting…";

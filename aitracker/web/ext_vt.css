@@ -139,6 +139,100 @@
 }
 .vtzoom span:hover { color: var(--text); border-color: var(--blue); }
 
+/* ---- context bar: docked to the bottom of the terminal pane (see ContextBar in ext_vt.js) --
+   a slim strip, NOT a second modal/toolbar system: same tokens (--chipbg/--line3/--dim/…) as
+   .vtzoom above and .chip/.mini in app.css. Model button first, then the usage readout, matching
+   the reference layout the user pointed at. Never steals focus (JS side handles that); this side
+   just keeps it visually quiet until there's something to say (see .vtctxbar's JS-driven
+   display:none default). ---- */
+.vtctxbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--line3);
+  background: var(--side);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--dim);
+  position: relative;
+}
+
+.vtmodelbtn {
+  flex: 0 0 auto;
+  cursor: pointer;
+  font: 700 11px/1 'JetBrains Mono', monospace;
+  color: var(--muted);
+  background: var(--chipbg);
+  border: 1px solid var(--line3);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+.vtmodelbtn:hover { color: var(--text); border-color: var(--blue); }
+
+.vtmodeldd {
+  display: none;
+  position: absolute;
+  left: 10px;
+  bottom: calc(100% + 4px);
+  z-index: 4;
+  flex-direction: column;
+  min-width: 96px;
+  background: var(--card);
+  border: 1px solid var(--line3);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .35);
+}
+.vtmodeldd.show { display: flex; }
+.vtmodelitem {
+  cursor: pointer;
+  padding: 5px 8px;
+  border-radius: 5px;
+  font: 12px/1.3 'JetBrains Mono', monospace;
+  color: var(--head);
+}
+.vtmodelitem:hover { background: var(--raised); color: var(--text); }
+.vtmodelitem.cur { color: var(--green2); }
+.vtmodelitem.cur::after { content: ' ✓'; }
+
+.vtctxreadout {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  overflow: hidden;
+}
+.vtctxbarwrap {
+  flex: 0 1 88px;
+  min-width: 36px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--chipbg);
+  border: 1px solid var(--line3);
+  overflow: hidden;
+}
+.vtctxbarfill { display: block; height: 100%; background: var(--blue); }
+.vtctxpct, .vtctxused { color: var(--muted); white-space: nowrap; }
+.vtctxcum { color: var(--dim); white-space: nowrap; }
+.vtctxcum::before { content: ''; }
+
+/* tablets/phones: the bar itself degrades by shrinking the bar-fill and letting the cumulative
+   figure wrap out of view before anything overflows -- never by hiding a control outright. */
+@media(min-width:601px) and (max-width:900px) {
+  .vtctxbar { font-size: 10.5px; gap: 6px; padding: 5px 8px; }
+  .vtctxbarwrap { flex-basis: 64px; }
+}
+@media(max-width:600px) {
+  .vtctxbar { font-size: 10px; gap: 5px; padding: 5px 6px; }
+  .vtmodelbtn { padding: 3px 6px; }
+  .vtctxbarwrap { flex-basis: 40px; }
+  .vtctxcum { display: none; }   /* cumulative total is the least essential number at this width */
+}
+
 /* SGR runs -> classes. MUST stay in sync with sgrRunClass() in ext_vt.js, which is the single
    place that maps parsed-integer SGR params to these class names -- see the comment there for
    the assumed row/run encoding this depends on. */
