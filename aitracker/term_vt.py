@@ -1243,6 +1243,13 @@ class Pty:
         self.ended = 0.0           # time.time() when finish() ran; 0.0 while still live
         self.started = time.time()
         self.last_active = self.started   # last keystroke, or last viewer leaving -- idle clock
+        self.last_output = self.started   # last time the CHILD actually produced bytes -- written
+                                           # only by `_reader` (single-writer, no lock needed, same
+                                           # informal style as `last_active`); this is what
+                                           # `inject()`'s quiescence wait polls, deliberately
+                                           # distinct from `last_active` (which also moves on a
+                                           # keystroke or a viewer connecting/leaving, neither of
+                                           # which means the TUI has finished redrawing)
         self.lock = threading.Lock()      # guards `screen` only
 
     def touch(self):
@@ -1351,6 +1358,9 @@ def _reader(pt):
                 break
             if not data:
                 break
+            pt.last_output = time.time()   # see the field's own comment: stamped BEFORE feed() so
+                                            # a caller polling it never sees a stale "quiet" read
+                                            # while this very chunk is still being parsed
             with pt.lock:
                 pt.screen.feed(data)
                 reply = pt.screen.pop_replies()
@@ -1655,8 +1665,228 @@ def term_scrollback(handler, parsed):
     handler._json(result)
 
 
+# --------------------------------------------------------------------- inject-when-ready
+#
+# `keys()` above already writes arbitrary bytes to the PTY -- that is the entire security
+# surface, and it existed before this primitive and is unchanged by it. `inject()` below is NOT
+# a new capability, only a more reliable way to drive the one `keys()` already grants: naively
+# writing "text\r" through `keys()` at the wrong moment gets silently swallowed by a TUI that is
+# still booting or mid-redraw, so this adds (1) a bounded wait for PTY quiescence before typing,
+# (2) the text and the submitting CR as two separate writes, and (3) a bounded number of CR
+# resends if the line still looks unsubmitted. All three are heuristics inferred from watching a
+# real `claude` TUI misbehave under naive injection, not protocol guarantees -- see `inject()`'s
+# own docstring for exactly what each one does and how each can misfire.
+
+INJECT_QUIET_WINDOW = 1.5
+"""Seconds of NO PTY output required before the terminal is considered settled enough to type
+into. Mirrors the reference implementation's ~1.5s figure: a TUI that is still booting or mid
+frame-redraw swallows input that arrives while it's rebuilding its own view of the screen, so
+`_wait_for_quiescence` blocks until this much silence has passed since `Pty.last_output`."""
+
+INJECT_MIN_WAIT = 0.3
+"""Floor on how long `_wait_for_quiescence` waits before it will ever return True, even when the
+PTY already LOOKS quiet the instant `inject()` is called. Without this, injecting immediately
+after `open_pty()` (before the child has emitted its first byte) or immediately after the
+previous output happened to stop `INJECT_QUIET_WINDOW` seconds ago would race a redraw that is
+about to start, rather than one already finished -- this floor gives that redraw a chance to
+begin and reset the quiet clock before we commit to typing."""
+
+INJECT_MAX_WAIT = 8.0
+"""Hard ceiling on the total time `_wait_for_quiescence` will wait for the terminal to go quiet.
+This is what keeps `inject()` from blocking the HTTP handler thread indefinitely against a
+program that never stops producing output (a runaway `tail -f`, a busy build log) -- past this
+many seconds the wait gives up and `inject()` returns `{"ok": false, "reason": ...}` instead of
+hanging the request."""
+
+INJECT_POLL_INTERVAL = 0.05
+"""How often `_wait_for_quiescence` re-checks `Pty.last_output` while waiting. Small relative to
+`INJECT_QUIET_WINDOW`/`INJECT_MAX_WAIT` so the wait notices new output (and resets the quiet
+clock) promptly, without busy-spinning."""
+
+INJECT_KEY_GAP = 0.03
+"""Pause between the Ctrl+E and Ctrl+U writes of `clear_first`, and between the text write and
+the first CR write. Not load-bearing for correctness (each is already a genuinely separate
+`os.write`) -- it exists so the child's read loop sees them as separate input events rather than
+one coalesced read, on the same theory as sending text and CR as separate writes in the first
+place: a TUI's input handling is more reliable across the boundary of two reads than inside the
+middle of one."""
+
+INJECT_RESEND_DELAY = 0.4
+"""After sending CR, how long `inject()` waits before checking whether the screen changed (a
+proxy for "did the Enter actually submit"). Short enough that three attempts stay well inside
+`INJECT_MAX_WAIT`'s HTTP-response budget, long enough to give the child a moment to draw its
+response to a real Enter."""
+
+INJECT_RESEND_MAX_ATTEMPTS = 3
+"""Total CR sends `inject()` will attempt (the first send plus up to two resends) before giving
+up on confirming submission. Reproduces the reference implementation's documented behaviour that
+Claude's TUI sometimes eats the first Enter."""
+
+INJECT_BRACKET_LEN_THRESHOLD = 200
+"""`inject()` wraps `text` in DEC bracketed-paste markers (`ESC[200~` / `ESC[201~`) when it
+contains a newline OR is at least this many characters -- long enough that a line editor doing
+per-character work (history search, syntax highlighting) while it streams in could plausibly
+misbehave the same way a naive multi-line paste does. A short single-line command does not need
+the wrapper and skipping it avoids depending on the child having bracketed-paste mode enabled for
+the overwhelmingly common case."""
+
+
+def _wait_for_quiescence(pt):
+    """Block the calling (HTTP handler) thread until `pt` has been silent for
+    `INJECT_QUIET_WINDOW` seconds, AT LEAST `INJECT_MIN_WAIT` seconds have elapsed since this
+    call started (see that constant's own comment), and no more than `INJECT_MAX_WAIT` seconds
+    total have elapsed.
+
+    Returns True once quiet, False on timeout. Bounded strictly by `INJECT_MAX_WAIT` on every
+    path -- this is the one thing standing between `inject()` and hanging the HTTP handler thread
+    against a PTY that never stops producing output; the WORST CASE wall-clock time this function
+    can consume is `INJECT_MAX_WAIT` (plus at most one `INJECT_POLL_INTERVAL` of overshoot).
+
+    Reads the four `INJECT_*` constants BY NAME on every iteration (not as bound default
+    arguments) so a caller -- production code choosing to retune them, or a test monkeypatching
+    `term_vt.INJECT_QUIET_WINDOW` etc. -- sees the effect immediately, exactly like `_reader`'s
+    own use of `IDLE_TIMEOUT` above.
+    """
+    start = time.time()
+    deadline = start + INJECT_MAX_WAIT
+    while True:
+        now = time.time()
+        idle = now - pt.last_output
+        elapsed = now - start
+        if idle >= INJECT_QUIET_WINDOW and elapsed >= INJECT_MIN_WAIT:
+            return True
+        if now >= deadline:
+            return False
+        time.sleep(INJECT_POLL_INTERVAL)
+
+
+def _inject_write(pt, data):
+    """One `os.write` to the PTY's stdin, swallowing the same failure `keys()` already tolerates
+    (the child is gone -- the next read/route call reports that properly). Returns False on
+    failure so callers can short-circuit instead of writing into a dead fd repeatedly."""
+    try:
+        os.write(pt.fd, data)
+        return True
+    except OSError:
+        return False
+
+
+def _bracket_if_needed(text):
+    """`text` -> UTF-8 bytes, wrapped in DEC bracketed-paste markers when `INJECT_BRACKET_LEN_
+    THRESHOLD` or a newline says a plain literal write risks being misread mid-stream (see that
+    constant's own comment). Never includes the submitting CR -- that is always its own write."""
+    payload = text.encode("utf-8")
+    if "\n" in text or "\r" in text or len(text) >= INJECT_BRACKET_LEN_THRESHOLD:
+        return b"\x1b[200~" + payload + b"\x1b[201~"
+    return payload
+
+
+def inject(handler, parsed, body):
+    """POST /api/term/inject {tty, text, submit=true, clear_first=false}
+        -> {"ok": true, "quiescent": bool, "cr_attempts": int, "submitted": bool}
+        or {"ok": false, "reason": str}                                     (never a 5xx/4xx for
+                                                                              "the wait timed out")
+
+    **Read this before treating this as anything more than a macro.** This route does not talk
+    to `claude`, does not know what a "model" is, and does not parse or validate `text` in any
+    way -- it types `text` (then, unless `submit` is false, a CR) into whatever process happens to
+    be attached to `tty` right now, exactly as `keys()` above would if a human typed it at the
+    keyboard. If that process is `claude`, `/model sonnet` + Enter does what you'd expect. If it
+    is a plain shell (`mode="cwd"`), the exact same bytes land at the shell prompt as literal
+    input -- `/model sonnet` becomes "run the file /model with argument sonnet", not a slash
+    command, because there IS no slash-command concept here, only a PTY that doesn't know or care
+    what's reading its stdin. This route grants NO new capability over `keys()`, which already
+    writes arbitrary bytes to the same fd with no allowlist and no interpretation (see the module
+    docstring's "unrestricted shell" section) -- it is a more reliable way to use that existing
+    surface, not a new one, and `term_gate.guard()` is the same and only perimeter either way.
+
+    What "more reliable" buys you, and why each piece is a heuristic that can misfire:
+
+    1. **Waits for quiescence first** (`_wait_for_quiescence`, bounded by `INJECT_MAX_WAIT` --
+       see that constant for the worst-case wait). A TUI that is still booting or mid-redraw
+       swallows input arriving while it's rebuilding its own idea of the screen; naively writing
+       straight through `keys()` at the wrong instant is exactly the failure this exists to avoid.
+       MISFIRE: a program that legitimately never stops producing output (a live log tail) never
+       looks quiet, so this always times out against it -- `inject()` is the wrong tool for that
+       target, not a bug in the wait.
+    2. **Text, then CR as a separate `os.write`** -- not concatenated into one write. Reproduces
+       the reference implementation's finding that some TUIs process a combined "text\\r" write
+       differently (worse) than the same bytes arriving as two reads.
+    3. **Resends CR up to `INJECT_RESEND_MAX_ATTEMPTS` times** if the screen's version counter
+       (`Screen.v`) hasn't moved `INJECT_RESEND_DELAY` seconds after a CR -- Claude's TUI is known
+       to sometimes eat the first Enter. MISFIRE, both directions: (a) a command that legitimately
+       produces NO visible output (e.g. a cleared/blank response) looks identical to a swallowed
+       Enter, so this can resend CR into an already-submitted line and doubly-execute it; (b) a
+       command that's simply slow to respond (past `INJECT_RESEND_DELAY` but before it draws
+       anything) reads the same way. This is a heuristic inferred from observed behaviour, not a
+       protocol-level acknowledgement that the line was received -- treat `"submitted": false` in
+       the response as "we couldn't confirm it", not as "it definitely failed".
+
+    `clear_first` (optional, default false) sends Ctrl+E (`\\x05`, end-of-line) then Ctrl+U
+    (`\\x15`, kill-to-start-of-line) before the text, so a half-typed draft already sitting at the
+    prompt does not get interleaved with the injected command instead of replaced by it. Only
+    useful against a line editor that binds those two keys the usual (readline-ish) way; a program
+    that doesn't will see two literal control bytes land in its input instead.
+
+    Long or multi-line `text` is wrapped in bracketed-paste markers automatically -- see
+    `_bracket_if_needed`/`INJECT_BRACKET_LEN_THRESHOLD` -- so a multi-line body's embedded
+    newlines are not each individually mistaken for a submitting Enter by a line-oriented editor.
+    """
+    if not term_gate.guard(handler):
+        return
+    if not isinstance(body, dict):
+        return handler._json({"error": "bad body: expected a JSON object"}, 400)
+    tid = body.get("tty") or ""
+    text = body.get("text")
+    if not isinstance(text, str) or text == "":
+        return handler._json({"error": "text required"}, 400)
+    submit = bool(body.get("submit", True))
+    clear_first = bool(body.get("clear_first", False))
+    with _LOCK:
+        _reap()
+        pt = PTYS.get(tid)
+    if pt is None or pt.done:
+        return handler._json({"error": "no such terminal"}, 404)
+
+    pt.touch()
+    if not _wait_for_quiescence(pt):
+        return handler._json({"ok": False, "reason": "terminal never went quiet"})
+
+    if clear_first:
+        if not _inject_write(pt, b"\x05"):                    # Ctrl+E: end of line
+            return handler._json({"ok": False, "reason": "write failed"})
+        time.sleep(INJECT_KEY_GAP)
+        if not _inject_write(pt, b"\x15"):                    # Ctrl+U: kill to start of line
+            return handler._json({"ok": False, "reason": "write failed"})
+        time.sleep(INJECT_KEY_GAP)
+
+    if not _inject_write(pt, _bracket_if_needed(text)):
+        return handler._json({"ok": False, "reason": "write failed"})
+
+    cr_attempts = 0
+    submitted = not submit                # no CR requested -> nothing to confirm
+    if submit:
+        time.sleep(INJECT_KEY_GAP)
+        for _ in range(INJECT_RESEND_MAX_ATTEMPTS):
+            with pt.lock:
+                v_before = pt.screen.v
+            if not _inject_write(pt, b"\r"):
+                return handler._json({"ok": False, "reason": "write failed"})
+            cr_attempts += 1
+            time.sleep(INJECT_RESEND_DELAY)
+            with pt.lock:
+                v_after = pt.screen.v
+            if v_after != v_before:
+                submitted = True
+                break
+
+    pt.touch()
+    handler._json({"ok": True, "quiescent": True, "cr_attempts": cr_attempts, "submitted": submitted})
+
+
 server.EXTRA_POST["/api/term/pty"] = open_pty
 server.EXTRA_POST["/api/term/keys"] = keys
 server.EXTRA_POST["/api/term/resize"] = resize_pty
+server.EXTRA_POST["/api/term/inject"] = inject
 server.EXTRA_GET["/api/term/screen"] = screen_stream
 server.EXTRA_GET["/api/term/scrollback"] = term_scrollback

@@ -1905,5 +1905,245 @@ class TestScrollbackRoute(unittest.TestCase):
         self.assertEqual(h.calls[-1][1], 200)
 
 
+class TestInject(unittest.TestCase):
+    """`term_vt.inject()` -- the inject-when-ready primitive. `term_vt._inject_write` (the sole
+    place `inject()` writes to the pty) is monkeypatched to a recorder rather than patching
+    `os.write` globally, so a stray reader thread from an unrelated real-PTY test elsewhere in
+    the suite can never interleave into `self.writes` and flake this class.
+    """
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+
+        self._consts0 = (
+            term_vt.INJECT_QUIET_WINDOW, term_vt.INJECT_MIN_WAIT, term_vt.INJECT_MAX_WAIT,
+            term_vt.INJECT_POLL_INTERVAL, term_vt.INJECT_KEY_GAP, term_vt.INJECT_RESEND_DELAY,
+        )
+        # Scaled-down but structurally identical to production: same floor/ceiling/poll/resend
+        # LOGIC, just fast enough that this class doesn't cost the suite real seconds.
+        term_vt.INJECT_QUIET_WINDOW = 0.1
+        term_vt.INJECT_MIN_WAIT = 0.0
+        term_vt.INJECT_MAX_WAIT = 2.0
+        term_vt.INJECT_POLL_INTERVAL = 0.02
+        term_vt.INJECT_KEY_GAP = 0.01
+        term_vt.INJECT_RESEND_DELAY = 0.05
+
+        self._orig_inject_write = term_vt._inject_write
+        self.writes = []
+
+        def fake_inject_write(pt, data):
+            self.writes.append(data)
+            return True
+
+        term_vt._inject_write = fake_inject_write
+
+        self.pt = term_vt.Pty(tid="inj1", pid=0, fd=99, screen=Screen(cols=80, rows=24))
+        self.pt.last_output = time.time() - 10   # already quiet, well past INJECT_QUIET_WINDOW
+        term_vt.PTYS["inj1"] = self.pt
+
+    def tearDown(self):
+        term_vt._inject_write = self._orig_inject_write
+        (term_vt.INJECT_QUIET_WINDOW, term_vt.INJECT_MIN_WAIT, term_vt.INJECT_MAX_WAIT,
+         term_vt.INJECT_POLL_INTERVAL, term_vt.INJECT_KEY_GAP, term_vt.INJECT_RESEND_DELAY) = self._consts0
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+
+    def test_route_registered(self):
+        from aitracker import server
+        self.assertIs(server.EXTRA_POST["/api/term/inject"], term_vt.inject)
+
+    def test_inject_into_quiet_pty_sends_text_then_cr_as_separate_writes(self):
+        """THE load-bearing one: text and the submitting CR must arrive as two distinct
+        `os.write` calls, never concatenated into one -- see `inject()`'s own docstring for why."""
+        calls = []
+
+        def fake_write(pt, data):
+            calls.append(data)
+            if data == b"\r":
+                # Simulate the child's response to a real Enter: a fresh prompt line. Must
+                # actually paint a character (not just CR/LF) -- Screen only bumps `v` on a
+                # dirtied row, and bare cursor movement with nothing drawn never dirties one.
+                pt.screen.feed(b"\r\n$ ")
+            return True
+
+        term_vt._inject_write = fake_write
+        h = _FakeHandler()
+        term_vt.inject(h, None, {"tty": "inj1", "text": "echo hi"})
+        obj, code = h.calls[-1]
+        self.assertTrue(obj["ok"], obj)
+        self.assertEqual(calls, [b"echo hi", b"\r"])
+        self.assertEqual(obj["cr_attempts"], 1)
+        self.assertTrue(obj["submitted"])
+
+    def test_inject_while_output_streaming_waits_then_sends_once_quiet(self):
+        """THE other load-bearing one: an active PTY must not be typed into mid-stream. A
+        background thread keeps `pt.last_output` moving (simulating a TUI still redrawing) for
+        ~0.3s; `inject()` must not write anything until that stops AND the quiet window elapses."""
+        self.pt.last_output = time.time()
+        stop = threading.Event()
+
+        def keep_busy():
+            while not stop.is_set():
+                self.pt.last_output = time.time()
+                time.sleep(0.02)
+
+        busy_thread = threading.Thread(target=keep_busy, daemon=True)
+        busy_thread.start()
+
+        def stop_after(seconds):
+            time.sleep(seconds)
+            stop.set()
+
+        threading.Thread(target=stop_after, args=(0.3,), daemon=True).start()
+
+        start = time.time()
+        h = _FakeHandler()
+        term_vt.inject(h, None, {"tty": "inj1", "text": "x", "submit": False})
+        elapsed = time.time() - start
+        busy_thread.join(2)
+
+        obj, code = h.calls[-1]
+        self.assertTrue(obj["ok"], obj)
+        self.assertGreaterEqual(elapsed, 0.3, "inject() sent while the PTY still looked busy")
+        self.assertEqual(self.writes, [b"x"])   # sent exactly once, only after quiescence
+
+    def test_inject_overall_timeout_returns_cleanly_instead_of_hanging(self):
+        """A PTY that never goes quiet within INJECT_MAX_WAIT must not hang the calling thread --
+        `inject()` must return a clean {"ok": false, ...} well inside a bounded time."""
+        term_vt.INJECT_QUIET_WINDOW = 5.0    # unreachable within the ceiling below
+        term_vt.INJECT_MAX_WAIT = 0.2
+        term_vt.INJECT_MIN_WAIT = 0.0
+        self.pt.last_output = time.time()    # "active" for the whole wait
+
+        start = time.time()
+        h = _FakeHandler()
+        term_vt.inject(h, None, {"tty": "inj1", "text": "x"})
+        elapsed = time.time() - start
+
+        obj, code = h.calls[-1]
+        self.assertFalse(obj["ok"])
+        self.assertIn("reason", obj)
+        self.assertLess(elapsed, 1.0, "inject() blocked far longer than INJECT_MAX_WAIT")
+        self.assertEqual(self.writes, [])    # never wrote anything into the still-busy pty
+
+    def test_inject_submit_false_sends_text_and_no_cr(self):
+        h = _FakeHandler()
+        term_vt.inject(h, None, {"tty": "inj1", "text": "echo hi", "submit": False})
+        obj, code = h.calls[-1]
+        self.assertTrue(obj["ok"], obj)
+        self.assertEqual(self.writes, [b"echo hi"])
+        self.assertEqual(obj["cr_attempts"], 0)
+
+    def test_inject_clear_first_sends_ctrl_e_then_ctrl_u_before_text(self):
+        h = _FakeHandler()
+        term_vt.inject(h, None,
+                        {"tty": "inj1", "text": "hi", "submit": False, "clear_first": True})
+        obj, code = h.calls[-1]
+        self.assertTrue(obj["ok"], obj)
+        self.assertEqual(self.writes, [b"\x05", b"\x15", b"hi"])
+
+    def test_inject_resends_cr_up_to_the_cap_when_never_confirmed(self):
+        """The recorder fake never mutates `screen.v`, so every CR looks unconfirmed -- inject()
+        must give up after exactly INJECT_RESEND_MAX_ATTEMPTS, not loop forever."""
+        h = _FakeHandler()
+        term_vt.inject(h, None, {"tty": "inj1", "text": "echo hi"})
+        obj, code = h.calls[-1]
+        self.assertTrue(obj["ok"], obj)
+        self.assertEqual(obj["cr_attempts"], term_vt.INJECT_RESEND_MAX_ATTEMPTS)
+        self.assertFalse(obj["submitted"])
+        self.assertEqual(self.writes, [b"echo hi"] + [b"\r"] * term_vt.INJECT_RESEND_MAX_ATTEMPTS)
+
+    def test_inject_bracket_wraps_multiline_text(self):
+        h = _FakeHandler()
+        term_vt.inject(h, None, {"tty": "inj1", "text": "line1\nline2", "submit": False})
+        obj, code = h.calls[-1]
+        self.assertTrue(obj["ok"], obj)
+        self.assertEqual(self.writes, [b"\x1b[200~line1\nline2\x1b[201~"])
+
+    def test_inject_403s_when_terminal_disabled(self):
+        config.TERMINAL = False
+        h = _FakeHandler()
+        term_vt.inject(h, None, {"tty": "inj1", "text": "x"})
+        self.assertEqual(h.calls[-1][1], 403)
+        self.assertFalse(term_gate.allowed())
+        self.assertEqual(self.writes, [])
+
+    def test_inject_404s_an_unknown_tty(self):
+        h = _FakeHandler()
+        term_vt.inject(h, None, {"tty": "nope", "text": "x"})
+        self.assertEqual(h.calls[-1][1], 404)
+
+    def test_inject_400s_a_non_dict_body(self):
+        h = _FakeHandler()
+        term_vt.inject(h, None, "not a dict")
+        self.assertEqual(h.calls[-1][1], 400)
+
+    def test_inject_400s_missing_text(self):
+        h = _FakeHandler()
+        term_vt.inject(h, None, {"tty": "inj1"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 400)
+        self.assertIn("text", obj["error"])
+
+
+class TestInjectEndToEnd(unittest.TestCase):
+    """Real pty.fork() + a real `/bin/sh` + the real, unmocked `inject()` route -- the same kind
+    of feasibility proof `TestSpawnAndScreen.test_spawn_feed_keys_snapshot_shows_the_echo` is for
+    `keys()`. `/bin/sh` (not the login shell) so this doesn't pay the ~75s pyenv-lock startup
+    tax the login shell carries on this machine."""
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._consts0 = (
+            term_vt.INJECT_QUIET_WINDOW, term_vt.INJECT_MIN_WAIT, term_vt.INJECT_MAX_WAIT,
+            term_vt.INJECT_RESEND_DELAY,
+        )
+        # Real quiescence detection against a real shell, just with a shorter window/ceiling than
+        # production so this one test doesn't cost the suite multiple seconds.
+        term_vt.INJECT_QUIET_WINDOW = 0.3
+        term_vt.INJECT_MIN_WAIT = 0.1
+        term_vt.INJECT_MAX_WAIT = 5.0
+        term_vt.INJECT_RESEND_DELAY = 0.3
+        self._pt = None
+
+    def tearDown(self):
+        (term_vt.INJECT_QUIET_WINDOW, term_vt.INJECT_MIN_WAIT, term_vt.INJECT_MAX_WAIT,
+         term_vt.INJECT_RESEND_DELAY) = self._consts0
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        if self._pt is not None:
+            self._pt.kill()
+            _drain(self._pt, 5)
+            term_vt.PTYS.pop(self._pt.id, None)
+
+    def test_inject_echo_into_a_real_shell_end_to_end(self):
+        pt = term_vt.spawn(os.getcwd(), ["/bin/sh"], 80, 24)
+        self._pt = pt
+        term_vt.PTYS[pt.id] = pt
+
+        h = _FakeHandler()
+        term_vt.inject(h, None, {"tty": pt.id, "text": "echo INJECT-OK", "submit": True})
+        obj, code = h.calls[-1]
+        self.assertTrue(obj["ok"], obj)
+
+        def seen():
+            with pt.lock:
+                snap = pt.screen.snapshot(-1)
+            return any("INJECT-OK" in r[1] for r in snap["rows"])
+
+        self.assertTrue(_wait_for(seen, 10), "INJECT-OK never showed up in the Screen snapshot")
+
+        with pt.lock:
+            snap = pt.screen.snapshot(-1)
+        matching = [r[1] for r in snap["rows"] if "INJECT-OK" in r[1]]
+        print("\n[end-to-end] inject() route result: %r" % obj)
+        print("[end-to-end] matching snapshot row(s): %r" % matching)
+        self.assertTrue(matching)
+
+
 if __name__ == "__main__":
     unittest.main()
