@@ -183,7 +183,7 @@ class Handler(BaseHTTPRequestHandler):
             # test) to unwrap an object for a value that's about the RESPONSE, not any one
             # session. The sidebar reads this header and uses it for every now-s.mtime<LIVE
             # check, so it can never compute liveness from a different clock than the detail
-            # pane does (see docs/conventions.md rule 5 -- server owns policy, client renders it).
+            # pane does (see .claude/rules/conventions.md rule 5 -- server owns policy, client renders it).
             self._json(all_sessions(), headers={"X-Server-Now": str(time.time())})
         elif p.path == "/api/flags":
             self._json(load_flags())
