@@ -1254,8 +1254,9 @@ class TestWireFormat(unittest.TestCase):
         payload = json.loads(captured.split(b"data: ", 1)[1].split(b"\n\n", 1)[0])
         self.assertEqual(
             set(payload.keys()),
-            {"v", "rows", "cursor", "alt", "cursor_visible", "bracketed_paste", "bell"},
+            {"v", "rows", "cursor", "alt", "cursor_visible", "bracketed_paste", "bell", "notices"},
         )
+        self.assertEqual(payload["notices"], [])
 
     def test_second_viewer_attaching_to_a_live_tty_gets_a_full_repaint(self):
         pt = term_vt.Pty(tid="fmt2")
@@ -2956,6 +2957,182 @@ class TestFeedNote(unittest.TestCase):
         snap = pt.screen.snapshot(-1)
         joined = " ".join(text for _, text, _ in snap["rows"])
         self.assertIn("hello from ai-tracker", joined)
+
+    def test_feed_note_also_queues_a_structured_notice(self):
+        """The async counterpart to the visible-text assertion above -- both channels are
+        populated by the SAME call, under the SAME lock acquisition (see _feed_note's docstring)."""
+        pt = _bare_pty()
+        term_vt._feed_note(pt, "hello from ai-tracker")
+        self.assertEqual(len(pt.notices), 1)
+        self.assertEqual(pt.notices[0]["text"], "hello from ai-tracker")
+        self.assertEqual(pt.notices[0]["seq"], 1)
+
+
+class TestNoticeQueueMechanics(unittest.TestCase):
+    """Direct tests of `Pty.add_notice`/`Pty.notices` in isolation -- no SSE loop, no real
+    process. `Pty.notice` (singular, the pre-existing synchronous field `_resume_backstop` sets on
+    the missing-transcript case) is untouched by any of this -- see the field's own comment and
+    TestResumeBackstopFiresOnRefusal.test_missing_transcript_sets_notice_and_does_not_retry, which
+    still passes unmodified."""
+
+    def test_seq_is_monotonic_and_never_reused_even_past_the_cap(self):
+        pt = _bare_pty()
+        total = term_vt.NOTICE_QUEUE_MAX + 5
+        with pt.lock:
+            for i in range(total):
+                pt.add_notice("n%d" % i)
+        seqs = [n["seq"] for n in pt.notices]
+        # strictly increasing, no duplicate -- and the retained window is exactly the cap
+        self.assertEqual(seqs, list(range(total - term_vt.NOTICE_QUEUE_MAX + 1, total + 1)))
+        self.assertEqual(len(pt.notices), term_vt.NOTICE_QUEUE_MAX)
+        # the CAP dropped the OLDEST entries, not the newest
+        texts = [n["text"] for n in pt.notices]
+        self.assertNotIn("n0", texts)
+        self.assertEqual(texts[-1], "n%d" % (total - 1))
+        self.assertEqual(pt._notice_seq, total)   # the counter itself never rewinds
+
+    def test_add_notice_alone_never_bumps_screen_v(self):
+        """`v` is the ROW-DIFF protocol's clock (see the module docstring's "`v` is monotonic"
+        section) -- a notice is not row content, so queuing one must not move it, independent of
+        whatever `_feed_note`'s own text write into the grid legitimately does."""
+        pt = _bare_pty()
+        v_before = pt.screen.v
+        with pt.lock:
+            pt.add_notice("queue-only, no screen write")
+        self.assertEqual(pt.screen.v, v_before)
+
+    def test_feed_note_text_write_and_notice_queue_do_not_interfere(self):
+        pt = _bare_pty()
+        pt.screen.feed(b"hello")            # ordinary content -- v moves for this reason alone
+        v1 = pt.screen.v
+        term_vt._feed_note(pt, "a note")     # feeds CRLF+text (legitimately bumps v) AND queues
+        self.assertGreater(pt.screen.v, v1)
+        self.assertEqual(len(pt.notices), 1)
+
+
+class TestNoticeDeliveryOverScreenStream(unittest.TestCase):
+    """End-to-end proof that `/api/term/screen` delivers `Pty.notices` asynchronously, per
+    viewer, over the SAME SSE connection the row diff already uses -- the actual gap this change
+    closes: previously the only channel for a late Option-C event was the synthesized on-screen
+    text line, which arrives whenever it happens to arrive relative to a poll, with no structured
+    signal a client could act on (dismiss, toast, log) independently of parsing screen text."""
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        term_vt._STREAMS = 0
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        for pt in list(term_vt.PTYS.values()):
+            pt.kill()
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+        term_vt._STREAMS = 0
+
+    def _open(self, pt):
+        h = _StreamHandler()
+        t = threading.Thread(target=term_vt.screen_stream, args=(h, _Q("tty=" + pt.id)))
+        t.daemon = True
+        t.start()
+        self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
+        return h, t
+
+    @staticmethod
+    def _recv_frame(h):
+        h.peer.settimeout(3)
+        raw = h.peer.recv(65536)
+        return json.loads(raw.split(b"data: ", 1)[1].split(b"\n\n", 1)[0])
+
+    def test_notice_queued_before_attach_is_delivered_on_the_first_frame(self):
+        pt = term_vt.Pty(tid="nq1", screen=Screen(cols=10, rows=2))
+        term_vt._feed_note(pt, "queued before anyone attached")
+        term_vt.PTYS[pt.id] = pt
+        h, t = self._open(pt)
+        try:
+            frame = self._recv_frame(h)
+            self.assertIn("queued before anyone attached",
+                           [n["text"] for n in frame["notices"]])
+        finally:
+            h.close_peer(); t.join(5); h.close()
+
+    def test_two_viewers_each_receive_the_notice_independently(self):
+        pt = term_vt.Pty(tid="nq2", screen=Screen(cols=10, rows=2))
+        term_vt.PTYS[pt.id] = pt
+        a, ta = self._open(pt)
+        b, tb = self._open(pt)
+        try:
+            self._recv_frame(a)      # each viewer's own initial (empty-notices) repaint
+            self._recv_frame(b)
+            term_vt._feed_note(pt, "for both viewers")
+            fa = self._recv_frame(a)
+            fb = self._recv_frame(b)
+            self.assertIn("for both viewers", [n["text"] for n in fa["notices"]])
+            self.assertIn("for both viewers", [n["text"] for n in fb["notices"]])
+            # neither viewer's consumption affected the other's -- a follow-up notice sent to
+            # only one connection's channel is not what's tested here, but the shared underlying
+            # `pt.notices` queue must not have been mutated by either read (only appended to by
+            # add_notice) -- both still see the same one entry queued so far.
+            self.assertEqual(len(pt.notices), 1)
+        finally:
+            a.close_peer(); ta.join(5); a.close()
+            b.close_peer(); tb.join(5); b.close()
+
+    def test_notice_on_an_idle_terminal_triggers_a_frame_on_its_own(self):
+        """No row change, no cursor move, no bell -- a pending notice ALONE must be enough to
+        trigger a frame, exactly the fix `bell` itself already needed in this same `changed`
+        computation (see _screen_stream_body's docstring). Without this, a notice arriving on an
+        otherwise-quiet terminal would sit unsent until the next unrelated screen change."""
+        pt = term_vt.Pty(tid="nq3", screen=Screen(cols=10, rows=2))
+        term_vt.PTYS[pt.id] = pt
+        h, t = self._open(pt)
+        try:
+            self._recv_frame(h)      # initial repaint, empty notices -- terminal now fully idle
+            term_vt._feed_note(pt, "idle-terminal notice")
+            frame = self._recv_frame(h)     # must arrive with no further screen output at all
+            self.assertIn("idle-terminal notice", [n["text"] for n in frame["notices"]])
+        finally:
+            h.close_peer(); t.join(5); h.close()
+
+    def test_v_is_not_bumped_by_a_notice_alone(self):
+        """The diff protocol's clock must stay row-content-only -- pinning this at the SSE level,
+        not just at the `Screen`/`Pty.add_notice` unit level above, since this is the layer that
+        actually decides what `since` (== v) advances to. Uses `pt.add_notice()` directly (not
+        `_feed_note()`, which ALSO legitimately writes text into the grid and would bump `v` for
+        that unrelated reason) to isolate the notice-queue-alone case."""
+        pt = term_vt.Pty(tid="nq4", screen=Screen(cols=10, rows=2))
+        term_vt.PTYS[pt.id] = pt
+        h, t = self._open(pt)
+        try:
+            first = self._recv_frame(h)
+            v_before = first["v"]
+            with pt.lock:
+                pt.add_notice("no row content, just a notice")
+            frame = self._recv_frame(h)
+            self.assertEqual(frame["v"], v_before)
+            self.assertEqual(frame["rows"], [])
+            self.assertIn("no row content, just a notice", [n["text"] for n in frame["notices"]])
+        finally:
+            h.close_peer(); t.join(5); h.close()
+
+    def test_synchronous_notice_field_on_open_pty_is_still_null(self):
+        """Non-negotiable: POST /api/term/pty's existing `notice` field (answered from what is
+        known AT RESPONSE TIME, always None -- see open_pty's own docstring) must not regress just
+        because an async channel now exists alongside it. TestOpenPtyForkedAndNoticeFields already
+        covers this end-to-end through open_pty()'s session-scoped form; this is the same pin
+        through the session-LESS form (mode="cwd", no `session` at all)."""
+        original_spawn = term_vt.spawn
+        term_vt.spawn = lambda cwd, argv, cols, rows: term_vt.Pty(tid="nq5")
+        try:
+            h = _FakeHandler()
+            term_vt.open_pty(h, None, {"cwd": "/tmp", "mode": "cwd"})
+        finally:
+            term_vt.spawn = original_spawn
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200, obj)
+        self.assertIsNone(obj["notice"])
 
 
 if __name__ == "__main__":

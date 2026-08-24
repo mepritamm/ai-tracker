@@ -1187,6 +1187,19 @@ chunk is a real, visible gap in that one viewer's xterm.js buffer -- there is no
 alternative (blocking `_reader()`'s single write-side thread on a wedged reader) would stall the
 Screen/grid path too, since both are fed from the same `feed()` call under the same lock."""
 
+NOTICE_QUEUE_MAX = 50
+"""Per-`Pty` cap on retained entries in `Pty.notices` (see that field's own comment, and the
+"Async notices" section above `_feed_note()` below). A notice is a rare, synthesized status line
+(a resume-refusal retry, a missing-transcript warning) -- there is no realistic path that produces
+more than a handful of these over a session's life, so this is generous headroom, not a tuned
+figure like `RAW_QUEUE_MAXLEN`. Bounded anyway for the same reason every other queue in this file
+is: an abandoned `Pty` that somehow accumulated many notices (or a future caller of `add_notice`
+this docstring doesn't yet anticipate) must not grow the record without bound. Past the cap,
+`add_notice` drops the OLDEST entry to make room for the newest -- same "give up on the old thing,
+not on the stream" tradeoff as `SCROLLBACK_MAX`/`MAX_REPLIES`/`MAX_PENDING`/`RAW_QUEUE_MAXLEN`. A
+dropped notice is invisible to a viewer whose `since_notice` is old enough to have missed it, but
+`seq` itself is never reused (see `Pty.add_notice`), so a client can always detect the gap."""
+
 PTYS = {}                # id -> Pty
 _STREAMS = 0              # open SSE connections across all PTYs; guarded by _LOCK
 _LOCK = threading.Lock()
@@ -1234,10 +1247,13 @@ class Pty:
     """One live (or just-finished) PTY session: the master fd, the child pid, and the `Screen`
     that turns its output into a grid.
 
-    `lock` guards `screen` -- `feed()` (from the reader thread) and `snapshot()` (from a viewer's
-    SSE loop) must never run concurrently, since both mutate/read the same grid and version
-    counter. Everything else here (`viewers`, `done`, `rc`, `last_active`) is only ever touched
-    under the MODULE-level `_LOCK`, exactly like term_run.Job's fields.
+    `lock` guards `screen` AND `notices`/`_notice_seq` -- `feed()` (from the reader thread) and
+    `snapshot()` (from a viewer's SSE loop) must never run concurrently, since both mutate/read
+    the same grid and version counter, and `add_notice()` shares the lock for the same reason: a
+    notice is always queued alongside a `screen.feed()` call (see `_feed_note()`), so one caller
+    holding the lock for both keeps the two in sync from a viewer's point of view. Everything else
+    here (`viewers`, `done`, `rc`, `last_active`) is only ever touched under the MODULE-level
+    `_LOCK`, exactly like term_run.Job's fields.
     """
 
     def __init__(self, tid=None, pid=0, fd=-1, screen=None, cwd="", cmd=""):
@@ -1265,6 +1281,14 @@ class Pty:
                                     # instead (a note fed straight into the terminal).
         self.notice = None         # human-readable warning set by _resume_backstop on the
                                     # missing-transcript case; same late-availability caveat
+        self.notices = collections.deque(maxlen=NOTICE_QUEUE_MAX)   # ordered {"seq","text"}
+                                    # entries -- the ASYNC counterpart to `self.notice` above, see
+                                    # "Async notices" above `_feed_note()` and `add_notice()` below.
+                                    # Guarded by `self.lock`, same as `screen`.
+        self._notice_seq = 0       # last seq handed out by add_notice() -- monotonic for the life
+                                    # of this Pty, NEVER reused even once an entry falls off the
+                                    # bounded `notices` deque above (mirrors `Screen.v`'s own
+                                    # "monotonic for the life of the object" rule).
         self.ended = 0.0           # time.time() when finish() ran; 0.0 while still live
         self.started = time.time()
         self.last_active = self.started   # last keystroke, or last viewer leaving -- idle clock
@@ -1279,6 +1303,21 @@ class Pty:
 
     def touch(self):
         self.last_active = time.time()
+
+    def add_notice(self, text):
+        """Queue `text` for asynchronous delivery over `/api/term/screen`'s SSE stream (see
+        `_screen_stream_body()`), as `{"seq": <int>, "text": text}`. MUST be called with
+        `self.lock` held -- exactly like every other mutation of `screen`, since a viewer's poll
+        of `snapshot()` + this queue must see a consistent pair, never one updated mid-way through
+        the other. `seq` is assigned from `self._notice_seq`, which only ever increases (never
+        reused, even past the `NOTICE_QUEUE_MAX` cap where the oldest entry is silently dropped by
+        the bounded deque itself) -- a client can therefore always detect a gap by seq, and two
+        viewers attached to the same `Pty` each track their own delivery position independently
+        (their own `since_notice` local, mirroring `since` for row diffs), so one viewer consuming
+        a notice can never rob another of it.
+        """
+        self._notice_seq += 1
+        self.notices.append({"seq": self._notice_seq, "text": text})
 
     def kill(self):
         """SIGKILL the whole process group, not just `pid`.
@@ -1500,13 +1539,31 @@ BACKSTOP_WINDOW."""
 
 
 def _feed_note(pt, text):
-    """Write a synthesized, CRLF-terminated status line straight into `pt.screen`. This is the
-    ONLY channel a LATE-firing Option-C event (see the section docstring above) has to reach a
-    viewer: the POST /api/term/pty response already went out by the time either condition below
-    can possibly be known, so the terminal's own on-screen text is what carries the explanation,
-    not a JSON field."""
+    """Record a LATE-firing Option-C event (see the section docstring above) on BOTH channels a
+    viewer can learn about it from -- the POST /api/term/pty response already went out by the
+    time either condition below can possibly be known, so neither channel here is that response:
+
+    1. A synthesized, CRLF-terminated status line written straight into `pt.screen` -- this is
+       what makes the note visible to a `screen_stream()`/grid-renderer viewer (it rides the
+       ordinary row-diff protocol, no client change needed) but it is INVISIBLE to a `raw_stream()`
+       /xterm.js-renderer viewer: that path only tees bytes `_reader()` actually read off the real
+       pty fd (`Pty.raw_queues`, filled inside `_reader()`'s loop), and this write goes straight to
+       `pt.screen.feed()` without ever touching the fd or that tee. This is a real, standing gap in
+       TRACKER_TERM_RENDERER=xterm mode, not something this function's write fixes -- see
+       `raw_stream()`'s own docstring for the renderer split.
+    2. `pt.add_notice(text)` -- the structured, per-viewer-tracked queue `_screen_stream_body()`
+       delivers as the SSE frame's `notices` key (added alongside `screen.snapshot()`'s own
+       fields, never inside `Screen` itself -- the queue lives on `Pty`, `Screen` has no notion of
+       it). Same caveat as (1): only a `screen_stream()` viewer ever sees this key: `raw_stream()`
+       carries no JSON envelope at all, so there is no channel through which an xterm.js viewer
+       could receive a structured notice either.
+
+    Both writes happen under ONE `pt.lock` acquisition so a concurrent `_screen_stream_body()`
+    poll can never observe the grid text without the matching queue entry, or vice versa.
+    """
     with pt.lock:
         pt.screen.feed(("\r\n" + text + "\r\n").encode("utf-8", "replace"))
+        pt.add_notice(text)
 
 
 def _retry_with_fork(pt, sid, cols, rows):
@@ -1888,8 +1945,22 @@ def _screen_stream_body(handler, pt):
       here.) The `: ping\\n\\n` heartbeat is a comment line, not a `data:`/`event:` frame, so
       EventSource ignores it for free -- that one is safe as-is.
     * The JSON object carries EXACTLY the keys `Screen.snapshot()` returns -- `v`, `rows`,
-      `cursor`, `alt`, `cursor_visible`, `bracketed_paste`, `bell` -- verbatim, unpadded. No
-      wrapping, no extra keys, ever.
+      `cursor`, `alt`, `cursor_visible`, `bracketed_paste`, `bell` -- verbatim, unpadded, PLUS one
+      key this function adds itself: `notices` (see below). No other wrapping, no other extra
+      keys, ever.
+    * `notices` is `[{"seq": <int>, "text": <str>}, ...]`, only entries THIS VIEWER has not yet
+      been sent -- `[]` when there are none. Tracked with a local `since_notice`, exactly the way
+      `since` already tracks the row diff per-viewer (see the very next bullet): two viewers on
+      the same `tty` each get their own delivery position, so one consuming a notice can never
+      starve the other of it. `seq` is monotonic and never reused (`Pty.add_notice`), so a client
+      can detect a gap if the queue's cap (`NOTICE_QUEUE_MAX`) dropped something before it was
+      delivered. Unlike `rows`, a pending notice is NOT part of `Screen.snapshot()` -- it lives on
+      `Pty.notices`, is read under the SAME `pt.lock` acquisition as the snapshot so the two can
+      never observe a torn state, and merged into the outgoing dict here. Critically, a pending
+      notice with NO OTHER change (no new rows, cursor didn't move, `bell` didn't tick) must still
+      trigger a frame on its own -- exactly the fix `bell` itself needed (see the `changed`
+      computation below): a notice arriving while the terminal is otherwise idle must not sit
+      unsent until the next unrelated screen change.
     * `since` is a LOCAL variable of this call, i.e. per-viewer: two viewers on the same `tty`
       (the deliberately-supported "New tab, same session" case) each start their own SSE
       connection, each running its own `_screen_stream_body()`, each with its own `since = -1` --
@@ -1913,26 +1984,37 @@ def _screen_stream_body(handler, pt):
     except (BrokenPipeError, ConnectionResetError):
         return
     since = -1
+    since_notice = 0    # this viewer's own delivery position into pt.notices -- see docstring's
+                         # `notices` bullet. 0 is safe as "nothing delivered yet" because
+                         # Pty.add_notice's seq starts at 1 and only ever increases.
     last_cursor, last_alt, last_cv, last_bp, last_bell = None, None, None, None, None
     quiet = time.time()
     while True:
         with pt.lock:
             snap = pt.screen.snapshot(since)
+            pending_notices = [n for n in pt.notices if n["seq"] > since_notice]
             done = pt.done
         cursor = tuple(snap["cursor"])
         # cursor_visible/bracketed_paste/bell are screen (or client-event) state, not row content
         # -- exactly like cursor/alt, a change in any of them alone (no row, no cursor move) must
         # still trigger a frame, or a bare `\a` with no other output would never reach the client.
+        # `pending_notices` joins that same list for the identical reason -- see the docstring's
+        # `notices` bullet: a notice with nothing else changed must still trigger a frame.
         changed = (
             snap["rows"] or since == -1
             or cursor != last_cursor or snap["alt"] != last_alt
             or snap["cursor_visible"] != last_cv or snap["bracketed_paste"] != last_bp
             or snap["bell"] != last_bell
+            or pending_notices
         )
         if changed:
             since = snap["v"]
             last_cursor, last_alt = cursor, snap["alt"]
             last_cv, last_bp, last_bell = snap["cursor_visible"], snap["bracketed_paste"], snap["bell"]
+            if pending_notices:
+                since_notice = pending_notices[-1]["seq"]
+            snap["notices"] = pending_notices   # merged in here, NOT part of Screen.snapshot()
+                                                 # itself -- the queue lives on Pty, see _feed_note
             if not _write(handler, "data: %s\n\n" % json.dumps(snap)):
                 return
             quiet = time.time()
