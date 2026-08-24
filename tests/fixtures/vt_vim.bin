@@ -1,0 +1,14 @@
+[?1049h[>4;2m[?1h=[?2004h[?1004h[1;24r[?12h[?12l[22;2t[22;1t[27m[23m[29m[m[H[2J[?25l[24;1H"README.md" 257L, 26428B[2;1H▽[6n[2;1H  [3;1HPzz\[0%m[6n[3;1H           [1;1H[>c[1;1H# AI Session Tracker[2;1H[K[3;1HA zero-dependency, local web dashboard that shows you **what your AI coding sesss[4;1Hions are doing —[4;18Hlive**, across tools. It reads the session logs each AI coding  [5;1Htool already writes to disk and turns them into one readable view: a plain-languu[6;1Hage summary, todos, files touched, commands run, background agents/shells, and tt[7;1Hhe assistant's own narration —[7;32Hrefreshing every 2 seconds.
+
+Works across tools via a small **provider** for each. Built in today: **Claude CC[10;1Hode** and **Auggie / Augment**. Adding another is a ~2-function adapter (see [Add[11;1Hding a tool](#adding-a-tool)).
+
+Nothing is sent anywhere. It's a single Python file using only the standard librr[14;1Hary, serving a local page you open in your browser.
+
+<p align="center">
+  <img src="docs/screenshot.png" alt="AI Session Tracker —[17;60Hlive dashboard showinn[18;1Hg the session sidebar, a plain-language summary, background agents, and the assii[19;1Hstant's narration" width="880">
+</p>
+
+<p align="center"><sub>Live dashboard —[22;41Hsession sidebar, summary (Goal / Now / SS[23;1Ho far), stat chips, background agents & shells, and the assistant's own narratio[22;1H[94m@                                                                               [23;1H@                                                                               [1;1H[?25h[?4m[?12$p[9;1H[?25l[m[24;70Hdd[9;1H[24;70H  [9;1H[9;23r[9;1H[3M[1;24r[19;1H<p align="center"><sub>Live dashboard —[19;40H session sidebar, summary (Goal / Now / SS[20;1Ho far), stat chips, background agents & shells, and the assistant's own narratioo[21;1Hn.</sub></p>
+
+---[24;1H[K[9;1H[?25h[?25l[24;70Hdd[9;1H[24;70H  [9;1H[9;23r[23;1H
+[1;24r[9;1H[?25h[?25l[24;1H[1m-- INSERT --[m[24;1H[K[11;13H[11;23r[11;1H[L[1;24r[11;1HINSERTED LINE[24;1H[1m-- INSERT --[11;14H[m[24;70H^[[11;13H[?25h[?25l[24;70H  [11;14H[24;1H[K[11;13H[?25h[?25l[24;70Hp[11;13H[24;70H [12;1H[12;23r[12;1H[L[1;24r[12;1H[?25h[?25l[24;1H[1m-- INSERT --[m[24;1H[K[12;3H>>>[24;1H[1m-- INSERT --[12;4H[m[24;70H^[[12;3H[?25h[?25l[24;70H  [12;4H[24;1H[K[12;3H[?25h[?25l[24;70H5x[12;3H[24;70H  [12;3H[24;70H5dl[12;3H[24;70H   [12;2H[12;3H[K[12;2H[?25h[?25l[24;1H:q![?2004l[>4;m[23;2t[23;1t[24;1H[K[24;1H[?1004l[?2004l[?1l>[?1049l[?25h[>4;m
