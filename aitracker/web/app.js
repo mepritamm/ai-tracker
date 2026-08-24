@@ -690,6 +690,12 @@ const srcLabel=v=>SRC[v]||v||"";
 const CIRC=2*Math.PI*51; // progress-ring circumference
 
 let sessions=[], searchResults=null, liveOnly=false;
+// The sidebar's clock: set from /api/list's X-Server-Now header on every poll, so
+// live/done here is computed from the SAME clock the detail pane uses (its `now`
+// field, server-stamped too) -- never the browser's own Date.now(), which drifts on
+// a phone/tablet over a tunnel or on any desktop with clock skew (conventions rule 5:
+// server owns policy, client renders it -- one clock for liveness, not two).
+let listNow=Date.now()/1000;   // seeded before the first poll lands; overwritten immediately after
 const LIVE=300; // seconds since last activity a session stays "live" (5 min)
 const EXT=[];   // feature modules (web/ext_*.js) push a fn(d); called at the end of every render
 function hl(text,q){
@@ -699,7 +705,7 @@ function hl(text,q){
 }
 let selEntry=null;   // last list row seen for the selected session — pin it so a poll can't drop it
 function renderSide(){
-  const now=Date.now()/1000;
+  const now=listNow;   // server clock (see listNow above) -- every live/done check below flows from this one value
   const sl=$("slist"), sc=sl?sl.scrollTop:0;   // preserve scroll: a background poll must not yank the list to the top
   if(searchResults!==null){       // search mode: show matches instead of the full list
     const q=$("q").value.trim();
@@ -843,7 +849,12 @@ function pickToggle(id,encGk){
 }
 function toggleLiveOnly(){liveOnly=!liveOnly;renderSide();}
 async function loadSide(){
-  try{sessions=await(await fetch("/api/list")).json();}catch(e){return}
+  try{
+    const res=await fetch("/api/list");
+    const t=res.headers.get("X-Server-Now");   // the same clock /api/session's `now` uses
+    if(t)listNow=+t;
+    sessions=await res.json();
+  }catch(e){return}
   renderSide();
   loadFlags();   // flags were only fetched by poll(), i.e. never until a session was selected
 }
@@ -891,7 +902,7 @@ function renderDetailSearch(q){
   if(!dHits.length){ $("dresults").innerHTML=`<div class=empty>no matches for “${esc(q)}” in this session</div>`; return; }
   $("dresults").innerHTML=dHits.map((h,i)=>
       `<div class="item dsr clk" onclick="openHit(${i})"><span class=dsrk>${DKIND[h.kind]||h.kind}</span>`+
-      `<span class=dsrt>${h.t?ago(Math.floor(Date.now()/1000)-Date.parse(h.t)/1000):""}</span>`+
+      `<span class=dsrt>${h.t?ago(Math.floor(listNow)-Date.parse(h.t)/1000):""}</span>`+
       `<div class=dsrsnip>${dhl(h.snippet,q)}</div><span class=chev>›</span></div>`).join("");
 }
 function openHit(i){
@@ -1613,7 +1624,7 @@ function renderFlags(){
   const open=mine.filter(f=>!f.resolved).length;
   $("flagc").textContent=mine.length?`${open} open / ${mine.length}`:"";
   const bc=$("flagbtnc"); if(bc)bc.textContent=open?" · "+open:"";   // header button shows the open-flag count
-  const now=Date.now()/1000;
+  const now=listNow;
   $("flags").innerHTML=mine.length?mine.map(f=>flagRow(f,now,false)).join(""):
     "<div class=empty>no flags yet</div>";
   // an open flag on the session you're looking at shouldn't need a click to find: reveal the
@@ -1632,7 +1643,7 @@ function renderAllFlags(){
   const btn=$("allflagsbtn"); if(btn){btn.classList.toggle("has",!!openN);
     btn.title=openN?`${openN} open flag${openN==1?'':'s'} across all sessions`:"Open flags across every session";}
   const box=$("allflags"); if(!box)return;
-  const now=Date.now()/1000;
+  const now=listNow;
   const all=flags.slice().sort((a,b)=>(a.resolved-b.resolved)||b.ts-a.ts);
   box.innerHTML=all.length?all.map(f=>flagRow(f,now,true)).join(""):
     "<div class=empty>no flags yet</div>";

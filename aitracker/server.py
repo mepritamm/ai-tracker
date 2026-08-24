@@ -79,12 +79,14 @@ def login_page():
 
 
 class Handler(BaseHTTPRequestHandler):
-    def _json(self, obj, code=200):
+    def _json(self, obj, code=200, headers=None):
         body = json.dumps(obj).encode()
         try:
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
@@ -172,7 +174,17 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
         elif p.path == "/api/list":
-            self._json(all_sessions())
+            # Liveness is one clock: /api/session already ships a `now` field (each
+            # provider's parse() stamps time.time()) and the detail pane renders live/done
+            # off it. /api/list has no per-item slot for that (it's a bare array, one entry
+            # per session, no "endpoint-level" field) so the server's clock rides an HTTP
+            # header instead of reshaping the body into {"sessions": [...], "now": ...} --
+            # that would force every consumer (the SPA's fetch, every existing /api/list
+            # test) to unwrap an object for a value that's about the RESPONSE, not any one
+            # session. The sidebar reads this header and uses it for every now-s.mtime<LIVE
+            # check, so it can never compute liveness from a different clock than the detail
+            # pane does (see docs/conventions.md rule 5 -- server owns policy, client renders it).
+            self._json(all_sessions(), headers={"X-Server-Now": str(time.time())})
         elif p.path == "/api/flags":
             self._json(load_flags())
         elif p.path == "/api/search":
