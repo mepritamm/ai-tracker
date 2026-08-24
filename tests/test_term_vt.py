@@ -304,6 +304,90 @@ class TestCursorVisibility(unittest.TestCase):
         self.assertTrue(s.cursor_visible)
 
 
+class TestSnapshotScreenStateFields(unittest.TestCase):
+    """`cursor_visible`, `bracketed_paste` and `bell` -- the parity-integration gap: the client
+    (`ext_vt.js`) already reads these three off every SSE snapshot; this class pins that the
+    server actually puts them there, and that a bell/mode change alone never bumps `v` (that
+    counter is reserved for row content -- see the module docstring's "`v` is monotonic")."""
+
+    def test_dectcem_flows_into_snapshot(self):
+        s = Screen(cols=10, rows=3)
+        self.assertTrue(s.snapshot(-1)["cursor_visible"])
+        s.feed(b"\x1b[?25l")
+        self.assertFalse(s.snapshot(-1)["cursor_visible"])
+        s.feed(b"\x1b[?25h")
+        self.assertTrue(s.snapshot(-1)["cursor_visible"])
+
+    def test_bracketed_paste_flips_in_snapshot(self):
+        s = Screen(cols=10, rows=3)
+        self.assertFalse(s.snapshot(-1)["bracketed_paste"])
+        s.feed(b"\x1b[?2004h")
+        self.assertTrue(s.snapshot(-1)["bracketed_paste"])
+        s.feed(b"\x1b[?2004l")
+        self.assertFalse(s.snapshot(-1)["bracketed_paste"])
+
+    def test_bell_increments_and_holds_steady_between_bells(self):
+        s = Screen(cols=10, rows=3)
+        self.assertEqual(s.snapshot(-1)["bell"], 0)
+        s.feed(b"\x07")
+        self.assertEqual(s.snapshot(-1)["bell"], 1)
+        # a snapshot with no bell fed in between must not change the count
+        self.assertEqual(s.snapshot(-1)["bell"], 1)
+        s.feed(b"\x07\x07\x07")
+        self.assertEqual(s.snapshot(-1)["bell"], 4)
+
+    def test_bell_survives_alt_screen_round_trip(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"\x07\x07")
+        self.assertEqual(s.bell, 2)
+        s.feed(b"\x1b[?1049h")   # enter alt
+        self.assertEqual(s.bell, 2)
+        s.feed(b"\x07")
+        self.assertEqual(s.bell, 3)
+        s.feed(b"\x1b[?1049l")   # leave alt -- must not reset the counter
+        self.assertEqual(s.bell, 3)
+
+    def test_bell_survives_ris(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"\x07\x07")
+        self.assertEqual(s.bell, 2)
+        s.feed(b"\x1bc")         # RIS -- bell is a client-event stream, not screen state
+        self.assertEqual(s.bell, 2)
+        s.feed(b"\x07")
+        self.assertEqual(s.bell, 3)
+
+    def test_ris_resets_cursor_visible_and_bracketed_paste(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"\x1b[?25l\x1b[?2004h")
+        self.assertFalse(s.cursor_visible)
+        self.assertTrue(s.bracketed_paste)
+        s.feed(b"\x1bc")
+        self.assertTrue(s.cursor_visible)
+        self.assertFalse(s.bracketed_paste)
+
+    def test_bell_alone_does_not_bump_v(self):
+        s = Screen(cols=10, rows=3)
+        v1 = s.v
+        s.feed(b"\x07\x07\x07")
+        self.assertEqual(s.v, v1)
+
+    def test_dectcem_toggle_alone_does_not_bump_v(self):
+        s = Screen(cols=10, rows=3)
+        v1 = s.v
+        s.feed(b"\x1b[?25l")
+        self.assertEqual(s.v, v1)
+        s.feed(b"\x1b[?25h")
+        self.assertEqual(s.v, v1)
+
+    def test_bracketed_paste_toggle_alone_does_not_bump_v(self):
+        s = Screen(cols=10, rows=3)
+        v1 = s.v
+        s.feed(b"\x1b[?2004h")
+        self.assertEqual(s.v, v1)
+        s.feed(b"\x1b[?2004l")
+        self.assertEqual(s.v, v1)
+
+
 class TestSnapshotVersioning(unittest.TestCase):
     def test_only_changed_rows_returned_and_v_bumps(self):
         s = Screen(cols=20, rows=5)
@@ -976,7 +1060,10 @@ class TestWireFormat(unittest.TestCase):
         self.assertIn(b"data: ", captured)
         self.assertNotIn(b"event:", captured)
         payload = json.loads(captured.split(b"data: ", 1)[1].split(b"\n\n", 1)[0])
-        self.assertEqual(set(payload.keys()), {"v", "rows", "cursor", "alt"})
+        self.assertEqual(
+            set(payload.keys()),
+            {"v", "rows", "cursor", "alt", "cursor_visible", "bracketed_paste", "bell"},
+        )
 
     def test_second_viewer_attaching_to_a_live_tty_gets_a_full_repaint(self):
         pt = term_vt.Pty(tid="fmt2")

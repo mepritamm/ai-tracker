@@ -13,6 +13,9 @@ agent adds on top of it is mechanical.
         "rows": [[row_index, text, runs], ...],   # only rows whose content changed after `since`
         "cursor": [row, col],        # always current, regardless of `since` -- 0-based
         "alt": bool,                 # True while the alternate screen buffer is active
+        "cursor_visible": bool,      # DECTCEM (`?25`) -- always current, regardless of `since`
+        "bracketed_paste": bool,     # DEC private mode `?2004` -- always current, regardless of `since`
+        "bell": int,                 # monotonic count of BEL (\\x07) bytes fed so far, never reset
     }
 
 - Pass `since=-1` for a full redraw (every row, since every row's stamp is >= 0). Pass the `v`
@@ -81,7 +84,6 @@ never reach the grid and never leave dangling bytes for the next character to in
 
 - **Mouse reporting** (private CSI modes `?1000`-`?1006`): consumed as unknown private DEC modes
   (no-op set/reset).
-- **Bracketed paste** (`?2004`): same -- consumed as an unknown private DEC mode.
 - **Sixel / other graphics** (DCS `ESC P ... ST`, and the sibling string types SOS `ESC X`, PM
   `ESC ^`, APC `ESC _`): the whole string is scanned for its terminator (`ESC \\` or `BEL`) and
   thrown away as one unit, so binary payload inside it (which can legitimately contain bytes
@@ -235,9 +237,13 @@ class Screen:
 
         self.autowrap = True
         self.cursor_visible = True
+        self.bracketed_paste = False   # DEC private mode `?2004` -- reported in snapshot(), the
+                                        # actual ESC[200~/201~ wrapping is the client's job
         self.origin_mode = False    # DECOM (`?6`): row params are relative to the scroll region
 
         self.title = ""
+        self.bell = 0    # monotonic count of BEL (\x07) bytes fed; a client-side event stream,
+                          # not screen state -- survives RIS (_reset), never rewound. See snapshot().
 
         # current SGR attribute state
         self.bold = self.dim = self.italic = self.underline = False
@@ -313,12 +319,20 @@ class Screen:
             self.pending_replies += data
 
     def snapshot(self, since):
-        """Rows changed since version `since`, plus cursor + alt-screen flag."""
+        """Rows changed since version `since`, plus cursor/alt/cursor_visible/bracketed_paste/bell.
+
+        The last four are screen (or client-event) STATE, not row diffs -- like `cursor` and
+        `alt`, they are always the CURRENT value regardless of `since`, never filtered by it.
+        """
         rows_out = []
         for r in range(self.rows):
             if self.row_v[r] > since:
                 rows_out.append(self._row_entry(r))
-        return {"v": self.v, "rows": rows_out, "cursor": [self.cur_r, self.cur_c], "alt": self.alt}
+        return {
+            "v": self.v, "rows": rows_out, "cursor": [self.cur_r, self.cur_c], "alt": self.alt,
+            "cursor_visible": self.cursor_visible, "bracketed_paste": self.bracketed_paste,
+            "bell": self.bell,
+        }
 
     @property
     def scrollback_len(self):
@@ -469,7 +483,9 @@ class Screen:
         elif b == 0x0D:        # CR
             self.cur_c = 0
             self.pending_wrap = False
-        # BEL and any other C0 control: no-op, consumed
+        elif b == 0x07:        # BEL -- bump the client-event counter, never `_dirty()`: a bell
+            self.bell += 1     # is not row content and must not bump `v` (see snapshot()'s bell).
+        # any other C0 control: no-op, consumed
         return 1
 
     # -- printable text / UTF-8 decode -----------------------------------
@@ -777,7 +793,9 @@ class Screen:
                 self.autowrap = set_
             elif code == 25:
                 self.cursor_visible = set_
-            # 1000-1006 (mouse), 2004 (bracketed paste), and any other private mode: no-op
+            elif code == 2004:
+                self.bracketed_paste = set_
+            # 1000-1006 (mouse) and any other private mode: no-op
 
     # -- erase -----------------------------------------------------------
 
@@ -1124,13 +1142,20 @@ class Screen:
 
         Scrollback survives too, for the same real-xterm-behaviour reason documented in the
         module docstring's "Scrollback" section: RIS clears the visible grid, not your history.
+
+        `cursor_visible` and `bracketed_paste` are SCREEN state, so RIS resets them like real
+        xterm does -- `__init__` below already sets them back to (True, False), nothing extra to
+        preserve. `bell` is the opposite: it is a client-side EVENT counter, not screen state
+        (see its own field comment), so it survives the reinit exactly like `v` does, for the
+        same reason -- a viewer's `since`-style comparison against it must never appear to rewind.
         """
-        cols, rows, v, replies, scrollback = (
-            self.cols, self.rows, self.v, self.pending_replies, self.scrollback)
+        cols, rows, v, replies, scrollback, bell = (
+            self.cols, self.rows, self.v, self.pending_replies, self.scrollback, self.bell)
         self.__init__(cols, rows)
         self.v = v
         self.pending_replies = replies
         self.scrollback = scrollback
+        self.bell = bell
         for r in range(rows):
             self._dirty(r)
 
@@ -1543,8 +1568,9 @@ def _screen_stream_body(handler, pt):
       next door DOES send `event: end` -- that pattern is Tier 2-only, deliberately not mirrored
       here.) The `: ping\\n\\n` heartbeat is a comment line, not a `data:`/`event:` frame, so
       EventSource ignores it for free -- that one is safe as-is.
-    * The JSON object carries EXACTLY the four keys `Screen.snapshot()` returns -- `v`, `rows`,
-      `cursor`, `alt` -- verbatim, unpadded. No wrapping, no extra keys, ever.
+    * The JSON object carries EXACTLY the keys `Screen.snapshot()` returns -- `v`, `rows`,
+      `cursor`, `alt`, `cursor_visible`, `bracketed_paste`, `bell` -- verbatim, unpadded. No
+      wrapping, no extra keys, ever.
     * `since` is a LOCAL variable of this call, i.e. per-viewer: two viewers on the same `tty`
       (the deliberately-supported "New tab, same session" case) each start their own SSE
       connection, each running its own `_screen_stream_body()`, each with its own `since = -1` --
@@ -1568,17 +1594,26 @@ def _screen_stream_body(handler, pt):
     except (BrokenPipeError, ConnectionResetError):
         return
     since = -1
-    last_cursor, last_alt = None, None
+    last_cursor, last_alt, last_cv, last_bp, last_bell = None, None, None, None, None
     quiet = time.time()
     while True:
         with pt.lock:
             snap = pt.screen.snapshot(since)
             done = pt.done
         cursor = tuple(snap["cursor"])
-        changed = snap["rows"] or since == -1 or cursor != last_cursor or snap["alt"] != last_alt
+        # cursor_visible/bracketed_paste/bell are screen (or client-event) state, not row content
+        # -- exactly like cursor/alt, a change in any of them alone (no row, no cursor move) must
+        # still trigger a frame, or a bare `\a` with no other output would never reach the client.
+        changed = (
+            snap["rows"] or since == -1
+            or cursor != last_cursor or snap["alt"] != last_alt
+            or snap["cursor_visible"] != last_cv or snap["bracketed_paste"] != last_bp
+            or snap["bell"] != last_bell
+        )
         if changed:
             since = snap["v"]
             last_cursor, last_alt = cursor, snap["alt"]
+            last_cv, last_bp, last_bell = snap["cursor_visible"], snap["bracketed_paste"], snap["bell"]
             if not _write(handler, "data: %s\n\n" % json.dumps(snap)):
                 return
             quiet = time.time()
