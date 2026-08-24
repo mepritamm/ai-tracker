@@ -1420,9 +1420,10 @@ def open_pty(handler, parsed, body):
     """POST /api/term/pty {session, cols, rows, mode} -> {tty}.
 
     `mode` follows term_launch's own naming (`"cwd"` = a plain login shell in the session's
-    working directory; `"resume"` = `claude --resume <sid>`; `"new"` = a fresh Claude session
-    with `argv = ["claude"]` borrowing the session's cwd) so the three buttons this route serves
-    stay consistent with Tier 1's. `"resume"` is refused for a non-Claude session id, exactly like
+    working directory; `"resume"` = `claude --resume <sid>` (see `term_gate.resume_argv` for
+    when this gains `--fork-session`); `"new"` = a fresh Claude session with `argv =
+    ["claude"]` borrowing the session's cwd) so the three buttons this route serves stay
+    consistent with Tier 1's. `"resume"` is refused for a non-Claude session id, exactly like
     term_launch.open_terminal -- see `_is_claude`. `"new"` is accepted for any session id (Claude
     or Auggie/etc.) because it merely borrows the working directory to start a fresh conversation.
     """
@@ -1448,7 +1449,7 @@ def open_pty(handler, parsed, body):
     cols = _clamp_int(body.get("cols"), MIN_COLS, MAX_COLS, DEFAULT_COLS)
     rows = _clamp_int(body.get("rows"), MIN_ROWS, MAX_ROWS, DEFAULT_ROWS)
     if mode == "resume":
-        argv = ["claude", "--resume", sid]
+        argv = term_gate.resume_argv(sid)   # appends --fork-session for a LIVE background agent
     elif mode == "new":
         argv = ["claude"]
     else:

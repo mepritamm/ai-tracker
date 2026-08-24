@@ -97,7 +97,7 @@ def _is_claude(sid):
     return True
 
 
-def build_script(cwd: str, sid: str, mode: str, app: str) -> str:
+def build_script(cwd: str, sid: str, mode: str, app: str, resume_argv=None) -> str:
     """Return the AppleScript source that opens a tab and runs the command.
 
     Pure function -- no side effects -- so the test can assert the exact string. `cwd` comes
@@ -106,10 +106,20 @@ def build_script(cwd: str, sid: str, mode: str, app: str) -> str:
     string literal (backslash, then double-quote) -- in that order, or a `"` surviving the first
     step could still break out of the AppleScript string in the second. `sid` reaches here only
     via normalize_sid().
+
+    `resume_argv`, used only when `mode == "resume"`, is the exact argv to run -- e.g.
+    `["claude", "--resume", sid]` or, for a live background-agent session, that plus
+    `--fork-session` (see `term_gate.resume_argv`, the ONE seam that decides this; both
+    terminal tiers call it, so this function never re-decides it itself, which is what
+    would let it drift from term_vt's PTY path). It is computed by the caller (`open_terminal`)
+    and handed in, rather than looked up here, so `build_script` stays pure -- it never touches
+    the registry/filesystem on its own. Falls back to the plain resume argv when omitted, so
+    existing direct callers (and tests) that don't care about forking keep working unchanged.
     """
     inner = "cd %s" % shlex.quote(cwd)
     if mode == "resume":
-        inner += " && claude --resume %s" % shlex.quote(sid)
+        argv = resume_argv or ["claude", "--resume", sid]
+        inner += " && " + " ".join(shlex.quote(a) for a in argv)
     escaped = inner.replace("\\", "\\\\").replace('"', '\\"')
     if app == "iTerm":
         return (
@@ -162,7 +172,11 @@ def open_terminal(handler, parsed, body) -> None:
     app = os.environ.get("TRACKER_TERM_APP", "Terminal")
     if app not in TERM_APPS:
         app = "Terminal"
-    script = build_script(cwd, sid, mode, app)
+    # same seam term_vt.open_pty uses for its PTY argv -- see term_gate.resume_argv's
+    # docstring for why this hands a COPY of a live agent's conversation rather than
+    # attaching to it.
+    resume_argv = term_gate.resume_argv(sid) if mode == "resume" else None
+    script = build_script(cwd, sid, mode, app, resume_argv)
     try:
         subprocess.run(["osascript", "-e", script], check=True, timeout=10,
                         capture_output=True)
