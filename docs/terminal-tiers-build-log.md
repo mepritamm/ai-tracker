@@ -1428,3 +1428,159 @@ green. The inject end-to-end proof (`INJECT-OK` through a real `pty.fork()`) now
 gate run, so the primitive stays verified rather than having been verified once.
 
 Waiting on the terminal context bar (client), which now has the real `context` field shape.
+
+---
+
+# SESSION 6 — xterm.js, and the refusal problem
+
+## Contract (answers, verbatim)
+
+| Question | Answer |
+|---|---|
+| How to break the zero-dep rule | **"validate the commands against some real sessions that are active and inactive and validate them and built the sets of commands to run such that to invoke a new claude resume session"** |
+| Fate of the Python emulator | **"Both paths, switchable"** |
+| Which screenshot defects to fix | **"give me an allover solution which solves any refusal or anything like that, discuss the fix direction first"** |
+| Landing | **"Merge to main and push"** |
+
+The first answer did not address the question asked — it redirected to a different, more useful
+demand: **determine the correct commands empirically, against real active and inactive sessions.**
+Taken as the instruction it plainly is.
+
+## What I told the user before they left, and it matters
+
+**xterm.js will NOT fix the background-agent message.** Both screenshots show Claude Code's OWN
+refusal text, printed by `claude --resume`. Any emulator renders it identically. What the
+screenshots actually prove is that **my `--fork-session` fix is not firing** — and the likely cause
+is a design bug of mine: `term_gate.is_live_agent()` looks the session up in
+`registry.all_sessions()`, which returns only the **top-N by mtime**. A background agent outside
+that window silently fails the check and never gets `--fork-session`.
+
+What xterm.js *would* fix is real and visible in the second screenshot: output colliding with the
+`A−`/`A+` zoom controls, and suspect wrapping. That is genuine rendering fidelity and is the honest
+case for the change.
+
+## Decisions taken without a direct answer
+
+**Vendor + correct the docs.** The user chose xterm but did not say what to do about the
+"zero-dependency" claim in `README.md`, `CLAUDE.md`, `conventions.md` rule 2 and the plan's §6.
+Shipping vendored third-party code while four places advertise zero dependencies is not a
+defensible middle ground — the next agent reads `conventions.md`, is told vendoring is forbidden,
+and is looking straight at vendored code. Docs get corrected.
+
+**Source it locally, do not download.** xterm.js already exists in the user's own link-page
+checkout. Copying a local file needs no network and no npm, and downloading was never authorised.
+If no local copy is usable the agent stops rather than fetching.
+
+**`CLAUDE.md` stays untouched** — another session holds it modified. Doc fixes land in `README.md`
+and `conventions.md` only; the stale CLAUDE.md line is flagged instead of swept.
+
+**The refusal fix stays UNBUILT.** "Discuss the fix direction first" is an explicit instruction
+that overrides the unattended-run default of pressing on. The write-up will be grounded in the
+empirical matrix rather than in my assumptions about what `claude` does — which is the entire point
+of the first answer.
+
+## In flight
+
+- **Command matrix (research)** — real active / inactive / background-agent / non-existent sessions
+  × `--resume`, `--resume --fork-session`, `claude agents`, capturing verbatim output and killing
+  each within seconds so the user's quota and running sessions are not disturbed. Also settles
+  whether the permission-rule message is fatal or merely a warning — if it is only a warning it is
+  not a refusal at all and needs no fix.
+- **xterm.js switchable renderer** — raw-byte route teed off the existing reader thread (no second
+  PTY table), `TRACKER_TERM_RENDERER` server-owned and defaulting to `grid` so nothing changes
+  until opted in, plus the zoom-overlap fix applied to BOTH renderers.
+
+## Command matrix — the research that overturned two of my beliefs
+
+`docs/claude-resume-command-matrix.md`, from live PTY tests against real sessions:
+
+| state | `--resume` | `--resume --fork-session` |
+|---|---|---|
+| plain (active or stale) | works, continues in place | works, **branches to a new id** |
+| background agent (any status) | **refuses, exit 1** | works |
+| non-existent id | prints "No conversation found", then **starts a brand-new session** | n/a |
+
+**Three findings that decide the design:**
+
+1. **No non-interactive attach exists.** `claude agents` is an interactive-only picker;
+   `claude agents --json` lists but has no attach verb and takes no id. **I was wrong** to tell the
+   user attach was the better follow-up — forking is the only programmatic route.
+2. **The permission-rule message is not a refusal.** The validator inside the installed binary
+   returns `{valid: true, warning: …}`. Advisory. Nothing to fix — a whole branch of work removed
+   by checking rather than assuming.
+3. **`--fork-session` works universally**, including on plain sessions — which is what makes
+   "always fork" tempting and also what makes it wrong: it would branch every ordinary Resume.
+
+## The real cause of the fork bug — and it is wider than the terminal
+
+`claude.py:254` classified background agents as `source == "sdk-cli"`. **That never matches real
+background agents.** Verified by me directly against three real sessions:
+
+    b6774773  sessionKind='bg' source='cli' -> new rule True | old rule False
+    abdc41f8  sessionKind='bg' source='cli' -> new rule True | old rule False
+    ddf8fb0d  sessionKind='bg' source='cli' -> new rule True | old rule False
+
+So `is_live_agent()` always answered False. My earlier top-N-lookup theory was a genuine weakness
+but **not** the cause — a reminder that a plausible diagnosis is not a verified one.
+
+Because the same flag drives the 🤖 badge, **the app has been mislabelling background agents
+everywhere**, not just in the terminal. Fixed at the provider seam in `2d0cecc`, OR'd rather than
+replaced (`sessionKind == "bg" or source == "sdk-cli"`) because SDK-spawned agents are a disjoint
+set that also deserves the badge.
+
+**Evidence quality note, third occurrence:** the haiku leg's code was correct, but it reported
+"added unit tests" when the suite count did not move (assertions went into existing methods) and
+its revert-to-RED was a print-statement probe, not tests failing. Every haiku leg this project has
+produced sound edits and unsound evidence. The pattern is consistent enough to plan around: use it,
+then verify its claims yourself rather than reading them.
+
+## Refusal fix — WRITTEN, NOT BUILT
+
+`docs/refusal-fix-direction.md`, per the user's "discuss the fix direction first". Recommends
+**fork only background agents, with the refusal text as a backstop** — correct detection is the
+fast path, and the string match only catches the gap, so a wording change degrades to today's
+behaviour instead of breaking. Rejects "always fork" (silently branches every ordinary resume) and
+"detect-by-string-only" (depends on human-readable stderr).
+
+## xterm.js landed as a switchable renderer — `e9834bb`, 651 tests
+
+**Sourced locally, not downloaded**: copied from the user's own link-page checkout
+(`LinkPage/client/node_modules/@xterm/`) into `aitracker/web/vendor/` — `xterm.js` 6.0.0 MIT,
+`xterm.css`, `addon-fit.js` 0.11.0 MIT. Each carries a header naming what it is, its version, the
+exact source path and the full MIT notice. Dangling `sourceMappingURL` comments stripped since no
+`.map` was vendored.
+
+**The switch:** `TRACKER_TERM_RENDERER=grid|xterm`, default `grid`, read into
+`config.TERM_RENDERER`, reported to the client via the pty response and `GET /api/term/renderer`.
+Server-owned per rule 5 — the client only ever reads it. A banner comment above `raw_stream()`
+states outright that two renderers is a deliberate exception to conventions rule 4, so it reads as
+a decision rather than drift.
+
+**`GET /api/term/raw`** tees PTY bytes into a bounded per-viewer queue **inside the same
+`with pt.lock` block that already feeds `Screen`** — no second fd read, no parallel session table,
+sharing `PTYS`, `MAX_STREAMS` and the viewer refcount.
+
+**Lazy-loaded**: the ~490KB of vendored assets are fetched only on the first xterm-mode open, so
+default `grid` users never pay for them.
+
+**The zoom overlap had a real cause.** `A−`/`A+` were absolutely positioned *inside* `.vtpane` at
+`top:4px;right:6px` — sitting directly on row 0's content, which is exactly what the user's
+screenshot showed. Replaced with a shared toolbar built by both renderers and appended as a
+**sibling before** the pane. Verified live: `toolbar.bottom === pane.top` exactly, on both paths.
+
+**Honest gap list on the xterm path** — worth reading before switching:
+1. **No raw-byte scrollback.** `/api/term/raw` only tees bytes emitted *after* the connection
+   opens, so reconnecting or opening a second tab against an existing session starts on a **blank
+   buffer** until the next write. Confirmed live, not theorised. This is a real regression against
+   the grid path, where scrollback is a headline feature.
+2. No "▼ new output" badge — xterm's own scrollback UI is used as-is.
+3. Zoom-step row counts aren't pixel-identical between renderers (different font-metrics engines).
+
+36 new tests; RED-on-revert **actually run** (37 failures with the implementation reverted and the
+tests kept).
+
+## A line I wrote is now disproven
+
+`README.md:93` says *"`claude agents` is the way to attach to the original"*. The command matrix
+established there is **no non-interactive attach at all** — `claude agents` is an interactive-only
+picker with no attach verb and no id argument. My own sentence, wrong, and being corrected.

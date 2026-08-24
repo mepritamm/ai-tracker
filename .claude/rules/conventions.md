@@ -4,7 +4,7 @@ These are invariants, not suggestions. Breaking one is a regression even if the 
 
 ## Structure
 1. **Package, not a scratchpad.** Sources live in `aitracker/` (Python) and `aitracker/web/` (the SPA). Edit those — never `dist/tracker.py`, which `make bundle` regenerates. Keep the module boundaries: providers under `providers/`, the shared seam in `registry.py`.
-2. **Zero dependencies.** Standard library only. No `pip install`, no `requirements.txt`/`pyproject.toml`, no bundler, no build step.
+2. **Python: stdlib only. Optional vendored front-end only.** The Python package has zero dependencies — no `pip install`, no `requirements.txt`/`pyproject.toml`, no build step. Vendored front-end assets are allowed only if optional, off by default, and added with explicit approval; they must be committed files, never fetched or built at runtime. xterm.js is the sole current instance.
 
 ## The shared seam (don't fork)
 3. Every AI tool is a **`Provider`** (`available/list/parse/search`) in `PROVIDERS`. Routes call `all_sessions()` / `parse_any()` / `search_all()` — never a specific source.
