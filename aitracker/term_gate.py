@@ -77,3 +77,45 @@ def session_cwd(sid):
     except Exception:
         return ""
     return cwd if cwd and os.path.isdir(cwd) else ""
+
+
+def is_live_agent(sid):
+    """True when `sid` names a background-agent session (the shared session-list shape's
+    `"agent"` key -- providers/claude.py sets it for entrypoint=sdk-cli; every other
+    provider hardcodes it False) that is STILL WITHIN the app's own liveness window
+    (config.LIVE_WINDOW, matched by `LIVE` in web/app.js -- conventions rule 5, don't add
+    a second threshold). This is exactly the condition under which Claude Code's own CLI
+    refuses a plain `claude --resume <sid>` with "... is currently running as a background
+    agent (bg)." -- see resume_argv() below, the seam that acts on this.
+
+    Looks the sid up in registry.all_sessions() (the shared list shape every provider
+    emits), never a specific provider's list -- conventions rule 3. Late import: registry
+    pulls in every provider, and this module is imported from server at startup."""
+    import time
+    from .config import LIVE_WINDOW
+    from .registry import all_sessions
+    for s in all_sessions():
+        if s.get("id") == sid:
+            return bool(s.get("agent")) and (time.time() - (s.get("mtime") or 0)) < LIVE_WINDOW
+    return False
+
+
+def resume_argv(sid):
+    """The argv for `claude --resume <sid>`, with `--fork-session` appended when
+    `is_live_agent(sid)` -- the ONE place both terminal tiers decide this (term_vt.open_pty
+    uses the list directly; term_launch.open_terminal passes it into build_script), so the
+    two call sites can't drift (conventions rule 4).
+
+    Why this is the honest fix and not a full one: `--fork-session` branches a COPY of the
+    agent's conversation -- it does NOT attach to the actually-running agent. Claude Code's
+    refusal message also suggests `claude agents`, which WOULD attach to the live session,
+    but that's an interactive picker with no argv that could drive it non-interactively.
+    Between "refuse to open a terminal at all" and "open one on a deliberate copy", this
+    picks the copy -- and callers should say so where they surface the result (a fork was
+    the trade-off, not a mistake). A finished (no-longer-live) agent session is resumed
+    normally: forking a conversation nothing is still adding to would just hand the user a
+    pointless duplicate."""
+    argv = ["claude", "--resume", sid]
+    if is_live_agent(sid):
+        argv.append("--fork-session")
+    return argv
