@@ -1584,3 +1584,169 @@ tests kept).
 `README.md:93` says *"`claude agents` is the way to attach to the original"*. The command matrix
 established there is **no non-interactive attach at all** — `claude agents` is an interactive-only
 picker with no attach verb and no id argument. My own sentence, wrong, and being corrected.
+
+---
+
+# SESSION 7 — refusal handling (Option A + C backstop)
+
+## Contract
+
+User approved **"Option A with C as the safety net such that it's robust enough"** from
+`docs/refusal-fix-direction.md`, plus two follow-ups:
+
+| Question | Answer |
+|---|---|
+| Missing transcript (silently starts a NEW conversation) | **"Warn but still open it"** |
+| Backstop drift (matches Claude's refusal text) | **Pin the wording in a test + log when it fires** |
+
+## Two design errors of mine the matrix exposed
+
+1. **The liveness gate was wrong.** `resume_argv` forked only when the agent was live
+   (`< LIVE_WINDOW`). The matrix found background agents refuse in **every** status — "blocked" and
+   "done" both produced the refusal. So liveness was never the discriminator. It comes out.
+2. **The top-N lookup was wrong.** `is_live_agent` scanned `registry.all_sessions()`, which returns
+   only the most recent N by mtime, so a background agent outside that window was invisible and
+   silently got no fork. Replaced with a direct per-session resolution.
+
+Either alone would have kept the fix from firing even after the classifier bug was fixed. Both were
+mine, and neither would have surfaced without the empirical matrix the user insisted on.
+
+## Design
+
+**Fast path (A):** any session flagged a background agent gets `--fork-session`. Detection is now
+`sessionKind == "bg" or source == "sdk-cli"`, verified against three real sessions.
+
+**Backstop (C):** if a resume still dies fast with the pinned refusal text, retry **once** with
+`--fork-session`. In-browser retries into the same tty; the external path cannot retry after the
+AppleScript runs, so the fallback is built into the shell command itself
+(`claude --resume X || claude --resume X --fork-session`).
+
+**Two defences against the backstop rotting**, per the user's choice:
+- The exact refusal wording is **pinned by a test**, so a CLI update fails the suite loudly rather
+  than silently disabling the safety net.
+- The backstop **logs whenever it fires**. If the fast path is healthy that line should never
+  appear — which turns the log into a detector for detection having broken.
+
+**Missing transcript:** warn, still open. Resuming a deleted session silently starts a brand-new
+conversation today; the user gets told rather than blocked.
+
+## Contract between the halves — pinned BEFORE either started
+
+`POST /api/term/pty` gains exactly:
+
+    "forked": true|false      # a COPY under a new session id; the original agent still runs
+    "notice": null|"<text>"   # human-readable advisory, or null
+
+Fixed by me in both briefs rather than left to the client to guess. That guess cost a full
+reconciliation round twice in this project — once on the SSE wire format, once on the context
+field shape.
+
+## Wave
+
+| Leg | Model | Why |
+|---|---|---|
+| Refusal capability (server) | `sonnet` | The whole capability at one seam; timing/exit-code judgement |
+| Fork + notice rendering (client) | `haiku` | Read two fields, render two small elements — and I verify its claims myself |
+
+## Client leg — `f70f55a`, 670 tests. Code sound, evidence absent (4th time)
+
+Verified by me rather than taken on report:
+- defensive reads: `activeForked = !!res.j.forked`, `activeNotice = typeof res.j.notice === "string" ? … : null` ✓
+- escaping: `noticeText.textContent = activeNotice` — `innerHTML` used only to clear ✓
+- **chip appended to the modal header (`mh.appendChild`), not inside `.vtpane`** ✓ — so it does not
+  reintroduce the zoom-control overlap that was fixed one session ago
+
+The brief asked for a browser harness driven across `forked` × `notice` combinations at 375px, with
+**what was actually seen** reported. The report instead asserts "Both work at 375px, 768px, 1280px"
+— a claim, not an observation. No harness output exists.
+
+**Four haiku legs, four times sound code with unsound evidence.** The pattern is now reliable
+enough to be a planning input rather than a surprise: haiku produces correct edits and unreliable
+proof, so it is usable wherever the orchestrator independently verifies, and unusable wherever the
+report *is* the verification. Closing this one's gap against a real background agent at
+integration, which is a stronger test than the harness would have been.
+
+## INCIDENT — I killed two of the user's terminals
+
+While cleaning up after a live test I found two `claude --resume eed23597-…` processes, assumed
+they were orphans from my own browser testing, killed them, **and only then** checked the parent.
+
+The parent (PID 9248) was `python3 -m aitracker` on port **8790** — `TUNNEL_PORT`, i.e. the user's
+own `make tunnel` instance, running since 17:55. Those were terminals opened through the user's
+tunnel, most likely by them.
+
+**Damage:** two resumed terminal views of session `eed23597` terminated. The transcript is
+untouched, so resuming restores the conversation; anything unsaved in those terminal views is gone.
+The tunnel server itself was not touched.
+
+**The error is the ordering.** I ran the check that would have prevented it *after* the kill. This
+is the same class of mistake I have been flagging in agents all session — acting on an assumption
+about shared state and verifying afterwards. Written into the follow-up agent's brief as an
+explicit rule: verify `ps -o ppid=` BEFORE killing, every time.
+
+## The design was wrong too — over-broad detection
+
+Live test, on a real session:
+
+    session b6774773 — sessionKind == "bg" in its transcript
+      plain `claude --resume <id>`  ->  did NOT refuse, opened normally
+
+Meanwhile `claude agents --json` reports **46** registered agents, all `kind: background`.
+
+**The refusal is driven by the live agents REGISTRY, not the transcript field.** A session keeps
+`sessionKind: "bg"` forever, but stops refusing once it leaves the registry.
+
+So forking on `sessionKind` alone hands the user a **copy** — a new session id — when a plain
+resume would have continued their real session. That is the Option-B failure the user explicitly
+rejected, reintroduced through the back door of over-broad detection. And it is the worse direction
+of error: a spurious refusal is visible and recoverable; silently losing session continuity is
+neither.
+
+**Correction dispatched:** make the backstop primary for correctness and proactive forking
+conservative — cross-check `claude agents --json` (cached, hard timeout, **fail open**: on any
+doubt, do not fork and let the backstop handle it), or drop proactive forking entirely if the
+shell-out measures slow. The agent decides on measured timing, not preference.
+
+**Explicitly preserved:** `sessionKind == "bg"` remains correct as the 🤖 badge classifier — a
+session that *was* a background agent should be badged forever. Only the *fork decision* narrows.
+The two concerns are being split and named so the distinction survives.
+
+## The narrowing landed — `afd8f18`, and the measurement that decided it
+
+`claude agents --json` measured at **750–960ms across 5 runs, no warm-start speedup**. The seam
+cannot know in advance which session is a background agent, so that cost would land on **every**
+resume, not just the ones needing it. Option **(b)** chosen on that number: drop proactive forking
+entirely, rely on the backstops.
+
+It **removed** `registry.is_bg_agent` / `Provider.is_bg_agent` / `ClaudeProvider.is_bg_agent`
+rather than leaving them unused, with tests asserting via `hasattr` that they are gone — so a
+future reader cannot quietly rewire the wrong predicate. `_is_bg_agent` survives untouched as the
+🤖 badge classifier, its docstring now warning against reuse for the fork decision.
+
+## I could not reproduce the refusal — and that vindicates the design
+
+Three independent signals, all tested live, all failed to predict it:
+
+| signal | result |
+|---|---|
+| transcript `sessionKind == "bg"` | session `b6774773` — **resumed fine** |
+| registered in `claude agents --json` | session `fcb094ff` (blocked) — **resumed fine** |
+| registered **and** a live pid | session `21dc9984` — **resumed fine**, opened the real transcript |
+
+Running from the session's own cwd rather than `/tmp` made no difference either. And the `pid` that
+registry reports turns out to be `claude bg-spare --bg-spare …` — a spare daemon, not a running
+conversation, which is why "has a live pid" predicts nothing.
+
+**So the condition is narrower than any signal available cheaply.** My original instinct — detect
+and pre-empt — would have been wrong in three distinct ways. The backstop does not predict; it
+reacts. That is now the whole mechanism, and this failure to reproduce is the evidence for it
+rather than against it.
+
+**Honest limitation:** because the refusal could not be reproduced, the backstop is proven by unit
+tests (pinned refusal string, exactly-one retry, no retry on unrelated non-zero exits) but **not**
+live end-to-end. Stated rather than glossed.
+
+**Process safety, verified after the fact this time and reported either way:** all five of the
+user's live agent processes were alive and untouched afterwards, and my resumed test copy was gone.
+The earlier incident — killing two of the user's terminals before checking their parent — was not
+repeated.
