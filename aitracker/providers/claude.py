@@ -83,15 +83,16 @@ def _tail_fields(path, nbytes=96000):
 
 
 def _session_meta(path):
-    """cwd + best title (custom > ai > opening prompt) + entrypoint, cached by mtime."""
+    """cwd + best title (custom > ai > opening prompt) + entrypoint + sessionKind, cached by mtime."""
     try:
         mt = os.path.getmtime(path)
     except OSError:
-        return {"cwd": "", "title": "", "source": "", "prompt": "", "first": 0, "waiting": False, "ended": False}
+        return {"cwd": "", "title": "", "source": "", "prompt": "", "first": 0, "waiting": False, "ended": False, "sessionKind": None}
     hit = _META_CACHE.get(path)
     if hit and hit[0] == mt:
         return hit[1]
     cwd = prompt = entry_head = first_ts = ""
+    session_kind = None
     try:
         with open(path, encoding="utf-8") as fh:
             for i, line in enumerate(fh):
@@ -105,6 +106,8 @@ def _session_meta(path):
                     cwd = o["cwd"]
                 if not entry_head and o.get("entrypoint"):
                     entry_head = o["entrypoint"]
+                if session_kind is None and o.get("sessionKind"):
+                    session_kind = o["sessionKind"]
                 if not first_ts and o.get("timestamp"):
                     first_ts = o["timestamp"]          # session start — used to attribute agents to their live orchestrator
                 if not prompt:
@@ -124,9 +127,18 @@ def _session_meta(path):
         "first": _ts_epoch(first_ts),   # sub-second so same-second orchestrator/agent starts still order
         "waiting": waiting,             # an AskUserQuestion is unanswered -> sidebar ⏳
         "ended": ended,                 # last real turn was the assistant finishing -> sidebar ✅ (completed)
+        "sessionKind": session_kind,    # "bg" for real background agents (claude --bg)
     }
     _META_CACHE[path] = (mt, meta)
     return meta
+
+
+def _is_bg_agent(sm):
+    """Determine if a session is a background agent. Checks for either:
+    1. Real background agents (claude --bg): sessionKind == "bg"
+    2. SDK-spawned agents: entrypoint == "sdk-cli"
+    Both are shown as 🤖 agents in the sidebar."""
+    return sm.get("sessionKind") == "bg" or sm.get("source") == "sdk-cli"
 
 
 _WT_MARKER = os.sep + ".claude" + os.sep + "worktrees" + os.sep
@@ -251,7 +263,7 @@ def list_sessions(limit=200):
             "title": titles.get(sid) or sm["title"],
             "prompt": sm["prompt"],
             "source": sm["source"],
-            "agent": sm["source"] == "sdk-cli",     # background-agent session -> 🤖
+            "agent": _is_bg_agent(sm),               # background-agent session -> 🤖
             "group": gkey, "groupLabel": glabel,     # fallback bucket (repo/sandbox) for orphan agents
             "parentId": parent,                      # the originating session it nests under; "" -> bucket
             "bg": bg,                                # in-transcript background agents live now -> 🤖 sidebar badge
@@ -363,7 +375,7 @@ def search_sessions(q, limit=500):
             "id": sid,
             "project": os.path.basename(sm["cwd"]) if sm["cwd"] else os.path.basename(os.path.dirname(f)),
             "title": title,
-            "agent": sm["source"] == "sdk-cli",     # 🤖 marker in search results too
+            "agent": _is_bg_agent(sm),               # 🤖 marker in search results too
             "matches": count,
             "snippet": snippet,
             "inQuery": in_query,

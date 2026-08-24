@@ -16,7 +16,8 @@ from aitracker.registry import parse_any, all_sessions
 from aitracker.providers.claude import (
     parse_session, parse_agents, parse_shells, _match_content, _active_mtime,
     file_diffs, command_output, shell_output, agent_detail, _redirect_log,
-    list_sessions, child_agent_sessions, _agent_group, _pick_parent, _mtime_and_bg, _tail_fields)
+    list_sessions, child_agent_sessions, _agent_group, _pick_parent, _mtime_and_bg, _tail_fields,
+    _is_bg_agent)
 from aitracker.providers.auggie import (
     list_auggie, parse_auggie, search_auggie, _AUGGIE_LIST_CACHE, _auggie_state)
 
@@ -237,6 +238,14 @@ def _run():
     # a term that lives ONLY in the injected skill list must NOT match
     assert _match_content(data, "bitbucket-automation")[0] == 0, "boilerplate leaked into search"
 
+    # background-agent detection: both real claude --bg (sessionKind:"bg") and SDK-spawned (sdk-cli)
+    # should be flagged as agents and show the 🤖 badge
+    assert _is_bg_agent({"sessionKind": "bg", "source": "cli"}), "real claude --bg sessions have sessionKind:bg"
+    assert _is_bg_agent({"sessionKind": None, "source": "sdk-cli"}), "SDK-spawned sessions have source:sdk-cli"
+    assert _is_bg_agent({"sessionKind": "bg", "source": "sdk-cli"}), "overlapping markers both true"
+    assert not _is_bg_agent({"sessionKind": None, "source": "cli"}), "regular interactive sessions have neither"
+    assert not _is_bg_agent({"sessionKind": None, "source": "claude-desktop"}), "desktop sessions are not agents"
+
     # background-agent (SDK) sessions nest under their ORIGINATING session — attributed by shared PROJECT
     # DIR (the SDK writes each agent transcript beside its orchestrator, even when their cwd fields differ)
     # and by who was live when the agent spawned (latest start <= agent start — handles resume chains).
@@ -270,12 +279,21 @@ def _run():
     _mk(d3, "ag_root.jsonl", "/repo/x/.claude/worktrees/wt-c", "sdk-cli", "2026-06-01T08:30:00Z", "finding 3")
     d2 = os.path.join(pdir, "-repo-x--claude-worktrees-wt-b"); os.makedirs(d2)   # dir with agents but no human
     _mk(d2, "ag_orphan.jsonl", "/repo/x/.claude/worktrees/wt-b", "sdk-cli", "2026-06-01T09:00:00Z", "orphan")
+    # real claude --bg background agents with sessionKind:"bg" should also be flagged as agent=True
+    _mk(d1, "bg_real.jsonl", WT, "cli", "2026-06-01T14:00:00Z", "analyzing the code")
+    with open(os.path.join(d1, "bg_real.jsonl"), "r") as f:
+        bg_line = json.loads(f.readline())
+    bg_line["sessionKind"] = "bg"
+    with open(os.path.join(d1, "bg_real.jsonl"), "w") as f:
+        f.write(json.dumps(bg_line) + "\n")
+
     ls = {s["id"]: s for s in list_sessions()}
     assert ls["ag_late"]["agent"] and ls["ag_late"]["parentId"] == "orchB", ls["ag_late"]
     assert ls["ag_mid"]["parentId"] == "orchA", ls["ag_mid"]
     assert ls["ag_root"]["parentId"] == "orchR", "repo-root orchestrator attributed via shared dir despite cwd mismatch"
     assert ls["ag_orphan"]["parentId"] == "" and ls["ag_orphan"]["group"] == "/repo/x", "no same-dir human -> bucket"
     assert not ls["orchR"]["agent"] and ls["orchR"]["parentId"] == "", ls["orchR"]
+    assert ls["bg_real"]["agent"] and not ls["bg_real"]["parentId"], "real claude --bg sessions get agent=True and no parent"
     kb = child_agent_sessions("orchB", d1)           # detail uses the SAME dir-scoped set as the sidebar
     assert [k["id"] for k in kb] == ["ag_late"] and kb[0]["wt"] == "wt-a", kb
     assert kb[0]["runs"] == 1, kb                    # a single-run agent reports runs=1
