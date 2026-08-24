@@ -75,6 +75,28 @@ Locally it's just `make serve` (localhost, no tunnel, no login). To reach it fro
 
 ---
 
+## Terminal — opt-in, off by default
+
+The tracker normally only *reads*. Two features let it *start processes*, so both are off unless you set **`TRACKER_TERMINAL=1`** **and** a **`TRACKER_AUTH`** login — either alone does nothing.
+
+```bash
+TRACKER_TERMINAL=1 TRACKER_AUTH=user:pass make serve
+```
+
+- **Open terminal here / Resume in terminal** — opens Terminal (or iTerm, via `TRACKER_TERM_APP`) already `cd`'d to the session's working directory, optionally running `claude --resume <id>`. Resume is Claude-only; other tools get the `cd` alone.
+- **Command runner** — runs line-oriented commands (`git status`, `make check`, `npm test`, …) in the session's directory and streams the output into the page with colour. There is **no shell**: the command is `shlex.split` into argv and `execvp`'d directly, so shell metacharacters are never operators. Commands must match an argv-prefix allowlist, overridable with `TRACKER_TERM_ALLOW`. Output is capped, concurrent jobs are capped, and a job is killed when you close its view.
+
+### What these features do and don't guarantee
+
+Worth reading before you enable them over a tunnel.
+
+- **"Local only" is best-effort, not a guarantee.** The launch route refuses requests carrying a proxy's fingerprint (`X-Forwarded-For` and friends) and non-loopback peers. But `make tunnel` terminates on this machine and dials the server over loopback, so a peer address proves nothing on its own. The thing actually standing between a stranger and your machine is `TRACKER_AUTH`.
+- **"No shell" is not "no code execution."** The allowlist deliberately includes commands that run project-supplied code: `make` runs your `Makefile`, `pytest` imports your `conftest.py`, `npm test` runs your scripts. That is the point of the feature, not a bug — but it means the runner is as trustworthy as the directory it runs in.
+- **Running `git` inside a repository whose `.git/config` you don't control is code execution, by git's own design.** The runner neutralises the vectors it knows (external diff and textconv drivers, `core.fsmonitor`, `core.hooksPath`, pagers, `core.editor`) and refuses config-bearing flags, but git has many config-driven exec points and that list is not proven complete.
+- **`cat` and `ls` are confined** to the session's own directory, so they can't read your keys.
+
+---
+
 ## What it shows
 
 **Sidebar** — every session across all your tools and projects, newest first, each with a source badge (Claude Desktop / Claude CLI / Claude SDK / Claude VS Code / Auggie / Augment VS Code / Augment Cursor), a live dot, and a short title.
