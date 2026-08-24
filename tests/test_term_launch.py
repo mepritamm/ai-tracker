@@ -339,6 +339,8 @@ class TestBodyShape(_TerminalEnabled):
 
 _EXT_LAUNCH_JS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                               "aitracker", "web", "ext_launch.js")
+_INDEX_HTML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "aitracker", "web", "index.html")
 
 
 class TestButtonsFollowServerPolicy(unittest.TestCase):
@@ -370,10 +372,10 @@ class TestButtonsFollowServerPolicy(unittest.TestCase):
 
 
 class TestRenamedLaunchButtonsAndNewControls(unittest.TestCase):
-    """The four Tier 1/3 buttons are named by WHERE the terminal opens ('…here' = in-browser,
-    'External …' = the Mac's own Terminal/iTerm, this-machine-only), plus two new controls that
-    spawn a terminal NOT attached to any existing session's Claude process. Asserted against the
-    asset's source, same as TestButtonsFollowServerPolicy above: there is no JS engine here."""
+    """The four Tier 1/3 detail-pane buttons are named by WHERE the terminal opens ('…here' =
+    in-browser, 'External …' = the Mac's own Terminal/iTerm, this-machine-only). Asserted
+    against the asset's source, same as TestButtonsFollowServerPolicy above: there is no JS
+    engine here."""
 
     def setUp(self):
         self.src = open(_EXT_LAUNCH_JS, encoding="utf-8").read()
@@ -389,27 +391,152 @@ class TestRenamedLaunchButtonsAndNewControls(unittest.TestCase):
         self.assertNotIn(">↗ Terminal</button>", self.src)
         self.assertNotIn(">↗ Resume</button>", self.src)
 
-    def test_new_terminal_controls_exist_and_send_the_right_modes(self):
-        self.assertIn("+ New terminal", self.src)
-        self.assertIn("+ New Claude session", self.src)
-        # "+ New terminal" reuses the existing mode:"cwd" contract (no new server work);
-        # "+ New Claude session" sends mode:"new", which is not yet supported server-side.
-        self.assertIn('window.ExtVT.open(cur, "new")', self.src)
-
-    def test_new_controls_are_assembled_before_the_localonly_gate(self):
-        # Both "+ New …" buttons must never be host-gated (conventions rule: no control hidden
-        # by host/viewport) -- i.e. built into newHtml, which is assembled before localOnly()
-        # is even consulted, exactly like the "…here" pair's vtHtml.
-        new_idx = self.src.index("const newHtml =")
-        gate_idx = self.src.index("if (localOnly())")
-        self.assertLess(new_idx, gate_idx)
-
     def test_external_pair_is_still_host_gated(self):
         # Unchanged: the native "External …" buttons are still built inside the localOnly()
         # branch, so they stay off the DOM entirely off-localhost.
         gate_idx = self.src.index("if (localOnly())")
         ext_idx = self.src.index("↗ External terminal")
         self.assertGreater(ext_idx, gate_idx)
+
+    def test_detail_pane_render_is_back_to_four_buttons(self):
+        # render()'s own innerHTML assembly must be exactly vtHtml + nativeHtml -- the "+ New …"
+        # pair (a THIRD group that used to be spliced in here) is gone from this function.
+        start = self.src.index("function render(d) {")
+        end = self.src.index("EXT.push(render)")
+        body = self.src[start:end]
+        self.assertIn("el.innerHTML = vtHtml + nativeHtml;", body)
+        self.assertNotIn("newHtml", body)
+        self.assertNotIn("+ New terminal", body)
+        self.assertNotIn("+ New Claude session", body)
+        self.assertNotIn("extnewgroup", body)
+
+
+class TestSidebarNewControls(unittest.TestCase):
+    """The "+ New terminal" / "+ New Claude session" pair moved to the sidebar (mounted into
+    #ext_launch_side) and now opens a directory picker instead of acting on `cur` directly --
+    they are global (no session need be selected). Asserted against the asset's source, same as
+    the classes above: there is no JS engine here."""
+
+    def setUp(self):
+        self.src = open(_EXT_LAUNCH_JS, encoding="utf-8").read()
+
+    def test_sidebar_mount_is_used(self):
+        self.assertIn('getElementById("ext_launch_side")', self.src)
+
+    def test_labels_present(self):
+        self.assertIn("+ New terminal", self.src)
+        self.assertIn("+ New Claude session", self.src)
+
+    def test_buttons_open_the_picker_with_the_right_mode(self):
+        # "+ New terminal" -> mode "cwd" (a plain shell); "+ New Claude session" -> mode "new"
+        # (a fresh `claude`) -- checked by pairing each button id with the very next openPicker()
+        # call after it, not just presence anywhere in the file.
+        m = re.search(r'sidenewcwdbtn"\).*?openPicker\("(\w+)"\)', self.src, re.S)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "cwd")
+        m = re.search(r'sidenewclaudebtn"\).*?openPicker\("(\w+)"\)', self.src, re.S)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "new")
+
+    def test_sidebar_controls_are_never_host_gated(self):
+        # Unlike the native "External …" pair, these must never disappear off a tunnel -- they
+        # are built (and their listeners wired) by a function that is called unconditionally,
+        # entirely separate from localOnly()/allowed.
+        self.assertIn("buildSideControls();", self.src)
+        build_start = self.src.index("function buildSideControls()")
+        build_end = self.src.index("function buildPicker()")
+        body = self.src[build_start:build_end]
+        self.assertNotIn("localOnly", body)
+        self.assertNotIn("allowed", body)
+
+
+class TestDirectoryPicker(unittest.TestCase):
+    """The picker: lists server-supplied recent directories (GET /api/term/cwds), accepts free
+    text, and opens the terminal via the session-less form of POST /api/term/pty ({cwd, cols,
+    rows, mode}). Asserted against the asset's source -- there is no JS engine here."""
+
+    def setUp(self):
+        self.src = open(_EXT_LAUNCH_JS, encoding="utf-8").read()
+
+    def test_reuses_the_existing_modal_classes_not_a_second_modal_system(self):
+        self.assertIn('pkOverlay.className = "overlay";', self.src)
+        self.assertIn('modal.className = "modal cwdmodal";', self.src)
+        self.assertIn('mh.className = "mh";', self.src)
+        self.assertIn('pkBodyEl.className = "mb cwdmb";', self.src)
+
+    def test_built_on_body_not_inside_the_sidebar_mount(self):
+        # .side gets a CSS transform for its phone drawer -- appending the overlay inside it
+        # would break position:fixed. Must be a body-level child, like #diffmodal/#msgmodal.
+        self.assertIn("document.body.appendChild(pkOverlay);", self.src)
+        self.assertNotIn('getElementById("ext_launch_side").appendChild', self.src)
+
+    def test_escape_closes_only_while_this_overlay_is_open(self):
+        m = re.search(r'document\.addEventListener\("keydown", function \(ev\) \{\s*'
+                       r'if \(ev\.key !== "Escape"\) return;\s*'
+                       r'if \(!pkOverlay \|\| pkOverlay\.style\.display !== "flex"\) return;\s*'
+                       r'closePicker\(\);', self.src)
+        self.assertIsNotNone(m)
+
+    def test_backdrop_click_closes(self):
+        self.assertIn("if (ev.target === pkOverlay) closePicker();", self.src)
+
+    def test_opening_closes_the_phone_drawer_first(self):
+        # On a phone, these buttons only exist inside the open sidebar drawer (.side, z-index
+        # 60); the picker overlay reuses app.css's shared .overlay class (z-index 50), so a
+        # still-open drawer would sit on top of it and hide it entirely. openPicker() must close
+        # the drawer before showing the overlay -- checked by requiring the closeDrawer() call to
+        # appear before pkOverlay.style.display is set to "flex" inside the function body.
+        start = self.src.index("function openPicker(mode)")
+        end = self.src.index("function showPickerBusy()")
+        body = self.src[start:end]
+        self.assertIn("closeDrawer()", body)
+        self.assertLess(body.index("closeDrawer()"), body.index('pkOverlay.style.display = "flex"'))
+
+    def test_lists_recent_dirs_from_the_server_owned_route(self):
+        self.assertIn('fetch("/api/term/cwds")', self.src)
+
+    def test_label_and_path_are_escaped_before_reaching_the_dom(self):
+        self.assertIn("esc(p)", self.src)
+        self.assertIn("esc(label)", self.src)
+
+    def test_missing_cwds_route_degrades_to_free_text_not_a_hang(self):
+        self.assertIn("cwds: [], note: note", self.src)
+        self.assertIn("aren't available on this server yet", self.src)
+
+    def test_free_text_is_trimmed(self):
+        self.assertIn("function pickDirectory(raw, mode)", self.src)
+        fn_start = self.src.index("function pickDirectory(raw, mode)")
+        fn_body = self.src[fn_start:fn_start + 400]
+        self.assertIn(".trim()", fn_body)
+
+    def test_free_text_never_invents_a_home_directory_for_a_leading_tilde(self):
+        # The client must not fabricate its own idea of "home" (conventions rule 5: never invent
+        # data the server should supply) -- no regex/string substitution of a leading "~"
+        # anywhere in this file; the raw text (trimmed only) is what's sent, and the server
+        # expands it (a comment here may mention *why*, but the code itself must not rewrite it).
+        self.assertNotIn("replace(/^~", self.src)
+        self.assertNotIn('path.replace("~"', self.src)
+
+    def test_posts_the_session_less_pty_route_with_cwd_and_mode(self):
+        self.assertIn('fetch("/api/term/pty"', self.src)
+        self.assertIn("cwd: path", self.src)
+        self.assertIn("mode: mode", self.src)
+        self.assertIn("cols: 100, rows: 30", self.src)
+
+    def test_bad_path_error_surfaces_inline_not_silently(self):
+        self.assertIn("function showPickerError(msg)", self.src)
+        self.assertIn("res.j && res.j.error", self.src)
+        self.assertIn("err.textContent = msg;", self.src)   # never innerHTML for server text
+
+    def test_404_and_403_on_pty_get_readable_messages(self):
+        self.assertIn("isn't available on this server yet", self.src)
+        self.assertIn("in-browser terminal is disabled", self.src)
+
+    def test_success_reuses_the_existing_standalone_tab_path(self):
+        # Reuses ext_vt.js's own ?tty= standalone route (see ext_vt.js's openNewTab/
+        # bootStandalone) instead of duplicating its terminal renderer in this file.
+        self.assertIn('"?tty=" + encodeURIComponent(res.j.tty)', self.src)
+        self.assertIn("window.open(url", self.src)
 
 
 class TestOpenTerminalGuardFirst(unittest.TestCase):
@@ -434,6 +561,34 @@ class TestOpenTerminalGuardFirst(unittest.TestCase):
         term_launch.open_terminal(h, None, {"session": "abc-123", "mode": "cwd"})
         obj, code = h.calls[-1]
         self.assertEqual(code, 403)
+
+
+class TestSidebarMount(unittest.TestCase):
+    """index.html's own mount point, added the same way Step 0 added #ext_launch/#ext_run/
+    #ext_vt: a single empty div, filled by ext_launch.js. Placed immediately above the "search
+    sessions…" box, inside .sidehead."""
+
+    def setUp(self):
+        self.html = open(_INDEX_HTML, encoding="utf-8").read()
+
+    def test_mount_exists(self):
+        self.assertIn("<div id=ext_launch_side></div>", self.html)
+
+    def test_mount_sits_in_the_sidehead_immediately_above_the_search_box(self):
+        sidehead_idx = self.html.index("class=sidehead")
+        mount_idx = self.html.index("id=ext_launch_side")
+        searchbox_idx = self.html.index("class=searchbox")
+        search_idx = self.html.index("id=q ")
+        self.assertLess(sidehead_idx, mount_idx)
+        self.assertLess(mount_idx, searchbox_idx)
+        self.assertLess(mount_idx, search_idx)
+
+    def test_detail_pane_mount_is_unchanged(self):
+        # the four-button detail-pane mount from Step 0 is untouched -- only the sidebar gained
+        # a new mount, nothing was renamed or removed.
+        self.assertIn("<div id=ext_launch></div>", self.html)
+        self.assertIn("<div id=ext_run></div>", self.html)
+        self.assertIn("<div id=ext_vt></div>", self.html)
 
 
 class TestRouteRegistered(unittest.TestCase):
