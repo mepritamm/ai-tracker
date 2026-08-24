@@ -15,7 +15,7 @@ the source badge distinguishes the IDE — mirrors Claude's per-surface
 import glob, json, os, time, urllib.parse
 from .. import config
 from ..store import load_titles, load_notes, _load_json
-from ..util import _first_line, push_when, _window, _git_branch
+from ..util import _first_line, push_when, _window, _git_branch, safe_path_component
 from .base import Provider
 
 
@@ -182,6 +182,13 @@ def _parse(kind, prefix, src_label, sid):
     rest = sid[len(prefix):]
     ws, _, uu = rest.partition(":")
     if not ws or not uu:
+        return None
+    # both components are untrusted, straight from the URL, and get joined into a
+    # filesystem path below (aug_dir, ws_json) — reject a traversal/separator/glob
+    # payload here rather than letting it reach os.path.join. Same seam Auggie uses.
+    ws = safe_path_component(ws)
+    uu = safe_path_component(uu)
+    if ws is None or uu is None:
         return None
     root = _ide_root(kind)
     aug_dir = os.path.join(root, ws, "Augment.vscode-augment")

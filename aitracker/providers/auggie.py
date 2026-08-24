@@ -1,7 +1,7 @@
 import glob, json, os, re, time
 from ..config import LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified, safe_path_component
 from ..overview import build_overview
 from ..store import load_titles, load_tasks, load_notes
 from .base import Provider
@@ -217,17 +217,11 @@ def _touch(files, path, ts, created=False):
 
 
 def _safe_session_id(session_id):
-    """Reject a session id that could escape AUGGIE_SESSIONS once joined into a
-    filesystem path (`../../etc/passwd`-style traversal, an absolute path smuggled
-    in, or a NUL byte) — the id portion of `auggie:<id>` is untrusted, sourced
-    straight from the URL. Legit ids are bare filenames with no separators."""
-    if not session_id or "\x00" in session_id:
-        return None
-    if "/" in session_id or "\\" in session_id or os.sep in session_id:
-        return None
-    if (os.altsep and os.altsep in session_id) or ".." in session_id:
-        return None
-    return session_id
+    """Thin alias for the shared seam sanitiser (aitracker.util.safe_path_component)
+    — kept so the existing call sites/tests in this module read naturally. The real
+    logic (and its rationale) lives at the seam so every provider shares one
+    implementation instead of forking it."""
+    return safe_path_component(session_id)
 
 
 def _load_auggie(session_id):

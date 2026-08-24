@@ -3,6 +3,34 @@ import datetime, difflib, os, re, subprocess
 from .config import LIVE_WINDOW
 
 
+def safe_path_component(s):
+    """Reject a URL-sourced id that could escape its intended directory once joined
+    into a filesystem path (`../../etc/passwd`-style traversal, an absolute path or
+    separator smuggled in, a NUL byte) — the id portion of a namespaced sid
+    (`auggie:<id>`, `augment-vscode:<ws>:<uuid>`, a bare Claude session id, …) is
+    untrusted, sourced straight from the URL. Also rejects glob metacharacters
+    (`*?[]`): a provider that reaches its lookup via glob.glob() would otherwise
+    honour them and disclose an arbitrary sibling session instead of 404ing. Every
+    real id across every provider is a bare filename/uuid with no separators, dots-
+    run, or glob syntax, so this rejects nothing legitimate. Returns the id
+    unchanged if safe, else None — callers treat None as "not found", never raise.
+
+    This is the shared seam: every provider must call this instead of writing its
+    own copy — see aitracker/providers/auggie.py and augment_ext.py.
+    """
+    if not s or "\x00" in s:
+        return None
+    if "/" in s or "\\" in s or os.sep in s:
+        return None
+    if os.altsep and os.altsep in s:
+        return None
+    if ".." in s:
+        return None
+    if any(c in s for c in "*?[]"):
+        return None
+    return s
+
+
 def _dur(a, b):
     if not (a and b):
         return ""

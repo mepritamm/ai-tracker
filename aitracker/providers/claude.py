@@ -1,7 +1,7 @@
 import glob, json, os, re, time
 from ..config import EDIT_TOOLS, LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified as _unified
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified as _unified, safe_path_component
 from ..overview import build_overview
 from ..store import load_titles, load_tasks, load_notes
 from .base import Provider
@@ -9,6 +9,14 @@ from .base import Provider
 
 def find_session(sid):
     sid = sid.strip().replace(".jsonl", "")
+    # sid is URL-sourced and lands straight in a glob.glob() pattern below — unlike a
+    # plain path join, glob also honours `*`/`?`/`[...]`, so an unsanitised sid can
+    # both traverse (`../../etc/passwd`) AND disclose an arbitrary sibling session
+    # (sid="*" matches literally any session in any project dir). Real Claude
+    # session ids are bare uuids, so this rejects nothing legitimate.
+    sid = safe_path_component(sid)
+    if sid is None:
+        return None
     hits = glob.glob(os.path.join(config.PROJECTS, "*", sid + ".jsonl"))
     return hits[0] if hits else None
 
