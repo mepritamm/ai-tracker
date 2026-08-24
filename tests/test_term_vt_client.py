@@ -778,5 +778,101 @@ class TestAsyncNoticesMovedOutOfPane(unittest.TestCase):
                       "notices must be flex items with fixed height, not flex: 1")
 
 
+class TestCapReclaimBlock(unittest.TestCase):
+    """Hitting the concurrent-terminal cap must be recoverable from the browser: the 429 body
+    names the ttys holding the slots, and the modal offers a kill-and-retry per row. Before this,
+    the only exit was waiting out the 30-minute IDLE_TIMEOUT."""
+
+    def setUp(self):
+        self.js = _read("ext_vt.js")
+        self.css = _read("ext_vt.css")
+
+    def test_429_takes_the_reclaim_branch_not_the_dead_end_string(self):
+        body = _body_until(self.js, "function openVT(", ["window.ExtVT ="])
+        self.assertIn("res.status === 429", body)
+        self.assertIn("renderCapBlock(sid, mode, res.j, gen)", body)
+
+    def test_reclaim_rows_post_to_the_close_route_and_retry_the_open(self):
+        block = _body_until(self.js, "function renderCapBlock(", ["function openVT("])
+        self.assertIn('"/api/term/close"', block)
+        self.assertIn('JSON.stringify({ tty: t.tty })', block)
+        self.assertIn("openVT(sid, mode)", block)
+
+    def test_the_retry_does_not_reopen_a_dismissed_or_superseded_modal(self):
+        """The retry is on a 250ms timer, so it must re-check on the way in: the user may have
+        closed the modal (don't re-open it behind their back) or switched to another session
+        (don't hijack it back). Same supersede discipline as openVT's own activeSid guard."""
+        block = _body_until(self.js, "function renderCapBlock(", ["function openVT("])
+        self.assertIn("if (gen !== openGen) return;", block)
+        self.assertIn('overlay.style.display === "none"', block)
+
+    def test_one_click_latches_the_whole_block_not_just_its_own_button(self):
+        """Each click schedules its own retry, and openVT's destroy() closes the client SSE
+        WITHOUT killing the pty it replaces. So two clicks would attach two terminals and orphan
+        the first one viewer-less for the full IDLE_TIMEOUT — freeing two slots and immediately
+        re-filling them. The latch must cover every row, and lift again only on failure."""
+        block = _body_until(self.js, "function renderCapBlock(", ["function openVT("])
+        self.assertIn('wrap.querySelectorAll(".vtcapx")', block)
+        self.assertNotIn("x.disabled = true;", block)     # per-button latch is the bug
+        self.assertIn("b.disabled = true;", block)
+        self.assertIn("var unlatch = function ()", block)
+        self.assertIn(".catch(unlatch)", block)
+
+    def test_a_superseded_open_hands_its_pty_back_instead_of_leaking_it(self):
+        """openVT's supersede branch used to drop a tty the server had already spawned: live,
+        viewer-less and invisible for the full IDLE_TIMEOUT. Reached most easily from the cap
+        block itself — the user frees a slot, dismisses the modal mid-retry, and silently gains a
+        hidden terminal instead. The abandon path must close what it abandons."""
+        body = _body_until(self.js, "function openVT(", ["window.ExtVT ="])
+        i = body.index("if (gen !== openGen) {")
+        supersede = body[i:body.index("if (!res.ok", i)]      # just the supersede branch
+        self.assertIn('"/api/term/close"', supersede)
+        self.assertIn("tty: res.j.tty", supersede)
+
+    def test_supersede_is_keyed_on_a_generation_not_on_the_session_id(self):
+        """`activeSid !== sid` cannot see a SAME-session supersede — two opens for one sid, or two
+        modes. Both responses passed it, both attached, and the second overwrote the first
+        terminal without closing its SSE, so pt.viewers never returned to 0 and the server could
+        not idle-reap that pty for the life of the tab. A counter cannot miss that case."""
+        self.assertIn("var openGen = 0;", self.js)
+        body = _body_until(self.js, "function openVT(", ["window.ExtVT ="])
+        self.assertIn("var gen = ++openGen;", body)
+        self.assertIn("if (gen !== openGen) {", body)
+        self.assertNotIn("if (activeSid !== sid) return;", body)   # the guard this replaced
+
+    def test_dismissing_the_modal_invalidates_an_in_flight_open(self):
+        """The regression the generation token could have introduced. `activeSid !== sid` got this
+        for free — closeVT nulls activeSid — so an open still in flight when the user hits Escape
+        was dropped. A counter loses that unless closeVT bumps it, and without the bump the
+        response would attach a terminal AND an SSE behind a hidden overlay, pinning a live pty
+        with a viewer nobody can see or reach."""
+        close_body = _body_until(self.js, "function closeVT(", ["function openNewTab("])
+        self.assertIn("openGen++;", close_body)
+
+    def test_cap_message_is_the_servers_text_not_a_client_copy_of_the_number(self):
+        """Conventions rule 5: the client renders server policy, never re-derives it. The cap
+        number must appear nowhere in the JS."""
+        block = _body_until(self.js, "function renderCapBlock(", ["function openVT("])
+        self.assertIn("j.error", block)
+        for hardcoded in ("max 4", "max 12", "MAX_TERMS", "MAX_PTYS"):
+            self.assertNotIn(hardcoded, self.js)
+
+    def test_reclaim_rows_are_usable_on_phone_and_tablet(self):
+        """No fixed widths, no host gating -- the cap is hit from a tunnelled phone as readily as
+        from localhost desktop, and the kill button must stay tappable there."""
+        self.assertIn(".vtcaprow {", self.css)
+        self.assertIn("min-width: 0;", self.css)          # the label ellipsises instead of overflowing
+        self.assertIn("text-overflow: ellipsis;", self.css)
+        self.assertIn(".vtcapx {", self.css)
+        self.assertIn("min-height: 28px;", self.css)      # a real tap target
+        self.assertNotIn("location.hostname", self.js)
+
+    def test_reclaim_block_survives_into_the_served_page(self):
+        page = build_page()
+        self.assertIn("renderCapBlock", page)
+        self.assertIn("/api/term/close", page)
+        self.assertIn(".vtcapx", page)
+
+
 if __name__ == "__main__":
     unittest.main()

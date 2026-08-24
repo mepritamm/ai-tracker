@@ -1170,7 +1170,13 @@ DEFAULT_COLS, DEFAULT_ROWS = 100, 30
 MIN_COLS, MAX_COLS = 20, 500
 MIN_ROWS, MAX_ROWS = 5, 200
 
-MAX_PTYS = 4            # concurrent shells -- each pins a Screen grid + a reader thread
+# The concurrent-shell cap now lives in config (TRACKER_MAX_TERMS, default 12) -- referenced
+# late-bound as `config.MAX_TERMS` at the check site, never copied into a module constant here, so
+# tests and callers see one source of truth (CLAUDE.md's "overridable paths are late-bound via
+# config.NAME"). Each live PTY still pins a Screen grid + a reader thread + a forked child, which
+# is why a cap exists at all; what changed is that 4 was far below what this app is FOR (watching
+# several concurrent AI sessions), and that hitting it is no longer a dead end -- see open_pty's
+# 429 branch and close_pty() below.
 MAX_STREAMS = 24         # concurrent SSE /api/term/screen connections, across all PTYs -- see
                           # term_run.stream's docstring for the thread-exhaustion measurement this
                           # cap exists to prevent (same ThreadingHTTPServer, same failure mode).
@@ -1279,6 +1285,14 @@ class Pty:
                                     # backstop retry is necessarily before this flips True
                                     # -- see open_pty()'s docstring for how that's surfaced
                                     # instead (a note fed straight into the terminal).
+        self.closing = False       # the user asked for this pty to go away (close_pty). Checked
+                                    # by _resume_backstop, which must never resurrect a pty that
+                                    # was deliberately closed -- `rc == -SIGKILL` alone is only a
+                                    # PROXY for that intent and misses the case where the child
+                                    # had ALREADY exited non-zero when the ✕ was clicked (kill()
+                                    # no-ops on a done pty, so rc stays 1 and looks like the CLI
+                                    # refusing). Write-once, never cleared: a closed pty is never
+                                    # reopened, only replaced. See close_pty().
         self.notice = None         # human-readable warning set by _resume_backstop on the
                                     # missing-transcript case; same late-availability caveat
         self.notices = collections.deque(maxlen=NOTICE_QUEUE_MAX)   # ordered {"seq","text"}
@@ -1486,6 +1500,13 @@ def _live_count():
     return sum(1 for p in PTYS.values() if not p.done)
 
 
+def _live_list():
+    """The live PTYs as plain dicts, oldest first -- what `open_pty()`'s 429 hands back so the
+    client can show WHICH terminals hold the slots and close one. Call under `_LOCK`."""
+    return [{"tty": p.id, "cmd": p.cmd, "cwd": p.cwd, "started": p.started}
+            for p in sorted(PTYS.values(), key=lambda p: p.started) if not p.done]
+
+
 def _reap():
     """Drop finished PTYs older than `_REAP_LINGER` so PTYS cannot grow without bound. Called from
     EVERY route, not just `open_pty()` -- see term_run._reap_old's docstring for why an
@@ -1608,12 +1629,46 @@ def _retry_with_fork(pt, sid, cols, rows):
     print("[ai-tracker] terminal %s: resume refusal backstop fired for session %s -- "
           "retrying with --fork-session" % (pt.id, sid))
     pid, fd = _fork_child(pt.cwd, argv, cols, rows)
-    with pt.lock:
-        pt.screen = Screen(cols=cols, rows=rows)
-    pt.pid, pt.fd = pid, fd
-    pt.cmd = " ".join(argv)
-    pt.done, pt.rc, pt.ended = False, None, 0.0
-    pt.forked = True
+    screen = Screen(cols=cols, rows=rows)     # allocate before the lock; it touches nothing shared
+    # MUTUAL EXCLUSION, not another re-check. `close_pty` and this swap are two check-then-act
+    # sequences over the same two fields, and every version of this guarded by an extra check just
+    # moved the window: the caller's `not pt.closing`, then a re-check after `_fork_child`, then
+    # the ~12us between that re-check and `done = False`. In each one `pt.done` is still True, so
+    # `close_pty` sets `closing`, reads `done`, and takes the {"closed": false} NO-KILL branch --
+    # and the swap commits behind it, handing an already-closed pty a fresh --fork-session child.
+    # A fourth check would only make the window smaller again.
+    #
+    # So both sides run their read-decide-write under `_LOCK` instead, and whichever gets there
+    # first wins deterministically:
+    #   close first  -> `closing` is set, this block abandons the fork, the pty stays dead.
+    #   swap first   -> `done` is False by the time close_pty looks, so it takes the KILL branch
+    #                    and kills the child we just forked.
+    # Either order frees the slot. (`pt.lock` nests inside `_LOCK` here; no path in this module
+    # takes them the other way round -- every `with pt.lock` block closes before any `with _LOCK`.)
+    with _LOCK:
+        abandoned = pt.closing
+        if not abandoned:
+            with pt.lock:
+                pt.screen = screen
+            pt.pid, pt.fd = pid, fd
+            pt.cmd = " ".join(argv)
+            pt.done, pt.rc, pt.ended = False, None, 0.0
+            pt.forked = True
+    if abandoned:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except (ChildProcessError, OSError):
+            pass
+        print("[ai-tracker] terminal %s: retry abandoned -- closed while forking" % pt.id)
+        return
     _feed_note(pt, "[ai-tracker] note: the resume was refused as a running background agent; "
                    "retried automatically with --fork-session -- this is now a COPY under a "
                    "new session id, not the live agent")
@@ -1659,7 +1714,21 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
                 print("[ai-tracker] terminal %s: missing-transcript notice fired for session %s"
                       % (pt.id, sid))
             if (not already_forked and pt.done and pt.rc not in (0, None)
+                    and not pt.closing and pt.rc != -signal.SIGKILL
                     and term_gate.looks_like_bg_refusal(text)):
+                # Two guards, because they catch different actors, and the intent one is the
+                # load-bearing half:
+                #   `pt.closing` -- the user clicked ✕ to free a capacity slot. This is INTENT,
+                #     and it holds whether or not the kill did anything: `Pty.kill()` no-ops on an
+                #     already-`done` pty, so a close arriving just after the child's own non-zero
+                #     exit leaves `rc = 1`, indistinguishable from a refusal by rc alone.
+                #   `rc == -SIGKILL` -- WE killed it and nobody set `closing`: `_reader`'s idle
+                #     reap. (Unreachable in practice -- IDLE_TIMEOUT is 1800s and this window is
+                #     2.5s -- but the reaper is a real second killer, so it gets a real guard.)
+                # Without these the backstop reads a deliberate kill as the CLI refusing and
+                # RESURRECTS the pty it was just told to destroy: _retry_with_fork resets `done`
+                # back to False and forks a --fork-session child nobody asked for, so close
+                # returns 200 while the slot never frees.
                 _retry_with_fork(pt, sid, cols, rows)
                 return
             if pt.done and grace_until is None:
@@ -1766,8 +1835,15 @@ def open_pty(handler, parsed, body):
             return handler._json({"error": "cwd does not exist or is not a directory"}, 400)
     with _LOCK:
         _reap()
-        if _live_count() >= MAX_PTYS:
-            return handler._json({"error": "too many running terminals (max %d)" % MAX_PTYS}, 429)
+        if _live_count() >= config.MAX_TERMS:
+            # Ride the list of slot-holders on the 429 itself rather than making the client ask a
+            # second route for it: this response IS the only moment that list is wanted, and it is
+            # the same "server-owned policy handed to the client on the response that already
+            # exists" move the `renderer` field below makes. Without it the cap is a dead end --
+            # closeVT() only detaches, so the slots are held by terminals the user cannot see,
+            # cannot name and cannot reclaim short of waiting out IDLE_TIMEOUT.
+            return handler._json({"error": "too many running terminals (max %d)" % config.MAX_TERMS,
+                                  "terminals": _live_list()}, 429)
     cols = _clamp_int(body.get("cols"), MIN_COLS, MAX_COLS, DEFAULT_COLS)
     rows = _clamp_int(body.get("rows"), MIN_ROWS, MAX_ROWS, DEFAULT_ROWS)
     forked = False
@@ -1882,6 +1958,44 @@ def keys(handler, parsed, body):
     except OSError as e:
         return handler._json({"error": "write failed: %s" % e}, 500)
     handler._json({"ok": True})
+
+
+def close_pty(handler, parsed, body):
+    """POST /api/term/close {tty} -> {ok: true, closed: bool}.
+
+    The reclaim half of the cap. Until this existed the ONLY way a slot came back was
+    `IDLE_TIMEOUT` (30 min) or the child exiting on its own -- and since the modal's ✕ (`closeVT`)
+    deliberately only detaches so you can reattach the same tty later, a user who closed four
+    modals was holding four slots they had no way to see or release. Same `term_gate.guard` as
+    every other route: killing a shell this server started is exactly as privileged as typing
+    `exit` into it, which `keys` above already allows.
+
+    `Pty.kill()` SIGKILLs the whole process group; the reader thread notices EOF and runs
+    `finish()`, which is what actually flips `done` and frees the slot -- so this does NOT touch
+    `PTYS` or `done` itself (single-writer discipline, see `_reader`). An already-finished tty is
+    a no-op success, not a 404: the caller's intent ("make this slot go away") is satisfied.
+    """
+    if not term_gate.guard(handler):
+        return
+    if not isinstance(body, dict):
+        return handler._json({"error": "bad body: expected a JSON object"}, 400)
+    tid = body.get("tty") or ""
+    with _LOCK:
+        _reap()
+        pt = PTYS.get(tid)
+        if pt is not None:
+            # `closing` is set and `done` is read in ONE critical section, under the same lock
+            # `_retry_with_fork` commits its swap beneath -- see the mutual-exclusion comment
+            # there. Split them and the backstop can resurrect this pty in the gap: it would see
+            # `done` still True, take the no-kill branch below, and get a fresh child anyway.
+            pt.closing = True
+            was_done = pt.done
+    if pt is None:
+        return handler._json({"error": "no such terminal"}, 404)
+    if was_done:
+        return handler._json({"ok": True, "closed": False})
+    pt.kill()                       # the syscall itself needs no lock; the decision did
+    handler._json({"ok": True, "closed": True})
 
 
 def resize_pty(handler, parsed, body):
@@ -2468,6 +2582,7 @@ server.EXTRA_POST["/api/term/pty"] = open_pty
 server.EXTRA_POST["/api/term/keys"] = keys
 server.EXTRA_POST["/api/term/resize"] = resize_pty
 server.EXTRA_POST["/api/term/inject"] = inject
+server.EXTRA_POST["/api/term/close"] = close_pty
 server.EXTRA_GET["/api/term/screen"] = screen_stream
 server.EXTRA_GET["/api/term/scrollback"] = term_scrollback
 server.EXTRA_GET["/api/term/renderer"] = renderer_info

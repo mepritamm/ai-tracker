@@ -940,6 +940,13 @@
   var activeTerm = null, activeTty = null, activeSid = null, activeMode = null, activeBar = null;
   var activeRenderer = null;   // "grid" | "xterm" -- server-owned (see openVT below), never guessed
   var activeForked = false, activeNotice = null;   // forked/notice from POST /api/term/pty response
+  var openGen = 0;   // bumped by every openVT(); an in-flight open whose generation is stale has
+                      // been superseded. Supersedes the older `activeSid !== sid` test, which could
+                      // not see a SAME-session supersede (two opens for one sid, or two modes):
+                      // both responses passed it, both attached, and the first terminal's SSE was
+                      // never closed -- so pt.viewers never returned to 0 and the server could not
+                      // idle-reap that pty for the life of the tab. A counter cannot miss a case
+                      // the way an identity comparison can.
   var modalForkChip = null, modalNoticeEl = null;   // UI elements for forked status and notice
 
   function buildOverlay(mount) {
@@ -1245,6 +1252,70 @@
     if (this.el && this.el.parentNode) this.el.parentNode.removeChild(this.el);
   };
 
+  // The cap is a slot problem, not a wall: show what is holding the slots and let the user free
+  // one. `j` is the 429 body from POST /api/term/pty -- {error, terminals:[{tty,cmd,cwd,started}]}.
+  // The error text and the cap number are the SERVER's (conventions rule 5); nothing here
+  // re-derives them. Closing a row re-runs openVT(sid, mode), so a successful reclaim lands
+  // straight in the terminal the user asked for.
+  function renderCapBlock(sid, mode, j, gen) {
+    var now = Date.now() / 1000;
+    var wrap = document.createElement("div");
+    wrap.className = "empty vtempty vtcap";
+    var head = document.createElement("div");
+    head.className = "vtcaphead";
+    head.textContent = j.error + " — close one to free a slot:";
+    wrap.appendChild(head);
+    j.terminals.forEach(function (t) {
+      var row = document.createElement("div");
+      row.className = "vtcaprow";
+      var mins = Math.max(0, Math.round((now - (t.started || now)) / 60));
+      var label = document.createElement("span");
+      label.className = "vtcaplabel";
+      label.textContent = (t.cmd || "shell") + "  ·  " + (t.cwd || "") + "  ·  " + mins + "m";
+      label.title = t.tty;
+      var x = document.createElement("button");
+      x.className = "vtcapx";
+      x.textContent = "✕";
+      x.title = "kill this terminal";
+      x.onclick = function () {
+        // Latch the WHOLE block, not just this button. Freeing two slots is the natural move when
+        // you want headroom, but each click schedules its own retry and each retry calls openVT
+        // again -- and openVT's destroy() only closes the client's SSE, it never kills the pty it
+        // is replacing. Two clicks would therefore attach two terminals, orphan the first one
+        // viewer-less for the full 30-minute IDLE_TIMEOUT, and recreate the exact cap this block
+        // exists to clear. One click, one retry.
+        var unlatch = function () {
+          Array.prototype.forEach.call(wrap.querySelectorAll(".vtcapx"),
+                                       function (b) { b.disabled = false; });
+        };
+        Array.prototype.forEach.call(wrap.querySelectorAll(".vtcapx"),
+                                     function (b) { b.disabled = true; });
+        fetch("/api/term/close", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tty: t.tty })
+        }).then(function (r) {
+          if (!r.ok) { unlatch(); return; }
+          // The slot frees on the reader thread noticing EOF, not on this response, so give it a
+          // beat before retrying rather than racing straight into another 429. Re-check on the
+          // way in: in those 250ms the user may have closed the modal (don't re-open it behind
+          // their back) or opened anything else at all (don't hijack it back to this one). The
+          // generation check covers both a different session and a different mode on the same
+          // one, which is exactly the case an `activeSid` comparison cannot see.
+          setTimeout(function () {
+            if (gen !== openGen) return;
+            if (!overlay || overlay.style.display === "none") return;
+            openVT(sid, mode);
+          }, 250);
+        }).catch(unlatch);
+      };
+      row.appendChild(label);
+      row.appendChild(x);
+      wrap.appendChild(row);
+    });
+    modalBodyEl.innerHTML = "";
+    modalBodyEl.appendChild(wrap);
+  }
+
   function openVT(sid, mode) {
     if (!sid) return;
     var mount = document.getElementById("ext_vt");
@@ -1255,6 +1326,7 @@
     activeTty = null;
     activeSid = sid;
     activeMode = mode;
+    var gen = ++openGen;             // this open's identity; see openGen's declaration above
 
     modalTitleEl.textContent = "Terminal — " + (mode === "resume" ? "resume · " : "") + sid;
     modalStatusEl.textContent = "connecting…";
@@ -1274,9 +1346,34 @@
         body: JSON.stringify({ session: sid, cols: m.cols, rows: m.rows, mode: mode })
       }).then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; }); })
         .then(function (res) {
-          if (activeSid !== sid) return;          // superseded by a later open() while this was in flight
+          if (gen !== openGen) {
+            // Superseded by a later open() while this was in flight — generation, not `activeSid`,
+            // because a same-session supersede (two opens for one sid, or two modes) leaves
+            // activeSid equal and would slip through. Dropping the response used to LEAK the pty
+            // the server had already spawned for us: live, viewer-less and invisible until
+            // IDLE_TIMEOUT — or, in the same-sid case, forever, since a second attach overwrote
+            // the first terminal without closing its SSE, pinning pt.viewers above 0 so the idle
+            // reap could never fire. Harmless-looking until you arrive here from the capacity
+            // block, where the user is actively trying to free slots and would silently gain a
+            // hidden one instead. Now that /api/term/close exists, handing it back is one call.
+            // Fire-and-forget: nothing is left to render.
+            if (res.ok && res.j && res.j.tty) {
+              fetch("/api/term/close", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ tty: res.j.tty })
+              }).catch(function () {});
+            }
+            return;
+          }
           if (!res.ok || !res.j || !res.j.tty) {
             modalStatusEl.textContent = "";
+            // 429 is the one failure the user can actually fix from here: the server tells us
+            // WHICH terminals hold the slots, so offer a ✕ per row that frees one and retries,
+            // instead of a dead-end string. Everything else stays a plain message.
+            if (res.status === 429 && res.j && res.j.terminals && res.j.terminals.length) {
+              renderCapBlock(sid, mode, res.j, gen);
+              return;
+            }
             modalBodyEl.innerHTML = '<div class="empty vtempty">' + esc(
               (res.j && res.j.error) ||
               (res.status === 403
@@ -1326,7 +1423,9 @@
           term.attach();
         })
         .catch(function (e) {
-          if (activeSid !== sid) return;
+          if (gen !== openGen) return;   // same generation test as the success path: a superseded
+                                          // failure must not overwrite the current modal either.
+                                          // Nothing to hand back here -- no pty was ever created.
           modalStatusEl.textContent = "";
           modalBodyEl.innerHTML = '<div class="empty vtempty">failed to reach the server: ' + esc(String(e)) + "</div>";
         });
@@ -1334,6 +1433,13 @@
   }
 
   function closeVT() {
+    // Dismissing counts as a supersede, so bump the generation. The old `activeSid !== sid` guard
+    // got this for free -- closeVT nulls activeSid -- and switching to a counter would silently
+    // lose it: an open still in flight when the user hits Escape would pass `gen === openGen`,
+    // attach a terminal and an SSE behind a now-hidden overlay, and leave a live pty pinned by a
+    // viewer nobody can see. The in-flight response instead takes openVT's supersede branch and
+    // hands its pty back.
+    openGen++;
     if (overlay) overlay.style.display = "none";
     if (activeTerm) { activeTerm.destroy(); activeTerm = null; }
     if (activeBar) { activeBar.destroy(); activeBar = null; }
