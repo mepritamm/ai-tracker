@@ -680,6 +680,76 @@ class TestServerEndToEnd(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertEqual(_texts(j), ["note"])
 
+    # -- the sidebar's session-less terminal picker: GET /api/term/cwds, POST /api/term/pty
+    # with {cwd, mode} and no `session` at all -- see term_vt.term_cwds/open_pty's docstrings.
+
+    def _write_claude_session_at(self, sid, cwd, mtime=None):
+        """A minimal Claude session file with a REAL, existing `cwd` -- unlike the module-level
+        `_write_claude()` helper (which hardcodes cwd="/x"), /api/term/cwds requires the
+        directory to actually exist on disk, so this points it at a real one."""
+        d = os.path.join(config.PROJECTS, "proj-" + sid)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, sid + ".jsonl")
+        with open(path, "w") as fh:
+            fh.write(json.dumps({"type": "user", "cwd": cwd,
+                                  "message": {"role": "user", "content": "go"}}) + "\n")
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def test_term_cwds_live_lists_real_existing_dirs_most_recent_first(self):
+        """GET /api/term/cwds over real HTTP -- built from registry.all_sessions() (the shared
+        seam, conventions rule 3), most-recently-used first, dropping a cwd that no longer
+        exists on disk."""
+        old_dir = tempfile.mkdtemp()
+        new_dir = tempfile.mkdtemp()
+        gone_dir = tempfile.mkdtemp()
+        os.rmdir(gone_dir)          # a cwd that no longer exists on disk
+        now = time.time()
+        self._write_claude_session_at("s-old", old_dir, now - 100)
+        self._write_claude_session_at("s-new", new_dir, now - 10)
+        self._write_claude_session_at("s-gone", gone_dir, now - 1)
+
+        st, body = self._get("/api/term/cwds")
+        self.assertEqual(st, 200)
+        cwds = json.loads(body)["cwds"]
+        real_paths = [os.path.realpath(c["path"]) for c in cwds]
+
+        self.assertIn(os.path.realpath(new_dir), real_paths)
+        self.assertIn(os.path.realpath(old_dir), real_paths)
+        self.assertNotIn(os.path.realpath(gone_dir), real_paths)   # dropped: no longer exists
+        idx = {p: i for i, p in enumerate(real_paths)}
+        self.assertLess(idx[os.path.realpath(new_dir)], idx[os.path.realpath(old_dir)])  # newest first
+
+    def test_open_pty_cwd_form_live_spawns_in_the_given_directory(self):
+        """POST /api/term/pty accepts {cwd, mode} with NO `session` at all -- proven end-to-end
+        over a real HTTP round trip, not just the unit-level _FakeHandler calls in
+        test_term_vt.py: the spawned shell's own `Pty.cwd` is exactly the directory asked for."""
+        from aitracker import term_vt
+        d = tempfile.mkdtemp()
+        st, j = self._post("/api/term/pty", {"cwd": d, "cols": 40, "rows": 10, "mode": "cwd"})
+        self.assertEqual(st, 200)
+        pt = term_vt.PTYS.get(j["tty"])
+        try:
+            self.assertIsNotNone(pt)
+            self.assertEqual(pt.cwd, d)
+        finally:
+            if pt is not None:
+                pt.kill()          # real spawned shell -- don't leak the process
+
+    def test_open_pty_cwd_form_live_rejects_bad_paths_and_bare_resume(self):
+        st, j = self._post("/api/term/pty", {"cwd": "/no/such/ai-tracker-test-dir", "mode": "cwd"})
+        self.assertEqual(st, 400)
+
+        f = tempfile.mktemp()
+        open(f, "w").write("x")
+        st, j = self._post("/api/term/pty", {"cwd": f, "mode": "cwd"})   # a file, not a directory
+        self.assertEqual(st, 400)
+
+        st, j = self._post("/api/term/pty", {"cwd": tempfile.mkdtemp(), "mode": "resume"})
+        self.assertEqual(st, 400)          # resume is meaningless without a session
+        self.assertIn("session", j["error"])
+
 
 class TestBasicAuth(unittest.TestCase):
     """config.AUTH gates every route with HTTP Basic Auth; empty (default) lets all through."""

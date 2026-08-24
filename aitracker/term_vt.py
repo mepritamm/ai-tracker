@@ -1590,6 +1590,7 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
 
 def open_pty(handler, parsed, body):
     """POST /api/term/pty {session, cols, rows, mode} -> {tty, renderer, forked, notice}.
+    Also accepts a SESSION-LESS form: {cwd, cols, rows, mode} -- see "Two ways in" below.
 
     `mode` follows term_launch's own naming (`"cwd"` = a plain login shell in the session's
     working directory; `"resume"` = `claude --resume <sid>` (see `term_gate.resume_argv` for
@@ -1598,6 +1599,43 @@ def open_pty(handler, parsed, body):
     consistent with Tier 1's. `"resume"` is refused for a non-Claude session id, exactly like
     term_launch.open_terminal -- see `_is_claude`. `"new"` is accepted for any session id (Claude
     or Auggie/etc.) because it merely borrows the working directory to start a fresh conversation.
+
+    ## Two ways in: `session` or `cwd`
+
+    The sidebar's "+ New terminal"/"+ New Claude session" buttons live ABOVE the session list --
+    no session is necessarily selected there, so the caller supplies a directory directly instead:
+
+        {cwd: "<path>", cols, rows, mode}      # mode is "cwd" or "new" -- see below
+
+    versus the original, still-unchanged session-scoped form:
+
+        {session: "<id>", cols, rows, mode}    # mode is "cwd", "resume" or "new"
+
+    Which form is used is decided purely by whether `session` is present in the body -- a
+    truthy `session` always takes the ORIGINAL path (cwd is resolved from the session via
+    `term_gate.session_cwd`, exactly as before this capability existed); an absent/empty
+    `session` takes the NEW path (`cwd` is taken from the body directly). `mode="resume"`
+    always requires a session -- there is no such thing as "resume" without knowing WHICH
+    conversation to resume, so a session-less `mode="resume"` request is rejected with a plain
+    400 rather than silently falling back to something else.
+
+    ## Validating a caller-supplied `cwd` -- what this check is, and what it is NOT
+
+    Accepting a caller-supplied `cwd` here grants NO new capability: `mode="cwd"`/`"new"` already
+    hand the caller an unrestricted interactive shell (see the module docstring's "unrestricted
+    shell" section), and the very first thing a user can type into it is `cd /anywhere` -- so a
+    path supplied at open-time is not a privilege boundary, and this function does not treat it
+    as one. There is deliberately NO allowlist of "permitted" directories here; building one would
+    be security theatre over a shell that can walk out of it in one keystroke, and would only
+    slow down (never stop) the one caller this gate actually restricts, which is the
+    unauthenticated/wrong-origin one `term_gate.guard()` already rejects above.
+
+    What the check below IS for: catching a typo or a stale path before it wastes a shell slot
+    and lands the user somewhere they didn't intend. `os.path.expanduser` resolves a leading `~`
+    (the browser has no shell to do that expansion for us), and `os.path.isdir` requires the
+    result to exist AND be a directory, not e.g. a regular file -- both are ordinary input
+    hygiene, not a security boundary, and are rejected with a 400 rather than a 403/404 for
+    exactly that reason: this is "that input was malformed", not "you may not access this".
 
     `forked` (bool) and `notice` (str or null) are the client contract: `forked` is `--fork-
     session` was applied (this tty is a COPY, not the live session), `notice` is a human-
@@ -1622,16 +1660,26 @@ def open_pty(handler, parsed, body):
     if not isinstance(body, dict):      # do_POST accepts ANY JSON value, "a string" included
         return handler._json({"error": "bad body: expected a JSON object"}, 400)
     sid = body.get("session") or ""
-    if not sid:
-        return handler._json({"error": "session required"}, 400)
     mode = body.get("mode", "cwd")
     if mode not in ("cwd", "resume", "new"):
         return handler._json({"error": "bad mode"}, 400)
-    if mode == "resume" and not _is_claude(sid):
-        return handler._json({"error": "resume is Claude-only"}, 400)
-    cwd = term_gate.session_cwd(sid)
-    if not cwd:
-        return handler._json({"error": "session not found or its cwd no longer exists"}, 404)
+    if sid:
+        # Original, session-scoped form -- unchanged from before the cwd form existed.
+        if mode == "resume" and not _is_claude(sid):
+            return handler._json({"error": "resume is Claude-only"}, 400)
+        cwd = term_gate.session_cwd(sid)
+        if not cwd:
+            return handler._json({"error": "session not found or its cwd no longer exists"}, 404)
+    else:
+        # Session-less form: the caller supplies a directory directly (the sidebar picker).
+        if mode == "resume":
+            return handler._json({"error": "mode=resume requires a session"}, 400)
+        raw_cwd = body.get("cwd")
+        if not isinstance(raw_cwd, str) or not raw_cwd.strip():
+            return handler._json({"error": "cwd required when no session is given"}, 400)
+        cwd = os.path.expanduser(raw_cwd.strip())
+        if not os.path.isdir(cwd):
+            return handler._json({"error": "cwd does not exist or is not a directory"}, 400)
     with _LOCK:
         _reap()
         if _live_count() >= MAX_PTYS:
@@ -1661,6 +1709,66 @@ def open_pty(handler, parsed, body):
     # the response that already exists (rather than a forced extra round trip) is what lets the
     # modal open its Terminal/XtermTerminal without waiting on anything else.
     handler._json({"tty": pt.id, "renderer": config.TERM_RENDERER, "forked": forked, "notice": None})
+
+
+CWD_LIST_CAP = 20
+"""Max entries `term_cwds()` returns. The picker is a quick-pick list, not a filesystem browser --
+this is generous enough to cover "every project touched recently" on a normal machine while
+keeping the response (and the dropdown it renders into) small. Distinct working directories are
+already deduplicated before this cap is applied, so it bounds DISTINCT projects, not raw sessions."""
+
+
+def term_cwds(handler, parsed):
+    """GET /api/term/cwds -> {"cwds": [{"path", "label", "mtime"}, ...]}.
+
+    Feeds the sidebar's directory picker for the session-less "+ New terminal"/"+ New Claude
+    session" buttons (see `open_pty()`'s "Two ways in" section) -- with no session selected, the
+    picker needs SOME list of directories to offer, and the sessions this app already knows about
+    are the obvious source: every provider's `cwd` is a real, meaningful working directory a user
+    has actually worked in recently.
+
+    Landed on the SHARED SEAM (`registry.all_sessions()`, conventions rule 3) rather than reading
+    one provider's list directly -- a directory from ANY provider (Claude, Auggie, Augment
+    VSCode/Cursor) belongs in the picker equally; there is nothing Claude-specific about "start a
+    shell in a directory I recently worked in".
+
+    Distinct directories, most-recently-used first: sessions sharing a `cwd` collapse into ONE
+    entry stamped with the MOST RECENT of their `mtime`s (a directory visited by three sessions
+    ranks by the newest visit, not the oldest or a duplicate triplicate). `label` is the
+    project/basename a user would recognise at a glance -- reuses each provider's own `project`
+    field (already `os.path.basename(cwd)` in every provider, see providers/*.py) rather than
+    recomputing it, falling back to a basename of `path` itself for the one degenerate case where
+    a session's `project` came back empty. `path` is always the absolute, existing directory.
+
+    Two policies apply BEFORE ranking, both server-owned (conventions rule 5 -- the client just
+    renders what it's given):
+      - a `cwd` that no longer exists on disk (the project was deleted/moved since the session
+        ran) is dropped -- offering a directory `open_pty()`'s own validation would immediately
+        reject is worse than not listing it;
+      - the result is capped at `CWD_LIST_CAP` entries (see that constant) after ranking, so the
+        MOST RECENT directories survive the cap, not an arbitrary prefix of provider order.
+    """
+    if not term_gate.guard(handler):
+        return
+    from .registry import all_sessions   # late import: registry pulls in every provider, and this
+                                          # module is imported from server.py at startup, same
+                                          # reasoning as term_gate.session_cwd's own late import.
+    best_mtime = {}    # absolute cwd -> newest mtime seen
+    label_for = {}      # absolute cwd -> label (kept in sync with best_mtime's owner)
+    for s in all_sessions():
+        raw = (s.get("cwd") or "").strip()
+        if not raw:
+            continue
+        cwd = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.isdir(cwd):
+            continue
+        mtime = s.get("mtime") or 0
+        if cwd not in best_mtime or mtime > best_mtime[cwd]:
+            best_mtime[cwd] = mtime
+            label_for[cwd] = s.get("project") or os.path.basename(cwd.rstrip(os.sep)) or cwd
+    ranked = sorted(best_mtime.items(), key=lambda kv: -kv[1])[:CWD_LIST_CAP]
+    out = [{"path": p, "label": label_for[p], "mtime": m} for p, m in ranked]
+    handler._json({"cwds": out})
 
 
 def keys(handler, parsed, body):
@@ -2255,5 +2363,6 @@ server.EXTRA_GET["/api/term/screen"] = screen_stream
 server.EXTRA_GET["/api/term/scrollback"] = term_scrollback
 server.EXTRA_GET["/api/term/renderer"] = renderer_info
 server.EXTRA_GET["/api/term/raw"] = raw_stream
+server.EXTRA_GET["/api/term/cwds"] = term_cwds
 for _path, (_fname, _ctype) in _VENDOR_FILES.items():
     server.EXTRA_GET[_path] = (lambda h, p, fn=_fname, ct=_ctype: _serve_vendor(h, p, fn, ct))

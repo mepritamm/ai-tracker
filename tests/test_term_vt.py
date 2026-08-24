@@ -885,6 +885,98 @@ class TestRoutes(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertIn("Claude-only", obj["error"])
 
+    # -- the session-less {cwd, mode} form (no `session` in the body) --------------------
+
+    def _capture_spawn(self, tid="test-pty-cwd"):
+        """Patch term_vt.spawn to record (cwd, argv) instead of actually forking, returning a
+        fake Pty so the route completes -- same technique test_pty_new_mode_spawns_claude_with_
+        no_args already uses. Restored via addCleanup."""
+        calls = []
+        original = term_vt.spawn
+        def fake(cwd, argv, cols, rows):
+            calls.append((cwd, argv))
+            return term_vt.Pty(tid=tid)
+        term_vt.spawn = fake
+        self.addCleanup(lambda: setattr(term_vt, "spawn", original))
+        return calls
+
+    def test_pty_cwd_form_spawns_without_a_session(self):
+        """{cwd, mode} with no `session` at all -- the sidebar's session-less picker."""
+        with tempfile.TemporaryDirectory() as d:
+            calls = self._capture_spawn()
+            h = _FakeHandler()
+            term_vt.open_pty(h, None, {"cwd": d, "cols": 40, "rows": 10, "mode": "cwd"})
+            obj, code = h.calls[-1]
+            self.assertEqual(code, 200)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0], d)
+
+    def test_pty_cwd_form_mode_new_spawns_claude_with_no_args(self):
+        with tempfile.TemporaryDirectory() as d:
+            calls = self._capture_spawn()
+            h = _FakeHandler()
+            term_vt.open_pty(h, None, {"cwd": d, "mode": "new"})
+            obj, code = h.calls[-1]
+            self.assertEqual(code, 200)
+            self.assertEqual(calls[0], (d, ["claude"]))
+
+    def test_pty_cwd_form_expands_tilde(self):
+        """`~` in a session-less `cwd` is expanded server-side (the browser has no shell to do
+        it), same as term_gate.session_cwd's own paths are always already-absolute."""
+        calls = self._capture_spawn()
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {"cwd": "~", "mode": "cwd"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200)
+        self.assertEqual(calls[0][0], os.path.expanduser("~"))
+
+    def test_pty_cwd_form_missing_cwd_400(self):
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {"mode": "cwd"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 400)
+        self.assertIn("cwd", obj["error"])
+
+    def test_pty_cwd_form_blank_cwd_400(self):
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {"cwd": "   ", "mode": "cwd"})
+        self.assertEqual(h.calls[-1][1], 400)
+
+    def test_pty_cwd_form_nonexistent_path_400(self):
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {"cwd": "/no/such/path/ai-tracker-test-xyz", "mode": "cwd"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 400)
+        self.assertIn("directory", obj["error"])
+
+    def test_pty_cwd_form_rejects_a_file_not_a_directory(self):
+        with tempfile.NamedTemporaryFile() as f:
+            h = _FakeHandler()
+            term_vt.open_pty(h, None, {"cwd": f.name, "mode": "cwd"})
+            obj, code = h.calls[-1]
+            self.assertEqual(code, 400)
+            self.assertIn("directory", obj["error"])
+
+    def test_pty_cwd_form_resume_without_session_400(self):
+        """mode="resume" with a cwd and no session is meaningless -- rejected, not guessed at."""
+        with tempfile.TemporaryDirectory() as d:
+            h = _FakeHandler()
+            term_vt.open_pty(h, None, {"cwd": d, "mode": "resume"})
+            obj, code = h.calls[-1]
+            self.assertEqual(code, 400)
+            self.assertIn("session", obj["error"])
+
+    def test_pty_session_form_ignores_absent_cwd_field(self):
+        """The original session-scoped form still works with no `cwd` in the body at all --
+        this is the regression guard that the new branch didn't disturb the old one."""
+        term_gate.session_cwd = lambda sid: "/tmp"
+        calls = self._capture_spawn()
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {"session": "some-session", "mode": "cwd"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200)
+        self.assertEqual(calls[0][0], "/tmp")
+
     def test_keys_404s_an_unknown_tty(self):
         h = _FakeHandler()
         term_vt.keys(h, None, {"tty": "nope", "data": ""})
@@ -905,6 +997,100 @@ class TestRoutes(unittest.TestCase):
         h = _FakeHandler()
         term_vt.screen_stream(h, _Q("tty=nope"))
         self.assertEqual(h.calls[-1][1], 404)
+
+
+class TestTermCwds(unittest.TestCase):
+    """GET /api/term/cwds -- the directory list feeding the sidebar's session-less picker.
+    Landed on the shared seam (registry.all_sessions()), so these tests fake out THAT seam
+    rather than any one provider -- see term_vt.term_cwds's own docstring for the contract."""
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+
+    def _fake_sessions(self, rows):
+        """Patch aitracker.registry.all_sessions() -- term_cwds imports it by name at call
+        time (late import, same pattern as term_gate.session_cwd), so patching the module
+        attribute before calling is picked up."""
+        from aitracker import registry
+        original = registry.all_sessions
+        registry.all_sessions = lambda: rows
+        self.addCleanup(lambda: setattr(registry, "all_sessions", original))
+
+    def test_403s_when_terminal_disabled(self):
+        config.TERMINAL = False
+        h = _FakeHandler()
+        term_vt.term_cwds(h, _Q(""))
+        self.assertEqual(h.calls[-1][1], 403)
+
+    def test_empty_when_no_sessions(self):
+        self._fake_sessions([])
+        h = _FakeHandler()
+        term_vt.term_cwds(h, _Q(""))
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200)
+        self.assertEqual(obj["cwds"], [])
+
+    def test_dedupes_by_directory_keeping_the_newest_mtime_and_drops_missing_dirs(self):
+        with tempfile.TemporaryDirectory() as old_dir, tempfile.TemporaryDirectory() as new_dir:
+            gone = tempfile.mkdtemp()
+            os.rmdir(gone)     # a cwd that no longer exists on disk
+            self._fake_sessions([
+                {"cwd": old_dir, "mtime": 100, "project": "old-proj-stale"},
+                {"cwd": old_dir, "mtime": 500, "project": "old-proj"},   # same dir, NEWER -- wins both rank and label
+                {"cwd": new_dir, "mtime": 300, "project": "new-proj"},
+                {"cwd": gone, "mtime": 999},              # dropped: no longer exists
+                {"cwd": "", "mtime": 1000},                # dropped: blank cwd
+            ])
+            h = _FakeHandler()
+            term_vt.term_cwds(h, _Q(""))
+            obj, code = h.calls[-1]
+            self.assertEqual(code, 200)
+            cwds = obj["cwds"]
+            paths = [c["path"] for c in cwds]
+
+            self.assertEqual(len(paths), 2)                       # deduplicated, gone/blank dropped
+            self.assertEqual(len(paths), len(set(paths)))
+            self.assertNotIn(gone, paths)
+            # old_dir's newest visit (500) outranks new_dir's only visit (300) -- most-recent-first
+            self.assertEqual(paths, [os.path.abspath(old_dir), os.path.abspath(new_dir)])
+            by_path = {c["path"]: c for c in cwds}
+            self.assertEqual(by_path[os.path.abspath(old_dir)]["mtime"], 500)
+            self.assertEqual(by_path[os.path.abspath(old_dir)]["label"], "old-proj")
+            self.assertEqual(by_path[os.path.abspath(new_dir)]["label"], "new-proj")
+
+    def test_label_falls_back_to_basename_when_project_field_is_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._fake_sessions([{"cwd": d, "mtime": 1, "project": ""}])
+            h = _FakeHandler()
+            term_vt.term_cwds(h, _Q(""))
+            obj = h.calls[-1][0]
+            self.assertEqual(obj["cwds"][0]["label"], os.path.basename(d.rstrip(os.sep)))
+
+    def test_capped_at_cwd_list_cap_keeping_the_most_recent(self):
+        dirs = [tempfile.mkdtemp() for _ in range(term_vt.CWD_LIST_CAP + 5)]
+        try:
+            rows = [{"cwd": d, "mtime": i, "project": "p%d" % i} for i, d in enumerate(dirs)]
+            self._fake_sessions(rows)
+            h = _FakeHandler()
+            term_vt.term_cwds(h, _Q(""))
+            obj = h.calls[-1][0]
+            self.assertEqual(len(obj["cwds"]), term_vt.CWD_LIST_CAP)
+            # the highest-mtime dirs survive the cap (mtime == index here, so the tail of `dirs`)
+            kept = {c["path"] for c in obj["cwds"]}
+            expected = {os.path.abspath(d) for d in dirs[-term_vt.CWD_LIST_CAP:]}
+            self.assertEqual(kept, expected)
+        finally:
+            for d in dirs:
+                if os.path.isdir(d):
+                    os.rmdir(d)
+
+    def test_route_registered(self):
+        from aitracker import server
+        self.assertIs(server.EXTRA_GET["/api/term/cwds"], term_vt.term_cwds)
 
 
 class _StreamHandler(_FakeHandler):
