@@ -13,8 +13,6 @@
   padding: 6px 12px;
   font-size: 12px;
 }
-/* "+ New terminal" / "+ New Claude session" -- grouped with a small caption so the pair reads
-   as distinct from the "…here" and "External …" pairs at a glance, without a modifier-click. */
 .extlaunchgroup {
   display: inline-flex;
   align-items: center;
@@ -26,4 +24,124 @@
   letter-spacing: .04em;
   text-transform: uppercase;
   color: var(--muted);
+}
+
+/* Sidebar mount for the (now global) "+ New terminal" / "+ New Claude session" controls --
+   moved out of the detail pane (they never touched a session anyway) to sit immediately above
+   the "search sessions…" box, so they read as a standing "browser terminal, anywhere" action
+   rather than something tied to whatever happens to be selected. */
+#ext_launch_side {
+  margin: 0 0 12px;
+}
+#ext_launch_side:empty {
+  display: none;
+}
+.sidenewgroup {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.sidenewgroup .extlaunchbtn {
+  flex: 1 1 auto;
+  text-align: center;
+}
+
+/* ===== the directory picker ==============================================================
+   Built as a child of <body> (see ext_launch.js's buildPicker comment for why: .side gets a
+   CSS transform for its phone slide-in drawer, which would break position:fixed on anything
+   mounted inside it). Reuses .overlay/.modal/.mh/.mb/.x from app.css -- only the modal's own
+   body content below is new. */
+.cwdmodal .mb {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.cwdlistwrap .empty {
+  padding: 10px 2px;
+  color: var(--dim);
+  font-size: 12.5px;
+}
+.cwdlist {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 240px;
+  overflow: auto;
+}
+.cwditem {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  background: var(--app);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 11px;
+  cursor: pointer;
+  color: var(--text);
+  font-family: inherit;
+}
+.cwditem:hover {
+  border-color: var(--blue);
+}
+.cwdlabel {
+  font-size: 13px;
+  font-weight: 600;
+}
+.cwdpath {
+  font-size: 11px;
+  color: var(--dim);
+  font-family: 'JetBrains Mono', monospace;
+  word-break: break-all;
+}
+.cwdfreewrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.cwdfreelbl {
+  font-size: 10px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.cwdfreerow {
+  display: flex;
+  gap: 8px;
+}
+.cwdfreerow input {
+  flex: 1;
+  min-width: 0;
+  background: var(--app);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+  color: var(--text);
+  font-size: 13px;
+  font-family: 'JetBrains Mono', monospace;
+}
+.cwdfreerow input:focus {
+  outline: 0;
+  border-color: var(--blue);
+}
+.cwdfreerow #cwdfreebtn {
+  flex: 0 0 auto;
+}
+.cwderrmsg {
+  color: var(--red);
+  font-size: 12px;
+}
+@media(max-width:600px) {
+  .cwdlist {
+    max-height: 40vh;
+  }
+  .cwdfreerow {
+    flex-wrap: wrap;
+  }
+  .cwdfreerow input {
+    flex: 1 1 100%;
+  }
 }
