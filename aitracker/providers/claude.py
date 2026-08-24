@@ -1044,3 +1044,13 @@ class ClaudeProvider(Provider):
     def agent(self, sid, aid):
         path = find_session(sid)
         return agent_detail(path, aid) if path else None
+
+    def is_bg_agent(self, sid):
+        # Resolves THIS ONE sid directly (one glob via find_session + a bounded read of
+        # that single file via _session_meta), never by scanning list_sessions()'s
+        # top-N-by-mtime output — see registry.is_bg_agent, the seam term_gate.py calls,
+        # for why that distinction is the whole point. Reuses the exact classifier
+        # list_sessions()/search_sessions() already use (_is_bg_agent on _session_meta's
+        # result) so there is exactly one place that knows what a background agent is.
+        path = find_session(sid)
+        return bool(path) and _is_bg_agent(_session_meta(path))

@@ -1254,6 +1254,17 @@ class Pty:
                                     # while it tees into these), never PTYS's module-level _LOCK.
         self.done = False
         self.rc = None
+        self.forked = False        # --fork-session is in effect for THIS running child --
+                                    # either the fast path (term_gate.resume_argv) chose it
+                                    # up front, or Option C's backstop (_resume_backstop)
+                                    # retried into it after the fact. Bookkeeping only: the
+                                    # POST /api/term/pty response's "forked" field is set
+                                    # from what's known at RESPONSE time, which for a late
+                                    # backstop retry is necessarily before this flips True
+                                    # -- see open_pty()'s docstring for how that's surfaced
+                                    # instead (a note fed straight into the terminal).
+        self.notice = None         # human-readable warning set by _resume_backstop on the
+                                    # missing-transcript case; same late-availability caveat
         self.ended = 0.0           # time.time() when finish() ran; 0.0 while still live
         self.started = time.time()
         self.last_active = self.started   # last keystroke, or last viewer leaving -- idle clock
@@ -1308,8 +1319,11 @@ class Pty:
         self.ended = time.time()
 
 
-def spawn(cwd, argv, cols, rows):
+def _fork_child(cwd, argv, cols, rows):
     """pty.fork() + execvp in `cwd`, sized to (cols, rows) from the very first ioctl (rule 1).
+    Returns (pid, fd) -- the raw primitive `spawn()` wraps into a new `Pty`, and the ONE piece
+    Option C's backstop (`_resume_backstop`/`_retry_with_fork`) needs to swap a fresh child into
+    an EXISTING `Pty` (same tty id) after a refused resume, without re-deriving any of this.
 
     No shell anywhere on the "resume" path: argv is `["claude", "--resume", sid]`, executed
     directly by execvp, exactly like term_run's own no-shell policy. The "cwd" (plain shell) path
@@ -1338,6 +1352,14 @@ def spawn(cwd, argv, cols, rows):
             pass
         os._exit(127)                                    # execvp only returns on failure
     _set_winsize(fd, rows, cols)
+    return pid, fd
+
+
+def spawn(cwd, argv, cols, rows):
+    """`_fork_child` plus the bookkeeping a caller actually wants: a `Screen`, a `Pty` record,
+    and the reader thread that drains the pty into that Screen. See `_fork_child` for the
+    fork/exec details."""
+    pid, fd = _fork_child(cwd, argv, cols, rows)
     screen = Screen(cols=cols, rows=rows)
     pt = Pty(pid=pid, fd=fd, screen=screen, cwd=cwd, cmd=" ".join(argv))
     t = threading.Thread(target=_reader, args=(pt,), daemon=True)
@@ -1445,10 +1467,127 @@ def _write(handler, text):
         return False
 
 
+# ------------------------------------------------------ Option C: the resume backstop
+#
+# term_gate.resume_argv() (Option A, the fast path) appends --fork-session up front for any
+# session registry.is_bg_agent() recognises. When that classification misses -- or simply can't
+# be known, e.g. the missing-transcript case below -- the CLI's own EARLY OUTPUT is the only
+# remaining signal, and it can only arrive AFTER open_pty() has already spawned the child. Both
+# functions below therefore run in a background thread, started by open_pty() right after spawn,
+# and are the one legitimate reason a "late fork" exists: the POST /api/term/pty response (see
+# open_pty()'s own docstring) has necessarily already gone out with `forked` reflecting only the
+# fast-path decision by the time either of these could fire.
+
+BACKSTOP_WINDOW = 2.5
+"""Total seconds `_resume_backstop` watches a fresh `mode="resume"` child's output for either
+the bg-agent refusal or the missing-transcript message before giving up. The matrix
+(docs/claude-resume-command-matrix.md) found the refusal is fast enough to self-terminate
+almost immediately ("EXITED code=1", no SIGKILL needed) -- this is generous headroom over that,
+not a tuned deadline, and bounds the ONE daemon thread this spawns per resume so it can never
+run forever against a hung child."""
+
+BACKSTOP_POLL = 0.1
+"""How often `_resume_backstop` re-checks its tee'd output and `pt.done`/`pt.rc` while inside
+BACKSTOP_WINDOW -- small relative to that window so a fast refusal is noticed promptly."""
+
+BACKSTOP_DONE_GRACE = 0.3
+"""Once the child has exited, how much longer `_resume_backstop` keeps watching before giving
+up -- gives any output already in flight (queued but not yet delivered to this watcher's tee) a
+moment to arrive, without extending every ordinary (non-refused) resume's watch out to the full
+BACKSTOP_WINDOW."""
+
+
+def _feed_note(pt, text):
+    """Write a synthesized, CRLF-terminated status line straight into `pt.screen`. This is the
+    ONLY channel a LATE-firing Option-C event (see the section docstring above) has to reach a
+    viewer: the POST /api/term/pty response already went out by the time either condition below
+    can possibly be known, so the terminal's own on-screen text is what carries the explanation,
+    not a JSON field."""
+    with pt.lock:
+        pt.screen.feed(("\r\n" + text + "\r\n").encode("utf-8", "replace"))
+
+
+def _retry_with_fork(pt, sid, cols, rows):
+    """The one-shot retry itself: fork a NEW child with --fork-session (reusing term_gate.
+    resume_argv's own argv-building rather than re-deriving `["claude", "--resume", sid]`) and
+    swap it into THIS SAME `Pty` -- same tty id the client already holds, fresh `Screen`, a new
+    `_reader` thread. Called at most once per `_resume_backstop` run (that caller returns
+    immediately after this), so this itself never loops."""
+    argv = term_gate.resume_argv(sid)
+    if "--fork-session" not in argv:
+        argv.append("--fork-session")
+    # The one log line this whole backstop exists to justify: if Option A (registry.is_bg_agent)
+    # is classifying correctly, this line should NEVER print -- its presence is the detector for
+    # that classification having broken (see the module's task-level docstring in term_gate.py).
+    print("[ai-tracker] terminal %s: resume refusal backstop fired for session %s -- "
+          "retrying with --fork-session" % (pt.id, sid))
+    pid, fd = _fork_child(pt.cwd, argv, cols, rows)
+    with pt.lock:
+        pt.screen = Screen(cols=cols, rows=rows)
+    pt.pid, pt.fd = pid, fd
+    pt.cmd = " ".join(argv)
+    pt.done, pt.rc, pt.ended = False, None, 0.0
+    pt.forked = True
+    _feed_note(pt, "[ai-tracker] note: the resume was refused as a running background agent; "
+                   "retried automatically with --fork-session -- this is now a COPY under a "
+                   "new session id, not the live agent")
+    threading.Thread(target=_reader, args=(pt,), daemon=True).start()
+
+
+def _resume_backstop(pt, sid, already_forked, cols, rows):
+    """Watches a just-spawned `mode="resume"` child's raw output for up to BACKSTOP_WINDOW
+    seconds, via the SAME tee `raw_stream()` uses (`pt.raw_queues`) -- not a second read of the
+    fd. Two independent things it reacts to:
+
+    1. **The bg-agent refusal** (term_gate.looks_like_bg_refusal), only when `already_forked` is
+       False -- a session the fast path already forked can't ALSO hit this refusal (that's
+       exactly what --fork-session avoids), so there is nothing to retry. On a match (and the
+       child having actually exited non-zero -- the refusal exits immediately, per the matrix),
+       retries EXACTLY ONCE via `_retry_with_fork` and returns; this function never loops.
+    2. **The missing-transcript message** (term_gate.looks_like_missing_transcript) -- not a
+       retry trigger (the CLI already recovered on its own), just records `pt.notice` and feeds
+       a note so the terminal doesn't silently pretend the resumed transcript is the one shown.
+    """
+    q = queue.Queue(maxsize=256)
+    with pt.lock:
+        pt.raw_queues.append(q)
+    buf = bytearray()
+    notice_fired = False
+    deadline = time.time() + BACKSTOP_WINDOW
+    grace_until = None      # set once pt.done is first observed -- see BACKSTOP_DONE_GRACE
+    try:
+        while True:
+            now = time.time()
+            if now >= deadline or (grace_until is not None and now >= grace_until):
+                return
+            try:
+                buf += q.get(timeout=BACKSTOP_POLL)
+            except queue.Empty:
+                pass
+            text = bytes(buf)
+            if not notice_fired and term_gate.looks_like_missing_transcript(text):
+                notice_fired = True
+                pt.notice = ("no prior transcript was found for this session -- a brand-new "
+                              "conversation was started instead")
+                _feed_note(pt, "[ai-tracker] note: " + pt.notice)
+                print("[ai-tracker] terminal %s: missing-transcript notice fired for session %s"
+                      % (pt.id, sid))
+            if (not already_forked and pt.done and pt.rc not in (0, None)
+                    and term_gate.looks_like_bg_refusal(text)):
+                _retry_with_fork(pt, sid, cols, rows)
+                return
+            if pt.done and grace_until is None:
+                grace_until = time.time() + BACKSTOP_DONE_GRACE
+    finally:
+        with pt.lock:
+            if q in pt.raw_queues:
+                pt.raw_queues.remove(q)
+
+
 # --------------------------------------------------------------------------- routes
 
 def open_pty(handler, parsed, body):
-    """POST /api/term/pty {session, cols, rows, mode} -> {tty}.
+    """POST /api/term/pty {session, cols, rows, mode} -> {tty, renderer, forked, notice}.
 
     `mode` follows term_launch's own naming (`"cwd"` = a plain login shell in the session's
     working directory; `"resume"` = `claude --resume <sid>` (see `term_gate.resume_argv` for
@@ -1457,6 +1596,23 @@ def open_pty(handler, parsed, body):
     consistent with Tier 1's. `"resume"` is refused for a non-Claude session id, exactly like
     term_launch.open_terminal -- see `_is_claude`. `"new"` is accepted for any session id (Claude
     or Auggie/etc.) because it merely borrows the working directory to start a fresh conversation.
+
+    `forked` (bool) and `notice` (str or null) are the client contract: `forked` is `--fork-
+    session` was applied (this tty is a COPY, not the live session), `notice` is a human-
+    readable warning (e.g. the missing-transcript case) to surface.
+
+    **Both fields are answered from what is knowable AT RESPONSE TIME, which is BEFORE the
+    spawned child has produced a single byte of output** (spawn() returns as soon as pty.fork()
+    has happened; nothing about the child's own behaviour -- refused, silently started fresh, or
+    genuinely resumed -- is observable yet). So in this response: `forked` reflects ONLY the
+    fast-path decision (term_gate.resume_argv/is_bg_agent, computed before spawning) and
+    `notice` is ALWAYS null. A `mode="resume"` spawn also starts `_resume_backstop` as a
+    background daemon thread (see the section above) that can, seconds later, retry with
+    --fork-session on a refusal or set a notice on a missing transcript -- but by definition
+    AFTER this response was already sent. That late outcome is communicated the only way it can
+    be at that point: a synthesized note line fed straight into the terminal's own Screen
+    (_feed_note), plus a server-side log line, NOT a follow-up JSON payload -- there is no route
+    that re-delivers `forked`/`notice` after the fact today.
     """
     if not term_gate.guard(handler):
         return
@@ -1479,8 +1635,10 @@ def open_pty(handler, parsed, body):
             return handler._json({"error": "too many running terminals (max %d)" % MAX_PTYS}, 429)
     cols = _clamp_int(body.get("cols"), MIN_COLS, MAX_COLS, DEFAULT_COLS)
     rows = _clamp_int(body.get("rows"), MIN_ROWS, MAX_ROWS, DEFAULT_ROWS)
+    forked = False
     if mode == "resume":
-        argv = term_gate.resume_argv(sid)   # appends --fork-session for a LIVE background agent
+        argv = term_gate.resume_argv(sid)   # appends --fork-session for a background agent,
+        forked = "--fork-session" in argv   # any status -- see term_gate.is_bg_agent
     elif mode == "new":
         argv = ["claude"]
     else:
@@ -1489,13 +1647,17 @@ def open_pty(handler, parsed, body):
         pt = spawn(cwd, argv, cols, rows)
     except OSError as e:
         return handler._json({"error": "spawn failed: %s" % e}, 500)
+    pt.forked = forked
     with _LOCK:
         PTYS[pt.id] = pt
+    if mode == "resume":
+        threading.Thread(target=_resume_backstop, args=(pt, sid, forked, cols, rows),
+                          daemon=True).start()
     # `renderer` is server-owned policy handed to the client, never asked of it (conventions rule
     # 5) -- see the TRACKER_TERM_RENDERER switch comment above raw_stream() below. Riding along on
     # the response that already exists (rather than a forced extra round trip) is what lets the
     # modal open its Terminal/XtermTerminal without waiting on anything else.
-    handler._json({"tty": pt.id, "renderer": config.TERM_RENDERER})
+    handler._json({"tty": pt.id, "renderer": config.TERM_RENDERER, "forked": forked, "notice": None})
 
 
 def keys(handler, parsed, body):

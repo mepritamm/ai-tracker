@@ -50,6 +50,23 @@ def parse_any(sid):
     return p.parse(sid) if p else None
 
 
+def is_bg_agent(sid):
+    """True when `sid` names a background-agent session, resolved DIRECTLY through the
+    owning provider (one glob + one bounded file read for Claude) rather than by scanning
+    all_sessions()'s top-N-by-mtime list. That distinction is the whole reason this seam
+    exists: a background agent whose session file is outside the recency window all_
+    sessions() returns used to be invisible to a lookup keyed off that list, and silently
+    answered False (see term_gate.py, the one caller this seam exists for — it decides
+    whether `claude --resume <sid>` needs `--fork-session` appended, which the CLI
+    requires unconditionally for a background-agent session, in EVERY status, not just a
+    "recently active" one — docs/claude-resume-command-matrix.md).
+
+    Providers with no background-agent concept (every non-Claude provider today) inherit
+    Provider.is_bg_agent's default of False."""
+    p = provider_for(sid)
+    return bool(p) and p.is_bg_agent(sid)
+
+
 DRILLS = ("output", "diff", "shell", "agent")
 
 

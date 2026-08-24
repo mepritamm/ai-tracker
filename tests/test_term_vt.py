@@ -5,13 +5,17 @@ correctness (an escape sequence or a UTF-8 character arriving across two feed() 
 single most likely real-world bug, so it gets its own dedicated section.
 """
 import base64
+import contextlib
 import importlib
+import io
 import json
 import os
 import queue
+import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from aitracker import config, term_gate, term_vt
 from aitracker.term_vt import Screen
@@ -2484,6 +2488,270 @@ class TestVendoredXtermAssets(unittest.TestCase):
     def test_vendor_files_carry_a_long_lived_cache_header(self):
         h = self._serve("xterm.js", "application/javascript; charset=utf-8")
         self.assertIn("immutable", h.hdrs.get("Cache-Control", ""))
+
+
+def _bare_pty(tid="bt", cwd="/tmp"):
+    """A `Pty` with no real process behind it -- for exercising `_resume_backstop`/
+    `_retry_with_fork`/`_feed_note` without ever forking or execing anything."""
+    return term_vt.Pty(tid=tid, pid=0, fd=-1, screen=Screen(cols=80, rows=24), cwd=cwd)
+
+
+class _ResumeModeRoutes(unittest.TestCase):
+    """Shared fixture for mode="resume" open_pty tests: an isolated config.PROJECTS (so
+    is_bg_agent's classification is test-controlled by whichever session files this test
+    writes), terminal enabled, PTYS cleared, session_cwd stubbed (the on-disk cwd check
+    is not what's under test here)."""
+
+    def setUp(self):
+        from aitracker.providers import claude as _claude
+        self._claude = _claude
+        self._projects0 = config.PROJECTS
+        config.PROJECTS = tempfile.mkdtemp()
+        _claude._META_CACHE.clear()
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        self._session_cwd0 = term_gate.session_cwd
+        term_gate.session_cwd = lambda sid: "/tmp"
+
+    def tearDown(self):
+        config.PROJECTS = self._projects0
+        self._claude._META_CACHE.clear()
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        for pt in list(term_vt.PTYS.values()):
+            pt.kill()
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+        term_gate.session_cwd = self._session_cwd0
+
+    def _write_bg_session(self, sid):
+        """A minimal session file this instance's is_bg_agent will classify True (entrypoint
+        sdk-cli) -- see providers/claude.py's _is_bg_agent."""
+        d = os.path.join(config.PROJECTS, "proj")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, sid + ".jsonl"), "w") as fh:
+            fh.write(json.dumps({"cwd": "/tmp", "entrypoint": "sdk-cli",
+                                  "timestamp": "2026-06-01T00:00:00Z",
+                                  "message": {"role": "user", "content": "go"}}) + "\n")
+
+
+class TestOpenPtyForkedAndNoticeFields(_ResumeModeRoutes):
+    """The client contract: POST /api/term/pty gains exactly `forked` (bool) and `notice`
+    (str|null). Both are answered from what open_pty knows BEFORE the spawned child has
+    produced any output -- see that route's own docstring -- so `notice` is always None
+    here; only `forked` varies, and only with the fast-path classification."""
+
+    def test_forked_true_for_a_background_agent_session(self):
+        self._write_bg_session("bg-sess")
+        original_spawn = term_vt.spawn
+        term_vt.spawn = lambda cwd, argv, cols, rows: term_vt.Pty(tid="pf1")
+        try:
+            with mock.patch.object(term_vt, "_resume_backstop"):
+                h = _FakeHandler()
+                term_vt.open_pty(h, None, {"session": "bg-sess", "mode": "resume"})
+        finally:
+            term_vt.spawn = original_spawn
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200, obj)
+        self.assertTrue(obj["forked"])
+        self.assertIsNone(obj["notice"])
+
+    def test_forked_false_for_an_ordinary_session(self):
+        """No session file written for "plain" at all -- find_session() finds nothing, so
+        is_bg_agent is naturally False, exactly like a real non-agent id would resolve."""
+        original_spawn = term_vt.spawn
+        term_vt.spawn = lambda cwd, argv, cols, rows: term_vt.Pty(tid="pf2")
+        try:
+            with mock.patch.object(term_vt, "_resume_backstop"):
+                h = _FakeHandler()
+                term_vt.open_pty(h, None, {"session": "plain", "mode": "resume"})
+        finally:
+            term_vt.spawn = original_spawn
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200, obj)
+        self.assertFalse(obj["forked"])
+        self.assertIsNone(obj["notice"])
+
+    def test_cwd_and_new_modes_never_start_the_backstop(self):
+        original_spawn = term_vt.spawn
+        term_vt.spawn = lambda cwd, argv, cols, rows: term_vt.Pty(tid="pf3")
+        try:
+            for mode in ("cwd", "new"):
+                with self.subTest(mode=mode), mock.patch.object(term_vt, "_resume_backstop") as backstop:
+                    h = _FakeHandler()
+                    term_vt.open_pty(h, None, {"session": "whatever-%s" % mode, "mode": mode})
+                    time.sleep(0.05)
+                    obj, code = h.calls[-1]
+                    self.assertEqual(code, 200, obj)
+                    self.assertFalse(obj["forked"])
+                    backstop.assert_not_called()
+        finally:
+            term_vt.spawn = original_spawn
+
+    def test_resume_mode_starts_the_backstop_with_the_right_args(self):
+        self._write_bg_session("bg-sess2")
+        original_spawn = term_vt.spawn
+        term_vt.spawn = lambda cwd, argv, cols, rows: term_vt.Pty(tid="pf4")
+        try:
+            with mock.patch.object(term_vt, "_resume_backstop") as backstop:
+                h = _FakeHandler()
+                term_vt.open_pty(h, None, {"session": "bg-sess2", "mode": "resume",
+                                            "cols": 77, "rows": 21})
+                self.assertTrue(_wait_for(lambda: backstop.called))
+        finally:
+            term_vt.spawn = original_spawn
+        pt_arg, sid_arg, forked_arg, cols_arg, rows_arg = backstop.call_args[0]
+        self.assertEqual(sid_arg, "bg-sess2")
+        self.assertTrue(forked_arg)
+        self.assertEqual((cols_arg, rows_arg), (77, 21))
+
+
+class TestResumeBackstopFiresOnRefusal(unittest.TestCase):
+    """Unit tests for `_resume_backstop` in isolation -- a bare `Pty` (no real process),
+    feeding bytes directly into the SAME tee mechanism raw_stream() uses (`pt.raw_queues`),
+    exactly like a real `_reader()` would after seeing the CLI's actual output."""
+
+    def _feed(self, pt, data):
+        self.assertTrue(_wait_for(lambda: bool(pt.raw_queues)))
+        with pt.lock:
+            qs = list(pt.raw_queues)
+        for q in qs:
+            q.put(data)
+
+    def test_refusal_plus_nonzero_exit_triggers_exactly_one_retry(self):
+        pt = _bare_pty()
+        calls = []
+        with mock.patch.object(term_vt, "_retry_with_fork",
+                                side_effect=lambda p, sid, c, r: calls.append(sid)):
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, "refused-sid", False, 80, 24))
+            t.start()
+            self._feed(pt, b"Session refused-sid is currently running as a "
+                           b"background agent (bg). Use `claude agents`...")
+            pt.done, pt.rc = True, 1
+            t.join(timeout=term_vt.BACKSTOP_WINDOW + 2)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(calls, ["refused-sid"])
+
+    def test_already_forked_suppresses_the_retry(self):
+        """A session the fast path already forked can't ALSO hit the bg-agent refusal --
+        that's exactly what --fork-session avoids -- so even if this text somehow showed
+        up, already_forked=True must never retry."""
+        pt = _bare_pty()
+        with mock.patch.object(term_vt, "BACKSTOP_WINDOW", 0.3), \
+             mock.patch.object(term_vt, "_retry_with_fork") as retry:
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, "already-forked-sid", True, 80, 24))
+            t.start()
+            self._feed(pt, b"Session already-forked-sid is currently running as a "
+                           b"background agent (bg).")
+            pt.done, pt.rc = True, 1
+            t.join(timeout=2)
+        retry.assert_not_called()
+
+    def test_unrelated_nonzero_exit_does_not_trigger_a_retry(self):
+        """A resume that fails for some OTHER reason must not be mistaken for the
+        specific bg-agent refusal."""
+        pt = _bare_pty()
+        with mock.patch.object(term_vt, "BACKSTOP_WINDOW", 0.3), \
+             mock.patch.object(term_vt, "_retry_with_fork") as retry:
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, "other-error-sid", False, 80, 24))
+            t.start()
+            self._feed(pt, b"claude: permission denied\n")
+            pt.done, pt.rc = True, 1
+            t.join(timeout=2)
+        retry.assert_not_called()
+
+    def test_missing_transcript_sets_notice_and_does_not_retry(self):
+        pt = _bare_pty()
+        with mock.patch.object(term_vt, "BACKSTOP_WINDOW", 0.3), \
+             mock.patch.object(term_vt, "_retry_with_fork") as retry:
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, "missing-sid", False, 80, 24))
+            t.start()
+            self._feed(pt, b"No conversation found with session ID: missing-sid\n")
+            t.join(timeout=2)
+        retry.assert_not_called()
+        self.assertIsNotNone(pt.notice)
+        self.assertIn("no prior transcript", pt.notice)
+        snap = pt.screen.snapshot(-1)
+        # Collapse the row-wrap boundary spacing (Screen wraps at a fixed column with no
+        # word-wrap, so a phrase spanning two rows can pick up an extra space) -- same
+        # normalisation term_gate._normalize_output uses for the same reason.
+        joined = " ".join(" ".join(text for _, text, _ in snap["rows"]).split())
+        self.assertIn("no prior transcript", joined)
+
+    def test_healthy_resume_produces_no_backstop_log_output(self):
+        """If the fast path's classification is healthy, this backstop sees nothing to
+        react to and prints nothing -- the log line's ABSENCE is the healthy case; its
+        presence is what would flag the fast path having broken."""
+        pt = _bare_pty()
+        pt.done, pt.rc = True, 0
+        buf = io.StringIO()
+        with mock.patch.object(term_vt, "BACKSTOP_WINDOW", 0.2), \
+             mock.patch.object(term_vt, "BACKSTOP_DONE_GRACE", 0.05), \
+             contextlib.redirect_stdout(buf):
+            term_vt._resume_backstop(pt, "healthy-sid", False, 80, 24)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_watcher_deregisters_its_tee_queue_when_it_returns(self):
+        pt = _bare_pty()
+        pt.done, pt.rc = True, 0
+        with mock.patch.object(term_vt, "BACKSTOP_WINDOW", 0.2), \
+             mock.patch.object(term_vt, "BACKSTOP_DONE_GRACE", 0.05):
+            term_vt._resume_backstop(pt, "sid-cleanup", False, 80, 24)
+        self.assertEqual(pt.raw_queues, [])
+
+
+class TestRetryWithFork(unittest.TestCase):
+    """Unit tests for `_retry_with_fork` in isolation: `_fork_child` and `threading.Thread`
+    are both faked, so this never touches a real process or a real reader thread."""
+
+    def test_rewires_the_same_pty_in_place(self):
+        pt = _bare_pty(tid="rt1")
+        with mock.patch.object(term_vt, "_fork_child", return_value=(4242, 99)), \
+             mock.patch.object(term_vt.threading, "Thread") as Thread:
+            term_vt._retry_with_fork(pt, "retry-sid", 80, 24)
+        self.assertEqual(pt.id, "rt1")                 # SAME tty id -- not a new Pty
+        self.assertEqual((pt.pid, pt.fd), (4242, 99))
+        self.assertTrue(pt.forked)
+        self.assertFalse(pt.done)
+        self.assertIsNone(pt.rc)
+        self.assertIn("--fork-session", pt.cmd)
+        self.assertIn("retry-sid", pt.cmd)
+        Thread.assert_called_once()
+        self.assertIs(Thread.call_args[1]["target"], term_vt._reader)
+        self.assertEqual(Thread.call_args[1]["args"], (pt,))
+
+    def test_feeds_a_visible_note_into_the_new_screen(self):
+        pt = _bare_pty(tid="rt2")
+        with mock.patch.object(term_vt, "_fork_child", return_value=(1, 2)), \
+             mock.patch.object(term_vt.threading, "Thread"):
+            term_vt._retry_with_fork(pt, "retry-sid2", 80, 24)
+        snap = pt.screen.snapshot(-1)
+        joined = " ".join(" ".join(text for _, text, _ in snap["rows"]).split())
+        self.assertIn("retried automatically with --fork-session", joined)
+
+    def test_logs_the_one_line_that_detects_a_broken_fast_path(self):
+        pt = _bare_pty(tid="rt3")
+        buf = io.StringIO()
+        with mock.patch.object(term_vt, "_fork_child", return_value=(1, 2)), \
+             mock.patch.object(term_vt.threading, "Thread"), \
+             contextlib.redirect_stdout(buf):
+            term_vt._retry_with_fork(pt, "retry-sid3", 80, 24)
+        self.assertIn("backstop fired", buf.getvalue())
+        self.assertIn("retry-sid3", buf.getvalue())
+
+
+class TestFeedNote(unittest.TestCase):
+    def test_feed_note_writes_a_line_visible_in_the_screen(self):
+        pt = _bare_pty()
+        term_vt._feed_note(pt, "hello from ai-tracker")
+        snap = pt.screen.snapshot(-1)
+        joined = " ".join(text for _, text, _ in snap["rows"])
+        self.assertIn("hello from ai-tracker", joined)
 
 
 if __name__ == "__main__":

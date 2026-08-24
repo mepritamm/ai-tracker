@@ -98,6 +98,52 @@ class TestBuildScriptResume(unittest.TestCase):
         self.assertNotIn("claude --resume", script)
 
 
+class TestBuildScriptResumeFallback(unittest.TestCase):
+    """Option C, Tier-1 shape (docs/refusal-fix-direction.md): term_launch hands off to
+    `osascript` and never observes the spawned tab again, so there is no way to retry
+    AFTER the fact like term_vt's PTY backstop does. The fallback is built into the shell
+    command itself instead -- `claude --resume <id> || claude --resume <id> --fork-session`
+    -- so a refused resume falls back with no ai-tracker process involved at all."""
+
+    def _unescape(self, script):
+        m = re.search(r'do script "((?:[^"\\]|\\.)*)"', script)
+        self.assertIsNotNone(m, "no valid do-script string literal found in:\n%s" % script)
+        return _applescript_unescape(m.group(1))
+
+    def test_plain_resume_gets_the_or_fallback_with_fork_session(self):
+        argv = ["claude", "--resume", "abc-123"]
+        inner = self._unescape(
+            term_launch.build_script("/tmp/proj", "abc-123", "resume", "Terminal", argv))
+        self.assertEqual(
+            inner,
+            "cd " + shlex.quote("/tmp/proj") +
+            " && (claude --resume abc-123 || claude --resume abc-123 --fork-session)")
+
+    def test_already_forked_argv_is_not_wrapped_in_a_redundant_or(self):
+        """When the fast path already appended --fork-session (a background-agent
+        session), there is nothing left to fall back to -- the command must stay a
+        single, unwrapped command, not `(cmd || cmd)` with itself."""
+        argv = ["claude", "--resume", "bg-sid", "--fork-session"]
+        inner = self._unescape(
+            term_launch.build_script("/tmp/proj", "bg-sid", "resume", "Terminal", argv))
+        self.assertEqual(
+            inner, "cd " + shlex.quote("/tmp/proj") +
+            " && claude --resume bg-sid --fork-session")
+        self.assertNotIn("||", inner)
+
+    def test_default_argv_when_resume_argv_omitted_also_gets_the_fallback(self):
+        """Existing direct callers that don't pass resume_argv (e.g. the plain
+        TestBuildScriptResume tests above) fall back to ["claude", "--resume", sid] --
+        which has no --fork-session, so it must ALSO gain the || fallback."""
+        script = term_launch.build_script("/tmp/proj", "abc-123", "resume", "Terminal")
+        self.assertIn("claude --resume abc-123 || claude --resume abc-123 --fork-session",
+                       script.replace("\\\\", "\\"))
+
+    def test_cwd_mode_never_gets_an_or_fallback(self):
+        script = term_launch.build_script("/tmp/proj", "abc-123", "cwd", "Terminal")
+        self.assertNotIn("||", script)
+
+
 class TestIsClaude(unittest.TestCase):
     def test_bare_id_is_claude(self):
         self.assertTrue(term_launch._is_claude("abc-123"))

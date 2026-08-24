@@ -108,18 +108,37 @@ def build_script(cwd: str, sid: str, mode: str, app: str, resume_argv=None) -> s
     via normalize_sid().
 
     `resume_argv`, used only when `mode == "resume"`, is the exact argv to run -- e.g.
-    `["claude", "--resume", sid]` or, for a live background-agent session, that plus
+    `["claude", "--resume", sid]` or, for a background-agent session, that plus
     `--fork-session` (see `term_gate.resume_argv`, the ONE seam that decides this; both
     terminal tiers call it, so this function never re-decides it itself, which is what
     would let it drift from term_vt's PTY path). It is computed by the caller (`open_terminal`)
     and handed in, rather than looked up here, so `build_script` stays pure -- it never touches
     the registry/filesystem on its own. Falls back to the plain resume argv when omitted, so
     existing direct callers (and tests) that don't care about forking keep working unchanged.
+
+    Option C's backstop, Tier-1 shape: unlike term_vt's PTY (which can watch the child's output
+    and retry -- see term_vt._resume_backstop), this route hands off to `osascript` and never
+    sees the spawned Terminal/iTerm tab again, so there is nothing here to retry AFTER the fact.
+    The fallback is built into the command ITSELF instead: when `resume_argv` does not already
+    include `--fork-session` (the fast path didn't classify this as a background agent), the
+    inner shell command becomes `(<resume> || <resume> --fork-session)` -- if the plain resume
+    is refused (exits non-zero), the shell's own `||` retries with the flag, with no ai-tracker
+    process involved at all. When `resume_argv` already forks (the fast path caught it), there
+    is nothing to fall back to, so the plain single command is used unchanged. There is no
+    Tier-1 equivalent of the missing-transcript notice (term_vt.Screen) -- an external Terminal/
+    iTerm tab is opaque to this server once launched, so that case is left to the CLI's own
+    already-observed behaviour (silently starts a fresh conversation; see
+    docs/claude-resume-command-matrix.md) with no warning surfaced here.
     """
     inner = "cd %s" % shlex.quote(cwd)
     if mode == "resume":
         argv = resume_argv or ["claude", "--resume", sid]
-        inner += " && " + " ".join(shlex.quote(a) for a in argv)
+        primary = " ".join(shlex.quote(a) for a in argv)
+        if "--fork-session" in argv:
+            inner += " && " + primary
+        else:
+            fallback = " ".join(shlex.quote(a) for a in argv + ["--fork-session"])
+            inner += " && (%s || %s)" % (primary, fallback)
     escaped = inner.replace("\\", "\\\\").replace('"', '\\"')
     if app == "iTerm":
         return (

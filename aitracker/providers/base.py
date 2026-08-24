@@ -23,6 +23,16 @@ class Provider:
         # AuggieProvider.exists — a plain lookup/file-existence check).
         return self.parse(sid) is not None
 
+    def is_bg_agent(self, sid):
+        # Is `sid` a "background agent" session in the `claude --bg`/SDK-spawned sense
+        # (the concept that makes `claude --resume` refuse without `--fork-session`,
+        # see term_gate.resume_argv)? Resolved DIRECTLY for this one sid — never by
+        # scanning list()'s top-N-by-mtime output, which would miss anything outside
+        # that window (registry.is_bg_agent is the seam; see that function's docstring).
+        # Only a provider that has this concept overrides it; everyone else has no
+        # background-agent notion at all, so the honest default is False.
+        return False
+
     # --- drill-downs: the click-through views behind the detail panels. Routes reach
     # these through registry.drill(), never through one provider's own session lookup,
     # so a namespaced id can't fall off the seam. registry.drill() checks exists()
