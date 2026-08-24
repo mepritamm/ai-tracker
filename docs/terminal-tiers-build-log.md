@@ -1750,3 +1750,96 @@ live end-to-end. Stated rather than glossed.
 user's live agent processes were alive and untouched afterwards, and my resumed test copy was gone.
 The earlier incident — killing two of the user's terminals before checking their parent — was not
 repeated.
+
+---
+
+# SESSION 8 — sidebar new-terminal controls + directory picker
+
+## Answers to the user's three questions
+
+**1. "Why the chips went away for the other ones?" — they did not; they are zero-suppressed.**
+
+`app.js:1071`:
+
+    const chip=(n,v,cls,tgt)=> v ? `<span class="chip …">…</span>` : "";
+
+A chip renders only when its value is truthy, so a count of `0` renders nothing.
+`vida-contact-validators` shows only `done 0/0`, `read 5`, `errors 1` because it genuinely created
+nothing, edited nothing, committed nothing, ran no tests and spawned no agents.
+
+Long-standing behaviour, not a regression from any of this work. One quirk worth knowing: `done`
+survives at zero because its value is the **string** `"0/0"` (truthy) while `created 0` is the
+**number** `0` (falsy) — so `done` is the only chip that shows when empty.
+
+**2. The parked `notice` item, explained.** `pty.fork()` returns immediately and the HTTP response
+is sent before the child emits a single byte. Anything learned by *watching output* — the backstop
+firing, a missing transcript — happens after that. So `notice` is always `null` in practice and the
+client's rendering path never triggers. Those events are not lost: they appear as a synthesized
+`[ai-tracker] note: …` line inside the terminal, plus a server log line. What is missing is a
+channel to push a late notice to the UI; the screen SSE stream is already open server→client and is
+the natural place, ~20 lines. Left undone because the user-visible outcome is already correct.
+
+**3. Move the controls** — dispatched below.
+
+## Contract (answers)
+
+| Question | Answer |
+|---|---|
+| cwd for a global new-terminal button | **"Ask which directory"** — picker of recent cwds + free text |
+| Keep them in the detail pane too? | **"Sidebar only — move them"** |
+
+## The consequence that shaped the design
+
+Once those buttons are global, the server can no longer derive a working directory from a session
+id, so `/api/term/pty` must accept a `cwd` directly.
+
+**That grants no new capability** — this is already an unrestricted shell whose first keystroke can
+be `cd /anywhere`. So the path is not a privilege boundary and must not be dressed up as one. It
+needs to be a *real directory* so a typo fails loudly instead of starting a shell somewhere
+surprising. The brief explicitly forbids building an allowlist of permitted directories: that would
+be theatre over a shell that can `cd` out of it in one keystroke, and a future reader might
+otherwise "harden" it into exactly that.
+
+## Contract pinned before either half started
+
+    POST /api/term/pty   {cwd, cols, rows, mode}   # session-less; mode ∈ "cwd" | "new"
+    GET  /api/term/cwds  -> {"cwds":[{"path","label","mtime"},…]}   # server-owned, existing dirs only
+
+Third time this project has pinned the wire format up front; the two times it was left to the
+client to guess each cost a full reconciliation round.
+
+## Models — both `sonnet`, stated per rule 3
+
+Leg A touches a route that now accepts a filesystem path. Leg B is a new modal plus a relocation
+plus three viewports. Four `haiku` legs this session produced correct code with unreliable
+evidence, and a modal's behaviour is precisely the case where the report *is* the verification —
+so neither leg is one I can cheaply re-check from a diff.
+
+## Both legs landed — 734 tests, merged on `main`
+
+**Server `5e23552`:** `/api/term/pty` accepts a session-less `{cwd, cols, rows, mode}` alongside the
+unchanged session form; `mode:"resume"` without a session is refused before `cwd` is even looked at.
+`GET /api/term/cwds` is built on `registry.all_sessions()`, deduped by absolute directory keeping
+the newest mtime, drops directories that no longer exist, newest-first, capped at 20 — **the cap
+applied AFTER ranking**, so the 20 shown are the most recent rather than an arbitrary prefix. The
+session-scoped path was *moved* into an `if sid:` branch rather than rewritten, so it cannot have
+drifted.
+
+Validation is `expanduser` + `isdir` and deliberately nothing more, with the reasoning in the
+docstring: this is input hygiene so a typo fails loudly, **not** a privilege boundary — an allowlist
+would be theatre over a shell whose first keystroke can be `cd /anywhere`.
+
+**Client `56dae63`:** mount added at `index.html:21` between `.sidetop` and `.searchbox`; the two
+buttons removed from the detail pane, which is back to exactly four with unchanged labels.
+
+**It found a real bug by driving a browser rather than asserting.** On phones the drawer `.side` is
+`z-index:60` and the shared `.overlay` is `z-index:50`, so the picker opened *behind* the drawer.
+Fixed by closing the drawer first, with a regression test. It also mounted the picker as a
+`document.body` child rather than inside `.side`, because the drawer's CSS transform breaks
+`position:fixed` descendants — the kind of thing that works on desktop and silently fails on a
+phone.
+
+**Verified by me at 375px**, since that was the predicted failure point: both buttons above the
+search box, 287px inside a 320px sidebar, no horizontal scroll, detail pane back to four buttons,
+picker opening as a bottom sheet with real directories (label + full path), free-text field, and the
+drawer confirmed closed so the z-index conflict cannot bite.
