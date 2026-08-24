@@ -19,6 +19,15 @@ def _read(name):
         return fh.read()
 
 
+def _function_body(src, marker):
+    """The full source of one `Terminal.prototype.X = function ...` (or any `marker`), up to the
+    next `Terminal.prototype.` after it -- robust against the body growing/shrinking, unlike a
+    fixed-size slice."""
+    start = src.index(marker)
+    nxt = src.find("Terminal.prototype.", start + len(marker))
+    return src[start: nxt if nxt != -1 else len(src)]
+
+
 class TestAssetsAreInlined(unittest.TestCase):
     """Step 0's page.build_page() must pick up ext_vt.js/css the same way it already picks up
     ext_launch.*/ext_run.* -- confirmed against the actually-served page, not just the source
@@ -102,9 +111,49 @@ class TestNoRawHtmlInsertion(unittest.TestCase):
         self.src = _read("ext_vt.js")
 
     def test_row_text_is_escaped_before_going_into_innerhtml(self):
-        i = self.src.index("Terminal.prototype._paintRow")
-        body = self.src[i:i + 700]
-        self.assertIn("esc(text.slice(s, e))", body)
+        body = _function_body(self.src, "Terminal.prototype._paintRow")
+        self.assertIn("esc(glyphs)", body)
+        self.assertIn("esc(_padSpaces(", body)
+
+
+class TestRightTrimmedRowsArePadded(unittest.TestCase):
+    """The coordinator's correction: Screen.snapshot() RIGHT-TRIMS `text` (drops trailing cells
+    that are both a plain space and default-styled) -- it does not pad/truncate to `cols`. A row
+    that shrinks must not leave the previous, longer render's glyphs to its right ("ghost text"),
+    and the cursor must not fall off the end when it sits past `text.length`. See the runtime
+    proof of the shrink case in the harness (reported separately -- there is no JS engine here)."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_no_residue_because_the_whole_row_is_rebuilt_every_paint(self):
+        # _paintRow must set el.innerHTML wholesale (never append to / patch a prefix of the
+        # existing row markup) -- that's what makes a shorter re-render leave nothing behind.
+        body = _function_body(self.src, "Terminal.prototype._paintRow")
+        self.assertIn("el.innerHTML = html;", body)
+        self.assertNotIn("innerHTML +=", body)
+        self.assertNotIn("innerHTML.slice", body)
+
+    def test_row_is_padded_out_to_the_full_column_width(self):
+        body = _function_body(self.src, "Terminal.prototype._paintRow")
+        self.assertIn("if (pos < cols) html += esc(_padSpaces(cols - pos));", body)
+
+    def test_a_run_extending_past_text_length_is_not_clamped_to_it(self):
+        # the old (wrong) version did `Math.min(text.length, run[1]|0)` -- a run's end must NOT
+        # be capped at text.length, or a styled trailing pad (e.g. a background colour on an
+        # erased line) silently loses its style and falls back to plain blank.
+        body = _function_body(self.src, "Terminal.prototype._paintRow")
+        self.assertNotIn("Math.min(text.length, run[1]", body)
+        self.assertIn("tailPad", body)
+
+    def test_cursor_clamp_uses_pane_width_not_row_text_length(self):
+        body = _function_body(self.src, "Terminal.prototype._layoutCursor")
+        # the actual clamp expression must bound against `this.cols`, never against the current
+        # row's (possibly short, right-trimmed) text -- pull just the assignment line so the
+        # explanatory comment above it (which legitimately says "text.length") can't fool this.
+        line = [l for l in body.splitlines() if l.strip().startswith("var c =")][0]
+        self.assertIn("this.cols - 1", line)
+        self.assertNotIn("text.length", line)
 
 
 class TestNoNewModalSystem(unittest.TestCase):

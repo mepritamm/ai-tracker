@@ -21,8 +21,13 @@
 //     - Each SSE connection is assumed to start from "nothing sent yet", so the FIRST event on a
 //       fresh connection carries every currently-populated row (a reconnect therefore repaints
 //       cleanly with no stale cells left behind — this file never sends a `since` parameter).
-//     - `text` is assumed padded/truncated to exactly the pty's current `cols` by the server, so
-//       a row can be painted by width alone.
+//     - CONFIRMED against the real Screen.snapshot() (term_vt.py, another worktree): `text` is
+//       RIGHT-TRIMMED, not padded — trailing cells that are both a plain space and default-styled
+//       are dropped, so a 100-col row showing "hi" arrives as `text="hi"`, not "hi" + 98 spaces.
+//       This file pads back out to `cols` when painting (see _paintRow) and never assumes a run
+//       stops at `text.length` — a run may extend past it (an erased-but-still-styled tail, e.g.
+//       a background colour on a cleared line), and that padding must render with THAT run's
+//       style, not as plain default blank.
 //     - `runs` is assumed to be a list of half-open column ranges over `text`:
 //         [[start_col, end_col, sgr], ...]
 //       where `sgr` is the ABSOLUTE set of SGR parameters active for that run, written the same
@@ -254,26 +259,47 @@
     }
   };
 
+  // `text` arrives RIGHT-TRIMMED (see the contract comment at the top of this file) — it may be
+  // shorter than `this.cols`. We always rebuild the row's ENTIRE innerHTML from scratch here
+  // (never patch/append a prefix into existing markup), so a row that shrank can never leave a
+  // previous longer render's glyphs sitting to its right — replacing innerHTML wholesale IS the
+  // fix for that ghosting class of bug. What still has to be done explicitly is padding the
+  // output out to the full `cols` width, because nothing else provides that: a run may extend
+  // past `text.length` (an erased-but-still-styled tail, e.g. a background colour on a cleared
+  // line) and that padding must carry THAT run's style, not be assumed blank/default.
+  function _padSpaces(n) {
+    return n > 0 ? new Array(n + 1).join(" ") : "";
+  }
   Terminal.prototype._paintRow = function (r) {
     var row = this.grid[r], el = this.rowEls[r];
     if (!row || !el) return;
     var text = row.text || "";
+    var cols = this.cols;
     var runs = (row.runs && row.runs.length) ? row.runs : [[0, text.length, ""]];
-    var html = "";
+    var html = "", pos = 0;
     for (var i = 0; i < runs.length; i++) {
       var run = runs[i];
-      var s = Math.max(0, run[0] | 0), e = Math.min(text.length, run[1] | 0);
-      if (e <= s) continue;
+      var s = Math.max(0, run[0] | 0), e = Math.max(0, run[1] | 0);   // NOT clamped to text.length —
+      if (e <= s) continue;                                          // a run may extend past it
+      if (s > pos) { html += esc(_padSpaces(s - pos)); pos = s; }     // gap before this run: default blank
       var cls = sgrRunClass(run[2]);
-      var chunk = esc(text.slice(s, e));
+      var glyphs = s < text.length ? text.slice(s, Math.min(e, text.length)) : "";
+      var tailPad = Math.max(0, e - Math.max(s, text.length));        // the part of this run past text.length
+      var chunk = esc(glyphs) + esc(_padSpaces(tailPad));
       html += cls ? ('<span class="' + cls + '">' + chunk + '</span>') : chunk;
+      pos = e;
     }
+    if (pos < cols) html += esc(_padSpaces(cols - pos));   // pad the rest of the row width, unstyled
     el.innerHTML = html;
   };
 
   Terminal.prototype._layoutCursor = function () {
+    // The row's rendered text is right-trimmed and shorter than `cols` far more often than not
+    // (an empty line, a line right after a clear, …) — the cursor is routinely at a column past
+    // `text.length` and must still land inside the pane rather than falling off the end, so we
+    // clamp to `cols - 1` (the pane's own width), never to the current row's text length.
     var r = Math.max(0, Math.min(this.rows - 1, this.cursor[0]));
-    var c = Math.max(0, this.cursor[1]);
+    var c = Math.max(0, Math.min(Math.max(0, this.cols - 1), this.cursor[1]));
     this.cursorEl.style.width = this.cellW + "px";
     this.cursorEl.style.height = this.cellH + "px";
     this.cursorEl.style.transform = "translate(" + (c * this.cellW) + "px," + (r * this.cellH) + "px)";
