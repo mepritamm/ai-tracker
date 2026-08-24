@@ -1,7 +1,7 @@
 import glob, json, os, re, time
 from ..config import LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified, safe_path_component
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified, safe_path_component, context_window
 from ..overview import build_overview
 from ..store import load_titles, load_tasks, load_notes
 from .base import Provider
@@ -265,6 +265,7 @@ def parse_auggie(session_id):
     pr_creates = []   # exchange indices where a PR-create ran — Auggie logs no output URL, so we
     pr_first_ex = {}  # url -> exchange it first appeared in → attribute "created" by order, below
     tok_in = tok_out = 0
+    ctx_current = ctx_limit = None  # LATEST turn's occupancy + the session's own context-window size
     def _cprs(text, narr=False):  # collect PRs + note which exchange each URL first showed up in
         before = set(prs)
         collect_prs(prs, text, ts, narr=narr)
@@ -291,6 +292,14 @@ def parse_auggie(session_id):
                 tok_in += ((tu.get("input_tokens") or 0) + (tu.get("cache_read_input_tokens") or 0)
                            + (tu.get("cache_creation_input_tokens") or 0))
                 tok_out += tu.get("output_tokens") or 0
+                # this turn's occupancy (last one wins) + Auggie's own stated context-window
+                # size, when present — unlike Claude's JSONL, Auggie's token_usage carries
+                # max_context_tokens, so a real limit/pct is honestly derivable here.
+                ctx_current = ((tu.get("input_tokens") or 0) + (tu.get("cache_read_input_tokens") or 0)
+                               + (tu.get("cache_creation_input_tokens") or 0))
+                mct = tu.get("max_context_tokens")
+                if isinstance(mct, (int, float)) and mct > 0:
+                    ctx_limit = mct
             call = rn.get("tool_use")               # commands/reads, from Auggie's tools
             if isinstance(call, dict):
                 inp = _tool_input(call)
@@ -389,6 +398,7 @@ def parse_auggie(session_id):
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": latest[:2000],
         "tokens": {"in": tok_in, "out": tok_out},
+        "context": context_window(ctx_current, ctx_limit),
         "counts": {"done": done, "todos": len(todos),
                    "created": sum(1 for x in files.values() if x.get("created")),
                    "edited": sum(1 for x in files.values() if not x.get("created")),

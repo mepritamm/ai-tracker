@@ -169,6 +169,32 @@ class TestFlagsAndTitles(unittest.TestCase):
         self.assertEqual(tracker.load_titles()["sess"], "My Title")
 
 
+class TestContextWindow(unittest.TestCase):
+    """The shared `context_window(current, limit)` helper both providers call."""
+
+    def test_both_known_computes_pct(self):
+        self.assertEqual(tracker.context_window(110, 550), {"current": 110, "limit": 550, "pct": 20.0})
+
+    def test_limit_unknown_no_pct(self):
+        self.assertEqual(tracker.context_window(100, None), {"current": 100, "limit": None, "pct": None})
+
+    def test_current_unknown_no_pct(self):
+        self.assertEqual(tracker.context_window(None, 1000), {"current": None, "limit": 1000, "pct": None})
+
+    def test_both_unknown(self):
+        self.assertEqual(tracker.context_window(None, None), {"current": None, "limit": None, "pct": None})
+
+    def test_zero_limit_does_not_divide_by_zero(self):
+        # a malformed/zero limit must never raise or fabricate a percentage
+        self.assertEqual(tracker.context_window(50, 0), {"current": 50, "limit": 0, "pct": None})
+
+    def test_negative_limit_no_pct(self):
+        self.assertEqual(tracker.context_window(50, -5), {"current": 50, "limit": -5, "pct": None})
+
+    def test_rounds_to_one_decimal(self):
+        self.assertEqual(tracker.context_window(1, 3)["pct"], 33.3)
+
+
 class TestClaudeEval(unittest.TestCase):
     """End-to-end: a realistic Claude session -> the full derived view."""
 
@@ -198,6 +224,46 @@ class TestClaudeEval(unittest.TestCase):
         self.assertEqual(d["commits"][0]["msg"], "init")
         self.assertEqual([r["text"] for r in d["requests"]], ["build the thing"])
         self.assertIn("working on it", [n["text"] for n in d["narrative"]])
+        # current context occupancy, distinct from the cumulative `tokens` total; Claude's
+        # transcript never states a window size -> limit/pct honestly None, not guessed.
+        self.assertEqual(d["context"], {"current": 100, "limit": None, "pct": None})
+
+    def test_context_current_is_the_latest_turn_not_a_sum(self):
+        """Two usage blocks: `tokens.in` (cumulative) sums both; `context.current` (this
+        turn's occupancy) reflects only the LATEST one — the two must diverge, or the
+        capability collapsed back into a re-statement of `tokens`."""
+        rows = [
+            {"type": "user", "message": {"role": "user", "content": "go"}},
+            {"type": "assistant", "timestamp": "2026-06-22T10:00:00Z",
+             "message": {"usage": {"input_tokens": 100, "output_tokens": 10}, "content": [
+                 {"type": "text", "text": "first turn"}]}},
+            {"type": "assistant", "timestamp": "2026-06-22T10:01:00Z",
+             "message": {"usage": {"input_tokens": 40, "cache_read_input_tokens": 25,
+                                    "output_tokens": 5}, "content": [
+                 {"type": "text", "text": "second turn"}]}},
+        ]
+        p = tempfile.mktemp(suffix=".jsonl")
+        with open(p, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        d = tracker.parse_session(p)
+        os.unlink(p)
+        self.assertEqual(d["tokens"]["in"], 165)               # 100 + (40+25) summed across both turns
+        self.assertEqual(d["context"]["current"], 65)          # only the LATEST turn: 40+25
+        self.assertIsNone(d["context"]["limit"])
+        self.assertIsNone(d["context"]["pct"])
+
+    def test_context_absent_when_no_usage_at_all(self):
+        """No assistant `usage` block anywhere -> current stays None, not 0 (0 would lie:
+        it would read as 'we know the session used zero tokens' instead of 'unknown')."""
+        rows = [{"type": "user", "message": {"role": "user", "content": "go"}}]
+        p = tempfile.mktemp(suffix=".jsonl")
+        with open(p, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        d = tracker.parse_session(p)
+        os.unlink(p)
+        self.assertEqual(d["context"], {"current": None, "limit": None, "pct": None})
 
 
 class TestAuggieEval(unittest.TestCase):
@@ -241,6 +307,30 @@ class TestAuggieEval(unittest.TestCase):
         self.assertEqual(d["counts"]["tests"], 1)                   # pytest classified
         self.assertEqual([r["text"] for r in d["requests"]], ["please do a thing"])
         self.assertIn("doing it now", [n["text"] for n in d["narrative"]])
+        # this fixture's token_usage carries no max_context_tokens -> honestly None,
+        # same rule as Claude: no limit stated in the logs, no fabricated denominator.
+        self.assertEqual(d["context"], {"current": 55, "limit": None, "pct": None})
+
+    def test_context_limit_derived_when_stated(self):
+        """Unlike Claude, Auggie's real token_usage blocks DO carry max_context_tokens
+        (confirmed against ~/.augment/sessions/*.json) -> a genuine limit/pct, not None.
+        Two response_nodes prove `current` tracks the LATEST block, not a sum."""
+        with open(os.path.join(tracker.AUGGIE_SESSIONS, "s2.json"), "w") as f:
+            json.dump({"sessionId": "s2", "modified": "2026-06-27T05:48:03Z",
+                       "customTitle": "Ctx test",
+                       "chatHistory": [{"finishedAt": "2026-06-27T05:47:50Z", "exchange": {
+                           "request_message": "go", "response_text": "on it",
+                           "response_nodes": [
+                               {"token_usage": {"input_tokens": 10, "output_tokens": 1,
+                                                "max_context_tokens": 1000}}]}},
+                                       {"finishedAt": "2026-06-27T05:48:10Z", "exchange": {
+                           "response_text": "done",
+                           "response_nodes": [
+                               {"token_usage": {"input_tokens": 5, "cache_read_input_tokens": 245,
+                                                "output_tokens": 2, "max_context_tokens": 1000}}]}}]}, f)
+        tracker._AUGGIE_LIST_CACHE.clear()
+        d = tracker.parse_auggie("s2")
+        self.assertEqual(d["context"], {"current": 250, "limit": 1000, "pct": 25.0})
 
     def test_list_uses_ide_cwd(self):
         al = tracker.list_auggie()

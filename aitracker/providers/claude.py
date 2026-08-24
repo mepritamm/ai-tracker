@@ -1,7 +1,7 @@
 import glob, json, os, re, time
 from ..config import EDIT_TOOLS, LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified as _unified, safe_path_component
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window
 from ..overview import build_overview
 from ..store import load_titles, load_tasks, load_notes
 from .base import Provider
@@ -769,6 +769,7 @@ def parse_session(path):
     meta = {}
     text_last = ""
     tok_in = tok_out = 0
+    ctx_current = None    # occupancy off the LATEST usage block only — not summed, unlike tok_in/out
     n_search = 0
     t_first = t_last = None
     with open(path, encoding="utf-8") as fh:
@@ -795,6 +796,9 @@ def parse_session(path):
             tok_in += (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
                        + u.get("cache_creation_input_tokens", 0))
             tok_out += u.get("output_tokens", 0)
+            if u:  # a real usage block (not the {} default) -> this turn's occupancy; last one wins
+                ctx_current = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                               + u.get("cache_creation_input_tokens", 0))
             if msg.get("model"):
                 meta["model"] = msg["model"]
             content = msg.get("content")
@@ -967,6 +971,9 @@ def parse_session(path):
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": text_last[:2000],
         "tokens": {"in": tok_in, "out": tok_out},
+        # current context occupancy (this turn), not cumulative — Claude's JSONL usage
+        # blocks never state a context-window size, so `limit`/`pct` stay honestly None.
+        "context": context_window(ctx_current, None),
         "counts": {
             "done": len(done_todos), "todos": len(todos),
             "created": sum(1 for f in files.values() if f.get("created")),

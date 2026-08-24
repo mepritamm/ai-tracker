@@ -86,6 +86,9 @@ def _run():
     assert [r["text"] for r in d["requests"]] == \
         ["build the thing", "/smasher-gap fix the parser bug", "fix the parser"], d["requests"]
     assert d["tokens"]["in"] == 100
+    # context occupancy: the ONE usage block's input_tokens (no cache fields in this fixture) —
+    # Claude's JSONL never states a context-window size, so limit/pct stay honestly None.
+    assert d["context"] == {"current": 100, "limit": None, "pct": None}, d["context"]
     assert [n["text"] for n in d["narrative"]] == ["starting"], d["narrative"]
     ov = d["overview"]
     assert ov["goal"] == "fix the parser", ov  # goal = latest prompt (now incl. list-form)
@@ -354,7 +357,8 @@ def _run():
                                                      "current_working_directory": "/work/dw-stack"}}}],
                                                  "response_nodes": [
                                                      {"token_usage": {"input_tokens": 10, "output_tokens": 20,
-                                                                      "cache_read_input_tokens": 100}},
+                                                                      "cache_read_input_tokens": 100,
+                                                                      "max_context_tokens": 550}},
                                                      # input_json is a JSON *string* in every real log (0/3882
                                                      # nodes on this machine carry it as a dict) — these three
                                                      # match that real shape like the edit-tool nodes below do.
@@ -394,6 +398,9 @@ def _run():
     assert _narr, pa["narrative"]
     assert len(_narr["text"]) > 2000, "narration must keep the full message, not cap at 900"
     assert pa["tokens"] == {"in": 110, "out": 20}, pa["tokens"]          # input + cache, like Claude
+    # context occupancy + limit: Auggie's token_usage carries max_context_tokens (Claude's
+    # doesn't), so a real percentage is honestly derivable here — 110/550 = 20.0%.
+    assert pa["context"] == {"current": 110, "limit": 550, "pct": 20.0}, pa["context"]
     assert pa["meta"]["cwd"] == "/work/dw-stack", pa["meta"]["cwd"]      # real IDE cwd, like Claude
     # parity: commands (launch-process), reads (view), commits + tests — like Claude
     assert len(pa["commands"]) == 2 and pa["counts"]["read"] == 1, (pa["commands"], pa["counts"])

@@ -220,6 +220,23 @@ def prs_sorted(acc, states=None):
     return sorted(acc.values(), key=lambda p: (p["created"], p["t"] or ""), reverse=True)
 
 
+def context_window(current, limit):
+    """The shared `context` shape every provider emits: `current` is the context the
+    model is CARRYING RIGHT NOW — input + cache-read + cache-creation tokens off the
+    LATEST turn's usage block, the "am I about to run out" number. This is deliberately
+    NOT the same as the session-cumulative `tokens` dict (which sums every turn's usage
+    across the whole session and only grows). `limit` is the model/session's context-
+    window size IF the provider's own logs state one — never guessed. `pct` is derived
+    only when both are known; a provider whose transcript carries no limit (Claude's
+    JSONL usage blocks don't) reports `limit`/`pct` as None rather than a fabricated
+    denominator. Callers must treat None as "unknown", not zero.
+    """
+    pct = None
+    if isinstance(current, (int, float)) and isinstance(limit, (int, float)) and limit > 0:
+        pct = round(current * 100.0 / limit, 1)
+    return {"current": current, "limit": limit, "pct": pct}
+
+
 def push_when(has_drain, mtime, now):
     """When a ▶ pushed note will actually reach this session — the server owns this policy,
     the client only renders it. One helper, both providers.

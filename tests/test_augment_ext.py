@@ -167,6 +167,8 @@ class TestProviderEndToEnd(unittest.TestCase):
         for k in ("reads", "commands", "commits", "tests", "requests",
                   "agents", "agents_bg", "shells", "decisions", "prs"):
             self.assertIn(k, d)
+        # no chat transcript survives stdlib-only (LevelDB) -> honestly empty, not a fabricated 0
+        self.assertEqual(d["context"], {"current": None, "limit": None, "pct": None})
 
         # parse of a bogus id returns None (doesn't crash)
         self.assertIsNone(p.parse("augment-vscode:nope:nope"))

@@ -15,7 +15,7 @@ the source badge distinguishes the IDE — mirrors Claude's per-surface
 import glob, json, os, time, urllib.parse
 from .. import config
 from ..store import load_titles, load_notes, _load_json
-from ..util import _first_line, push_when, _window, _git_branch, safe_path_component
+from ..util import _first_line, push_when, _window, _git_branch, safe_path_component, context_window
 from .base import Provider
 
 
@@ -235,6 +235,9 @@ def _parse(kind, prefix, src_label, sid):
         "narrative": narrative,
         "message": NOTE[:2000],
         "tokens": {"in": 0, "out": 0},
+        # no per-turn usage data survives stdlib-only (chat transcript is in the extension's
+        # LevelDB kv-store) — honestly empty, never a fabricated occupancy/limit.
+        "context": context_window(None, None),
         "counts": {"done": done, "todos": len(todos), "created": 0, "edited": len(files),
                    "read": 0, "commits": 0, "tests": 0,
                    "tests_failed": 0, "errors": 0, "agents": 0, "searches": 0},
