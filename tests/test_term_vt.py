@@ -15,8 +15,30 @@ from aitracker import config, term_gate, term_vt
 from aitracker.term_vt import Screen
 
 
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
+
 def _rows(snap):
     return {r[0]: r for r in snap["rows"]}
+
+
+def _txt(s, r):
+    """The row's text straight off the grid, right-trimmed. Deliberately NOT via snapshot():
+    these assertions are about what a painter would draw, not about the diff protocol."""
+    return "".join(c[0] for c in s.grid[r]).rstrip()
+
+
+def _grid(s):
+    return [_txt(s, r) for r in range(s.rows)]
+
+
+def _codes(s, r):
+    return [c[1] for c in s.grid[r]]
+
+
+def _capture(name):
+    with open(os.path.join(FIXTURES, name), "rb") as f:
+        return f.read()
 
 
 class TestBasicText(unittest.TestCase):
@@ -987,6 +1009,466 @@ class TestEviction(unittest.TestCase):
             self.assertIn("stale", term_vt.PTYS)
             call(_FakeHandler())
             self.assertNotIn("stale", term_vt.PTYS)
+
+
+class TestAbsoluteAddressing(unittest.TestCase):
+    """CHA/VPA/CNL/CPL -- the finals `top` uses for almost every cell it paints.
+
+    Discarding `d` silently is why the process table used to land entirely on row 0: `top`
+    addresses rows with VPA and columns with CHA, and an ignored VPA leaves the cursor wherever
+    the previous row's text left it.
+    """
+
+    def test_vpa_moves_the_row_and_leaves_the_column(self):
+        # THE minimal repro from the adversarial review: this used to render on row 0.
+        s = Screen(cols=40, rows=5)
+        s.feed(b"\x1b[2dLINE-TWO")
+        self.assertEqual(_txt(s, 0), "")
+        self.assertEqual(_txt(s, 1), "LINE-TWO")
+
+    def test_vpa_keeps_the_column(self):
+        s = Screen(cols=40, rows=5)
+        s.feed(b"ABCD\x1b[3dX")            # col stays at 4, row becomes 2
+        self.assertEqual(_txt(s, 2), "    X")
+
+    def test_vpa_defaults_and_clamps(self):
+        s = Screen(cols=10, rows=4)
+        s.feed(b"\x1b[3;1H\x1b[d")          # bare VPA == row 1
+        self.assertEqual(s.cur_r, 0)
+        s.feed(b"\x1b[99d")
+        self.assertEqual(s.cur_r, 3)
+
+    def test_cha_moves_the_column_and_leaves_the_row(self):
+        s = Screen(cols=20, rows=4)
+        s.feed(b"\x1b[2;1HAB\x1b[10GZ")
+        self.assertEqual(s.cur_r, 1)
+        self.assertEqual(_txt(s, 1), "AB       Z")
+        s.feed(b"\x1b[G")                   # bare CHA == column 1
+        self.assertEqual(s.cur_c, 0)
+        s.feed(b"\x1b[99G")
+        self.assertEqual(s.cur_c, 19)
+
+    def test_cnl_and_cpl_go_to_column_zero(self):
+        s = Screen(cols=20, rows=8)
+        s.feed(b"\x1b[3;9Hx\x1b[2E")        # CNL 2: row 2 -> 4, column -> 0
+        self.assertEqual((s.cur_r, s.cur_c), (4, 0))
+        s.feed(b"\x1b[3;9Hx\x1b[2F")        # CPL 2: row 2 -> 0, column -> 0
+        self.assertEqual((s.cur_r, s.cur_c), (0, 0))
+
+    def test_cnl_cpl_clamp_at_the_screen_edges(self):
+        s = Screen(cols=10, rows=4)
+        s.feed(b"\x1b[99E")
+        self.assertEqual(s.cur_r, 3)
+        s.feed(b"\x1b[99F")
+        self.assertEqual(s.cur_r, 0)
+
+
+class TestInsertDeleteChars(unittest.TestCase):
+    """ICH/DCH/ECH: shift or fill WITHIN the line, vacated cells carry the ACTIVE SGR."""
+
+    def test_dch_deletes_and_pulls_the_rest_left(self):
+        # THE second minimal repro: a shell line-edit that used to leave a stray "d" behind.
+        s = Screen(cols=40, rows=3)
+        s.feed(b"echo hello world\x08\x08\x08\x08\x08Bworld"
+               b"\x08\x08\x08\x08\x08\x08\x1b[1Pworld")
+        self.assertEqual(_txt(s, 0), "echo hello world")
+
+    def test_ich_inserts_blanks_and_pushes_right(self):
+        s = Screen(cols=10, rows=2)
+        s.feed(b"ABCDEF\x1b[1;3H\x1b[2@")
+        self.assertEqual(_txt(s, 0), "AB  CDEF")
+
+    def test_ich_truncates_at_the_right_margin_never_wraps(self):
+        s = Screen(cols=6, rows=2)
+        s.feed(b"ABCDEF\x1b[1;1H\x1b[2@")
+        self.assertEqual(_txt(s, 0), "  ABCD")
+        self.assertEqual(_txt(s, 1), "")           # nothing spilled onto the next row
+
+    def test_dch_beyond_the_line_just_clears_the_tail(self):
+        s = Screen(cols=6, rows=2)
+        s.feed(b"ABCDEF\x1b[1;3H\x1b[99P")
+        self.assertEqual(_txt(s, 0), "AB")
+
+    def test_ech_erases_in_place_without_shifting(self):
+        s = Screen(cols=10, rows=2)
+        s.feed(b"ABCDEFGH\x1b[1;3H\x1b[3X")
+        self.assertEqual(_txt(s, 0), "AB   FGH")   # F..H did NOT move left
+        self.assertEqual(s.cur_c, 2)               # ECH does not move the cursor
+
+    def test_vacated_cells_carry_the_active_sgr(self):
+        """The same rule EL/ED already follow -- a TUI editing its own coloured status line in
+        place must not punch unstyled holes in it."""
+        # ICH/ECH vacate cells at the cursor; DCH vacates them at the RIGHT MARGIN.
+        for seq, col in ((b"\x1b[3@", 0), (b"\x1b[3P", 7), (b"\x1b[3X", 0)):
+            s = Screen(cols=10, rows=2)
+            s.feed(b"ABCDEFGH\x1b[1;1H\x1b[41m" + seq)
+            self.assertIn("41", _codes(s, 0)[col], seq)
+
+
+class TestInsertDeleteLines(unittest.TestCase):
+    """IL/DL/SU/SD operate on the SCROLL REGION, never on the whole screen."""
+
+    def _six(self):
+        s = Screen(cols=6, rows=6)
+        for r in range(6):
+            s.feed(("\x1b[%d;1H%s" % (r + 1, chr(ord("A") + r))).encode())
+        return s
+
+    def test_il_pushes_down_only_inside_the_region(self):
+        s = self._six()
+        s.feed(b"\x1b[2;5r\x1b[3;1H\x1b[L")     # region rows 1..4, cursor row 2, insert 1
+        self.assertEqual(_grid(s), ["A", "B", "", "C", "D", "F"])   # E fell off, F untouched
+
+    def test_dl_pulls_up_only_inside_the_region(self):
+        s = self._six()
+        s.feed(b"\x1b[2;5r\x1b[2;1H\x1b[M")     # region rows 1..4, cursor row 1, delete 1
+        self.assertEqual(_grid(s), ["A", "C", "D", "E", "", "F"])
+
+    def test_il_dl_are_noops_outside_the_region(self):
+        s = self._six()
+        s.feed(b"\x1b[2;5r\x1b[6;1H\x1b[L")     # cursor below the region
+        self.assertEqual(_grid(s), ["A", "B", "C", "D", "E", "F"])
+        s.feed(b"\x1b[1;1H\x1b[M")               # cursor above the region
+        self.assertEqual(_grid(s), ["A", "B", "C", "D", "E", "F"])
+
+    def test_il_dl_move_the_cursor_to_column_zero(self):
+        s = self._six()
+        s.feed(b"\x1b[3;5H\x1b[L")
+        self.assertEqual(s.cur_c, 0)
+        s.feed(b"\x1b[3;5H\x1b[M")
+        self.assertEqual(s.cur_c, 0)
+
+    def test_su_and_sd_scroll_the_region_without_moving_the_cursor(self):
+        s = self._six()
+        s.feed(b"\x1b[2;5r\x1b[1;3H\x1b[2S")     # SU 2 inside rows 1..4
+        self.assertEqual(_grid(s), ["A", "D", "E", "", "", "F"])
+        self.assertEqual((s.cur_r, s.cur_c), (0, 2))
+        s.feed(b"\x1b[1S")                        # a bare SU is 1 line
+        self.assertEqual(_grid(s), ["A", "E", "", "", "", "F"])
+        s.feed(b"\x1b[2T")                        # SD 2 puts blanks back at the region top
+        self.assertEqual(_grid(s), ["A", "", "", "E", "", "F"])
+
+
+class TestBackTab(unittest.TestCase):
+    def test_cbt_walks_back_over_tab_stops(self):
+        s = Screen(cols=40, rows=2)
+        s.feed(b"\x1b[1;21H\x1b[Z")      # col 20 -> previous stop at 16
+        self.assertEqual(s.cur_c, 16)
+        s.feed(b"\x1b[2Z")                # two more stops -> 0
+        self.assertEqual(s.cur_c, 0)
+
+    def test_cbt_from_a_tab_stop_goes_to_the_previous_one(self):
+        s = Screen(cols=40, rows=2)
+        s.feed(b"\x1b[1;9H\x1b[Z")        # col 8 IS a stop -> 0
+        self.assertEqual(s.cur_c, 0)
+        s.feed(b"\x1b[Z")                  # already home: stays
+        self.assertEqual(s.cur_c, 0)
+
+
+class TestOriginMode(unittest.TestCase):
+    """DECOM (`?6`): row addressing becomes relative to the scroll region."""
+
+    def test_cup_and_vpa_are_region_relative_under_decom(self):
+        s = Screen(cols=10, rows=8)
+        s.feed(b"\x1b[3;6r\x1b[?6h")       # region rows 2..5 (0-based)
+        self.assertEqual(s.cur_r, 2)        # setting DECOM homes to the region top
+        s.feed(b"\x1b[1;1HX")
+        self.assertEqual(_txt(s, 2), "X")
+        s.feed(b"\x1b[2dY")
+        self.assertEqual(_txt(s, 3), " Y")
+
+    def test_decom_clamps_addressing_inside_the_region(self):
+        s = Screen(cols=10, rows=8)
+        s.feed(b"\x1b[3;6r\x1b[?6h\x1b[99;1HZ")
+        self.assertEqual(_txt(s, 5), "Z")   # clamped to the region bottom, not row 7
+
+    def test_resetting_decom_restores_absolute_addressing(self):
+        s = Screen(cols=10, rows=8)
+        s.feed(b"\x1b[3;6r\x1b[?6h\x1b[?6l")
+        self.assertEqual((s.cur_r, s.cur_c), (0, 0))
+        s.feed(b"\x1b[1;1HQ")
+        self.assertEqual(_txt(s, 0), "Q")
+
+    def test_cpr_is_region_relative_under_decom(self):
+        s = Screen(cols=10, rows=8)
+        s.feed(b"\x1b[3;6r\x1b[?6h\x1b[2;3H\x1b[6n")
+        self.assertEqual(s.pop_replies(), b"\x1b[2;3R")
+
+
+class TestSaveRestoreCursor(unittest.TestCase):
+    """DECSC/DECRC and their `CSI s` / `CSI u` aliases save ATTRIBUTES, not just a position."""
+
+    def test_decsc_decrc_round_trip_the_sgr(self):
+        s = Screen(cols=20, rows=4)
+        s.feed(b"\x1b[31m\x1b[2;5H\x1b7")      # save under red, at row1 col4
+        s.feed(b"\x1b[0m\x1b[1;1Hplain")
+        s.feed(b"\x1b8X")
+        self.assertEqual((s.cur_r, s.cur_c), (1, 5))
+        self.assertEqual(_codes(s, 1)[4], "31")
+
+    def test_csi_s_and_u_use_the_same_slot(self):
+        s = Screen(cols=20, rows=4)
+        s.feed(b"\x1b[3;7H\x1b[s\x1b[1;1H\x1b[u")
+        self.assertEqual((s.cur_r, s.cur_c), (2, 6))
+
+    def test_alt_and_primary_have_independent_save_slots(self):
+        """A TUI doing ESC 7 inside the alt screen must not clobber the position `?1049l`
+        restores the primary screen to."""
+        s = Screen(cols=20, rows=6)
+        s.feed(b"\x1b[4;9H\x1b7")               # DECSC in the PRIMARY buffer: row3 col8
+        s.feed(b"\x1b[?1049h")
+        s.feed(b"\x1b[2;3H\x1b7")               # DECSC in the ALT buffer: must not clobber it
+        s.feed(b"\x1b[6;1H\x1b8")
+        self.assertEqual((s.cur_r, s.cur_c), (1, 2))    # alt's own save works
+        s.feed(b"\x1b[?1049l\x1b[1;1H\x1b8")
+        self.assertEqual((s.cur_r, s.cur_c), (3, 8),
+                         "the alt buffer's DECSC overwrote the primary buffer's save slot")
+
+
+class TestAltScreenRestoresEverything(unittest.TestCase):
+    def test_1049l_restores_the_sgr_not_just_the_position(self):
+        s = Screen(cols=20, rows=4)
+        s.feed(b"\x1b[32m\x1b[?1049h\x1b[41mALT\x1b[?1049l")
+        s.feed(b"\x1b[1;1Hafter")
+        self.assertEqual(_codes(s, 0)[0], "32", "the alt screen's background leaked out with it")
+
+    def test_reentering_alt_starts_from_a_clean_buffer(self):
+        s = Screen(cols=20, rows=4)
+        s.feed(b"\x1b[?1049hFIRST-RUN\x1b[?1049l")
+        s.feed(b"\x1b[?1049h")
+        self.assertEqual(_grid(s), ["", "", "", ""], "stale alt content survived the round trip")
+
+    def test_primary_content_still_survives_the_round_trip(self):
+        s = Screen(cols=20, rows=4)
+        s.feed(b"\x1b[1;1Hprimary\x1b[?1049hALT\x1b[?1049l")
+        self.assertEqual(_txt(s, 0), "primary")
+
+
+class TestNulInsideCsi(unittest.TestCase):
+    def test_nul_inside_a_csi_is_ignored_not_printed(self):
+        """The only path by which escape residue ever reached cell text: the NUL ended the
+        sequence early and the real final byte was printed as a character."""
+        s = Screen(cols=10, rows=2)
+        s.feed(b"A\x1b[3\x00mB")
+        self.assertEqual(_txt(s, 0), "AB")
+        self.assertEqual(_codes(s, 0)[1], "3")   # ...and the SGR still took effect
+
+    def test_nul_does_not_corrupt_a_multi_param_csi(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"\x1b[\x002;\x004H*")
+        self.assertEqual(_txt(s, 1), "   *")
+
+
+class TestDeviceReports(unittest.TestCase):
+    """DSR/DA: a real `vim` BLOCKS on these at startup. See Screen.pop_replies."""
+
+    def test_cpr_reports_the_1_based_cursor_position(self):
+        s = Screen(cols=20, rows=6)
+        s.feed(b"\x1b[3;7H\x1b[6n")
+        self.assertEqual(s.pop_replies(), b"\x1b[3;7R")
+        self.assertEqual(s.pop_replies(), b"")   # drained, not repeated
+
+    def test_dsr_5_reports_terminal_ok(self):
+        s = Screen(cols=20, rows=6)
+        s.feed(b"\x1b[5n")
+        self.assertEqual(s.pop_replies(), b"\x1b[0n")
+
+    def test_primary_and_secondary_da(self):
+        s = Screen(cols=20, rows=6)
+        s.feed(b"\x1b[c")
+        self.assertEqual(s.pop_replies(), b"\x1b[?1;2c")
+        s.feed(b"\x1b[>c")
+        self.assertTrue(s.pop_replies().startswith(b"\x1b[>"))
+
+    def test_replies_never_reach_the_grid(self):
+        s = Screen(cols=20, rows=4)
+        s.feed(b"\x1b[6n\x1b[>c\x1b[5n")
+        self.assertEqual(_grid(s), ["", "", "", ""])
+
+    def test_undrained_replies_stay_bounded(self):
+        s = Screen(cols=20, rows=4)
+        s.feed(b"\x1b[6n" * 20000)
+        self.assertLessEqual(len(s.pending_replies), term_vt.MAX_REPLIES)
+
+
+class TestUnterminatedStringSequence(unittest.TestCase):
+    """B3: an OSC/DCS with no terminator used to buffer the whole rest of the stream forever."""
+
+    def test_pending_never_exceeds_the_cap(self):
+        s = Screen(cols=20, rows=4)
+        for _ in range(20):
+            s.feed(b"\x1bP" + b"x" * 20000)
+        self.assertLessEqual(len(s._pending), term_vt.MAX_PENDING)
+
+    def test_the_screen_keeps_working_after_an_abandoned_sequence(self):
+        s = Screen(cols=20, rows=4)
+        s.feed(b"\x1bP" + b"\x00" * (term_vt.MAX_PENDING + 100))
+        self.assertGreaterEqual(s.resyncs, 1)
+        s.feed(b"\x1b[2J\x1b[1;1HALIVE")
+        self.assertEqual(_txt(s, 0), "ALIVE")
+
+    def test_a_short_unterminated_sequence_is_still_buffered_for_the_next_feed(self):
+        """The cap must not break the split-read contract: a real OSC arriving in two pieces
+        still has to parse identically to one that arrived whole."""
+        s = Screen(cols=20, rows=4)
+        s.feed(b"\x1b]0;my-ti")
+        self.assertEqual(s.resyncs, 0)
+        s.feed(b"tle\x07done")
+        self.assertEqual(s.title, "my-title")
+        self.assertEqual(_txt(s, 0), "done")
+
+    def test_real_bin_sh_bytes_do_not_wedge_the_screen(self):
+        """/bin/sh carries a stray DCS introducer; `cat /bin/sh` used to kill the tty for good."""
+        if not os.path.exists("/bin/sh"):
+            self.skipTest("no /bin/sh")
+        with open("/bin/sh", "rb") as f:
+            blob = f.read()
+        s = Screen(cols=80, rows=24)
+        worst = 0
+        for i in range(0, len(blob), 4096):
+            s.feed(blob[i:i + 4096])
+            worst = max(worst, len(s._pending))
+        self.assertLessEqual(worst, term_vt.MAX_PENDING)
+        v_before = s.v
+        s.feed(b"\x1b[2J\x1b[1;1Hstill-here")
+        self.assertEqual(_txt(s, 0), "still-here")
+        self.assertGreater(s.v, v_before)
+
+
+class TestVersionIsMonotonic(unittest.TestCase):
+    """B4: `v` is the diff protocol's clock. Rewinding it strands every attached viewer."""
+
+    def test_ris_does_not_rewind_v(self):
+        s = Screen(cols=20, rows=4)
+        s.feed(b"one\x1b[2;1Htwo")
+        since = s.snapshot(-1)["v"]
+        s.feed(b"\x1bc")
+        self.assertGreaterEqual(s.v, since)
+
+    def test_ris_repaints_every_row_for_a_viewer_holding_an_old_since(self):
+        s = Screen(cols=20, rows=4)
+        s.feed(b"one\x1b[2;1Htwo")
+        since = s.snapshot(-1)["v"]
+        s.feed(b"\x1bcfresh")
+        snap = s.snapshot(since)
+        self.assertEqual(sorted(r[0] for r in snap["rows"]), [0, 1, 2, 3])
+        self.assertEqual(_txt(s, 0), "fresh")
+
+    def test_ris_still_resets_everything_else(self):
+        s = Screen(cols=20, rows=6)
+        s.feed(b"\x1b[41m\x1b[2;5r\x1b[?7l\x1b[?1049h\x1bc")
+        self.assertEqual(s._cur_code, "")
+        self.assertEqual((s.scroll_top, s.scroll_bot), (0, 5))
+        self.assertTrue(s.autowrap)
+        self.assertFalse(s.alt)
+        self.assertEqual(_grid(s), [""] * 6)
+
+    def test_v_is_monotonic_across_reset_resize_and_alt_switches(self):
+        s = Screen(cols=20, rows=4)
+        seen = []
+        for step in (b"hello", b"\x1bc", b"after", b"\x1b[?1049h", b"\x1b[?1049l", b"\x1bc"):
+            s.feed(step)
+            seen.append(s.v)
+            s.resize(s.cols + 1, s.rows)
+            seen.append(s.v)
+        self.assertEqual(seen, sorted(seen), "v went backwards: %r" % (seen,))
+
+
+class TestReaderAnswersDeviceReports(unittest.TestCase):
+    """B7's other half: `Screen` accumulates the answer, `_reader` writes it back to the pty.
+
+    Without this the emulator is write-only, and any program that asks the terminal a question
+    and waits for the reply -- `vim` does, on startup -- simply hangs.
+    """
+
+    _PROG = (
+        "import os,sys,tty\n"
+        "tty.setraw(0)\n"
+        "os.write(1, b'\\x1b[6n')\n"
+        "buf = b''\n"
+        "while not buf.endswith(b'R'):\n"
+        "    ch = os.read(0, 1)\n"
+        "    if not ch: sys.exit(1)\n"
+        "    buf += ch\n"
+        "os.write(1, b'CPR=' + buf[2:-1] + b'\\r\\n')\n"
+    )
+
+    def test_a_child_blocked_on_cpr_gets_its_answer(self):
+        import sys as _sys
+        pt = term_vt.spawn(os.getcwd(), [_sys.executable, "-c", self._PROG], 80, 24)
+        try:
+            def answered():
+                with pt.lock:
+                    return any("CPR=" in r[1] for r in pt.screen.snapshot(-1)["rows"])
+            self.assertTrue(_wait_for(answered, 15),
+                            "the child never received a cursor position report")
+            with pt.lock:
+                text = " ".join(r[1] for r in pt.screen.snapshot(-1)["rows"])
+            self.assertIn("CPR=1;1", text)   # 1-based, and the query itself printed nothing
+        finally:
+            pt.kill()
+            _drain(pt, 5)
+
+
+class TestRealCapturedStreams(unittest.TestCase):
+    """The gap every hand-written test above missed: NOTHING here was ever fed a real program's
+    bytes. These three fixtures are verbatim `pty.fork()` captures -- vim, zsh's line editor and
+    ncurses' own `tput` output -- and each one's grid was diffed row-by-row against `pyte` (a
+    third-party emulator used as an oracle in a throwaway venv; it is deliberately NOT a
+    dependency of anything shipped) until the differing-row count reached zero."""
+
+    def test_tput_capture_exercises_every_newly_added_final(self):
+        """236 bytes of real terminfo output: VPA, CHA, ECH, DCH, ICH, IL, DL and CBT, each
+        emitted by ncurses rather than typed by hand."""
+        s = Screen(cols=80, rows=24)
+        s.feed(_capture("vt_tput.bin"))
+        self.assertEqual([(i, t) for i, t in enumerate(_grid(s)) if t], [
+            (0, "ROW-ZERO"),
+            (2, "        VPA-ROW-TWO"),      # VPA kept the column CHA/text had left it at
+            (4, "          CHA-COL-TEN"),
+            (6, "aaa    aaa"),               # ECH 4 erased in place, nothing shifted
+            (8, "01456789"),                 # two DCH pulled the tail left
+            (10, "X   YZ"),                  # ICH 3 pushed YZ right
+            (12, "L12"), (14, "L13"), (15, "L14"),   # IL 1 opened a gap at row 13
+            (16, "M17"), (17, "M18"),               # DL 1 removed M16
+            (20, "                CBT"),     # CBT from column 20 -> the stop at 16
+            (22, "DONE"),
+        ])
+        self.assertEqual(s._pending, b"")
+        self.assertEqual(s.resyncs, 0)
+
+    def test_vim_capture_renders_the_file_and_the_edits(self):
+        """A real `vim -u NONE README.md` session (open, dd, dd, o, p, i, 5x, :q!) with its
+        `ESC[6n` / `ESC[>c` queries answered live from `pop_replies()`. Carries a real DCS
+        (`ESC P zz ESC \\`), real DECSTBM traffic and real IL/DL."""
+        blob = _capture("vt_vim.bin")
+        cut = blob.rfind(b"\x1b[?1049l")     # everything up to leaving the alt screen
+        self.assertGreater(cut, 0)
+        s = Screen(cols=80, rows=24)
+        for i in range(0, cut, 64):          # 64-byte reads: split-feed correctness, for real
+            s.feed(blob[i:min(i + 64, cut)])
+        self.assertTrue(s.alt)
+        self.assertEqual(_txt(s, 0), "# AI Session Tracker")
+        self.assertEqual(_txt(s, 10), "INSERTED LINE")   # the `o` command's IL
+        self.assertEqual(_txt(s, 11), ">>")              # `0i>>>` then `5x`
+        self.assertEqual(_txt(s, 17), "</p>")
+        for r in range(24):                              # no escape residue anywhere
+            self.assertNotIn("\x1b", _txt(s, r))
+            self.assertNotIn("zz", _txt(s, r), "the DCS payload leaked into the grid")
+        s.feed(blob[cut:])
+        self.assertFalse(s.alt)
+        self.assertIsNone(s.alt_grid)
+        self.assertEqual(s._cur_code, "")
+        self.assertEqual(s._pending, b"")
+        self.assertEqual(s.resyncs, 0)
+
+    def test_zsh_line_edit_capture_leaves_no_deleted_characters_behind(self):
+        """A real zsh line editor moving mid-line and deleting with `ESC[P` -- the shape that
+        used to leave the deleted characters on screen."""
+        s = Screen(cols=80, rows=24)
+        s.feed(_capture("vt_zsh.bin"))
+        self.assertEqual([t for t in _grid(s) if t.strip()],
+                         ["$ echo XYZha beta gamma", "XYZha beta gamma", "$ exit"])
 
 
 if __name__ == "__main__":

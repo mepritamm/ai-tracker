@@ -33,6 +33,22 @@ agent adds on top of it is mechanical.
   background code (`40`-`47`, `100`-`107`, `48;5;N`, or `48;2;R;G;B`). `code` is never empty --
   an empty/default style never produces a run.
 
+## `v` is monotonic FOR THE LIFE OF THE OBJECT -- reset and resize included
+
+`v` only ever increases: `ESC c` (RIS), `resize()` and alt-screen switches all bump it and stamp
+every row dirty, rather than starting a new counter. A viewer holding `since=N` must never be
+told "nothing changed" while the grid is being repainted underneath it, and RIS is exactly what
+a user types (`reset`) when the screen already looks wrong.
+
+## `pop_replies()` -- the one thing that flows back TOWARDS the child
+
+Some sequences are questions, not commands: `ESC[6n` asks where the cursor is, `ESC[c` / `ESC[>c`
+ask what the terminal is, and a real program (`vim`, every startup) BLOCKS until it gets an
+answer. `Screen` owns no file descriptor, so it accumulates the answer in `pending_replies` and
+whoever owns the pty drains it with `pop_replies()` after each `feed()` and writes the bytes back
+to the master fd -- see `_reader`. A caller that never drains is not corrupted, just mute: the
+buffer is capped at `MAX_REPLIES`.
+
 ## Explicitly out of scope -- accepted and consumed, never left to corrupt the stream
 
 These are parsed just far enough to find their terminator and are then silently discarded; they
@@ -45,9 +61,12 @@ never reach the grid and never leave dangling bytes for the next character to in
   `ESC ^`, APC `ESC _`): the whole string is scanned for its terminator (`ESC \\` or `BEL`) and
   thrown away as one unit, so binary payload inside it (which can legitimately contain bytes
   that look like other escape codes) does not desync the parser.
-- **Wide characters (CJK / emoji double-width)**: not implemented -- every decoded Unicode code
-  point is treated as exactly one display column. A double-width character will visually misalign
-  the columns after it; this is a known, deliberate gap, not a bug.
+- **Wide characters (CJK / emoji double-width) and combining marks**: not implemented -- every
+  decoded Unicode code point is treated as exactly one display column, and a combining mark
+  (including emoji variation selector U+FE0F) occupies its own cell instead of joining the
+  character before it. Columns after such a character visually misalign; this is a known,
+  deliberate gap, not a bug, and it is the ONE row on which this emulator still disagrees with
+  `pyte` across the real captured streams in `tests/fixtures/`.
 - **Every OSC beyond title-set** (`ESC ] 0 ;` / `ESC ] 2 ;`, terminated by `BEL` or `ESC \\`):
   the title text is captured onto `self.title` (not part of `snapshot()` -- it's outside the
   documented contract but harmless to expose); any other OSC number is consumed and discarded.
@@ -101,6 +120,7 @@ rotated regularly. That tradeoff is theirs to make; do not silently "fix" it bac
 """
 
 import base64
+import collections
 import json
 import os
 import pty
@@ -123,9 +143,36 @@ from . import server, term_gate, term_run
 
 TAB_STOP = 8
 
+MAX_PENDING = 4096
+"""Hard cap on the unconsumed tail `feed()` will carry across calls (B3).
+
+A legitimate OSC/DCS/SOS/PM/APC string is short -- a title, a termcap query, a sixel frame.
+An UNTERMINATED one is not: `_handle_string_seq` finds no BEL/ST, returns None, and every
+subsequent byte of the stream is buffered forever with the screen frozen behind it. That is not
+hypothetical -- of 447 real binaries under /bin and /usr/bin, four contain a stray DCS
+introducer (`/bin/sh` has one at offset 87584), so a plain `cat /bin/sh` in a terminal used to
+wedge the emulator permanently and grow `_pending` without bound. Past this many bytes we give
+up on the sequence instead of on the stream: the introducer is discarded and parsing resumes as
+ordinary text from just after it (see `Screen.resyncs`)."""
+
+MAX_REPLIES = 8192
+"""Cap on un-drained DSR/DA reply bytes (B7). The reader loop drains after every `feed()`, so
+this only matters if nobody ever calls `pop_replies()` -- a `Screen` used bare in a test, or a
+pty whose write side died. Bounded rather than unbounded is the whole point."""
+
 
 def _blank_row(cols):
     return [(" ", "")] * cols
+
+
+_Save = collections.namedtuple("_Save", "r c attrs origin")
+"""What DECSC (`ESC 7`) actually saves, and what DECRC (`ESC 8`) actually restores.
+
+Position ALONE is the bug B5 fixes: DECSC saves the graphic rendition and the origin-mode flag
+too, so a TUI that does `ESC 7`, paints a coloured status bar, then `ESC 8` expects its previous
+colour back -- restoring only (r, c) leaves the status bar's background smeared across everything
+it writes next. xterm's `?1049` is defined in terms of DECSC/DECRC, so it inherits this.
+"""
 
 
 class Screen:
@@ -140,8 +187,12 @@ class Screen:
         self.alt_grid = None
         self.grid = self.primary
         self.alt = False
-        self._primary_cursor = (0, 0)
-        self._primary_cursor_save = None
+        # One save slot PER BUFFER, indexed by int(self.alt) -- xterm keeps a separate saved
+        # cursor for the normal and the alternate screen, and sharing one slot means a TUI that
+        # does ESC 7 inside the alt screen silently overwrites the position `?1049l` will later
+        # restore the primary screen to. Each entry is the full DECSC record (see `_save_cursor`),
+        # not just a position: DECSC saves the SGR attributes and origin mode too.
+        self._saves = [None, None]
 
         self.cur_r = 0
         self.cur_c = 0
@@ -152,6 +203,7 @@ class Screen:
 
         self.autowrap = True
         self.cursor_visible = True
+        self.origin_mode = False    # DECOM (`?6`): row params are relative to the scroll region
 
         self.title = ""
 
@@ -166,7 +218,9 @@ class Screen:
         self.row_v = [0] * rows
         self._bumped = False   # has this feed() call already bumped self.v?
 
-        self._pending = b""    # unconsumed tail bytes across feed() calls
+        self._pending = b""    # unconsumed tail bytes across feed() calls (bounded: MAX_PENDING)
+        self.resyncs = 0       # how many times an over-long unterminated sequence was abandoned
+        self.pending_replies = bytearray()   # DSR/DA answers owed to the child; see pop_replies
 
     # ---------------------------------------------------------------- public
 
@@ -184,6 +238,14 @@ class Screen:
             if b == 0x1B:  # ESC
                 consumed = self._handle_escape(data, i)
                 if consumed is None:      # incomplete -- need more bytes
+                    if n - i > MAX_PENDING:
+                        # Not "more is coming" -- this sequence has no terminator in a whole
+                        # MAX_PENDING of stream, so waiting for one freezes the screen forever
+                        # (B3). Abandon the introducer, keep the stream: resume the parse right
+                        # after `ESC <type>` as ordinary text.
+                        self.resyncs += 1
+                        i += 2 if n - i >= 2 else 1
+                        continue
                     self._pending = bytes(data[i:])
                     return
                 i += consumed
@@ -195,6 +257,23 @@ class Screen:
                     self._pending = bytes(data[i:])
                     return
                 i += consumed
+
+    def pop_replies(self):
+        """Bytes the terminal owes the child, drained (B7).
+
+        A `Screen` is an output device with one narrow input duct: some sequences are QUESTIONS
+        (`ESC[6n` "where is the cursor?", `ESC[>c` "what are you?") and a real program BLOCKS
+        waiting for the answer -- `vim` sends both on startup. Answering is not the parser's job
+        to perform (it owns no fd), so it accumulates the answer here and whoever owns the pty
+        writes it back after each `feed()`; see `_reader`. Returns b"" when nothing is owed.
+        """
+        out = bytes(self.pending_replies)
+        del self.pending_replies[:]
+        return out
+
+    def _reply(self, data):
+        if len(self.pending_replies) + len(data) <= MAX_REPLIES:
+            self.pending_replies += data
 
     def snapshot(self, since):
         """Rows changed since version `since`, plus cursor + alt-screen flag."""
@@ -241,8 +320,9 @@ class Screen:
         self.cur_c = min(self.cur_c, cols - 1)
         self.pending_wrap = False
         self.scroll_top, self.scroll_bot = 0, rows - 1
-        pr, pc = self._primary_cursor
-        self._primary_cursor = (min(pr, rows - 1), min(pc, cols - 1))
+        for k, save in enumerate(self._saves):
+            if save is not None:
+                self._saves[k] = save._replace(r=min(save.r, rows - 1), c=min(save.c, cols - 1))
 
         self.v += 1
         self.row_v = [self.v] * rows
@@ -355,13 +435,10 @@ class Screen:
             self.pending_wrap = False
             return 2
         if b1 == 0x37:   # '7' DECSC
-            self._primary_cursor_save = (self.cur_r, self.cur_c)
+            self._save_cursor()
             return 2
         if b1 == 0x38:   # '8' DECRC
-            saved = self._primary_cursor_save
-            if saved:
-                self.cur_r, self.cur_c = saved
-                self.pending_wrap = False
+            self._restore_cursor()
             return 2
         if b1 == 0x63:   # 'c' RIS -- full reset
             self._reset()
@@ -413,12 +490,17 @@ class Screen:
         j = i + 2
         while j < n:
             b = data[j]
-            if 0x30 <= b <= 0x3F or 0x20 <= b <= 0x2F:
+            if 0x30 <= b <= 0x3F or 0x20 <= b <= 0x2F or b == 0x00:
+                # NUL inside a CSI is IGNORED, exactly as xterm ignores it (B6). Treating it as
+                # a stray byte instead ends the sequence early and leaves the real final byte to
+                # be printed: `ESC[3<NUL>mB` rendered a literal "m" into the grid -- the only
+                # path by which escape residue ever reached cell text. The NUL is stripped from
+                # the parameter bytes below so it cannot poison the int() parse either.
                 j += 1
                 continue
             if 0x40 <= b <= 0x7E:
                 final = b
-                params_raw = bytes(data[i + 2:j])
+                params_raw = bytes(data[i + 2:j]).replace(b"\x00", b"")
                 self._dispatch_csi(params_raw, chr(final))
                 return j - i + 1
             # stray byte outside the CSI grammar -- bail out, consume through here
@@ -439,7 +521,8 @@ class Screen:
         return out
 
     def _dispatch_csi(self, params_raw, final):
-        private = params_raw[:1] in (b"?", b">", b"<", b"=")
+        marker = params_raw[:1]
+        private = marker in (b"?", b">", b"<", b"=")
         body = params_raw[1:] if private else params_raw
         try:
             text = body.decode("ascii", errors="ignore")
@@ -448,7 +531,70 @@ class Screen:
         params = self._parse_params(text)
 
         if private:
-            self._dispatch_private(params, final)
+            if marker == b">" and final == "c":
+                # Secondary DA. `vim` asks this on startup and waits for the answer -- see
+                # pop_replies. "xterm, patch level 136, no firmware version" is the shape every
+                # client already knows how to ignore.
+                self._reply(b"\x1b[>0;136;0c")
+            elif marker == b"?":
+                self._dispatch_private(params, final)
+            return
+
+        if final == "c":                       # primary DA -- "VT100 with advanced video"
+            if not params or params[0] == 0:
+                self._reply(b"\x1b[?1;2c")
+            return
+        if final == "n":                       # DSR
+            self._device_status(params[0] if params else 0)
+            return
+        if final == "G":                       # CHA -- absolute column
+            n = params[0] if params and params[0] else 1
+            self.cur_c = min(max(n - 1, 0), self.cols - 1)
+            self.pending_wrap = False
+            return
+        if final == "d":                       # VPA -- absolute row
+            n = params[0] if params and params[0] else 1
+            self.cur_r = self._abs_row(n - 1)
+            self.pending_wrap = False
+            return
+        if final in ("E", "F"):                # CNL / CPL -- n lines down/up, column 0
+            n = params[0] if params and params[0] else 1
+            if final == "E":
+                self.cur_r = min(self.rows - 1, self.cur_r + n)
+            else:
+                self.cur_r = max(0, self.cur_r - n)
+            self.cur_c = 0
+            self.pending_wrap = False
+            return
+        if final == "@":                       # ICH -- insert blanks, shift the rest right
+            self._insert_chars(params[0] if params and params[0] else 1)
+            return
+        if final == "P":                       # DCH -- delete chars, shift the rest left
+            self._delete_chars(params[0] if params and params[0] else 1)
+            return
+        if final == "X":                       # ECH -- erase in place, no shifting
+            self._erase_chars(params[0] if params and params[0] else 1)
+            return
+        if final in ("L", "M"):                # IL / DL -- inside the scroll region only
+            n = params[0] if params and params[0] else 1
+            self._insert_lines(n) if final == "L" else self._delete_lines(n)
+            return
+        if final in ("S", "T"):                # SU / SD -- scroll the region, cursor unmoved
+            n = params[0] if params and params[0] else 1
+            if self.scroll_top <= self.scroll_bot:
+                self._scroll_up(n) if final == "S" else self._scroll_down(n)
+            return
+        if final == "Z":                       # CBT -- back-tab
+            n = params[0] if params and params[0] else 1
+            for _ in range(n):
+                self.cur_c = max(0, ((self.cur_c - 1) // TAB_STOP) * TAB_STOP)
+            self.pending_wrap = False
+            return
+        if final == "s":                       # ANSI.SYS save cursor (same slot as DECSC)
+            self._save_cursor()
+            return
+        if final == "u":                       # ANSI.SYS restore cursor (same slot as DECRC)
+            self._restore_cursor()
             return
 
         if final in ("A", "B", "C", "D"):
@@ -465,7 +611,7 @@ class Screen:
         elif final in ("H", "f"):
             row = params[0] if len(params) >= 1 and params[0] else 1
             col = params[1] if len(params) >= 2 and params[1] else 1
-            self.cur_r = min(max(row - 1, 0), self.rows - 1)
+            self.cur_r = self._abs_row(row - 1)
             self.cur_c = min(max(col - 1, 0), self.cols - 1)
             self.pending_wrap = False
         elif final == "J":
@@ -483,11 +629,39 @@ class Screen:
                 self.scroll_top, self.scroll_bot = top0, bot0
             else:
                 self.scroll_top, self.scroll_bot = 0, self.rows - 1
-            self.cur_r, self.cur_c = 0, 0
-            self.pending_wrap = False
+            self._home()
         # any other final byte: no-op, consumed
 
+    def _home(self):
+        """Cursor to the home position -- the top of the SCROLL REGION under origin mode."""
+        self.cur_r = self.scroll_top if self.origin_mode else 0
+        self.cur_c = 0
+        self.pending_wrap = False
+
+    def _abs_row(self, row0):
+        """Turn a 0-based absolute row parameter (CUP's first, VPA's only) into a grid row.
+
+        Under DECOM (`?6h`) row 1 means the FIRST ROW OF THE SCROLL REGION, not of the screen,
+        and the cursor may not be addressed outside that region at all -- which is the whole
+        reason a pager can set a region and then address "line 1" without knowing where its
+        region starts.
+        """
+        if self.origin_mode:
+            return min(max(self.scroll_top + row0, self.scroll_top), self.scroll_bot)
+        return min(max(row0, 0), self.rows - 1)
+
+    def _device_status(self, mode, private=False):
+        """DSR: the child asked a question and is BLOCKING on the answer (B7)."""
+        if mode == 6:      # CPR -- cursor position report, 1-based, origin-mode relative
+            r = self.cur_r - self.scroll_top if self.origin_mode else self.cur_r
+            self._reply(b"\x1b[%s%d;%dR" % (b"?" if private else b"", r + 1, self.cur_c + 1))
+        elif mode == 5 and not private:
+            self._reply(b"\x1b[0n")            # "terminal OK"
+
     def _dispatch_private(self, params, final):
+        if final == "n":                                  # DECDSR, e.g. `ESC[?6n`
+            self._device_status(params[0] if params else 0, private=True)
+            return
         if final not in ("h", "l"):
             return
         set_ = final == "h"
@@ -497,6 +671,9 @@ class Screen:
                     self._enter_alt()
                 else:
                     self._leave_alt()
+            elif code == 6:                               # DECOM -- origin mode
+                self.origin_mode = set_
+                self._home()                              # setting or resetting DECOM homes
             elif code == 7:
                 self.autowrap = set_
             elif code == 25:
@@ -519,6 +696,87 @@ class Screen:
             for c in range(self.cols):
                 row[c] = blank
         self._dirty(r)
+
+    # -- insert / delete within one line (ICH, DCH, ECH) ------------------
+    #
+    # All three shift or fill WITHIN THE CURRENT LINE ONLY -- never across the row boundary --
+    # and the cells they vacate are filled with the CURRENTLY ACTIVE SGR, exactly like erase
+    # (see the module docstring's "Erase uses the currently-active SGR" section). Filling with a
+    # hard default instead would punch unstyled holes into a TUI's coloured status line every
+    # time it edits one in place.
+
+    def _insert_chars(self, n):
+        r, c = self.cur_r, self.cur_c
+        n = min(n, self.cols - c)
+        if n <= 0:
+            return
+        row = self.grid[r]
+        blank = (" ", self._cur_code)
+        self.grid[r] = row[:c] + [blank] * n + row[c:self.cols - n]
+        self._dirty(r)
+        self.pending_wrap = False
+
+    def _delete_chars(self, n):
+        r, c = self.cur_r, self.cur_c
+        n = min(n, self.cols - c)
+        if n <= 0:
+            return
+        row = self.grid[r]
+        blank = (" ", self._cur_code)
+        self.grid[r] = row[:c] + row[c + n:self.cols] + [blank] * n
+        self._dirty(r)
+        self.pending_wrap = False
+
+    def _erase_chars(self, n):
+        r, c = self.cur_r, self.cur_c
+        n = min(n, self.cols - c)
+        if n <= 0:
+            return
+        blank = (" ", self._cur_code)
+        row = self.grid[r]
+        for k in range(c, c + n):
+            row[k] = blank
+        self._dirty(r)
+        self.pending_wrap = False
+
+    # -- insert / delete whole lines (IL, DL) ------------------------------
+
+    def _insert_lines(self, n):
+        """IL: push `n` blank lines in at the cursor row, INSIDE THE SCROLL REGION.
+
+        The region, not the screen, is the boundary that matters: a pager with a fixed status
+        line at the bottom sets `DECSTBM` and then inserts lines above it, and an IL that
+        shifted the whole screen would push that status line off the end of the world.
+        """
+        top, bot = self.scroll_top, self.scroll_bot
+        r = self.cur_r
+        if not (top <= r <= bot):
+            return
+        n = min(n, bot - r + 1)
+        if n <= 0:
+            return
+        block = self.grid[r:bot + 1]
+        self.grid[r:bot + 1] = [_blank_row(self.cols) for _ in range(n)] + block[:len(block) - n]
+        for k in range(r, bot + 1):
+            self._dirty(k)
+        self.cur_c = 0
+        self.pending_wrap = False
+
+    def _delete_lines(self, n):
+        """DL: drop `n` lines at the cursor row, pulling the rest of the REGION up."""
+        top, bot = self.scroll_top, self.scroll_bot
+        r = self.cur_r
+        if not (top <= r <= bot):
+            return
+        n = min(n, bot - r + 1)
+        if n <= 0:
+            return
+        block = self.grid[r:bot + 1]
+        self.grid[r:bot + 1] = block[n:] + [_blank_row(self.cols) for _ in range(n)]
+        for k in range(r, bot + 1):
+            self._dirty(k)
+        self.cur_c = 0
+        self.pending_wrap = False
 
     def _erase_display(self, mode):
         blank = (" ", self._cur_code)
@@ -681,14 +939,46 @@ class Screen:
         for r in range(top, bot + 1):
             self._dirty(r)
 
+    # -- DECSC / DECRC (and their `CSI s` / `CSI u` aliases) ----------------
+
+    def _attrs(self):
+        return (self.bold, self.dim, self.italic, self.underline,
+                self.blink, self.reverse, self.strike, self.fg, self.bg)
+
+    def _save_cursor(self):
+        self._saves[int(self.alt)] = _Save(self.cur_r, self.cur_c, self._attrs(), self.origin_mode)
+
+    def _restore_cursor(self):
+        save = self._saves[int(self.alt)]
+        if save is None:
+            # DECRC with nothing saved homes the cursor and clears attributes, per DEC.
+            self.origin_mode = False
+            self._reset_attrs()
+            self._recompute_code()
+            self._home()
+            return
+        self.origin_mode = save.origin
+        self.cur_r = min(max(save.r, 0), self.rows - 1)
+        self.cur_c = min(max(save.c, 0), self.cols - 1)
+        (self.bold, self.dim, self.italic, self.underline,
+         self.blink, self.reverse, self.strike, self.fg, self.bg) = save.attrs
+        self._recompute_code()
+        self.pending_wrap = False
+
     # -- alt screen ----------------------------------------------------------
 
     def _enter_alt(self):
+        """`?1049h` == DECSC, switch to the alternate buffer, clear it.
+
+        The clear is not optional and the buffer must be FRESH: keeping the previous alt grid
+        around means the next TUI to start (or the same one restarted) paints on top of the last
+        one's leftovers, and every cell it never writes shows the previous program's output --
+        which reads as a corrupted screen, not as a stale cache.
+        """
         if self.alt:
             return
-        self._primary_cursor = (self.cur_r, self.cur_c)
-        if self.alt_grid is None:
-            self.alt_grid = [_blank_row(self.cols) for _ in range(self.rows)]
+        self._save_cursor()                                    # into the PRIMARY slot
+        self.alt_grid = [_blank_row(self.cols) for _ in range(self.rows)]
         self.grid = self.alt_grid
         self.alt = True
         self.cur_r, self.cur_c = 0, 0
@@ -697,20 +987,40 @@ class Screen:
             self._dirty(r)
 
     def _leave_alt(self):
+        """`?1049l` == switch back to the primary buffer, then DECRC.
+
+        DECRC, not "put the cursor back": xterm's 1049 is DEFINED in terms of DECSC/DECRC, so it
+        restores the graphic rendition as well. Restoring position alone leaves whatever colour
+        the TUI happened to be painting with active over the shell prompt that comes back.
+        """
         if not self.alt:
             return
         self.grid = self.primary
         self.alt = False
-        self.cur_r, self.cur_c = self._primary_cursor
-        self.pending_wrap = False
+        self.alt_grid = None                                   # drop it -- see _enter_alt
+        self._saves[1] = None                                  # the alt buffer's slot dies with it
+        self._restore_cursor()                                 # from the PRIMARY slot
         for r in range(self.rows):
             self._dirty(r)
 
     # -- RIS full reset --------------------------------------------------
 
     def _reset(self):
-        cols, rows = self.cols, self.rows
+        """`ESC c` -- everything back to power-on state EXCEPT the version counter (B4).
+
+        `self.v` is the diff protocol's clock, and a viewer holding `since=N` asks "what changed
+        after N?". Rewinding `v` to 0 makes every row's stamp <= that viewer's `since` forever,
+        so it is told "nothing changed" while the grid is being completely repainted underneath
+        it -- the one failure the protocol must never produce, and RIS is exactly what a user
+        types (`reset`) when the screen already looks wrong. So `v` survives, and every row is
+        stamped dirty so a viewer at ANY `since` gets the full repaint.
+        """
+        cols, rows, v, replies = self.cols, self.rows, self.v, self.pending_replies
         self.__init__(cols, rows)
+        self.v = v
+        self.pending_replies = replies
+        for r in range(rows):
+            self._dirty(r)
 
 
 # ============================================================================================
@@ -906,6 +1216,17 @@ def _reader(pt):
                 break
             with pt.lock:
                 pt.screen.feed(data)
+                reply = pt.screen.pop_replies()
+            if reply:
+                # The child asked the terminal a question (`ESC[6n`, `ESC[>c`) and is BLOCKING on
+                # the answer -- `vim` sends both while starting up. Screen owns no fd, so this
+                # loop is the reply channel; without it the emulator is write-only and a TUI
+                # simply hangs. Best effort: a failed write here means the pty is already gone,
+                # which the next read reports properly.
+                try:
+                    os.write(pt.fd, reply)
+                except OSError:
+                    pass
             pt.touch()
     finally:
         pt.finish()
