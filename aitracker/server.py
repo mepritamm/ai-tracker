@@ -466,6 +466,7 @@ def publish_endpoint(actual):
 
 
 def run(host="127.0.0.1", port=8787, open_browser=True):
+    config.BIND_HOST = host    # term_gate reads this to know whether we're loopback-only
     srv = bind(host, port)
     actual = srv.server_address[1]
     publish_endpoint(actual)

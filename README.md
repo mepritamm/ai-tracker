@@ -77,12 +77,14 @@ Locally it's just `make serve` (localhost, no tunnel, no login). To reach it fro
 
 ## Terminal — on by default
 
-The tracker normally only *reads*. Three features let it *start processes*, and are enabled by default. To disable them, set **`TRACKER_TERMINAL=0`**. Note that `make tunnel` requires **`TRACKER_AUTH`**, so reaching the server over the network always requires a password; `make serve` binds to localhost only.
+The tracker normally only *reads*. Three features let it *start processes*, and are enabled by default. To disable them, set **`TRACKER_TERMINAL=0`**. `make serve`'s default `127.0.0.1` bind needs no password. But **binding beyond localhost requires `TRACKER_AUTH`** before the terminal will run — that covers `make tunnel` (which already mandates `TRACKER_AUTH` on its own) *and* `HOST=0.0.0.0 make serve` (LAN/Tailscale access, see [Remote & mobile access](docs/remote-access.md)): either one makes the terminal reachable off this machine, so without a password it would otherwise be an unauthenticated shell for anyone who can reach the port.
 
 ```bash
-make serve                                    # terminal enabled, localhost only
+make serve                                    # terminal enabled, localhost only, no password needed
 TRACKER_TERMINAL=0 make serve                # terminal disabled
 make tunnel                                   # terminal enabled (requires TRACKER_AUTH)
+HOST=0.0.0.0 make serve                       # terminal DISABLED until TRACKER_AUTH is also set
+HOST=0.0.0.0 TRACKER_AUTH=user:pass make serve # terminal enabled (requires TRACKER_AUTH)
 ```
 
 - **Terminal in the browser** — **▶ Open terminal here** and **▶ Resume in terminal** open a real interactive terminal in a dialog, right in the page: a live PTY in the session's working directory, `claude --resume <id>` for the resume variant. It runs full-screen programs — `vim`, `top`, Claude Code's own TUI — because the VT100/xterm emulator lives *server-side* in Python (stdlib only; nothing is vendored into the page). **⤢ New tab** reopens the *same* shell full-window in its own browser tab, so you can leave it running alongside the dashboard.
@@ -93,7 +95,7 @@ make tunnel                                   # terminal enabled (requires TRACK
 
 Worth reading, especially if you expose the server over a tunnel.
 
-- **The in-browser terminal is an unrestricted shell, and it is reachable wherever the server is.** No allowlist applies to it — that is the whole point of the feature. There is deliberately **no loopback restriction**: it works over `make tunnel` on purpose. So when the terminal is enabled (the default), anyone who can reach the port and knows `TRACKER_AUTH` gets a shell as your user. **Treat `TRACKER_AUTH` with the seriousness you'd give a root password**, and rotate it if you expose it publicly.
+- **The in-browser terminal is an unrestricted shell, and it is reachable wherever the server is.** No allowlist applies to it — that is the whole point of the feature. Once `TRACKER_AUTH` is set, there is deliberately **no further loopback restriction**: it works over `make tunnel`, or `HOST=0.0.0.0`, on purpose. So on any server that's reachable beyond loopback, the terminal only runs once you've set `TRACKER_AUTH` (a loopback-only `make serve` needs neither), and from then on anyone who reaches the port and knows `TRACKER_AUTH` gets a shell as your user. **Treat `TRACKER_AUTH` with the seriousness you'd give a root password**, and rotate it if you expose it publicly.
 - **"Local only" on the `↗` buttons is best-effort, not a guarantee.** That route refuses requests carrying a proxy's fingerprint (`X-Forwarded-For` and friends) and non-loopback peers. But `make tunnel` terminates on this machine and dials the server over loopback, so a peer address proves nothing on its own. The thing actually standing between a stranger and your machine is `TRACKER_AUTH`.
 - **"No shell" is not "no code execution."** The allowlist deliberately includes commands that run project-supplied code: `make` runs your `Makefile`, `pytest` imports your `conftest.py`, `npm test` runs your scripts. That is the point of the feature, not a bug — but it means the runner is as trustworthy as the directory it runs in.
 - **Running `git` inside a repository whose `.git/config` you don't control is code execution, by git's own design.** The runner neutralises the vectors it knows (external diff and textconv drivers, `core.fsmonitor`, `core.hooksPath`, pagers, `core.editor`) and refuses config-bearing flags, but git has many config-driven exec points and that list is not proven complete.
