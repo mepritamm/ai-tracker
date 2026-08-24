@@ -59,8 +59,10 @@
       if (!r.ok || j.error) {
         if (r.status === 403) {         // feature off, or the server refused us as remote
           allowed = false;
-          const el = document.getElementById("ext_launch");
-          if (el) hide(el);
+          // only the native sub-section hides -- the in-browser buttons are a different
+          // feature/gate entirely and must not disappear because native launch was refused.
+          const nat = document.getElementById("extnative");
+          if (nat) { nat.style.display = "none"; nat.innerHTML = ""; }
         }
         alert(j.error || "failed to open terminal");
         return;
@@ -71,26 +73,59 @@
     }
   }
 
+  // Tier 3 rewires the primary action: both buttons now open the in-browser terminal (ext_vt.js,
+  // exposed as window.ExtVT) instead of launching a native process. The native Terminal/iTerm
+  // launch stays reachable as a small secondary "↗" control -- the user asked for the in-browser
+  // terminal to be the default, not for the native launch to disappear.
+  //
+  // The two live in DIFFERENT gating regimes, so they can't share one visibility check any more:
+  //  - in-browser buttons: never host-gated (conventions rule: no control hidden by host/
+  //    viewport -- this one is exactly as usable over the tunnel as any other panel). A disabled
+  //    server feature (TRACKER_TERMINAL unset) surfaces as an in-modal error on click, not as a
+  //    missing button -- see ExtVT.open's 403 handling in ext_vt.js.
+  //  - native "↗" buttons: unchanged from before -- localOnly() + the existing /api/term/open
+  //    probe-and-latch, both already justified by the ponytail comment above.
   function render(d) {
     const el = document.getElementById("ext_launch");
     if (!el) return;
-    if (!localOnly() || allowed === false) return hide(el);
-    if (allowed === null) {             // not answered yet: stay hidden, then draw if allowed
-      hide(el);
-      probe().then(function () { if (allowed) render(d); });
-      return;
-    }
+    if (!cur) return hide(el);
     el.style.display = "";
     const resumable = isClaudeId(cur);
-    el.innerHTML =
-      '<button class="mini extlaunchbtn" id=extopenbtn ' +
-      'title="Open Terminal/iTerm here, cd\'d to this session\'s working directory — this machine only">' +
+
+    const vtHtml =
+      '<button class="mini extlaunchbtn" id=extvtopenbtn ' +
+      'title="Open a terminal right here in the browser, cd\'d to this session\'s working directory">' +
       "▶ Open terminal here</button>" +
       (resumable
-        ? '<button class="mini extlaunchbtn" id=extresumebtn ' +
-          'title="Open a terminal and run claude --resume for this session — this machine only">' +
+        ? '<button class="mini extlaunchbtn" id=extvtresumebtn ' +
+          'title="Resume this session in an in-browser terminal (claude --resume)">' +
           "⟲ Resume in terminal</button>"
         : "");
+
+    let nativeHtml = "";
+    if (localOnly()) {
+      if (allowed === false) {          // latched off by a previous 403 -- nothing native this cycle
+        nativeHtml = "";
+      } else if (allowed === null) {    // not answered yet: probe, then redraw once it resolves
+        probe().then(function () { render(d); });
+      } else {
+        nativeHtml =
+          '<span id=extnative>' +
+          '<button class="mini extlaunchbtn" id=extopenbtn ' +
+          'title="Open in Terminal/iTerm instead, cd\'d here — this machine only">↗ Terminal</button>' +
+          (resumable
+            ? '<button class="mini extlaunchbtn" id=extresumebtn ' +
+              'title="Resume via claude --resume in Terminal/iTerm instead — this machine only">↗ Resume</button>'
+            : "") +
+          "</span>";
+      }
+    }
+
+    el.innerHTML = vtHtml + nativeHtml;
+    const vb = document.getElementById("extvtopenbtn");
+    if (vb) vb.onclick = () => window.ExtVT ? window.ExtVT.open(cur, "cwd") : alert("in-browser terminal unavailable");
+    const vr = document.getElementById("extvtresumebtn");
+    if (vr) vr.onclick = () => window.ExtVT ? window.ExtVT.open(cur, "resume") : alert("in-browser terminal unavailable");
     const ob = document.getElementById("extopenbtn");
     if (ob) ob.onclick = () => openTerm("cwd");
     const rb = document.getElementById("extresumebtn");

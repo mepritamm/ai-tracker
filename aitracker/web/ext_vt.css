@@ -1,0 +1,119 @@
+/* Tier 3 — in-browser terminal. The modal chrome REUSES app.css's .overlay/.modal/.mh/.mb/.x
+   (built dynamically in JS with those exact class names, never a second modal system — see
+   conventions rule 4). Everything here is either the terminal pane itself (new, .vt*) or the
+   standalone full-tab layout (.vt-standalone / #ext_vt.vtfull). SGR -> class palette mirrors
+   ext_run.css's a30..a97 scheme (same underlying tokens) so Tier 2 and Tier 3 output look the
+   same; the two files don't share code because they're independent features per file, not
+   because the choice differs. */
+
+#ext_vt:empty { display: none; }   /* mirrors ext_launch/ext_run: no footprint until built */
+
+/* ---- modal sizing (chrome itself comes from app.css's .overlay/.modal) ---- */
+.vtmodal { width: min(920px, 100%); }
+.vtmodal .mb.vtmb { padding: 0; display: flex; flex-direction: column; min-height: 360px; }
+.vtempty { padding: 18px 22px; }
+
+/* ---- the terminal pane: grid text (.vtrows) + a synthetic cursor (.vtcursor) + a fully
+   covering, invisible input (.vtinput) that captures keyboard/paste/IME and focuses on tap.
+   The covering input means the grid text itself isn't mouse-selectable -- a deliberate v1
+   trade-off (spec doesn't ask for copy-from-grid; use "New tab" + OS copy, or the modal's own
+   scrollback is not kept either, matching a real PTY's altscreen semantics). ---- */
+.vtpane {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 300px;
+  background: var(--app);
+  overflow: hidden;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12.5px;
+  line-height: 17px;
+  padding: 8px 10px;
+  cursor: text;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.vtpane.vtalt { box-shadow: inset 0 0 0 1px var(--amber-line); }   /* alt-screen (vim/htop/…): a subtle tell */
+.vtrows { position: relative; white-space: pre; }
+.vtrow { height: 17px; line-height: 17px; white-space: pre; overflow: hidden; color: var(--text); }
+.vtcursor {
+  position: absolute;
+  top: 0; left: 0;
+  background: var(--ring2);
+  opacity: .5;
+  pointer-events: none;
+  animation: blink 1.1s step-end infinite;   /* reuses @keyframes blink from app.css */
+}
+.vtinput {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  opacity: 0;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  resize: none;
+  background: transparent;
+  color: transparent;
+  caret-color: transparent;
+}
+
+/* SGR runs -> classes. MUST stay in sync with sgrRunClass() in ext_vt.js, which is the single
+   place that maps parsed-integer SGR params to these class names -- see the comment there for
+   the assumed row/run encoding this depends on. */
+.vtrow .vtb { font-weight: 700; }
+.vtrow .vti { font-style: italic; }
+.vtrow .vtu { text-decoration: underline; }
+.vtrow .vtr { background: var(--text); color: var(--app); }
+.vtrow .vtf30, .vtrow .vtf90 { color: var(--dim); }
+.vtrow .vtf31, .vtrow .vtf91 { color: var(--red); }
+.vtrow .vtf32, .vtrow .vtf92 { color: var(--green); }
+.vtrow .vtf33, .vtrow .vtf93 { color: var(--amber); }
+.vtrow .vtf34, .vtrow .vtf94 { color: var(--blue); }
+.vtrow .vtf35, .vtrow .vtf95 { color: var(--violet); }
+.vtrow .vtf36, .vtrow .vtf96 { color: var(--ring2); }
+.vtrow .vtf37, .vtrow .vtf97 { color: var(--head); }
+.vtrow .vtg41 { background: var(--red-bg); }
+.vtrow .vtg42 { background: var(--green-bg); }
+.vtrow .vtg43 { background: var(--amber-bg); }
+.vtrow .vtg44 { background: var(--blue-deep); }
+
+/* tablets/phones: the overlay/modal already becomes a bottom sheet via app.css's own
+   @media(max-width:600px) rules (same classes, reused) -- only the pane's own metrics need a
+   touch here so a narrower viewport still fits a usable number of columns. */
+@media(min-width:601px) and (max-width:900px) {
+  .vtpane { font-size: 12px; line-height: 16px; }
+  .vtrow { height: 16px; line-height: 16px; }
+}
+@media(max-width:600px) {
+  .vtpane { font-size: 11.5px; line-height: 15px; padding: 6px 8px; min-height: 46vh; min-height: 46dvh; }
+  .vtrow { height: 15px; line-height: 15px; }
+}
+
+/* ---- standalone tab ("New tab" button / ?tty=<id>): #ext_vt takes over the whole viewport and
+   everything else the baked SPA would normally render is hidden. No new CSS system -- this is
+   the same #ext_vt mount every render() call already targets, just given a fullscreen layout. */
+.vt-standalone .app,
+.vt-standalone .foot,
+.vt-standalone .toasts,
+.vt-standalone .bgscrim,
+.vt-standalone .bgdrawer,
+.vt-standalone .overlay {
+  display: none !important;
+}
+#ext_vt.vtfull {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: var(--app);
+  display: flex;
+  flex-direction: column;
+}
+#ext_vt.vtfull .vtpane { flex: 1 1 auto; min-height: 0; padding: 10px 14px; }
+.vtfullstatus {
+  flex: 0 0 auto;
+  padding: 4px 12px;
+  font: 11px/1.4 'JetBrains Mono', monospace;
+  color: var(--dim);
+  border-top: 1px solid var(--line);
+  background: var(--side);
+}
