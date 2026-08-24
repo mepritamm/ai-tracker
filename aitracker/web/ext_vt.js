@@ -255,6 +255,9 @@
     this.scrollTotal = 0;
     this.pendingNewOutput = false;
     this._scrollReqSeq = 0;
+    // ---- async notices streamed via SSE frames (server sends {seq, text} for each notice) ----
+    this._noticeHighestSeq = -1;           // tracks highest seq seen to dedup re-sent frames
+    this._noticeEls = [];                  // array of displayed notice <div> elements (stacked)
 
     container.innerHTML = "";
     var self = this;
@@ -388,6 +391,21 @@
     if (msg.cursor && msg.cursor.length === 2) {
       this.cursor = [msg.cursor[0] | 0, msg.cursor[1] | 0];
     }
+    // Async notices: process if present (server sends [{"seq": <int>, "text": "<str>"}, ...])
+    // Defensively handle missing/malformed notices (older server sends nothing, or key absent).
+    var notices = msg.notices;
+    if (Array.isArray(notices)) {
+      for (var k = 0; k < notices.length; k++) {
+        var notice = notices[k];
+        var seq = (typeof notice.seq === "number") ? (notice.seq | 0) : -1;
+        var text = (typeof notice.text === "string") ? notice.text : "";
+        // Dedupe: skip if we've already seen this seq or higher
+        if (seq > this._noticeHighestSeq) {
+          this._noticeHighestSeq = seq;
+          this._displayNotice(text);
+        }
+      }
+    }
     // The single most infuriating thing a terminal can do (requirement 1): while the user is
     // scrolled back into history, a live SSE diff must NEVER repaint the screen out from under
     // them. `this.grid` above is still kept current either way (so the live view is correct and
@@ -451,6 +469,33 @@
     this.cursorEl.style.width = this.cellW + "px";
     this.cursorEl.style.height = this.cellH + "px";
     this.cursorEl.style.transform = "translate(" + (c * this.cellW) + "px," + (r * this.cellH) + "px)";
+  };
+
+  // Display an async notice streamed from the server. Maintains a stacked list of up to 3 notices
+  // to avoid filling the pane; older notices are removed when a 4th arrives. Text is escaped
+  // via textContent to prevent XSS. MOVED OUT OF THE PANE (inserted as siblings, not children)
+  // to prevent consuming the pane's vertical space and clipping rows. measureAndResize() is
+  // called whenever the notice list changes so the terminal renegotiates its row count.
+  Terminal.prototype._displayNotice = function (text) {
+    if (!text) return;
+    if (!this.pane || !this.pane.parentNode) return;   // guard: terminal destroyed or pane not ready
+    var maxNotices = 3;   // cap on displayed notices to prevent flooding the pane
+    // Create a new notice element
+    var el = document.createElement("div");
+    el.className = "vtnotice";
+    var span = document.createElement("span");
+    span.textContent = text;   // textContent escapes HTML
+    el.appendChild(span);
+    // Add to the DOM as a sibling BEFORE .vtpane (outside the pane, not a child of it)
+    this.pane.parentNode.insertBefore(el, this.pane);
+    this._noticeEls.push(el);
+    // Remove oldest notices if we exceed the cap
+    while (this._noticeEls.length > maxNotices) {
+      var oldest = this._noticeEls.shift();
+      if (oldest && oldest.parentNode) oldest.parentNode.removeChild(oldest);
+    }
+    // Renegotiate rows because the pane is now shorter (notices consume space in the container)
+    this.measureAndResize();
   };
 
   // Copy/paste/zoom are page-level UI actions, not terminal input -- they are intercepted here,
@@ -523,6 +568,16 @@
   };
   Terminal.prototype.destroy = function () {
     if (this.es) { this.es.close(); this.es = null; }
+    // Clean up any displayed notices and reset the sequence tracker
+    var hadNotices = this._noticeEls.length > 0;
+    for (var i = 0; i < this._noticeEls.length; i++) {
+      var el = this._noticeEls[i];
+      if (el && el.parentNode) el.parentNode.removeChild(el);
+    }
+    this._noticeEls = [];
+    this._noticeHighestSeq = -1;
+    // Renegotiate rows if notices were removed (the pane will expand to fill the space)
+    if (hadNotices) this.measureAndResize();
   };
   // Generic focus entry point shared with XtermTerminal (see that class's own .focus) -- so
   // ContextBar's getInput() callback can hand back the TERMINAL object itself, one interface for

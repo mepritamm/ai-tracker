@@ -659,5 +659,124 @@ class TestForkedAndNoticeResponsiveness(unittest.TestCase):
         self.assertIn("font-family: 'JetBrains Mono', monospace;", self.css)
 
 
+class TestAsyncNoticesFromScreenFrame(unittest.TestCase):
+    """POST /api/term/screen (SSE) now carries async notices in each frame. The client must:
+    - Consume and dedupe by seq
+    - Render multiple notices (capped at 3)
+    - Escape text safely
+    - Handle missing/malformed notices defensively
+    - Reset state when terminal changes"""
+
+    def setUp(self):
+        self.js = _read("ext_vt.js")
+
+    def test_terminal_constructor_initializes_notice_tracking(self):
+        # Terminal must set up _noticeHighestSeq and _noticeEls on construction
+        body = _function_body(self.js, "function Terminal(container, ttyId) {")
+        self.assertIn("this._noticeHighestSeq = -1;", body)
+        self.assertIn("this._noticeEls = [];", body)
+
+    def test_applyPatch_processes_notices_array_defensively(self):
+        # _applyPatch must read notices array only if it's an Array
+        body = _function_body(self.js, "Terminal.prototype._applyPatch = function")
+        self.assertIn("Array.isArray(notices)", body)
+
+    def test_applyPatch_extracts_seq_and_text_from_each_notice(self):
+        body = _function_body(self.js, "Terminal.prototype._applyPatch = function")
+        # Must extract seq as number and text as string
+        self.assertIn('typeof notice.seq === "number"', body)
+        self.assertIn('typeof notice.text === "string"', body)
+
+    def test_applyPatch_dedupes_by_seq(self):
+        # Only display notices with seq > _noticeHighestSeq; update high water mark
+        body = _function_body(self.js, "Terminal.prototype._applyPatch = function")
+        self.assertIn("seq > this._noticeHighestSeq", body)
+        self.assertIn("this._noticeHighestSeq = seq", body)
+
+    def test_applyPatch_calls_displayNotice_for_new_notices(self):
+        body = _function_body(self.js, "Terminal.prototype._applyPatch = function")
+        self.assertIn("this._displayNotice(text)", body)
+
+    def test_displayNotice_method_exists(self):
+        self.assertIn("Terminal.prototype._displayNotice = function", self.js)
+
+    def test_displayNotice_creates_vtnotice_div(self):
+        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
+        self.assertIn('el.className = "vtnotice"', body)
+
+    def test_displayNotice_escapes_text_via_textContent(self):
+        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
+        self.assertIn("span.textContent = text;", body)
+        self.assertNotIn("span.innerHTML = text;", body)
+
+    def test_displayNotice_inserts_as_sibling_before_pane(self):
+        # Notices are now inserted as siblings BEFORE the pane (not as children of it) to avoid
+        # consuming the pane's vertical space and clipping rows. The insertion uses
+        # pane.parentNode.insertBefore(el, pane), placing notices in the same flex container.
+        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
+        self.assertIn("this.pane.parentNode.insertBefore(el, this.pane)", body)
+
+    def test_displayNotice_tracks_elements_in_noticeEls_array(self):
+        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
+        self.assertIn("this._noticeEls.push(el);", body)
+
+    def test_displayNotice_caps_stacked_notices_at_3(self):
+        # When 4th notice arrives, oldest is removed
+        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
+        self.assertIn("var maxNotices = 3", body)
+        self.assertIn("while (this._noticeEls.length > maxNotices)", body)
+        self.assertIn("this._noticeEls.shift()", body)
+
+    def test_destroy_cleans_up_async_notices(self):
+        # When terminal is destroyed, remove all async notice DOM elements and reset state
+        body = _function_body(self.js, "Terminal.prototype.destroy = function")
+        self.assertIn("this._noticeEls = [];", body)
+        self.assertIn("this._noticeHighestSeq = -1;", body)
+        # Check that it removes elements from DOM
+        self.assertIn("el.parentNode.removeChild(el)", body)
+
+    def test_sync_notice_path_still_works(self):
+        # The synchronous notice from POST /api/term/pty response (activeNotice) must still render
+        # This ensures backward compat with older servers not sending async notices
+        self.assertIn("activeNotice = (typeof res.j.notice === \"string\") ? res.j.notice : null;", self.js)
+
+
+class TestAsyncNoticesMovedOutOfPane(unittest.TestCase):
+    """Layout defect fix: notices used to be inserted as children of .vtpane, consuming its
+    vertical space and clipping rows. They are now siblings of .vtpane, and measureAndResize()
+    is called whenever the notice list changes to renegotiate the row count."""
+
+    def setUp(self):
+        self.js = _read("ext_vt.js")
+
+    def test_notices_inserted_as_pane_siblings_not_pane_children(self):
+        # The key fix: use pane.parentNode.insertBefore(el, pane) not rowsEl.parentNode.insertBefore
+        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
+        self.assertIn("this.pane.parentNode.insertBefore(el, this.pane)", body)
+        # Old code path must be gone entirely
+        self.assertNotIn("rowsEl.parentNode.insertBefore(el, rowsEl)", body)
+
+    def test_displayNotice_calls_measureAndResize_after_adding(self):
+        # After adding a notice, the pane's available height has decreased (notices consume space
+        # in the flex container). measureAndResize() recalculates cols/rows for the new pane height.
+        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
+        self.assertIn("this.measureAndResize()", body)
+
+    def test_destroy_calls_measureAndResize_if_notices_were_shown(self):
+        # When the terminal is destroyed and notices exist, removing them frees up space in the
+        # container. Though the terminal itself is going away, the resize ensures consistency.
+        body = _function_body(self.js, "Terminal.prototype.destroy = function")
+        self.assertIn("measureAndResize()", body)
+
+    def test_notice_css_is_flex_container_item(self):
+        # .vtnotice must be `flex: 0 0 auto` so it doesn't consume the pane's shrinking space
+        css = _read("ext_vt.css")
+        notice_start = css.index(".vtnotice {")
+        notice_end = css.index("}", notice_start) + 1
+        notice_block = css[notice_start:notice_end]
+        self.assertIn("flex: 0 0 auto;", notice_block,
+                      "notices must be flex items with fixed height, not flex: 1")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -27,8 +27,13 @@
 }
 .mh .fn + .vtforkchip { margin-left: 6px; }   /* space after title */
 
-/* ---- server notice: muted advisory line displayed at the top of terminal pane ---- */
+/* ---- async notices from SSE stream: muted advisory lines displayed as siblings BEFORE .vtpane.
+   MOVED OUT OF THE PANE (not a child of .vtpane anymore) to prevent consuming its vertical space
+   and clipping rows. Each notice is its own flex: 0 0 auto sibling, so the pane can renegotiate
+   its rows count when notices are added/removed. See Terminal.prototype._displayNotice and the
+   call to measureAndResize() when the notice list changes. ---- */
 .vtnotice {
+  flex: 0 0 auto;
   padding: 8px 10px;
   background: var(--side);
   border-bottom: 1px solid var(--line3);
