@@ -6,9 +6,6 @@ help:
 	@echo "make serve | stop | tunnel | check | test | hooks | bundle   (PORT=$(PORT))"
 
 serve:
-	@pid=$$(lsof -nP -iTCP:$(PORT) -sTCP:LISTEN -t 2>/dev/null); \
-	if [ -n "$$pid" ]; then echo "Freeing :$(PORT) (pid $$pid)"; kill $$pid; sleep 1; fi
-	@echo "Starting AI session tracker on http://localhost:$(PORT)"
 	@PORT=$(PORT) python3 -m aitracker
 
 # stop everything: local tracker, the authed tunnel instance, and the Cloudflare tunnel

@@ -469,10 +469,11 @@ def run(host="127.0.0.1", port=8787, open_browser=True):
     srv = bind(host, port)
     actual = srv.server_address[1]
     publish_endpoint(actual)
-    if actual != port:
-        print(f"port {port} is in use → using {actual}")
     url = f"http://localhost:{actual}"
-    print(f"AI session tracker → {url}  (Ctrl-C to stop)")
+    if actual != port:
+        print(f"Starting AI session tracker on http://localhost:{actual} ({port}-{actual-1} were busy)")
+    else:
+        print(f"Starting AI session tracker on http://localhost:{actual}")
     if open_browser:
         try:
             webbrowser.open(url)
