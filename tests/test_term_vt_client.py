@@ -659,5 +659,85 @@ class TestForkedAndNoticeResponsiveness(unittest.TestCase):
         self.assertIn("font-family: 'JetBrains Mono', monospace;", self.css)
 
 
+class TestAsyncNoticesFromScreenFrame(unittest.TestCase):
+    """POST /api/term/screen (SSE) now carries async notices in each frame. The client must:
+    - Consume and dedupe by seq
+    - Render multiple notices (capped at 3)
+    - Escape text safely
+    - Handle missing/malformed notices defensively
+    - Reset state when terminal changes"""
+
+    def setUp(self):
+        self.js = _read("ext_vt.js")
+
+    def test_terminal_constructor_initializes_notice_tracking(self):
+        # Terminal must set up _noticeHighestSeq and _noticeEls on construction
+        body = _function_body(self.js, "function Terminal(container, ttyId) {")
+        self.assertIn("this._noticeHighestSeq = -1;", body)
+        self.assertIn("this._noticeEls = [];", body)
+
+    def test_applyPatch_processes_notices_array_defensively(self):
+        # _applyPatch must read notices array only if it's an Array
+        body = _function_body(self.js, "Terminal.prototype._applyPatch = function")
+        self.assertIn("Array.isArray(notices)", body)
+
+    def test_applyPatch_extracts_seq_and_text_from_each_notice(self):
+        body = _function_body(self.js, "Terminal.prototype._applyPatch = function")
+        # Must extract seq as number and text as string
+        self.assertIn('typeof notice.seq === "number"', body)
+        self.assertIn('typeof notice.text === "string"', body)
+
+    def test_applyPatch_dedupes_by_seq(self):
+        # Only display notices with seq > _noticeHighestSeq; update high water mark
+        body = _function_body(self.js, "Terminal.prototype._applyPatch = function")
+        self.assertIn("seq > this._noticeHighestSeq", body)
+        self.assertIn("this._noticeHighestSeq = seq", body)
+
+    def test_applyPatch_calls_displayNotice_for_new_notices(self):
+        body = _function_body(self.js, "Terminal.prototype._applyPatch = function")
+        self.assertIn("this._displayNotice(text)", body)
+
+    def test_displayNotice_method_exists(self):
+        self.assertIn("Terminal.prototype._displayNotice = function", self.js)
+
+    def test_displayNotice_creates_vtnotice_div(self):
+        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
+        self.assertIn('el.className = "vtnotice"', body)
+
+    def test_displayNotice_escapes_text_via_textContent(self):
+        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
+        self.assertIn("span.textContent = text;", body)
+        self.assertNotIn("span.innerHTML = text;", body)
+
+    def test_displayNotice_inserts_before_rowsEl(self):
+        # Notice must go at the top of the pane, above the grid, to match sync notice placement
+        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
+        self.assertIn("rowsEl.parentNode.insertBefore(el, rowsEl)", body)
+
+    def test_displayNotice_tracks_elements_in_noticeEls_array(self):
+        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
+        self.assertIn("this._noticeEls.push(el);", body)
+
+    def test_displayNotice_caps_stacked_notices_at_3(self):
+        # When 4th notice arrives, oldest is removed
+        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
+        self.assertIn("var maxNotices = 3", body)
+        self.assertIn("while (this._noticeEls.length > maxNotices)", body)
+        self.assertIn("this._noticeEls.shift()", body)
+
+    def test_destroy_cleans_up_async_notices(self):
+        # When terminal is destroyed, remove all async notice DOM elements and reset state
+        body = _function_body(self.js, "Terminal.prototype.destroy = function")
+        self.assertIn("this._noticeEls = [];", body)
+        self.assertIn("this._noticeHighestSeq = -1;", body)
+        # Check that it removes elements from DOM
+        self.assertIn("el.parentNode.removeChild(el)", body)
+
+    def test_sync_notice_path_still_works(self):
+        # The synchronous notice from POST /api/term/pty response (activeNotice) must still render
+        # This ensures backward compat with older servers not sending async notices
+        self.assertIn("activeNotice = (typeof res.j.notice === \"string\") ? res.j.notice : null;", self.js)
+
+
 if __name__ == "__main__":
     unittest.main()
