@@ -2585,6 +2585,106 @@ class TestRawStreamRoute(unittest.TestCase):
             _drain(pt, 5)
 
 
+class TestNoticeReachesRawViewer(unittest.TestCase):
+    """End-to-end proof that `_feed_note` closes the asymmetry documented in its own docstring: a
+    `raw_stream()`/xterm.js viewer now sees the SAME note text a `screen_stream()`/grid viewer
+    does, over the real SSE wire, through the real `raw_stream()` route -- not just at the
+    `pt.raw_queues` unit level TestFeedNote already covers. Mirrors TestRawStreamRoute's own
+    `test_raw_bytes_tee_from_a_real_pty_to_the_sse_wire` (real spawned shell, real /api/term/raw
+    connection)."""
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        term_vt._STREAMS = 0
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        for pt in list(term_vt.PTYS.values()):
+            pt.kill()
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+        term_vt._STREAMS = 0
+
+    def test_a_note_fired_after_attach_reaches_the_raw_viewer(self):
+        shell = os.environ.get("SHELL", "/bin/bash")
+        pt = term_vt.spawn(os.getcwd(), [shell, "-l"], 80, 24)
+        term_vt.PTYS[pt.id] = pt
+        h = _StreamHandler()
+        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("tty=" + pt.id)))
+        t.daemon = True
+        t.start()
+        try:
+            self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
+            term_vt._feed_note(pt, "raw viewer note test")
+
+            h.peer.settimeout(10)
+            seen = b""
+            deadline = time.time() + 10
+            while b"raw viewer note test" not in seen and time.time() < deadline:
+                try:
+                    chunk = h.peer.recv(65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                seen += chunk
+            frames = [ln[len(b"data: "):] for ln in seen.split(b"\n\n") if ln.startswith(b"data: ")]
+            decoded = b""
+            for f in frames:
+                try:
+                    decoded += base64.b64decode(f, validate=True)
+                except Exception:
+                    pass   # a partial trailing frame cut off mid-recv() -- ignore, not a real one
+            self.assertIn(b"raw viewer note test", decoded,
+                          "the raw/xterm path did not receive the note text")
+            self.assertEqual(decoded, b"\r\nraw viewer note test\r\n",
+                          "the raw viewer must receive EXACTLY the bytes fed to the screen, not "
+                          "a re-derived line")
+        finally:
+            h.close_peer()
+            t.join(5)
+            h.close()
+            pt.kill()
+            _drain(pt, 5)
+
+    def test_a_raw_viewer_attaching_after_the_notice_does_not_get_it_retroactively(self):
+        """The raw stream is a plain live byte tee with no scrollback (see `raw_stream()`'s own
+        "KNOWN GAP" docstring paragraph) -- a notice fired BEFORE any raw viewer attaches is
+        therefore invisible to one that attaches afterward. This is a REAL, INTENDED behavioural
+        difference from the grid path, which replays it via a full `since=-1` snapshot plus the
+        `notices` queue (0 is always "nothing delivered yet") -- see
+        TestNoticeDeliveryOverScreenStream.
+        test_notice_queued_before_attach_is_delivered_on_the_first_frame for that side. Pinned
+        here, not papered over."""
+        pt = term_vt.Pty(tid="rawlate1", screen=Screen(cols=10, rows=2))
+        term_vt.PTYS[pt.id] = pt
+        term_vt._feed_note(pt, "fired before any raw viewer attached")
+
+        h = _StreamHandler()
+        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("tty=" + pt.id)))
+        t.daemon = True
+        t.start()
+        try:
+            self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
+            h.peer.settimeout(1)
+            try:
+                chunk = h.peer.recv(65536)
+            except OSError:
+                chunk = b""       # the expected outcome: the 1s wait timed out, nothing arrived
+            self.assertNotIn(b"fired before any raw viewer attached", chunk,
+                              "a late raw viewer must not receive a notice queued before it "
+                              "attached -- the raw stream is live-only by design")
+        finally:
+            h.close_peer()
+            t.join(5)
+            h.close()
+            pt.kill()
+            _drain(pt, 5)
+
+
 class TestRawQueueOverflow(unittest.TestCase):
     """RAW_QUEUE_MAXLEN's drop-oldest overflow policy -- a slow/stalled raw viewer must not grow
     its queue without bound, and must not block _reader()'s single write-side thread either."""
@@ -2966,6 +3066,36 @@ class TestFeedNote(unittest.TestCase):
         self.assertEqual(len(pt.notices), 1)
         self.assertEqual(pt.notices[0]["text"], "hello from ai-tracker")
         self.assertEqual(pt.notices[0]["seq"], 1)
+
+    def test_feed_note_tees_the_exact_same_bytes_into_raw_queues(self):
+        """The raw/xterm renderer's counterpart to the screen-visible-text assertion above --
+        this is the asymmetry fix itself: `_feed_note` must push the SAME bytes it fed into
+        `pt.screen` onto every attached `pt.raw_queues` entry too, via `_tee_raw` (the identical
+        drop-oldest enqueue path `_reader()` uses for real PTY output), not a second hand-written
+        copy of the line."""
+        pt = _bare_pty()
+        q = queue.Queue(maxsize=8)
+        pt.raw_queues.append(q)
+        term_vt._feed_note(pt, "hello from ai-tracker")
+        raw_chunk = q.get_nowait()
+        self.assertEqual(raw_chunk, b"\r\nhello from ai-tracker\r\n")
+
+    def test_feed_note_populates_all_three_sinks_from_one_call(self):
+        """The whole contract in one assertion: ONE `_feed_note()` call populates the grid, the
+        raw-queue tee, AND the structured notice queue -- built from a single line, not three
+        independently-constructed copies that could drift out of sync with each other."""
+        pt = _bare_pty()
+        q = queue.Queue(maxsize=8)
+        pt.raw_queues.append(q)
+        term_vt._feed_note(pt, "all three sinks")
+
+        snap = pt.screen.snapshot(-1)                      # 1. grid renderer
+        joined = " ".join(text for _, text, _ in snap["rows"])
+        self.assertIn("all three sinks", joined)
+
+        self.assertEqual(q.get_nowait(), b"\r\nall three sinks\r\n")   # 2. raw/xterm renderer
+
+        self.assertEqual(pt.notices[-1]["text"], "all three sinks")    # 3. structured notice
 
 
 class TestNoticeQueueMechanics(unittest.TestCase):

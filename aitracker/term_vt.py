@@ -1406,6 +1406,28 @@ def spawn(cwd, argv, cols, rows):
     return pt
 
 
+def _tee_raw(pt, data):
+    """Push `data` (bytes) onto every open `raw_stream()` viewer's queue in `pt.raw_queues`,
+    drop-oldest on overflow. The ONE enqueue path for that list -- `_reader()` uses it to tee real
+    PTY output, `_feed_note()` uses it to tee a synthesized notice line -- so a slow/stalled raw
+    viewer is handled identically no matter which of the two produced the bytes; neither caller
+    writes to the deques directly. MUST be called with `pt.lock` held, exactly like every other
+    mutator of `pt.raw_queues`/`pt.screen` (both callers already hold it).
+    """
+    for q in pt.raw_queues:
+        try:
+            q.put_nowait(data)
+        except queue.Full:
+            try:
+                q.get_nowait()          # drop the oldest queued chunk...
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(data)       # ...to make room for this one
+            except queue.Full:
+                pass
+
+
 def _reader(pt):
     """Drain the pty into `pt.screen` via `feed()` until EOF, or until the idle timeout fires with
     nobody attached. Owns the reap: the thread that reads the fd is the thread that `waitpid()`s
@@ -1444,18 +1466,7 @@ def _reader(pt):
                 # same fd from two threads would race and split each PTY write unpredictably
                 # between them). Every raw_stream() viewer gets the SAME bytes Screen just
                 # parsed, unparsed -- see RAW_QUEUE_MAXLEN for the overflow policy.
-                for q in pt.raw_queues:
-                    try:
-                        q.put_nowait(data)
-                    except queue.Full:
-                        try:
-                            q.get_nowait()          # drop the oldest queued chunk...
-                        except queue.Empty:
-                            pass
-                        try:
-                            q.put_nowait(data)       # ...to make room for this one
-                        except queue.Full:
-                            pass
+                _tee_raw(pt, data)
             if reply:
                 # The child asked the terminal a question (`ESC[6n`, `ESC[>c`) and is BLOCKING on
                 # the answer -- `vim` sends both while starting up. Screen owns no fd, so this
@@ -1539,30 +1550,46 @@ BACKSTOP_WINDOW."""
 
 
 def _feed_note(pt, text):
-    """Record a LATE-firing Option-C event (see the section docstring above) on BOTH channels a
-    viewer can learn about it from -- the POST /api/term/pty response already went out by the
-    time either condition below can possibly be known, so neither channel here is that response:
+    """Record a LATE-firing Option-C event (see the section docstring above) on EVERY channel a
+    viewer -- grid or raw -- can learn about it from. The POST /api/term/pty response already
+    went out by the time either condition below can possibly be known, so none of these is that
+    response; the line is built exactly ONCE and fed to all three sinks so they can never drift
+    into slightly different wording:
 
-    1. A synthesized, CRLF-terminated status line written straight into `pt.screen` -- this is
-       what makes the note visible to a `screen_stream()`/grid-renderer viewer (it rides the
-       ordinary row-diff protocol, no client change needed) but it is INVISIBLE to a `raw_stream()`
-       /xterm.js-renderer viewer: that path only tees bytes `_reader()` actually read off the real
-       pty fd (`Pty.raw_queues`, filled inside `_reader()`'s loop), and this write goes straight to
-       `pt.screen.feed()` without ever touching the fd or that tee. This is a real, standing gap in
-       TRACKER_TERM_RENDERER=xterm mode, not something this function's write fixes -- see
-       `raw_stream()`'s own docstring for the renderer split.
-    2. `pt.add_notice(text)` -- the structured, per-viewer-tracked queue `_screen_stream_body()`
+    1. `pt.screen.feed(line)` -- a synthesized, CRLF-terminated status line written straight into
+       the grid. This is what makes the note visible to a `screen_stream()`/grid-renderer viewer
+       (it rides the ordinary row-diff protocol, no client change needed), and it is what a LATE
+       grid viewer (one that attaches after this fires) still sees too: the line is baked into
+       row content a fresh `since=-1` snapshot replays in full, same as any other output.
+    2. `_tee_raw(pt, line)` -- the SAME bytes pushed onto every currently-open `raw_stream()`
+       viewer's queue, exactly the way `_reader()` tees genuine PTY output (see that function and
+       `_tee_raw`'s own docstring): this is what makes the note visible to a `raw_stream()`/
+       xterm.js-renderer viewer, closing what used to be a standing gap in
+       TRACKER_TERM_RENDERER=xterm mode. Unlike (1), this delivery is LIVE-ONLY by construction --
+       `pt.raw_queues` holds one `queue.Queue` per viewer ALREADY attached at the moment this
+       runs, so a raw viewer that attaches AFTER the note fired never receives it retroactively;
+       there is no raw-byte scrollback to replay it from (see `raw_stream()`'s own "KNOWN GAP"
+       paragraph -- this is the same live-only nature, not a new one). This is a real, intended
+       difference between the two renderers, not an oversight left to paper over.
+       **Never write `line` to `pt.fd`** -- these bytes are a synthesized notice for viewers, not
+       input to the child process; writing them to the pty would send them to the running program
+       as keystrokes.
+    3. `pt.add_notice(text)` -- the structured, per-viewer-tracked queue `_screen_stream_body()`
        delivers as the SSE frame's `notices` key (added alongside `screen.snapshot()`'s own
        fields, never inside `Screen` itself -- the queue lives on `Pty`, `Screen` has no notion of
-       it). Same caveat as (1): only a `screen_stream()` viewer ever sees this key: `raw_stream()`
-       carries no JSON envelope at all, so there is no channel through which an xterm.js viewer
-       could receive a structured notice either.
+       it). Only a `screen_stream()` viewer ever sees this key: `raw_stream()` carries no JSON
+       envelope at all, so there is no channel through which an xterm.js viewer could receive a
+       structured notice either -- (1)/(2) above are the only way that renderer learns anything.
 
-    Both writes happen under ONE `pt.lock` acquisition so a concurrent `_screen_stream_body()`
-    poll can never observe the grid text without the matching queue entry, or vice versa.
+    All three happen under ONE `pt.lock` acquisition -- the same lock `_tee_raw`'s other caller
+    (`_reader`) and every other mutator of `pt.screen`/`pt.raw_queues` already holds -- so a
+    concurrent `_screen_stream_body()` or `raw_stream()` poll can never observe one sink updated
+    without the others.
     """
     with pt.lock:
-        pt.screen.feed(("\r\n" + text + "\r\n").encode("utf-8", "replace"))
+        line = ("\r\n" + text + "\r\n").encode("utf-8", "replace")
+        pt.screen.feed(line)
+        _tee_raw(pt, line)
         pt.add_notice(text)
 
 
