@@ -636,3 +636,329 @@ closed every reachable route for that provider.
 
 Verified live on `main` after merge: `find_session` blocks `*`, `?`, and `../../etc/hosts`;
 `parse_any("*")` returns `None`.
+
+---
+
+# SESSION 3 — Tier 3 (in-browser terminal) + port fallback
+
+## Contract (the four answers, verbatim)
+
+| Question | Answer |
+|---|---|
+| Emulator approach | **"Build the Python emulator (Recommended)"** — server-side `Screen`, zero deps |
+| Shell over the tunnel | **"Remove the gate it's okay to have the terminal in the tunnel, since the username password the URL everything is always anyways rotated."** |
+| Port fallback | **"Scan up from 8787 (Recommended)"** |
+| Landing | **"Branch + push, don't touch main (Recommended)"** |
+
+### On the tunnel decision
+
+I recommended a loopback gate with a second opt-in, on the grounds that Tier 3 is an
+**unrestricted shell** and `make tunnel` puts it on the public internet. The user overruled that
+explicitly, reasoning that the credentials and the tunnel URL are rotated anyway. **That is their
+call and it ships that way.** `TRACKER_TERMINAL=1` + `TRACKER_AUTH` remain required — the base
+gate stays; only the loopback restriction is dropped. The plan's §5 rule 4 and the ERRATA must be
+updated to record that this was decided, not overlooked.
+
+## Assumptions taken without asking
+
+1. **Both buttons open the in-browser modal, and the native launch is KEPT** as a small secondary
+   control. The user asked for the modal; they did not ask for the native Terminal launch to be
+   deleted, and removing a working feature is the irreversible choice.
+2. The three pieces are built in file-disjoint worktrees and integrated by me onto ONE branch, so
+   the session still produces one PR.
+3. `Screen` ships and goes green BEFORE any route is written — the plan makes that build order
+   part of the spec, not a preference.
+
+## Wave 1 — dispatched
+
+| Leg | Model | Rationale (rule 3, answered bottom-up) |
+|---|---|---|
+| `Screen` VT emulator + tests | `sonnet` | Sequence set is enumerated in the spec and an exhaustive test file catches errors; `opus` is reserved for the adversarial review, where judgement actually lives |
+| Port scan-up | `haiku` | One loop, a Makefile deletion, one file-write contract — mechanical |
+| Modal + standalone tab | `sonnet` | UI matching an existing modal pattern; taste, not deep reasoning |
+
+**The seam between the two halves is `Screen.snapshot()`'s return shape.** The client agent is
+coding against a documented contract, not running code, and was told to isolate SGR decoding in
+one function and report the encoding it assumed — so I can reconcile the halves at integration
+rather than discover a mismatch at runtime.
+
+## Wave 2 — blocked on the emulator
+
+PTY session table + the four routes (`/api/term/pty`, `/keys`, `/resize`, `/screen`), including
+`TIOCSWINSZ` resize (without it TUIs render at 80x24 forever) and the same bounds Tier 2 learned
+the hard way: max concurrent PTYs, idle timeout, viewer-scoped kill-on-disconnect, `killpg` not
+`kill`, and a cap on concurrent SSE connections.
+
+## Port fallback — `4165837`, and the diagnosis was not what the brief assumed
+
+**`bind()` already scanned 20 ports at `e08168e`** (`server.py:425-434`), and
+`publish_endpoint(actual)` already wrote the real bound port. The Python side was never broken —
+my brief assumed it was.
+
+**The only real bug was the Makefile**, which killed the process holding the port *before* the
+server ever got a chance to scan. Three lines deleted. That is the entire fix, and it is the right
+one.
+
+Correctly, the agent added no new test: `test_bind_skips_busy_port` already covers the helper, and
+a Makefile deletion is not unit-testable. An added test here would have been theatre.
+
+**Verified empirically by me**, because the agent hedged ("the port file *would* receive…"):
+occupied 8931, started the server, and got — server bound **8932**, `./aitracker/port` contains
+**8932**, and the process holding 8931 **survived**. That last line is the whole point of the
+change.
+
+Two reporting inaccuracies, behaviour unaffected: the agent named the port file
+`~/.config/aitracker/port` (it is `aitracker/port`, as the README says), and it inferred the
+file-write rather than testing it.
+
+To fold in at integration: the new startup message dropped the `(Ctrl-C to stop)` hint.
+
+## VT emulator — `7b2be38`, 386 tests (355 + 31)
+
+Every in-scope sequence implemented and tested; nothing on the list was skipped. Out-of-scope
+sequences proven *consumed* rather than mis-rendered — including a DCS/sixel payload with a fake
+`\x1b[31m` embedded in its body, proven NOT to apply.
+
+**It caught a real bug in its own adversarial pass**, which is the kind that survives naive tests:
+a truncated extended-colour code (`\x1b[38;5m`, `\x1b[48;2m`) let the leftover `5`/`2` sub-param be
+reinterpreted as ordinary SGR — silently switching on blink/dim and leaking it into all subsequent
+text.
+
+Split-feed handling is structural: `feed()` prepends the unconsumed tail from the previous call,
+and any handler hitting end-of-data mid-sequence returns "incomplete" rather than guessing.
+
+## Client — `e545b96`, 373 tests — and the contract mismatch it exposed
+
+The client was built against a documented GUESS at the wire format, and it reported that guess
+explicitly. That is the only reason the following was caught before runtime rather than after:
+
+| | Emulator actually does | Client assumed |
+|---|---|---|
+| `text` | **right-trimmed** of trailing default-styled cells | **padded to `cols`** |
+| SSE framing | (unspecified) | plain `data:`, no `event:` name |
+| `/api/term/pty` body | `{session, cols, rows}` | added a **`mode`** field |
+
+**Reconciled, each in the cheaper direction:**
+- Trimming STAYS (it is the bandwidth win the diff protocol exists for); the client pads on
+  render. Told it to handle the two consequences — a shrinking row must not leave ghost glyphs to
+  the right, and `cursor[1]` is routinely `> len(text)`.
+- Server must emit **no `event:` name** — the client uses `EventSource.onmessage`, which ignores
+  named events. A named event would make the terminal go permanently silent with no error, which
+  is the worst failure mode available. Note Tier 2's `term_run.py` DOES use `event: end`, so this
+  was a live copy-paste hazard.
+- `mode` is correct and my original four-field table was incomplete — the two buttons cannot work
+  without it. Server now accepts `{session, cols, rows, mode}`.
+- Two viewers on one tty need INDEPENDENT `since` counters, or whichever attached later starves.
+  This is a designed-for case, not an edge case, because "New tab" attaches to the same tty.
+
+Client extras worth keeping: Escape reaches the shell (the capture textarea calls
+`stopPropagation`, so the modal's own Escape-to-close only fires when focus is elsewhere), output
+is escaped (an `<img onerror>` payload rendered as literal text in the harness), resize reports
+the actually-measured pane size, and the native Terminal launch was **kept** as a secondary
+`↗ Terminal` / `↗ Resume` pair rather than deleted.
+
+Known v1 limitation, stated in the CSS: the invisible capture textarea covers the pane, so grid
+text is not mouse-selectable. "New tab" plus OS-level copy is the workaround.
+
+## Client contract fix — `9db1d9e`, 377 tests
+
+`_paintRow` now rebuilds each row wholesale and pads to `cols`, rather than assuming the server
+padded. Verified live in a browser harness, not just by assertion:
+
+- **shrink:** 40-char row → `"hi!"` gives `contains_leftover: false`, `length == cols`, rest spaces
+- **styled tail:** text `"X"` with run `[0,10,"44"]` renders the padding INSIDE the blue span
+  (`span_covers_10_cols: true`) — the erased-with-active-SGR case
+- **cursor beyond text:** requested col 200 on a 78-col pane clamps to `(cols-1)*7.2`, never
+  off-pane
+
+It also removed the now-wrong `Math.min(text.length, run[1])` clamp, which would have silently
+truncated any run extending past the trimmed text — the exact failure the trimming mismatch would
+have caused.
+
+## Integration map (files are disjoint; merge order will not matter)
+
+| Branch | Owns |
+|---|---|
+| `…ab8bd7a0` port | `Makefile`, `aitracker/server.py` |
+| `…a761310f` emulator + routes | `aitracker/term_vt.py`, `tests/test_term_vt.py` |
+| `…ac215238` client | `aitracker/web/ext_vt.{js,css}`, `ext_launch.js`, `tests/test_term_vt_client.py` |
+
+## VT emulator adversarial review — VERDICT: **REFUTED**, four ship-blockers
+
+Method worth recording: the reviewer installed **`pyte` in a scratch venv as a reference oracle**
+and fed both it and `Screen` the *same real PTY captures*, then diffed the grids row by row. That
+is what found everything below. Nothing in the 31 hand-written tests touches any of it — **the
+suite was never fed a real program's bytes**, which is exactly why B1–B4 survived it untouched.
+
+### B1 — `top` renders unreadable garbage
+
+`Screen` implements only CSI finals `A B C D H f J K m r`. Real `top` addresses **every line**
+with `\r\x1b[<n>d` (VPA) and columns with `\x1b[21G` (CHA). Over one 4737-byte capture: `d`×49,
+`G`×2, `P`×2 — all silently discarded. pyte got 29/30 rows right; `Screen` got a scrambled
+process table. Minimal repro:
+
+    b'\x1b[2dLINE-TWO'  ->  Screen: 'LINE-TWO' on row 0.  xterm: row 0 empty, row 1 = 'LINE-TWO'
+
+### B2 — shell line-editing leaves deleted characters on screen
+
+`\x1b[<n>P` (DCH) is a no-op, and GNU readline emits it for every mid-line backspace. Captured
+verbatim from a real `bash -i`:
+
+    b'echo hello world\x08...\x1b[1Pworld'  ->  Screen: 'echo hello worldd'   xterm: 'echo hello world'
+
+**This is the first thing a user will do in the terminal.** Also missing and diverging from pyte:
+`G`(CHA) `d`(VPA) `E`(CNL) `F`(CPL) `@`(ICH) `P`(DCH) `X`(ECH) `L`(IL) `M`(DL) `S`(SU) `T`(SD)
+`Z`(CBT) `s`/`u`(SC/RC), `?6` origin mode.
+
+### B3 — an unterminated DCS freezes the emulator permanently
+
+`_handle_string_seq` returns `None` when no BEL/ST is found and `feed()` then buffers **everything**
+into `_pending` forever. No cap, no resync. Scanned 447 real system binaries: **4 stall the parser
+permanently**, including `/bin/sh` (stray DCS introducer at offset 87584). After `cat /bin/sh`,
+`_pending` = 13456 bytes, the screen is dead for the life of the tty, and it keeps growing.
+
+### B4 — `ESC c` (RIS) rewinds the version counter; viewers go permanently stale
+
+`_reset()` calls `__init__`, zeroing `v` and `row_v`. A client holding `since=2` then receives
+`[]` forever while the grid actually changed — the precise "missed row" failure the diff protocol
+must never have. And `reset` **starts with `ESC c`** — which, given B1 and B2, is exactly what a
+user types when the screen looks wrong.
+
+### Non-blocking
+
+**B5** `?1049l` restores grid and cursor but **not SGR** (xterm's 1049 does DECSC/DECRC). Latent —
+all five real programs tested reset SGR before exiting. `_leave_alt` also leaves `alt_grid`
+uncleared, so re-entering shows stale content.
+**B6** NUL inside a CSI leaks a literal char: `b'A\x1b[3\x00mB'` → `'AmB'`. The one place escape
+residue reached cell text.
+**B7** No reply channel for DSR/DA — real `vim` emits `\x1b[6n` twice and expects an answer.
+**And `Screen` has no `resize()` at all**, so a browser resize has nowhere to land.
+**B8** Inverted DECSTBM resets margins instead of being ignored; pyte agrees with `Screen`, so low
+confidence it matters.
+
+### What the review CONFIRMED — and it is a lot
+
+- **Real programs, 15 captures, zero row-diffs vs pyte**: `git log --color`, `git show --color`,
+  `ls -Gla`, `top -l 1`, `vim` open+quit, `vim` with movement/search/insert/undo, `less` with
+  navigation, `bash -i`, `claude --help`, Python REPL. Zero escape residue in cell text.
+  On `vim`'s alt-screen, `Screen` is **more** correct than pyte (which lacks `?1049` and crashes on
+  `\x1b[>4;2m`).
+- **Split-feed: the strongest part of the implementation.** Split at *every* byte offset across
+  ~40k split points, byte-at-a-time feeding, and 300 random 12-way splits per capture — **0
+  divergences** across full state (grids, cursor, scroll margins, autowrap, pending, title).
+- **`snapshot()` diff protocol sound except B4**: incremental replay reproduced the final full
+  snapshot exactly for all 15 captures; runs round-trip with 0 mismatches; keys exactly
+  `['alt','cursor','rows','v']`. It also independently confirmed the wire contract I reconciled —
+  trimming is real, `since=-1` yields every row.
+- **Out-of-scope handling confirmed except B3**, including the specific claim that a fake
+  `\x1b[31m` inside a DCS body does not apply.
+- **Hostile input all sane**, incl. 200KB of random bytes leaving `pending=0`.
+- **13/13 mutants killed.** The hand-written suite is honest for what it covers.
+
+### My process error
+
+I sent the wire-format contract to this reviewer instead of to the routes agent. No damage — the
+reviewer used it constructively and verified the contract points — but the routes agent went
+without it until now. Resent.
+
+## Tier 3 routes — `1883348`, 423 tests
+
+Four routes on `term_vt.py`, all `term_gate.guard()` first, registered at import time. The
+contract reconciliation (which I misrouted, then resent) was applied in full: `event: end` removed
+so every frame is an unnamed `data:` line, `{session, cols, rows, mode}` accepted, `snapshot()`
+sent verbatim without padding, `since` per-connection, keys exactly `v/rows/cursor/alt`.
+
+It also added the missing **`Screen.resize()`** (`term_vt.py:149`) that the review flagged as B7,
+and documented — without implementing — the DSR reply-channel hook.
+
+**Caps, with reasoning:** `MAX_PTYS=4` (each pins a Screen grid plus a reader thread; interactive
+shells are heavier than Tier 2's one-shot jobs) · `MAX_STREAMS=24` (same thread-exhaustion
+rationale Tier 2 learned by reproducing a total wedge) · `IDLE_TIMEOUT=1800s` checked inside the
+reader's own `select` loop, so no second timer thread · `_REAP_LINGER=600s`.
+
+**A deliberate divergence from Tier 2, and the right one:** the PTY is **not** killed when the last
+viewer leaves. Tier 2 kills on last-viewer-gone because a job has a finite output; a Tier 3 shell
+is persistent and meant to be reattached to — which is exactly what the "New tab" button does.
+Only `IDLE_TIMEOUT` reaps an abandoned one.
+
+Real end-to-end: keys spelling `echo hi-from-tier3` produced row 7 = `"hi-from-tier3"` in the
+snapshot, distinct from row 6's echoed input line. Shell exited gracefully, `pgrep -P` empty.
+
+**Its honest answer on the security posture**, now in the module docstring: anyone who reaches the
+HTTP port and knows `TRACKER_AUTH` gets an unrestricted interactive shell as the server's OS user
+— localhost, LAN, or the far end of a Cloudflare tunnel alike, since cloudflared's requests also
+present as `127.0.0.1`. `TRACKER_AUTH` deserves root-password-level seriousness whenever
+`TRACKER_TERMINAL=1` is set.
+
+## Emulator fixes dispatched (opus)
+
+B1+B2 (missing CSI finals: `G d E F @ P X L M S T Z s u`, `?6`), B3 (bound `_pending`, resync on
+overflow), B4 (`v` monotonic across reset/resize/alt), B5 (`?1049l` restores SGR; clear `alt_grid`;
+independent save slots), B6 (NUL inside CSI), B7 (DSR/DA reply channel wired to the reader loop).
+B8 left alone — pyte agrees with current behaviour.
+
+**Method is mandated, not optional:** `pyte` in a throwaway venv as an oracle (never a dependency,
+nothing committed may import it), real captures from `top` / `bash -i` mid-line edit / `vim` /
+`git log --color` / `less`, fed to both, row-diff driven to zero. Plus a committed real-byte
+fixture test, so the "never fed real bytes" gap closes permanently rather than being re-opened by
+the next change.
+
+Given `opus` — four ship-blockers already survived a competent implementer AND a 31-test suite
+that kills 13/13 mutants; the failure mode is silent mis-rendering.
+
+## Emulator fixes — `e51e620`, 471 tests. The headline is the row-diff table
+
+Method: `pyte` in a throwaway venv as oracle (never imported by shipped code), identical real PTY
+captures fed to both, grids diffed at four checkpoints.
+
+| capture | before | after |
+|---|---|---|
+| `top` (interactive, 4s) | **23 / 24 rows wrong** | **0** |
+| `vim` open/navigate/quit | 0 | 0 |
+| `less -R` navigation | 1 | 1 (kept) |
+| `tput` (real ncurses vpa/hpa/ech/dch/ich/il/dl/cbt) | n/a | 1 (kept) |
+| `zsh -i` mid-line edit (real `ESC[P`) | n/a | 0 |
+| `git log --color --graph` | 0 | 0 |
+| **total across 9 captures** | **57** | **2** |
+
+**Both survivors are cases where pyte is the wrong oracle**, and the agent was right to keep them:
+an emoji variation selector (the documented wide-char gap), and `CBT` — where `pyte` has no `Z`
+handler at all, so it leaves the cursor un-moved while this emulator correctly goes to the tab stop.
+
+B3's scan widened from the reviewer's sample of 447 binaries to **961**: **15** would previously
+have wedged the parser, not 4. Max `_pending` across all of them now **2 bytes**. `_pending` on
+`/bin/sh` peaks at 2528 and ends at 0 with `resyncs=1`, and the screen keeps working afterwards.
+
+B4 verified monotonic across `text → RIS → text → resize → alt-in → alt-out → RIS`: `v = 1..7`,
+and a viewer holding the pre-RIS `since` gets its rows back.
+
+**Real-byte fixtures are now committed** (`tests/fixtures/*.bin`, 3.4 KB) — including vim fed in
+64-byte chunks so split-feed is exercised on real bytes. The agent rejected its `top` capture from
+the fixtures because it contained machine-identifying content; good call.
+
+## Integration — 495 tests, and one bug only the browser could find
+
+Merged all four branches into `terminal/tier3-integration`. Gate green at 495.
+
+Live browser pass against the live server found a defect **no assertion on either side could
+have caught, because each half was correct on its own**: the standalone "New tab" page rendered a
+**black screen**. The DOM was perfect — 25 rows, right text, right colours — laid out at **0x0**.
+
+Cause: `#ext_vt` lives inside `.app`, and `.vt-standalone` hides `.app` with
+`display:none !important`. **A `display:none` ancestor removes its whole subtree from rendering;
+`position:fixed; inset:0` on the descendant does not rescue it.** Fixed in `d1defcb` by
+reparenting the mount to `<body>` before it takes over the window, with a regression test proved
+RED on revert.
+
+Verified after the fix by screenshot: monospace output, live green cursor, `tty … · connected`
+status bar.
+
+## Shipped
+
+Branch **`terminal/tier3-in-browser`** pushed to `personal` (head `d1defcb`). `main` untouched at
+`e08168e`, per the user's "branch + push, don't touch main".
+
+Also worth recording: while integrating I ran `git switch` on the PRIMARY checkout, which moves
+HEAD for every session sharing it — the exact discipline I had written into three separate agent
+briefs. Caught immediately, restored to `main` with all WIP intact, and the integration moved into
+its own worktree.
