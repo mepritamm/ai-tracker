@@ -539,5 +539,125 @@ class TestXtermRendererSwitch(unittest.TestCase):
         self.assertNotIn("function () { return term.input; }", self.js)
 
 
+class TestForkedStatusIndicator(unittest.TestCase):
+    """POST /api/term/pty gains a `forked` field (true/false) indicating if the terminal is a
+    copy of a background agent. The client must surface this unmistakably in both modal and
+    standalone views, and read it defensively (if absent, behave as false)."""
+
+    def setUp(self):
+        self.js = _read("ext_vt.js")
+
+    def test_forked_is_stored_as_active_module_variable(self):
+        self.assertIn("var activeForked = false", self.js)
+
+    def test_fork_chip_element_created_in_buildoverlay(self):
+        self.assertIn("modalForkChip = document.createElement", self.js)
+        self.assertIn('modalForkChip.className = "vtforkchip"', self.js)
+
+    def test_fork_chip_shown_when_forked_true(self):
+        self.assertIn("activeForked = !!res.j.forked", self.js)
+        self.assertIn("if (modalForkChip) modalForkChip.style.display = activeForked ? \"\" : \"none\";", self.js)
+
+    def test_fork_chip_hidden_on_close(self):
+        body = _body_until(self.js, "function closeVT()", ["function openNewTab"])
+        self.assertIn("if (modalForkChip) modalForkChip.style.display = \"none\";", body)
+
+    def test_forked_parameter_passed_to_standalone_view(self):
+        self.assertIn('"&forked=" + (activeForked ? "1" : "0")', self.js)
+
+    def test_standalone_reads_forked_from_url_defensively(self):
+        body = _body_until(self.js, "function bootStandalone", ["})();\n})();"])
+        self.assertIn('var standaloneForked = qs.get("forked") === "1";', body)
+
+    def test_standalone_shows_fork_indicator_in_status_line(self):
+        body = _body_until(self.js, "function bootStandalone", ["})();\n})();"])
+        self.assertIn("standaloneForked", body)
+        self.assertIn('chip.className = "vtstatus-fork"', body)
+
+
+class TestServerNoticeAdvisory(unittest.TestCase):
+    """POST /api/term/pty gains a `notice` field (string or null) with a human-readable advisory
+    warning. The client must display it as a muted advisory line (not red/error), escape it, and
+    read it defensively (if absent, render nothing)."""
+
+    def setUp(self):
+        self.js = _read("ext_vt.js")
+        self.css = _read("ext_vt.css")
+
+    def test_notice_stored_as_active_module_variable(self):
+        self.assertIn("activeNotice = null", self.js)  # part of comma-separated variable declaration
+
+    def test_notice_element_created_in_buildoverlay(self):
+        self.assertIn("modalNoticeEl = document.createElement", self.js)
+
+    def test_notice_extracted_from_response_defensively(self):
+        # activeNotice gets the string if notice is present, or null otherwise
+        self.assertIn('activeNotice = (typeof res.j.notice === "string") ? res.j.notice : null;', self.js)
+
+    def test_notice_text_is_escaped_not_inserted_raw_html(self):
+        body = _body_until(self.js, "if (activeNotice) {", ["} else if (modalNoticeEl"])
+        # textContent property escapes; innerHTML with pre-created elements is safe
+        self.assertIn("noticeText.textContent = activeNotice", body)
+        self.assertNotIn("noticeText.innerHTML = activeNotice", body)
+
+    def test_notice_renders_nothing_when_null(self):
+        # When activeNotice is null/falsy, the else clause removes the notice element from DOM
+        self.assertIn("} else if (modalNoticeEl && modalNoticeEl.parentNode) {", self.js)
+        self.assertIn("modalNoticeEl.parentNode.removeChild(modalNoticeEl);", self.js)
+
+    def test_notice_removed_on_close(self):
+        body = _body_until(self.js, "function closeVT()", ["function openNewTab"])
+        self.assertIn("activeNotice = null;", body)
+        self.assertIn("if (modalNoticeEl && modalNoticeEl.parentNode)", body)
+        self.assertIn("modalNoticeEl.parentNode.removeChild(modalNoticeEl);", body)
+
+    def test_notice_passed_to_standalone_view_in_url(self):
+        self.assertIn('(activeNotice ? "&notice=" + encodeURIComponent(activeNotice) : "")', self.js)
+
+    def test_standalone_reads_notice_from_url(self):
+        body = _body_until(self.js, "function bootStandalone", ["})();\n})();"])
+        self.assertIn('var standaloneNotice = qs.get("notice") || null;', body)
+
+    def test_standalone_displays_notice_element(self):
+        body = _body_until(self.js, "function bootStandalone", ["})();\n})();"])
+        self.assertIn('if (standaloneNotice) {', body)
+        self.assertIn('noticeEl.className = "vtnotice"', body)
+        self.assertIn("noticeText.textContent = standaloneNotice", body)
+
+    def test_notice_css_class_exists_and_is_muted_not_error(self):
+        self.assertIn(".vtnotice {", self.css)
+        # Extract just the .vtnotice rule block to check its styling
+        notice_start = self.css.index(".vtnotice {")
+        notice_end = self.css.index("}", notice_start) + 1
+        notice_block = self.css[notice_start:notice_end]
+        # must be visually subtle (muted) not alarming (red/error)
+        self.assertIn("color: var(--dim);", notice_block)
+        self.assertNotIn("color: var(--red);", notice_block)
+        # advisory line styling (bg, border, padding, font-size)
+        self.assertIn("background: var(--side);", notice_block)
+        self.assertIn("border-bottom: 1px solid var(--line3);", notice_block)
+
+
+class TestForkedAndNoticeResponsiveness(unittest.TestCase):
+    """The fork chip and notice must work at all viewport widths (phone, tablet, desktop)
+    without overflowing or pushing content off-screen."""
+
+    def setUp(self):
+        self.css = _read("ext_vt.css")
+
+    def test_fork_chip_has_responsive_styling(self):
+        # The chip should be small and use white-space: nowrap to prevent wrapping
+        self.assertIn(".vtforkchip {", self.css)
+        self.assertIn("white-space: nowrap;", self.css)
+        # Font size kept small on all breakpoints
+        self.assertIn("font-size: 11px;", self.css)
+
+    def test_notice_reflows_on_narrow_viewports(self):
+        # The notice element should be responsive and not overflow
+        self.assertIn(".vtnotice {", self.css)
+        # Uses monospace but normal flow (not fixed width)
+        self.assertIn("font-family: 'JetBrains Mono', monospace;", self.css)
+
+
 if __name__ == "__main__":
     unittest.main()

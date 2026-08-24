@@ -884,6 +884,8 @@
   var overlay = null, modalTitleEl = null, modalStatusEl = null, modalBodyEl = null;
   var activeTerm = null, activeTty = null, activeSid = null, activeMode = null, activeBar = null;
   var activeRenderer = null;   // "grid" | "xterm" -- server-owned (see openVT below), never guessed
+  var activeForked = false, activeNotice = null;   // forked/notice from POST /api/term/pty response
+  var modalForkChip = null, modalNoticeEl = null;   // UI elements for forked status and notice
 
   function buildOverlay(mount) {
     overlay = document.createElement("div");
@@ -899,6 +901,12 @@
     modalTitleEl = document.createElement("span");
     modalTitleEl.className = "fn";
     modalTitleEl.textContent = "Terminal";
+    // Fork chip: appended after title, shown conditionally when forked=true
+    modalForkChip = document.createElement("span");
+    modalForkChip.className = "vtforkchip";
+    modalForkChip.setAttribute("aria-label", "This terminal is a copy of a background agent — the original is still running separately");
+    modalForkChip.textContent = "⑂ fork";
+    modalForkChip.style.display = "none";
     modalStatusEl = document.createElement("span");
     modalStatusEl.className = "pp";
     var newTabBtn = document.createElement("span");
@@ -912,6 +920,7 @@
     xBtn.textContent = "✕";
     xBtn.addEventListener("click", closeVT);
     mh.appendChild(modalTitleEl);
+    mh.appendChild(modalForkChip);
     mh.appendChild(modalStatusEl);
     mh.appendChild(newTabBtn);
     mh.appendChild(xBtn);
@@ -1222,6 +1231,26 @@
             return;
           }
           activeTty = res.j.tty;
+          // Defensive reads for forked/notice fields — may not exist yet in this worktree if the
+          // server agent's work is not merged yet. Default to sensible no-op values.
+          activeForked = !!res.j.forked;
+          activeNotice = (typeof res.j.notice === "string") ? res.j.notice : null;
+          // Update fork chip display
+          if (modalForkChip) modalForkChip.style.display = activeForked ? "" : "none";
+          // Create and display notice if present
+          if (activeNotice) {
+            if (!modalNoticeEl) {
+              modalNoticeEl = document.createElement("div");
+              modalNoticeEl.className = "vtnotice";
+            }
+            modalNoticeEl.innerHTML = "";   // clear any previous content
+            var noticeText = document.createElement("span");
+            noticeText.textContent = activeNotice;  // textContent escapes HTML
+            modalNoticeEl.appendChild(noticeText);
+            if (!modalNoticeEl.parentNode) modalBodyEl.insertBefore(modalNoticeEl, modalBodyEl.firstChild);
+          } else if (modalNoticeEl && modalNoticeEl.parentNode) {
+            modalNoticeEl.parentNode.removeChild(modalNoticeEl);
+          }
           // Server-owned (conventions rule 5): the client reads which renderer to build off the
           // response `open_pty()` already sent, never decides it locally -- see term_vt.py's
           // TRACKER_TERM_RENDERER switch comment. An unrecognized/missing value falls back to
@@ -1254,6 +1283,9 @@
     if (activeTerm) { activeTerm.destroy(); activeTerm = null; }
     if (activeBar) { activeBar.destroy(); activeBar = null; }
     activeTty = null; activeSid = null; activeMode = null; activeRenderer = null;
+    activeForked = false; activeNotice = null;
+    if (modalForkChip) modalForkChip.style.display = "none";
+    if (modalNoticeEl && modalNoticeEl.parentNode) modalNoticeEl.parentNode.removeChild(modalNoticeEl);
   }
 
   function openNewTab() {
@@ -1263,10 +1295,13 @@
     // there too — the standalone view otherwise only knows the tty id. `renderer` is a value the
     // SERVER already chose (see openVT's res.j.renderer) being relayed forward, not decided here
     // — bootStandalone() also has its own fallback (GET /api/term/renderer) for a bookmarked
-    // ?tty= link with no renderer param at all.
+    // ?tty= link with no renderer param at all. `forked` and `notice` are similarly relayed so
+    // the new tab can display the same fork chip and advisory notice as the opening modal.
     var url = location.origin + location.pathname + "?tty=" + encodeURIComponent(activeTty) +
       "&sid=" + encodeURIComponent(activeSid || "") + "&mode=" + encodeURIComponent(activeMode || "") +
-      "&renderer=" + encodeURIComponent(activeRenderer || "grid");
+      "&renderer=" + encodeURIComponent(activeRenderer || "grid") +
+      "&forked=" + (activeForked ? "1" : "0") +
+      (activeNotice ? "&notice=" + encodeURIComponent(activeNotice) : "");
     var w = window.open(url, "_blank");
     if (!w) alert("Popup blocked — allow popups for this page to open a new tab.");
   }
@@ -1309,6 +1344,10 @@
     // (bookmarked before this change, or typed by hand) falls back to GET /api/term/renderer
     // below rather than silently assuming "grid" -- the server is still the one deciding.
     var rendererParam = qs.get("renderer") || "";
+    // Defensive reads for forked/notice: may not be present in bookmarked ?tty= links from
+    // before this session, or if generated by other means. Defaults to sensible no-op values.
+    var standaloneForked = qs.get("forked") === "1";
+    var standaloneNotice = qs.get("notice") || null;
     if (!tty) {
       var m = /[?&#]tty=([^&]+)/.exec(location.hash);
       if (m) tty = decodeURIComponent(m[1]);
@@ -1337,11 +1376,55 @@
         bar = new ContextBar(mount, sid, tty, mode, function () { return term; });
         bar.start();
       }
+      // Build notice element if present (same as modal, but in standalone context)
+      if (standaloneNotice) {
+        var noticeEl = document.createElement("div");
+        noticeEl.className = "vtnotice";
+        var noticeText = document.createElement("span");
+        noticeText.textContent = standaloneNotice;  // textContent escapes HTML
+        noticeEl.appendChild(noticeText);
+        mount.appendChild(noticeEl);
+      }
+      // Build status line with fork indicator if present
       var status = document.createElement("div");
       status.className = "vtfullstatus";
-      status.textContent = "tty " + tty + " · connecting…";
+      var statusContent = "tty " + tty;
+      if (standaloneForked) statusContent += " · ⑂ fork";
+      statusContent += " · connecting…";
+      status.innerHTML = "";   // clear before adding spans to avoid HTML injection
+      var parts = statusContent.split(" · ");
+      for (var i = 0; i < parts.length; i++) {
+        if (i > 0) status.appendChild(document.createTextNode(" · "));
+        if (i === 1 && standaloneForked) {
+          var chip = document.createElement("span");
+          chip.className = "vtstatus-fork";
+          chip.setAttribute("title", "This terminal is a copy of a background agent — the original is still running separately");
+          chip.textContent = "⑂ fork";
+          status.appendChild(chip);
+        } else {
+          status.appendChild(document.createTextNode(parts[i]));
+        }
+      }
       mount.appendChild(status);
-      term._onStatusChange = function (s) { status.textContent = "tty " + tty + " · " + s; };
+      term._onStatusChange = function (s) {
+        status.innerHTML = "";   // clear before adding new content
+        var statusText = "tty " + tty;
+        if (standaloneForked) statusText += " · ⑂ fork";
+        statusText += " · " + s;
+        var parts = statusText.split(" · ");
+        for (var i = 0; i < parts.length; i++) {
+          if (i > 0) status.appendChild(document.createTextNode(" · "));
+          if (i === 1 && standaloneForked) {
+            var chip = document.createElement("span");
+            chip.className = "vtstatus-fork";
+            chip.setAttribute("title", "This terminal is a copy of a background agent — the original is still running separately");
+            chip.textContent = "⑂ fork";
+            status.appendChild(chip);
+          } else {
+            status.appendChild(document.createTextNode(parts[i]));
+          }
+        }
+      };
       term.attach();
       window.addEventListener("resize", debounce(function () { term.measureAndResize(); }, 150));
     }

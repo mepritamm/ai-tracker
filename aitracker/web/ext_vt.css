@@ -13,6 +13,39 @@
 .vtmodal .mb.vtmb { padding: 0; display: flex; flex-direction: column; min-height: 360px; }
 .vtempty { padding: 18px 22px; }
 
+/* ---- fork indicator: shown in modal header when terminal is a copy of a background agent ---- */
+.vtforkchip {
+  display: none;   /* shown conditionally via JS when forked=true */
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: var(--chipbg);
+  border: 1px solid var(--line3);
+  color: var(--dim);
+  white-space: nowrap;
+  cursor: help;
+}
+.mh .fn + .vtforkchip { margin-left: 6px; }   /* space after title */
+
+/* ---- server notice: muted advisory line displayed at the top of terminal pane ---- */
+.vtnotice {
+  padding: 8px 10px;
+  background: var(--side);
+  border-bottom: 1px solid var(--line3);
+  color: var(--dim);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Fork indicator in standalone status line */
+.vtstatus-fork {
+  color: var(--dim);
+  cursor: help;
+}
+
 /* ---- the terminal pane: grid text (.vtrows) + a synthetic cursor (.vtcursor) + a tiny,
    off-screen input (.vtinput) that captures keyboard/paste/IME and focuses on tap. The input no
    longer COVERS the pane (that was v1's whole selection blocker -- it swallowed every mouse event
