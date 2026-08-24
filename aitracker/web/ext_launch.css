@@ -13,3 +13,17 @@
   padding: 6px 12px;
   font-size: 12px;
 }
+/* "+ New terminal" / "+ New Claude session" -- grouped with a small caption so the pair reads
+   as distinct from the "…here" and "External …" pairs at a glance, without a modifier-click. */
+.extlaunchgroup {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.extlaunchcap {
+  font-size: 10px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}

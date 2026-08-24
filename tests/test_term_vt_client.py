@@ -225,8 +225,12 @@ class TestExtLaunchStillPassesTier1Contract(unittest.TestCase):
         self.assertLess(self.src.index("const vtHtml ="), self.src.index("if (localOnly())"))
 
     def test_native_button_kept_as_secondary_control(self):
-        self.assertIn("↗ Terminal", self.src)
-        self.assertIn("↗ Resume", self.src)
+        # What this protects is that the NATIVE launch pair still exists as a secondary
+        # control -- it was not deleted when the in-browser terminal became primary. Only
+        # the label text moved: the pair is now qualified "External" so that which-opens-
+        # where is obvious beside the two "here" buttons.
+        self.assertIn("↗ External terminal", self.src)
+        self.assertIn("↗ External resume", self.src)
 
 
 if __name__ == "__main__":
