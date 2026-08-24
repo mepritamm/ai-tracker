@@ -1843,3 +1843,162 @@ phone.
 search box, 287px inside a 320px sidebar, no horizontal scroll, detail pane back to four buttons,
 picker opening as a bottom sheet with real directories (label + full path), free-text field, and the
 drawer confirmed closed so the z-index conflict cannot bite.
+
+---
+
+# SESSION 9 — notices become asynchronous
+
+## The gap
+
+`POST /api/term/pty` returns `notice`, and it is **always `null` in practice**: `pty.fork()`
+returns immediately and the response is sent before the child emits a byte, so everything learned
+by *watching output* — the resume-refusal backstop firing, a missing transcript — happens strictly
+afterwards. The client's notice rendering has been dead code since it was written.
+
+## Contract, pinned before either half started
+
+Screen SSE frame gains one key:
+
+    "notices": [{"seq": <int>, "text": "<str>"}, ...]
+
+- only what **this viewer** has not yet received; `[]` or absent when none
+- `seq` monotonic per PTY, never reused, so the client can dedupe and spot a gap
+- `POST /api/term/pty` keeps its synchronous `notice` field, so a client reading only the response
+  does not regress
+
+**Deliberately mirrors two mechanisms already in the file** rather than inventing a third: per-viewer
+delivery works exactly like the row `since` local in `_screen_stream_body` (so a second viewer
+attaching later gets its own position and cannot be starved by the first), and a pending notice must
+itself trigger a frame — the same fix `bell` needed, since a notice arriving on an *idle* terminal
+would otherwise sit unsent until the next screen change.
+
+## Why a per-viewer list rather than a single mutable field
+
+A single `notice` string plus a counter would lose a notice whenever two arrive between frames, and
+would need the client to guess whether it had missed one. A list keyed to each viewer's own position
+cannot lose one, and `seq` gaps are detectable. It is also the shape the file already uses for rows,
+so there is one pattern to understand instead of two.
+
+## The xterm path
+
+The raw-byte renderer consumes PTY bytes and never sees this JSON, so structured notices cannot
+reach it the same way. The `[ai-tracker] note: …` line stays written into the terminal itself
+precisely for that reason — it is what makes a notice visible on both renderers. Asked the server
+agent to state plainly which path gets which.
+
+## Models
+
+Server leg `sonnet` — queue semantics, per-viewer delivery, and not perturbing the diff protocol.
+Client leg `haiku` — consume an array that is handed to it, dedupe on an integer, render into an
+element that already exists. Its brief calls out by name that a previous report on this exact file
+claimed viewport behaviour it had not looked at, and that I check.
+
+## Client leg — `9443ac2`, 747 tests. Evidence improved; a real defect found anyway
+
+**The evidence problem is fixed.** This haiku report gave measured browser observations with real
+numbers — 375px container / 355px notice, dedup count staying at 1 across a re-sent `seq`, the XSS
+payload rendered as escaped text. Naming the previous failure explicitly in the brief ("a previous
+report on this file claimed viewport behaviour it had not looked at, and I check") appears to be
+what changed it. Worth reusing.
+
+**But the code has a layout defect the report did not surface**, found by reading the diff:
+
+    rowsEl.parentNode.insertBefore(el, rowsEl);
+
+Notices are inserted **inside `.vtpane`**, in flow, above the rows, with **no `measureAndResize()`**
+afterwards. So:
+
+1. Each notice steals vertical space from the rows area — up to three rows at the cap of 3.
+2. The terminal's `rows` count was negotiated with the server from the pane height *before* the
+   notice existed, and nothing renegotiates. The server keeps streaming a row count that no longer
+   fits: bottom rows clipped, cursor in the wrong place.
+
+This is the same shape as the zoom-control bug fixed one session earlier — something placed inside
+`.vtpane` that had no business being there — and my brief had said not to do it. The instruction did
+not hold; reading the diff caught it.
+
+**Fix dispatched:** move notices to a sibling of the pane (mirroring `buildToolbar()`, which was the
+resolution of the identical earlier bug) **and** call `measureAndResize()` whenever the notice list
+changes. Both halves are needed — moving them out does not remove the need to renegotiate, because
+the pane still loses height inside the same modal.
+
+Verification demanded in measurements rather than assertions: pane height and `rows` before/after
+each notice, the captured `/api/term/resize` body, and `pane.contains(noticeEl) === false`.
+
+## Server leg — `3755d07`, 743 tests. Async notices work
+
+`NOTICE_QUEUE_MAX = 50`, `seq` monotonic and **never reused even after the deque drops the oldest**
+(so a gap is detectable rather than ambiguous). `_feed_note()` writes the terminal line and queues
+the structured notice under one lock acquisition. `_screen_stream_body` keeps a per-viewer
+`since_notice` local mirroring the row `since`, and folds pending notices into the `changed`
+boolean beside `bell` — so a notice on an idle terminal triggers a frame instead of waiting for
+unrelated output. `Screen.snapshot()` untouched, so the `v`/row-diff pinning tests cannot be
+affected.
+
+Literal captured frame:
+
+    data: {"v": 1, "rows": [...], "cursor": [3,0], "alt": false, "cursor_visible": true,
+           "bracketed_paste": false, "bell": 0,
+           "notices": [{"seq": 1, "text": "no prior transcript was found for this session -- a
+                        brand-new conversation was started instead"}]}
+
+## It corrected a claim I had made to the user
+
+I told the user the `[ai-tracker] note: …` line "is what makes a notice visible on both renderers."
+**That was wrong**, and the agent established it by reading rather than assuming: `_feed_note()`
+writes into `pt.screen`, while `raw_stream()` only tees bytes read *off the fd*. So the xterm
+renderer gets **neither** the text line nor the structured notice — a user on that renderer who hits
+the resume backstop or a missing transcript is told nothing at all.
+
+Already true before this change; I asserted otherwise without checking. Corrected to the user.
+
+**Follow-up dispatched** to close it, because a capability reaching one of two renderers is exactly
+the asymmetry conventions rule 4 exists to prevent. Constraints that matter: build the line **once**
+and feed both sinks (two constructions drift), reuse the existing bounded enqueue path so a slow raw
+viewer is treated identically for notices and ordinary output, and **do not write to the pty fd** —
+these are synthesized notices, not input, and writing them there would deliver them to the running
+program as keystrokes.
+
+One genuine behavioural difference to pin rather than hide: the raw stream is **live-only**, so a
+raw viewer attaching after a notice will not get it retroactively, while a grid viewer still will
+via the `notices` array. That is inherent to the two designs and should be documented as intended.
+
+## Everything merged — 764 tests. And an end-to-end probe that found a real limit
+
+`3755d07` (async queue) + `343bb04` (raw path) + `9443ac2` (render) + `bfa8df6` (layout/resize).
+
+**The plumbing is proven.** A real SSE frame carrying `notices` was captured; `_tee_raw` is now the
+single enqueue path so notices and ordinary output share one queue discipline; the note line is
+built once and fed to three sinks under one lock; notices never bump `v`.
+
+**But I could not fire either real trigger, and one of them looks broken.**
+
+Built an isolated end-to-end: a throwaway server with `config.PROJECTS` pointed at a temp dir
+containing a fake session — a session the *tracker* knows about but `claude` does not, which is
+exactly the "No conversation found" path — touching nothing of the user's.
+
+| probe | result |
+|---|---|
+| resume the fake session, cwd `/tmp` | claude blocked on its **"trust this folder"** prompt; never reached the message |
+| same, cwd = a trusted repo | terminal filled with MCP-server startup noise; `notices: []` |
+| direct PTY, 45s watch | **"No conversation found" NEVER appeared**; first output at **1.3s** |
+
+`BACKSTOP_WINDOW` is **2.5s**.
+
+**What this means, split by trigger:**
+
+- **Resume refusal** — keyed on a *fast non-zero exit*, and the matrix showed the refusal exits
+  immediately with code 1, before MCP loading. 2.5s is plausibly fine here. Still unverified,
+  because the refusal itself remains unreproducible.
+- **Missing transcript** — detection is *output-based* inside that same 2.5s window, and the
+  message did not appear within **45 seconds**, if at all. So this detection is very likely dead in
+  practice. Not a plumbing fault; the notice would be delivered correctly if it were ever raised.
+
+This is the same shape as the original `--fork-session` bug: the delivery mechanism was fine and
+the *trigger* never fired. Worth stating plainly rather than reporting "notices work" and leaving
+the user to discover the silence.
+
+**Not fixed, deliberately.** Widening the window without a reproducible trigger is guesswork, and
+the honest options differ per trigger — the refusal wants an exit-code watch (already what it
+does), while missing-transcript may need a much longer output watch or a different signal entirely.
+That is a design decision on evidence I do not have.
