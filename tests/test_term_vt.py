@@ -728,6 +728,73 @@ class TestRoutes(unittest.TestCase):
         pt = term_vt.PTYS[obj["tty"]]
         self.assertEqual((pt.screen.cols, pt.screen.rows), (40, 10))
 
+    def test_pty_new_mode_spawns_claude_with_no_args(self):
+        """mode="new" on a Claude session id produces argv == ["claude"]."""
+        term_gate.session_cwd = lambda sid: "/tmp"
+        h = _FakeHandler()
+
+        # Patch spawn() to capture the argv without actually spawning
+        spawn_argv = []
+        original_spawn = term_vt.spawn
+        def capture_spawn(cwd, argv, cols, rows):
+            spawn_argv.append(argv)
+            # Return a fake Pty to allow the route to complete
+            return term_vt.Pty(tid="test-pty-new")
+
+        term_vt.spawn = capture_spawn
+        try:
+            term_vt.open_pty(h, None, {"session": "claude-sid", "mode": "new", "cols": 80, "rows": 24})
+            obj, code = h.calls[-1]
+            self.assertEqual(code, 200)
+            self.assertEqual(spawn_argv, [["claude"]])
+        finally:
+            term_vt.spawn = original_spawn
+
+    def test_pty_new_mode_accepted_for_non_claude_session(self):
+        """mode="new" is accepted for a non-Claude session id (e.g., auggie:xxx).
+
+        Unlike "resume" which requires Claude, "new" merely borrows the session's cwd
+        to start a fresh conversation, so it is valid for any session type.
+        """
+        from aitracker.registry import PROVIDERS
+        prefixed = [p for p in PROVIDERS if p.prefix]
+        if not prefixed:
+            self.skipTest("no prefixed provider registered")
+
+        term_gate.session_cwd = lambda sid: "/tmp"
+        h = _FakeHandler()
+
+        # Patch spawn() to avoid actual process spawning
+        original_spawn = term_vt.spawn
+        term_vt.spawn = lambda cwd, argv, cols, rows: term_vt.Pty(tid="test-pty-auggie")
+        try:
+            # Use a non-Claude session id (prefixed)
+            non_claude_sid = prefixed[0].prefix + "x"
+            term_vt.open_pty(h, None, {"session": non_claude_sid, "mode": "new"})
+            obj, code = h.calls[-1]
+            self.assertEqual(code, 200, "mode=new should be accepted for non-Claude sessions")
+        finally:
+            term_vt.spawn = original_spawn
+
+    def test_pty_resume_still_rejected_for_non_claude_session_after_new_mode_added(self):
+        """Verify that mode="resume" still rejects non-Claude sessions (proving we narrowed nothing).
+
+        This is a regression test to ensure that adding mode="new" didn't accidentally
+        weaken the guard on mode="resume".
+        """
+        from aitracker.registry import PROVIDERS
+        prefixed = [p for p in PROVIDERS if p.prefix]
+        if not prefixed:
+            self.skipTest("no prefixed provider registered")
+
+        term_gate.session_cwd = lambda sid: "/tmp"
+        h = _FakeHandler()
+        non_claude_sid = prefixed[0].prefix + "x"
+        term_vt.open_pty(h, None, {"session": non_claude_sid, "mode": "resume"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 400)
+        self.assertIn("Claude-only", obj["error"])
+
     def test_keys_404s_an_unknown_tty(self):
         h = _FakeHandler()
         term_vt.keys(h, None, {"tty": "nope", "data": ""})

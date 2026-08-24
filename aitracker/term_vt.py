@@ -1385,9 +1385,11 @@ def open_pty(handler, parsed, body):
     """POST /api/term/pty {session, cols, rows, mode} -> {tty}.
 
     `mode` follows term_launch's own naming (`"cwd"` = a plain login shell in the session's
-    working directory; `"resume"` = `claude --resume <sid>`) so the two buttons this route serves
+    working directory; `"resume"` = `claude --resume <sid>`; `"new"` = a fresh Claude session
+    with `argv = ["claude"]` borrowing the session's cwd) so the three buttons this route serves
     stay consistent with Tier 1's. `"resume"` is refused for a non-Claude session id, exactly like
-    term_launch.open_terminal -- see `_is_claude`.
+    term_launch.open_terminal -- see `_is_claude`. `"new"` is accepted for any session id (Claude
+    or Auggie/etc.) because it merely borrows the working directory to start a fresh conversation.
     """
     if not term_gate.guard(handler):
         return
@@ -1397,7 +1399,7 @@ def open_pty(handler, parsed, body):
     if not sid:
         return handler._json({"error": "session required"}, 400)
     mode = body.get("mode", "cwd")
-    if mode not in ("cwd", "resume"):
+    if mode not in ("cwd", "resume", "new"):
         return handler._json({"error": "bad mode"}, 400)
     if mode == "resume" and not _is_claude(sid):
         return handler._json({"error": "resume is Claude-only"}, 400)
@@ -1412,6 +1414,8 @@ def open_pty(handler, parsed, body):
     rows = _clamp_int(body.get("rows"), MIN_ROWS, MAX_ROWS, DEFAULT_ROWS)
     if mode == "resume":
         argv = ["claude", "--resume", sid]
+    elif mode == "new":
+        argv = ["claude"]
     else:
         argv = [os.environ.get("SHELL", "/bin/bash"), "-l"]
     try:
