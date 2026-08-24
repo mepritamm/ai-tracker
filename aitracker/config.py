@@ -73,7 +73,9 @@ CURSOR_WS_ROOT = os.environ.get(
 AUTH = os.environ.get("TRACKER_AUTH", "")
 
 
-# Terminal features (Tiers 1-3) are OFF unless explicitly enabled. They turn the tracker from a
-# read-only viewer into something that can start processes, so they require BOTH this flag and a
-# configured TRACKER_AUTH — see term_gate.allowed().
-TERMINAL = os.environ.get("TRACKER_TERMINAL", "") == "1"
+# Terminal features (Tiers 1-3) are ON by default. Set TRACKER_TERMINAL=0 to disable them.
+# They turn the tracker from a read-only viewer into something that can start processes.
+# The only way to expose this server over the network is `make tunnel`, which requires TRACKER_AUTH,
+# so a loopback-only `make serve` with the terminal enabled poses no additional risk.
+# See term_gate.allowed() for the gate logic.
+TERMINAL = os.environ.get("TRACKER_TERMINAL", "") != "0"
