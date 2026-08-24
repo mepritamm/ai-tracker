@@ -709,10 +709,12 @@ class TestAsyncNoticesFromScreenFrame(unittest.TestCase):
         self.assertIn("span.textContent = text;", body)
         self.assertNotIn("span.innerHTML = text;", body)
 
-    def test_displayNotice_inserts_before_rowsEl(self):
-        # Notice must go at the top of the pane, above the grid, to match sync notice placement
+    def test_displayNotice_inserts_as_sibling_before_pane(self):
+        # Notices are now inserted as siblings BEFORE the pane (not as children of it) to avoid
+        # consuming the pane's vertical space and clipping rows. The insertion uses
+        # pane.parentNode.insertBefore(el, pane), placing notices in the same flex container.
         body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
-        self.assertIn("rowsEl.parentNode.insertBefore(el, rowsEl)", body)
+        self.assertIn("this.pane.parentNode.insertBefore(el, this.pane)", body)
 
     def test_displayNotice_tracks_elements_in_noticeEls_array(self):
         body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
@@ -737,6 +739,43 @@ class TestAsyncNoticesFromScreenFrame(unittest.TestCase):
         # The synchronous notice from POST /api/term/pty response (activeNotice) must still render
         # This ensures backward compat with older servers not sending async notices
         self.assertIn("activeNotice = (typeof res.j.notice === \"string\") ? res.j.notice : null;", self.js)
+
+
+class TestAsyncNoticesMovedOutOfPane(unittest.TestCase):
+    """Layout defect fix: notices used to be inserted as children of .vtpane, consuming its
+    vertical space and clipping rows. They are now siblings of .vtpane, and measureAndResize()
+    is called whenever the notice list changes to renegotiate the row count."""
+
+    def setUp(self):
+        self.js = _read("ext_vt.js")
+
+    def test_notices_inserted_as_pane_siblings_not_pane_children(self):
+        # The key fix: use pane.parentNode.insertBefore(el, pane) not rowsEl.parentNode.insertBefore
+        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
+        self.assertIn("this.pane.parentNode.insertBefore(el, this.pane)", body)
+        # Old code path must be gone entirely
+        self.assertNotIn("rowsEl.parentNode.insertBefore(el, rowsEl)", body)
+
+    def test_displayNotice_calls_measureAndResize_after_adding(self):
+        # After adding a notice, the pane's available height has decreased (notices consume space
+        # in the flex container). measureAndResize() recalculates cols/rows for the new pane height.
+        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
+        self.assertIn("this.measureAndResize()", body)
+
+    def test_destroy_calls_measureAndResize_if_notices_were_shown(self):
+        # When the terminal is destroyed and notices exist, removing them frees up space in the
+        # container. Though the terminal itself is going away, the resize ensures consistency.
+        body = _function_body(self.js, "Terminal.prototype.destroy = function")
+        self.assertIn("measureAndResize()", body)
+
+    def test_notice_css_is_flex_container_item(self):
+        # .vtnotice must be `flex: 0 0 auto` so it doesn't consume the pane's shrinking space
+        css = _read("ext_vt.css")
+        notice_start = css.index(".vtnotice {")
+        notice_end = css.index("}", notice_start) + 1
+        notice_block = css[notice_start:notice_end]
+        self.assertIn("flex: 0 0 auto;", notice_block,
+                      "notices must be flex items with fixed height, not flex: 1")
 
 
 if __name__ == "__main__":

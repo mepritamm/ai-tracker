@@ -473,7 +473,9 @@
 
   // Display an async notice streamed from the server. Maintains a stacked list of up to 3 notices
   // to avoid filling the pane; older notices are removed when a 4th arrives. Text is escaped
-  // via textContent to prevent XSS.
+  // via textContent to prevent XSS. MOVED OUT OF THE PANE (inserted as siblings, not children)
+  // to prevent consuming the pane's vertical space and clipping rows. measureAndResize() is
+  // called whenever the notice list changes so the terminal renegotiates its row count.
   Terminal.prototype._displayNotice = function (text) {
     if (!text) return;
     if (!this.pane || !this.pane.parentNode) return;   // guard: terminal destroyed or pane not ready
@@ -484,17 +486,16 @@
     var span = document.createElement("span");
     span.textContent = text;   // textContent escapes HTML
     el.appendChild(span);
-    // Add to the DOM at the top of the pane (before .vtrows)
-    var rowsEl = this.rowsEl;
-    if (rowsEl && rowsEl.parentNode) {
-      rowsEl.parentNode.insertBefore(el, rowsEl);
-    }
+    // Add to the DOM as a sibling BEFORE .vtpane (outside the pane, not a child of it)
+    this.pane.parentNode.insertBefore(el, this.pane);
     this._noticeEls.push(el);
     // Remove oldest notices if we exceed the cap
     while (this._noticeEls.length > maxNotices) {
       var oldest = this._noticeEls.shift();
       if (oldest && oldest.parentNode) oldest.parentNode.removeChild(oldest);
     }
+    // Renegotiate rows because the pane is now shorter (notices consume space in the container)
+    this.measureAndResize();
   };
 
   // Copy/paste/zoom are page-level UI actions, not terminal input -- they are intercepted here,
@@ -568,12 +569,15 @@
   Terminal.prototype.destroy = function () {
     if (this.es) { this.es.close(); this.es = null; }
     // Clean up any displayed notices and reset the sequence tracker
+    var hadNotices = this._noticeEls.length > 0;
     for (var i = 0; i < this._noticeEls.length; i++) {
       var el = this._noticeEls[i];
       if (el && el.parentNode) el.parentNode.removeChild(el);
     }
     this._noticeEls = [];
     this._noticeHighestSeq = -1;
+    // Renegotiate rows if notices were removed (the pane will expand to fill the space)
+    if (hadNotices) this.measureAndResize();
   };
   // Generic focus entry point shared with XtermTerminal (see that class's own .focus) -- so
   // ContextBar's getInput() callback can hand back the TERMINAL object itself, one interface for
