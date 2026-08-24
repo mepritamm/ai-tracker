@@ -40,6 +40,31 @@ every row dirty, rather than starting a new counter. A viewer holding `since=N` 
 told "nothing changed" while the grid is being repainted underneath it, and RIS is exactly what
 a user types (`reset`) when the screen already looks wrong.
 
+## Scrollback -- `history(offset, count)`, read this before writing a client against it
+
+`Screen` retains up to `SCROLLBACK_MAX` lines of the PRIMARY screen's history, appended by
+`_scroll_up` as rows fall off the top, and readable via `history()` (see that method's own
+docstring for the exact offset/count contract). Two rules make this behave like a real terminal
+rather than a second copy of the live grid:
+
+- **Alt-screen output never enters scrollback.** `vim`/`top`/`less` run on the alternate screen;
+  a real terminal does not pollute your history with their repaints, so any row scrolled while
+  `self.alt` is true is discarded, never retained.
+- **Only a scroll whose region starts at row 0 enters history.** A `DECSTBM` region with
+  `scroll_top > 0` (a pager's fixed status line, a split) scrolling is a REDRAW of that region,
+  not new history -- exactly the DECSTBM-vs-full-screen distinction the module already draws for
+  `IL`/`DL` above. Only `scroll_top == 0` means "this is the top of the screen actually scrolling
+  away", which is what a shell prompt or a pager's main pane does.
+- **Retained lines are immutable.** Each entry is encoded (`text`, `runs`) via `_encode_row` at
+  the moment it leaves the screen, not stored as a live cell reference -- a later SGR change or
+  an erase to the grid can never retroactively alter a line already in history.
+- **`history()` never touches `v`/`row_v`.** It is a pure read over `self.scrollback`, entirely
+  outside the `snapshot()` diff protocol -- see "`v` is monotonic" below, which this must never
+  violate.
+- **`ESC c` (RIS) keeps scrollback.** Real xterm's hard reset clears the visible grid and cursor
+  state but does not discard terminal history; `_reset()` preserves `self.scrollback` across the
+  reinitialization for the same reason it preserves `v` and `pending_replies`.
+
 ## `pop_replies()` -- the one thing that flows back TOWARDS the child
 
 Some sequences are questions, not commands: `ESC[6n` asks where the cursor is, `ESC[c` / `ESC[>c`
@@ -160,6 +185,13 @@ MAX_REPLIES = 8192
 this only matters if nobody ever calls `pop_replies()` -- a `Screen` used bare in a test, or a
 pty whose write side died. Bounded rather than unbounded is the whole point."""
 
+SCROLLBACK_MAX = 5000
+"""ponytail: hard cap on retained scrollback lines per `Screen` (primary screen only -- see
+`Screen._scroll_up`). Each retained line is a `(text, runs)` pair, small on its own, but a
+`Screen` can live for the life of a long-running PTY session and a busy `make check` alone
+scrolls thousands of lines past in seconds. 5000 lines is generous headroom over real xterm's
+own default (1000) while keeping worst-case memory bounded and independent of session length."""
+
 
 def _blank_row(cols):
     return [(" ", "")] * cols
@@ -217,6 +249,11 @@ class Screen:
         self.v = 0
         self.row_v = [0] * rows
         self._bumped = False   # has this feed() call already bumped self.v?
+
+        # Primary-screen scrollback: rows pushed here by `_scroll_up` as they fall off the top,
+        # oldest at the LEFT, most-recently-scrolled (i.e. closest to the live top row) at the
+        # RIGHT. Bounded by SCROLLBACK_MAX -- appending past that silently drops the oldest.
+        self.scrollback = collections.deque(maxlen=SCROLLBACK_MAX)
 
         self._pending = b""    # unconsumed tail bytes across feed() calls (bounded: MAX_PENDING)
         self.resyncs = 0       # how many times an over-long unterminated sequence was abandoned
@@ -283,6 +320,51 @@ class Screen:
                 rows_out.append(self._row_entry(r))
         return {"v": self.v, "rows": rows_out, "cursor": [self.cur_r, self.cur_c], "alt": self.alt}
 
+    @property
+    def scrollback_len(self):
+        """How many lines are currently retained -- cheap, for a client sizing a scrollbar
+        without paying for a full `history()` call."""
+        return len(self.scrollback)
+
+    def history(self, offset: int, count: int) -> dict:
+        """Rows from scrollback, for a viewport scrolled `offset` lines above the live top.
+
+        offset=0 means the live viewport (return nothing; the caller uses snapshot()).
+        offset=N returns the `count` rows whose bottom edge sits N lines above the live
+        viewport's top row -- i.e. what the user sees after scrolling up N lines.
+        Clamped: an offset beyond what is retained returns the oldest rows available.
+
+        Returns {"rows": [[i, text, runs], ...], "total": int, "offset": int}
+          rows   -- `i` is the row index WITHIN THE RETURNED VIEW (0..count-1), not an
+                    absolute history index; text/runs use exactly the same encoding as
+                    snapshot() (text is RIGHT-TRIMMED of trailing default-styled cells,
+                    runs are [[start, end_exclusive, sgr_param_string], ...]).
+          total  -- how many lines are currently retained (so the client can size a scrollbar)
+          offset -- the offset actually used after clamping (may be < the one requested)
+
+        Pure read: never touches `self.v`, `self.row_v` or anything `snapshot()`/the diff
+        protocol depends on -- see the module docstring's "`v` is monotonic" section. Scrolling
+        into history must never make a live viewer's `since` look stale or fresh.
+        """
+        total = len(self.scrollback)
+        try:
+            offset = int(offset)
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            count = 0
+        offset = max(0, min(offset, total))
+        count = max(0, count)
+        if offset == 0 or count == 0:
+            return {"rows": [], "total": total, "offset": offset}
+        bottom = total - offset                    # 0-based index of the bottom-most row wanted
+        start = max(0, bottom - count + 1)
+        window = list(self.scrollback)[start:bottom + 1]
+        rows = [[i, text, runs] for i, (text, runs) in enumerate(window)]
+        return {"rows": rows, "total": total, "offset": offset}
+
     def resize(self, cols, rows):
         """Change the grid dimensions in place, preserving whatever fits from the top-left.
 
@@ -330,8 +412,16 @@ class Screen:
     # ------------------------------------------------------------- internals
 
     def _row_entry(self, r):
-        cells = self.grid[r]
-        end = self.cols
+        text, runs = self._encode_row(self.grid[r])
+        return [r, text, runs]
+
+    @staticmethod
+    def _encode_row(cells):
+        """`cells` (a list of `(ch, code)` tuples) -> `(text, runs)` in exactly `snapshot()`'s
+        documented row encoding. Shared by `_row_entry` (live rows) and `_push_scrollback`
+        (rows leaving the top of the screen) so there is exactly one place that knows this
+        format -- see the module docstring's `runs`/trailing-trim rules."""
+        end = len(cells)
         while end > 0 and cells[end - 1] == (" ", ""):
             end -= 1
         text = "".join(c[0] for c in cells[:end])
@@ -348,7 +438,16 @@ class Screen:
                     run_code = code
             if run_code:
                 runs.append([run_start, end, run_code])
-        return [r, text, runs]
+        return text, runs
+
+    def _push_scrollback(self, cells):
+        """One row that just scrolled off the top of the primary screen -> retained history.
+
+        Encoded immediately via `_encode_row` (text + runs, not the raw cell list): a later SGR
+        change or erase mutates the LIVE grid's cells, never this already-retained tuple, so
+        history stays an immutable snapshot of what was actually on screen when it scrolled off
+        -- see the module docstring's "Retained lines are immutable" rule."""
+        self.scrollback.append(self._encode_row(cells))
 
     def _dirty(self, r):
         if not self._bumped:
@@ -926,6 +1025,14 @@ class Screen:
     def _scroll_up(self, count):
         top, bot = self.scroll_top, self.scroll_bot
         region = self.grid[top:bot + 1]
+        if top == 0 and not self.alt:
+            # The top of the SCREEN (not just of some mid-screen region) is what's actually
+            # scrolling away, and it's the primary buffer -- exactly the two conditions the
+            # module docstring's "Scrollback" section documents. `region[:count]` is oldest-first
+            # (row 0 was the topmost/oldest of what's leaving), which is also `deque.append`
+            # order -- see `self.scrollback`'s own comment for why that's the right order.
+            for cells in region[:count]:
+                self._push_scrollback(cells)
         region = region[count:] + [_blank_row(self.cols) for _ in range(count)]
         self.grid[top:bot + 1] = region
         for r in range(top, bot + 1):
@@ -1014,11 +1121,16 @@ class Screen:
         it -- the one failure the protocol must never produce, and RIS is exactly what a user
         types (`reset`) when the screen already looks wrong. So `v` survives, and every row is
         stamped dirty so a viewer at ANY `since` gets the full repaint.
+
+        Scrollback survives too, for the same real-xterm-behaviour reason documented in the
+        module docstring's "Scrollback" section: RIS clears the visible grid, not your history.
         """
-        cols, rows, v, replies = self.cols, self.rows, self.v, self.pending_replies
+        cols, rows, v, replies, scrollback = (
+            self.cols, self.rows, self.v, self.pending_replies, self.scrollback)
         self.__init__(cols, rows)
         self.v = v
         self.pending_replies = replies
+        self.scrollback = scrollback
         for r in range(rows):
             self._dirty(r)
 
@@ -1477,7 +1589,35 @@ def _screen_stream_body(handler, pt):
         time.sleep(0.05)
 
 
+def term_scrollback(handler, parsed):
+    """GET /api/term/scrollback?tty=<id>&offset=<N>&rows=<M> -> Screen.history(offset, rows).
+
+    Same guard and 404 shape as `screen_stream`'s neighbouring GET route right above -- and, like
+    that route, deliberately does NOT 404 on a finished (`pt.done`) PTY: reading history from a
+    shell that already exited is exactly when a viewer is most likely to want it. Takes `pt.lock`
+    only for the duration of the `history()` call itself; `history()` never touches `v`/`row_v`
+    (see its own docstring), so this can never desync a live SSE stream running concurrently on
+    the same `Pty`.
+    """
+    if not term_gate.guard(handler):
+        return
+    from urllib.parse import parse_qs
+    qs = parse_qs(parsed.query)
+    tid = qs.get("tty", [""])[0]
+    with _LOCK:
+        _reap()
+        pt = PTYS.get(tid)
+    if pt is None:
+        return handler._json({"error": "no such terminal", "tty": tid}, 404)
+    offset = _clamp_int(qs.get("offset", ["0"])[0], 0, SCROLLBACK_MAX, 0)
+    count = _clamp_int(qs.get("rows", ["0"])[0], 0, SCROLLBACK_MAX, 0)
+    with pt.lock:
+        result = pt.screen.history(offset, count)
+    handler._json(result)
+
+
 server.EXTRA_POST["/api/term/pty"] = open_pty
 server.EXTRA_POST["/api/term/keys"] = keys
 server.EXTRA_POST["/api/term/resize"] = resize_pty
 server.EXTRA_GET["/api/term/screen"] = screen_stream
+server.EXTRA_GET["/api/term/scrollback"] = term_scrollback

@@ -1471,5 +1471,285 @@ class TestRealCapturedStreams(unittest.TestCase):
                          ["$ echo XYZha beta gamma", "XYZha beta gamma", "$ exit"])
 
 
+class TestScrollbackBasic(unittest.TestCase):
+    """Feed more lines than a small screen holds; scrolled-off rows must show up in `history()`,
+    oldest first, with their SGR runs intact -- and the live grid keeps only what's left."""
+
+    def _fill(self, s, lines):
+        for text in lines:
+            s.feed(text)
+
+    def test_scrolled_off_rows_land_in_history_in_order_with_sgr_intact(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"\x1b[31mL0\x1b[0m\r\n")   # L0 written in red, then reset
+        s.feed(b"L1\r\n")
+        s.feed(b"L2\r\n")
+        s.feed(b"L3\r\n")
+        s.feed(b"L4\r\n")                  # by now L0, L1, L2 have scrolled off the top
+
+        self.assertEqual(s.scrollback_len, 3)
+        self.assertEqual(list(s.scrollback), [
+            ("L0", [[0, 2, "31"]]),
+            ("L1", []),
+            ("L2", []),
+        ])
+        # live grid keeps exactly what's left
+        self.assertEqual(_txt(s, 0), "L3")
+        self.assertEqual(_txt(s, 1), "L4")
+
+    def test_history_offset_and_count_select_the_right_window(self):
+        s = Screen(cols=10, rows=3)
+        for text in (b"\x1b[31mL0\x1b[0m\r\n", b"L1\r\n", b"L2\r\n", b"L3\r\n", b"L4\r\n"):
+            s.feed(text)
+        h = s.history(1, 3)
+        self.assertEqual(h["total"], 3)
+        self.assertEqual(h["offset"], 1)
+        self.assertEqual(h["rows"], [
+            [0, "L0", [[0, 2, "31"]]],
+            [1, "L1", []],
+            [2, "L2", []],
+        ])
+        # a smaller count returns just the bottom-most slice of the same history
+        h2 = s.history(1, 1)
+        self.assertEqual(h2["rows"], [[0, "L2", []]])
+
+
+class TestScrollbackAltScreenExcluded(unittest.TestCase):
+    def test_alt_screen_scrolling_never_enters_history(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"\x1b[?1049h")               # enter alt
+        for i in range(6):                   # scrolls repeatedly on the alt buffer
+            s.feed(("A%d\r\n" % i).encode())
+        self.assertEqual(s.scrollback_len, 0)
+        s.feed(b"\x1b[?1049l")                # leave alt
+        self.assertEqual(s.scrollback_len, 0)
+
+    def test_primary_scrolling_before_and_after_alt_still_counts(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"P0\r\nP1\r\nP2\r\nP3\r\n")   # one primary scroll before alt
+        before = s.scrollback_len
+        self.assertGreater(before, 0)
+        s.feed(b"\x1b[?1049h")
+        s.feed(b"X0\r\nX1\r\nX2\r\nX3\r\n")   # alt scrolling: must not add
+        self.assertEqual(s.scrollback_len, before)
+        s.feed(b"\x1b[?1049l")
+        self.assertEqual(s.scrollback_len, before)
+
+
+class TestScrollbackMidRegionNotHistory(unittest.TestCase):
+    def test_scroll_region_not_starting_at_row_zero_is_a_redraw_not_history(self):
+        s = Screen(cols=10, rows=5)
+        s.feed(b"\x1b[2;5r")     # DECSTBM: region rows 2..5 (1-based) -> scroll_top = 1
+        s.feed(b"\x1b[5;1H")     # cursor to the bottom of that region
+        for i in range(6):
+            s.feed(("M%d\r\n" % i).encode())
+        self.assertEqual(s.scrollback_len, 0)
+
+    def test_scroll_region_starting_at_row_zero_does_enter_history(self):
+        s = Screen(cols=10, rows=5)
+        s.feed(b"\x1b[1;3r")     # region rows 1..3 (1-based) -> scroll_top = 0: this IS the top
+        s.feed(b"\x1b[3;1H")     # cursor to the bottom of that region
+        for i in range(6):
+            s.feed(("N%d\r\n" % i).encode())
+        self.assertGreater(s.scrollback_len, 0)
+
+
+class TestScrollbackCap(unittest.TestCase):
+    def test_cap_holds_and_drops_the_oldest(self):
+        original = term_vt.SCROLLBACK_MAX
+        term_vt.SCROLLBACK_MAX = 5
+        try:
+            s = Screen(cols=10, rows=1)   # every extra line forces a scroll
+            for i in range(12):
+                s.feed(("L%02d\r\n" % i).encode())
+            self.assertEqual(s.scrollback_len, 5)
+            self.assertEqual([t for t, _ in s.scrollback],
+                              ["L07", "L08", "L09", "L10", "L11"])
+        finally:
+            term_vt.SCROLLBACK_MAX = original
+
+
+class TestScrollbackOffsetClamping(unittest.TestCase):
+    def setUp(self):
+        self.s = Screen(cols=10, rows=3)
+        for text in (b"L0\r\n", b"L1\r\n", b"L2\r\n", b"L3\r\n", b"L4\r\n"):
+            self.s.feed(text)
+        self.assertEqual(self.s.scrollback_len, 3)
+
+    def test_offset_zero_returns_nothing(self):
+        h = self.s.history(0, 5)
+        self.assertEqual(h, {"rows": [], "total": 3, "offset": 0})
+
+    def test_negative_offset_clamps_to_zero(self):
+        h = self.s.history(-7, 5)
+        self.assertEqual(h["rows"], [])
+        self.assertEqual(h["offset"], 0)
+
+    def test_offset_beyond_retained_clamps_to_the_oldest_available(self):
+        h = self.s.history(999, 2)
+        self.assertEqual(h["offset"], 3)                  # clamped down to `total`
+        self.assertEqual(h["rows"], [[0, "L0", []]])       # only the oldest row exists that far back
+
+    def test_offset_within_range_is_used_unclamped(self):
+        h = self.s.history(2, 5)
+        self.assertEqual(h["offset"], 2)
+
+    def test_zero_count_returns_nothing_but_still_reports_total_and_offset(self):
+        h = self.s.history(2, 0)
+        self.assertEqual(h["rows"], [])
+        self.assertEqual(h["total"], 3)
+        self.assertEqual(h["offset"], 2)
+
+
+class TestScrollbackDoesNotTouchVersioning(unittest.TestCase):
+    """The load-bearing guarantee: scrolling into history must be invisible to the `v`/`row_v`
+    diff protocol -- see the module docstring's warning about a version-counter rewind freezing
+    viewers forever. `history()` must never move that needle."""
+
+    def test_v_and_row_v_are_unchanged_by_any_number_of_history_calls(self):
+        s = Screen(cols=10, rows=3)
+        for text in (b"L0\r\n", b"L1\r\n", b"L2\r\n", b"L3\r\n", b"L4\r\n"):
+            s.feed(text)
+        v_before = s.v
+        row_v_before = list(s.row_v)
+        for offset, count in [(0, 3), (1, 3), (2, 1), (999, 5), (-1, 3), (1, 0)]:
+            s.history(offset, count)
+        self.assertEqual(s.v, v_before)
+        self.assertEqual(s.row_v, row_v_before)
+
+    def test_live_snapshot_since_is_identical_whether_or_not_history_was_read_in_between(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"L0\r\nL1\r\nL2\r\nL3\r\n")
+        since = s.v
+        s.feed(b"\x1b[3;1HZZ")               # one more live change, row 2 (0-based)
+        snap_without = s.snapshot(since)
+
+        s2 = Screen(cols=10, rows=3)
+        s2.feed(b"L0\r\nL1\r\nL2\r\nL3\r\n")
+        since2 = s2.v
+        self.assertEqual(since, since2)
+        s2.history(1, 3)                     # interleave a scrollback read -- must not matter
+        s2.feed(b"\x1b[3;1HZZ")
+        snap_with = s2.snapshot(since2)
+
+        self.assertEqual(snap_without, snap_with)
+
+
+class TestScrollbackAcrossResize(unittest.TestCase):
+    def test_resize_does_not_corrupt_or_drop_history(self):
+        s = Screen(cols=10, rows=3)
+        for text in (b"L0\r\n", b"L1\r\n", b"L2\r\n", b"L3\r\n", b"L4\r\n"):
+            s.feed(text)
+        before = list(s.scrollback)
+        s.resize(20, 6)
+        self.assertEqual(list(s.scrollback), before)
+        self.assertEqual(s.scrollback_len, 3)
+        # still readable correctly after the resize
+        h = s.history(1, 3)
+        self.assertEqual(h["rows"], [[0, "L0", []], [1, "L1", []], [2, "L2", []]])
+
+
+class TestScrollbackAcrossReset(unittest.TestCase):
+    def test_ris_keeps_scrollback_real_xterm_behaviour(self):
+        """`ESC c` (RIS) clears the visible grid and cursor state but real xterm does NOT
+        discard terminal history -- see the module docstring's "Scrollback" section for why
+        `_reset()` deliberately preserves `self.scrollback` alongside `v`/`pending_replies`."""
+        s = Screen(cols=10, rows=3)
+        for text in (b"K0\r\n", b"K1\r\n", b"K2\r\n", b"K3\r\n", b"K4\r\n"):
+            s.feed(text)
+        before = list(s.scrollback)
+        self.assertGreater(len(before), 0)
+        s.feed(b"\x1bc")                     # RIS
+        self.assertEqual(list(s.scrollback), before)
+        self.assertEqual(s.scrollback_len, len(before))
+        # and the grid really was reset underneath it
+        self.assertEqual(_txt(s, 0), "")
+
+
+class TestScrollbackRealCapture(unittest.TestCase):
+    """The same lesson TestRealCapturedStreams exists for: hand-written escape sequences pass
+    hand-written tests. Feed a real captured zsh session through a screen too small to hold it
+    and check the resulting scrollback against what a real terminal would retain."""
+
+    def test_real_zsh_capture_scrolled_lines_land_in_history(self):
+        s = Screen(cols=80, rows=2)          # small enough that the capture overflows it
+        s.feed(_capture("vt_zsh.bin"))
+        self.assertEqual(s.scrollback_len, 2)
+        self.assertEqual([t for t, _ in s.scrollback],
+                          ["$ echo XYZha beta gamma", "XYZha beta gamma"])
+        # what's left on screen is exactly the tail the real fixture ends with
+        self.assertEqual(_txt(s, 0), "$ exit")
+        h = s.history(1, 2)
+        self.assertEqual(h["total"], 2)
+        self.assertEqual([r[1] for r in h["rows"]],
+                          ["$ echo XYZha beta gamma", "XYZha beta gamma"])
+
+
+class TestScrollbackRoute(unittest.TestCase):
+    """GET /api/term/scrollback -- same guard/registration pattern as TestRoutes above."""
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+
+    def test_route_is_registered(self):
+        from aitracker import server
+        self.assertIs(server.EXTRA_GET["/api/term/scrollback"], term_vt.term_scrollback)
+
+    def test_404s_an_unknown_tty(self):
+        h = _FakeHandler()
+        term_vt.term_scrollback(h, _Q("tty=nope"))
+        self.assertEqual(h.calls[-1][1], 404)
+
+    def test_403s_when_terminal_disabled(self):
+        config.TERMINAL = False
+        h = _FakeHandler()
+        term_vt.term_scrollback(h, _Q("tty=whatever"))
+        self.assertEqual(h.calls[-1][1], 403)
+
+    def test_returns_history_for_a_known_tty(self):
+        screen = Screen(cols=10, rows=3)
+        for text in (b"L0\r\n", b"L1\r\n", b"L2\r\n", b"L3\r\n", b"L4\r\n"):
+            screen.feed(text)
+        term_vt.PTYS["p1"] = term_vt.Pty(tid="p1", screen=screen)
+        h = _FakeHandler()
+        term_vt.term_scrollback(h, _Q("tty=p1&offset=1&rows=3"))
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200)
+        self.assertEqual(obj["total"], 3)
+        self.assertEqual(obj["offset"], 1)
+        self.assertEqual([r[1] for r in obj["rows"]], ["L0", "L1", "L2"])
+
+    def test_missing_query_params_default_to_no_rows(self):
+        screen = Screen(cols=10, rows=3)
+        for text in (b"L0\r\n", b"L1\r\n", b"L2\r\n", b"L3\r\n", b"L4\r\n"):
+            screen.feed(text)
+        term_vt.PTYS["p1"] = term_vt.Pty(tid="p1", screen=screen)
+        h = _FakeHandler()
+        term_vt.term_scrollback(h, _Q("tty=p1"))
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200)
+        self.assertEqual(obj["rows"], [])            # offset defaulted to 0
+
+    def test_reads_a_finished_pty_without_404ing(self):
+        """Unlike `keys`/`resize`, a finished PTY's history is still legitimately readable."""
+        screen = Screen(cols=10, rows=3)
+        screen.feed(b"L0\r\nL1\r\nL2\r\nL3\r\n")
+        pt = term_vt.Pty(tid="p1", screen=screen)
+        pt.done = True
+        pt.ended = time.time()          # else _reap() (called by every route) drops it on sight
+        term_vt.PTYS["p1"] = pt
+        h = _FakeHandler()
+        term_vt.term_scrollback(h, _Q("tty=p1&offset=1&rows=3"))
+        self.assertEqual(h.calls[-1][1], 200)
+
+
 if __name__ == "__main__":
     unittest.main()
