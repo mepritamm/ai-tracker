@@ -323,6 +323,49 @@ class TestButtonsFollowServerPolicy(unittest.TestCase):
         self.assertIn("registry.PROVIDERS", self.src)    # defect 5: one-line pointer, by choice
 
 
+class TestRenamedLaunchButtonsAndNewControls(unittest.TestCase):
+    """The four Tier 1/3 buttons are named by WHERE the terminal opens ('…here' = in-browser,
+    'External …' = the Mac's own Terminal/iTerm, this-machine-only), plus two new controls that
+    spawn a terminal NOT attached to any existing session's Claude process. Asserted against the
+    asset's source, same as TestButtonsFollowServerPolicy above: there is no JS engine here."""
+
+    def setUp(self):
+        self.src = open(_EXT_LAUNCH_JS, encoding="utf-8").read()
+
+    def test_here_pair_labels(self):
+        self.assertIn("▶ Open terminal here", self.src)
+        self.assertIn("⟲ Resume terminal here", self.src)
+
+    def test_external_pair_is_renamed(self):
+        self.assertIn("↗ External terminal", self.src)
+        self.assertIn("↗ External resume", self.src)
+        # the old, unqualified labels must not survive the rename
+        self.assertNotIn(">↗ Terminal</button>", self.src)
+        self.assertNotIn(">↗ Resume</button>", self.src)
+
+    def test_new_terminal_controls_exist_and_send_the_right_modes(self):
+        self.assertIn("+ New terminal", self.src)
+        self.assertIn("+ New Claude session", self.src)
+        # "+ New terminal" reuses the existing mode:"cwd" contract (no new server work);
+        # "+ New Claude session" sends mode:"new", which is not yet supported server-side.
+        self.assertIn('window.ExtVT.open(cur, "new")', self.src)
+
+    def test_new_controls_are_assembled_before_the_localonly_gate(self):
+        # Both "+ New …" buttons must never be host-gated (conventions rule: no control hidden
+        # by host/viewport) -- i.e. built into newHtml, which is assembled before localOnly()
+        # is even consulted, exactly like the "…here" pair's vtHtml.
+        new_idx = self.src.index("const newHtml =")
+        gate_idx = self.src.index("if (localOnly())")
+        self.assertLess(new_idx, gate_idx)
+
+    def test_external_pair_is_still_host_gated(self):
+        # Unchanged: the native "External …" buttons are still built inside the localOnly()
+        # branch, so they stay off the DOM entirely off-localhost.
+        gate_idx = self.src.index("if (localOnly())")
+        ext_idx = self.src.index("↗ External terminal")
+        self.assertGreater(ext_idx, gate_idx)
+
+
 class TestOpenTerminalGuardFirst(unittest.TestCase):
     """Rule 5: term_gate.guard() runs first. With TRACKER_TERMINAL unset, the route 403s before
     any of open_terminal's own checks (mode, session, client_address) even run."""
