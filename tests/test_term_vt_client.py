@@ -28,6 +28,17 @@ def _function_body(src, marker):
     return src[start: nxt if nxt != -1 else len(src)]
 
 
+def _body_until(src, start_marker, end_markers):
+    """Like _function_body, but for the ContextBar/modal section, which comes AFTER every
+    `Terminal.prototype.` definition in the file -- `_function_body`'s hardcoded next-marker scan
+    would return "start of ContextBar through end of file" there instead of one function's body.
+    Bounds to whichever of `end_markers` occurs first after `start_marker`."""
+    start = src.index(start_marker)
+    search_from = start + len(start_marker)
+    ends = [i for i in (src.find(m, search_from) for m in end_markers) if i != -1]
+    return src[start: min(ends) if ends else len(src)]
+
+
 class TestAssetsAreInlined(unittest.TestCase):
     """Step 0's page.build_page() must pick up ext_vt.js/css the same way it already picks up
     ext_launch.*/ext_run.* -- confirmed against the actually-served page, not just the source
@@ -231,6 +242,198 @@ class TestExtLaunchStillPassesTier1Contract(unittest.TestCase):
         # where is obvious beside the two "here" buttons.
         self.assertIn("↗ External terminal", self.src)
         self.assertIn("↗ External resume", self.src)
+
+
+class TestContextBarModelSwitcher(unittest.TestCase):
+    """The model switcher: hardcoded ladder, sends /model <name> via the inject route, gated on
+    Claude-vs-shell mode, and never steals keyboard focus from the terminal."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_model_ladder_is_hardcoded_with_reasoning(self):
+        self.assertIn('var MODEL_LADDER = ["haiku", "sonnet", "opus", "fable"];', self.src)
+        self.assertIn("HARDCODED", self.src)
+
+    def test_gated_on_resume_or_new_never_cwd(self):
+        body = _body_until(self.src, "function ContextBar(", ["ContextBar.prototype."])
+        self.assertIn('mode === "resume"', body)
+        self.assertIn('mode === "new"', body)
+
+    def test_picking_a_model_sends_the_documented_inject_contract(self):
+        body = _body_until(self.src, "ContextBar.prototype._pickModel = function", ["ContextBar.prototype."])
+        self.assertIn('"/api/term/inject"', body)
+        self.assertIn('tty: this.ttyId', body)
+        self.assertIn('text: "/model " + name', body)
+        self.assertIn("submit: true", body)
+        self.assertIn("clear_first: true", body)
+
+    def test_inject_failure_surfaces_a_toast_not_silence(self):
+        body = _body_until(self.src, "ContextBar.prototype._pickModel = function", ["ContextBar.prototype."])
+        self.assertIn("404", body)
+        self.assertIn("toast(", body)
+
+    def test_button_never_takes_native_focus(self):
+        body = _body_until(self.src, "function ContextBar(", ["ContextBar.prototype."])
+        # preventDefault on mousedown is what stops a <button> from stealing DOM focus at all.
+        self.assertIn('btn.addEventListener("mousedown", function (ev) { ev.preventDefault(); });', self.src)
+        self.assertIn("_focusTerminal", body)
+
+
+class TestContextUsageIsIsolatedAndDocumented(unittest.TestCase):
+    """The context-window field's wire shape (d.context = {current, limit, pct}) was landed by a
+    parallel agent partway through this session -- CONFIRMED against the coordinator's real
+    shape, not this file's own first guess (which used {used, limit} with a client-computed
+    percentage; see the reconciliation note in the header comment and this file's own git log).
+    The read must live in exactly one small function with the real contract spelled out."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_single_read_function(self):
+        self.assertEqual(self.src.count("function readContextUsage"), 1)
+
+    def test_contract_is_documented_for_reconciliation(self):
+        self.assertIn("d.context", self.src)
+        self.assertIn("CONFIRMED CONTRACT", self.src)
+        self.assertIn("current", self.src)
+        self.assertIn("limit", self.src)
+        self.assertIn("pct", self.src)
+
+    def test_reads_current_not_the_first_guess_used_field(self):
+        body = _body_until(self.src, "function readContextUsage", ["function ContextBar("])
+        self.assertIn("c.current", body)
+        self.assertNotIn("c.used", body)
+
+    def test_absent_or_malformed_context_means_nothing_to_show(self):
+        body = _body_until(self.src, "function readContextUsage", ["function ContextBar("])
+        self.assertIn("return null;", body)
+
+    def test_no_denominator_is_invented_when_limit_is_absent(self):
+        body = _body_until(self.src, "function readContextUsage", ["function ContextBar("])
+        # limit must stay null (not e.g. defaulted to some guessed window size) when the server
+        # doesn't supply a positive number for it.
+        self.assertIn('var limit = (typeof c.limit === "number" && c.limit > 0) ? c.limit : null;', body)
+
+    def test_pct_is_read_verbatim_never_computed_here(self):
+        # the coordinator was explicit: pct is SERVER-computed only, and this file must never
+        # re-derive its own percentage from current/limit (the earlier draft did exactly that).
+        body = _body_until(self.src, "function readContextUsage", ["function ContextBar("])
+        self.assertIn('var pct = (typeof c.pct === "number") ? c.pct : null;', body)
+        self.assertNotIn("current / limit", body.replace("c.current", "current").replace("c.limit", "limit"))
+        self.assertNotIn("current / c.limit", body)
+
+    def test_cumulative_total_reads_the_existing_shared_tokens_field(self):
+        # d.tokens.{in,out} already ships today for every provider (claude.py/auggie.py/
+        # augment_ext.py) -- unlike d.context, this one is NOT a guess, so it's read directly
+        # rather than through the isolated function above.
+        body = _body_until(self.src, "ContextBar.prototype._applySessionData = function", ["ContextBar.prototype."])
+        self.assertIn("d.tokens", body)
+
+
+class TestContextReadoutLeadsWithCurrentNotTheBar(unittest.TestCase):
+    """Coordinator's design correction, mid-build: Claude sessions (the terminal's main use case)
+    have `limit: null` and `pct: null` -- there is no honest denominator. `current` must always
+    be the lead element when present, the bar/percentage only an ENHANCEMENT gated on `pct`
+    specifically (never on `limit` alone, and never fabricated), and the whole readout must
+    render nothing -- not "0", not empty chrome -- when `current` is null."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def _readout_body(self):
+        return _body_until(self.src, "ContextBar.prototype._renderReadout", ["ContextBar.prototype."])
+
+    def test_current_rendered_unconditionally_when_usage_present(self):
+        body = self._readout_body()
+        # the "current" span is built before the pct-gated branch, i.e. unconditionally once
+        # `usage` itself is truthy -- not nested inside the `usage.pct !== null` check.
+        cur_i = body.index('vtctxused')
+        pct_gate_i = body.index("usage.pct !== null")
+        self.assertLess(cur_i, pct_gate_i)
+
+    def test_bar_gated_on_pct_not_on_limit(self):
+        body = self._readout_body()
+        self.assertIn("if (usage.pct !== null) {", body)
+
+    def test_nothing_rendered_when_usage_is_null(self):
+        body = self._readout_body()
+        self.assertIn('if (!usage) {\n        el.innerHTML = "";', body)
+
+
+class TestContextBarDocksToBottomOfBothMounts(unittest.TestCase):
+    """The bar must appear in both the modal (openVT) and the standalone ?tty= view
+    (bootStandalone), built AFTER the Terminal so its own container.innerHTML="" doesn't wipe it,
+    and it must be torn down (poll interval + doc listener) whenever its terminal is."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_modal_builds_a_context_bar_after_the_terminal(self):
+        term_i = self.src.index("var term = new Terminal(modalBodyEl, activeTty);")
+        bar_i = self.src.index("activeBar = new ContextBar(modalBodyEl, sid, activeTty, mode,")
+        self.assertLess(term_i, bar_i)
+
+    def test_standalone_builds_a_context_bar_too(self):
+        body = _body_until(self.src, "function bootStandalone", ["})();\n})();"])
+        self.assertIn("new ContextBar(mount, sid, tty, mode,", body)
+
+    def test_standalone_carries_sid_and_mode_in_the_new_tab_url(self):
+        body = _body_until(self.src, "function openNewTab", ["window.ExtVT ="])
+        self.assertIn('"&sid=" + encodeURIComponent(activeSid || "")', body)
+        self.assertIn('"&mode=" + encodeURIComponent(activeMode || "")', body)
+
+    def test_close_destroys_the_bar(self):
+        body = _body_until(self.src, "function closeVT", ["function openNewTab"])
+        self.assertIn("activeBar.destroy()", body)
+
+    def test_destroy_stops_the_poll_and_the_document_listener(self):
+        body = _body_until(self.src, "ContextBar.prototype.destroy", ["function openVT"])
+        self.assertIn("clearInterval", self.src)   # inside _pollStop, referenced from destroy
+        self.assertIn("_pollStop()", body)
+        self.assertIn('document.removeEventListener("click", this._onDocClick)', body)
+
+
+class TestContextBarUsesSharedTokensNotRawHtml(unittest.TestCase):
+    """The readout must escape everything dynamic before it reaches innerHTML -- same untrusted-
+    output discipline as _paintRow (requirement 6)."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_readout_escapes_the_tooltip_title(self):
+        body = _body_until(self.src, "ContextBar.prototype._renderReadout", ["ContextBar.prototype."])
+        self.assertIn("esc(title)", body)
+        self.assertIn("esc(fmtTok(", body)
+
+
+class TestContextBarCss(unittest.TestCase):
+    """No second styling system -- the bar reuses the app's existing color/spacing tokens, and
+    responsive rules exist for both breakpoints without hiding the interactive control."""
+
+    def setUp(self):
+        self.css = _read("ext_vt.css")
+
+    def test_bar_classes_present(self):
+        for cls in (".vtctxbar", ".vtmodelbtn", ".vtmodeldd", ".vtctxreadout"):
+            self.assertIn(cls, self.css)
+
+    def test_reuses_existing_design_tokens_not_new_colors(self):
+        body = self.css[self.css.index(".vtctxbar {"):self.css.index(".vtmodelitem.cur::after")]
+        self.assertIn("var(--chipbg)", body)
+        self.assertIn("var(--line3)", body)
+
+    def test_both_breakpoints_present(self):
+        self.assertIn("min-width:601px) and (max-width:900px)", self.css)
+        self.assertIn("max-width:600px", self.css)
+
+    def test_model_button_never_hidden_by_breakpoint(self):
+        # the model button itself must stay reachable at every width -- only the least essential
+        # figure (cumulative total) may be dropped at the narrowest breakpoint.
+        phone = self.css[self.css.index("@media(max-width:600px) {\n  .vtctxbar"):]
+        phone = phone[:phone.index("}\n\n") + 1] if "}\n\n" in phone else phone
+        self.assertNotIn(".vtmodelbtn { display: none", phone)
+        self.assertNotIn(".vtmodeldd { display: none", phone)
 
 
 if __name__ == "__main__":
