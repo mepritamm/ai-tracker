@@ -40,6 +40,28 @@
 //     - `cursor` is [row, col], both 0-based. `alt` is a bool (alt-screen active).
 // The SGR decoding is isolated in ONE function, sgrRunClass(), below — that's the piece that
 // must match term_vt.Screen.snapshot() once it exists.
+//
+// ===== PARITY EXTENSIONS (this session) ================================================
+//   GET /api/term/scrollback?tty=<id>&offset=<N>&rows=<M> -> {"rows": [[i, text, runs], ...],
+//     "total": int, "offset": int}
+//   Same row/run encoding as the /api/term/screen contract above (right-trimmed text, runs are
+//   half-open [start, end, sgr] ranges). `i` is the row index WITHIN the returned view (0..M-1),
+//   never an absolute history line number. offset=0 means "the live viewport"; offset=N means "N
+//   lines scrolled back from there". The server clamps the requested offset — the response's
+//   `offset` is the clamped value and is what this file trusts, never the value it asked for.
+//   `total` sizes the scrollbar.
+//
+//   Two fields below are read DEFENSIVELY because the term_vt.py in this worktree does not emit
+//   them yet (confirmed by reading Screen.snapshot() / _set_private_mode() / the C0 dispatcher
+//   there before writing this): `msg.cursor_visible` (DECTCEM `?25` — Screen tracks
+//   `self.cursor_visible` internally but snapshot() only returns v/rows/cursor/alt today) and
+//   `msg.bell` (a monotonic count of BEL bytes seen — BEL is currently consumed as a no-op C0
+//   control and never surfaces anywhere in snapshot()). Both default to "assume visible" / "never
+//   rang" until the server adds them; this file picks them up with no further client change once
+//   it does. Bracketed-paste state (`?2004`) is in the same boat — `_set_private_mode` treats it
+//   as a no-op private mode, so there is currently NO server signal for whether the running
+//   program wants pasted text wrapped in `ESC[200~ … ESC[201~`. Read defensively as
+//   `msg.bracketed_paste` (default false) rather than guessing a value with no server backing.
 (function () {
   var esc = window.esc || function (s) { return (s || "").replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); };
 
@@ -115,6 +137,10 @@
       body: JSON.stringify({ tty: tty, cols: cols, rows: rows })
     }).catch(function () { });
   }
+  function fetchScrollback(tty, offset, rows) {
+    return fetch("/api/term/scrollback?tty=" + encodeURIComponent(tty) + "&offset=" + offset + "&rows=" + rows)
+      .then(function (r) { return r.json(); });
+  }
 
   // ===== sizing: report ACTUAL rendered cols/rows, not a guess =====
   var _measureCanvas = null;
@@ -161,6 +187,21 @@
     this.cellW = 7.2; this.cellH = 17;
     this._sized = false;
     this._onStatusChange = null;
+    this.focused = false;
+    this.cursorVisible = true;             // DECTCEM ?25 -- see the header comment's caveat
+    this.bracketedPaste = false;           // ?2004 -- see the header comment's caveat
+    this._bellSeen = null;                 // msg.bell baseline -- see the header comment's caveat
+    this._fontPx = null; this._linePx = null;   // null == use the CSS default, unzoomed
+    // ---- scrollback view state: `this.grid` above stays the LIVE model always (fed by every SSE
+    // patch, unconditionally); `this.historyGrid`/`viewingHistory` is a separate, frozen snapshot
+    // painted INSTEAD of the live grid while scrolled back, so a live diff arriving mid-scroll
+    // never yanks the view back down -- see _applyPatch and _paintRow below. ----
+    this.viewingHistory = false;
+    this.historyGrid = null;
+    this.scrollOffset = 0;
+    this.scrollTotal = 0;
+    this.pendingNewOutput = false;
+    this._scrollReqSeq = 0;
 
     container.innerHTML = "";
     var pane = document.createElement("div");
@@ -169,6 +210,25 @@
     rowsEl.className = "vtrows";
     var cursorEl = document.createElement("div");
     cursorEl.className = "vtcursor";
+    var newOutEl = document.createElement("div");
+    newOutEl.className = "vtnewout";
+    newOutEl.textContent = "▼ new output";
+    var scrollbarEl = document.createElement("div");
+    scrollbarEl.className = "vtscrollbar";
+    var scrollThumbEl = document.createElement("div");
+    scrollThumbEl.className = "vtscrollthumb";
+    scrollbarEl.appendChild(scrollThumbEl);
+    var zoomEl = document.createElement("div");
+    zoomEl.className = "vtzoom";
+    var zoomOut = document.createElement("span");
+    zoomOut.textContent = "A−"; zoomOut.title = "Smaller (Ctrl/Cmd -)";
+    var zoomIn = document.createElement("span");
+    zoomIn.textContent = "A+"; zoomIn.title = "Larger (Ctrl/Cmd +)";
+    zoomEl.appendChild(zoomOut);
+    zoomEl.appendChild(zoomIn);
+    // Deliberately NOT covering the pane (that was v1's whole selection blocker): a tiny,
+    // off-screen textarea still captures every keystroke/paste/IME composition, but leaves the
+    // real .vtrow text nodes underneath free for the browser's native mouse selection.
     var input = document.createElement("textarea");
     input.className = "vtinput";
     input.setAttribute("autocomplete", "off");
@@ -178,13 +238,29 @@
     input.setAttribute("aria-label", "Terminal input");
     pane.appendChild(rowsEl);
     pane.appendChild(cursorEl);
+    pane.appendChild(scrollbarEl);
+    pane.appendChild(newOutEl);
+    pane.appendChild(zoomEl);
     pane.appendChild(input);
     container.appendChild(pane);
 
     this.pane = pane; this.rowsEl = rowsEl; this.cursorEl = cursorEl; this.input = input;
+    this.newOutEl = newOutEl; this.scrollbarEl = scrollbarEl; this.scrollThumbEl = scrollThumbEl;
 
     var self = this;
-    pane.addEventListener("mousedown", function (ev) { ev.preventDefault(); input.focus(); });
+    this._scrollHistoryDebounced = debounce(function (offset) { self._scrollHistory(offset); }, 30);
+    // No preventDefault here (requirement 2's whole point): blocking the mousedown default is
+    // what stops native text selection from ever starting. Focusing the capture textarea on the
+    // same event still routes the next keystroke to the PTY without touching the emerging
+    // selection -- selection anchoring is driven by the browser off the ORIGINAL mousedown target
+    // (a .vtrow text node now that the input no longer overlays the pane), not by DOM focus.
+    pane.addEventListener("mousedown", function () { input.focus(); });
+    pane.addEventListener("wheel", function (ev) { self._onWheel(ev); }, { passive: false });
+    newOutEl.addEventListener("click", function () { self._scrollToBottom(); input.focus(); });
+    zoomOut.addEventListener("click", function () { self._zoom(-1); input.focus(); });
+    zoomIn.addEventListener("click", function () { self._zoom(1); input.focus(); });
+    input.addEventListener("focus", function () { self.focused = true; pane.classList.add("vtfocused"); });
+    input.addEventListener("blur", function () { self.focused = false; pane.classList.remove("vtfocused"); });
     input.addEventListener("keydown", function (ev) { self._onKeyDown(ev); });
     input.addEventListener("input", function () { self._onInput(); });
     input.addEventListener("compositionstart", function () { self.composing = true; });
@@ -205,6 +281,7 @@
       this.rowEls.push(el);
     }
     this.rowsEl.appendChild(frag);
+    this._applyRowSizing();   // freshly-created rows must match any active font zoom immediately
   };
 
   Terminal.prototype.measureAndResize = function () {
@@ -245,18 +322,34 @@
     if (!msg) return;
     if (typeof msg.v === "number") this.version = msg.v;
     if (msg.alt !== undefined) { this.alt = !!msg.alt; this.pane.classList.toggle("vtalt", this.alt); }
+    // Defensive reads for fields the server doesn't emit yet -- see the header comment. Both no-op
+    // (stay at their existing value) until term_vt.py starts sending them.
+    if (msg.cursor_visible !== undefined) this.cursorVisible = !!msg.cursor_visible;
+    if (msg.bracketed_paste !== undefined) this.bracketedPaste = !!msg.bracketed_paste;
+    if (typeof msg.bell === "number") {
+      if (this._bellSeen !== null && msg.bell !== this._bellSeen) this._flashBell();
+      this._bellSeen = msg.bell;
+    }
     var rows = msg.rows || [];
     for (var i = 0; i < rows.length; i++) {
       var entry = rows[i];
       var r = entry[0] | 0;
       if (r < 0 || r >= this.grid.length) continue;   // a resize raced the stream -- drop stale rows
       this.grid[r] = { text: String(entry[1] || ""), runs: entry[2] || [] };
-      this._paintRow(r);
     }
     if (msg.cursor && msg.cursor.length === 2) {
       this.cursor = [msg.cursor[0] | 0, msg.cursor[1] | 0];
-      this._layoutCursor();
     }
+    // The single most infuriating thing a terminal can do (requirement 1): while the user is
+    // scrolled back into history, a live SSE diff must NEVER repaint the screen out from under
+    // them. `this.grid` above is still kept current either way (so the live view is correct and
+    // instant the moment they return to it) -- only the DOM paint and cursor layout are gated.
+    if (this.viewingHistory) {
+      if (rows.length) { this.pendingNewOutput = true; this._updateNewOutputBadge(); }
+      return;
+    }
+    for (var j = 0; j < rows.length; j++) this._paintRow(rows[j][0] | 0);
+    this._layoutCursor();
   };
 
   // `text` arrives RIGHT-TRIMMED (see the contract comment at the top of this file) — it may be
@@ -271,7 +364,11 @@
     return n > 0 ? new Array(n + 1).join(" ") : "";
   }
   Terminal.prototype._paintRow = function (r) {
-    var row = this.grid[r], el = this.rowEls[r];
+    // Paints from the live model normally, or from the frozen scrollback snapshot while the user
+    // is scrolled back (see the constructor's scrollback-view comment) -- the two callers
+    // (_applyPatch for live, _paintHistory below for scrollback) never need their own copy of the
+    // run/pad/escape logic below, which is exactly what keeps that logic in ONE place.
+    var row = (this.viewingHistory ? this.historyGrid : this.grid)[r], el = this.rowEls[r];
     if (!row || !el) return;
     var text = row.text || "";
     var cols = this.cols;
@@ -294,6 +391,9 @@
   };
 
   Terminal.prototype._layoutCursor = function () {
+    // DECTCEM (?25, defensive -- see header comment) and "no live cursor while viewing frozen
+    // scrollback" both collapse to the same thing: hide the synthetic cursor element.
+    this.cursorEl.style.visibility = (this.cursorVisible && !this.viewingHistory) ? "" : "hidden";
     // The row's rendered text is right-trimmed and shorter than `cols` far more often than not
     // (an empty line, a line right after a clear, …) — the cursor is routinely at a column past
     // `text.length` and must still land inside the pane rather than falling off the end, so we
@@ -305,7 +405,50 @@
     this.cursorEl.style.transform = "translate(" + (c * this.cellW) + "px," + (r * this.cellH) + "px)";
   };
 
+  // Copy/paste/zoom are page-level UI actions, not terminal input -- they are intercepted here,
+  // BEFORE the generic "any key returns to the live view" rule below, and each returns early
+  // without reaching keyToBytes. Copy in particular MUST run first: _scrollToBottom() repaints
+  // every row's innerHTML from scratch (see _paintRow), which destroys whatever DOM text nodes
+  // the browser's live Selection was anchored to -- jumping to live before copying would silently
+  // copy nothing.
   Terminal.prototype._onKeyDown = function (ev) {
+    var k = ev.key;
+    var copyCombo = (ev.metaKey && !ev.ctrlKey && !ev.altKey && (k === "c" || k === "C")) ||
+                     (ev.ctrlKey && ev.shiftKey && !ev.metaKey && !ev.altKey && (k === "c" || k === "C"));
+    if (copyCombo) {
+      // Plain Ctrl+C (no Shift, no Meta) never reaches this branch -- it falls through to
+      // keyToBytes below unconditionally, which is what makes it ALWAYS send SIGINT (\x03),
+      // selection or not. That is the one thing this file must never get wrong.
+      var sel = window.getSelection ? window.getSelection().toString() : "";
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (sel) this._copyText(sel);
+      // no selection: nothing to copy, and neither Cmd+C nor Ctrl+Shift+C is a control code --
+      // swallow it either way rather than falling into the ctrl-letter SIGINT-alike mapping below
+      // (which would otherwise turn Ctrl+Shift+C into an accidental interrupt).
+      return;
+    }
+    var pasteCombo = (ev.metaKey && !ev.ctrlKey && !ev.altKey && (k === "v" || k === "V")) ||
+                      (ev.ctrlKey && ev.shiftKey && !ev.metaKey && !ev.altKey && (k === "v" || k === "V"));
+    if (pasteCombo) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (this.viewingHistory) this._scrollToBottom();   // pasted text is about to hit the shell
+      this._pasteFromClipboard();
+      return;
+    }
+    if ((ev.metaKey || ev.ctrlKey) && !ev.shiftKey && !ev.altKey && (k === "+" || k === "=" || k === "-" || k === "_")) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._zoom(k === "-" || k === "_" ? -1 : 1);
+      return;
+    }
+    // Requirement 1: any OTHER key, while scrolled into history, returns to the live view first --
+    // like a real terminal (Shift+End's own "scroll to bottom" falls out of this for free: it's
+    // just another key). Runs AFTER the intercepts above, on purpose (see the comment before this
+    // function).
+    if (this.viewingHistory) this._scrollToBottom();
+
     var bytes = keyToBytes(ev);
     if (bytes === null) return;             // printable/dead-key/IME: let it land in the textarea
     ev.preventDefault();
@@ -321,13 +464,168 @@
   Terminal.prototype._onInput = function () {
     if (this.composing) return;
     var v = this.input.value;
-    if (v) { this._send(v); this.input.value = ""; }
+    if (v) {
+      if (this.viewingHistory) this._scrollToBottom();   // e.g. a native right-click paste
+      this._send(v);
+      this.input.value = "";
+    }
   };
   Terminal.prototype._send = function (s) {
     postKeys(this.ttyId, s);
   };
   Terminal.prototype.destroy = function () {
     if (this.es) { this.es.close(); this.es = null; }
+  };
+
+  // ===== mouse wheel: scrollback on the primary screen, arrow keys on the alt screen ==========
+  // Full-screen programs (vim/less/top/…) own the alt screen and read arrow keys for their own
+  // scrolling/navigation -- forwarding wheel-as-history there instead of as arrows is exactly the
+  // "every full-screen program feels broken" bug the plan calls out.
+  Terminal.prototype._onWheel = function (ev) {
+    ev.preventDefault();   // never let it fall through to the page behind the modal
+    var linesPerTick = Math.max(1, Math.round(Math.abs(ev.deltaY) / (this.cellH || 17)));
+    if (this.alt) {
+      var n = Math.min(3, linesPerTick);   // cap so a big trackpad flick doesn't spam the PTY
+      var one = ev.deltaY > 0 ? "\x1b[B" : "\x1b[A", s = "";
+      for (var i = 0; i < n; i++) s += one;
+      this._send(s);
+      return;
+    }
+    var next = ev.deltaY < 0 ? this.scrollOffset + linesPerTick : Math.max(0, this.scrollOffset - linesPerTick);
+    this.scrollOffset = next;   // optimistic, so several quick ticks accumulate before the fetch lands
+    if (next <= 0) { this._scrollToBottom(); return; }
+    this.viewingHistory = true;   // freeze the live paint (see _applyPatch) as soon as scrolling starts,
+    this._updateNewOutputBadge(); // even before the fetch below resolves
+    this._scrollHistoryDebounced(next);
+  };
+
+  Terminal.prototype._scrollHistory = function (offset) {
+    var self = this;
+    if (offset <= 0) { this._scrollToBottom(); return; }
+    var seq = ++this._scrollReqSeq;
+    fetchScrollback(this.ttyId, offset, this.rows).then(function (data) {
+      if (seq !== self._scrollReqSeq) return;   // superseded by a newer scroll / a return-to-live
+      if (!data || !(data.offset > 0)) { self._scrollToBottom(); return; }   // clamped to the bottom
+      self.viewingHistory = true;
+      self.scrollOffset = data.offset;
+      self.scrollTotal = data.total || 0;
+      self._paintHistory(data.rows || []);
+      self._updateScrollbar();
+    }).catch(function () { });
+  };
+
+  Terminal.prototype._paintHistory = function (rows) {
+    var view = [];
+    for (var i = 0; i < this.rows; i++) view.push({ text: "", runs: [] });
+    for (var j = 0; j < rows.length; j++) {
+      var entry = rows[j];
+      var r = entry[0] | 0;
+      if (r < 0 || r >= this.rows) continue;
+      view[r] = { text: String(entry[1] || ""), runs: entry[2] || [] };
+    }
+    this.historyGrid = view;
+    this.viewingHistory = true;
+    for (var r2 = 0; r2 < this.rows; r2++) this._paintRow(r2);
+    this._layoutCursor();   // hides the live cursor -- see _layoutCursor's viewingHistory guard
+  };
+
+  Terminal.prototype._scrollToBottom = function () {
+    this._scrollReqSeq++;   // invalidate any in-flight scrollback fetch
+    if (!this.viewingHistory && this.scrollOffset === 0) return;
+    this.viewingHistory = false;
+    this.historyGrid = null;
+    this.scrollOffset = 0;
+    this.scrollTotal = 0;
+    this.pendingNewOutput = false;
+    for (var r = 0; r < this.rows; r++) this._paintRow(r);
+    this._layoutCursor();
+    this._updateNewOutputBadge();
+    this._updateScrollbar();
+  };
+
+  Terminal.prototype._updateNewOutputBadge = function () {
+    if (this.newOutEl) this.newOutEl.classList.toggle("show", this.viewingHistory && this.pendingNewOutput);
+  };
+
+  Terminal.prototype._updateScrollbar = function () {
+    if (!this.scrollbarEl) return;
+    if (!this.viewingHistory || this.scrollTotal <= this.rows) { this.scrollbarEl.classList.remove("show"); return; }
+    this.scrollbarEl.classList.add("show");
+    var total = this.scrollTotal;
+    var thumbPct = Math.max(8, (this.rows / total) * 100);
+    var topPct = Math.max(0, Math.min(100 - thumbPct, ((total - this.rows - this.scrollOffset) / total) * 100));
+    this.scrollThumbEl.style.height = thumbPct + "%";
+    this.scrollThumbEl.style.top = topPct + "%";
+  };
+
+  // ===== selection / copy / paste =====================================================
+  Terminal.prototype._copyText = function (text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(function () { _fallbackCopy(text); });
+    } else {
+      _fallbackCopy(text);
+    }
+  };
+  function _fallbackCopy(text) {
+    try {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.focus(); ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    } catch (e) { /* clipboard just isn't available here -- nothing more to do */ }
+  }
+
+  Terminal.prototype._pasteFromClipboard = function () {
+    var self = this;
+    if (!navigator.clipboard || !navigator.clipboard.readText) {
+      if (typeof toast === "function") toast("Clipboard paste isn't available", "the browser blocked it (needs HTTPS/localhost + a user gesture)");
+      return;
+    }
+    navigator.clipboard.readText().then(function (text) {
+      if (!text) return;
+      // Bracketed paste (?2004): wrap so a multi-line paste lands as one atomic block instead of
+      // being executed line-by-line by the shell. `bracketedPaste` mirrors the server's snapshot
+      // stream (see the header comment) -- it is always false today because term_vt.py doesn't
+      // emit that field yet, so this wraps automatically the moment it does.
+      self._send(self.bracketedPaste ? ("\x1b[200~" + text + "\x1b[201~") : text);
+    }).catch(function () {
+      if (typeof toast === "function") toast("Couldn't read the clipboard", "allow clipboard access for this page and try again");
+    });
+  };
+
+  // ===== bell: a brief visual flash, no audio (requirement 3) ==========================
+  Terminal.prototype._flashBell = function () {
+    var self = this;
+    this.pane.classList.add("vtbell");
+    setTimeout(function () { self.pane.classList.remove("vtbell"); }, 180);
+  };
+
+  // ===== font size: a small in-pane control, or Ctrl/Cmd +/- (requirement 3) ===========
+  // Recomputes cols/rows and re-POSTs /api/term/resize afterwards via measureAndResize() -- a
+  // real terminal reflows on a font change exactly like it does on a window resize.
+  Terminal.prototype._zoom = function (dir) {
+    var cs = getComputedStyle(this.pane);
+    var curFs = this._fontPx || parseFloat(cs.fontSize);
+    var curLh = this._linePx || parseFloat(cs.lineHeight);
+    var ratio = curLh / (curFs || 1);
+    var newFs = Math.max(8, Math.min(28, curFs + dir));
+    if (newFs === curFs) return;
+    this._fontPx = newFs;
+    this._linePx = Math.round(newFs * ratio);
+    this.pane.style.fontSize = this._fontPx + "px";
+    this.pane.style.lineHeight = this._linePx + "px";
+    this._applyRowSizing();
+    this.measureAndResize();
+  };
+  Terminal.prototype._applyRowSizing = function () {
+    if (!this._linePx) return;   // still the CSS default -- nothing to override per-row
+    for (var i = 0; i < this.rowEls.length; i++) {
+      this.rowEls[i].style.height = this._linePx + "px";
+      this.rowEls[i].style.lineHeight = this._linePx + "px";
+    }
   };
 
   // ===== the modal (reuses app.css's .overlay/.modal/.mh/.mb/.x — no second modal system) =====

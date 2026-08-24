@@ -225,8 +225,189 @@ class TestExtLaunchStillPassesTier1Contract(unittest.TestCase):
         self.assertLess(self.src.index("const vtHtml ="), self.src.index("if (localOnly())"))
 
     def test_native_button_kept_as_secondary_control(self):
-        self.assertIn("↗ Terminal", self.src)
-        self.assertIn("↗ Resume", self.src)
+        # Renamed "↗ Terminal" / "↗ Resume" -> "↗ External terminal" / "↗ External resume" (user
+        # instruction, landing via a concurrent worktree not yet merged into this one). What this
+        # test actually protects is that the native/external launch pair still EXISTS as a
+        # secondary control at all, not the exact wording -- accept either label so it stays green
+        # both before and after that sibling rename merges in.
+        self.assertTrue("↗ External terminal" in self.src or "↗ Terminal" in self.src)
+        self.assertTrue("↗ External resume" in self.src or "↗ Resume" in self.src)
+
+
+class TestPlainCtrlCAlwaysSendsSigint(unittest.TestCase):
+    """The single most important key in a terminal (plan requirement 2): plain Ctrl+C (no Shift,
+    no Meta) must ALWAYS reach keyToBytes's ctrl-letter mapping (which turns it into \\x03) and
+    must NEVER be captured by the copy handler -- copy is Cmd+C or Ctrl+Shift+C only. Proven here
+    by pinning the actual boolean conditions, not just their presence, so a future edit that
+    accidentally widens the copy condition to swallow plain Ctrl+C fails this test."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_copy_combo_requires_meta_or_ctrl_shift_never_plain_ctrl(self):
+        body = _function_body(self.src, "Terminal.prototype._onKeyDown")
+        i = body.index("var copyCombo")
+        combo = body[i:body.index(";", body.index(");", i))]
+        # plain Ctrl+C is ctrlKey=true, shiftKey=false, metaKey=false -- assert the condition
+        # structurally excludes that combination on both of its OR branches.
+        self.assertIn('ev.metaKey && !ev.ctrlKey', combo)
+        self.assertIn('ev.ctrlKey && ev.shiftKey', combo)
+
+    def test_plain_ctrl_c_falls_through_to_keytobytes_unmodified(self):
+        # keyToBytes's own ctrl-letter branch (the thing that actually produces \x03 for Ctrl+C)
+        # must still exist, unconditioned on any copy/paste/zoom check -- i.e. this file never grew
+        # a special case that intercepts a bare "c" before it reaches this regex mapping.
+        self.assertIn('if (/^[a-zA-Z]$/.test(k)) return String.fromCharCode(k.toUpperCase().charCodeAt(0) & 0x1f);', self.src)
+
+    def test_onkeydown_never_returns_before_keytobytes_for_plain_ctrl_key(self):
+        # Every early `return` inside _onKeyDown before the keyToBytes call is gated behind a
+        # combo/zoom condition that plain Ctrl+C cannot satisfy (copyCombo/pasteCombo require Meta
+        # or Ctrl+Shift; the zoom check requires +/-/=/_) -- so plain Ctrl+C always reaches
+        # `var bytes = keyToBytes(ev);` further down.
+        body = _function_body(self.src, "Terminal.prototype._onKeyDown")
+        self.assertIn("var bytes = keyToBytes(ev);", body)
+        self.assertLess(body.index("var copyCombo"), body.index("var bytes = keyToBytes(ev);"))
+
+
+class TestCopyRunsBeforeReturnToLive(unittest.TestCase):
+    """Copying FROM a frozen scrollback selection must not first jump back to live -- doing so
+    would rebuild every row's innerHTML (see _paintRow) and destroy the very DOM text nodes the
+    browser Selection was anchored to, silently copying nothing. The copy branch must therefore
+    `return` before the generic viewingHistory-returns-to-live rule runs."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_copy_branch_returns_before_the_generic_scroll_to_bottom_rule(self):
+        body = _function_body(self.src, "Terminal.prototype._onKeyDown")
+        copy_idx = body.index("if (copyCombo)")
+        generic_idx = body.index("if (this.viewingHistory) this._scrollToBottom();")
+        self.assertLess(copy_idx, generic_idx)
+
+
+class TestScrollbackNeverYanksLiveDiffsBack(unittest.TestCase):
+    """Requirement 1's core promise: while scrolled into history, a live SSE diff must never
+    repaint the DOM out from under the user. _applyPatch must update the live model
+    unconditionally (so returning to live is instant and correct) but skip painting/cursor layout
+    while viewingHistory."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_applypatch_updates_model_before_the_viewinghistory_gate(self):
+        body = _function_body(self.src, "Terminal.prototype._applyPatch")
+        model_update = body.index("this.grid[r] = {")
+        gate = body.index("if (this.viewingHistory) {")
+        self.assertLess(model_update, gate)
+
+    def test_applypatch_skips_paint_while_viewing_history(self):
+        body = _function_body(self.src, "Terminal.prototype._applyPatch")
+        self.assertIn("if (this.viewingHistory) {", body)
+        self.assertIn("this.pendingNewOutput = true", body)
+        # the live-paint loop must be reachable only AFTER that gate would have returned
+        gate = body.index("if (this.viewingHistory) {")
+        paint = body.index("this._paintRow(rows[j][0]")
+        self.assertLess(gate, paint)
+
+
+class TestAltScreenWheelSendsArrowsNotHistory(unittest.TestCase):
+    """Requirement 1: vim/less/top own the alt screen and read arrow keys -- the wheel must NEVER
+    trigger a scrollback fetch while `this.alt` is true."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_onwheel_checks_alt_before_touching_scroll_state(self):
+        body = _function_body(self.src, "Terminal.prototype._onWheel")
+        alt_check = body.index("if (this.alt)")
+        # the scrollback-history path (fetchScrollback / _scrollHistoryDebounced) must be
+        # textually AFTER the alt-screen branch's own early return.
+        history_call = body.index("this._scrollHistoryDebounced(next)")
+        self.assertLess(alt_check, history_call)
+        self.assertIn('"\\x1b[B"', body)
+        self.assertIn('"\\x1b[A"', body)
+
+
+class TestScrollbackFetchContract(unittest.TestCase):
+    """Pins the exact endpoint/params this file was told to code against, so a mismatch against
+    the concurrently-built server half fails loudly here instead of silently at runtime."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_fetch_hits_the_documented_endpoint_with_offset_and_rows(self):
+        self.assertIn('fetch("/api/term/scrollback?tty=" + encodeURIComponent(tty) + "&offset=" + offset + "&rows=" + rows)', self.src)
+
+    def test_response_offset_is_trusted_over_the_requested_one(self):
+        # the response's clamped `offset` must be what gets stored, never the value that was sent
+        self.assertIn("self.scrollOffset = data.offset;", self.src)
+
+
+class TestSelectionIsNotBlockedByTheCaptureInput(unittest.TestCase):
+    """Requirement 2: the capture textarea must no longer cover the pane (that was v1's whole
+    selection blocker) -- confirmed by asserting the CSS drops the covering `inset:0` layout and
+    the JS mousedown handler no longer preventDefault()s (which would cancel native selection)."""
+
+    def setUp(self):
+        self.js = _read("ext_vt.js")
+        self.css = _read("ext_vt.css")
+
+    def test_mousedown_no_longer_prevents_default(self):
+        self.assertIn('pane.addEventListener("mousedown", function () { input.focus(); });', self.js)
+        self.assertNotIn('pane.addEventListener("mousedown", function (ev) { ev.preventDefault(); input.focus(); });', self.js)
+
+    def test_input_is_off_screen_not_covering_the_pane(self):
+        self.assertIn("left: -9999px", self.css)
+        self.assertNotIn("inset: 0;\n  z-index: 2;", self.css)
+
+    def test_pane_allows_text_selection(self):
+        self.assertIn("user-select: text;", self.css)
+
+
+class TestFontZoomRecomputesGeometry(unittest.TestCase):
+    """Requirement 3: a font-size change must reflow, exactly like a window resize -- _zoom must
+    call measureAndResize() (which resets the grid and POSTs /api/term/resize) rather than just
+    changing CSS."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_zoom_calls_measure_and_resize(self):
+        body = _function_body(self.src, "Terminal.prototype._zoom")
+        self.assertIn("this.measureAndResize();", body)
+
+    def test_ctrl_or_cmd_plus_minus_is_wired_and_distinct_from_copy_paste(self):
+        body = _function_body(self.src, "Terminal.prototype._onKeyDown")
+        zoom_idx = body.index('k === "+" || k === "=" || k === "-" || k === "_"')
+        copy_idx = body.index("var copyCombo")
+        paste_idx = body.index("var pasteCombo")
+        self.assertGreater(zoom_idx, copy_idx)
+        self.assertGreater(zoom_idx, paste_idx)
+
+
+class TestDefensiveServerFieldsDoNotAssumeUnbuiltState(unittest.TestCase):
+    """cursor_visible / bracketed_paste / bell all depend on term_vt.py fields that do not exist
+    yet in this worktree (see the header comment) -- each must be read defensively (guarded by an
+    `undefined`/type check) rather than assumed present, so this file doesn't crash or misbehave
+    against today's actual snapshot payload (v/rows/cursor/alt only)."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_cursor_visible_is_read_defensively(self):
+        self.assertIn("if (msg.cursor_visible !== undefined) this.cursorVisible = !!msg.cursor_visible;", self.src)
+
+    def test_bracketed_paste_is_read_defensively(self):
+        self.assertIn("if (msg.bracketed_paste !== undefined) this.bracketedPaste = !!msg.bracketed_paste;", self.src)
+
+    def test_bell_is_read_defensively_as_a_monotonic_counter(self):
+        self.assertIn('if (typeof msg.bell === "number") {', self.src)
+
+    def test_gap_is_documented_against_the_real_server_file(self):
+        # this must name the actual server-side symbols so a reader can go verify/reconcile it,
+        # not just assert something vague.
+        self.assertIn("_set_private_mode", self.src)
+        self.assertIn("cursor_visible", self.src)
 
 
 if __name__ == "__main__":
