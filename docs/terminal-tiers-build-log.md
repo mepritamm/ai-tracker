@@ -872,7 +872,8 @@ It also added the missing **`Screen.resize()`** (`term_vt.py:149`) that the revi
 and documented — without implementing — the DSR reply-channel hook.
 
 **Caps, with reasoning:** `MAX_PTYS=4` (each pins a Screen grid plus a reader thread; interactive
-shells are heavier than Tier 2's one-shot jobs) · `MAX_STREAMS=24` (same thread-exhaustion
+shells are heavier than Tier 2's one-shot jobs) — **later raised and made reclaimable, see "The cap
+was a wall" below** · `MAX_STREAMS=24` (same thread-exhaustion
 rationale Tier 2 learned by reproducing a total wedge) · `IDLE_TIMEOUT=1800s` checked inside the
 reader's own `select` loop, so no second timer thread · `_REAP_LINGER=600s`.
 
@@ -1750,3 +1751,216 @@ live end-to-end. Stated rather than glossed.
 user's live agent processes were alive and untouched afterwards, and my resumed test copy was gone.
 The earlier incident — killing two of the user's terminals before checking their parent — was not
 repeated.
+
+---
+
+## The cap was a wall — `MAX_PTYS=4` → `config.MAX_TERMS`, plus reclaim
+
+**The user's report, verbatim:** *"why there's a limit to running terminals when technically I can
+run multiple claude sessions at once, I mean thats the entire purpose of this app."*
+
+Fair. The cap itself is real — every live PTY pins a forked child, a reader thread and a `Screen`
+grid, so an uncapped route is a resource bug waiting to happen. But **4 was well under both what
+the machine holds and what this app exists to watch**, and worse, the number was never the actual
+problem.
+
+**The real defect was that the cap had no exit.** Three facts compounded:
+
+1. The modal's ✕ (`closeVT`) only *detaches* — deliberately, so a tty survives to be reattached in
+   a new tab. The PTY keeps running.
+2. There was no route or UI that listed running PTYs. Nothing anywhere named them.
+3. So a slot came back only via `IDLE_TIMEOUT` (30 minutes) or the child exiting on its own.
+
+Close four modals and you are holding four slots occupied by terminals you cannot see, cannot name
+and cannot kill, and the fifth open returns the string `too many running terminals (max 4)` into a
+dead-end modal body. Raising the number alone would only have moved that wall to 12.
+
+**What landed, at the seam rather than twice:**
+
+- **`config.MAX_TERMS`** (`TRACKER_MAX_TERMS`, default **12**, clamped to `[1, 64]`) replaces the
+  hardcoded `term_vt.MAX_PTYS`. Referenced **late-bound** at the check site — `config.MAX_TERMS`,
+  never copied into a module constant — so there is one source of truth, per CLAUDE.md.
+- **The 429 body now carries `terminals: [{tty, cmd, cwd, started}]`** (`_live_list()`). No new
+  list route: this response *is* the only moment that list is wanted, and it is exactly the move
+  `open_pty` already makes with the server-owned `renderer` field — ride policy on the response
+  that already exists rather than force a second round trip.
+- **`POST /api/term/close {tty}`** — the reclaim half. Behind the same `term_gate.guard` as every
+  other terminal route (killing a shell this server started is no more privileged than typing
+  `exit` into it, which `keys` already allows). It calls `Pty.kill()` and *stops there*: the reader
+  thread sees EOF and runs `finish()`, which is what actually flips `done` and frees the slot —
+  single-writer discipline preserved. An already-finished tty is a `200 {closed: false}` no-op, not
+  a 404; the caller's intent ("free this slot") is satisfied either way.
+- **Client:** `openVT`'s failure branch special-cases 429 into `renderCapBlock()`, which lists each
+  holder (`cmd · cwd · age`) with a ✕ that closes it and re-runs the open the user originally
+  asked for. The cap text and the number are the **server's** — the JS contains neither, and a
+  test asserts it never will (conventions rule 5).
+
+**No host gating, and the tests say so.** The cap is hit from a tunnelled phone as readily as from
+localhost, so the reclaim rows ellipsise instead of overflowing and the ✕ carries a real
+`min-height: 28px` tap target. `test_reclaim_rows_are_usable_on_phone_and_tablet` pins both, plus
+the absence of `location.hostname` anywhere in `ext_vt.js`.
+
+**Proven live, not just unit-tested** — the honest-limitation note above does not apply here. With
+`TRACKER_MAX_TERMS=1` against a real server on a real session: open → `200`; second open → `429`
+whose body named the holding tty, its `cmd` (`/bin/zsh -l`), `cwd` and `started`; `close` → `200
+{"ok":true,"closed":true}`; reopen → `200` with a fresh tty. Eleven new unit tests cover the
+late-bound cap, the 429 list, `_live_list` skipping finished PTYs, close's 404 / bad-body /
+already-finished / gate-refused branches, and an end-to-end close that asserts the slot actually
+returns rather than that `kill()` merely returned.
+
+### What the adversarial pass caught (and it was not the cap)
+
+A reviewer was pointed at the diff and told to assume the report was false. Two of five attack lines
+landed, and the serious one was nowhere near the code the change was about:
+
+**`close_pty` could resurrect the terminal it had just killed.** `close_pty`'s docstring leaned on
+"the reader thread is the only writer of `done`". That premise was already false —
+`_retry_with_fork` writes `pt.done, pt.rc, pt.ended = False, None, 0.0` — and `_resume_backstop`
+fires it on `pt.done and pt.rc not in (0, None) and looks_like_bg_refusal(text)`. A SIGKILL sets
+`rc = -9`, which the backstop could not tell apart from the CLI's own non-zero refusal exit.
+Reproduced: click ✕ on a `mode="resume"` terminal inside the 2.5s `BACKSTOP_WINDOW` whose output
+already contains the refusal marker, and you get `200 {"closed": true}`, `done` flipped back to
+False, a fresh `--fork-session` child nobody asked for, the slot still held, and the client's 250ms
+retry landing on another 429 listing the same tty.
+
+The fix is one clause — the backstop now also requires `pt.rc != -signal.SIGKILL`, because
+`-SIGKILL` means *we* killed it (the ✕, or `_reader`'s idle reap), never the CLI refusing. Pinned by
+`test_a_deliberate_sigkill_is_not_mistaken_for_the_refusal`, which deliberately shares its refusal
+text verbatim with `test_refusal_plus_nonzero_exit_triggers_exactly_one_retry` so that `rc` is the
+only difference between the retry firing and not.
+
+**A test that proved nothing.** Deleting `server.EXTRA_POST["/api/term/close"] = close_pty` left all
+709 tests green while the feature was completely unreachable from the browser — the new tests all
+called `term_vt.close_pty` directly, and `close` was the only term route missing from
+`test_routes_are_registered`. Added.
+
+Also fixed from the same pass: the 250ms reclaim retry re-checks `activeSid` and overlay visibility
+before re-opening (it could otherwise re-open a modal the user had just dismissed, or hijack a
+different session opened in that window), and `TRACKER_MAX_TERMS` parsing gained the coverage it
+had none of — default, both clamp ends, and the garbage-falls-back path.
+
+Held up under attack, stated plainly because the refutations above are: the gate on `close_pty` is
+byte-identical to `keys`/`resize_pty`/`inject` and was confirmed over HTTP to 403 a cross-origin
+POST; the 429's new list leaks nothing to a caller who can already `POST /api/term/keys` arbitrary
+bytes into a login shell; two racing closes are safe (`kill()` is idempotent, `PTYS`/`done`
+untouched); and 4 → 12 does not threaten `MAX_STREAMS=24`, which is a *global* SSE counter shared by
+`screen_stream` and `raw_stream`, so the thread budget Tier 2 measured is untouched by the PTY cap.
+
+**Still true and worth naming:** the client tests are source-text greps — there is no JS engine in
+the stdlib and this suite has never had one. They pin that the strings exist and survive
+`build_page()`; they do not execute the retry. That half rests on the live browser run (desktop and
+375px phone, cap forced to 1: 429 → list → ✕ → slot freed → terminal connected).
+
+### Round two: the guard that was a proxy, and the button that latched too little
+
+The reviewer was sent back at the fixes with the same instruction. Fix 2 held (deleting the
+registration line now fails the suite where it previously left 709/709 green). The other two did
+not survive intact, and both failures are the same shape — **a guard that approximates the intent
+instead of recording it.**
+
+**`rc != -SIGKILL` was a proxy, and it had a hole.** `Pty.kill()` is a no-op when `done` is already
+True. So a ✕ arriving in the ~0.4s after the child's *own* non-zero exit kills nothing, leaves
+`rc = 1`, and is byte-identical to a refusal — `close_pty` returns `200 {"closed": false}` and the
+backstop forks the pty back to life anyway, re-occupying the slot. Demonstrated, not theorised.
+
+The fix records intent rather than inferring it: `Pty.closing`, set by `close_pty` **before** the
+done-check, checked by the backstop. Both guards are kept, because they catch different actors —
+`closing` is the user's ✕, `-SIGKILL` is `_reader`'s idle reap, which never goes through
+`close_pty`. Each has its own test that goes red when only its own clause is reverted; the
+`closing` test uses `rc = 1` precisely so the SIGKILL guard cannot carry it.
+
+**The latch covered one button when the failure needed all of them.** `x.disabled = true` disabled
+only the row clicked. A cap block lists up to 12 rows, and freeing two slots is the natural move
+when you want headroom — but each click schedules its own 250ms retry, and `openVT`'s `destroy()`
+closes the client's SSE **without killing the pty it replaces**. Two clicks therefore attached two
+terminals and orphaned the first, viewer-less and invisible, for the full 30-minute
+`IDLE_TIMEOUT`: the user freed two slots and immediately recreated the cap. One click now latches
+every ✕ in the block, with an `unlatch` that lifts them all on failure. The retry guard also gained
+`activeMode`, which `openVT`'s own supersede check ignores.
+
+**And a test that could lie about its own subject.** The env-parse test loaded config.py via
+`spec_from_file_location`, which goes through `SourceFileLoader` — and that runs a stale
+`__pycache__/config.*.pyc` whenever its (mtime-to-the-second, size) header still matches. Mutating
+a value and restoring it within the same wall-clock second left the test asserting the *mutant's*
+value against restored source. It now reads the file and `exec(compile(...))` into a namespace,
+which is both shorter and the only version that is actually testing the file it names.
+
+The lesson generalises past this change: **when two events are indistinguishable by their effects,
+do not guard on the effects.** Record the intent at the point where it is still known.
+
+### Round three: the check that had to happen twice
+
+Recording `closing` as intent fixed the two branches the rc proxy could not — and moved the bug one
+level down rather than removing it. The reviewer reproduced it **naturally, 1 run in 20**, then
+pinned it deterministically by clicking ✕ from inside a stretched `_fork_child`:
+
+`_resume_backstop` evaluates `not pt.closing` and *then* calls `_retry_with_fork`, which forks the
+new child **before** it writes `done = False`. For the whole duration of `pty.fork()` + `execvp` +
+the `TIOCSWINSZ` ioctl, `pt.done` is still True — so a ✕ landing in that window marks `closing`,
+sees `done`, and returns `{"closed": false}` **without killing anything**. Then the swap commits: a
+brand-new `--fork-session` child, `done` back to False, `closing` True and never read again. The
+slot comes back *occupied*, after a 200 from close.
+
+Check-then-act is only safe if you check again after the act. `_retry_with_fork` now re-checks
+`pt.closing` the moment `_fork_child` returns and, if set, closes the fd, kills the process group,
+reaps it, and returns without touching the `Pty` — leaving it exactly as `close_pty` left it. The
+test for it calls the **real** `_retry_with_fork`, deliberately: its two sibling tests mock that
+function out, so the race lives entirely in code they cannot see. That is the general lesson —
+*a mock is a place a bug can hide*, and three tests passing around a function is not coverage of it.
+
+**And one leak the reclaim flow made worth fixing.** `openVT`'s supersede branch
+(`if (activeSid !== sid) return;`) dropped a response whose tty the server had **already spawned** —
+live, viewer-less and invisible until `IDLE_TIMEOUT`. Pre-existing, and previously unfixable without
+a kill route. Arriving there from the capacity block is the case that makes it bite: the user is
+actively freeing slots, dismisses the modal mid-retry, and silently gains a hidden terminal instead.
+`/api/term/close` now exists, so the abandon path hands the pty back in one fire-and-forget call.
+
+Three rounds, and every finding was in the same family: **the cap was never the problem.** What made
+it a wall was a slot nobody could see, released by a kill nobody could request, guarded by
+conditions that inferred intent instead of recording it.
+
+### Rounds four and five: stop checking, start excluding
+
+Round four's re-check-after-fork made the window ~80× narrower (`Screen(100,30)` is 12.6 µs against
+~1 ms for `_fork_child`) and left it structurally intact: between the re-check and `done = False`,
+`pt.done` is still True, so the ✕ still takes the no-kill branch and the swap still commits behind
+it. A fourth check would have moved the window a fourth time.
+
+**The terminating fix is mutual exclusion, not another check.** `close_pty`'s [set `closing` → read
+`done`] and `_retry_with_fork`'s [read `closing` → commit swap] now run under the same `_LOCK`, so
+whichever arrives first wins deterministically:
+
+- close first → `closing` is set, the fork is abandoned and reaped, the pty stays dead.
+- swap first → `done` is False by the time close looks, so it takes the **kill** branch.
+
+Either order frees the slot. The `Screen` is allocated before the lock, and `pt.lock` nests inside
+`_LOCK` — verified safe by an AST scan of every `with` in the package: that nesting is the only
+lexical one anywhere, every other site touches the two locks *sequentially*, and no `pt.lock` body
+calls anything that takes `_LOCK`. Worst-case stall on the terminal routes is ~1 ms (`snapshot` on a
+200×50 screen with 5000 scrollback lines measured 0.87 ms); the 58 ms `feed(64KB)` case belongs to
+the reader thread, which provably cannot contend because the commit only runs when `done` is True
+and `done = True` is the last statement of `finish()`. Stress-tested at 250 rounds with the ✕
+landing uniformly across the backstop's own evaluation window: 45 rounds actually forked (11
+abandoned mid-fork, 34 committed-then-killed), **0 left a held slot**.
+
+**The test named after the lock did not test the lock.** First version released the racer and then
+*waited* for it, so `close_pty` always completed before the decision was read — `pt.closing` was
+already True with or without the lock, and it passed on a tree with the mutual exclusion stripped
+out. It pinned a code shape ("`Screen()` is allocated before the decision"), not the invariant. The
+replacement gates the commit's `pt.lock` so the racer lands *between* the decision and
+`done = False`, and asserts on the **reply**, which is what actually separates the two worlds:
+`{"closed": true}` only happens if close blocked until the swap landed; without the lock it slips in
+first and returns `{"closed": false}`. Verified red on a lock-stripped copy, 8/8 stable with it.
+
+**And the generation token nearly cost what it bought.** Replacing `activeSid !== sid` with a
+counter closed the same-session double-open leak — two opens for one sid both attached, the second
+overwrote the first without closing its SSE, so `pt.viewers` never returned to 0 and the idle reap
+could *never* fire, pinning that pty for the life of the tab. But the old guard had been doing
+invisible work: `closeVT` nulls `activeSid`, so dismissing the modal invalidated an in-flight open
+for free. A counter loses that unless `closeVT` bumps it — and without the bump, an open still in
+flight when the user hits Escape would attach a terminal and an SSE **behind a hidden overlay**.
+`closeVT` now bumps `openGen` first thing, which covers all three dismiss paths (header ✕, backdrop,
+Escape) since they all funnel through it.
+
+That is the fourth time in this change the same lesson arrived: **when you replace a guard, audit
+what the old one was doing that nobody wrote down.**

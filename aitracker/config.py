@@ -108,3 +108,17 @@ TERMINAL = os.environ.get("TRACKER_TERMINAL", "") != "0"
 TERM_RENDERER = os.environ.get("TRACKER_TERM_RENDERER", "grid")
 if TERM_RENDERER not in ("grid", "xterm"):
     TERM_RENDERER = "grid"
+
+
+# How many in-browser terminals (Tier 3 PTYs) may run at once. Each pins a forked child process,
+# a reader thread and a Screen grid, so the cap is real -- but the whole point of this app is
+# watching SEVERAL concurrent AI sessions, so 4 was well under what the machine can hold and well
+# under what the user actually runs. Env-overridable (like TRACKER_TERMINAL/TRACKER_TERM_RENDERER
+# above) rather than hardcoded, and clamped to [1, 64] so a typo can't uncap the box. The other
+# half of this is reclaim: POST /api/term/close lets the user free a slot instead of waiting out
+# term_vt.IDLE_TIMEOUT, and the 429 body lists what is holding the slots -- see term_vt.open_pty.
+MAX_TERMS = 12
+try:
+    MAX_TERMS = max(1, min(64, int(os.environ.get("TRACKER_MAX_TERMS", MAX_TERMS))))
+except (TypeError, ValueError):
+    MAX_TERMS = 12

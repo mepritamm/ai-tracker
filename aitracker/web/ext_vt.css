@@ -13,6 +13,18 @@
 .vtmodal .mb.vtmb { padding: 0; display: flex; flex-direction: column; min-height: 360px; }
 .vtempty { padding: 18px 22px; }
 
+/* ---- cap-reached block: which terminals hold the slots, each with a kill button. No host
+       gating and no fixed widths -- this has to work on the phone/tablet layouts too. ---- */
+.vtcaphead { margin-bottom: 10px; }
+.vtcaprow { display: flex; align-items: center; gap: 8px; padding: 5px 0; min-width: 0; }
+.vtcaplabel { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; opacity: .8; }
+.vtcapx { flex: none; cursor: pointer; background: none; border: 1px solid currentColor;
+  border-radius: 4px; color: inherit; opacity: .7; font-size: 12px; line-height: 1;
+  padding: 4px 8px; min-width: 32px; min-height: 28px; }
+.vtcapx:hover { opacity: 1; }
+.vtcapx:disabled { opacity: .3; cursor: default; }
+
 /* ---- fork indicator: shown in modal header when terminal is a copy of a background agent ---- */
 .vtforkchip {
   display: none;   /* shown conditionally via JS when forked=true */

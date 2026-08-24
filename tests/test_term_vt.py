@@ -11,6 +11,7 @@ import io
 import json
 import os
 import queue
+import signal
 import tempfile
 import threading
 import time
@@ -751,6 +752,7 @@ class TestRoutes(unittest.TestCase):
         self.assertIs(server.EXTRA_POST["/api/term/pty"], term_vt.open_pty)
         self.assertIs(server.EXTRA_POST["/api/term/keys"], term_vt.keys)
         self.assertIs(server.EXTRA_POST["/api/term/resize"], term_vt.resize_pty)
+        self.assertIs(server.EXTRA_POST["/api/term/close"], term_vt.close_pty)
         self.assertIs(server.EXTRA_GET["/api/term/screen"], term_vt.screen_stream)
 
     def test_pty_403s_when_terminal_disabled(self):
@@ -798,8 +800,8 @@ class TestRoutes(unittest.TestCase):
         obj, code = h.calls[-1]
         self.assertEqual(code, 404)
 
-    def test_fifth_concurrent_pty_gets_429(self):
-        for i in range(term_vt.MAX_PTYS):
+    def test_one_over_the_cap_gets_429(self):
+        for i in range(config.MAX_TERMS):
             term_vt.PTYS["fake%d" % i] = term_vt.Pty(tid="fake%d" % i)  # pid 0, done False
         term_gate.session_cwd = lambda sid: "/tmp"
         h = _FakeHandler()
@@ -807,6 +809,137 @@ class TestRoutes(unittest.TestCase):
         obj, code = h.calls[-1]
         self.assertEqual(code, 429)
         self.assertIn("too many", obj["error"])
+
+    def test_cap_is_read_late_bound_from_config(self):
+        """The cap is `config.MAX_TERMS`, not a copy frozen into term_vt at import time --
+        so a caller (or a test) that sets it sees it take effect on the very next open."""
+        self.assertFalse(hasattr(term_vt, "MAX_PTYS"), "the old hardcoded cap must be gone")
+        old = config.MAX_TERMS
+        try:
+            config.MAX_TERMS = 1
+            term_vt.PTYS["only"] = term_vt.Pty(tid="only")
+            term_gate.session_cwd = lambda sid: "/tmp"
+            h = _FakeHandler()
+            term_vt.open_pty(h, None, {"session": "x"})
+            obj, code = h.calls[-1]
+            self.assertEqual(code, 429)
+            self.assertIn("max 1", obj["error"])
+        finally:
+            config.MAX_TERMS = old
+
+    def test_429_lists_the_terminals_holding_the_slots(self):
+        """The dead end this closes: the body must name WHICH ttys hold the cap, so the client
+        can offer a reclaim instead of an unactionable string."""
+        old = config.MAX_TERMS
+        try:
+            config.MAX_TERMS = 2
+            for i, cwd in enumerate(("/tmp/a", "/tmp/b")):
+                pt = term_vt.Pty(tid="held%d" % i, cwd=cwd, cmd="claude --resume s%d" % i)
+                pt.started = 1000.0 + i          # deterministic order
+                term_vt.PTYS[pt.id] = pt
+            term_gate.session_cwd = lambda sid: "/tmp"
+            h = _FakeHandler()
+            term_vt.open_pty(h, None, {"session": "x"})
+            obj, code = h.calls[-1]
+            self.assertEqual(code, 429)
+            self.assertEqual([t["tty"] for t in obj["terminals"]], ["held0", "held1"])
+            self.assertEqual(obj["terminals"][0]["cwd"], "/tmp/a")
+            self.assertEqual(obj["terminals"][1]["cmd"], "claude --resume s1")
+            self.assertEqual(obj["terminals"][0]["started"], 1000.0)
+        finally:
+            config.MAX_TERMS = old
+
+    def test_max_terms_env_parsing_and_clamp(self):
+        """TRACKER_MAX_TERMS is user input reaching a resource cap, so every branch of the
+        parse gets pinned: default, clamp at both ends, and the garbage-falls-back path.
+        A negative or zero value must clamp to 1, not disable terminals outright.
+        Execs config.py's SOURCE into a throwaway namespace per case (it imports nothing but
+        `os`). Not importlib.reload() -- that would re-read every other env-driven setting in the
+        shared module and stomp what concurrent test classes have patched there. Not
+        spec_from_file_location either: that goes through SourceFileLoader, which happily runs a
+        stale __pycache__/config.*.pyc whenever its (mtime-to-the-second, size) header still
+        matches, so an edit-and-rerun inside the same wall-clock second would assert against the
+        PREVIOUS source and lie. Reading the file is the one way to be sure it is the file.
+        """
+        with open(config.__file__, encoding="utf-8") as fh:
+            src = compile(fh.read(), config.__file__, "exec")
+
+        def fresh(raw):
+            env = {k: v for k, v in os.environ.items() if k != "TRACKER_MAX_TERMS"}
+            if raw is not None:
+                env["TRACKER_MAX_TERMS"] = raw
+            ns = {"__file__": config.__file__}      # config.py resolves paths relative to itself
+            with mock.patch.dict(os.environ, env, clear=True):
+                exec(src, ns)
+            return ns["MAX_TERMS"]
+
+        for raw, want in [(None, 12), ("", 12), ("8", 8), ("0", 1), ("-5", 1),
+                          ("64", 64), ("65", 64), ("100000", 64), ("abc", 12), ("3.7", 12)]:
+            with self.subTest(raw=raw):
+                self.assertEqual(fresh(raw), want)
+
+    def test_live_list_omits_finished_ptys(self):
+        live = term_vt.Pty(tid="live")
+        gone = term_vt.Pty(tid="gone")
+        gone.done, gone.ended = True, time.time()
+        term_vt.PTYS["live"], term_vt.PTYS["gone"] = live, gone
+        self.assertEqual([t["tty"] for t in term_vt._live_list()], ["live"])
+
+    def test_close_404s_an_unknown_tty(self):
+        h = _FakeHandler()
+        term_vt.close_pty(h, None, {"tty": "nope"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 404)
+
+    def test_close_rejects_a_non_object_body(self):
+        h = _FakeHandler()
+        term_vt.close_pty(h, None, "a string")
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 400)
+
+    def test_close_is_a_no_op_success_on_an_already_finished_pty(self):
+        pt = term_vt.Pty(tid="fin")
+        pt.done, pt.ended = True, time.time()   # what finish() leaves behind; ended=0.0 would be
+        term_vt.PTYS["fin"] = pt                # reaped by _reap() before the lookup, and is a 404
+        h = _FakeHandler()
+        term_vt.close_pty(h, None, {"tty": "fin"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200)
+        self.assertEqual((obj["ok"], obj["closed"]), (True, False))
+
+    def test_close_kills_a_live_pty_and_frees_the_slot(self):
+        """End to end on a REAL child: open a pty, close it, and assert the slot comes back --
+        i.e. the reader thread saw EOF and ran finish(), not just that kill() returned."""
+        term_gate.session_cwd = lambda sid: "/tmp"
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {"session": "x", "mode": "cwd"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200)
+        tid = obj["tty"]
+        self.assertEqual(term_vt._live_count(), 1)
+        h2 = _FakeHandler()
+        term_vt.close_pty(h2, None, {"tty": tid})
+        self.assertEqual(h2.calls[-1], ({"ok": True, "closed": True}, 200))
+        for _ in range(200):                      # reader thread flips `done` on EOF
+            if term_vt.PTYS[tid].done:
+                break
+            time.sleep(0.02)
+        self.assertTrue(term_vt.PTYS[tid].done, "close must free the slot, not just signal")
+        self.assertEqual(term_vt._live_count(), 0)
+
+    def test_close_is_behind_the_same_gate_as_every_other_term_route(self):
+        """A refused gate must short-circuit BEFORE the tty is looked up or killed."""
+        pt = term_vt.Pty(tid="guarded")
+        term_vt.PTYS["guarded"] = pt
+        old_guard = term_gate.guard
+        try:
+            term_gate.guard = lambda handler: False
+            h = _FakeHandler()
+            term_vt.close_pty(h, None, {"tty": "guarded"})
+            self.assertEqual(h.calls, [])
+            self.assertFalse(pt.done)
+        finally:
+            term_gate.guard = old_guard
 
     def test_open_pty_spawns_a_real_shell_and_registers_it(self):
         term_gate.session_cwd = lambda sid: "/tmp"
@@ -2651,6 +2784,161 @@ class TestResumeBackstopFiresOnRefusal(unittest.TestCase):
             t.join(timeout=term_vt.BACKSTOP_WINDOW + 2)
         self.assertFalse(t.is_alive())
         self.assertEqual(calls, ["refused-sid"])
+
+    def test_a_deliberate_sigkill_is_not_mistaken_for_the_refusal(self):
+        """Regression: close_pty (the ✕ that frees a capacity slot) and _reader's idle reap both
+        SIGKILL the child, so `rc == -SIGKILL`. Inside the backstop's 2.5s window that used to be
+        indistinguishable from the CLI's own non-zero refusal exit -- the backstop would RESURRECT
+        the pty the user just asked to destroy (_retry_with_fork resets `done` to False and forks a
+        --fork-session child), so close returned {"closed": true} while the slot never freed.
+
+        Deliberately shares the exact refusal text with
+        test_refusal_plus_nonzero_exit_triggers_exactly_one_retry above: rc is the ONLY difference,
+        so this goes red the moment the SIGKILL guard is dropped."""
+        pt = _bare_pty()
+        with mock.patch.object(term_vt, "BACKSTOP_WINDOW", 0.3), \
+             mock.patch.object(term_vt, "_retry_with_fork") as retry:
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, "killed-sid", False, 80, 24))
+            t.start()
+            self._feed(pt, b"Session killed-sid is currently running as a "
+                           b"background agent (bg). Use `claude agents`...")
+            pt.done, pt.rc = True, -signal.SIGKILL
+            t.join(timeout=2)
+        retry.assert_not_called()
+
+    def test_a_requested_close_is_not_resurrected_even_when_the_kill_was_a_no_op(self):
+        """The half `rc != -SIGKILL` cannot cover. `Pty.kill()` no-ops on an already-`done` pty,
+        so a ✕ arriving just after the child's own non-zero exit leaves `rc = 1` -- byte-identical
+        to a refusal. Only the INTENT flag distinguishes them, so close_pty sets `pt.closing`
+        before the done-check and the backstop honours it.
+
+        rc is deliberately 1 here, not -SIGKILL: this test goes red if the SIGKILL guard is doing
+        all the work and `closing` is not consulted."""
+        pt = _bare_pty()
+        with mock.patch.object(term_vt, "BACKSTOP_WINDOW", 0.3), \
+             mock.patch.object(term_vt, "_retry_with_fork") as retry:
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, "closed-sid", False, 80, 24))
+            t.start()
+            self._feed(pt, b"Session closed-sid is currently running as a "
+                           b"background agent (bg). Use `claude agents`...")
+            # what finish() leaves behind; `ended` matters -- at 0.0 close_pty's _reap() would
+            # drop the record first and the route would 404 before reaching the flag at all
+            pt.done, pt.rc, pt.ended = True, 1, time.time()
+            term_vt.PTYS[pt.id] = pt
+            h = _FakeHandler()
+            term_vt.close_pty(h, None, {"tty": pt.id})   # ...and only THEN the user clicks ✕
+            self.assertEqual(h.calls[-1], ({"ok": True, "closed": False}, 200))
+            t.join(timeout=2)
+        self.assertTrue(pt.closing)
+        retry.assert_not_called()
+
+    def test_retry_abandons_the_fork_if_the_close_lands_mid_fork(self):
+        """The third resurrection path, and the one neither guard above can reach: the backstop
+        checks `not pt.closing` and only THEN calls _retry_with_fork, whose _fork_child is a real
+        window. During it `pt.done` is still True, so a ✕ arriving there marks `closing`, sees
+        `done`, and returns {"closed": false} without killing anything -- and the swap then hands
+        the closed pty a new child and resets `done`. Reproduced naturally ~1 run in 20; made
+        deterministic here by clicking ✕ from inside a stretched _fork_child.
+
+        Calls the REAL _retry_with_fork on purpose: the sibling tests mock it out, so the race
+        lives entirely in code they cannot see."""
+        pt = _bare_pty()
+        pt.done, pt.rc, pt.ended = True, 1, time.time()
+        term_vt.PTYS[pt.id] = pt
+        real_fork = term_vt._fork_child
+        forked = []
+
+        def slow_fork(cwd, argv, cols, rows):
+            pid, fd = real_fork(cwd, argv, cols, rows)
+            forked.append(pid)
+            h = _FakeHandler()                       # the ✕, landing mid-fork
+            term_vt.close_pty(h, None, {"tty": pt.id})
+            return pid, fd
+
+        with mock.patch.object(term_vt, "_fork_child", slow_fork), \
+             mock.patch.object(term_gate, "resume_argv",
+                                lambda s: ["/bin/sh", "-c", "sleep 30"]):
+            term_vt._retry_with_fork(pt, "raced-sid", 80, 24)
+
+        self.assertTrue(pt.closing)
+        self.assertTrue(pt.done, "a pty closed mid-fork must stay dead")
+        self.assertEqual(term_vt._live_count(), 0, "the slot must not come back occupied")
+        self.assertFalse(pt.forked, "the abandoned retry must not be swapped in")
+        self.assertEqual(len(forked), 1)
+        for _ in range(100):                          # the abandoned child must be reaped, not orphaned
+            try:
+                os.kill(forked[0], 0)
+            except OSError:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("the abandoned fork is still running")
+
+    def test_close_blocks_on_the_swap_instead_of_racing_it(self):
+        """The end of the check-then-act chain, and it must be pinned by BEHAVIOUR, not by code
+        shape. Three earlier versions guarded this with one more check than the last, and each
+        only shrank the window: the caller's `not pt.closing`, a re-check after _fork_child, then
+        the ~12us between that re-check and `done = False`. In every one, `pt.done` was still True
+        when the ✕ landed, so close_pty set `closing`, read `done`, took the NO-KILL branch, and
+        the swap committed behind it -- slot re-occupied after a 200 from close.
+
+        The racer is released from inside the commit, i.e. AFTER _retry_with_fork has read
+        `pt.closing` and decided to proceed. That is the window a fourth check would have left
+        open, and the reply distinguishes the two worlds exactly:
+
+          with _LOCK -- close blocks until the swap lands, then sees done=False -> {"closed": true}
+          without    -- close slips in first, sees done=True   -> {"closed": false}, slot leaks
+
+        (An earlier version of this test released the racer and then WAITED for it, so close_pty
+        always completed before the decision was read; `pt.closing` was already True either way
+        and it passed with the lock removed. Asserting on the reply is what makes it real.)"""
+        pt = _bare_pty()
+        pt.done, pt.rc, pt.ended = True, 1, time.time()
+        term_vt.PTYS[pt.id] = pt
+        at_commit = threading.Event()
+        reply = {}
+
+        class GatedLock:
+            """Stands in for `pt.lock`. Its first acquisition is the commit's own, so releasing
+            the racer there lands it precisely between the decision and `done = False`."""
+
+            def __init__(self):
+                self.real, self.fired = threading.Lock(), False
+
+            def __enter__(self):
+                if not self.fired:
+                    self.fired = True
+                    at_commit.set()
+                    time.sleep(0.3)      # long enough for the racer to reach and block on _LOCK
+                return self.real.__enter__()
+
+            def __exit__(self, *exc):
+                return self.real.__exit__(*exc)
+
+        def racer():
+            at_commit.wait(5)
+            h = _FakeHandler()
+            term_vt.close_pty(h, None, {"tty": pt.id})
+            reply["got"] = h.calls[-1] if h.calls else None
+
+        pt.lock = GatedLock()
+        t = threading.Thread(target=racer, daemon=True)
+        t.start()
+        with mock.patch.object(term_gate, "resume_argv",
+                                lambda s: ["/bin/sh", "-c", "sleep 30"]):
+            term_vt._retry_with_fork(pt, "raced-sid", 80, 24)
+        t.join(timeout=5)
+
+        self.assertEqual(reply.get("got"), ({"ok": True, "closed": True}, 200),
+                          "close must not be able to observe the pre-swap state")
+        self.assertTrue(pt.closing)
+        for _ in range(200):         # close killed the swapped-in child; its reader flips done
+            if term_vt._live_count() == 0:
+                break
+            time.sleep(0.02)
+        self.assertEqual(term_vt._live_count(), 0, "a closed pty must not hold a slot")
 
     def test_already_forked_suppresses_the_retry(self):
         """A session the fast path already forked can't ALSO hit the bg-agent refusal --
