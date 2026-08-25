@@ -34,12 +34,12 @@ Follow-up instruction, same session:
 | 1 | Fix full-suite failure | **DISCHARGED** — was stale `.pyc`, not a regression. 790 tests OK. |
 | 2 | Bug A: refusal never matched (ANSI) | **DISCHARGED** — see below. |
 | 3 | Bug B: backstop window closed before exit | **DISCHARGED** — see below. |
-| 4 | Client waits on a ready signal | not yet |
-| 5 | Hide the refusal, show `starting…` | not yet |
+| 4 | Client waits on a ready signal | **DISCHARGED** — `starting` on POST + every SSE frame. |
+| 5 | Hide the refusal, show `starting…` | **DISCHARGED** — verified by the reviewer's own repro. |
 | 6 | Port 8787 → 8790 app-wide | **DISCHARGED** — 17 files; verified independently (below). |
-| 7 | Restart live dashboard on 8790 | not yet |
-| 8 | `make check` green | pending (re-run after 4–6) |
-| 9 | Push + PR + merge to `personal` | not yet |
+| 7 | Restart live dashboard on 8790 | **DISCHARGED** — with a caveat, see below. |
+| 8 | `make check` green | **DISCHARGED** — 804 tests, `selfcheck ok`. |
+| 9 | Push + PR + merge to `personal` | **DISCHARGED as a direct push** — PR impossible, see below. |
 
 ## What landed so far
 
@@ -75,7 +75,7 @@ Both fixes proven by reverting each and watching its test go RED.
 byte count (`8.0` / `2.5`) inside the same mtime second, so Python reuses the stale `.pyc` and the
 suite reports the OLD value. Clear `__pycache__` when a constant edit appears not to take.
 
-## The readiness design (settled — in implementation)
+## The readiness design (shipped)
 
 Symptom chain, confirmed end to end: the refused child prints the refusal, exits(1), the server
 closes the SSE stream, `EventSource.onerror` fires, and `ext_vt.js` writes `reconnecting…` into the
@@ -90,9 +90,10 @@ as if it were a failure. (Note the browser terminal lives in **`aitracker/web/ex
 bearing detail — **does not advance the viewer's `since` cursor**. So when the flag clears, the very
 next ordinary frame carries every withheld row for free. No second replay path was written.
 
-**Clearing, first-of (all fail-open):** `_retry_with_fork` completing · a normal resume painting
-non-refusal output after `BACKSTOP_SETTLE = 0.5s` · `_resume_backstop` returning for any reason
-(`finally:`) · `finish()`. A pane must never be stuck in `starting`.
+**Clearing, first-of:** `_retry_with_fork` completing · a normal resume painting non-refusal
+**printable** output after `BACKSTOP_SETTLE = 0.5s` · `_resume_backstop` returning for any reason
+(`finally:`). **`finish()` deliberately does NOT clear it** — see defect #3 below; an earlier draft
+of this design listed it here and that was wrong.
 
 **Constraint that shaped it:** an ordinary, non-refused resume must not wait the full 8s window —
 that would be a worse regression than the bug being fixed. Hence the settle-based early clear.
@@ -224,6 +225,24 @@ iteration; `finish()` sets `rc` before `done`) · stuck-in-`starting` (all paths
 `BACKSTOP_WINDOW`, including the new `Thread.start()` guard) · thread/socket leak past `done` ·
 lock-order inversion (only nesting anywhere is `_LOCK` → `pt.lock` in `_retry_with_fork`) · the
 marker straddling the `BACKSTOP_SCAN_BYTES` truncation · the client wedging on a missing key.
+
+## Shipping notes
+
+**"PR + merge" became a direct push, and had to.** The `/tracker-push` skill documents that the
+pushing account is an **Enterprise Managed User** and GitHub blocks EMU accounts from opening or
+merging PRs on this repo — verified error: `GraphQL: Unauthorized: As an Enterprise Managed User,
+you cannot access this content (createPullRequest)`. Direct push to `personal/main` is the only way
+this account ships here. End state is the same: the work is on `main`. Commits `3c79e9b`
+(the fix) and `9932d74` (README sync gate). `LICENSE ok` verified on the remote.
+
+**The dashboard restart, and the caveat that matters.** 8787 turned out to be **LinkPage**, not
+ai-tracker — ai-tracker was already on 8790 (pid 50847), running pre-fix code. Stopped by PID (never
+`pkill -f aitracker`) and restarted on 8790, now serving the new page (`vtstarting` present,
+`aitracker/port` = 8790). **It is running FROM THIS WORKTREE**, because worktree isolation forbids
+touching the shared checkout — and that checkout had another session's uncommitted work at session
+start, so forcing a pull there would have been the wrong call. **Action for you: `git pull` the main
+checkout to `personal/main` and restart from there, then this worktree is free to remove.** Until
+then, removing the worktree kills the dashboard.
 
 ## Open / parked
 - **`TRACKER_TERM_RENDERER=xterm` gets none of this** — `_raw_stream_body` returns on bare `pt.done`
