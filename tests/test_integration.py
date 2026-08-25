@@ -25,7 +25,7 @@ from aitracker.util import _first_line, _iso_epoch
 from aitracker.providers import auggie as _auggie
 from aitracker.providers import claude as _claude
 
-_PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "TASKS_DIR", "NOTES_FILE", "PORT_FILE", "TOKEN_FILE")
+_PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "TASKS_DIR", "NOTES_FILE", "PORT_FILE", "TOKEN_FILE", "OPENCODE_DB")
 
 
 def _texts(resp):
@@ -53,6 +53,7 @@ def _empty_env():
     # dirs so the providers see nothing on this machine when tests build their fixtures.
     config.VSCODE_WS_ROOT = tempfile.mkdtemp()
     config.CURSOR_WS_ROOT = tempfile.mkdtemp()
+    config.OPENCODE_DB = os.path.join(tempfile.mkdtemp(), "no-opencode.db")
     config.NOTES_FILE = tempfile.mktemp(suffix=".json")
     _auggie._AUGGIE_LIST_CACHE.clear()
     _claude._META_CACHE.clear()
@@ -1213,6 +1214,44 @@ class TestBundle(unittest.TestCase):
         self.assertIn("PAGE = ", src)           # page inlined
         self.assertIn("def main(", src)
         self.assertNotIn("from .", src)         # no leftover intra-package imports
+
+    def test_bundle_runs_standalone(self):
+        # ast.parse only proves the bundle is *syntactically* valid — it does not prove
+        # the bundle *runs*. dist/tracker.py was broken at runtime for months (commit
+        # 85a21bf, terminal features) with "ModuleNotFoundError: No module named 'None'"
+        # while this file's syntax-only checks stayed green. Actually execute it.
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        bundler = os.path.join(root, "scripts", "bundle.py")
+        bundle_path = os.path.join(root, "dist", "tracker.py")
+        if not os.path.exists(bundler):
+            self.skipTest("no bundler")
+        runpy.run_path(bundler, run_name="__main__")
+
+        # Copy the bundle into a tempdir with no aitracker/ package next to it, and run
+        # it FROM that tempdir (cwd=). If we ran it from the repo root instead, a bundle
+        # that's still secretly importing the real, unbundled aitracker/ source (rather
+        # than being genuinely standalone) would silently succeed here off the checkout's
+        # sys.path[0]/cwd-relative imports — masking exactly the bug this test exists to
+        # catch. A real user only ever has the single dist/tracker.py file, nothing else
+        # on disk next to it, so that's the environment this test must reproduce.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            copied = os.path.join(tmpdir, "tracker.py")
+            with open(bundle_path, "rb") as src_f, open(copied, "wb") as dst_f:
+                dst_f.write(src_f.read())
+
+            env = dict(os.environ)
+            env.pop("PYTHONPATH", None)  # don't let an ambient path smuggle the package in either
+
+            proc = subprocess.run(
+                [sys.executable, copied, "--version"],
+                capture_output=True, text=True, timeout=30,
+                cwd=tmpdir, env=env,
+            )
+            combined = "stdout:\n" + proc.stdout + "\nstderr:\n" + proc.stderr
+            self.assertEqual(proc.returncode, 0,
+                              "standalone bundle failed to run:\n" + combined)
+            self.assertNotIn("Traceback", proc.stderr,
+                              "standalone bundle raised at runtime:\n" + combined)
 
 
 class TestCoverageGaps(unittest.TestCase):
