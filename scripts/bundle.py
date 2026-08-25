@@ -11,6 +11,7 @@ PKG = os.path.join(ROOT, "aitracker")
 ORDER = [
     "config.py", "util.py", "store.py", "overview.py",
     "providers/base.py", "providers/claude.py", "providers/auggie.py",
+    "providers/augment_ext.py",
     "registry.py", "server.py", "cli.py",
 ]
 
@@ -54,6 +55,30 @@ def main():
         body = strip_module(open(os.path.join(PKG, rel)).read())
         if rel == "server.py":
             body = body.replace("build_page()", "PAGE")           # inline page
+            # The terminal-tier loader below relies on `__import__("%s.%s" % (__package__, _m))`
+            # to optionally pull in term_launch/term_run/term_vt as real PACKAGE SUBMODULES --
+            # meaningless once this file is flattened into one standalone script. Worse than
+            # meaningless: run standalone, __package__ is None (not ""), so "%s.%s" % (None, _m)
+            # produces "None.term_vt", __import__ raises ModuleNotFoundError(name="None") --
+            # e.name ("None") != the expected "None.term_vt" -- and the loop's own `raise` fires,
+            # crashing --version/--help/--selfcheck alike. The terminal tiers themselves are not
+            # bundled (they cross-reference each other and server/store via bare `module.attr`
+            # access that only resolves inside the real package -- flattening that cleanly is a
+            # separate, larger effort); replace the loop with a no-op so the standalone build
+            # simply ships without the terminal feature, matching what already silently happened
+            # before this fix (the loop always no-op'd for a genuinely-absent module) instead of
+            # crashing on it.
+            body = re.sub(
+                r'for _m in \("term_launch", "term_run", "term_vt"\):\n'
+                r'    try:\n'
+                r'        __import__\("%s\.%s" % \(__package__, _m\)\)\n'
+                r'    except ModuleNotFoundError as e:\n'
+                r'        if e\.name != "%s\.%s" % \(__package__, _m\):\n'
+                r'            raise',
+                '# terminal-tier loader removed for the standalone bundle -- see bundle.py',
+                body)
+            assert "__package__" not in body, \
+                "terminal-tier loader text changed upstream; update the regex in bundle.py"
             parts.append(inlined_page())
         if rel == "cli.py":
             # the bundle has no test suite; make --selfcheck point at the repo

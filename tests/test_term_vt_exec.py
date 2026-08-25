@@ -84,10 +84,18 @@ _SRC = _read_src() if _HAS_NODE else ""
 if _HAS_NODE:
     _SEND_ORDERING_SRC = "\n".join([
         _function_body(_SRC, "Terminal.prototype._enqueue = function"),
+        _function_body(_SRC, "Terminal.prototype._sendWithTimeout = function"),
         _function_body(_SRC, "Terminal.prototype._flushMotion = function"),
         _function_body(_SRC, "Terminal.prototype._send = function"),
         _function_body(_SRC, "Terminal.prototype._sendMotion = function"),
     ])
+
+    # keyToBytes is a bare top-level function (not a Terminal.prototype method), so it's extracted
+    # by literal span the same way the constructor's outside-pane wiring is above: from its own
+    # declaration through (but not including) the very next function declaration in the file.
+    _key_start = _SRC.index("function keyToBytes(ev) {")
+    _key_end = _SRC.index("function b64utf8(")
+    _KEY_TO_BYTES_SRC = _SRC[_key_start:_key_end]
 
     _DESTROY_SRC = _function_body(_SRC, "Terminal.prototype.destroy = function")
 
@@ -112,6 +120,23 @@ if _HAS_NODE:
         'document.addEventListener("mouseup", this._onDocMouseUp);',
     )
 
+    # The mouse-reporting toggle's real wiring: the `mouseToggle` interface object literal built
+    # inside the Terminal constructor and handed to buildToolbar (see that function's own header
+    # comment). Extracted the same span way as the outside-pane fallback above, because it too is
+    # a closure captured inline in the constructor, not a `Terminal.prototype.X`. Using the REAL
+    # `setEnabled`/`getEnabled` here (instead of a test just poking `self.mouseReportingEnabled`
+    # by hand) is what actually closes the gap this module's own header/the task brief describe:
+    # tests/test_term_vt_client.py's TestMouseReportingToggle pins that buildToolbar CALLS
+    # `mouseToggle.setEnabled(...)` by name, but never checks what field that real `setEnabled`
+    # writes -- a future edit that had it write to a differently-named property would still pass
+    # every one of those source-text pins. Routing through the extracted `setEnabled`/`getEnabled`
+    # closures here means a regression like that breaks THESE tests instead.
+    _MOUSE_TOGGLE_WIRING_SRC = _span(
+        _SRC,
+        "getEnabled: function () { return self.mouseReportingEnabled; },",
+        "isMeaningful: function () { return self.mouse.mode !== 0; }",
+    )
+
 
 _HARNESS_PRELUDE = """
 'use strict';
@@ -127,15 +152,47 @@ def _harness_mocks():
     removeEventListener calls so `destroy()`-style cleanup can be asserted too."""
     return """
 var __calls = [];
-var __rejectNth = null;   // 1-based index of a postKeys() call to make reject, or null
+var __rejectNth = null;      // 1-based index of a postKeys() call to make reject, or null
+var __neverResolveNth = null;   // 1-based index of a postKeys() call that NEITHER resolves NOR
+                                 // rejects -- ever -- simulating the observed background-tab hang
+                                 // (a real POST /api/term/keys stuck ~5 minutes under Chrome's
+                                 // throttling). Used to prove _sendWithTimeout's bound is what
+                                 // advances the chain, not the request itself ever settling.
 var __callCount = 0;
 function postKeys(tty, s) {
   __callCount++;
   __calls.push(s);
+  if (__neverResolveNth !== null && __callCount === __neverResolveNth) {
+    return new Promise(function () { });   // deliberately never resolves or rejects
+  }
   if (__rejectNth !== null && __callCount === __rejectNth) {
     return Promise.reject(new Error('simulated network hiccup'));
   }
   return Promise.resolve({ ok: true });
+}
+// Manually-driven setTimeout/clearTimeout -- shadows the real Node globals by name within this
+// script (same trick already used for requestAnimationFrame/cancelAnimationFrame/document below),
+// so _sendWithTimeout's 5000ms timer never has to actually elapse in real wall-clock time for the
+// test to control exactly when it fires.
+var __timeoutQueue = [];      // [{id, cb, ms, cancelled}]
+var __cancelledTimeoutIds = [];
+var __nextTimeoutId = 1;
+function setTimeout(cb, ms) {
+  var id = __nextTimeoutId++;
+  __timeoutQueue.push({ id: id, cb: cb, ms: ms, cancelled: false });
+  return id;
+}
+function clearTimeout(id) {
+  __cancelledTimeoutIds.push(id);
+  for (var i = 0; i < __timeoutQueue.length; i++) {
+    if (__timeoutQueue[i].id === id) __timeoutQueue[i].cancelled = true;
+  }
+}
+// Fires every still-pending (non-cancelled) mock timer's callback, simulating however much real
+// time would need to pass -- mirrors flushRAF()'s "nothing fires until told to" design.
+function fireAllTimeouts() {
+  var q = __timeoutQueue; __timeoutQueue = [];
+  q.forEach(function (t) { if (!t.cancelled) t.cb(); });
 }
 // requestAnimationFrame returns an id (its queue index) and cancelAnimationFrame records which
 // ids were cancelled AND nulls that queue slot -- so flushRAF()/fireAllRAF() below can tell a
@@ -171,12 +228,19 @@ function makeSelf(ttyId) {
   return {
     ttyId: ttyId,
     _sendChain: Promise.resolve(),
+    _sendTimers: [],
     _pendingMotion: null,
     _motionRAFPending: false,
     _motionRAFHandle: null,
     _mouseButtonDown: null,
     _lastMouseCell: null,
     mouse: { mode: 0, sgr: false },
+    // Real boolean default, matching the production Terminal constructor's own
+    // `this.mouseReportingEnabled = false;` -- NOT left undefined. A test double that predates a
+    // field and leaves it undefined is exactly how a `=== false` gate check can silently mean
+    // "enabled" for every scenario built on this helper; see _mouseGate's own comment and
+    // TestMouseReportingToggleGateExecuted below for the tests that actually exercise this.
+    mouseReportingEnabled: false,
     viewingHistory: false,
     cols: 80, rows: 24,
     rowsEl: { getBoundingClientRect: function () { return { left: 0, top: 0 }; } },
@@ -186,6 +250,7 @@ function makeSelf(ttyId) {
     _noticeEls: [],
     measureAndResize: function () {},
     _enqueue: Terminal.prototype._enqueue,
+    _sendWithTimeout: Terminal.prototype._sendWithTimeout,
     _flushMotion: Terminal.prototype._flushMotion,
     _send: Terminal.prototype._send,
     _sendMotion: Terminal.prototype._sendMotion,
@@ -301,6 +366,206 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         )
 
 
+class TestKeyToBytesComposedCharacters(unittest.TestCase):
+    """DEFECT 1, executed: keyToBytes used to ESC-prefix ANY single-character Alt/Option key,
+    including a COMPOSED character. On macOS, Option is `altKey`, and Option+key produces the
+    composed character directly in `ev.key` -- Option+2 arrives as {altKey: true, key: "€"}
+    ("€" == the EURO SIGN), so the old `ev.key.length === 1` check let it through and sent
+    ESC + "€", corrupting a character the user simply typed. Fixed by restricting the
+    Alt-prefix path to the printable ASCII range -- a composed/non-ASCII character now returns
+    null and falls through to the textarea's own `input` handler instead."""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def _key_to_bytes(self, ev_overrides):
+        script = _HARNESS_PRELUDE + _KEY_TO_BYTES_SRC + """
+var ev = {
+  ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, key: "",
+};
+""" + "\n".join(
+            "ev.%s = %s;" % (k, json.dumps(v)) for k, v in ev_overrides.items()
+        ) + """
+var result = keyToBytes(ev);
+console.log(JSON.stringify({ result: result }));
+"""
+        return _run_node(script)["result"]
+
+    def test_option_2_composed_euro_sign_is_not_esc_prefixed(self):
+        # The exact scenario from the defect report: Option+2 on a Mac keyboard.
+        result = self._key_to_bytes({"altKey": True, "key": "€"})
+        self.assertIsNone(
+            result,
+            "a composed character must fall through to the textarea, not get ESC-prefixed",
+        )
+
+    def test_another_composed_option_character_is_also_rejected(self):
+        # Option+p on a US Mac layout composes "π" (GREEK SMALL LETTER PI) -- a second,
+        # independent example of the same composed-character class, not just the one the defect
+        # report happened to name.
+        result = self._key_to_bytes({"altKey": True, "key": "π"})
+        self.assertIsNone(result)
+
+    def test_plain_ascii_alt_letter_still_gets_the_meta_prefix(self):
+        # The line's actual intent (readline's Alt+b word-motion binding) must still work --
+        # this is the regression guard against an over-broad fix that rejects everything.
+        result = self._key_to_bytes({"altKey": True, "key": "b"})
+        self.assertEqual(result, "\x1bb")
+
+    def test_plain_ascii_alt_digit_still_gets_the_meta_prefix(self):
+        # A plain US-layout Alt+2 (no composition happens on that layout) must be unaffected --
+        # this is what proves the fix narrowed to "non-ASCII", not to "letters only".
+        result = self._key_to_bytes({"altKey": True, "key": "2"})
+        self.assertEqual(result, "\x1b2")
+
+    def test_windows_linux_altgr_is_excluded_by_the_pre_existing_ctrlkey_guard(self):
+        # AltGr on Windows/Linux reports BOTH ctrlKey and altKey set. Even though "@" itself is
+        # plain ASCII (and so would otherwise pass the new range check), this must still be
+        # excluded -- but by the line's OWN pre-existing `!ev.ctrlKey` guard, not by the ASCII
+        # check added here. Confirms the two guards are independent and both hold.
+        result = self._key_to_bytes({"altKey": True, "ctrlKey": True, "key": "@"})
+        self.assertNotEqual(result, "\x1b@")
+
+    def test_the_fix_reaches_the_browser_not_just_the_source_file(self):
+        from aitracker.page import build_page
+        page = build_page()
+        self.assertIn(r"/^[\x20-\x7e]$/.test(ev.key)", page)
+
+
+class TestSendTimeoutRegression(unittest.TestCase):
+    """DEFECT 2, executed: a queued send that never SETTLES (neither resolves nor rejects -- the
+    observed real failure was a `POST /api/term/keys` hung ~5 minutes under Chrome's
+    background-tab throttling, vs. a control curl to the same endpoint returning in 17ms) used to
+    block `_sendChain` -- and therefore every later keystroke -- forever. `_sendWithTimeout` bounds
+    each queued send with a 5000ms timer raced against the real request, so the chain always
+    advances. Uses the harness's mock setTimeout/clearTimeout (see `_harness_mocks()`) so the
+    5000ms never has to actually elapse in wall-clock time."""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_never_settling_send_does_not_block_later_sends_forever(self):
+        script = _HARNESS_PRELUDE + _SEND_ORDERING_SRC + _harness_mocks() + """
+async function main() {
+  var self = makeSelf('tty-hang');
+  __neverResolveNth = 1;   // the FIRST postKeys() call hangs forever, like the observed bug
+  self._send.call(self, 'a');
+  // Drain pending microtasks WITHOUT advancing the (mock) clock -- 'b' must NOT have reached
+  // postKeys yet. This is the ordering guarantee: a later send must not overtake an earlier one
+  // that is still in flight, only stand behind it until it times out.
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  self._send.call(self, 'b');
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  var callsBeforeTimeout = __calls.slice();
+
+  fireAllTimeouts();   // simulate the 5000ms elapsing for 'a's still-hung request
+  await self._sendChain;
+
+  console.log(JSON.stringify({
+    callsBeforeTimeout: callsBeforeTimeout,
+    callsAfterTimeout: __calls,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertEqual(
+            result["callsBeforeTimeout"], ["a"],
+            "while 'a' is still hung (before its timeout fires), 'b' must not have been issued "
+            "-- a later send must never overtake one still in flight",
+        )
+        self.assertEqual(
+            result["callsAfterTimeout"], ["a", "b"],
+            "once 'a' times out the chain must advance and 'b' must still be sent, in order",
+        )
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_send_is_bounded_by_a_five_second_timeout(self):
+        script = _HARNESS_PRELUDE + _SEND_ORDERING_SRC + _harness_mocks() + """
+async function main() {
+  var self = makeSelf('tty-delay');
+  self._send.call(self, 'x');
+  await Promise.resolve(); await Promise.resolve();
+  console.log(JSON.stringify({ delays: __timeoutQueue.map(function (t) { return t.ms; }) }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertEqual(
+            result["delays"], [5000],
+            "each queued send must be bounded by a 5000ms timeout",
+        )
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_a_send_that_settles_normally_clears_its_own_timer(self):
+        # Proves the timer doesn't leak/double-fire on the ordinary (healthy) path: once postKeys
+        # resolves normally, its timer must be cancelled, not left pending.
+        script = _HARNESS_PRELUDE + _SEND_ORDERING_SRC + _harness_mocks() + """
+async function main() {
+  var self = makeSelf('tty-healthy');
+  self._send.call(self, 'x');
+  await self._sendChain;
+  console.log(JSON.stringify({
+    cancelledCount: __cancelledTimeoutIds.length,
+    stillQueued: __timeoutQueue.length,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertEqual(result["cancelledCount"], 1, "the settled send's own timer must be cleared")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_timed_out_payload_is_dropped_like_a_rejected_send(self):
+        # A timed-out send must not be retried -- exactly like an ordinarily-rejected send, it is
+        # simply dropped. Proven by never seeing 'a' reach postKeys() a second time.
+        script = _HARNESS_PRELUDE + _SEND_ORDERING_SRC + _harness_mocks() + """
+async function main() {
+  var self = makeSelf('tty-drop');
+  __neverResolveNth = 1;
+  self._send.call(self, 'a');
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  fireAllTimeouts();
+  await self._sendChain;
+  console.log(JSON.stringify({ calls: __calls, count: __callCount }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertEqual(
+            result["calls"], ["a"],
+            "the timed-out send must never be retried/resent",
+        )
+        self.assertEqual(result["count"], 1)
+
+
+class TestDestroyClearsSendTimers(unittest.TestCase):
+    """destroy() must clear any outstanding send-timeout timers (see _sendWithTimeout), the same
+    way it already cancels a scheduled motion rAF -- otherwise a timer from a send still in flight
+    at teardown time keeps running past destroy(), which the brief explicitly rules out."""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_destroy_cancels_the_pending_send_timer(self):
+        script = _HARNESS_PRELUDE + _SEND_ORDERING_SRC + _DESTROY_SRC + _harness_mocks() + """
+async function main() {
+  var self = makeSelf('tty-destroy-timer');
+  __neverResolveNth = 1;   // the send hangs -- its timer is still pending at destroy() time
+  self._send.call(self, 'a');
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  var pendingBeforeDestroy = self._sendTimers.length;
+
+  self.destroy.call(self);
+
+  console.log(JSON.stringify({
+    pendingBeforeDestroy: pendingBeforeDestroy,
+    pendingAfterDestroy: self._sendTimers.length,
+    cancelledCount: __cancelledTimeoutIds.length,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertEqual(result["pendingBeforeDestroy"], 1, "a timer must actually be pending first")
+        self.assertEqual(result["pendingAfterDestroy"], 0, "destroy() must clear _sendTimers")
+        self.assertEqual(result["cancelledCount"], 1, "destroy() must clearTimeout() the pending timer")
+
+
 class TestOutsidePaneReleaseExecuted(unittest.TestCase):
     """DEFECT 2, executed: a press-inside/drag-outside/release-outside sequence must still clear
     `_mouseButtonDown`, and a release that landed INSIDE the pane must not be double-reported by
@@ -325,6 +590,10 @@ function wireOutsidePaneFallback(pane, document) {
         script = self._wired_self(False) + """
 async function main() {
   var self = makeSelf('tty5');
+  self.mouseReportingEnabled = true;   // this scenario is about outside-pane release plumbing,
+                                        // not the toggle -- keep the gate open exactly like every
+                                        // one of these tests behaved before the toggle field
+                                        // existed (see makeSelf's own comment on the field).
   self.mouse = { mode: 1002, sgr: false };   // drag-only motion mode
   self._mouseButtonDown = 0;                  // a drag is in progress (left button)
   self._lastMouseCell = { row: 3, col: 3 };
@@ -363,6 +632,7 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         script = self._wired_self(False) + """
 async function main() {
   var self = makeSelf('tty6');
+  self.mouseReportingEnabled = true;   // see tty5's comment above -- keep the gate open
   self.mouse = { mode: 1002, sgr: false };   // 1002: motion reported ONLY while dragging
   self._mouseButtonDown = 0;
   self._lastMouseCell = { row: 3, col: 3 };
@@ -400,6 +670,7 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         script = self._wired_self(True) + """
 async function main() {
   var self = makeSelf('tty7');
+  self.mouseReportingEnabled = true;   // see tty5's comment above -- keep the gate open
   self.mouse = { mode: 1000, sgr: false };
   self._mouseButtonDown = 0;
   self._lastMouseCell = { row: 1, col: 1 };
@@ -445,6 +716,7 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         script = self._wired_self(True) + """
 async function main() {
   var self = makeSelf('tty8');
+  self.mouseReportingEnabled = true;   // see tty5's comment above -- keep the gate open
   self.mouse = { mode: 1002, sgr: false };
   self._mouseButtonDown = 0;   // still set -- as if the pane's own handler never cleared it
 
@@ -471,6 +743,128 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         # past that early `return;`, so button state is untouched by this call (whatever cleared
         # it, if anything, was the pane's own listener -- out of scope for this isolated call).
         self.assertEqual(result["buttonDown"], 0)
+
+
+class TestMouseReportingToggleGateExecuted(unittest.TestCase):
+    """Closes the gap this module's own header/the task brief describe: tests/test_term_vt_client.py's
+    TestMouseReportingToggle proves the SHAPE of the toggle (13 source-text pins -- the toolbar
+    calls `mouseToggle.setEnabled(...)`, `_mouseGate` mentions `this.mouseReportingEnabled`, in the
+    right order relative to the other three checks) but never actually RUNS any of it. Nothing
+    instantiates a real gate call with the flag flipped and observes the resulting boolean or
+    postKeys call -- so the toggle's actual runtime interaction with the other three gate
+    conditions (mode/shift/viewingHistory) was proven by nobody, and a future change that had
+    `setEnabled` write to a differently-named property would still pass every one of those pins.
+
+    These tests route through the REAL extracted `getEnabled`/`setEnabled`/`isMeaningful` closures
+    (Terminal's constructor `mouseToggle` object handed to buildToolbar -- see
+    `_MOUSE_TOGGLE_WIRING_SRC`'s own comment above), not a hand-poked `self.mouseReportingEnabled`,
+    specifically so a `setEnabled`-writes-the-wrong-field regression breaks THESE tests instead of
+    sailing through every text pin unnoticed."""
+
+    def _toggle_wired_self_script(self):
+        return (
+            _HARNESS_PRELUDE + _SEND_ORDERING_SRC + _MOUSE_METHODS_SRC + _harness_mocks()
+            + "function makeMouseToggle(self) {\n  return {\n    " + _MOUSE_TOGGLE_WIRING_SRC
+            + "\n  };\n}\n"
+        )
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_toggle_off_blocks_mousedown_and_gate_returns_false(self):
+        script = self._toggle_wired_self_script() + """
+async function main() {
+  var self = makeSelf('tty-toggle-off');
+  self.mouse = { mode: 1000, sgr: false };   // a program HAS asked for tracking...
+  var mouseToggle = makeMouseToggle(self);
+  mouseToggle.setEnabled(false);             // ...but the user's toolbar toggle is off (default)
+  var ev = fakeEvent({ clientX: 10, clientY: 10, target: 'inside' });
+  var gateResult = self._mouseGate.call(self, ev);
+  self._onMouseDown.call(self, ev);
+  await self._sendChain;
+  console.log(JSON.stringify({ gateResult: gateResult, sentCount: __callCount }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertFalse(result["gateResult"], "_mouseGate must return false while the toggle is off")
+        self.assertEqual(result["sentCount"], 0, "a mousedown must produce no postKeys call while the toggle is off")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_toggle_on_allows_mousedown_and_gate_returns_true(self):
+        script = self._toggle_wired_self_script() + """
+async function main() {
+  var self = makeSelf('tty-toggle-on');
+  self.mouse = { mode: 1000, sgr: false };
+  var mouseToggle = makeMouseToggle(self);
+  mouseToggle.setEnabled(true);              // the user has flipped the toolbar toggle on
+  var ev = fakeEvent({ clientX: 10, clientY: 10, target: 'inside' });
+  var gateResult = self._mouseGate.call(self, ev);
+  self._onMouseDown.call(self, ev);
+  await self._sendChain;
+  console.log(JSON.stringify({ gateResult: gateResult, sentCount: __callCount, sent: __calls[0] || null }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertTrue(result["gateResult"], "_mouseGate must return true once the toggle is on")
+        self.assertEqual(result["sentCount"], 1, "a mousedown must produce exactly one mouse report once the toggle is on")
+        self.assertIsInstance(result["sent"], str)
+        self.assertTrue(len(result["sent"]) > 0, "the mouse report payload must be non-empty")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_toggle_on_does_not_override_the_other_three_gate_conditions(self):
+        # Pins the actual INTERACTION: the toggle is a FOURTH, additional gate (per _mouseGate's
+        # own comment) -- it must never bypass the pre-existing mode/shift/viewingHistory checks,
+        # even once the user has explicitly turned it on.
+        script = self._toggle_wired_self_script() + """
+async function main() {
+  var out = {};
+
+  // shiftKey drag must still be bypassed (the user's native-selection escape hatch) even with
+  // the toggle ON.
+  var s1 = makeSelf('tty-toggle-shift');
+  s1.mouse = { mode: 1000, sgr: false };
+  makeMouseToggle(s1).setEnabled(true);
+  var ev1 = fakeEvent({ clientX: 1, clientY: 1, target: 'inside', shiftKey: true });
+  var before1 = __callCount;
+  var gate1 = s1._mouseGate.call(s1, ev1);
+  s1._onMouseDown.call(s1, ev1);
+  await s1._sendChain;
+  out.shiftKey = { gate: gate1, sent: __callCount - before1 };
+
+  // mouse.mode === 0 (no program has asked for tracking) must still block, even with the toggle ON.
+  var s2 = makeSelf('tty-toggle-mode0');
+  s2.mouse = { mode: 0, sgr: false };
+  makeMouseToggle(s2).setEnabled(true);
+  var ev2 = fakeEvent({ clientX: 1, clientY: 1, target: 'inside' });
+  var before2 = __callCount;
+  var gate2 = s2._mouseGate.call(s2, ev2);
+  s2._onMouseDown.call(s2, ev2);
+  await s2._sendChain;
+  out.modeZero = { gate: gate2, sent: __callCount - before2 };
+
+  // viewingHistory (a frozen scrollback snapshot) must still block, even with the toggle ON.
+  var s3 = makeSelf('tty-toggle-history');
+  s3.mouse = { mode: 1000, sgr: false };
+  s3.viewingHistory = true;
+  makeMouseToggle(s3).setEnabled(true);
+  var ev3 = fakeEvent({ clientX: 1, clientY: 1, target: 'inside' });
+  var before3 = __callCount;
+  var gate3 = s3._mouseGate.call(s3, ev3);
+  s3._onMouseDown.call(s3, ev3);
+  await s3._sendChain;
+  out.viewingHistory = { gate: gate3, sent: __callCount - before3 };
+
+  console.log(JSON.stringify(out));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertFalse(result["shiftKey"]["gate"], "Shift+drag must still bypass reporting even with the toggle on")
+        self.assertEqual(result["shiftKey"]["sent"], 0)
+        self.assertFalse(result["modeZero"]["gate"], "mode===0 (tracking off) must still block even with the toggle on")
+        self.assertEqual(result["modeZero"]["sent"], 0)
+        self.assertFalse(result["viewingHistory"]["gate"], "viewingHistory must still block even with the toggle on")
+        self.assertEqual(result["viewingHistory"]["sent"], 0)
 
 
 class TestMultiFrameMotionRegression(unittest.TestCase):

@@ -848,13 +848,24 @@ function pickToggle(id,encGk){
   pick(id);   // pick() re-renders
 }
 function toggleLiveOnly(){liveOnly=!liveOnly;renderSide();}
+// In-flight guard: /api/list can be slow (cold cache, load). Without this, setInterval keeps
+// firing every 5s regardless of whether the previous call finished, and slow calls stack up
+// unboundedly, eating the browser's 6-socket-per-host budget until nothing else on the page can
+// load (see the bug this guards against, described where the poller is registered). A single
+// boolean caps loadSide() at 1 in-flight request — no backoff needed, since 1 is already small
+// relative to the 6-socket budget and a plain guard recovers immediately once a call returns,
+// slow or not. sideBusy is cleared in `finally` so a rejected/erroring fetch can't wedge it stuck.
+let sideBusy=false;
 async function loadSide(){
+  if(sideBusy)return;
+  sideBusy=true;
   try{
     const res=await fetch("/api/list");
     const t=res.headers.get("X-Server-Now");   // the same clock /api/session's `now` uses
     if(t)listNow=+t;
     sessions=await res.json();
   }catch(e){return}
+  finally{sideBusy=false;}
   renderSide();
   loadFlags();   // flags were only fetched by poll(), i.e. never until a session was selected
 }
@@ -1015,9 +1026,18 @@ function checkCompletions(d){
   }
   notifRunning=running;
 }
+// Same in-flight guard as loadSide's sideBusy, kept as a separate flag: poll() (session detail,
+// every 2s) and loadSide() (session list, every 5s) hit different endpoints and must not block
+// each other — a slow /api/list must not stall /api/session refreshes, or vice versa. Cleared in
+// `finally` so a rejected fetch can't leave poll() permanently unable to start again.
+let pollBusy=false;
 async function poll(){
-  if(!cur)return;
-  let d;try{d=await(await fetch("/api/session?id="+encodeURIComponent(cur))).json()}catch(e){return}
+  if(!cur||pollBusy)return;
+  pollBusy=true;
+  let d;
+  try{d=await(await fetch("/api/session?id="+encodeURIComponent(cur))).json()}
+  catch(e){return}
+  finally{pollBusy=false;}
   if(d.error){$("hmeta").innerHTML=`<span class=dot></span> ${esc(d.error)}: ${esc(cur)}`;return}
   lastData=d;render(d);loadFlags();checkCompletions(d);
 }

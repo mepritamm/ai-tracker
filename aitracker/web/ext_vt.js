@@ -154,7 +154,19 @@
       // universally relied on) is implemented; the others are deliberately left unguessed.
       if (k === " ") return "\x00";
     }
-    if (ev.altKey && !ev.ctrlKey && !ev.metaKey && ev.key.length === 1) return "\x1b" + ev.key;
+    // Meta/Alt prefix (readline's Alt+<letter> word-motion convention, e.g. Alt+b -> ESC b) only
+    // makes sense for a PLAIN ASCII character. `ev.key.length === 1` alone is not that test: on
+    // macOS, Option is `altKey`, and Option+key produces a COMPOSED character -- Option+2 arrives
+    // as `{altKey: true, key: "€"}` ("€" is a single UTF-16 code unit, so `.length` is
+    // still 1), and prefixing that with ESC corrupts a character the user simply typed. AltGr on
+    // European layouts (@, #, €, ~, \\ on many keyboards) has the same failure mode. Restrict
+    // to the printable ASCII range so only a real plain-ASCII Alt+<char> takes this path; anything
+    // else returns null and falls through to the textarea, which _onInput reads correctly (see the
+    // comment above keyToBytes about why composed input is read off the textarea, not here).
+    //
+    // AltGr on Windows/Linux reports BOTH `ctrlKey` and `altKey` set -- that is already excluded
+    // by this line's own `!ev.ctrlKey` guard, independent of the ASCII check added here.
+    if (ev.altKey && !ev.ctrlKey && !ev.metaKey && /^[\x20-\x7e]$/.test(ev.key)) return "\x1b" + ev.key;
 
     // ===== modifier-aware cursor/nav/function keys =====
     // xterm ctlseqs (invisible-island.net/xterm/ctlseqs/ctlseqs.html), Patch #411: modified cursor
@@ -276,7 +288,7 @@
   // row 0's real content. Both renderers (Terminal below and XtermTerminal further down) build
   // this the same way and append it as a sibling BEFORE their own pane, so the fix covers both
   // paths from one place rather than being reimplemented per-renderer. =====
-  function buildToolbar(onZoomOut, onZoomIn, onAfterZoom) {
+  function buildToolbar(onZoomOut, onZoomIn, onAfterZoom, mouseToggle) {
     var bar = document.createElement("div");
     bar.className = "vttoolbar";
     var zoomOut = document.createElement("span");
@@ -289,6 +301,57 @@
     zoomIn.addEventListener("click", function () { onZoomIn(); onAfterZoom(); });
     bar.appendChild(zoomOut);
     bar.appendChild(zoomIn);
+    // ===== mouse-reporting toggle (this session) ===========================================
+    // Commit 4bc3e08 added mouse forwarding: once a TUI (Claude Code's own included) turns on
+    // `?1000`/`?1002`/`?1003` tracking, every drag inside the pane became a mouse report instead
+    // of a native text selection. Shift+drag still works (XTSHIFTESCAPE, see the Terminal class's
+    // own _mouseGate) but that escape hatch isn't discoverable and isn't what most users want by
+    // default -- this button is the visible, PER-TERMINAL fix: default OFF, flip it on only when
+    // you actually want clicks/drags to reach the program running inside the pane.
+    // `mouseToggle` is a tiny renderer-agnostic interface (not a DOM/class check) so this ONE
+    // function serves both Terminal (a real gate wired into _mouseGate below) and XtermTerminal
+    // (permanently inert -- xterm.js owns its own mouse handling; see that constructor's call site
+    // for why forwarding through here would fight it instead of helping it):
+    //   getEnabled()   -> current on/off state to render
+    //   setEnabled(v)  -> called on a real (non-inert) click/tap
+    //   isMeaningful() -> whether toggling would currently do anything; false dims the button and
+    //                     makes it a no-op (requirement: offer it only when it's meaningful, but
+    //                     never hide it -- no host/viewport gate, see ext_vt.css's .vtmousebtn).
+    var mouseBtn = document.createElement("span");
+    mouseBtn.className = "vtzoombtn vtmousebtn";
+    mouseBtn.setAttribute("role", "switch");
+    mouseBtn.setAttribute("tabindex", "0");
+    function renderMouseBtn() {
+      var on = mouseToggle.getEnabled();
+      var meaningful = mouseToggle.isMeaningful();
+      mouseBtn.textContent = on ? "🖱 on" : "🖱 off";   // "🖱 on" / "🖱 off"
+      mouseBtn.setAttribute("aria-pressed", on ? "true" : "false");
+      mouseBtn.classList.toggle("vtmouseon", on);
+      mouseBtn.classList.toggle("vtmouseinert", !meaningful);
+      mouseBtn.title = !meaningful
+        ? "Mouse reporting has no effect right now — nothing running here has asked for mouse tracking."
+        : (on
+          ? "Mouse reporting is ON: clicks and drags go to the program running here. Shift+drag still selects text. Tap to turn off."
+          : "Mouse reporting is OFF: dragging selects text like a normal terminal. Tap to turn it on so clicks reach the program (Shift+drag always selects text either way).");
+    }
+    function activateMouseToggle() {
+      if (!mouseToggle.isMeaningful()) return;   // inert: nothing running here wants mouse tracking
+      mouseToggle.setEnabled(!mouseToggle.getEnabled());
+      renderMouseBtn();
+      onAfterZoom();   // refocus the capture textarea, exactly like a zoom click does
+    }
+    mouseBtn.addEventListener("click", activateMouseToggle);
+    // Keyboard activation (Enter/Space) alongside tap/click -- the tap path itself needs no special
+    // handling: a `click` fires for a tap on any element with no touch-action interference, same as
+    // the pre-existing A-/A+ buttons above, which are usable on phone today with this exact pattern.
+    mouseBtn.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); activateMouseToggle(); }
+    });
+    renderMouseBtn();
+    bar.appendChild(mouseBtn);
+    // Exposed so the owner can re-render when meaningfulness changes out from under the click --
+    // e.g. Terminal's own _applyPatch calls this after a fresh `mouse.mode` arrives over SSE.
+    bar.refreshMouseToggle = renderMouseBtn;
     return bar;
   }
 
@@ -318,6 +381,14 @@
     this.mouse = { mode: 0, sgr: false };  // msg.mouse -- see the header comment's caveat; default
                                             // (tracking off) preserves today's native-selection/
                                             // scrollback behaviour until the server sends otherwise.
+    // ---- user-facing mouse-reporting toggle (this session; see buildToolbar's own comment) ----
+    // Default OFF: even once a program turns tracking on (this.mouse.mode above), plain dragging
+    // keeps selecting text like it did before commit 4bc3e08 -- the user has to opt in via the
+    // toolbar button before clicks/drags start reaching the program. PER-INSTANCE, deliberately
+    // NOT persisted (no new JSON state file) -- same choice as `_fontPx`/`_linePx` below: a fresh
+    // terminal always starts predictable (native selection), never silently inherits a stale
+    // "reporting on" state from a previous pane/session.
+    this.mouseReportingEnabled = false;
     this.focusEvents = false;              // msg.focus_events -- see the header comment's "FOCUS
                                             // REPORTING" section; default (off) sends nothing on
                                             // focus/blur, byte-for-byte today's behaviour.
@@ -331,6 +402,9 @@
     this._sendChain = Promise.resolve();   // every send is queued onto this ONE promise chain, so
                                             // bytes reach /api/term/keys in production order even
                                             // though postKeys() fires independent fetch()es.
+    this._sendTimers = [];                 // outstanding setTimeout ids from _sendWithTimeout below
+                                            // (see that function's comment); destroy() clears every
+                                            // one still pending so no timer outlives this terminal.
     this._pendingMotion = null;            // newest not-yet-flushed motion report, or null.
     this._motionRAFPending = false;        // an rAF flush is already scheduled for it.
     this._motionRAFHandle = null;          // requestAnimationFrame()'s own id for that scheduled
@@ -356,8 +430,14 @@
     var toolbarEl = buildToolbar(
       function () { self._zoom(-1); },
       function () { self._zoom(1); },
-      function () { input.focus(); }
+      function () { input.focus(); },
+      {
+        getEnabled: function () { return self.mouseReportingEnabled; },
+        setEnabled: function (v) { self.mouseReportingEnabled = v; },
+        isMeaningful: function () { return self.mouse.mode !== 0; }
+      }
     );
+    this._refreshMouseToggle = toolbarEl.refreshMouseToggle;   // called from _applyPatch below
     var pane = document.createElement("div");
     pane.className = "vtpane";
     var rowsEl = document.createElement("div");
@@ -512,6 +592,10 @@
     if (msg.mouse !== undefined && msg.mouse) {
       if (typeof msg.mouse.mode === "number") this.mouse.mode = msg.mouse.mode;
       if (msg.mouse.sgr !== undefined) this.mouse.sgr = !!msg.mouse.sgr;
+      // The toolbar toggle's "meaningful" state (see buildToolbar) tracks this.mouse.mode -- a
+      // program can turn tracking on/off mid-session, so the button's dim/inert look must follow
+      // the SSE stream, not just react to the user's own clicks.
+      if (this._refreshMouseToggle) this._refreshMouseToggle();
     }
     if (msg.focus_events !== undefined) this.focusEvents = !!msg.focus_events;
     if (typeof msg.bell === "number") {
@@ -744,11 +828,73 @@
   //
   // A rejected send (e.g. a network hiccup) must not wedge the chain forever -- the `.catch()`
   // swallows the failure inside the chain itself, so the NEXT queued `.then()` still runs.
+  //
+  // That covers a send that SETTLES (resolves or rejects). It does nothing for one that never
+  // settles at all -- observed for real: a `POST /api/term/keys` hung for ~5 minutes under
+  // Chrome's background-tab network throttling (a control `curl` to the same endpoint returned in
+  // 17ms), which would otherwise wedge every later keystroke behind it permanently, with no error
+  // and no recovery short of reopening the terminal. `_sendWithTimeout`, below, bounds each queued
+  // send so the chain always advances even then.
   Terminal.prototype._enqueue = function (s) {
     var self = this;
     this._sendChain = this._sendChain.then(function () {
-      return postKeys(self.ttyId, s);
+      return self._sendWithTimeout(s);
     }).catch(function () { });
+  };
+  // SEND TIMEOUT: races the real postKeys() promise against a timer, so a request that never
+  // settles cannot block `_sendChain` forever -- see `_enqueue`'s comment above for the observed
+  // hang this fixes. 5000ms: this is a LOCALHOST server (a healthy request here is single-digit
+  // milliseconds, per the 17ms control curl above), so 5s is already an enormous margin above any
+  // real response time and fires only on a genuinely wedged request.
+  //
+  // ORDERING TRADE-OFF (read before touching this): `_sendChain`'s own `.then()` chaining means
+  // send N+1's `_sendWithTimeout` call -- and so its `postKeys()` fetch -- is only ISSUED after
+  // send N's promise settles, real response or timeout alike, so sends are still produced onto the
+  // wire in order during ordinary typing. But once a send times out, its underlying fetch() is
+  // simply abandoned in flight (there is no cheap way to actually cancel it without adding
+  // AbortController plumbing this file doesn't otherwise need) while the NEXT queued send's
+  // fetch() starts immediately. That means the timed-out request and the one after it CAN now be
+  // in flight on the network at the same time, and could in principle land at the server out of
+  // order. This is the SAME class of hazard this file's own header comment above already
+  // documents as pre-existing and latent (independent fetch()es have no ordering guarantee of
+  // their own) -- not a new one, just a somewhat likelier occurrence of the old one -- and it is a
+  // strictly better trade than every later keystroke hanging forever behind one dead request.
+  //
+  // The timed-out payload is DROPPED, exactly like an ordinarily-rejected send already is: this
+  // function's synthesized timeout rejection is swallowed by the very same `.catch(function () {
+  // })` in `_enqueue` above that already swallows a real network rejection. There is no retry --
+  // a retried keystroke would be a DUPLICATED keystroke, which is worse than a dropped one.
+  Terminal.prototype._sendWithTimeout = function (s) {
+    var self = this;
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      var timer = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        var idx = self._sendTimers.indexOf(timer);
+        if (idx !== -1) self._sendTimers.splice(idx, 1);
+        reject(new Error("term send timed out"));
+      }, 5000);
+      self._sendTimers.push(timer);
+      postKeys(self.ttyId, s).then(
+        function (v) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          var idx = self._sendTimers.indexOf(timer);
+          if (idx !== -1) self._sendTimers.splice(idx, 1);
+          resolve(v);
+        },
+        function (e) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          var idx = self._sendTimers.indexOf(timer);
+          if (idx !== -1) self._sendTimers.splice(idx, 1);
+          reject(e);
+        }
+      );
+    });
   };
   Terminal.prototype._flushMotion = function () {
     if (this._pendingMotion === null) return;   // nothing pending, or already flushed -- no-op,
@@ -808,6 +954,13 @@
     }
     this._motionRAFPending = false;
     this._pendingMotion = null;
+    // Same reasoning, for the send-timeout timers from _sendWithTimeout (see that function's own
+    // comment): a timer left running past destroy() would fire into a promise chain nobody is
+    // waiting on any more -- harmless in itself, but still a live timer this terminal no longer
+    // owns. Clear every one still pending; a timer that already fired and was removed from this
+    // array is naturally skipped.
+    for (var ti = 0; ti < this._sendTimers.length; ti++) clearTimeout(this._sendTimers[ti]);
+    this._sendTimers = [];
     // See the constructor's "outside-pane release fallback" comment -- this is a document-level
     // listener, so it leaks past this terminal's own DOM teardown unless explicitly removed here
     // (same pattern as ContextBar's own `_onDocClick`, below).
@@ -849,6 +1002,25 @@
     if (this.mouse.mode === 0) return false;
     if (ev.shiftKey) return false;
     if (this.viewingHistory) return false;
+    // 4. the user's own toolbar toggle (this session, see buildToolbar's comment and the
+    //    constructor's `mouseReportingEnabled` field) -- default OFF: even once a program has
+    //    asked for tracking, native drag-select stays the default until the user explicitly flips
+    //    the toolbar button on. Checked with a strict `=== false` (never a plain falsy `!`): every
+    //    REAL Terminal instance always initializes this field explicitly in its constructor, so
+    //    `undefined` never occurs there.
+    //
+    //    tests/test_term_vt_exec.py's `makeSelf()` (a hand-built test double this file does not
+    //    own) now ALSO initializes this field to a real boolean (`false`, matching this
+    //    constructor's own default) rather than leaving it `undefined` -- see that file's
+    //    TestMouseReportingToggleGateExecuted, which exercises this exact line by routing through
+    //    the REAL extracted `getEnabled`/`setEnabled` closures, not a hand-poked field. That makes
+    //    a plain `!this.mouseReportingEnabled` safe for makeSelf()'s callers today. It is kept
+    //    strict anyway: tests/test_term_vt_client.py's TestMouseReportingToggle (a file also
+    //    outside this task's ownership) pins this exact `=== false` source line by literal text
+    //    (`test_mousegate_still_consults_mode_shift_and_viewinghistory_in_order` /
+    //    `test_reaches_the_browser`), so relaxing the comparison here would need a matching edit
+    //    there in the same change -- judged not worth doing one-sided.
+    if (this.mouseReportingEnabled === false) return false;
     return true;
   };
 
@@ -1190,7 +1362,18 @@
     var toolbarEl = buildToolbar(
       function () { self._zoom(-1); },
       function () { self._zoom(1); },
-      function () { self.focus(); }
+      function () { self.focus(); },
+      {
+        // xterm.js owns mouse handling entirely inside its own <canvas> -- this file has no
+        // `mouse.mode` equivalent for this renderer (no JSON envelope at all; see this class's own
+        // header comment) and forwarding/gating clicks ourselves here would fight xterm.js's own
+        // handling instead of helping it ("xterm.js handles its own mouse; do not fight it"). The
+        // toggle is therefore permanently inert on this renderer -- still shown (never hidden, per
+        // the no-host/no-viewport-gate requirement), always dimmed, a no-op on tap/click.
+        getEnabled: function () { return false; },
+        setEnabled: function () { },
+        isMeaningful: function () { return false; }
+      }
     );
     var pane = document.createElement("div");
     pane.className = "vtpane vtxpane";

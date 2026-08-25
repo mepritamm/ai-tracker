@@ -159,7 +159,11 @@ def _list(kind, prefix, src_label):
     titles = load_titles()
     out = []
     for ws, aug_dir, folder in _scan_workspaces(kind):
-        allmap = {u: t for u, t, _ in _iter_tasks(aug_dir)}
+        # ONE pass over the task files. There used to be an `allmap` built from a first
+        # _iter_tasks() pass here, but nothing in this loop ever read it (only _parse()
+        # needs the map, to flatten subTasks) — it just opened and json-parsed every task
+        # file a second time on every /api/list. Measured on real data: 665 Augment tasks
+        # read as 1330 opens, ~0.12s of a 0.40s warm /api/list (~30%).
         for uu, task, mt_file in _iter_tasks(aug_dir):
             gid = "%s%s:%s" % (prefix, ws, uu)
             mt = _mtime_of(task, aug_dir) or mt_file

@@ -9,6 +9,7 @@ import json
 import sys
 import os
 import runpy
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -1200,19 +1201,76 @@ class TestNarrationPagination(unittest.TestCase):
 
 
 class TestBundle(unittest.TestCase):
-    """`make bundle` produces a valid, standalone single-file build."""
+    """`make bundle` produces a valid, standalone single-file build that actually RUNS.
 
-    def test_bundle_builds_and_is_valid(self):
+    A syntax check alone let a broken bundle ship: `python3 dist/tracker.py --selfcheck` raised
+    `NameError: AugmentVscodeProvider` because scripts/bundle.py's ORDER omitted
+    `providers/augment_ext.py`, which registry.py's PROVIDERS list references. Fixing that
+    surfaced a second, independent bug -- server.py's terminal-tier loader does
+    `__import__("%s.%s" % (__package__, _m))` to optionally pull in real package submodules;
+    run standalone (`__package__` is `None`, not `""`), that raises `ModuleNotFoundError`
+    with `e.name == "None"`, which fails the loop's own `e.name != "None.term_vt"` check and
+    re-raises -- crashing --version/--help/--selfcheck alike. bundle.py now excises that loop
+    when bundling server.py (the terminal tiers -- term_launch/term_run/term_vt -- cross-
+    reference each other and server/store via bare `module.attr` access that only resolves
+    inside the real package; they are intentionally NOT part of the standalone bundle, which
+    simply ships without the terminal feature, same as before this fix for any other
+    genuinely-absent module).
+
+    Both failures were runtime-only -- ast.parse() is silent on both -- so this test actually
+    EXECUTES the bundle as a subprocess. --selfcheck is included and cheap: bundle.py replaces
+    cli.py's real self-check with a one-line print (see its own comment) precisely because the
+    real one discovers and runs the whole test suite *from inside itself*, which would make this
+    test crawl -- that full run is what `make check` already covers in the source tree."""
+
+    def setUp(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         bundler = os.path.join(root, "scripts", "bundle.py")
         if not os.path.exists(bundler):
             self.skipTest("no bundler")
         runpy.run_path(bundler, run_name="__main__")
-        src = open(os.path.join(root, "dist", "tracker.py")).read()
+        self.root = root
+        self.dist = os.path.join(root, "dist", "tracker.py")
+
+    def _run(self, *args):
+        return subprocess.run([sys.executable, self.dist, *args],
+                               capture_output=True, text=True, timeout=30)
+
+    def test_bundle_is_syntactically_valid_and_self_contained(self):
+        src = open(self.dist).read()
         ast.parse(src)                          # syntactically valid
         self.assertIn("PAGE = ", src)           # page inlined
         self.assertIn("def main(", src)
         self.assertNotIn("from .", src)         # no leftover intra-package imports
+
+    def test_bundle_version_runs(self):
+        r = self._run("--version")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ai-tracker", r.stdout)
+
+    def test_bundle_help_runs(self):
+        r = self._run("--help")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Usage:", r.stdout)
+
+    def test_bundle_selfcheck_runs_without_crashing(self):
+        # Neutered to a one-line print by bundle.py (see the class docstring) -- not the full
+        # suite, so it's cheap enough to run here rather than only via `make bundle` by hand.
+        r = self._run("--selfcheck")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_bundle_imports_and_instantiates_every_provider(self):
+        # The actual regression: PROVIDERS referenced a class scripts/bundle.py never inlined.
+        # Load the bundle as a plain module (run_name != "__main__", so its own
+        # `if __name__ == "__main__": main()` doesn't try to start a server) and exercise the
+        # shared seam for real, the way registry.all_sessions() is exercised in the live app.
+        ns = runpy.run_path(self.dist, run_name="tracker_bundle_smoke")
+        names = {type(p).__name__ for p in ns["PROVIDERS"]}
+        self.assertEqual(
+            names,
+            {"ClaudeProvider", "AuggieProvider", "AugmentVscodeProvider", "AugmentCursorProvider"})
+        sessions = ns["all_sessions"]()         # the shared seam -- must not raise
+        self.assertIsInstance(sessions, list)
 
 
 class TestCoverageGaps(unittest.TestCase):
@@ -1283,6 +1341,256 @@ class TestCoverageGaps(unittest.TestCase):
         ids = [r["id"] for r in search_all("auth bug")]
         self.assertIn("aaa", ids)                # both terms present -> match
         self.assertNotIn("bbb", ids)             # a term missing -> excluded (AND semantics)
+
+
+class TestPollerInFlightGuard(unittest.TestCase):
+    """Source pins for the in-flight guard on the two client pollers (app.js: loadSide()/poll()).
+
+    Without a guard, setInterval(loadSide,5000) / setInterval(poll,2000) keep firing regardless
+    of whether the previous call finished; when /api/list is genuinely slow (measured: 36.6s cold,
+    >60s under load), stacked calls exhaust the browser's 6-socket-per-host budget and starve
+    every other request on the page, including the terminal's own polling. These assertions pin
+    the shape of the fix directly against the shipped app.js source (there is no JS engine in the
+    stdlib) -- see TestPollerInFlightGuardExecuted below for a behavioural check that actually
+    runs the guard logic under Node."""
+
+    def setUp(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "aitracker", "web", "app.js"), encoding="utf-8") as fh:
+            self.src = fh.read()
+
+    def test_loadSide_has_its_own_inflight_flag(self):
+        self.assertIn("let sideBusy=false;", self.src)
+        i = self.src.index("async function loadSide(){")
+        body_end = self.src.index("\nfunction pick(id)", i)   # loadSide is the last stmt before pick()
+        body = self.src[i:body_end]
+        self.assertIn("if(sideBusy)return;", body)     # guard at entry
+        self.assertIn("sideBusy=true;", body)           # set before the fetch
+        self.assertIn("finally{sideBusy=false;}", body)  # released unconditionally
+
+    def test_poll_has_its_own_inflight_flag_independent_of_loadSide(self):
+        self.assertIn("let pollBusy=false;", self.src)
+        i = self.src.index("async function poll(){")
+        body_end = self.src.index("\nconst KICON=", i)   # poll is the last stmt before KICON
+        body = self.src[i:body_end]
+        self.assertIn("pollBusy", body)
+        self.assertIn("finally{pollBusy=false;}", body)  # released unconditionally
+        # the two pollers must not share one flag -- a slow /api/list must not block /api/session
+        self.assertNotIn("sideBusy", body)
+
+    def test_guard_release_sits_in_a_finally_covering_the_fetch(self):
+        # both releases must be reachable on the reject path too, not only after a successful
+        # .json() parse -- i.e. the finally must wrap the try that contains the fetch/await, not
+        # merely follow it as a sibling statement that a thrown error would skip.
+        for flag, needle in (("sideBusy", "let sideBusy=false;"), ("pollBusy", "let pollBusy=false;")):
+            start = self.src.index(needle)
+            # the nearest `try{` after the flag's declaration must be closed by a `finally` that
+            # clears the same flag, before any other top-level `let `/`function ` declaration.
+            try_idx = self.src.index("try{", start)
+            finally_idx = self.src.index("finally{" + flag + "=false;}", try_idx)
+            # sanity bound: the finally must be close to its try (same function body), not some
+            # unrelated finally{} further down the file
+            self.assertLess(finally_idx - try_idx, 400, "finally{%s=false} is not the release for this try{}" % flag)
+
+    def test_intervals_unchanged(self):
+        # rule 4 of the task: 5000/2000 and LIVE/liveness semantics are server policy -- the
+        # guard must not touch how often the pollers are asked to run, only whether a new call
+        # is allowed to start while one is already in flight.
+        self.assertIn("setInterval(loadSide,5000);", self.src)
+        self.assertIn("timer=setInterval(poll,2000);", self.src)
+
+
+def _extract_js_block(src, start_marker, func_marker):
+    """From `start_marker` (e.g. the flag's `let ...=false;` declaration) through the matching
+    closing brace of the function introduced by `func_marker` (found at or after start_marker) --
+    a self-contained snippet that declares both the flag and the guarded function, pasteable
+    verbatim into a Node harness. Brace-counts the raw text; safe here because neither loadSide()
+    nor poll() contains a stray unbalanced `{`/`}` inside a string (checked by hand -- poll()'s
+    one template literal, `${esc(d.error)}: ${esc(cur)}`, contributes two balanced pairs)."""
+    start = src.index(start_marker)
+    open_idx = src.index("{", src.index(func_marker, start))
+    depth = 0
+    i = open_idx
+    while i < len(src):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    return src[start:i + 1]
+
+
+class TestPollerInFlightGuardExecuted(unittest.TestCase):
+    """Behavioural (EXECUTED) counterpart to TestPollerInFlightGuard: the source pins above can
+    confirm the SHAPE of the fix but not that it actually stops a second call from starting while
+    the first is still pending, or that a rejected fetch truly unwedges the flag -- both are
+    timing/control-flow properties that only show up by running the real functions. Extracted
+    verbatim (by source-text slicing, not retyped) out of aitracker/web/app.js and executed under
+    Node with mocked fetch/DOM globals, following the same pattern as
+    tests/test_term_vt_exec.py (owned by another agent in this session; not modified here).
+
+    Node is not a project dependency -- skipped outright when `node` isn't on PATH, so `make
+    check` stays green without it, exactly like test_term_vt_exec.py."""
+
+    _HAS_NODE = shutil.which("node") is not None
+
+    @classmethod
+    def setUpClass(cls):
+        if not cls._HAS_NODE:
+            return
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "aitracker", "web", "app.js"), encoding="utf-8") as fh:
+            src = fh.read()
+        cls._loadside_src = _extract_js_block(src, "let sideBusy=false;", "async function loadSide(){")
+        cls._poll_src = _extract_js_block(src, "let pollBusy=false;", "async function poll(){")
+
+    _MOCKS = """
+'use strict';
+var sessions = [];
+var listNow = 0;
+var cur = null;
+var lastData = null;
+var __renderSideCalls = 0, __loadFlagsCalls = 0, __renderCalls = 0, __checkCompletionsCalls = 0;
+function renderSide(){ __renderSideCalls++; }
+function loadFlags(){ __loadFlagsCalls++; }
+function render(d){ __renderCalls++; }
+function checkCompletions(d){ __checkCompletionsCalls++; }
+function esc(s){ return String(s); }
+function $(id){ return { innerHTML: '', textContent: '' }; }
+
+var __fetchCalls = [];
+function fetch(url) {
+  return new Promise(function (resolve, reject) {
+    __fetchCalls.push({ url: url, resolve: resolve, reject: reject });
+  });
+}
+function __resolveList(i) {
+  __fetchCalls[i].resolve({ headers: { get: function () { return null; } }, json: function () { return Promise.resolve([]); } });
+}
+function __resolveSession(i) {
+  __fetchCalls[i].resolve({ json: function () { return Promise.resolve({}); } });
+}
+"""
+
+    def _run(self, js_source):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "harness.js")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(js_source)
+            proc = subprocess.run(["node", path], capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            raise AssertionError(
+                "node harness exited %d\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (proc.returncode, proc.stdout, proc.stderr)
+            )
+        try:
+            return json.loads(proc.stdout.strip().splitlines()[-1])
+        except Exception as e:
+            raise AssertionError(
+                "could not parse JSON from node harness output: %r\nfull stdout:\n%s\nstderr:\n%s"
+                % (e, proc.stdout, proc.stderr)
+            )
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_loadSide_second_call_is_a_noop_while_first_is_pending(self):
+        script = self._MOCKS + self._loadside_src + """
+async function main() {
+  var p1 = loadSide();
+  var p2 = loadSide();   // must NOT fetch again -- previous call hasn't settled
+  var callsWhilePending = __fetchCalls.length;
+  __resolveList(0);
+  await p1; await p2;
+  console.log(JSON.stringify({ callsWhilePending: callsWhilePending, busyAfter: sideBusy, renderSideCalls: __renderSideCalls }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = self._run(script)
+        self.assertEqual(result["callsWhilePending"], 1, "a second loadSide() while one is in flight must not issue a new fetch")
+        self.assertFalse(result["busyAfter"], "the guard must be released once the pending call settles")
+        self.assertEqual(result["renderSideCalls"], 1, "only the single real fetch should have rendered")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_loadSide_guard_released_on_rejected_fetch(self):
+        script = self._MOCKS + self._loadside_src + """
+async function main() {
+  var p1 = loadSide();
+  __fetchCalls[0].reject(new Error('network down'));
+  await p1;
+  var busyAfterFailure = sideBusy;
+  // guard must not be wedged permanently "in flight" -- a second call must fetch again
+  var p2 = loadSide();
+  var fetchedAgain = __fetchCalls.length === 2;
+  __resolveList(1);
+  await p2;
+  console.log(JSON.stringify({ busyAfterFailure: busyAfterFailure, fetchedAgain: fetchedAgain }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = self._run(script)
+        self.assertFalse(result["busyAfterFailure"], "a rejected fetch must clear the guard, not leave it stuck")
+        self.assertTrue(result["fetchedAgain"], "after a failure the next loadSide() must be allowed to fetch")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_poll_second_call_is_a_noop_while_first_is_pending(self):
+        script = self._MOCKS + self._poll_src + """
+async function main() {
+  cur = "sess1";
+  var p1 = poll();
+  var p2 = poll();   // must NOT fetch again -- previous call hasn't settled
+  var callsWhilePending = __fetchCalls.length;
+  __resolveSession(0);
+  await p1; await p2;
+  console.log(JSON.stringify({ callsWhilePending: callsWhilePending, busyAfter: pollBusy, renderCalls: __renderCalls }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = self._run(script)
+        self.assertEqual(result["callsWhilePending"], 1, "a second poll() while one is in flight must not issue a new fetch")
+        self.assertFalse(result["busyAfter"], "the guard must be released once the pending call settles")
+        self.assertEqual(result["renderCalls"], 1)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_poll_guard_released_on_rejected_fetch(self):
+        script = self._MOCKS + self._poll_src + """
+async function main() {
+  cur = "sess1";
+  var p1 = poll();
+  __fetchCalls[0].reject(new Error('network down'));
+  await p1;
+  var busyAfterFailure = pollBusy;
+  var p2 = poll();
+  var fetchedAgain = __fetchCalls.length === 2;
+  __resolveSession(1);
+  await p2;
+  console.log(JSON.stringify({ busyAfterFailure: busyAfterFailure, fetchedAgain: fetchedAgain }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = self._run(script)
+        self.assertFalse(result["busyAfterFailure"], "a rejected fetch must clear the guard, not leave it stuck")
+        self.assertTrue(result["fetchedAgain"], "after a failure the next poll() must be allowed to fetch")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_loadSide_and_poll_guards_are_independent(self):
+        # a slow /api/list must not block /api/session refreshes, or vice versa -- both guarded
+        # calls made while both are "slow" (unresolved) must each issue their own fetch.
+        script = self._MOCKS + self._loadside_src + self._poll_src + """
+async function main() {
+  cur = "sess1";
+  var pList1 = loadSide();     // pending, unresolved
+  var pSess1 = poll();         // pending, unresolved -- must NOT be blocked by loadSide's guard
+  var callsWhileBothPending = __fetchCalls.length;
+  __resolveList(0);
+  __resolveSession(1);
+  await pList1; await pSess1;
+  console.log(JSON.stringify({ callsWhileBothPending: callsWhileBothPending }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = self._run(script)
+        self.assertEqual(result["callsWhileBothPending"], 2, "loadSide() and poll() must guard independently, not share one flag")
 
 
 if __name__ == "__main__":

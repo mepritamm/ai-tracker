@@ -30,6 +30,7 @@ from aitracker import store as store_mod
 from aitracker.store import record_fork, resolve_fork_child, fork_parent_of, _load_forks
 from aitracker.registry import all_sessions, parse_any
 from aitracker.providers import auggie as _auggie
+from aitracker.providers import augment_ext as _augment_ext
 from aitracker.providers import claude as _claude
 from aitracker.term_vt import Screen
 
@@ -974,6 +975,242 @@ class TestRetryWithForkRecordsLineage(unittest.TestCase):
         self.assertTrue(pt.forked)
         self.assertEqual((pt.pid, pt.fd), (4242, 99))
         Thread.assert_called_once()
+
+
+class TestForksMemo(unittest.TestCase):
+    """Direct, unit-level pin on `_load_forks`'s memo itself — as opposed to
+    `TestListDoesNoPerSessionFileReads` below, which only proves forks.json isn't
+    re-read PER SESSION inside all_sessions(). That integration test (and every other
+    test in this file) stays fully green even if the memo's hit-check is disabled
+    entirely -- e.g. `_FORKS_CACHE[0] == key` replaced with `if False:` -- because
+    none of them assert the fast path is actually TAKEN, only that invalidation
+    correctly happens when it should (which stays true with the memo a no-op). These
+    tests pin the other half: that N successive reads of an UNCHANGED forks.json cost
+    one real parse, not N, for both the file-exists and the file-never-existed case."""
+
+    def setUp(self):
+        self._snap = {"FORKS_FILE": config.FORKS_FILE}
+        config.FORKS_FILE = tempfile.mktemp(suffix=".json")
+        store_mod._FORKS_CACHE = (None, {})
+
+    def tearDown(self):
+        if os.path.exists(config.FORKS_FILE):
+            os.remove(config.FORKS_FILE)
+        for k, v in self._snap.items():
+            setattr(config, k, v)
+        store_mod._FORKS_CACHE = (None, {})
+
+    def _count_loader_calls(self, n_calls):
+        """Run `_load_forks()` `n_calls` times and return how many of those calls
+        actually reached the underlying `_load_json` loader for FORKS_FILE -- counting
+        through whatever memoization store.py has, the same technique
+        `TestListDoesNoPerSessionFileReads._count_forks_reads` uses."""
+        calls = []
+        real_load_json = store_mod._load_json
+
+        def counting_load_json(path, default):
+            if path == config.FORKS_FILE:
+                calls.append(path)
+            return real_load_json(path, default)
+
+        with mock.patch.object(store_mod, "_load_json", side_effect=counting_load_json):
+            for _ in range(n_calls):
+                store_mod._load_forks()
+        return len(calls)
+
+    def test_unchanged_existing_file_is_parsed_once_not_n_times(self):
+        """THE test that catches `if False:` at the hit-check (the reviewer's exact
+        reproduction): with a real forks.json on disk that is never modified, 5
+        successive `_load_forks()` calls must perform the underlying open+json.parse
+        exactly ONCE. Disabling the memo makes this 5 -- this must fail in that case."""
+        store_mod._save_json(config.FORKS_FILE, {"someparent": {"child": "somechild"}})
+        store_mod._FORKS_CACHE = (None, {})   # start cold, as a real process would
+        n_parses = self._count_loader_calls(5)
+        self.assertEqual(n_parses, 1,
+                          "5 successive load_forks() calls against an UNCHANGED file "
+                          "must parse it once, not 5 -- the memo hit-check is either "
+                          "disabled or never actually taken")
+
+    def test_unchanged_absent_file_never_calls_the_loader(self):
+        """The no-file case must ALSO memoize: with forks.json never created, 5
+        successive `_load_forks()` calls must never call the underlying loader at all
+        -- each is satisfied by a stat confirming nothing has changed."""
+        self.assertFalse(os.path.exists(config.FORKS_FILE))
+        n_parses = self._count_loader_calls(5)
+        self.assertEqual(n_parses, 0,
+                          "5 successive load_forks() calls against a file that never "
+                          "existed must never call the loader -- the absent case must "
+                          "memoize too")
+
+    def test_load_forks_returns_the_real_content_from_the_memo(self):
+        """Guards against a degenerate 'memoize but always answer {}' implementation:
+        the memoized value must be the actual parsed content, and repeat calls must
+        hand back the SAME cached object (not a fresh equal-but-different one)."""
+        store_mod._save_json(config.FORKS_FILE, {"p1": {"child": "c1"}})
+        store_mod._FORKS_CACHE = (None, {})
+        first = store_mod._load_forks()
+        second = store_mod._load_forks()
+        self.assertEqual(first, {"p1": {"child": "c1"}})
+        self.assertIs(second, first, "second call must return the SAME cached dict object")
+
+    def test_newly_appearing_forks_file_is_observed_promptly(self):
+        """The absent-state memo must not get stuck: once forks.json is created after
+        earlier calls saw it as absent, the very next call must see the new content --
+        never a stale cached {} left over from when the file didn't exist yet."""
+        self.assertFalse(os.path.exists(config.FORKS_FILE))
+        self.assertEqual(store_mod._load_forks(), {}, "starts absent")
+        self.assertEqual(store_mod._load_forks(), {}, "still absent, still memoized-empty")
+        store_mod._save_json(config.FORKS_FILE, {"newp": {"child": "newc"}})
+        self.assertEqual(store_mod._load_forks(), {"newp": {"child": "newc"}},
+                          "a newly-appearing forks.json must be observed on the very "
+                          "next call, not stuck behind the earlier absent-state memo")
+
+
+class TestListDoesNoPerSessionFileReads(unittest.TestCase):
+    """`/api/list` is `all_sessions()` and the SPA polls it every few seconds, so any
+    file read done ONCE PER SESSION scales with the user's transcript count and pushes
+    the endpoint past the poll interval -- at which point polls overlap, exhaust the
+    browser's 6-socket-per-host budget and starve every other request on the page
+    (measured: 36-60s responses; the in-browser terminal's keystroke POSTs stopped
+    reaching the PTY entirely).
+
+    These are I/O-COUNT assertions, deliberately not timing assertions -- a wall-clock
+    threshold would be flaky on a different machine, while "how many times did we open
+    this file" is the actual behaviour that regressed and is identical everywhere.
+
+    Two per-session reads are pinned here, both found by profiling one real
+    `all_sessions()` over 950 sessions (1900 of its 3963 total `open()` calls were the
+    same 826-byte `forks.json`):
+      1. the fork-lineage loops (`registry.all_sessions`) -- `resolve_fork_child` and
+         `fork_parent_of` each re-read `forks.json` per session;
+      2. `providers/augment_ext._list` -- scanned every task file TWICE per workspace.
+    (2) lives here rather than in `test_augment_ext.py` because it is the same defect
+    class as (1) and this suite owns the `/api/list` cost contract."""
+
+    def setUp(self):
+        self._snap = {k: getattr(config, k) for k in
+                      ("PROJECTS", "FORKS_FILE", "TITLES_FILE", "PINS_FILE", "NOTES_FILE",
+                       "FLAGS_FILE", "AUGMENT_DIR", "AUGGIE_SESSIONS",
+                       "VSCODE_WS_ROOT", "CURSOR_WS_ROOT")}
+        config.PROJECTS = tempfile.mkdtemp()
+        config.FORKS_FILE = tempfile.mktemp(suffix=".json")
+        config.TITLES_FILE = tempfile.mktemp(suffix=".json")
+        config.PINS_FILE = tempfile.mktemp(suffix=".json")
+        config.NOTES_FILE = tempfile.mktemp(suffix=".json")
+        config.FLAGS_FILE = tempfile.mktemp(suffix=".json")
+        config.AUGMENT_DIR = tempfile.mkdtemp()
+        config.AUGGIE_SESSIONS = os.path.join(config.AUGMENT_DIR, "sessions")
+        os.makedirs(config.AUGGIE_SESSIONS)
+        config.VSCODE_WS_ROOT = tempfile.mkdtemp()
+        config.CURSOR_WS_ROOT = tempfile.mkdtemp()
+        _auggie._AUGGIE_LIST_CACHE.clear()
+        _claude._META_CACHE.clear()
+
+    def tearDown(self):
+        for d in (config.PROJECTS, config.AUGMENT_DIR, config.VSCODE_WS_ROOT, config.CURSOR_WS_ROOT):
+            shutil.rmtree(d, ignore_errors=True)
+        for k, v in self._snap.items():
+            setattr(config, k, v)
+        _auggie._AUGGIE_LIST_CACHE.clear()
+        _claude._META_CACHE.clear()
+
+    def _count_forks_reads(self, n_sessions):
+        """Run one all_sessions() over `n_sessions` Claude transcripts and return how
+        many times forks.json was actually opened and parsed."""
+        shutil.rmtree(config.PROJECTS, ignore_errors=True)
+        os.makedirs(config.PROJECTS, exist_ok=True)
+        _claude._META_CACHE.clear()
+        for i in range(n_sessions):
+            _mk_transcript(config.PROJECTS, "sess%02d" % i, "/work/repo",
+                            time.time() - i, [_u() for _ in range(3)])
+        # count real I/O at the lowest shared seam (`_load_json`), filtered to
+        # forks.json -- this counts through ANY memoization store.py may add, so the
+        # assertion stays honest whichever way the redundancy is removed.
+        reads = []
+        real_load_json = store_mod._load_json
+
+        def counting_load_json(path, default):
+            if path == config.FORKS_FILE:
+                reads.append(path)
+            return real_load_json(path, default)
+
+        with mock.patch.object(store_mod, "_load_json", side_effect=counting_load_json):
+            sessions = all_sessions()
+        self.assertEqual(len(sessions), n_sessions)      # the listing itself still works
+        return len(reads)
+
+    def test_forks_file_is_not_read_once_per_session(self):
+        """THE regression this class exists for. `resolve_fork_child()` and
+        `fork_parent_of()` were each called per session from `all_sessions()`, and each
+        one re-read + re-parsed forks.json from disk -- 2 x N file reads per poll.
+
+        The assertion is scale-freedom, not a magic number: quadrupling the session
+        count must not increase the number of forks.json reads at all. Before the fix
+        this went 8 -> 32; after it, it is a small constant either way."""
+        few = self._count_forks_reads(4)
+        many = self._count_forks_reads(16)
+        self.assertEqual(
+            few, many,
+            "forks.json reads must not scale with the session count: %d sessions caused "
+            "%d reads but %d sessions caused %d. all_sessions() must load the fork map "
+            "ONCE and reuse it, not re-read it inside a per-session loop." % (4, few, 16, many))
+        self.assertLessEqual(
+            many, 4,
+            "one /api/list should read forks.json a handful of times at most, got %d" % many)
+
+    def test_fork_that_resolves_mid_call_gets_both_ends_stamped_in_that_same_response(self):
+        """Guard on the shape of the fix, not on the old bug: hoisting the fork map out
+        of the loop must NOT be done by taking one snapshot and reusing it blindly.
+        `resolve_fork_child()` WRITES when it first resolves a parent, so a snapshot
+        taken before the `continued_as` loop is already out of date by the time the
+        `continued_from` loop runs -- and the child would render with a dangling
+        'forked from' for a whole poll cycle. Both ends must appear in the SAME
+        response, exactly as they did when every lookup re-read the file."""
+        at = time.time() - 1
+        parent_uuids = [_u() for _ in range(6)]
+        _mk_transcript(config.PROJECTS, "liveParent", "/work/repo", at - 60, parent_uuids)
+        record_fork("liveParent", "/work/repo", at)
+        # the child appears only AFTER the record -- so this all_sessions() call is the
+        # one that both resolves it and has to report it.
+        _mk_transcript(config.PROJECTS, "liveChild", "/work/repo", at + 2, parent_uuids[:5])
+        self.assertEqual(_load_forks()["liveParent"].get("child", ""), "",
+                          "precondition: the fork must still be UNRESOLVED going in")
+
+        by_id = {s["id"]: s for s in all_sessions()}
+        self.assertEqual(by_id["liveParent"]["continued_as"], "liveChild")
+        self.assertEqual(
+            by_id["liveChild"]["continued_from"], "liveParent",
+            "the fork resolved during this very call, so the child's continued_from must "
+            "be stamped in this response too -- a stale pre-loop snapshot loses it")
+
+    def test_augment_ext_list_reads_each_task_file_once(self):
+        """`providers/augment_ext._list()` built an `allmap` that nothing in its loop
+        body ever read, then iterated `_iter_tasks()` a SECOND time -- so every task
+        file on disk was opened and json-parsed twice on every /api/list. Measured on
+        real data: 665 Augment tasks, 1330 opens, ~40% of the warm endpoint cost."""
+        from tests.test_augment_ext import _mk_workspace
+        tasks = [{"uuid": "task%02d" % i, "name": "task %d" % i, "lastUpdated": 1_700_000_000_000}
+                 for i in range(8)]
+        _mk_workspace(config.VSCODE_WS_ROOT, "wsAAA", "file:///repo/aug", tasks=tasks)
+
+        opens = []
+        real_open = open
+
+        def counting_open(path, *a, **k):
+            p = str(path)
+            if "task-storage" in p:
+                opens.append(p)
+            return real_open(path, *a, **k)
+
+        with mock.patch("builtins.open", side_effect=counting_open):
+            listed = _augment_ext._list("vscode", "augvs:", "augment-vscode")
+
+        self.assertEqual(len(listed), len(tasks))        # same sessions as before
+        self.assertEqual(
+            len(opens), len(tasks),
+            "each Augment task file must be opened exactly once per list(): expected %d "
+            "opens for %d tasks, got %d (a second _iter_tasks() pass doubles the I/O)"
+            % (len(tasks), len(tasks), len(opens)))
 
 
 if __name__ == "__main__":

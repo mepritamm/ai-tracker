@@ -25,7 +25,9 @@ git clone https://github.com/mepritamm/ai-tracker.git
 cd ai-tracker
 ```
 
-(or just grab the standalone `dist/tracker.py` from a `make bundle` — one file, no install).
+(or just grab the standalone `dist/tracker.py` from a `make bundle` — one file, no install; it ships
+the dashboard but **not** the in-browser terminal, whose modules resolve each other through the real
+package and don't survive being flattened into a single script).
 
 **Nothing else to configure.** The tracker auto-discovers your local session data:
 

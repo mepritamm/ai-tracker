@@ -217,9 +217,75 @@ GIVE_UP_SECS = 15 * 60     # a fork that hasn't written a matching transcript wi
                             # every ~2-5s poll) well within a normal session.
 
 
+_FORKS_CACHE = (None, {})    # (identity key of the file we parsed, parsed dict)
+
+_FORKS_ABSENT = object()     # sentinel identity key: "forks.json did not exist as of
+                              # the last stat" — a stable, comparable value in its own
+                              # right, so the no-file state memoizes too (see below),
+                              # not just the file-exists state.
+
+
+def _forks_key():
+    """Identity of forks.json's current CONTENT: (inode, size, mtime_ns). The
+    `_FORKS_ABSENT` sentinel when the file doesn't exist yet (the common case — most
+    users never fork) — deliberately NOT `None`/`False`/some other falsy value that a
+    caller might accidentally treat as "no key" and skip the memo for; `_load_forks`
+    compares this by identity like any other key."""
+    try:
+        st = os.stat(config.FORKS_FILE)
+    except OSError:
+        return _FORKS_ABSENT
+    return (config.FORKS_FILE, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
 def _load_forks():
-    d = _load_json(config.FORKS_FILE, {})
-    return d if isinstance(d, dict) else {}
+    """The fork records, parsed. Memoized on forks.json's (inode, size, mtime_ns) —
+    or, when the file doesn't exist, on the `_FORKS_ABSENT` sentinel — so the repeat
+    reads that /api/list used to do are a single `stat` instead of an open+json.parse.
+    That includes the common case of a user who has never forked: with no file on
+    disk, repeat calls now cost one `os.stat` each instead of one `open()` that
+    immediately raises FileNotFoundError and gets caught by `_load_json` — that used
+    to run in full on every call because a bare `None` key was deliberately never
+    trusted as a memo hit (see the prior revision of this docstring), which made the
+    "most users never fork" case exactly the one the memo did NOT help.
+
+    STALENESS THIS CAN INTRODUCE: none in practice, and by construction rather than by
+    timing. There is no TTL here — the key is the file's own identity (or its
+    confirmed absence), so the cache is invalidated by a real change on disk, not by a
+    clock:
+      - a WRITE always changes the inode AND the mtime (every writer goes through
+        `_save_json`, which writes a NEW temp file and `os.replace`s it in), so the
+        next reader's key differs and it re-parses;
+      - forks.json APPEARING for the first time changes the key from `_FORKS_ABSENT`
+        to a real (inode, size, mtime_ns) tuple, so that transition is caught on the
+        very next call too — a newly created file is never stuck behind a stale
+        "absent" memo;
+      - `_update_forks` additionally bypasses this memo entirely (it re-reads under
+        the flock), so the read-modify-write cycle never sees a cached dict.
+
+    The only way to get a stale read is to rewrite forks.json IN PLACE, keeping the
+    same inode and byte length, within the same nanosecond of mtime. Nothing does that.
+    Deliberately NOT applied to flags/titles/pins/notes: those are read live by design
+    and a late-appearing flag or rename is a regression, not an optimisation.
+
+    The returned dict is SHARED — callers must treat it as read-only."""
+    global _FORKS_CACHE
+    key = _forks_key()
+    if _FORKS_CACHE[0] == key:
+        return _FORKS_CACHE[1]
+    d = {} if key is _FORKS_ABSENT else _load_json(config.FORKS_FILE, {})
+    if not isinstance(d, dict):
+        d = {}
+    _FORKS_CACHE = (key, d)
+    return d
+
+
+def load_forks():
+    """Public read-only snapshot of the fork records — the seam `registry.all_sessions()`
+    loads ONCE per /api/list and hands to `resolve_fork_child`/`fork_parent_of`, instead
+    of each of them re-reading the file once per session (2 x N file reads per poll, on
+    an endpoint the SPA polls every few seconds). Read-only: do not mutate the result."""
+    return _load_forks()
 
 
 def _update_forks(mutate):
@@ -243,7 +309,12 @@ def _update_forks(mutate):
     try:
         fcntl.flock(lockfh.fileno(), fcntl.LOCK_EX)
         try:
-            forks = _load_forks()
+            # deliberately NOT _load_forks(): the whole point of holding the lock is to
+            # read the true current on-disk state, and mutating a dict shared with
+            # _load_forks' memo would leak this in-progress edit to every reader.
+            forks = _load_json(config.FORKS_FILE, {})
+            if not isinstance(forks, dict):
+                forks = {}
             if mutate(forks) is not False:
                 _save_json(config.FORKS_FILE, forks)
         finally:
@@ -429,7 +500,7 @@ def record_fork(parent_sid, cwd, at, snapshot=None):
     _update_forks(mutate)
 
 
-def resolve_fork_child(parent_sid):
+def resolve_fork_child(parent_sid, forks=None):
     """The session id `parent_sid` forked into, or "" if it isn't a recorded
     fork parent at all, the fork hasn't matched anything yet, or resolution
     was abandoned (see GIVE_UP_SECS).
@@ -476,8 +547,13 @@ def resolve_fork_child(parent_sid):
     lookup, no re-scan. This is called once per session on every ~2s poll
     (registry.all_sessions()/parse_any()), so an unmemoized scan -- or a scan
     that never gives up on a parent that will never resolve -- would be a
-    real performance bug."""
-    forks = _load_forks()
+    real performance bug.
+
+    `forks` is an ALREADY-LOADED record map (see load_forks). A caller in a
+    per-session loop passes it so the file is read once for the whole loop
+    instead of once per session; omitting it reads (memoized) per call, which
+    is right for the one-off callers like parse_any()."""
+    forks = _load_forks() if forks is None else forks
     rec = forks.get(parent_sid)
     if not isinstance(rec, dict):
         return ""                        # not a fork parent — no I/O beyond the one read above
@@ -549,12 +625,16 @@ def resolve_fork_child(parent_sid):
     return ""                            # not written yet, or nothing matched — retried later (until give-up)
 
 
-def fork_parent_of(child_sid):
+def fork_parent_of(child_sid, forks=None):
     """Reverse of resolve_fork_child: the recorded fork parent that has
     ALREADY resolved to this session id, or "". Only looks at what's already
     memoized in forks.json — it never itself triggers a directory scan, so
-    it's as cheap as the (tiny) record is small."""
-    for parent_sid, rec in _load_forks().items():
+    it's as cheap as the (tiny) record is small.
+
+    `forks` is the same already-loaded map resolve_fork_child takes, for the
+    same reason: registry.all_sessions() calls this once per session and must
+    not re-read the file each time."""
+    for parent_sid, rec in (_load_forks() if forks is None else forks).items():
         if isinstance(rec, dict) and rec.get("child") == child_sid:
             return parent_sid
     return ""

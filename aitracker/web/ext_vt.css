@@ -227,6 +227,19 @@
 }
 .vtzoombtn:hover { opacity: 1; color: var(--text); border-color: var(--blue); }
 
+/* ---- mouse-reporting toggle (this session): a sibling .vtzoombtn-styled control, same idiom
+   (span, same tokens/padding/border-radius) so it reads as "part of the toolbar", not a bolted-on
+   second control system. `.vtmouseon` marks it green while forwarding is active (distinct from the
+   plain hover state above); `.vtmouseinert` dims it and cancels the hover highlight when nothing
+   running here has asked for mouse tracking -- still visible and tappable, per the requirement
+   that no control here is ever hidden by host or viewport (no @media/location.hostname gate on
+   this rule). Sizing is unchanged from .vtzoombtn, so it stays a comfortable tap target on phone
+   without any width/media-query special-casing. ---- */
+.vtmousebtn { margin-left: 4px; }
+.vtmousebtn.vtmouseon { color: var(--green2); border-color: var(--green2); opacity: .85; }
+.vtmousebtn.vtmouseinert { opacity: .3; cursor: default; }
+.vtmousebtn.vtmouseinert:hover { opacity: .3; color: var(--dim); border-color: var(--line3); }
+
 /* ---- xterm.js pane (the "xterm" TRACKER_TERM_RENDERER path -- see term_vt.py's big comment
    above raw_stream() and config.py's TERM_RENDERER for why two renderers coexist). Reuses
    .vtpane's box (flex/min-height/background/overflow) so it sits identically to the grid pane

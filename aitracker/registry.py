@@ -1,7 +1,10 @@
 from .providers.claude import ClaudeProvider
 from .providers.auggie import AuggieProvider
 from .providers.augment_ext import AugmentVscodeProvider, AugmentCursorProvider
-from .store import load_pins, load_notes, load_flags, resolve_fork_child, fork_parent_of
+# NOTE: one line, no parenthesised continuation — scripts/bundle.py strips imports
+# line-by-line (`^(import |from )`), so a wrapped import leaves its tail behind and
+# `make bundle` emits a file that won't parse.
+from .store import load_pins, load_notes, load_flags, load_forks, resolve_fork_child, fork_parent_of
 
 
 PROVIDERS = [ClaudeProvider(), AuggieProvider(),
@@ -29,9 +32,16 @@ def all_sessions():
     # real work — and only ONCE, memoized after — for a genuine parent. Non-Claude
     # providers (Auggie, Augment ext) have no fork concept and no ids ever recorded here,
     # so they get "" for both through this exact same loop, no per-provider branch.
+    #
+    # The record map is loaded ONCE for the whole listing and handed to both loops.
+    # It used to be re-read from disk inside each of them — 2 x N file reads of the
+    # same small file per poll (measured: 1900 of one real /api/list's 3963 total
+    # open() calls, ~40% of its warm cost, on an endpoint the SPA polls every few
+    # seconds). Nothing about the ANSWERS changes; only the number of reads does.
+    forks = load_forks()
     continued_as = {}                              # parent sid -> child sid, for sids in `out`
     for s in out:
-        child = resolve_fork_child(s.get("id", ""))
+        child = resolve_fork_child(s.get("id", ""), forks)
         if child:
             continued_as[s["id"]] = child
     # child sid -> parent sid. Deliberately NOT a `{c: p for p, c in continued_as.items()}`
@@ -42,10 +52,17 @@ def all_sessions():
     # silently order-dependent if it ever happens again. Calling fork_parent_of() directly
     # keeps the two in agreement BY CONSTRUCTION (same function, same answer) instead of
     # risking a second, independently-ordered derivation.
+    #
+    # Re-read before the reverse pass: resolve_fork_child WRITES when it first resolves
+    # a parent, so a fork that resolved in the loop above is not in the map loaded before
+    # it. Without this, the child would render with a dangling "forked from" until the
+    # next poll. Thanks to load_forks' mtime/inode memo this is a single stat() — free —
+    # in the overwhelmingly common case where nothing above wrote anything.
+    forks = load_forks()
     continued_from = {}
     for s in out:
         sid = s.get("id", "")
-        parent = fork_parent_of(sid)
+        parent = fork_parent_of(sid, forks)
         if parent:
             continued_from[sid] = parent
     for s in out:

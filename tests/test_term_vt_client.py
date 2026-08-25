@@ -1226,6 +1226,135 @@ class TestMouseButtonCodeCommentIsHonest(unittest.TestCase):
         self.assertIn("never reaches this function", self.src)
 
 
+class TestMouseReportingToggle(unittest.TestCase):
+    """The user-visible fix for the regression 4bc3e08 introduced: Claude Code's own TUI turns on
+    `?1003` any-motion tracking, so plain dragging inside the pane stopped making a native text
+    selection. Shift+drag still worked (XTSHIFTESCAPE, `_mouseGate`) but wasn't discoverable and
+    isn't the default the user wants. This toggle is a further gate in front of the EXISTING mouse
+    encoder (buildToolbar/_mouseGate) -- it must not delete or rewrite any of that machinery."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+        self.css = _read("ext_vt.css")
+
+    def test_toggle_is_built_in_the_shared_toolbar_not_per_renderer(self):
+        # both renderers inherit it from ONE place, exactly like the A-/A+ zoom controls -- pinned
+        # the same way TestZoomControlOverlapFix pins buildToolbar's shared-ness.
+        body = _function_body(self.src, "function buildToolbar(")
+        self.assertIn("vtmousebtn", body)
+        self.assertIn("mouseToggle.getEnabled()", body)
+        self.assertIn("mouseToggle.setEnabled(", body)
+        self.assertIn("mouseToggle.isMeaningful()", body)
+        # not reimplemented separately inside either constructor
+        term_body = _function_body(self.src, "function Terminal(container, ttyId) {")
+        self.assertNotIn("vtmousebtn", term_body)
+        xterm_start = self.src.index("function XtermTerminal(container, ttyId) {")
+        xterm_body = self.src[xterm_start:self.src.index("XtermTerminal.prototype.attach")]
+        self.assertNotIn("vtmousebtn", xterm_body)
+
+    def test_default_is_off_in_the_initializer_not_just_a_comment(self):
+        # pin the actual assignment, not prose -- a comment claiming "default off" with the
+        # initializer flipped to true would still pass a text-only "mentions off" check.
+        body = _function_body(self.src, "function Terminal(container, ttyId) {")
+        self.assertIn("this.mouseReportingEnabled = false;", body)
+
+    def test_toggle_is_not_persisted_no_new_state_file(self):
+        # matches _fontPx/_linePx's own per-instance, not-saved precedent -- no _load_json/
+        # _save_json-style read/write anywhere near the field.
+        self.assertNotIn("mouseReportingEnabled", self._read_flags_or_titles_refs())
+
+    def _read_flags_or_titles_refs(self):
+        # every place flags.json/titles.json are touched in this file (there should be none --
+        # ext_vt.js never persists anything; this just documents/pins that assumption locally
+        # rather than assuming it silently).
+        return "\n".join(line for line in self.src.splitlines() if "flags.json" in line or "titles.json" in line)
+
+    def test_mousegate_still_consults_mode_shift_and_viewinghistory_in_order(self):
+        # the pre-existing three checks must survive, in their pre-existing order -- this toggle
+        # is a FOURTH, additional gate, not a replacement.
+        body = _function_body(self.src, "Terminal.prototype._mouseGate = function")
+        mode_i = body.index("if (this.mouse.mode === 0) return false;")
+        shift_i = body.index("if (ev.shiftKey) return false;")
+        hist_i = body.index("if (this.viewingHistory) return false;")
+        toggle_i = body.index("if (this.mouseReportingEnabled === false) return false;")
+        self.assertLess(mode_i, shift_i)
+        self.assertLess(shift_i, hist_i)
+        self.assertLess(hist_i, toggle_i)
+
+    def test_mousegate_consults_the_toggle(self):
+        body = _function_body(self.src, "Terminal.prototype._mouseGate = function")
+        self.assertIn("this.mouseReportingEnabled", body)
+
+    def test_wheel_still_takes_the_scrollback_branch_when_gate_is_closed(self):
+        # with the toggle off, `_mouseGate` returns false (same as mode===0 today) -- the
+        # pre-existing scrollback/alt-screen-arrow branch must still be the fallback path.
+        body = _function_body(self.src, "Terminal.prototype._onWheel = function")
+        self.assertIn("if (this._mouseGate(ev)) {", body)
+        self.assertIn("if (this.alt) {", body)
+        self.assertIn("this._scrollToBottom();", body)
+
+    def test_control_is_not_hidden_by_host_or_viewport(self):
+        # hard project rule: no control is gated on location.hostname; and requirement 5 says this
+        # toggle must work on desktop/tablet/phone alike -- no @media rule may hide .vtmousebtn.
+        self.assertNotIn("location.hostname", self.src)
+        css = self.css
+        idx = 0
+        while True:
+            idx = css.find(".vtmousebtn", idx)
+            if idx == -1:
+                break
+            # walk back to the nearest enclosing @media block (if any) and confirm it isn't one
+            # that hides the control via display:none.
+            media_start = css.rfind("@media", 0, idx)
+            if media_start != -1:
+                block_end = css.find("}", idx)
+                block = css[media_start:block_end]
+                self.assertNotIn("display: none", block, "a @media rule must not hide .vtmousebtn")
+                self.assertNotIn("display:none", block, "a @media rule must not hide .vtmousebtn")
+            idx += len(".vtmousebtn")
+
+    def test_inert_state_is_deliberate_and_commented(self):
+        # requirement 5: when the toggle would do nothing (mouse.mode === 0), the choice to
+        # dim+no-op rather than hide it must be an explicit, commented decision.
+        body = _function_body(self.src, "function buildToolbar(")
+        self.assertIn("vtmouseinert", body)
+        self.assertIn("inert", body.lower())
+
+    def test_xterm_toggle_is_inert_and_commented_as_deliberate(self):
+        # requirement 7: xterm.js owns its own mouse handling -- the toggle must not fight it.
+        xterm_start = self.src.index("function XtermTerminal(container, ttyId) {")
+        xterm_body = self.src[xterm_start:self.src.index("XtermTerminal.prototype.attach")]
+        self.assertIn("isMeaningful: function () { return false; }", xterm_body)
+        self.assertIn("do not fight it", xterm_body)
+
+    def test_button_carries_aria_pressed_and_a_title(self):
+        body = _function_body(self.src, "function buildToolbar(")
+        self.assertIn('mouseBtn.setAttribute("aria-pressed"', body)
+        self.assertIn("mouseBtn.title", body)
+        self.assertIn("Shift", body)   # the title must explain the Shift+drag escape hatch
+
+    def test_button_is_reachable_and_activatable_by_tap_not_only_hover(self):
+        # no hover-only affordance: a real click/keydown listener, a tabindex for focusability,
+        # and no CSS rule making the control only appear on :hover.
+        body = _function_body(self.src, "function buildToolbar(")
+        self.assertIn('mouseBtn.addEventListener("click"', body)
+        self.assertIn('mouseBtn.setAttribute("tabindex", "0")', body)
+        self.assertNotIn(".vtmousebtn:hover { display", self.css)
+
+    def test_css_uses_a_sibling_class_in_the_same_idiom_as_vtzoombtn(self):
+        self.assertIn(".vtmousebtn", self.css)
+        # reuses the shared .vtzoombtn base class (same font/padding/border tokens) rather than
+        # inventing a whole new control system.
+        body = _function_body(self.src, "function buildToolbar(")
+        self.assertIn('mouseBtn.className = "vtzoombtn vtmousebtn";', body)
+
+    def test_reaches_the_browser(self):
+        page = build_page()
+        self.assertIn("vtmousebtn", page)
+        self.assertIn("this.mouseReportingEnabled = false;", page)
+        self.assertIn("if (this.mouseReportingEnabled === false) return false;", page)
+
+
 class TestFocusReportingClient(unittest.TestCase):
     """`?1004` focus in/out reporting, the client half of TestFocusReportingSnapshot
     (tests/test_term_vt.py -- server side). Mirrors `mouse`'s own defensive-read pattern exactly:
@@ -1288,10 +1417,12 @@ class TestSendOrderingAndMotionCoalescing(unittest.TestCase):
     def test_enqueue_appends_to_the_chain_in_order(self):
         # `_enqueue` is the ONE place that appends to `_sendChain` -- both `_send` (discrete
         # events) and `_flushMotion` (a flushed motion report) must go through it rather than
-        # each maintaining their own chain-append logic.
+        # each maintaining their own chain-append logic. It goes through `_sendWithTimeout`
+        # (see that test class below) rather than calling `postKeys` directly, so a send that
+        # never settles still cannot block the chain -- see TestSendNeverSettlesTimeout.
         body = _function_body(self.src, "Terminal.prototype._enqueue = function")
         self.assertIn("this._sendChain = this._sendChain.then(function () {", body)
-        self.assertIn("return postKeys(self.ttyId, s);", body)
+        self.assertIn("return self._sendWithTimeout(s);", body)
 
     def test_a_rejected_send_does_not_wedge_the_chain(self):
         body = _function_body(self.src, "Terminal.prototype._enqueue = function")
@@ -1377,6 +1508,47 @@ class TestSendOrderingAndMotionCoalescing(unittest.TestCase):
         page = build_page()
         self.assertIn("this._sendChain = this._sendChain.then(function () {", page)
         self.assertIn("Terminal.prototype._sendMotion = function", page)
+
+
+class TestSendNeverSettlesTimeout(unittest.TestCase):
+    """A send that neither resolves nor rejects (observed: a POST /api/term/keys hung ~5 minutes
+    under Chrome's background-tab throttling) used to wedge `_sendChain` -- and every later
+    keystroke behind it -- forever, since `.catch()` only protects against a REJECTED send. The
+    actual timing/ordering proof (a never-settling postKeys() call followed by a later send that
+    must still arrive once the timeout fires, and must not arrive before) is executed under Node
+    in tests/test_term_vt_exec.py's TestSendTimeoutRegression -- these are source-text pins for
+    the parts a text search CAN usefully confirm: the constant itself, that destroy() sweeps up
+    any timer still pending, and that the fix is actually in the served page."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_send_with_timeout_races_postkeys_against_a_bounded_timer(self):
+        body = _function_body(self.src, "Terminal.prototype._sendWithTimeout = function")
+        self.assertIn("setTimeout(function () {", body)
+        self.assertIn("}, 5000);", body)
+        self.assertIn("postKeys(self.ttyId, s).then(", body)
+
+    def test_timeout_rejects_so_enqueues_catch_drops_it_like_any_rejected_send(self):
+        # No retry: the timeout path must REJECT (not resolve, not silently swallow itself) so
+        # it flows through the exact same `.catch(function () { })` in `_enqueue` that an
+        # ordinarily-rejected send already goes through -- one drop path, not two.
+        body = _function_body(self.src, "Terminal.prototype._sendWithTimeout = function")
+        self.assertIn('reject(new Error("term send timed out"));', body)
+
+    def test_destroy_clears_any_pending_send_timers(self):
+        body = _function_body(self.src, "Terminal.prototype.destroy = function")
+        self.assertIn("clearTimeout(this._sendTimers[ti]);", body)
+        self.assertIn("this._sendTimers = [];", body)
+
+    def test_send_timers_array_initialized_in_constructor(self):
+        body = _function_body(self.src, "function Terminal(container, ttyId) {")
+        self.assertIn("this._sendTimers = [];", body)
+
+    def test_the_fix_reaches_the_browser_not_just_the_source_file(self):
+        page = build_page()
+        self.assertIn("Terminal.prototype._sendWithTimeout = function", page)
+        self.assertIn("}, 5000);", page)
 
 
 if __name__ == "__main__":
