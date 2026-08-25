@@ -112,25 +112,112 @@
 (function () {
   var esc = window.esc || function (s) { return (s || "").replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); };
 
-  // ===== SGR runs -> CSS classes (see the contract comment above the IIFE) =====
+  // ===== SGR runs -> CSS classes + inline colour style (see the contract comment above the IIFE) =
   // Mirrors ext_run.js's sgrClass() numeric ranges 1:1 so Tier 2 and Tier 3 render the same
-  // colours from the same SGR codes -- but as an ABSOLUTE mapping (one run in, one class string
-  // out), not a delta/reset walk over a byte stream, because a Screen run already IS the
+  // colours from the same SGR codes -- but as an ABSOLUTE mapping (one run in, one {cls, style}
+  // pair out), not a delta/reset walk over a byte stream, because a Screen run already IS the
   // resolved state for that span.
+  //
+  // 256-colour (38;5;N / 48;5;N) and true-colour (38;2;R;G;B / 48;2;R;G;B) SUPPORT: term_vt.py's
+  // SGR parser (Screen._sgr, term_vt.py) already resolves these into the run's code string
+  // verbatim -- e.g. "38;5;208" or "7;48;2;10;20;30" -- CONFIRMED by reading Screen._sgr and
+  // Screen._recompute_code there before writing this. The 16-colour codes stay on the existing
+  // vtf*/vtg* CSS-class path untouched; 256-colour indices 0-15 are mapped onto THOSE SAME
+  // classes (one set of CSS rules, not a second copy -- see _stdColorClass below) so they render
+  // identically to the plain 16-colour codes. Indices 16-255 and full RGB have no fixed class
+  // (16.7M possible colours), so they produce an inline `style` string instead -- built ONLY from
+  // validated integers (see _byte255 below), never from the raw SGR text, so a malformed or
+  // out-of-range sequence can never inject anything into the markup _paintRow assembles from this
+  // (see _paintRow's own comment for how `style` lands in the attribute).
+  function _byte255(tok) {
+    // Strict: digits only (no sign, no leading "+", no trailing junk) and in [0, 255] -- anything
+    // else means the sequence is malformed/out-of-range and this colour must be dropped rather
+    // than guessed at.
+    if (!/^\d+$/.test(tok)) return null;
+    var v = parseInt(tok, 10);
+    return (v >= 0 && v <= 255) ? v : null;
+  }
+  // xterm-256 palette indices 0-15 reuse the SAME class tokens the plain 30-37/90-97 (fg) and
+  // 40-47 (bg) SGR codes already use -- see the CSS comment above .vtf30 for the rule this must
+  // stay in sync with. `isBg` picks the 40../100.. family instead of 30../90...
+  function _stdColorClass(idx, isBg) {
+    var base = idx < 8 ? (isBg ? 40 : 30) + idx : (isBg ? 100 : 90) + (idx - 8);
+    return (isBg ? "vtg" : "vtf") + base;
+  }
+  // xterm's 6x6x6 colour cube (indices 16-231): each of the 3 axes is a "level" 0-5, converted to
+  // an 8-bit component with the standard xterm formula -- 0 stays 0, levels 1-5 map to
+  // 95/135/175/215/255 (55 + 40*level), NOT a linear 0..255 spread.
+  function _cubeLevel(l) { return l === 0 ? 0 : 55 + 40 * l; }
+  function _256Rgb(idx) {
+    if (idx <= 231) {
+      var i = idx - 16;
+      return [_cubeLevel(Math.floor(i / 36)), _cubeLevel(Math.floor(i / 6) % 6), _cubeLevel(i % 6)];
+    }
+    var v = 8 + 10 * (idx - 232);   // 232-255: 24-step greyscale ramp, 8..238
+    return [v, v, v];
+  }
   function sgrRunClass(sgr) {
-    var out = [];
-    (sgr || "").split(";").forEach(function (p) {
-      if (p === "") return;
-      var n = parseInt(p, 10);              // classes come from parsed integers only
-      if (!isFinite(n)) return;
-      if (n === 1) out.push("vtb");
-      else if (n === 3) out.push("vti");
-      else if (n === 4) out.push("vtu");
-      else if (n === 7) out.push("vtr");
-      else if ((n >= 30 && n <= 37) || (n >= 90 && n <= 97)) out.push("vtf" + n);
-      else if (n >= 40 && n <= 47) out.push("vtg" + n);
-    });
-    return out.join(" ");
+    var out = [], style = "";
+    var parts = (sgr || "").split(";");
+    var n = parts.length;
+    var i = 0;
+    while (i < n) {
+      var p = parts[i];
+      if (p !== "") {
+        var v = parseInt(p, 10);              // classes come from parsed integers only
+        if (isFinite(v)) {
+          if (v === 1) out.push("vtb");
+          else if (v === 3) out.push("vti");
+          else if (v === 4) out.push("vtu");
+          else if (v === 7) out.push("vtr");
+          else if ((v >= 30 && v <= 37) || (v >= 90 && v <= 97)) out.push("vtf" + v);
+          // BOTH ranges here -- not just 40-47 -- because term_vt.py's Screen._sgr (confirmed by
+          // reading it) stores a direct aixterm bright-background code (100-107) VERBATIM in the
+          // run's sgr string, exactly like it does for the 90-97 bright-foreground codes on the
+          // line above; it does NOT normalise 100-107 through the 48;5;N extended-colour form.
+          // This branch used to stop at 47, so a program emitting `\x1b[100m` directly (not via
+          // 48;5;8) got no background class at all -- a second, independent way for the SAME
+          // bright-background-invisible bug to happen, on top of the 48;5;N low-index path
+          // _stdColorClass below already handles.
+          else if ((v >= 40 && v <= 47) || (v >= 100 && v <= 107)) out.push("vtg" + v);
+          else if (v === 38 || v === 48) {
+            // Extended (256-colour / truecolor) fg (38) or bg (48) -- mirrors Screen._sgr's own
+            // handling of the SAME truncated/malformed forms it has to defend against (see the
+            // comment there): a truncated "38;5" with no index, "38;2" with <3 RGB components, or
+            // an unrecognised colour-space id must still consume whatever sub-params it DID see so
+            // they can never fall through and be reinterpreted as unrelated SGR codes.
+            var isBg = (v === 48);
+            if (i + 1 < n) {
+              var mode = parseInt(parts[i + 1], 10);
+              if (mode === 5 && i + 2 < n) {
+                var idx = _byte255(parts[i + 2]);
+                if (idx !== null) {
+                  if (idx < 16) out.push(_stdColorClass(idx, isBg));
+                  else {
+                    var rgb = _256Rgb(idx);
+                    style += (isBg ? "background-color:rgb(" : "color:rgb(") + rgb.join(",") + ");";
+                  }
+                }
+                i += 2;
+              } else if (mode === 2 && i + 4 < n) {
+                var r = _byte255(parts[i + 2]), g = _byte255(parts[i + 3]), b = _byte255(parts[i + 4]);
+                if (r !== null && g !== null && b !== null) {
+                  style += (isBg ? "background-color:rgb(" : "color:rgb(") + r + "," + g + "," + b + ");";
+                }
+                i += 4;
+              } else if (mode === 2 || mode === 5) {
+                i = n - 1;           // incomplete extended sequence -- swallow the malformed tail
+              } else {
+                i += 1;              // unrecognised colour-space id -- consume just it
+              }
+            }
+            // else: 38/48 was the final token with nothing after it -- no-op, nothing to consume
+          }
+        }
+      }
+      i++;
+    }
+    return { cls: out.join(" "), style: style };
   }
 
   // ===== key capture =====================================================
@@ -288,7 +375,7 @@
   // row 0's real content. Both renderers (Terminal below and XtermTerminal further down) build
   // this the same way and append it as a sibling BEFORE their own pane, so the fix covers both
   // paths from one place rather than being reimplemented per-renderer. =====
-  function buildToolbar(onZoomOut, onZoomIn, onAfterZoom, mouseToggle) {
+  function buildToolbar(onZoomOut, onZoomIn, onAfterZoom, mouseToggle, rendererSwitch) {
     var bar = document.createElement("div");
     bar.className = "vttoolbar";
     var zoomOut = document.createElement("span");
@@ -352,11 +439,79 @@
     // Exposed so the owner can re-render when meaningfulness changes out from under the click --
     // e.g. Terminal's own _applyPatch calls this after a fresh `mouse.mode` arrives over SSE.
     bar.refreshMouseToggle = renderMouseBtn;
+
+    // ===== renderer switch (this session): xterm.js is now the DEFAULT renderer, with the
+    // built-in grid painter (`Terminal`, above) kept available ON DEMAND -- see config.TERM_
+    // RENDERER for the server-side default. This button is what makes that switch reachable, per
+    // terminal, from the UI. The server still owns the DEFAULT: `rendererSwitch.getActive()`
+    // starts at whatever openVT()/bootStandalone() read off the server a few lines below this
+    // file's own header comment ("SECOND RENDER PATH") -- this control is a later, EXPLICIT
+    // per-terminal user override layered on top, same category as the mouse-reporting toggle just
+    // above and the A-/A+ zoom controls, so it does NOT violate conventions rule 5 ("server owns
+    // policy, client renders it"): the user is choosing among renderers the server already
+    // exposed, not deciding what a FRESH terminal opens with next time.
+    // `rendererSwitch` mirrors `mouseToggle`'s own tiny renderer-agnostic shape:
+    //   getActive()      -> "grid" | "xterm", whichever is live right now
+    //   switchTo(target) -> destroy the current terminal, build `target` against the SAME tty,
+    //                       re-wire the ContextBar to it (see openVT/bootStandalone's own
+    //                       switch functions for exactly how)
+    // Switching TO xterm leaves the pane BLANK until the program's next write -- GET /api/term/raw
+    // only tees bytes emitted after the stream opens, so there is no repaint of whatever was
+    // already on screen (see this file's "SECOND RENDER PATH" header comment and XtermTerminal's
+    // own "KNOWN GAPS" comment). Switching to grid repaints immediately from the server's retained
+    // Screen. That asymmetry is spelled out in the title/aria-label below, not hidden (this file's
+    // own brief, requirement 6) -- a user who lands on a blank xterm pane has an honest reason why.
+    var rendererBtn = document.createElement("span");
+    rendererBtn.className = "vtzoombtn vtrendererbtn";
+    rendererBtn.setAttribute("role", "switch");
+    rendererBtn.setAttribute("tabindex", "0");
+    function renderRendererBtn() {
+      var isXterm = rendererSwitch.getActive() === "xterm";
+      rendererBtn.textContent = isXterm ? "▤ xterm" : "▦ grid";
+      rendererBtn.setAttribute("aria-pressed", isXterm ? "true" : "false");
+      rendererBtn.setAttribute("aria-label", isXterm
+        ? "Renderer: xterm.js. Tap to switch to the built-in grid renderer."
+        : "Renderer: built-in grid. Tap to switch to xterm.js.");
+      rendererBtn.classList.toggle("vtrendererxterm", isXterm);
+      rendererBtn.title = isXterm
+        ? "Renderer: xterm.js. Tap to switch to the built-in grid renderer — it repaints instantly from the current screen (server-retained), unlike the switch below."
+        : "Renderer: built-in grid. Tap to switch to xterm.js — the pane goes BLANK until the program next writes anything (no repaint of what's already on screen; xterm.js has no server-side scrollback to repaint FROM).";
+    }
+    function activateRendererSwitch() {
+      var next = rendererSwitch.getActive() === "xterm" ? "grid" : "xterm";
+      rendererSwitch.switchTo(next);
+      // No renderRendererBtn()/onAfterZoom() call here, unlike the mouse toggle above: switchTo
+      // destroys THIS terminal (and this toolbar along with it, via its own container.innerHTML =
+      // "") and builds a fresh one, whose own buildToolbar call renders its OWN button already in
+      // the correct state and focuses the new terminal on attach -- see openVT's
+      // switchActiveRenderer / bootStandalone's mountRenderer. Touching `rendererBtn` here would
+      // just be poking an already-detached element.
+    }
+    rendererBtn.addEventListener("click", activateRendererSwitch);
+    rendererBtn.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); activateRendererSwitch(); }
+    });
+    renderRendererBtn();
+    bar.appendChild(rendererBtn);
     return bar;
   }
 
+  // Fallback rendererSwitch for a Terminal/XtermTerminal built with no third constructor arg (e.g.
+  // a hand-rolled test double that only exercises the older 2-arg shape). Reports "grid" so the
+  // button still renders something sane, and switching is a harmless no-op rather than a throw.
+  var _noopRendererSwitch = { getActive: function () { return "grid"; }, switchTo: function () { } };
+
   // ===== Terminal: one live grid + key capture, mounted into any container =====
-  function Terminal(container, ttyId) {
+  // Third constructor arg is the renderer-switch interface -- see buildToolbar's own comment. It
+  // used to be read via `arguments[2]` instead of a named parameter, because this file's own
+  // signature `function Terminal(container, ttyId) {` was pinned VERBATIM by a couple dozen
+  // existing assertions in tests/test_term_vt_client.py (each locating this constructor's body by
+  // searching for that exact string) -- a third named parameter would have shifted that literal
+  // and broken every one of them for a change that had nothing to do with what they were actually
+  // pinning. `_function_body` there now matches by PREFIX (see its own docstring), so the
+  // signature is free to grow again; the named parameter replaces the old `arguments[2]` read.
+  function Terminal(container, ttyId, rendererSwitch) {
+    rendererSwitch = rendererSwitch || _noopRendererSwitch;
     this.ttyId = ttyId;
     this.cols = 0; this.rows = 0;
     this.grid = []; this.rowEls = [];
@@ -435,7 +590,8 @@
         getEnabled: function () { return self.mouseReportingEnabled; },
         setEnabled: function (v) { self.mouseReportingEnabled = v; },
         isMeaningful: function () { return self.mouse.mode !== 0; }
-      }
+      },
+      rendererSwitch
     );
     this._refreshMouseToggle = toolbarEl.refreshMouseToggle;   // called from _applyPatch below
     var pane = document.createElement("div");
@@ -678,11 +834,18 @@
       var s = Math.max(0, run[0] | 0), e = Math.max(0, run[1] | 0);   // NOT clamped to text.length —
       if (e <= s) continue;                                          // a run may extend past it
       if (s > pos) { html += esc(_padSpaces(s - pos)); pos = s; }     // gap before this run: default blank
-      var cls = sgrRunClass(run[2]);
+      var sgrOut = sgrRunClass(run[2]);
+      var cls = sgrOut.cls, style = sgrOut.style;   // style: built ONLY from validated integers by
+                                                     // sgrRunClass (never from raw SGR text) --
+                                                     // safe to place verbatim in the attribute below.
       var glyphs = s < text.length ? text.slice(s, Math.min(e, text.length)) : "";
       var tailPad = Math.max(0, e - Math.max(s, text.length));        // the part of this run past text.length
       var chunk = esc(glyphs) + esc(_padSpaces(tailPad));
-      html += cls ? ('<span class="' + cls + '">' + chunk + '</span>') : chunk;
+      if (cls || style) {
+        html += "<span" + (cls ? ' class="' + cls + '"' : "") + (style ? ' style="' + style + '"' : "") + ">" + chunk + "</span>";
+      } else {
+        html += chunk;
+      }
       pos = e;
     }
     if (pos < cols) html += esc(_padSpaces(cols - pos));   // pad the rest of the row width, unstyled
@@ -1348,13 +1511,25 @@
     };
   }
 
-  function XtermTerminal(container, ttyId) {
+  // Third constructor arg -- see Terminal's own constructor comment just above: now a named
+  // parameter here too, for the same reason (the test helper that used to demand a fixed literal
+  // now matches by prefix instead).
+  function XtermTerminal(container, ttyId, rendererSwitch) {
+    rendererSwitch = rendererSwitch || _noopRendererSwitch;
     this.ttyId = ttyId;
     this.es = null;
     this.term = null;
     this.fitAddon = null;
     this._onStatusChange = null;
     this._fontSize = 12.5;   // matches .vtpane's default font-size in ext_vt.css
+    // Guards _build() firing after a mid-load destroy(): attach() defers _build() behind
+    // _loadXtermAssets()'s promise, and if destroy() runs while that ~480KB asset load is still
+    // in flight (e.g. the user switches renderers again before it resolves), destroy() completes
+    // as a clean no-op against a still-null this.term/this._ro -- then the deferred _build() would
+    // fire anyway and build a real xterm.js Terminal, ResizeObserver and window listener on an
+    // already-destroyed instance, none of which anything would ever clean up. Same pattern as
+    // ContextBar._destroyed (see that class's constructor/destroy).
+    this._destroyed = false;
     var self = this;
     this._resizeDebounced = debounce(function () { self._doResize(); }, 150);
 
@@ -1373,7 +1548,8 @@
         getEnabled: function () { return false; },
         setEnabled: function () { },
         isMeaningful: function () { return false; }
-      }
+      },
+      rendererSwitch
     );
     var pane = document.createElement("div");
     pane.className = "vtpane vtxpane";
@@ -1393,6 +1569,9 @@
   };
 
   XtermTerminal.prototype._build = function () {
+    // Bail out if destroy() already ran while attach()'s asset load was still pending -- see the
+    // constructor's own comment on `this._destroyed` for the leak this closes.
+    if (this._destroyed) return;
     var self = this;
     var term = new window.Terminal({
       fontFamily: "'JetBrains Mono', monospace",
@@ -1483,6 +1662,10 @@
   };
 
   XtermTerminal.prototype.destroy = function () {
+    // Set FIRST, unconditionally: covers both paths -- _build() already ran (this cleans up what
+    // it created, below) and _build() is still pending behind attach()'s asset-load promise (this
+    // makes that deferred call a no-op instead of building a leak onto a destroyed instance).
+    this._destroyed = true;
     if (this.es) { this.es.close(); this.es = null; }
     if (this._ro) { this._ro.disconnect(); this._ro = null; }
     window.removeEventListener("resize", this._resizeDebounced);
@@ -1493,6 +1676,9 @@
   var overlay = null, modalTitleEl = null, modalStatusEl = null, modalBodyEl = null;
   var activeTerm = null, activeTty = null, activeSid = null, activeMode = null, activeBar = null;
   var activeRenderer = null;   // "grid" | "xterm" -- server-owned (see openVT below), never guessed
+  var activeTermWrap = null;   // dedicated wrap div holding ONLY the current terminal's own
+                                // toolbar+pane -- see switchActiveRenderer's own comment for why
+                                // this can't just be modalBodyEl itself.
   var activeForked = false, activeNotice = null;   // forked/notice from POST /api/term/pty response
   var openGen = 0;   // bumped by every openVT(); an in-flight open whose generation is stale has
                       // been superseded. Supersedes the older `activeSid !== sid` test, which could
@@ -1870,6 +2056,51 @@
     modalBodyEl.appendChild(wrap);
   }
 
+  // Wires a modal terminal's status callback -- shared by openVT's initial build AND
+  // switchActiveRenderer's rebuild below, so the two never drift into two slightly different
+  // copies of the same "starting…" suppression logic.
+  function _wireModalStatus(term) {
+    term._onStatusChange = function (s) {
+      if (activeTerm !== term) return;
+      // Suppress the connecting/connected/reconnecting churn while starting -- in particular
+      // this is where the refused resume child's SSE drop would otherwise flash
+      // "reconnecting…" into the header even though the server recovers on its own a couple
+      // seconds later (the whole point of this change). One steady "starting…" instead, no
+      // matter what status string actually came in.
+      if (term.starting) { modalStatusEl.textContent = "tty " + activeTty + " · starting…"; return; }
+      modalStatusEl.textContent = "tty " + activeTty + " · " + s;
+    };
+  }
+
+  // ===== renderer switch (modal): destroys the CURRENT Terminal/XtermTerminal and rebuilds the
+  // OTHER one against the SAME tty -- both renderers read/write through the server's shared PTYS
+  // table (term_vt.py), so the pty itself is untouched; only which client renders it changes. Set
+  // as the `switchTo` half of the interface handed to buildToolbar's switch button (see that
+  // function's own comment). `activeRenderer`'s INITIAL value (a few lines up in openVT, from
+  // `res.j.renderer`) is never touched here -- this only ever runs LATER, from an explicit click.
+  function switchActiveRenderer(renderer) {
+    if (!activeTerm || !activeTermWrap || renderer === activeRenderer) return;
+    // destroy() closes the old terminal's SSE stream and clears its own timers/document-level
+    // listeners (Terminal.prototype.destroy / XtermTerminal.prototype.destroy) -- see this file's
+    // header brief, requirement 3, for why that matters here specifically: leaving it running
+    // would leak a second live stream against the same tty.
+    activeTerm.destroy();
+    activeRenderer = renderer;
+    var Cls = renderer === "xterm" ? XtermTerminal : Terminal;
+    var term = new Cls(activeTermWrap, activeTty, {
+      getActive: function () { return activeRenderer; },
+      switchTo: switchActiveRenderer
+    });
+    _wireModalStatus(term);
+    activeTerm = term;
+    // Re-wire, don't destroy: the ContextBar's polling/dropdown state has nothing to do with which
+    // renderer is on screen -- only its getInput() callback (used by _focusTerminal) needs to stop
+    // pointing at the terminal that was just destroyed above. See this file's header brief,
+    // requirement 4 ("re-wire ... rather than leaving it pointing at a destroyed one").
+    if (activeBar) activeBar.getInput = function () { return term; };
+    term.attach();
+  }
+
   function openVT(sid, mode) {
     if (!sid) return;
     var mount = document.getElementById("ext_vt");
@@ -1960,36 +2191,44 @@
           // Server-owned (conventions rule 5): the client reads which renderer to build off the
           // response `open_pty()` already sent, never decides it locally -- see term_vt.py's
           // TRACKER_TERM_RENDERER switch comment. An unrecognized/missing value falls back to
-          // "grid", same as config.TERM_RENDERER's own server-side fallback.
+          // "grid", same as config.TERM_RENDERER's own server-side fallback. This is the ONE place
+          // the INITIAL choice is made -- switchActiveRenderer (above) is a later, explicit user
+          // override layered on top, never a second vote on this line.
           activeRenderer = (res.j.renderer === "xterm") ? "xterm" : "grid";
           modalStatusEl.textContent = "tty " + activeTty;
+          // The terminal's own toolbar+pane live in a DEDICATED wrap, never directly in
+          // modalBodyEl: Terminal/XtermTerminal's constructor does `container.innerHTML = ""` on
+          // whatever it's given, and a later renderer switch (switchActiveRenderer) rebuilds THIS
+          // wrap alone -- handing it modalBodyEl directly would also wipe the ContextBar's own
+          // .el and the fork-chip/notice chrome that live alongside it as modalBodyEl's siblings.
+          var wrap = document.createElement("div");
+          wrap.className = "vttermwrap";
+          modalBodyEl.appendChild(wrap);
+          activeTermWrap = wrap;
           var Cls = activeRenderer === "xterm" ? XtermTerminal : Terminal;
-          var term = new Cls(modalBodyEl, activeTty);
+          var term = new Cls(wrap, activeTty, {
+            getActive: function () { return activeRenderer; },
+            switchTo: switchActiveRenderer
+          });
           // `starting` (true only for mode="resume" panes still recovering from a refused
           // `claude --resume`) is server-owned and read straight off this POST response, seeded
           // BEFORE term.attach() ever opens the EventSource below -- see Terminal's own `starting`
           // field comment. Only meaningful for the grid renderer: xterm's /api/term/raw stream
           // carries no JSON envelope at all, so it has no `starting` key to read (deliberately out
-          // of scope -- see XtermTerminal.prototype._openStream's comment).
+          // of scope -- see XtermTerminal.prototype._openStream's comment). Never set on a
+          // renderer switch (switchActiveRenderer never touches it): the pty being rebuilt against
+          // is already running, not freshly resuming.
           if (activeRenderer === "grid") {
             term.starting = !!res.j.starting;
             term.pane.classList.toggle("vtstarting", term.starting);
             if (term.starting) modalStatusEl.textContent = "tty " + activeTty + " · starting…";
           }
-          term._onStatusChange = function (s) {
-            if (activeTerm !== term) return;
-            // Suppress the connecting/connected/reconnecting churn while starting -- in particular
-            // this is where the refused resume child's SSE drop would otherwise flash
-            // "reconnecting…" into the header even though the server recovers on its own a couple
-            // seconds later (the whole point of this change). One steady "starting…" instead, no
-            // matter what status string actually came in.
-            if (term.starting) { modalStatusEl.textContent = "tty " + activeTty + " · starting…"; return; }
-            modalStatusEl.textContent = "tty " + activeTty + " · " + s;
-          };
+          _wireModalStatus(term);
           activeTerm = term;
           // Built AFTER the Terminal/XtermTerminal (both do container.innerHTML = "" in their own
-          // constructor) so the bar's own DOM survives — appended as a sibling of .vtpane inside
-          // the same flex-column .vtmb, so it docks to the bottom without any CSS shuffling.
+          // constructor, now confined to `wrap` above) so the bar's own DOM survives — appended as
+          // a sibling of `wrap` inside the same flex-column .vtmb, so it docks to the bottom
+          // without any CSS shuffling, and stays untouched by a later renderer switch too.
           // getInput hands back the TERMINAL OBJECT itself (both classes expose .focus()), not a
           // raw DOM node -- see Terminal.prototype.focus / XtermTerminal.prototype.focus.
           activeBar = new ContextBar(modalBodyEl, sid, activeTty, mode, function () { return term; });
@@ -2018,6 +2257,7 @@
     if (activeTerm) { activeTerm.destroy(); activeTerm = null; }
     if (activeBar) { activeBar.destroy(); activeBar = null; }
     activeTty = null; activeSid = null; activeMode = null; activeRenderer = null;
+    activeTermWrap = null;
     activeForked = false; activeNotice = null;
     if (modalForkChip) modalForkChip.style.display = "none";
     if (modalNoticeEl && modalNoticeEl.parentNode) modalNoticeEl.parentNode.removeChild(modalNoticeEl);
@@ -2099,18 +2339,95 @@
     document.body.appendChild(mount);
     mount.classList.add("vtfull");
 
-    function boot(renderer) {
-      var Cls = renderer === "xterm" ? XtermTerminal : Terminal;
-      var term = new Cls(mount, tty);
-      var bar = null;
-      if (sid) {
-        // Appended AFTER the Terminal/XtermTerminal (whose constructor does
-        // container.innerHTML = "") and BEFORE the status line below, so DOM order is
-        // pane -> context bar -> status -- the bar docks directly under the pane, with the
-        // tty/connection status as the very bottom line.
-        bar = new ContextBar(mount, sid, tty, mode, function () { return term; });
-        bar.start();
+    // curTerm/curBar/curRenderer/termWrap/statusEl are mutable across a renderer switch (see
+    // mountRenderer below) -- plain `var term`/`bar` locals inside a one-shot boot() can't be
+    // reassigned by a switch button that outlives that single call.
+    var curTerm = null, curBar = null, curRenderer = null, termWrap = null, statusEl = null;
+
+    // Re-renders the standalone status line from scratch -- shared by boot()'s own initial
+    // "connecting…" placeholder and by every term._onStatusChange callback wired in
+    // mountRenderer, so the fork-chip-splicing logic isn't maintained as two near-identical copies
+    // (the original shape of this code, before the renderer switch, was exactly that).
+    function renderStandaloneStatus(s) {
+      statusEl.innerHTML = "";   // clear before adding spans to avoid HTML injection
+      var statusText = "tty " + tty;
+      if (standaloneForked) statusText += " · ⑂ fork";
+      statusText += " · " + s;
+      var parts = statusText.split(" · ");
+      for (var i = 0; i < parts.length; i++) {
+        if (i > 0) statusEl.appendChild(document.createTextNode(" · "));
+        if (i === 1 && standaloneForked) {
+          var chip = document.createElement("span");
+          chip.className = "vtstatus-fork";
+          chip.setAttribute("title", "This terminal is a copy of a background agent — the original is still running separately");
+          chip.textContent = "⑂ fork";
+          statusEl.appendChild(chip);
+        } else {
+          statusEl.appendChild(document.createTextNode(parts[i]));
+        }
       }
+    }
+
+    // Destroys the CURRENT terminal (if any) and builds `renderer` against the SAME tty, inside
+    // the dedicated `termWrap` (never `mount` directly -- see boot()'s own comment below for why).
+    // This is both what boot() calls for the very first mount AND the `switchTo` half of the
+    // interface handed to buildToolbar's switch button, so the initial build and every later
+    // switch share one code path instead of two that could drift apart.
+    function mountRenderer(renderer) {
+      if (curTerm) { curTerm.destroy(); curTerm = null; }   // see this file's header brief,
+                                                              // requirement 3: closes the old SSE
+                                                              // stream and clears its own timers/
+                                                              // document-level listeners.
+      curRenderer = renderer;
+      var Cls = renderer === "xterm" ? XtermTerminal : Terminal;
+      var term = new Cls(termWrap, tty, {
+        getActive: function () { return curRenderer; },
+        switchTo: mountRenderer
+      });
+      curTerm = term;
+      if (curBar) {
+        // Re-wire, don't destroy -- same reasoning as openVT's own switchActiveRenderer (requirement
+        // 4): the ContextBar's polling/dropdown state has nothing to do with which renderer is on
+        // screen, only its getInput() callback needs to stop pointing at the destroyed terminal.
+        curBar.getInput = function () { return term; };
+      } else if (sid) {
+        // First mount only (mountRenderer's earlier calls, if any, already built curBar above).
+        // Appended AFTER the Terminal/XtermTerminal (whose constructor does
+        // container.innerHTML = "", now confined to termWrap) so the bar's own DOM survives a
+        // later switch -- see termWrap's own comment in boot().
+        curBar = new ContextBar(mount, sid, tty, mode, function () { return term; });
+        curBar.start();
+      }
+      term._onStatusChange = function (s) {
+        if (curTerm !== term) return;
+        renderStandaloneStatus(s);
+      };
+      term.attach();
+    }
+
+    function boot(renderer) {
+      // The term's own toolbar+pane live in a DEDICATED wrap, never directly in `mount`: both
+      // Terminal and XtermTerminal's constructors do `container.innerHTML = ""` on whatever
+      // they're given, and a later renderer switch (mountRenderer, above) rebuilds THIS wrap
+      // alone -- handing it `mount` directly would also wipe the notice banner and the status
+      // line below, both of which are `mount`'s other children.
+      termWrap = document.createElement("div");
+      termWrap.className = "vttermwrap";
+      mount.appendChild(termWrap);
+
+      // Created (and pre-rendered) BEFORE mountRenderer() runs, but not yet appended to `mount`:
+      // XtermTerminal.prototype.attach calls _onStatusChange SYNCHRONOUSLY the instant attach() is
+      // called (before any async asset loading) -- so `statusEl` must already exist and be
+      // wireable the moment mountRenderer() below calls term.attach(). Mutating a still-detached
+      // node is harmless; it's appended for real once the notice banner (if any) has taken its
+      // spot ahead of it, so the final DOM order stays pane -> context bar -> notice -> status,
+      // matching the order this code built in before the renderer switch existed.
+      statusEl = document.createElement("div");
+      statusEl.className = "vtfullstatus";
+      renderStandaloneStatus("connecting…");
+
+      mountRenderer(renderer);   // builds the terminal into termWrap, and the context bar right after it
+
       // Build notice element if present (same as modal, but in standalone context)
       if (standaloneNotice) {
         var noticeEl = document.createElement("div");
@@ -2120,48 +2437,9 @@
         noticeEl.appendChild(noticeText);
         mount.appendChild(noticeEl);
       }
-      // Build status line with fork indicator if present
-      var status = document.createElement("div");
-      status.className = "vtfullstatus";
-      var statusContent = "tty " + tty;
-      if (standaloneForked) statusContent += " · ⑂ fork";
-      statusContent += " · connecting…";
-      status.innerHTML = "";   // clear before adding spans to avoid HTML injection
-      var parts = statusContent.split(" · ");
-      for (var i = 0; i < parts.length; i++) {
-        if (i > 0) status.appendChild(document.createTextNode(" · "));
-        if (i === 1 && standaloneForked) {
-          var chip = document.createElement("span");
-          chip.className = "vtstatus-fork";
-          chip.setAttribute("title", "This terminal is a copy of a background agent — the original is still running separately");
-          chip.textContent = "⑂ fork";
-          status.appendChild(chip);
-        } else {
-          status.appendChild(document.createTextNode(parts[i]));
-        }
-      }
-      mount.appendChild(status);
-      term._onStatusChange = function (s) {
-        status.innerHTML = "";   // clear before adding new content
-        var statusText = "tty " + tty;
-        if (standaloneForked) statusText += " · ⑂ fork";
-        statusText += " · " + s;
-        var parts = statusText.split(" · ");
-        for (var i = 0; i < parts.length; i++) {
-          if (i > 0) status.appendChild(document.createTextNode(" · "));
-          if (i === 1 && standaloneForked) {
-            var chip = document.createElement("span");
-            chip.className = "vtstatus-fork";
-            chip.setAttribute("title", "This terminal is a copy of a background agent — the original is still running separately");
-            chip.textContent = "⑂ fork";
-            status.appendChild(chip);
-          } else {
-            status.appendChild(document.createTextNode(parts[i]));
-          }
-        }
-      };
-      term.attach();
-      window.addEventListener("resize", debounce(function () { term.measureAndResize(); }, 150));
+
+      mount.appendChild(statusEl);
+      window.addEventListener("resize", debounce(function () { if (curTerm) curTerm.measureAndResize(); }, 150));
     }
 
     if (rendererParam === "grid" || rendererParam === "xterm") {
@@ -2169,6 +2447,14 @@
     } else {
       fetch("/api/term/renderer").then(function (r) { return r.json(); })
         .then(function (j) { boot((j && j.renderer === "xterm") ? "xterm" : "grid"); })
+        // Deliberately "grid", not xterm (the server's own DEFAULT) -- this only fires when
+        // GET /api/term/renderer itself is unreachable, which is a different situation from
+        // "unset", exactly like config.TERM_RENDERER's own garbage-value fallback (see its comment
+        // in config.py, "An unrecognised value is a DIFFERENT question from 'unset'"): grid is the
+        // safer renderer here (repaint on reconnect, server-backed scrollback, mid-session
+        // notices), so a client that can't even ask the server what to use should land on the safe
+        // choice rather than the now-riskier default. Keep this in sync with that reasoning --
+        // don't "fix" it to match the unset default without re-reading it.
         .catch(function () { boot("grid"); });
     }
   })();

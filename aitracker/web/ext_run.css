@@ -12,7 +12,33 @@
   white-space:pre-wrap;overflow-wrap:anywhere}
 .runout:empty{display:none}
 
-/* SGR classes emitted by ext_run.js — nothing else in the output becomes markup. */
+/* Background tints app.css has no token for (black/magenta/cyan/white -- unlike red-bg/green-bg/
+   amber-bg/blue-deep, which app.css already defines for the other four 16-colour backgrounds).
+   Kept local to this file rather than added to app.css's own :root (out of this file's ownership
+   scope), same per-theme-pair pattern app.css itself uses (a :root/html.light split). Values are
+   each matching foreground token's own colour (--dim/--violet/--ring2/--head -- the exact colours
+   .a30/.a35/.a36/.a37 above use) at the same low alpha app.css's own --red-bg already uses (.14
+   dark / .12 light), so these stay theme-correct without a hardcoded hex that would go stale if
+   app.css's palette ever changes. `rn-` prefixed (this file's own short name, mirroring ext_vt.css's
+   `vt-` prefix for its identical need) so a future app.css token of the same short name can never
+   silently collide with this file's own, and so the two sibling files' tokens never collide with
+   each other either even though both land in the same global :root at runtime. */
+:root {
+  --rn-black-bg: rgba(107, 117, 133, .14);
+  --rn-violet-bg: rgba(167, 139, 250, .14);
+  --rn-cyan-bg: rgba(41, 211, 152, .14);
+  --rn-white-bg: rgba(201, 212, 224, .14);
+}
+html.light {
+  --rn-black-bg: rgba(149, 140, 118, .12);
+  --rn-violet-bg: rgba(122, 92, 192, .12);
+  --rn-cyan-bg: rgba(31, 157, 107, .12);
+  --rn-white-bg: rgba(64, 58, 46, .12);
+}
+
+/* SGR classes emitted by ext_run.js — nothing else in the output becomes markup. MUST stay in
+   sync with sgrClass() in ext_run.js, which is the single place that maps parsed-integer SGR
+   params to these class names. */
 .runout .ab{font-weight:700}
 .runout .ai{font-style:italic}
 .runout .au{text-decoration:underline}
@@ -25,7 +51,16 @@
 .runout .a35,.runout .a95{color:var(--violet)}
 .runout .a36,.runout .a96{color:var(--ring2)}
 .runout .a37,.runout .a97{color:var(--head)}
-.runout .a41{background:var(--red-bg)}
-.runout .a42{background:var(--green-bg)}
-.runout .a43{background:var(--amber-bg)}
-.runout .a44{background:var(--blue-deep)}
+/* Bright background (100-107) has no distinct token of its own -- approximated as IDENTICAL to
+   the matching classic background (40-47), sharing one rule each, exactly the way the bright
+   FOREGROUND codes (90-97) already share a rule with their classic counterparts (30-37) above.
+   An honest approximation: bright and classic render the same colour for these, rather than an
+   invisible run. */
+.runout .a40,.runout .a100{background:var(--rn-black-bg)}
+.runout .a41,.runout .a101{background:var(--red-bg)}
+.runout .a42,.runout .a102{background:var(--green-bg)}
+.runout .a43,.runout .a103{background:var(--amber-bg)}
+.runout .a44,.runout .a104{background:var(--blue-deep)}
+.runout .a45,.runout .a105{background:var(--rn-violet-bg)}
+.runout .a46,.runout .a106{background:var(--rn-cyan-bg)}
+.runout .a47,.runout .a107{background:var(--rn-white-bg)}

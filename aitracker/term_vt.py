@@ -2709,7 +2709,7 @@ def inject(handler, parsed, body):
 # SAME viewer-refcount/`_STREAMS` accounting and the SAME `term_gate.guard()` perimeter -- the
 # only thing duplicated is the row-vs-byte INTERPRETATION, not the session/PTY plumbing.
 #
-# The switch is `config.TERM_RENDERER` (env `TRACKER_TERM_RENDERER=grid|xterm`, default "grid" --
+# The switch is `config.TERM_RENDERER` (env `TRACKER_TERM_RENDERER=grid|xterm`, default "xterm" --
 # see config.py's own comment on that constant). It is resolved ONCE, server-side, at read time
 # here -- `open_pty()` above hands it to the client in its response (`renderer` key) and
 # `renderer_info()` just below serves it standalone (for a reconnecting `?tty=` tab, which never
@@ -2819,10 +2819,11 @@ def _raw_stream_body(handler, pt, q):
 
 # ---- vendored xterm.js static assets --------------------------------------------------------
 # Served as plain files, NOT inlined into the baked page (unlike ext_vt.js/css -- see page.py's
-# read_ext()): xterm.js alone is ~480KB minified, and the default renderer is "grid" (config.
-# TERM_RENDERER), so every page load paying for it unconditionally would be dead weight for
-# anyone who never opts into TRACKER_TERM_RENDERER=xterm. ext_vt.js's `_loadXtermAssets()` fetches
-# these lazily, exactly once, only the first time an xterm-rendered terminal is actually opened.
+# read_ext()): xterm.js alone is ~480KB minified. Even though the default renderer is "xterm"
+# (config.TERM_RENDERER), lazy-loading these assets ensures users who do not open a terminal
+# session never pay for them. ext_vt.js's `_loadXtermAssets()` fetches these lazily, exactly
+# once, only the first time an xterm-rendered terminal is actually opened (see conventions rule 2
+# for lazy loading as the binding invariant for vendored front-end assets).
 # Gated by the SAME `_authok()` every other non-`/api` path already goes through in
 # `Handler.do_GET` (see server.py) -- no separate check needed here.
 _VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "vendor")

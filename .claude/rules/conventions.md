@@ -4,7 +4,7 @@ These are invariants, not suggestions. Breaking one is a regression even if the 
 
 ## Structure
 1. **Package, not a scratchpad.** Sources live in `aitracker/` (Python) and `aitracker/web/` (the SPA). Edit those — never `dist/tracker.py`, which `make bundle` regenerates. Keep the module boundaries: providers under `providers/`, the shared seam in `registry.py`.
-2. **Python: stdlib only. Optional vendored front-end only.** The Python package has zero dependencies — no `pip install`, no `requirements.txt`/`pyproject.toml`, no build step. Vendored front-end assets are allowed only if optional, off by default, and added with explicit approval; they must be committed files, never fetched or built at runtime. xterm.js is the sole current instance.
+2. **Python: stdlib only. Vendored front-end assets load lazily, not eagerly.** The Python package has zero dependencies — no `pip install`, no `requirements.txt`/`pyproject.toml`, no build step. Vendored front-end assets need explicit approval to add, and must be committed files, never fetched or built at runtime. The invariant that actually protects page-load cost is **lazy loading**, not "off by default" (the default flipped by explicit decision — see xterm.js below): a vendored asset must be fetched only when the feature that needs it actually activates, never baked into every page load. xterm.js is the sole current instance — the default terminal renderer as of that decision, still ~480KB and still fetched only when a terminal is actually opened, via `_loadXtermAssets()`, never on page load.
 
 ## The shared seam (don't fork)
 3. Every AI tool is a **`Provider`** (`available/list/parse/search`) in `PROVIDERS`. Routes call `all_sessions()` / `parse_any()` / `search_all()` — never a specific source.

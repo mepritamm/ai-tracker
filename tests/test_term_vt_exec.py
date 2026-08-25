@@ -20,6 +20,7 @@ best-effort extra check.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -136,6 +137,36 @@ if _HAS_NODE:
         "getEnabled: function () { return self.mouseReportingEnabled; },",
         "isMeaningful: function () { return self.mouse.mode !== 0; }",
     )
+
+    # ===== 256-colour / true-colour SGR rendering (this session) =====
+    # `sgrRunClass` plus its helpers (_byte255, _stdColorClass, _cubeLevel, _256Rgb) are all
+    # plain top-level functions declared back-to-back, bounded by the next top-level function
+    # declaration (`keyToBytes`) -- same "span between two literal markers" extraction strategy
+    # _KEY_TO_BYTES_SRC above already uses for a bare (non Terminal.prototype) function.
+    _sgr_start = _SRC.index("function _byte255(tok) {")
+    _sgr_end = _SRC.index("function keyToBytes(ev) {")
+    _SGR_HELPERS_SRC = _SRC[_sgr_start:_sgr_end]
+
+    # `esc()` is a one-line `var` assignment at the very top of the IIFE, and `_padSpaces` is a
+    # small top-level function declared immediately before `Terminal.prototype._paintRow` --
+    # both needed alongside _SGR_HELPERS_SRC to run the real _paintRow standalone.
+    _esc_start = _SRC.index("var esc = window.esc")
+    _esc_end = _SRC.index("\n", _esc_start)
+    _ESC_SRC = _SRC[_esc_start:_esc_end]
+    _padspaces_start = _SRC.index("function _padSpaces(n) {")
+    _PADSPACES_SRC = _SRC[_padspaces_start:_SRC.index("Terminal.prototype._paintRow = function")]
+    _PAINT_ROW_SRC = _function_body(_SRC, "Terminal.prototype._paintRow = function")
+
+    # ===== XtermTerminal: the async-load-vs-destroy race (this session) =====
+    # Everything from `_b64ToBytes` (used by `_openStream`'s onmessage) through the end of
+    # `XtermTerminal.prototype.destroy` -- one contiguous span covering `_xtermTheme`, the
+    # `XtermTerminal` constructor, `attach`/`_build`/`_doResize`/`_zoom`/`_openStream`/
+    # `measureAndResize`/`focus`/`destroy`. Bounded by the "===== the modal" comment that opens
+    # the next section of the file, the same "span between two literal markers" strategy
+    # `_SGR_HELPERS_SRC` above already uses.
+    _xterm_leak_start = _SRC.index("function _b64ToBytes(")
+    _xterm_leak_end = _SRC.index("// ===== the modal")
+    _XTERM_LEAK_SRC = _SRC[_xterm_leak_start:_xterm_leak_end]
 
 
 _HARNESS_PRELUDE = """
@@ -1017,6 +1048,431 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
 """
         result = _run_node(script)
         self.assertEqual(result["calls"], ["M1", "M2"])
+
+
+class TestSgrColourRendering(unittest.TestCase):
+    """256-colour (38;5;N / 48;5;N) and true-colour (38;2;R;G;B / 48;2;R;G;B) support: the Python
+    emulator's SGR parser already resolves these into the run's code string (CONFIRMED against
+    Screen._sgr / Screen._recompute_code in term_vt.py -- e.g. "38;5;208" or "7;48;2;10;20;30"),
+    but sgrRunClass()/_paintRow used to silently drop anything outside the 16 plain ANSI codes.
+    Driven EXECUTED (not just source-pinned) because the interesting failure mode -- a malformed
+    or out-of-range extended sequence leaking raw text into the `style` attribute _paintRow
+    builds -- is exactly the class of bug a text-only assertion cannot catch."""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def _sgr(self, sgr_string):
+        script = _HARNESS_PRELUDE + _SGR_HELPERS_SRC + """
+var result = sgrRunClass(""" + json.dumps(sgr_string) + """);
+console.log(JSON.stringify({ result: result }));
+"""
+        return _run_node(script)["result"]
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def _paint(self, text, runs, cols=None):
+        script = _HARNESS_PRELUDE + "\nvar window = {};\n" + _ESC_SRC + "\n" + _SGR_HELPERS_SRC + "\n" + _PADSPACES_SRC + "\n" + _PAINT_ROW_SRC + """
+var self = {
+  viewingHistory: false,
+  historyGrid: [],
+  grid: [{ text: """ + json.dumps(text) + """, runs: """ + json.dumps(runs) + """ }],
+  rowEls: [{ innerHTML: "" }],
+  cols: """ + str(cols if cols is not None else len(text)) + """
+};
+Terminal.prototype._paintRow.call(self, 0);
+console.log(JSON.stringify({ html: self.rowEls[0].innerHTML }));
+"""
+        return _run_node(script)["html"]
+
+    # ----- sgrRunClass: 256-colour cube -----------------------------------------------------
+
+    def test_256_colour_cube_value_produces_the_derived_rgb_style(self):
+        # 38;5;208 -- a mid-cube index (not 0-15, not the greyscale ramp). i = 208-16 = 192;
+        # r-level = 192//36 = 5 -> 255, g-level = (192//6)%6 = 2 -> 135, b-level = 192%6 = 0 -> 0.
+        # This is xterm's documented "DarkOrange"-ish 208 swatch.
+        out = self._sgr("38;5;208")
+        self.assertEqual(out["cls"], "")
+        self.assertEqual(out["style"], "color:rgb(255,135,0);")
+
+    def test_256_colour_greyscale_ramp_value(self):
+        # 48;5;244 -- greyscale ramp (232-255): v = 8 + 10*(244-232) = 128, i.e. a mid grey,
+        # applied as a BACKGROUND (48, not 38).
+        out = self._sgr("48;5;244")
+        self.assertEqual(out["cls"], "")
+        self.assertEqual(out["style"], "background-color:rgb(128,128,128);")
+
+    def test_256_colour_low_index_reuses_the_existing_ansi_class_path(self):
+        # Indices 0-15 must NOT go through the inline-style path at all -- they reuse the same
+        # vtf*/vtg* classes the plain 30-37/90-97/40-47 codes already use (one set of CSS rules).
+        fg_dim = self._sgr("38;5;3")          # 3 < 8 -> plain, maps to the existing 30+3 class
+        self.assertEqual(fg_dim["cls"], "vtf33")
+        self.assertEqual(fg_dim["style"], "")
+        fg_bright = self._sgr("38;5;12")      # 12 >= 8 -> bright, maps to the existing 90+(12-8)
+        self.assertEqual(fg_bright["cls"], "vtf94")
+        self.assertEqual(fg_bright["style"], "")
+
+    def test_true_colour_rgb_foreground(self):
+        out = self._sgr("38;2;255;99;71")     # tomato
+        self.assertEqual(out["cls"], "")
+        self.assertEqual(out["style"], "color:rgb(255,99,71);")
+
+    def test_true_colour_background_variant(self):
+        out = self._sgr("48;2;10;20;30")
+        self.assertEqual(out["cls"], "")
+        self.assertEqual(out["style"], "background-color:rgb(10,20,30);")
+
+    def test_out_of_range_index_is_dropped_not_clamped_or_guessed(self):
+        # 999 is not a valid byte -- the run's colour must be dropped entirely (default colour),
+        # never clamped into range and never silently reinterpreted.
+        out = self._sgr("38;5;999")
+        self.assertEqual(out["cls"], "")
+        self.assertEqual(out["style"], "")
+
+    def test_truncated_truecolor_sequence_is_swallowed_not_misparsed(self):
+        # "38;2;10;20" is missing the blue component. Mirrors Screen._sgr's own defence against a
+        # truncated extended sequence: the malformed tail must be consumed so it can never fall
+        # through and be reinterpreted as unrelated SGR codes (e.g. "20" as some other attribute).
+        # Bold (1) before it must still register; nothing after must leak through as a stray class.
+        out = self._sgr("1;38;2;10;20")
+        self.assertEqual(out["cls"], "vtb")
+        self.assertEqual(out["style"], "")
+
+    def test_garbage_colour_token_cannot_reach_the_style_string(self):
+        # A non-numeric token in the index/RGB position (this is the injection-shaped case: what
+        # if the value were somehow attacker-controlled text rather than a validated integer) must
+        # be rejected by the digits-only check and produce no colour at all -- never get
+        # interpolated into `style` verbatim.
+        out = self._sgr('38;5;1" onmouseover="alert(1)')
+        self.assertEqual(out["cls"], "")
+        self.assertEqual(out["style"], "")
+
+    def test_composes_with_reverse_video(self):
+        # Reverse (7) and an extended true-colour foreground both resolve independently: the "vtr"
+        # class still appears (CSS's .vtr rule swaps the DEFAULT fg/bg via the `--text`/`--app`
+        # tokens) and the true-colour style is emitted alongside it. Inline `style` always wins
+        # CSS specificity over any class selector, so this explicit foreground colour overrides
+        # .vtr's color swap while background still comes from .vtr -- the same "explicit colour
+        # wins its own property, reverse still governs the other" composition the pre-existing
+        # 16-colour path already has (an explicit vtf3x class already outranks .vtr's color rule
+        # by CSS cascade order within the same specificity) -- this is not a special case in JS.
+        out = self._sgr("7;38;2;255;0;0")
+        self.assertEqual(out["cls"], "vtr")
+        self.assertEqual(out["style"], "color:rgb(255,0,0);")
+
+    # ----- _paintRow: the style actually lands safely in the markup ------------------------
+
+    def test_paint_row_emits_class_and_style_together(self):
+        html = self._paint("hi", [[0, 2, "38;5;208"]])
+        self.assertEqual(html, '<span style="color:rgb(255,135,0);">hi</span>')
+
+    def test_paint_row_malformed_sequence_never_injects_into_the_markup(self):
+        # Same attack-shaped payload as test_garbage_colour_token_cannot_reach_the_style_string,
+        # but proven at the _paintRow level: the glyphs are real PTY text ("x") and the SGR
+        # portion is attacker-shaped junk -- the produced HTML must contain neither a stray
+        # attribute nor any unescaped quote/tag, and the run's own text is still correctly
+        # HTML-escaped.
+        html = self._paint('x<"\'', [[0, 4, '38;5;1" onmouseover="alert(1)']])
+        self.assertNotIn("onmouseover", html)
+        self.assertNotIn("<script", html)
+        self.assertEqual(html, "x&lt;\"'")   # no span at all: cls and style both came back empty
+
+
+class TestSgrClassCssCoverage(unittest.TestCase):
+    """Structural test: EVERY class string sgrRunClass()/_stdColorClass() can emit for a plain
+    16-colour attribute/foreground/background code -- direct SGR params (1/3/4/7 attrs, 30-37/
+    90-97 fg, 40-47/100-107 bg) and the 256-colour low-index path (38;5;N/48;5;N for N in 0-15,
+    resolved through _stdColorClass onto those SAME class names) -- must have a matching
+    `.vtrow .vtXXX` rule in ext_vt.css. A class sgrRunClass can produce with no CSS rule renders
+    as an invisible/no-op span: exactly the `vtg100`..`vtg107` (bright 256-colour background) and
+    pre-existing `vtg40`/`vtg45`/`vtg46`/`vtg47` (classic background) bug this test class was
+    added to catch. Data-driven over the FULL 0-15 index range and the full direct-code ranges,
+    not a handful of hand-picked cases -- a future gap anywhere in that space fails this test by
+    name, not just the two spans a human happened to think to check.
+
+    100-107 direct (not just 48;5;8..15) are included deliberately: term_vt.py's Screen._sgr
+    (confirmed by reading it) stores a raw aixterm bright-background code 100-107 VERBATIM in the
+    run's sgr string, so a program that emits `\\x1b[100m` directly takes a different code path
+    through sgrRunClass than `\\x1b[48;5;8m` does -- both must resolve to a real class."""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_every_emittable_sgr_class_has_a_css_rule(self):
+        inputs = ["1", "3", "4", "7"]                              # vtb / vti / vtu / vtr
+        for v in list(range(30, 38)) + list(range(90, 98)):        # direct foreground
+            inputs.append(str(v))
+        for v in list(range(40, 48)) + list(range(100, 108)):      # direct background
+            inputs.append(str(v))
+        for idx in range(16):                                      # 256-colour low-index path
+            inputs.append("38;5;%d" % idx)
+            inputs.append("48;5;%d" % idx)
+
+        script = _HARNESS_PRELUDE + _SGR_HELPERS_SRC + """
+var out = [];
+""" + "\n".join("out.push(sgrRunClass(%s).cls);" % json.dumps(s) for s in inputs) + """
+console.log(JSON.stringify({ classes: out }));
+"""
+        result = _run_node(script)["classes"]
+        self.assertEqual(len(result), len(inputs))
+
+        # Every one of these inputs is a real, well-formed SGR param this file must render --
+        # an empty `cls` means sgrRunClass silently dropped it (a JS-side gap, not a CSS one).
+        empty = [inp for inp, cls in zip(inputs, result) if not cls]
+        self.assertEqual(empty, [], "sgrRunClass(...) produced NO class at all for: %s" % empty)
+
+        emitted = set()
+        for cls in result:
+            emitted.update(c for c in cls.split(" ") if c)
+
+        with open(os.path.join(_WEB, "ext_vt.css"), encoding="utf-8") as fh:
+            css = fh.read()
+        # SGR run classes are always written as one or more `.vtrow .vtXXX` selectors sharing a
+        # rule (e.g. ".vtrow .vtf30, .vtrow .vtf90 { ... }") -- see the comment right above that
+        # block in ext_vt.css. Collecting every such class name gives the exact set of classes the
+        # stylesheet actually defines, independent of how the rules are grouped.
+        defined = set(re.findall(r"\.vtrow \.([A-Za-z0-9]+)", css))
+
+        missing = sorted(emitted - defined)
+        self.assertEqual(missing, [],
+                          "sgrRunClass()/_stdColorClass() can emit these classes but ext_vt.css "
+                          "defines no `.vtrow .<class>` rule for them: %s" % missing)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_256_colour_background_low_index_reuses_the_existing_ansi_class_path(self):
+        # The background twin of test_256_colour_low_index_reuses_the_existing_ansi_class_path
+        # above, which only ever exercised foreground (38;5;3, 38;5;12) -- never 48;5;N for any N
+        # in 0-15, which is exactly why the background gap shipped unnoticed. Covers a classic
+        # low index (0), a classic high index that needed a NEW css token (5, 7), the bright
+        # boundary (7 -> 8), and a bright high index (15).
+        script = _HARNESS_PRELUDE + _SGR_HELPERS_SRC + """
+var out = {};
+[0, 5, 7, 8, 9, 15].forEach(function (n) {
+  out[n] = sgrRunClass("48;5;" + n).cls;
+});
+console.log(JSON.stringify({ result: out }));
+"""
+        result = _run_node(script)["result"]
+        self.assertEqual(result["0"], "vtg40")     # classic black bg
+        self.assertEqual(result["5"], "vtg45")     # classic magenta bg
+        self.assertEqual(result["7"], "vtg47")     # classic white bg
+        self.assertEqual(result["8"], "vtg100")    # bright black bg (0-7 -> 8-15 boundary)
+        self.assertEqual(result["9"], "vtg101")    # bright red bg
+        self.assertEqual(result["15"], "vtg107")   # bright white bg
+        for n in (0, 5, 7, 8, 9, 15):
+            self.assertEqual(_run_node(_HARNESS_PRELUDE + _SGR_HELPERS_SRC + """
+console.log(JSON.stringify({ style: sgrRunClass("48;5;" + """ + str(n) + """).style }));
+""")["style"], "", "index %d must stay on the class path, not fall through to inline style" % n)
+
+
+def _xterm_leak_harness():
+    """Mock infrastructure for XtermTerminal, standing in for the browser globals `_build()`/
+    `destroy()` touch: `window.Terminal`/`window.FitAddon.FitAddon` (fake xterm.js), a fake
+    `ResizeObserver` global (matching real DOM behaviour: `window.ResizeObserver` is just a
+    feature-detection READ of the same global, so this is one constructor, not two independent
+    fakes that could silently drift apart), `window.addEventListener`/`removeEventListener` (net
+    counting 'resize' registrations), a minimal `document`/`getComputedStyle` for `_xtermTheme()`,
+    a controllable `_loadXtermAssets()` (returns a Promise this harness resolves on command,
+    simulating the real ~480KB asset fetch staying pending for an arbitrary amount of time), and
+    counters for how many real xterm.js Terminal instances were ever constructed/disposed. Every
+    counter is a plain running total -- the tests read it directly rather than eyeballing calls."""
+    return """
+// Real addEventListener/removeEventListener are keyed on the FUNCTION REFERENCE, not a counter --
+// adding the same listener twice is a no-op, and removing one that was never added is *also* a
+// no-op (never goes negative). A plain incr/decr counter mock would get this wrong -- e.g.
+// destroy()'s own removeEventListener() call is UNCONDITIONAL even when _build() never ran and
+// nothing was ever added -- so this models it as a Set instead, exactly like the real DOM.
+var __resizeListenerSet = new Set();
+var __roInstances = [];          // every ResizeObserver ever constructed, in creation order
+var __xtermBuilt = 0;            // how many real (fake) xterm.js Terminal instances were built
+var __xtermDisposed = 0;
+
+function ResizeObserver(cb) {
+  this._cb = cb;
+  this.disconnected = false;
+  __roInstances.push(this);
+}
+ResizeObserver.prototype.observe = function () {};
+ResizeObserver.prototype.disconnect = function () { this.disconnected = true; };
+
+var window = {
+  ResizeObserver: ResizeObserver,
+  addEventListener: function (name, fn) { if (name === 'resize') __resizeListenerSet.add(fn); },
+  removeEventListener: function (name, fn) { if (name === 'resize') __resizeListenerSet.delete(fn); },
+};
+window.Terminal = function (opts) {
+  __xtermBuilt++;
+  this._opts = opts;
+};
+window.Terminal.prototype.loadAddon = function () {};
+window.Terminal.prototype.open = function () {};
+window.Terminal.prototype.attachCustomKeyEventHandler = function () {};
+window.Terminal.prototype.onData = function () {};
+window.Terminal.prototype.onResize = function () {};
+window.Terminal.prototype.focus = function () {};
+window.Terminal.prototype.hasSelection = function () { return false; };
+window.Terminal.prototype.dispose = function () { __xtermDisposed++; };
+function FakeFitAddon() {}
+FakeFitAddon.prototype.fit = function () {};
+window.FitAddon = { FitAddon: FakeFitAddon };
+
+var document = {
+  documentElement: {},
+  createElement: function () {
+    return { className: '', appendChild: function () {}, setAttribute: function () {} };
+  },
+};
+function getComputedStyle() { return { getPropertyValue: function () { return ''; } }; }
+
+function postKeys() {}
+function postResize() {}
+function EventSource(url) { this.url = url; this.closed = false; }
+EventSource.prototype.close = function () { this.closed = true; };
+
+function debounce(fn) { return fn; }   // real debounce timing is not what this module tests
+
+var _noopRendererSwitch = { getActive: function () { return 'grid'; }, switchTo: function () {} };
+function buildToolbar() { return { refreshMouseToggle: function () {} }; }
+
+function makeContainer() {
+  return { innerHTML: '', appendChild: function () {} };
+}
+
+// Controllable stand-in for the real _loadXtermAssets(): each call returns a NEW pending Promise
+// and stashes its resolver, so the test decides exactly when (and whether) that call's asset
+// "finishes loading" -- this is what lets a test put attach() into the exact pending state the
+// reviewer's repro needs, hold it there across a destroy(), and only then let it resolve.
+var __assetLoadResolvers = [];
+function _loadXtermAssets() {
+  return new Promise(function (resolve) { __assetLoadResolvers.push(resolve); });
+}
+function resolveNextAssetLoad() {
+  var r = __assetLoadResolvers.shift();
+  if (r) r();
+}
+"""
+
+
+class TestXtermSwitchDestroyRace(unittest.TestCase):
+    """DEFECT 1, executed: the reviewer's exact repro. `XtermTerminal.prototype.attach` defers
+    everything (the real `this.term`, `this._ro` ResizeObserver, and the `window` resize listener)
+    behind `_loadXtermAssets()`'s promise; `destroy()` called while that promise is still pending
+    used to complete as a clean no-op (nothing was built yet to tear down) and then the deferred
+    `_build()` fired anyway -- ON the already-destroyed instance -- building a real xterm.js
+    Terminal (never disposed), a ResizeObserver on a detached pane (never disconnected), and
+    re-adding the window resize listener AFTER destroy() had already tried to remove it. Fixed by
+    the `_destroyed` flag set in destroy() and checked at the top of `_build()` (mirroring
+    ContextBar._destroyed). Proven RED against the pre-fix code by hand: temporarily reverted the
+    `_destroyed` guard (the constructor's `this._destroyed = false;`, `_build`'s early-return
+    check, and destroy()'s `this._destroyed = true;`) back to the original code, reran this exact
+    test, and confirmed it fails with the same leak the reviewer measured, before restoring the
+    fix."""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_destroy_during_pending_asset_load_leaks_nothing(self):
+        script = _HARNESS_PRELUDE + _xterm_leak_harness() + _XTERM_LEAK_SRC + """
+async function main() {
+  var container = makeContainer();
+  var term = new XtermTerminal(container, 'tty1');
+  term.attach();      // starts the (pending, controllable) asset load
+  term.destroy();     // destroy() BEFORE that load ever resolves -- the exact race
+  resolveNextAssetLoad();   // now let the deferred _build() fire, if it still would
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+
+  console.log(JSON.stringify({
+    termSetOnDestroyed: term.term !== null,
+    roSetOnDestroyed: !!term._ro,
+    liveResizeListeners: __resizeListenerSet.size,
+    liveResizeObservers: __roInstances.filter(function (r) { return !r.disconnected; }).length,
+    xtermInstancesBuilt: __xtermBuilt,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertFalse(result["termSetOnDestroyed"], "term.term must stay null on a destroyed instance")
+        self.assertFalse(result["roSetOnDestroyed"], "term._ro must stay null on a destroyed instance")
+        self.assertEqual(result["liveResizeListeners"], 0, "no window resize listener may survive")
+        self.assertEqual(result["liveResizeObservers"], 0, "no live ResizeObserver may survive")
+        self.assertEqual(
+            result["xtermInstancesBuilt"], 0,
+            "_build() must bail out before ever constructing a real xterm.js Terminal",
+        )
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_repeated_switches_do_not_leak_cumulatively(self):
+        # The exact real-world shape: an impatient user taps the switch button repeatedly before
+        # each load finishes. Ten repetitions of attach()-then-destroy()-then-resolve, asserting
+        # the leak counters stay at their post-fix value of zero EVERY time, not just once --
+        # catching a fix that clears state once but still accumulates across repeats.
+        script = _HARNESS_PRELUDE + _xterm_leak_harness() + _XTERM_LEAK_SRC + """
+async function main() {
+  var snapshots = [];
+  for (var i = 0; i < 10; i++) {
+    var container = makeContainer();
+    var term = new XtermTerminal(container, 'tty-repeat-' + i);
+    term.attach();
+    term.destroy();
+    resolveNextAssetLoad();
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    snapshots.push({
+      liveResizeListeners: __resizeListenerSet.size,
+      liveResizeObservers: __roInstances.filter(function (r) { return !r.disconnected; }).length,
+      xtermInstancesBuilt: __xtermBuilt,
+    });
+  }
+  console.log(JSON.stringify({ snapshots: snapshots }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        for i, snap in enumerate(result["snapshots"]):
+            self.assertEqual(snap["liveResizeListeners"], 0, "repetition %d leaked a resize listener" % i)
+            self.assertEqual(snap["liveResizeObservers"], 0, "repetition %d leaked a live ResizeObserver" % i)
+            self.assertEqual(snap["xtermInstancesBuilt"], 0, "repetition %d built a real xterm.js instance" % i)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_normal_path_build_then_destroy_cleans_up_everything(self):
+        # The non-racing path: attach() resolves BEFORE destroy() -- _build() runs for real, and
+        # destroy() must then actually dispose the xterm.js terminal, disconnect the
+        # ResizeObserver, and remove the window listener (not just skip re-leaking them).
+        script = _HARNESS_PRELUDE + _xterm_leak_harness() + _XTERM_LEAK_SRC + """
+async function main() {
+  var container = makeContainer();
+  var term = new XtermTerminal(container, 'tty-normal');
+  term.attach();
+  resolveNextAssetLoad();
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+
+  var afterBuild = {
+    termIsSet: term.term !== null,
+    roIsSet: !!term._ro,
+    liveResizeListeners: __resizeListenerSet.size,
+    liveResizeObservers: __roInstances.filter(function (r) { return !r.disconnected; }).length,
+    xtermInstancesBuilt: __xtermBuilt,
+  };
+
+  term.destroy();
+
+  console.log(JSON.stringify({
+    afterBuild: afterBuild,
+    termAfterDestroy: term.term,
+    roAfterDestroy: term._ro,
+    liveResizeListenersAfterDestroy: __resizeListenerSet.size,
+    liveResizeObserversAfterDestroy: __roInstances.filter(function (r) { return !r.disconnected; }).length,
+    xtermInstancesDisposed: __xtermDisposed,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        before = result["afterBuild"]
+        self.assertTrue(before["termIsSet"], "sanity: _build() must actually run on the normal path")
+        self.assertTrue(before["roIsSet"])
+        self.assertEqual(before["liveResizeListeners"], 1)
+        self.assertEqual(before["liveResizeObservers"], 1)
+        self.assertEqual(before["xtermInstancesBuilt"], 1)
+
+        self.assertIsNone(result["termAfterDestroy"], "destroy() must dispose and clear this.term")
+        self.assertIsNone(result["roAfterDestroy"], "destroy() must disconnect and clear this._ro")
+        self.assertEqual(result["liveResizeListenersAfterDestroy"], 0, "destroy() must remove the window listener")
+        self.assertEqual(result["liveResizeObserversAfterDestroy"], 0, "destroy() must disconnect the ResizeObserver")
+        self.assertEqual(result["xtermInstancesDisposed"], 1, "destroy() must dispose() the xterm.js terminal")
 
 
 if __name__ == "__main__":

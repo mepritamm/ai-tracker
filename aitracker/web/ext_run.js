@@ -24,6 +24,13 @@
       else if (n === 4) out.push("au");
       else if (n === 7) out.push("ar");
       else if ((n >= 30 && n <= 37) || (n >= 90 && n <= 97) || (n >= 40 && n <= 47)) out.push("a" + n);
+      // BOTH background ranges -- not just 40-47 -- for the same reason ext_vt.js's sgrRunClass
+      // takes both: term_vt.py's Screen._sgr (the shared server-side SGR parser both Tier 2 and
+      // Tier 3 stream through) stores a direct aixterm bright-background code (100-107) VERBATIM
+      // rather than normalising it, so a program emitting `\x1b[100m` directly used to produce no
+      // class at all here. Named "a100".."a107" (not "ag100" or similar) to match this file's own
+      // "a" + n scheme, which already uses one prefix for both fg and bg classes.
+      else if (n >= 100 && n <= 107) out.push("a" + n);
     });
     return { reset: reset, cls: out.join(" ") };
   }

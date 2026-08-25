@@ -2629,8 +2629,8 @@ class TestTermRendererConfigDefault(unittest.TestCase):
         importlib.reload(config)
         return config.TERM_RENDERER
 
-    def test_default_is_grid_when_unset(self):
-        self.assertEqual(self._reload_with(None), "grid")
+    def test_default_is_xterm_when_unset(self):
+        self.assertEqual(self._reload_with(None), "xterm")
 
     def test_xterm_is_honoured(self):
         self.assertEqual(self._reload_with("xterm"), "xterm")
@@ -2638,7 +2638,11 @@ class TestTermRendererConfigDefault(unittest.TestCase):
     def test_grid_is_honoured_explicitly(self):
         self.assertEqual(self._reload_with("grid"), "grid")
 
-    def test_garbage_value_falls_back_to_grid_rather_than_breaking(self):
+    def test_garbage_value_falls_back_to_grid_not_the_new_default(self):
+        # Deliberate: an unrecognised value is user/env error, not a preference, so it falls back
+        # to the SAFER renderer ("grid" -- repaint on reconnect, server-backed scrollback,
+        # mid-session notices) rather than mirroring the new "xterm" default. See the comment
+        # above config.TERM_RENDERER for the reasoning.
         self.assertEqual(self._reload_with("nonsense"), "grid")
 
 

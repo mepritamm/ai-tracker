@@ -3,7 +3,12 @@
 The load-bearing one is TestParseCmd.test_injection_semicolon: this feature is only defensible
 because there is no shell, and the allowlist is what keeps it that way.
 """
+import json
 import os
+import re
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -711,6 +716,131 @@ class TestEviction(unittest.TestCase):
             self.assertIn("stale", term_run.JOBS)
             call(_FakeHandler())
             self.assertNotIn("stale", term_run.JOBS)
+
+
+# ===== SGR class <-> CSS coverage (this session) ================================================
+# Tier 3's ext_vt.js/.css had the identical bug this section closes here: sgrRunClass()'s
+# class-mapping branch only matched background codes 40-47, and ext_vt.css defined rules for only
+# a handful of those -- so a background SGR code could produce either no class at all (JS gap) or
+# a class with no matching CSS rule (CSS gap), both rendering as an invisible/no-op background.
+# ext_run.js/.css mirror that same SGR-class scheme (see ext_run.js's own header comment), so this
+# ports the same structural test: EXECUTE the real sgrClass() (extracted verbatim out of
+# ext_run.js, not retyped) under Node over the FULL 30-37/90-97 (fg) and 40-47/100-107 (bg) direct
+# SGR ranges, and assert every class it can emit has a matching `.runout .aXXX` rule in
+# ext_run.css. Node is NOT a dependency of this project (CLAUDE.md: "Stdlib only") -- this class is
+# skipped outright when `node` isn't on PATH, so `make check` stays green without it.
+_WEB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "aitracker", "web")
+_HAS_NODE = shutil.which("node") is not None
+
+
+def _read_ext_run_js():
+    with open(os.path.join(_WEB, "ext_run.js"), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _run_node(js_source):
+    """Writes `js_source` to a temp file and runs it with `node`, returning parsed JSON printed to
+    stdout by the script's own final `console.log(JSON.stringify(...))`. Raises with the script's
+    stderr/stdout on any non-zero exit or unparsable output, so a failure here shows up as a normal
+    test failure with full context, not a silent None."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "harness.js")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(js_source)
+        proc = subprocess.run(["node", path], capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        raise AssertionError(
+            "node harness exited %d\n--- stdout ---\n%s\n--- stderr ---\n%s"
+            % (proc.returncode, proc.stdout, proc.stderr)
+        )
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except Exception as e:
+        raise AssertionError(
+            "could not parse JSON from node harness output: %r\nfull stdout:\n%s\nstderr:\n%s"
+            % (e, proc.stdout, proc.stderr)
+        )
+
+
+if _HAS_NODE:
+    # sgrClass(params) is a bare top-level function inside ext_run.js's IIFE (not a
+    # Terminal.prototype method) -- extracted by literal span from its own declaration through
+    # (but not including) the next top-level function declared right after it, same strategy
+    # test_term_vt_exec.py's own _KEY_TO_BYTES_SRC/_SGR_HELPERS_SRC use for ext_vt.js.
+    _src = _read_ext_run_js()
+    _sgr_start = _src.index("function sgrClass(params) {")
+    _sgr_end = _src.index("function stripNonSgr(s) {")
+    _SGR_CLASS_SRC = _src[_sgr_start:_sgr_end]
+
+
+class TestSgrClassCssCoverage(unittest.TestCase):
+    """Structural test: EVERY class string sgrClass() can emit for a plain 16-colour attribute/
+    foreground/background code -- direct SGR params (1/3/4/7 attrs, 30-37/90-97 fg, 40-47/100-107
+    bg) -- must have a matching `.runout .aXXX` rule in ext_run.css. A class sgrClass can produce
+    with no CSS rule renders as an invisible/no-op span: exactly the `a100`..`a107` (bright
+    background) and pre-existing `a40`/`a45`/`a46`/`a47` (classic background) bug this test class
+    was added to catch. Data-driven over the FULL range, not a handful of hand-picked cases -- a
+    future gap anywhere in that space fails this test by name, not just the spans a human happened
+    to think to check."""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_every_emittable_sgr_class_has_a_css_rule(self):
+        inputs = ["1", "3", "4", "7"]                              # ab / ai / au / ar
+        for v in list(range(30, 38)) + list(range(90, 98)):        # direct foreground
+            inputs.append(str(v))
+        for v in list(range(40, 48)) + list(range(100, 108)):      # direct background
+            inputs.append(str(v))
+
+        script = _HARNESS_RUN_PRELUDE + _SGR_CLASS_SRC + """
+var out = [];
+""" + "\n".join("out.push(sgrClass(%s).cls);" % json.dumps(s) for s in inputs) + """
+console.log(JSON.stringify({ classes: out }));
+"""
+        result = _run_node(script)["classes"]
+        self.assertEqual(len(result), len(inputs))
+
+        # Every one of these inputs is a real, well-formed SGR param this file must render -- an
+        # empty `cls` means sgrClass silently dropped it (a JS-side gap, not a CSS one).
+        empty = [inp for inp, cls in zip(inputs, result) if not cls]
+        self.assertEqual(empty, [], "sgrClass(...) produced NO class at all for: %s" % empty)
+
+        emitted = set()
+        for cls in result:
+            emitted.update(c for c in cls.split(" ") if c)
+
+        with open(os.path.join(_WEB, "ext_run.css"), encoding="utf-8") as fh:
+            css = fh.read()
+        # SGR run classes are always written as one or more `.runout .aXXX` selectors sharing a
+        # rule (e.g. ".runout .a30,.runout .a90{...}") -- see the comment right above that block in
+        # ext_run.css. Collecting every such class name gives the exact set of classes the
+        # stylesheet actually defines, independent of how the rules are grouped.
+        defined = set(re.findall(r"\.runout \.([A-Za-z0-9]+)", css))
+
+        missing = sorted(emitted - defined)
+        self.assertEqual(missing, [],
+                          "sgrClass() can emit these classes but ext_run.css defines no "
+                          "`.runout .<class>` rule for them: %s" % missing)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_direct_bright_background_100_to_107_gets_a_class(self):
+        # Behavioural pin for the JS-side half specifically: term_vt.py's Screen._sgr (the shared
+        # server-side SGR parser both Tier 2 and Tier 3 stream through -- see term_vt.py:1093)
+        # stores a direct aixterm bright-background code (100-107) VERBATIM rather than
+        # normalising it, so this is the more common real-world path, not an edge case.
+        script = _HARNESS_RUN_PRELUDE + _SGR_CLASS_SRC + """
+var out = {};
+[100, 101, 107].forEach(function (n) {
+  out[n] = sgrClass(String(n)).cls;
+});
+console.log(JSON.stringify({ result: out }));
+"""
+        result = _run_node(script)["result"]
+        self.assertEqual(result["100"], "a100")   # bright black bg
+        self.assertEqual(result["101"], "a101")   # bright red bg
+        self.assertEqual(result["107"], "a107")   # bright white bg
+
+
+_HARNESS_RUN_PRELUDE = "'use strict';\n"
 
 
 if __name__ == "__main__":

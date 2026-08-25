@@ -227,6 +227,15 @@
 }
 .vtzoombtn:hover { opacity: 1; color: var(--text); border-color: var(--blue); }
 
+/* ---- terminal wrap (this session): the ACTIVE terminal's own toolbar+pane, nested one level
+   inside .vtmb/#ext_vt.vtfull. Terminal/XtermTerminal's constructor does `container.innerHTML =
+   ""` on whatever container it's handed -- giving it this wrap (never .vtmb/#ext_vt.vtfull
+   directly) is what lets a renderer switch (ext_vt.js's switchActiveRenderer / mountRenderer)
+   wipe and rebuild JUST the toolbar+pane, leaving the ContextBar and any notice banner sitting
+   outside it untouched. Must itself be a flex column with flex:1 so nesting it doesn't change
+   .vttoolbar's/.vtpane's existing flex sizing one level up -- see those rules' own comments. ---- */
+.vttermwrap { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+
 /* ---- mouse-reporting toggle (this session): a sibling .vtzoombtn-styled control, same idiom
    (span, same tokens/padding/border-radius) so it reads as "part of the toolbar", not a bolted-on
    second control system. `.vtmouseon` marks it green while forwarding is active (distinct from the
@@ -239,6 +248,15 @@
 .vtmousebtn.vtmouseon { color: var(--green2); border-color: var(--green2); opacity: .85; }
 .vtmousebtn.vtmouseinert { opacity: .3; cursor: default; }
 .vtmousebtn.vtmouseinert:hover { opacity: .3; color: var(--dim); border-color: var(--line3); }
+
+/* ---- renderer switch (this session): same .vtzoombtn idiom as the mouse toggle just above --
+   xterm.js is now the DEFAULT renderer (see config.TERM_RENDERER) with the built-in grid painter
+   kept reachable here as a per-terminal override. `.vtrendererxterm` marks it (a distinct colour
+   from the mouse toggle's green, so the two states are never confused at a glance) while xterm.js
+   is the one on screen; unlike `.vtmouseinert` there is no dimmed/inert state here -- the switch
+   is always meaningful, so it's never styled as a no-op. ---- */
+.vtrendererbtn { margin-left: 4px; }
+.vtrendererbtn.vtrendererxterm { color: var(--blue); border-color: var(--blue); opacity: .85; }
 
 /* ---- xterm.js pane (the "xterm" TRACKER_TERM_RENDERER path -- see term_vt.py's big comment
    above raw_stream() and config.py's TERM_RENDERER for why two renderers coexist). Reuses
@@ -343,6 +361,28 @@
   .vtctxcum { display: none; }   /* cumulative total is the least essential number at this width */
 }
 
+/* Background tints app.css has no token for (black/magenta/cyan/white -- unlike red-bg/green-bg/
+   amber-bg/blue-deep, which app.css already defines for the other four 16-colour backgrounds).
+   Kept local to this file rather than added to app.css's own :root (out of this file's ownership
+   scope) -- same per-theme-pair pattern app.css itself uses (a :root/html.light split), each value
+   the matching foreground token's own colour (--dim/--violet/--ring2/--head, the exact colours
+   .vtf30/.vtf35/.vtf36/.vtf37 already use below) at a low alpha in line with app.css's existing
+   --red-bg (.14 dark / .12 light) -- so these stay theme-correct without hardcoding a hex value
+   that would go stale if app.css's palette ever changes. `vt-` prefixed so a future app.css token
+   of the same short name can never silently collide with this file's own. */
+:root {
+  --vt-black-bg: rgba(107, 117, 133, .14);
+  --vt-violet-bg: rgba(167, 139, 250, .14);
+  --vt-cyan-bg: rgba(41, 211, 152, .14);
+  --vt-white-bg: rgba(201, 212, 224, .14);
+}
+html.light {
+  --vt-black-bg: rgba(149, 140, 118, .12);
+  --vt-violet-bg: rgba(122, 92, 192, .12);
+  --vt-cyan-bg: rgba(31, 157, 107, .12);
+  --vt-white-bg: rgba(64, 58, 46, .12);
+}
+
 /* SGR runs -> classes. MUST stay in sync with sgrRunClass() in ext_vt.js, which is the single
    place that maps parsed-integer SGR params to these class names -- see the comment there for
    the assumed row/run encoding this depends on. */
@@ -358,10 +398,19 @@
 .vtrow .vtf35, .vtrow .vtf95 { color: var(--violet); }
 .vtrow .vtf36, .vtrow .vtf96 { color: var(--ring2); }
 .vtrow .vtf37, .vtrow .vtf97 { color: var(--head); }
-.vtrow .vtg41 { background: var(--red-bg); }
-.vtrow .vtg42 { background: var(--green-bg); }
-.vtrow .vtg43 { background: var(--amber-bg); }
-.vtrow .vtg44 { background: var(--blue-deep); }
+/* Bright background (100-107) has no distinct token of its own -- approximated as IDENTICAL to
+   the matching classic background (40-47), sharing one rule each, exactly the way the bright
+   FOREGROUND codes (90-97) already share a rule with their classic counterparts (30-37) above.
+   An honest approximation: bright and classic render the same colour for these, rather than an
+   invisible cell. */
+.vtrow .vtg40, .vtrow .vtg100 { background: var(--vt-black-bg); }
+.vtrow .vtg41, .vtrow .vtg101 { background: var(--red-bg); }
+.vtrow .vtg42, .vtrow .vtg102 { background: var(--green-bg); }
+.vtrow .vtg43, .vtrow .vtg103 { background: var(--amber-bg); }
+.vtrow .vtg44, .vtrow .vtg104 { background: var(--blue-deep); }
+.vtrow .vtg45, .vtrow .vtg105 { background: var(--vt-violet-bg); }
+.vtrow .vtg46, .vtrow .vtg106 { background: var(--vt-cyan-bg); }
+.vtrow .vtg47, .vtrow .vtg107 { background: var(--vt-white-bg); }
 
 /* tablets/phones: the overlay/modal already becomes a bottom sheet via app.css's own
    @media(max-width:600px) rules (same classes, reused) -- only the pane's own metrics need a

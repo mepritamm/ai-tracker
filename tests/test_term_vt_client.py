@@ -22,9 +22,28 @@ def _read(name):
 def _function_body(src, marker):
     """The full source of one `Terminal.prototype.X = function ...` (or any `marker`), up to the
     next `Terminal.prototype.` after it -- robust against the body growing/shrinking, unlike a
-    fixed-size slice."""
-    start = src.index(marker)
-    nxt = src.find("Terminal.prototype.", start + len(marker))
+    fixed-size slice.
+
+    `marker` is matched as a PREFIX of the target's signature, not a full-literal exact match: a
+    trailing ") {" (a complete, closed parameter list) is stripped before searching, so a marker
+    like "function Terminal(container, ttyId) {" actually locates the source via the shorter
+    "function Terminal(container, ttyId" -- which still matches even after the real signature
+    grows an added parameter (e.g. "function Terminal(container, ttyId, rendererSwitch) {"). The
+    real function start is then found by scanning forward to the first "{" from there, so the
+    returned body still opens at the true brace regardless of how long the parameter list got.
+    This is what lets a constructor's signature grow without invalidating every test that locates
+    its body by this literal (see ext_vt.js's own Terminal/XtermTerminal constructor comments).
+
+    Substring hazard checked: a Terminal marker must never accidentally match inside
+    XtermTerminal's signature. It can't -- "function " is followed directly by "XtermTerminal" in
+    that constructor, never by "Terminal", so the prefix "function Terminal(" (or the fuller
+    "function Terminal(container, ttyId") never occurs as a substring of
+    "function XtermTerminal(container, ttyId, ...) {" at any position.
+    """
+    prefix = marker[:-3] if marker.endswith(") {") else marker
+    start = src.index(prefix)
+    brace = src.index("{", start)
+    nxt = src.find("Terminal.prototype.", brace)
     return src[start: nxt if nxt != -1 else len(src)]
 
 
@@ -372,9 +391,10 @@ class TestContextBarDocksToBottomOfBothMounts(unittest.TestCase):
     def test_modal_builds_a_context_bar_after_the_terminal(self):
         # ext_vt.js now picks between Terminal (grid) and XtermTerminal per the server-owned
         # `renderer` -- see the TRACKER_TERM_RENDERER switch -- so the construction call is
-        # `new Cls(...)`, not a literal `new Terminal(...)`; the ordering guarantee this test
-        # pins (terminal built before the context bar) is unchanged.
-        term_i = self.src.index("var term = new Cls(modalBodyEl, activeTty);")
+        # `new Cls(...)`, not a literal `new Terminal(...)`. The terminal is built into its own
+        # dedicated `wrap` (see TestRendererSwitch below for why), not modalBodyEl directly; the
+        # ordering guarantee this test pins (terminal built before the context bar) is unchanged.
+        term_i = self.src.index("var term = new Cls(wrap, activeTty, {")
         bar_i = self.src.index("activeBar = new ContextBar(modalBodyEl, sid, activeTty, mode,")
         self.assertLess(term_i, bar_i)
 
@@ -485,7 +505,7 @@ class TestZoomControlOverlapFix(unittest.TestCase):
         self.assertLess(term_body.index("container.appendChild(toolbarEl)"),
                          term_body.index("container.appendChild(pane)"))
 
-        xterm_start = self.js.index("function XtermTerminal(container, ttyId) {")
+        xterm_start = self.js.index("function XtermTerminal(container, ttyId")
         xterm_body = self.js[xterm_start:self.js.index("XtermTerminal.prototype.attach")]
         self.assertIn("container.appendChild(toolbarEl)", xterm_body)
         self.assertIn("container.appendChild(pane)", xterm_body)
@@ -501,7 +521,7 @@ class TestXtermRendererSwitch(unittest.TestCase):
         self.js = _read("ext_vt.js")
 
     def test_xterm_terminal_class_exists(self):
-        self.assertIn("function XtermTerminal(container, ttyId)", self.js)
+        self.assertIn("function XtermTerminal(container, ttyId", self.js)
         for method in ("attach", "measureAndResize", "destroy", "focus"):
             self.assertIn("XtermTerminal.prototype.%s = function" % method, self.js)
 
@@ -1248,7 +1268,7 @@ class TestMouseReportingToggle(unittest.TestCase):
         # not reimplemented separately inside either constructor
         term_body = _function_body(self.src, "function Terminal(container, ttyId) {")
         self.assertNotIn("vtmousebtn", term_body)
-        xterm_start = self.src.index("function XtermTerminal(container, ttyId) {")
+        xterm_start = self.src.index("function XtermTerminal(container, ttyId")
         xterm_body = self.src[xterm_start:self.src.index("XtermTerminal.prototype.attach")]
         self.assertNotIn("vtmousebtn", xterm_body)
 
@@ -1322,7 +1342,7 @@ class TestMouseReportingToggle(unittest.TestCase):
 
     def test_xterm_toggle_is_inert_and_commented_as_deliberate(self):
         # requirement 7: xterm.js owns its own mouse handling -- the toggle must not fight it.
-        xterm_start = self.src.index("function XtermTerminal(container, ttyId) {")
+        xterm_start = self.src.index("function XtermTerminal(container, ttyId")
         xterm_body = self.src[xterm_start:self.src.index("XtermTerminal.prototype.attach")]
         self.assertIn("isMeaningful: function () { return false; }", xterm_body)
         self.assertIn("do not fight it", xterm_body)
@@ -1549,6 +1569,142 @@ class TestSendNeverSettlesTimeout(unittest.TestCase):
         page = build_page()
         self.assertIn("Terminal.prototype._sendWithTimeout = function", page)
         self.assertIn("}, 5000);", page)
+
+
+class TestRendererSwitchControl(unittest.TestCase):
+    """xterm.js is now the DEFAULT renderer (config.TERM_RENDERER, flipped by a concurrent agent
+    this session); this is the client half that keeps the built-in grid painter reachable ON
+    DEMAND, per terminal, from the toolbar -- so a user can switch away from xterm the moment they
+    hit one of its documented gaps. Mirrors TestMouseReportingToggle's own structure closely: same
+    "shared toolbar, not reimplemented per renderer" shape, same "never hidden by host/viewport"
+    rule, same "reaches the browser" check."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+        self.css = _read("ext_vt.css")
+
+    def _switch_body(self):
+        return _body_until(self.src, "function switchActiveRenderer(renderer) {", ["function openVT(sid, mode) {"])
+
+    def _mount_body(self):
+        return _body_until(self.src, "function mountRenderer(renderer) {", ["function boot(renderer) {"])
+
+    def test_switch_is_built_in_the_shared_toolbar_not_per_renderer(self):
+        # Same pattern TestZoomControlOverlapFix/TestMouseReportingToggle already pin for the
+        # zoom controls and the mouse toggle: ONE buildToolbar definition, consulted by both
+        # constructors, never reimplemented separately inside either one.
+        body = _function_body(self.src, "function buildToolbar(")
+        self.assertIn("vtrendererbtn", body)
+        self.assertIn("rendererSwitch.getActive()", body)
+        self.assertIn("rendererSwitch.switchTo(", body)
+        term_body = _function_body(self.src, "function Terminal(container, ttyId) {")
+        self.assertNotIn("vtrendererbtn", term_body)
+        xterm_start = self.src.index("function XtermTerminal(container, ttyId")
+        xterm_body = self.src[xterm_start:self.src.index("XtermTerminal.prototype.attach")]
+        self.assertNotIn("vtrendererbtn", xterm_body)
+
+    def test_both_constructors_pass_a_rendererswitch_into_the_shared_toolbar(self):
+        # The interface itself is supplied by the CALL SITE (openVT / bootStandalone), not
+        # invented inside Terminal/XtermTerminal -- each constructor just forwards what it was
+        # given, now as an ordinary third NAMED parameter (`rendererSwitch`). This used to be read
+        # via `arguments[2]` specifically to avoid touching the `function Terminal(container,
+        # ttyId) {` / `function XtermTerminal(container, ttyId) {` literals that dozens of OTHER
+        # tests in this file located bodies by; `_function_body` (see its own docstring) now
+        # matches those by prefix instead, so the signature is free to carry the parameter for
+        # real -- default-filled with `_noopRendererSwitch` when the caller omits it.
+        term_body = _function_body(self.src, "function Terminal(container, ttyId, rendererSwitch) {")
+        self.assertIn("rendererSwitch = rendererSwitch || _noopRendererSwitch;", term_body)
+        self.assertIn("rendererSwitch\n    );", term_body)
+        xterm_start = self.src.index("function XtermTerminal(container, ttyId")
+        xterm_body = self.src[xterm_start:self.src.index("XtermTerminal.prototype.attach")]
+        self.assertIn("function XtermTerminal(container, ttyId, rendererSwitch)", xterm_body)
+        self.assertIn("rendererSwitch = rendererSwitch || _noopRendererSwitch;", xterm_body)
+        self.assertIn("rendererSwitch\n    );", xterm_body)
+
+    def test_switching_destroys_the_old_terminal(self):
+        # Requirement 3: the old Terminal/XtermTerminal must actually be torn down (closing its
+        # SSE, timers and document-level listeners -- see Terminal.prototype.destroy /
+        # XtermTerminal.prototype.destroy) before the replacement is built, for BOTH mount points.
+        self.assertIn("activeTerm.destroy();", self._switch_body())
+        self.assertIn("curTerm.destroy(); curTerm = null;", self._mount_body())
+
+    def test_switching_rebuilds_against_the_same_tty(self):
+        # Both renderers share the server's PTYS table -- the switch must pass the EXISTING tty id
+        # to the new constructor, never request a fresh one.
+        self.assertIn("new Cls(activeTermWrap, activeTty,", self._switch_body())
+        self.assertIn("new Cls(termWrap, tty,", self._mount_body())
+
+    def test_contextbar_is_rewired_not_destroyed_on_switch(self):
+        # Requirement 4: "re-wire it to the new terminal object rather than leaving it pointing at
+        # a destroyed one" -- the SAME ContextBar instance must survive, only its getInput()
+        # callback should move to the new terminal. Destroying/recreating the bar would also be
+        # wrong here (it would reset the bar's own DOM/poll timer for no reason).
+        modal = self._switch_body()
+        self.assertIn("activeBar.getInput = function () { return term; };", modal)
+        self.assertNotIn("activeBar.destroy()", modal)
+        standalone = self._mount_body()
+        self.assertIn("curBar.getInput = function () { return term; };", standalone)
+        self.assertNotIn("curBar.destroy()", standalone)
+
+    def test_switch_updates_the_active_renderer_variable_new_tab_url_reads(self):
+        # openNewTab() (TestXtermRendererSwitch.test_new_tab_url_relays_the_server_chosen_renderer)
+        # builds its URL from the module-level `activeRenderer` -- the switch must write to that
+        # SAME variable so a "New tab" opened after a switch carries the renderer actually on
+        # screen, not the server's original pick from openVT's own res.j.renderer line.
+        self.assertIn("activeRenderer = renderer;", self._switch_body())
+
+    def test_initial_choice_lines_are_unchanged_by_the_switch_feature(self):
+        # The switch is a later, explicit override -- it must not touch how the INITIAL renderer
+        # is picked. Both of the server-owned decision lines from before this feature existed are
+        # pinned verbatim.
+        self.assertIn('activeRenderer = (res.j.renderer === "xterm") ? "xterm" : "grid";', self.src)
+        body = _body_until(self.src, "function bootStandalone", ["})();\n})();"])
+        self.assertIn('fetch("/api/term/renderer")', body)
+        self.assertIn('renderer === "xterm" ? XtermTerminal : Terminal', body)
+
+    def test_control_documents_the_blank_pane_asymmetry_honestly(self):
+        # Requirement 6: switching TO xterm must warn, in the control's own title/aria-label, that
+        # the pane goes blank until the next write -- not hidden in a code comment only.
+        body = _function_body(self.src, "function buildToolbar(")
+        self.assertIn("BLANK", body)
+        self.assertIn("no repaint", body)
+        # and the reverse direction (xterm -> grid) is explained as the safe/instant one, so the
+        # asymmetry itself -- not just one direction -- is documented on the control.
+        self.assertIn("repaints instantly", body)
+
+    def test_control_carries_aria_pressed_and_is_keyboard_activatable(self):
+        # Requirement 7: real accessibility state, not just a visual style change, and reachable
+        # by keyboard (Enter/Space) as well as tap/click -- same pattern as the mouse toggle.
+        body = _function_body(self.src, "function buildToolbar(")
+        self.assertIn('rendererBtn.setAttribute("aria-pressed"', body)
+        self.assertIn('rendererBtn.setAttribute("tabindex", "0")', body)
+        self.assertIn('rendererBtn.addEventListener("click"', body)
+        self.assertIn('rendererBtn.addEventListener("keydown"', body)
+
+    def test_control_is_not_hidden_by_host_or_viewport(self):
+        # Hard project rule (same as TestMouseReportingToggle.test_control_is_not_hidden_by_
+        # host_or_viewport): no location.hostname gate anywhere, and no @media rule may hide
+        # .vtrendererbtn behind display:none at any breakpoint.
+        self.assertNotIn("location.hostname", self.src)
+        css = self.css
+        idx = 0
+        while True:
+            idx = css.find(".vtrendererbtn", idx)
+            if idx == -1:
+                break
+            media_start = css.rfind("@media", 0, idx)
+            if media_start != -1:
+                block_end = css.find("}", idx)
+                block = css[media_start:block_end]
+                self.assertNotIn("display: none", block, "a @media rule must not hide .vtrendererbtn")
+                self.assertNotIn("display:none", block, "a @media rule must not hide .vtrendererbtn")
+            idx += len(".vtrendererbtn")
+
+    def test_reaches_the_browser(self):
+        page = build_page()
+        self.assertIn("vtrendererbtn", page)
+        self.assertIn("function switchActiveRenderer(renderer) {", page)
+        self.assertIn("function mountRenderer(renderer) {", page)
 
 
 if __name__ == "__main__":

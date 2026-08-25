@@ -111,18 +111,23 @@ BIND_HOST = "127.0.0.1"
 TERMINAL = os.environ.get("TRACKER_TERMINAL", "") != "0"
 
 
-# TWO renderer implementations exist for the in-browser terminal (Tier 3): "grid" (default) is
-# term_vt.Screen, a server-side VT100 emulator streaming parsed rows over SSE to a hand-written JS
-# painter; "xterm" hands the PTY's raw bytes straight to a vendored xterm.js in the browser. This
-# is a DELIBERATE exception to conventions rule 4 ("land a capability at the shared seam, never
-# two forked implementations") -- see the big comment above term_vt.raw_stream() (search
+# TWO renderer implementations exist for the in-browser terminal (Tier 3): "grid" is term_vt.Screen,
+# a server-side VT100 emulator streaming parsed rows over SSE to a hand-written JS painter; "xterm"
+# (default) hands the PTY's raw bytes straight to a vendored xterm.js in the browser. This is a
+# DELIBERATE exception to conventions rule 4 ("land a capability at the shared seam, never two
+# forked implementations") -- see the big comment above term_vt.raw_stream() (search
 # "TRACKER_TERM_RENDERER switch" in term_vt.py) for why the user chose "both, switchable" instead
 # of a straight replacement, and for exactly what each path does and does not support.
 # Server-owned (conventions rule 5): the client learns this from POST /api/term/pty's response or
-# GET /api/term/renderer, never decides it locally. Default "grid" so nothing changes for existing
-# users until they opt in; any value other than "grid"/"xterm" falls back to "grid" rather than
-# breaking the terminal outright.
-TERM_RENDERER = os.environ.get("TRACKER_TERM_RENDERER", "grid")
+# GET /api/term/renderer, never decides it locally. Default "xterm" -- it beats grid on wide
+# characters (CJK/emoji -- the grid emulator treats every codepoint as one column), true colour and
+# native VT fidelity, and the user has accepted its gaps (no repaint on attach/reconnect, no
+# server-backed scrollback/badge/scrollbar, no mid-session server notices on the raw path).
+# An unrecognised value is a DIFFERENT question from "unset": it's user/env error, not a preference,
+# so it deliberately falls back to "grid" -- the safer renderer (repaint on reconnect, server-backed
+# scrollback, mid-session notices) -- rather than to the now-riskier default. This is a decision,
+# not an accident: don't "fix" it to match the unset default without re-reading this comment.
+TERM_RENDERER = os.environ.get("TRACKER_TERM_RENDERER", "xterm")
 if TERM_RENDERER not in ("grid", "xterm"):
     TERM_RENDERER = "grid"
 
