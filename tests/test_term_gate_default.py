@@ -98,7 +98,7 @@ class TestTerminalDefaults(unittest.TestCase):
         This tests the belt-and-braces protection: _origin_ok() is independent of allowed()
         and still rejects cross-origin POSTs."""
         config.TERMINAL = True
-        h = _FakeHandler({"Origin": "https://evil.example", "Host": "localhost:8787"})
+        h = _FakeHandler({"Origin": "https://evil.example", "Host": "localhost:8790"})
         self.assertFalse(term_gate.guard(h),
                         "guard() should refuse cross-origin even when allowed() is True")
         self.assertEqual(h.calls[-1][1], 403,

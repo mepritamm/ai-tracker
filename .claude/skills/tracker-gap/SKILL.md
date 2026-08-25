@@ -139,7 +139,7 @@ them is unfinished, no matter how well it runs by hand. Land them in the same ch
    parser branch → each gets its own test.
 3. **`make check` must print `selfcheck ok` with every test green** (`python3 -m aitracker --selfcheck` +
    the `tests/` suite; `python3 tracker.py --selfcheck` in single-file layout). **Never regress it.**
-4. **Restart the server** (`make serve`, or kill the `:8787` listener and relaunch) — the page is baked in
+4. **Restart the server** (`make serve`, or kill the `:8790` listener and relaunch) — the page is baked in
    at startup, so a client change won't show otherwise.
 5. **Prove it live:** `curl` the relevant endpoint (`/api/list`, `/api/session?id=…`, `/api/search?q=…`)
    and confirm the new field/behavior in the JSON, for **both** a Claude and an Auggie session where the

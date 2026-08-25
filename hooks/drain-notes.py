@@ -22,7 +22,7 @@ Anything unexpected — no tracker, no notes, bad stdin, an unknown event — ex
 A queued note must never be able to break the session it was meant to help.
 
 Finding the tracker: PORT env if set, else the port the server wrote at startup
-(`aitracker/port` — it falls back past 8787 when something else already holds it), else 8787.
+(`aitracker/port` — it falls back past 8790 when something else already holds it), else 8790.
 If the tracker requires a login, it also writes `aitracker/token` and this hook presents it —
 a hook is spawned by the AI tool, so it never inherits TRACKER_AUTH from your shell.
 
@@ -83,7 +83,7 @@ def _note(msg):
         pass
 
 
-port = os.environ.get("PORT") or _published("port") or "8787"
+port = os.environ.get("PORT") or _published("port") or "8790"
 url = "http://127.0.0.1:%s/api/notes/next" % port
 req = urllib.request.Request(url, data=json.dumps({"session": sid}).encode(),
                              headers={"Content-Type": "application/json"})

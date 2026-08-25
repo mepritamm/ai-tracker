@@ -111,6 +111,35 @@
   100% { box-shadow: inset 0 0 0 2px transparent; }
 }
 .vtpane.vtbell { animation: vtbellflash .18s ease-out; }
+
+/* ---- "starting…" overlay: while a mode="resume" pane is still coming up after the server's
+   refused-resume auto-recovery, the server withholds `rows` entirely (see Terminal.prototype.
+   _applyPatch's msg.starting handling and openVT in ext_vt.js), so the pane would otherwise just
+   show an empty grid with a lone blinking cursor -- which reads as broken, not "in progress". This
+   shows a centred, unobtrusive pill instead, following .vtnotice/.vtforkchip's established
+   colours/spacing. CSS-only: no JS animation loop, no timers -- the class toggle is the only JS
+   involvement, the pulse itself is a plain @keyframes animation. ---- */
+.vtpane.vtstarting::after {
+  content: 'starting…';
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: var(--chipbg);
+  border: 1px solid var(--line3);
+  color: var(--dim);
+  font: 600 12px/1 'JetBrains Mono', monospace;
+  white-space: nowrap;
+  pointer-events: none;
+  animation: vtstartingpulse 1.3s ease-in-out infinite;
+}
+@keyframes vtstartingpulse {
+  0%, 100% { opacity: .55; }
+  50% { opacity: 1; }
+}
+.vtpane.vtstarting .vtcursor { visibility: hidden; }   /* no blinking cursor over an empty screen */
 .vtinput {
   position: fixed;
   left: -9999px;

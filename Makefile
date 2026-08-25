@@ -1,4 +1,4 @@
-PORT ?= 8787
+PORT ?= 8790
 TUNNEL_PORT ?= 8790
 .PHONY: help serve stop tunnel check test hooks bundle
 
