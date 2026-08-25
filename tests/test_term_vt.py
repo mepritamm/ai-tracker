@@ -1387,9 +1387,11 @@ class TestWireFormat(unittest.TestCase):
         payload = json.loads(captured.split(b"data: ", 1)[1].split(b"\n\n", 1)[0])
         self.assertEqual(
             set(payload.keys()),
-            {"v", "rows", "cursor", "alt", "cursor_visible", "bracketed_paste", "bell", "notices"},
+            {"v", "rows", "cursor", "alt", "cursor_visible", "bracketed_paste", "bell", "notices",
+             "starting"},
         )
         self.assertEqual(payload["notices"], [])
+        self.assertIs(payload["starting"], False)   # a plain Pty() defaults to starting=False
 
     def test_second_viewer_attaching_to_a_live_tty_gets_a_full_repaint(self):
         pt = term_vt.Pty(tid="fmt2")
@@ -3551,6 +3553,314 @@ class TestNoticeDeliveryOverScreenStream(unittest.TestCase):
         obj, code = h.calls[-1]
         self.assertEqual(code, 200, obj)
         self.assertIsNone(obj["notice"])
+
+
+class TestStartingFieldOnOpenPty(_ResumeModeRoutes):
+    """POST /api/term/pty's `starting` field (see open_pty()'s readiness-state section): True
+    only for a fresh mode="resume" open -- and reflected on the `Pty` itself, not just the JSON
+    response, since that's what `_screen_stream_body()` actually reads. Never True for "cwd"/
+    "new", which never touch the flag at all (it stays at `Pty.__init__`'s own default False)."""
+
+    def test_starting_true_for_resume_mode(self):
+        original_spawn = term_vt.spawn
+        term_vt.spawn = lambda cwd, argv, cols, rows: term_vt.Pty(tid="sf1")
+        try:
+            with mock.patch.object(term_vt, "_resume_backstop"):
+                h = _FakeHandler()
+                term_vt.open_pty(h, None, {"session": "any-sid", "mode": "resume"})
+        finally:
+            term_vt.spawn = original_spawn
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200, obj)
+        self.assertIs(obj["starting"], True)
+        self.assertTrue(term_vt.PTYS["sf1"].starting)
+
+    def test_backstop_thread_failing_to_start_does_not_wedge_the_pane(self):
+        """`_resume_backstop` is the SOLE owner of clearing `starting` now that `Pty.finish()`
+        leaves it alone, so a resume pane that never gets a backstop would withhold rows FOREVER --
+        a permanently blank terminal, strictly worse than the refusal flash this state exists to
+        hide. The pty is already registered in PTYS by the time the thread is started, and
+        `Thread.start()` can genuinely fail under thread exhaustion, so that failure must undo the
+        flag instead of leaking a wedged pane."""
+        def _boom(*a, **kw):
+            raise RuntimeError("can't start new thread")
+        original_spawn = term_vt.spawn
+        term_vt.spawn = lambda cwd, argv, cols, rows: term_vt.Pty(tid="sf-wedge")
+        try:
+            with mock.patch.object(term_vt.threading, "Thread", _boom):
+                h = _FakeHandler()
+                term_vt.open_pty(h, None, {"session": "wedged-sid", "mode": "resume"})
+        finally:
+            term_vt.spawn = original_spawn
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200, obj)
+        self.assertIs(obj["starting"], False,
+                      "must not tell the client to await a readiness signal that cannot arrive")
+        self.assertFalse(term_vt.PTYS["sf-wedge"].starting,
+                         "a resume pane with no backstop must not stay stuck in `starting`")
+
+    def test_starting_false_for_cwd_and_new_modes(self):
+        original_spawn = term_vt.spawn
+        term_vt.spawn = lambda cwd, argv, cols, rows: term_vt.Pty(tid="sf2")
+        try:
+            for mode in ("cwd", "new"):
+                with self.subTest(mode=mode):
+                    h = _FakeHandler()
+                    term_vt.open_pty(h, None, {"session": "any-sid-%s" % mode, "mode": mode})
+                    obj, code = h.calls[-1]
+                    self.assertEqual(code, 200, obj)
+                    self.assertIs(obj["starting"], False)
+                    self.assertFalse(term_vt.PTYS["sf2"].starting)
+        finally:
+            term_vt.spawn = original_spawn
+
+
+class TestStartingReadinessState(unittest.TestCase):
+    """The per-pty `starting` readiness flag as seen over a live `/api/term/screen` SSE stream:
+    while a `mode="resume"` pty's refusal question is still open, `_screen_stream_body()`
+    withholds row content (but not cursor/alt/bell/notices) from every grid viewer, and once it
+    clears the very next frame is a full, uncapped replay -- see that function's docstring for why
+    leaving `since` pinned during `starting` is what makes that replay free, with no second code
+    path and no separate buffer to keep in sync."""
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        term_vt._STREAMS = 0
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        for pt in list(term_vt.PTYS.values()):
+            pt.kill()
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+        term_vt._STREAMS = 0
+
+    def _open(self, pt):
+        h = _StreamHandler()
+        t = threading.Thread(target=term_vt.screen_stream, args=(h, _Q("tty=" + pt.id)))
+        t.daemon = True
+        t.start()
+        self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
+        return h, t
+
+    @staticmethod
+    def _recv_frame(h):
+        h.peer.settimeout(3)
+        raw = h.peer.recv(65536)
+        return json.loads(raw.split(b"data: ", 1)[1].split(b"\n\n", 1)[0])
+
+    def test_frame_while_starting_withholds_rows_but_keeps_notices(self):
+        pt = term_vt.Pty(tid="st1", screen=Screen(cols=10, rows=2))
+        pt.screen.feed(b"AAAAAAAAAA")
+        with pt.lock:
+            pt.starting = True
+            pt.add_notice("still starting")
+        term_vt.PTYS[pt.id] = pt
+        h, t = self._open(pt)
+        try:
+            frame = self._recv_frame(h)
+            self.assertEqual(frame["rows"], [])
+            self.assertIs(frame["starting"], True)
+            self.assertIn("still starting", [n["text"] for n in frame["notices"]])
+        finally:
+            h.close_peer(); t.join(5); h.close()
+
+    def test_since_is_not_advanced_while_starting_so_rows_replay_once_cleared(self):
+        pt = term_vt.Pty(tid="st2", screen=Screen(cols=10, rows=2))
+        pt.screen.feed(b"AAAAAAAAAA")
+        with pt.lock:
+            pt.starting = True
+        term_vt.PTYS[pt.id] = pt
+        h, t = self._open(pt)
+        try:
+            first = self._recv_frame(h)
+            self.assertEqual(first["rows"], [])
+            self.assertIs(first["starting"], True)
+
+            # More output arrives while STILL starting -- also withheld, not just the first row.
+            pt.screen.feed(b"BBBBBBBBBB")
+            second = self._recv_frame(h)
+            self.assertEqual(second["rows"], [])
+            self.assertIs(second["starting"], True)
+
+            # Flag clears -- with no further screen output at all, the very next frame must carry
+            # EVERYTHING withheld so far (both rows), because `since` was never advanced while
+            # starting was True.
+            with pt.lock:
+                pt.starting = False
+            third = self._recv_frame(h)
+            self.assertIs(third["starting"], False)
+            texts = " ".join(text for _, text, _ in third["rows"])
+            self.assertIn("AAAAAAAAAA", texts)
+            self.assertIn("BBBBBBBBBB", texts)
+        finally:
+            h.close_peer(); t.join(5); h.close()
+
+    def test_non_resume_pty_is_never_starting_and_frames_are_unaffected(self):
+        """A "cwd"/"new" pty never sets `starting` at all (default False from `Pty.__init__`) --
+        so its frames must carry real row content from the very first one, exactly as before this
+        capability existed."""
+        pt = term_vt.Pty(tid="st3", screen=Screen(cols=10, rows=2))
+        pt.screen.feed(b"CCCCCCCCCC")
+        term_vt.PTYS[pt.id] = pt
+        self.assertFalse(pt.starting)
+        h, t = self._open(pt)
+        try:
+            frame = self._recv_frame(h)
+            self.assertIs(frame["starting"], False)
+            texts = " ".join(text for _, text, _ in frame["rows"])
+            self.assertIn("CCCCCCCCCC", texts)
+        finally:
+            h.close_peer(); t.join(5); h.close()
+
+    def test_done_while_starting_keeps_stream_open_until_starting_clears(self):
+        """The refusal-recovery race `_screen_stream_body`'s own docstring calls out under its
+        `done and not starting` bullet: a refused `mode="resume"` child exits (`pt.done = True`)
+        mid-recovery while `starting` is still True, and `_retry_with_fork()` is about to revive
+        this SAME `Pty` a moment later. If the loop returned on `done` alone the SSE connection
+        would close in between and the browser's EventSource would fire `onerror` -- so with both
+        flags True the body must NOT return, and once `starting` is cleared (the replacement child
+        answered, or the backstop gave up) it must return promptly on the very next poll."""
+        pt = term_vt.Pty(tid="st5", screen=Screen(cols=10, rows=2))
+        with pt.lock:
+            pt.starting = True
+            pt.done = True
+            pt.ended = time.time()   # otherwise _reap() (called from every route) drops this
+                                      # already-"done" record before the stream ever attaches
+        term_vt.PTYS[pt.id] = pt
+        h, t = self._open(pt)
+        try:
+            frame = self._recv_frame(h)
+            self.assertIs(frame["starting"], True)
+            # `done` is already True here too -- if the loop returned on `done` alone the thread
+            # would have exited by now. Give it a bounded moment and confirm it is still running.
+            t.join(0.5)
+            self.assertTrue(t.is_alive(),
+                             "_screen_stream_body returned while starting was still True, "
+                             "despite pt.done -- the resume-refusal SSE connection must stay open")
+
+            with pt.lock:
+                pt.starting = False
+            # Now `done and not starting` -- the very next poll (<=0.05s tick) must return.
+            t.join(5)
+            self.assertFalse(t.is_alive(),
+                              "_screen_stream_body did not return promptly once starting cleared")
+        finally:
+            if t.is_alive():
+                with pt.lock:
+                    pt.starting = False
+                h.close_peer()
+                t.join(5)
+            h.close()
+
+
+class TestStartingClearedByBackstop(unittest.TestCase):
+    """Every place `Pty.starting` is cleared OTHER than a live SSE viewer's own read (that side is
+    covered by TestStartingReadinessState above): the settle-based "this is an ordinary resume"
+    conclusion, the fork retry's own completion, `Pty.finish()`, and the unconditional fail-open
+    in `_resume_backstop`'s `finally` -- a pty must never be left stuck in `starting` forever just
+    because none of the others ever ran."""
+
+    def test_finish_does_not_clear_starting(self):
+        """INVERTED deliberately. The refused child exiting is the NORMAL MIDDLE of a recovery,
+        not the end of one -- it exits(1) at ~2.61s and `_retry_with_fork` revives this same Pty
+        moments later. Clearing `starting` here would reveal the refusal at exactly the moment the
+        flag exists to hide it, and would also let the SSE stream close mid-recovery. Fail-open is
+        still guaranteed, just by `_resume_backstop`'s `finally` instead (covered by
+        test_fail_open_when_backstop_exits_without_matching_anything)."""
+        pt = _bare_pty()
+        with pt.lock:
+            pt.starting = True
+        pt.finish()
+        self.assertTrue(pt.starting, "finish() must leave the recovery's readiness state alone")
+        self.assertTrue(pt.done)
+
+    def _feed(self, pt, data):
+        self.assertTrue(_wait_for(lambda: bool(pt.raw_queues)))
+        with pt.lock:
+            qs = list(pt.raw_queues)
+        for q in qs:
+            q.put(data)
+
+    def test_fail_open_when_backstop_exits_without_matching_anything(self):
+        """The child already looks done, for some reason entirely unrelated to a refusal (e.g.
+        `claude` itself just exited 0) -- BEFORE the loop even gets a chance to see any output, so
+        neither the settle-clear (which requires `not pt.done`) nor a refusal match can ever fire.
+        Only the unconditional clear in `finally` can end this pty's `starting` state."""
+        pt = _bare_pty()
+        with pt.lock:
+            pt.starting = True
+        pt.done, pt.rc = True, 0
+        with mock.patch.object(term_vt, "BACKSTOP_WINDOW", 0.2), \
+             mock.patch.object(term_vt, "BACKSTOP_DONE_GRACE", 0.05):
+            term_vt._resume_backstop(pt, "healthy-sid", False, 80, 24)
+        self.assertFalse(pt.starting)
+
+    def test_settle_clears_starting_for_an_ordinary_non_refusing_resume(self):
+        """The other clearing path: output that never matches the refusal marker, once
+        BACKSTOP_SETTLE has passed since it first arrived, concludes "ordinary resume" on its own
+        -- without waiting for the child to exit or for BACKSTOP_WINDOW to run out."""
+        pt = _bare_pty()
+        with pt.lock:
+            pt.starting = True
+        with mock.patch.object(term_vt, "BACKSTOP_WINDOW", 3.0), \
+             mock.patch.object(term_vt, "BACKSTOP_SETTLE", 0.1):
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, "ordinary-sid", False, 80, 24))
+            t.start()
+            try:
+                self._feed(pt, b"an ordinary CLI banner, not the refusal text\n")
+                self.assertTrue(_wait_for(lambda: pt.starting is False, timeout=2))
+                # The child never exited during this wait -- proves the SETTLE path cleared it,
+                # not the fail-open `finally` (which only runs once this function returns).
+                self.assertTrue(t.is_alive())
+            finally:
+                pt.done = True     # let the watcher's grace window end the thread promptly
+                t.join(timeout=2)
+
+    def test_escape_only_output_does_not_start_the_settle_clock(self):
+        """THE REGRESSION THIS CLASS EXISTS FOR. A real `claude --resume` writes a terminal-init
+        escape burst at t~=0 and prints the refusal about two seconds later (measured: 2.05s).
+        The settle clock must not start on those escapes -- if it does, it expires while the child
+        is still alive and no refusal has printed, clears `starting`, and the refusal paints into
+        the pane after all. That defeats the flag entirely on the live path while every other test
+        in this file still passes, because none of them model the gap between "first bytes" and
+        "first readable text"."""
+        pt = _bare_pty(tid="st-esc")
+        with pt.lock:
+            pt.starting = True
+        with mock.patch.object(term_vt, "BACKSTOP_WINDOW", 3.0), \
+             mock.patch.object(term_vt, "BACKSTOP_SETTLE", 0.1):
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, "esc-sid", False, 80, 24))
+            t.start()
+            try:
+                # Exactly what the CLI emits before it prints anything a human can read.
+                self._feed(pt, b"\x1b7\x1b[r\x1b8\x1b[?25h\x1b[?25l\x1b[?2004h"
+                                b"\x1b[?1004h\x1b[?2031h\x1b[>0q\x1b[c")
+                # Well past BACKSTOP_SETTLE: if the clock had started on those bytes it would
+                # already have fired by now.
+                time.sleep(0.4)
+                self.assertTrue(pt.starting,
+                                "escape-only output must not satisfy the settle heuristic")
+                # Real text now starts the clock for real.
+                self._feed(pt, b"an ordinary CLI banner\n")
+                self.assertTrue(_wait_for(lambda: pt.starting is False, timeout=2))
+            finally:
+                pt.done = True
+                t.join(timeout=2)
+
+    def test_retry_with_fork_clears_starting(self):
+        pt = _bare_pty(tid="rt-st1")
+        with pt.lock:
+            pt.starting = True
+        with mock.patch.object(term_vt, "_fork_child", return_value=(4242, 99)), \
+             mock.patch.object(term_vt.threading, "Thread"):
+            term_vt._retry_with_fork(pt, "retry-sid", 80, 24)
+        self.assertFalse(pt.starting)
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ NOTES_FILE = os.path.join(_HERE, "notes.json")
 
 
 # Where the server is actually listening, written at startup. `run()` falls back to the next
-# free port when 8787 is taken, so anything outside the browser (the notes drain hook) has to
+# free port when 8790 is taken, so anything outside the browser (the notes drain hook) has to
 # be told the real one rather than assume the default.
 PORT_FILE = os.path.join(_HERE, "port")
 

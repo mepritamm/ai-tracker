@@ -45,12 +45,12 @@ A tool only appears if its data exists on the machine — install nothing, it ju
 python3 -m aitracker
 ```
 
-That's it. It starts a local server on **http://localhost:8787** and opens your browser. Pick a session from the sidebar (or paste a session id) and watch it work. If `8787` is already taken it automatically uses the next free port (and prints the one it picked, plus records it in `aitracker/port` so the notes drain hook can still find it).
+That's it. It starts a local server on **http://localhost:8790** and opens your browser. Pick a session from the sidebar (or paste a session id) and watch it work. If `8790` is already taken it automatically uses the next free port (and prints the one it picked, plus records it in `aitracker/port` so the notes drain hook can still find it).
 
 Prefer the Makefile — it restarts cleanly (frees a stuck port so UI changes always take effect):
 
 ```bash
-make serve            # run locally on http://localhost:8787 — no tunnel, no login (the default)
+make serve            # run locally on http://localhost:8790 — no tunnel, no login (the default)
 make stop             # stop the tracker (and any running tunnel)
 make serve PORT=9000  # use a different port
 make tunnel           # OPTIONAL — reach it from your phone via a Cloudflare tunnel (needs TRACKER_AUTH; see below)

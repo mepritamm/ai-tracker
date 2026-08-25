@@ -163,7 +163,7 @@ class TestGuard(unittest.TestCase):
         """guard() returns False when Origin header doesn't match Host."""
         # Same-origin curl/fetch sends no Origin header at all -- only a mismatched Origin
         # (a cross-site POST) should be refused.
-        h = _FakeHandler({"Origin": "https://evil.example", "Host": "localhost:8787"})
+        h = _FakeHandler({"Origin": "https://evil.example", "Host": "localhost:8790"})
         self.assertFalse(term_gate.guard(h))
         obj, code = h.calls[-1]
         self.assertEqual(code, 403)
@@ -171,7 +171,7 @@ class TestGuard(unittest.TestCase):
 
     def test_same_origin_post_passes(self):
         """guard() returns True when Origin header matches Host."""
-        h = _FakeHandler({"Origin": "http://localhost:8787", "Host": "localhost:8787"})
+        h = _FakeHandler({"Origin": "http://localhost:8790", "Host": "localhost:8790"})
         self.assertTrue(term_gate.guard(h))
         self.assertEqual(h.calls, [])   # guard writes nothing when it allows the request through
 

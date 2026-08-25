@@ -22,7 +22,7 @@ const stub=()=>new Proxy(function(){},{get:(t,k)=>k===Symbol.toPrimitive?()=>"":
 globalThis.document={documentElement:{classList:{contains:()=>false,toggle:()=>{}}},
   getElementById:()=>stub(),addEventListener:()=>{},querySelectorAll:()=>[],querySelector:()=>stub()};
 globalThis.localStorage={getItem:()=>null,setItem:()=>{}};
-globalThis.location={host:"localhost:8787",href:"http://localhost:8787/"};
+globalThis.location={host:"localhost:8790",href:"http://localhost:8790/"};
 globalThis.addEventListener=()=>{};
 globalThis.fetch=()=>new Promise(()=>{});
 globalThis.window=globalThis;

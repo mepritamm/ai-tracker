@@ -240,6 +240,11 @@
     this.cellW = 7.2; this.cellH = 17;
     this._sized = false;
     this._onStatusChange = null;
+    // `starting`: true only while a mode="resume" pane is still coming up after the server's
+    // refused-resume auto-recovery (see openVT, which seeds this off the POST /api/term/pty
+    // response before this pane's EventSource even opens, and _applyPatch below, which tracks the
+    // SSE stream's own per-frame `starting` key once it's open). Server-owned (conventions rule 5).
+    this.starting = false;
     this.focused = false;
     this.cursorVisible = true;             // DECTCEM ?25 -- see the header comment's caveat
     this.bracketedPaste = false;           // ?2004 -- see the header comment's caveat
@@ -381,6 +386,18 @@
       if (this._bellSeen !== null && msg.bell !== this._bellSeen) this._flashBell();
       this._bellSeen = msg.bell;
     }
+    // `starting`: absent key (older server, or the standalone raw page which never sends this
+    // envelope shape at all) is treated as "not starting" -- never let a missing field wedge the
+    // pane in a starting state forever. While starting the server withholds `rows` entirely, so
+    // there's nothing to paint here either way; the moment it flips false the very next frame
+    // carries every withheld row (the server doesn't advance our version cursor while starting),
+    // so that arrives and paints itself via the normal row loop below -- no refetch, no reopening
+    // the stream. We do force one header refresh on the false-edge, since _onStatusChange (see
+    // openVT) was suppressing real connection status text the whole time we were starting.
+    var wasStarting = this.starting;
+    this.starting = (msg.starting !== undefined) ? !!msg.starting : false;
+    this.pane.classList.toggle("vtstarting", this.starting);
+    if (wasStarting && !this.starting && this._onStatusChange) this._onStatusChange("connected");
     var rows = msg.rows || [];
     for (var i = 0; i < rows.length; i++) {
       var entry = rows[i];
@@ -908,6 +925,9 @@
   };
 
   XtermTerminal.prototype._openStream = function () {
+    // No `starting` handling here, deliberately: /api/term/raw is a raw byte stream with no JSON
+    // envelope, so it has no `starting` key to read -- that asymmetry with Terminal's grid-path
+    // _openStream (below) is intentional, not an oversight.
     var self = this;
     if (self.es) self.es.close();
     if (self._onStatusChange) self._onStatusChange("connecting…");
@@ -1411,7 +1431,27 @@
           modalStatusEl.textContent = "tty " + activeTty;
           var Cls = activeRenderer === "xterm" ? XtermTerminal : Terminal;
           var term = new Cls(modalBodyEl, activeTty);
-          term._onStatusChange = function (s) { if (activeTerm === term) modalStatusEl.textContent = "tty " + activeTty + " · " + s; };
+          // `starting` (true only for mode="resume" panes still recovering from a refused
+          // `claude --resume`) is server-owned and read straight off this POST response, seeded
+          // BEFORE term.attach() ever opens the EventSource below -- see Terminal's own `starting`
+          // field comment. Only meaningful for the grid renderer: xterm's /api/term/raw stream
+          // carries no JSON envelope at all, so it has no `starting` key to read (deliberately out
+          // of scope -- see XtermTerminal.prototype._openStream's comment).
+          if (activeRenderer === "grid") {
+            term.starting = !!res.j.starting;
+            term.pane.classList.toggle("vtstarting", term.starting);
+            if (term.starting) modalStatusEl.textContent = "tty " + activeTty + " · starting…";
+          }
+          term._onStatusChange = function (s) {
+            if (activeTerm !== term) return;
+            // Suppress the connecting/connected/reconnecting churn while starting -- in particular
+            // this is where the refused resume child's SSE drop would otherwise flash
+            // "reconnecting…" into the header even though the server recovers on its own a couple
+            // seconds later (the whole point of this change). One steady "starting…" instead, no
+            // matter what status string actually came in.
+            if (term.starting) { modalStatusEl.textContent = "tty " + activeTty + " · starting…"; return; }
+            modalStatusEl.textContent = "tty " + activeTty + " · " + s;
+          };
           activeTerm = term;
           // Built AFTER the Terminal/XtermTerminal (both do container.innerHTML = "" in their own
           // constructor) so the bar's own DOM survives — appended as a sibling of .vtpane inside

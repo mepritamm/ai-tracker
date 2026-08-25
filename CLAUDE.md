@@ -19,7 +19,7 @@ Run from a clone via `python -m aitracker`, or install with `uv` → the `ai-tra
 
 ## Commands
 ```bash
-make serve            # start / restart on http://localhost:8787 (frees the port first)
+make serve            # start / restart on http://localhost:8790 (frees the port first)
 make stop
 make check            # the gate: python -m unittest discover -s tests  → prints "selfcheck ok"
 make bundle           # regenerate the standalone dist/tracker.py

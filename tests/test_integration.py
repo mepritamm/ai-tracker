@@ -459,9 +459,9 @@ class TestServerEndToEnd(unittest.TestCase):
             # one drain per wake — the note is gone, not re-injected on the next prompt
             self.assertEqual(self._hook({"session_id": "idle", "hook_event_name": event}), (0, ""))
 
-    def test_hook_finds_a_server_that_fell_back_off_8787(self):
-        """bind() walks past a busy 8787, so the hook must read the port the server actually
-        published — assuming the default silently queries whatever else owns 8787, forever."""
+    def test_hook_finds_a_server_that_fell_back_off_8790(self):
+        """bind() walks past a busy 8790, so the hook must read the port the server actually
+        published — assuming the default silently queries whatever else owns 8790, forever."""
         self._post("/api/notes", {"session": "moved", "text": "found you"})
         self._post("/api/notes/push", {"session": "moved", "index": 0})
 

@@ -14,7 +14,7 @@ Three things combine here, each independent:
 
 ## TL;DR
 
-**Just running it locally? `make serve` — done** (http://localhost:8787, no tunnel, no login). Everything
+**Just running it locally? `make serve` — done** (http://localhost:8790, no tunnel, no login). Everything
 below is only for reaching it from *another* device; the tracker stays localhost-only until you opt in.
 
 ```bash
@@ -23,14 +23,14 @@ TRACKER_AUTH="you:pick-a-strong-pass" make tunnel      # prints a https://…try
 
 # Or a private Tailscale mesh (stable URL, no public exposure):
 TRACKER_AUTH="you:pick-a-strong-pass" HOST=0.0.0.0 make serve
-# then on the phone open  http://<your-mac-name>:8787  (Tailscale MagicDNS)
+# then on the phone open  http://<your-mac-name>:8790  (Tailscale MagicDNS)
 ```
 
 | Env var | Default | Set it to… |
 |---|---|---|
 | `HOST` | `127.0.0.1` (localhost only) | `0.0.0.0` to accept connections from LAN / Tailscale |
 | `TRACKER_AUTH` | *(empty — off)* | `"user:pass"` to require HTTP Basic Auth on **every** route |
-| `PORT` | `8787` | any free port |
+| `PORT` | `8790` | any free port |
 
 `HOST` and `TRACKER_AUTH` are **off by default** — local development is completely unchanged unless you
 opt in.
@@ -70,7 +70,7 @@ A free, private WireGuard mesh: only *your* devices can see each other, from any
    TRACKER_AUTH="you:pick-a-strong-pass" HOST=0.0.0.0 make serve
    ```
 3. Find your Mac's Tailscale name (MagicDNS) — e.g. `pritams-mac` — in the Tailscale app.
-4. On the phone open `http://pritams-mac:8787`, enter the username/password.
+4. On the phone open `http://pritams-mac:8790`, enter the username/password.
 
 The Tailscale name never changes, so the Home-Screen icon (below) keeps working across restarts. This is
 the best fit for the tracker's "nothing leaves the machine to strangers" design.
@@ -90,8 +90,8 @@ A public URL that forwards to your localhost. Convenient, but it puts your dashb
    ```
 3. In another terminal, open the tunnel:
    ```bash
-   ngrok http 8787
-   # or, with your reserved domain:  ngrok http --domain=your-name.ngrok-free.app 8787
+   ngrok http 8790
+   # or, with your reserved domain:  ngrok http --domain=your-name.ngrok-free.app 8790
    ```
 4. Open the `https://…ngrok-free.app` URL on the phone (click through ngrok's one-time warning), enter the
    password.
@@ -110,7 +110,7 @@ Simplest, but only works while the phone is on the **same network** as the Mac (
    TRACKER_AUTH="you:pick-a-strong-pass" HOST=0.0.0.0 make serve
    ```
 2. Find the Mac's LAN IP: `ipconfig getifaddr en0` (e.g. `192.168.1.105`).
-3. On the phone open `http://192.168.1.105:8787`, enter the password.
+3. On the phone open `http://192.168.1.105:8790`, enter the password.
 
 ---
 
@@ -120,7 +120,7 @@ A free public HTTPS tunnel over Cloudflare's edge. No account for a **quick tunn
 it commonly works where ngrok/Tailscale are blocked.
 
 1. Install once: `brew install cloudflared`.
-2. Start an **authed** tracker on a dedicated port (keeps your local `:8787` untouched):
+2. Start an **authed** tracker on a dedicated port (keeps your local `:8790` untouched):
    ```bash
    TRACKER_AUTH="you:pick-a-strong-pass" PORT=8790 python3 -m aitracker &
    ```

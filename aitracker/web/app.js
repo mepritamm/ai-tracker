@@ -943,7 +943,7 @@ async function togglePin(e,id){
   await loadSide();   // server re-sorts pinned-first; scroll is preserved by renderSide
 }
 async function start(){
-  const _hl=$("hostlbl");if(_hl)_hl.textContent=location.host;   // real host, not the baked "localhost:8787" (matters on phone/tunnel)
+  const _hl=$("hostlbl");if(_hl)_hl.textContent=location.host;   // real host, not the baked "localhost:8790" (matters on phone/tunnel)
   await loadSide();
   // fall back to the newest session if nothing is stored or the stored id is stale
   if((!cur||!sessions.some(s=>s.id===cur))&&sessions[0])cur=sessions[0].id;

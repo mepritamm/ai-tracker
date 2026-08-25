@@ -302,6 +302,81 @@ class TestRefusalAndMissingTranscriptMarkers(unittest.TestCase):
         "No conversation found with session ID: 00000000-0000-0000-0000-000000000000\n"
     )
 
+    # The SAME refusal as VERBATIM_REFUSAL, captured from a REAL pty (python -m pty forking
+    # `claude --resume <a-live-bg-agent-id>`) rather than from a pipe. Ink renders it by jumping
+    # the cursor to each word's column instead of emitting spaces, so the plain-text capture
+    # above is NOT what the backstop actually receives -- and REFUSAL_MARKER is not a substring
+    # of these bytes until term_gate._ANSI_RE has stripped the escapes. This is the regression:
+    # every pinned-wording test passed while the live terminal never fired the backstop once.
+    PTY_REFUSAL = (
+        b"\x1b[?25l\x1b[?2004h\x1b[>0q\x1b[c\x1b[>4m\x1b[<u\x1b[?1004l\x1b[?2004l"
+        b"Session\x1b[9Ge4e6bdd6-937b-4b4a-ac2f-9a8c7789e5b7\x1b[46Gis\x1b[49Gcurrently"
+        b"\x1b[59Grunning\x1b[67Gas\x1b[70Ga\r\r\n"
+        b"background\x1b[12Gagent\x1b[18G(bg).\x1b[24GUse\x1b[28G`claude\x1b[36Gagents`"
+        b"\x1b[44Gto\x1b[47Gfind\x1b[52Gand\x1b[56Gattach\x1b[63Gto\x1b[66Git,\x1b[70Gor"
+        b"\x1b[73Gadd\r\r\n"
+        b"--fork-session\x1b[16Gto\x1b[19Gbranch\x1b[26Goff\x1b[30Ga\x1b[32Gcopy.\r\r\n"
+        b"\x1b[?25h\x1b[?1000l\x1b(B\x0f\x1b[?25h"
+    )
+
+    # Seconds from spawn to exit(1), measured on a real pty against a genuine background-agent
+    # id (refusal bytes printed at 2.05s, waitpid reaped code=1 at 2.61s). The backstop can only
+    # retry once it has observed BOTH the marker and a non-zero rc, so the window has to clear
+    # this -- at the old 2.5 it expired ~0.1s early and _retry_with_fork never ran.
+    MEASURED_REFUSAL_EXIT_SECONDS = 2.61
+
+    def test_backstop_window_clears_the_measured_refusal_exit(self):
+        """The OTHER half of the bug: a correct matcher still can't fire if the watcher has
+        already given up. Every other backstop test mocks BACKSTOP_WINDOW down to keep the
+        suite fast, so this is the only thing pinning the shipped value."""
+        from aitracker import term_vt
+        self.assertGreater(term_vt.BACKSTOP_WINDOW, self.MEASURED_REFUSAL_EXIT_SECONDS * 2,
+                           "BACKSTOP_WINDOW must leave real headroom over a cold-start refusal")
+
+    # The init frame a real `claude --resume` writes before it prints anything readable.
+    PTY_INIT_BURST = (b"\x1b7\x1b[r\x1b8\x1b[?25h\x1b[?25l\x1b[?2004h\x1b[?1049h"
+                      b"\x1b[2J\x1b[H\x1b[?1004h\x1b[?2031h\x1b[>0q\x1b[c")
+
+    def test_no_prefix_of_the_init_burst_normalises_to_text(self):
+        """A pty master read is capped at 1024 bytes, so this burst NEVER arrives as one chunk,
+        and `_resume_backstop` re-scans its buffer after every chunk. If a boundary falls inside an
+        escape sequence -- which is the common case, not the corner one -- the partial tail must
+        not survive stripping as printable junk: b'...\x1b[38' must not normalise to '38', and a
+        buffer ending on a bare b'\x1b' must not normalise to '\x1b' (str.split() does not treat
+        ESC as whitespace).
+
+        Asserting over EVERY prefix is the point. The earlier version of this test fed the burst as
+        a single chunk and therefore could not fail, which is how the settle clock ended up
+        latching at t~=0.06s and letting the refusal paint after all."""
+        for i in range(len(self.PTY_INIT_BURST) + 1):
+            prefix = self.PTY_INIT_BURST[:i]
+            self.assertEqual(term_gate._normalize_output(prefix), "",
+                             "prefix of length %d normalised to text: %r"
+                             % (i, term_gate._normalize_output(prefix)))
+
+    def test_escape_forms_the_cli_actually_emits_leave_no_residue(self):
+        """Forms that used to spill through as text because no branch matched them. Each would
+        latch the settle clock on its own, with no chunk split involved at all."""
+        for raw, expected in [
+            (b"\x1b[38:2:255:0:0mhi\x1b[0m", "hi"),   # ITU sub-parameter (colon) SGR
+            (b"\x1b[4:3m", ""),                       # curly underline
+            (b"\x1b]0;claude", ""),                   # OSC whose terminator is in the next chunk
+            (b"\x1bP>|Claude Code\x1b\\", ""),        # DCS
+            (b"\x1b_G f=100\x1b\\", ""),             # APC
+        ]:
+            with self.subTest(raw=raw):
+                self.assertEqual(term_gate._normalize_output(raw), expected)
+
+    def test_pty_rendered_refusal_is_recognised(self):
+        """The one that was failing in production: ANSI-laden bytes off a real pty."""
+        self.assertTrue(term_gate.looks_like_bg_refusal(self.PTY_REFUSAL))
+
+    def test_ansi_strip_separates_words_it_removes(self):
+        """A column jump BETWEEN two words must become a space, not vanish -- deleting it
+        would fuse "currently"/"running" and fail the match just as quietly."""
+        self.assertIn("is currently running as a background agent (bg)",
+                      term_gate._normalize_output(self.PTY_REFUSAL))
+
     def test_pinned_refusal_wording_is_recognised(self):
         self.assertTrue(term_gate.looks_like_bg_refusal(self.VERBATIM_REFUSAL))
         self.assertTrue(term_gate.looks_like_bg_refusal(self.VERBATIM_REFUSAL.encode()))

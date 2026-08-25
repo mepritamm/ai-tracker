@@ -10,6 +10,7 @@ IMPORTANT: On a server that IS reachable and has a password, anyone with TRACKER
 unrestricted shell as this OS user.
 """
 import ipaddress
+import re
 from urllib.parse import urlparse
 
 from . import config
@@ -100,14 +101,70 @@ session in the current directory. So this is a warn-but-still-open signal, not a
 trigger -- see looks_like_missing_transcript()."""
 
 
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;:?<>=]*[ -/]*[@-~]"     # CSI -- incl. the \x1b[<n>G cursor jumps below. The ':'
+                                          # is required: ITU sub-parameter SGR (\x1b[38:2:255:0:0m,
+                                          # \x1b[4:3m curly underline) is real output, and without
+                                          # it the whole sequence spilled through as "38:2:255:0:0m".
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC  -- title sets etc.
+    r"|\x1b[P^_X][^\x1b]*(?:\x1b\\|\x07)"   # DCS / PM / APC / SOS -- terminated strings
+    r"|\x1b[ -/]*[0-~]"                   # Fp/Fs/Fe + charset escapes: ESC 7, ESC 8, ESC ( B, ...
+                                          # (0x30-0x7E finals -- NOT just @-Z: ESC 7 / ESC 8 are
+                                          # the first bytes a real `claude --resume` emits, and a
+                                          # narrower class left a stray "7"/"8" behind that read as
+                                          # printable text)
+)
+
+_ANSI_PARTIAL_TAIL_RE = re.compile(
+    r"\x1b(?:\[[0-9;:?<>=]*[ -/]*"       # a CSI whose final byte hasn't arrived yet
+    r"|\][^\x07\x1b]*"                  # an OSC still waiting for its BEL / ST
+    r"|[P^_X][^\x1b]*"                   # a DCS/PM/APC/SOS still waiting for its ST
+    r"|[ -/]*"                            # ESC + intermediates, final byte not here yet
+    r")?$"
+)
+"""A TRAILING, still-incomplete escape sequence -- dropped before matching rather than left to be
+half-eaten by _ANSI_RE.
+
+This is the same defect as the one _ANSI_RE's ESC 7/ESC 8 comment describes, one level down, and
+it is the reason it matters: **a pty master read is capped at 1024 bytes**, so Ink's init frame
+never arrives as one chunk, and `_resume_backstop` re-scans its buffer after EVERY chunk. Whenever
+a chunk boundary falls inside an escape sequence -- probability ~(N-1)/N for N-byte sequences, so
+usually -- the partial tail survives stripping as printable junk: b'...\x1b[38' normalises to
+'38', a buffer ending on a bare b'\x1b' normalises to '\x1b' (str.split() does NOT treat ESC as
+whitespace). Measured: 26 of the 42 prefixes of the captured init burst normalised to non-empty.
+
+That junk latched `_resume_backstop`'s settle clock at t~=0.06s instead of at first real text, so
+`starting` cleared at ~0.57s and the refusal painted at 2.05s after all -- the exact bug the flag
+exists to prevent, reproduced end to end. Stripping the partial tail makes normalisation a
+function of the CONTENT rather than of where the reader happened to slice the stream."""
+"""Every escape sequence stripped (to a SPACE, never to nothing) before marker matching.
+
+MEASURED, not assumed: `claude --resume <bg-id>` on a real pty renders the refusal through
+Ink, which does not emit spaces between words -- it jumps the cursor to each word's column.
+The raw bytes are literally:
+
+    Session\x1b[9G<id>\x1b[46Gis\x1b[49Gcurrently\x1b[59Grunning\x1b[67Gas\x1b[70Ga\r\r\n
+    background\x1b[12Gagent\x1b[18G(bg).\x1b[24GUse ...
+
+so REFUSAL_MARKER ("is currently running as a background agent (bg)") is NOT a substring of
+those bytes at all, whitespace-collapsed or not -- the old normalisation only handled the
+`\r\n` wraps, which is why the pinned plain-text capture in the tests passed while the live
+terminal never once fired the backstop. Substituting a space keeps the words apart; deleting
+the escapes would fuse "currently" and "running" into one token and fail just as silently."""
+
+
 def _normalize_output(output) -> str:
-    """`bytes` (or `str`) captured from a child's pty -> one whitespace-collapsed line, so
-    a real terminal's own line-wrapping (which can split REFUSAL_MARKER/
-    MISSING_TRANSCRIPT_MARKER across two visual lines at whatever column the pty happens
-    to be) can never hide a match."""
+    """`bytes` (or `str`) captured from a child's pty -> one whitespace-collapsed line with
+    escape sequences replaced by spaces, so neither the terminal's own line-wrapping nor
+    Ink's column-jump rendering (see _ANSI_RE) can hide a REFUSAL_MARKER/
+    MISSING_TRANSCRIPT_MARKER match."""
     if isinstance(output, bytes):
         output = output.decode("utf-8", "replace")
-    return " ".join(output.split())
+    # Drop a trailing half-arrived escape FIRST -- see _ANSI_PARTIAL_TAIL_RE. Doing it after
+    # _ANSI_RE would be too late: _ANSI_RE's last branch would already have eaten the ESC and
+    # spilled the rest as text.
+    output = _ANSI_PARTIAL_TAIL_RE.sub("", output)
+    return " ".join(_ANSI_RE.sub(" ", output).split())
 
 
 def looks_like_bg_refusal(output) -> bool:

@@ -1276,6 +1276,14 @@ class Pty:
                                     # while it tees into these), never PTYS's module-level _LOCK.
         self.done = False
         self.rc = None
+        self.starting = False      # True only for a `mode="resume"` pty between open_pty() and
+                                    # the moment the refusal/no-refusal question is settled -- see
+                                    # open_pty()'s "readiness state" section and
+                                    # _screen_stream_body()'s use of it. False (and permanently
+                                    # irrelevant) for every other mode, so a "cwd"/"new" pty is
+                                    # completely unaffected. Guarded by `self.lock`, same as
+                                    # `screen` -- every reader/writer of this field already holds
+                                    # it for the snapshot/notices it reads or writes alongside.
         self.forked = False        # --fork-session is in effect for THIS running child --
                                     # either the fast path (term_gate.resume_argv) chose it
                                     # up front, or Option C's backstop (_resume_backstop)
@@ -1368,6 +1376,14 @@ class Pty:
                 self.rc = -os.WTERMSIG(status) if os.WIFSIGNALED(status) else os.WEXITSTATUS(status)
             except (ChildProcessError, OSError):
                 pass
+        # DELIBERATELY does NOT clear `starting`. The refused child exiting is the NORMAL middle
+        # of a recovery, not the end of one: it exits(1) at ~2.61s and `_retry_with_fork` then
+        # revives this same Pty with a --fork-session child. Clearing here would reveal the
+        # refusal at exactly the moment we exist to hide it. Fail-open is still guaranteed, just
+        # by the right owner: `starting` is only ever set for a mode="resume" open, and every such
+        # open starts a `_resume_backstop` whose `finally` clears the flag unconditionally within
+        # BACKSTOP_WINDOW -- so no pty can be stuck even if the child dies in a way nobody
+        # examined. See open_pty()'s readiness-state section.
         self.done = True
         self.ended = time.time()
 
@@ -1551,13 +1567,30 @@ def _write(handler, text):
 # open_pty()'s own docstring) has necessarily already gone out with `forked` reflecting only the
 # fast-path decision (today: always False) by the time either of these could fire.
 
-BACKSTOP_WINDOW = 2.5
+BACKSTOP_WINDOW = 8.0
 """Total seconds `_resume_backstop` watches a fresh `mode="resume"` child's output for either
-the bg-agent refusal or the missing-transcript message before giving up. The matrix
-(docs/claude-resume-command-matrix.md) found the refusal is fast enough to self-terminate
-almost immediately ("EXITED code=1", no SIGKILL needed) -- this is generous headroom over that,
-not a tuned deadline, and bounds the ONE daemon thread this spawns per resume so it can never
-run forever against a hung child."""
+the bg-agent refusal or the missing-transcript message before giving up. Bounds the ONE daemon
+thread this spawns per resume so it can never run forever against a hung child.
+
+WAS 2.5, on the matrix's claim (docs/claude-resume-command-matrix.md) that the refusal
+"self-terminates almost immediately". Re-measured against a real pty on this machine, a genuine
+background-agent refusal takes **2.05s to print and 2.61s to exit(1)** -- the CLI's own startup
+dominates, and the exit landed PAST the old deadline every time. So the watcher gave up ~0.1s
+before the `pt.done`/`pt.rc` it is waiting for existed, and `_retry_with_fork` could not fire
+even once the matcher was fixed. 8.0 is headroom over a slow cold start, not a tuned deadline.
+
+An ordinary (non-refused) resume now holds its watcher thread for the full 8s instead of 2.5s,
+which is why the buffer it scans is capped -- see BACKSTOP_SCAN_BYTES."""
+
+
+BACKSTOP_SCAN_BYTES = 65536
+"""How much of a watched child's output `_resume_backstop` keeps to match against. The whole
+buffer is re-scanned on every BACKSTOP_POLL tick, so an unbounded one makes a chatty resume
+(a long transcript replaying into the pane) quadratic for the length of the window -- a cost
+that tripled when the window went 2.5 -> 8.0. Both markers are ~100 bytes and are printed
+before anything else the CLI emits, so a tail this size cannot lose a match that a full buffer
+would have found; the tail (not the head) is kept so the wrap-spanning normalisation still sees
+whole lines."""
 
 BACKSTOP_POLL = 0.1
 """How often `_resume_backstop` re-checks its tee'd output and `pt.done`/`pt.rc` while inside
@@ -1568,6 +1601,20 @@ BACKSTOP_DONE_GRACE = 0.3
 up -- gives any output already in flight (queued but not yet delivered to this watcher's tee) a
 moment to arrive, without extending every ordinary (non-refused) resume's watch out to the full
 BACKSTOP_WINDOW."""
+
+BACKSTOP_SETTLE = 0.5
+"""How long `_resume_backstop` waits, after a watched child's FIRST output arrives, before it
+will conclude "this is an ordinary resume, not a refusal" and clear `Pty.starting` early (see
+open_pty()'s readiness-state section). The refusal marker can arrive split across chunks, so
+non-matching bytes on the very first poll are not proof of anything by themselves -- this window
+gives a genuinely-in-progress marker time to finish arriving before the non-match is trusted.
+
+0.5 is comfortably UNDER the measured 2.05s at which a real refusal's marker prints (see
+BACKSTOP_WINDOW's docstring): on this machine a refused resume produces NO output at all until
+that marker (and its preamble) lands in one piece, so this window elapses while a genuine
+refusal is still completely silent -- `text` stays empty, `first_output_at` stays unset, and the
+clear never fires for it. An ordinary resume, by contrast, starts painting well inside 0.5s, so
+its `starting` placeholder clears promptly instead of sitting through the full BACKSTOP_WINDOW."""
 
 
 def _feed_note(pt, text):
@@ -1673,6 +1720,12 @@ def _retry_with_fork(pt, sid, cols, rows):
                    "retried automatically with --fork-session -- this is now a COPY under a "
                    "new session id, not the live agent")
     threading.Thread(target=_reader, args=(pt,), daemon=True).start()
+    # The replacement child is live and being read -- the readiness question `pt.starting` was
+    # tracking (refused vs. not) is now answered, so a `_screen_stream_body()` viewer can go back
+    # to seeing real rows. This is the LOAD-BEARING clear for the "refused" path -- the fail-open
+    # one in `_resume_backstop`'s `finally` fires moments later too, but only as a safety net.
+    with pt.lock:
+        pt.starting = False
 
 
 def _resume_backstop(pt, sid, already_forked, cols, rows):
@@ -1688,12 +1741,21 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
     2. **The missing-transcript message** (term_gate.looks_like_missing_transcript) -- not a
        retry trigger (the CLI already recovered on its own), just records `pt.notice` and feeds
        a note so the terminal doesn't silently pretend the resumed transcript is the one shown.
+
+    Also owns clearing `Pty.starting` for the "turned out fine" case: once the child's first
+    output arrives and, BACKSTOP_SETTLE later, still doesn't look like the refusal AND the child
+    is still alive, this concludes "ordinary resume" and clears it early (see BACKSTOP_SETTLE's
+    own docstring for why that ordering is safe against a real refusal). And unconditionally in
+    `finally`, REGARDLESS of which way this function exits -- window expiry, an unrelated child
+    exit, anything -- so a pty can never be left stuck in `starting` because this watcher gave up
+    without either of the two conditions above ever resolving. Fail-open, not fail-stuck.
     """
     q = queue.Queue(maxsize=256)
     with pt.lock:
         pt.raw_queues.append(q)
     buf = bytearray()
     notice_fired = False
+    first_output_at = None   # time.time() of the first non-empty `text` seen -- see BACKSTOP_SETTLE
     deadline = time.time() + BACKSTOP_WINDOW
     grace_until = None      # set once pt.done is first observed -- see BACKSTOP_DONE_GRACE
     try:
@@ -1703,9 +1765,31 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
                 return
             try:
                 buf += q.get(timeout=BACKSTOP_POLL)
+                del buf[:-BACKSTOP_SCAN_BYTES]   # keep a bounded tail; see BACKSTOP_SCAN_BYTES
             except queue.Empty:
                 pass
             text = bytes(buf)
+            # Anchor the settle on the first PRINTABLE output, not the first bytes. A real
+            # `claude --resume` writes a terminal-init escape burst
+            # (\x1b7\x1b[r\x1b8\x1b[?25h\x1b[?25l\x1b[?2004h...) at t~=0, roughly TWO SECONDS
+            # before it prints anything a human could read -- measured: the refusal text lands at
+            # 2.05s. Anchoring on raw bytes therefore fired the settle at ~0.5s, cleared `starting`
+            # while the child was still alive and no refusal had been printed yet, and let the
+            # refusal paint into the pane after all -- defeating the whole point of the flag while
+            # every unit test still passed, because none of them modelled that gap.
+            # `_normalize_output` strips escapes to whitespace and collapses, so an init burst
+            # normalises to "" and only real text starts the clock.
+            # ponytail: relies on the CLI printing NOTHING readable before the refusal, which is
+            # what the capture shows. If a future CLI adds an early banner this clears too soon and
+            # the refusal flashes again -- the old behaviour, not a hang, since every clearing path
+            # here is fail-open.
+            if first_output_at is None and term_gate._normalize_output(text):
+                first_output_at = now
+            if (pt.starting and first_output_at is not None
+                    and now - first_output_at >= BACKSTOP_SETTLE
+                    and not pt.done and not term_gate.looks_like_bg_refusal(text)):
+                with pt.lock:
+                    pt.starting = False
             if not notice_fired and term_gate.looks_like_missing_transcript(text):
                 notice_fired = True
                 pt.notice = ("no prior transcript was found for this session -- a brand-new "
@@ -1734,7 +1818,12 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
             if pt.done and grace_until is None:
                 grace_until = time.time() + BACKSTOP_DONE_GRACE
     finally:
+        # Fail-open, unconditional: however this function is exiting (window expiry, an
+        # already_forked resume with nothing to detect, an unrelated done -- anything), a pty
+        # must never be left stuck in `starting` just because neither the settle-clear above nor
+        # `_retry_with_fork` happened to run. See this function's own docstring.
         with pt.lock:
+            pt.starting = False
             if q in pt.raw_queues:
                 pt.raw_queues.remove(q)
 
@@ -1742,7 +1831,7 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
 # --------------------------------------------------------------------------- routes
 
 def open_pty(handler, parsed, body):
-    """POST /api/term/pty {session, cols, rows, mode} -> {tty, renderer, forked, notice}.
+    """POST /api/term/pty {session, cols, rows, mode} -> {tty, renderer, forked, notice, starting}.
     Also accepts a SESSION-LESS form: {cwd, cols, rows, mode} -- see "Two ways in" below.
 
     `mode` follows term_launch's own naming (`"cwd"` = a plain login shell in the session's
@@ -1793,6 +1882,14 @@ def open_pty(handler, parsed, body):
     `forked` (bool) and `notice` (str or null) are the client contract: `forked` is `--fork-
     session` was applied (this tty is a COPY, not the live session), `notice` is a human-
     readable warning (e.g. the missing-transcript case) to surface.
+
+    `starting` (bool) is a THIRD, independent field, True only for a fresh `mode="resume"` pty
+    (always False otherwise) -- it is NOT about `--fork-session`, it is about whether the refusal
+    question is still open. While True, `_screen_stream_body()` withholds row content from every
+    `screen_stream()` viewer of this tty (see that function's own docstring) so a refusal that is
+    about to be auto-retried never paints into the pane at all; it clears itself, asynchronously,
+    once `_resume_backstop` resolves one way or the other -- see that function's docstring for the
+    two ways it can, and `Pty.starting`/`Pty.finish()` for the unconditional fail-open.
 
     **Both fields are answered from what is knowable AT RESPONSE TIME, which is BEFORE the
     spawned child has produced a single byte of output** (spawn() returns as soon as pty.fork()
@@ -1859,16 +1956,43 @@ def open_pty(handler, parsed, body):
     except OSError as e:
         return handler._json({"error": "spawn failed: %s" % e}, 500)
     pt.forked = forked
+    starting = mode == "resume"
+    if starting:
+        # Set BEFORE the backstop thread starts (and thus before any viewer can possibly learn
+        # this tty id and attach a `screen_stream()`) -- see the readiness-state section above
+        # `_resume_backstop` and `_screen_stream_body()`'s use of this flag. Guarded by `pt.lock`
+        # like every other field it shares that lock with.
+        with pt.lock:
+            pt.starting = True
     with _LOCK:
         PTYS[pt.id] = pt
     if mode == "resume":
-        threading.Thread(target=_resume_backstop, args=(pt, sid, forked, cols, rows),
-                          daemon=True).start()
+        try:
+            threading.Thread(target=_resume_backstop, args=(pt, sid, forked, cols, rows),
+                              daemon=True).start()
+        except RuntimeError:
+            # The backstop is the SOLE owner of clearing `starting` (Pty.finish() deliberately
+            # does not -- see its comment), so a pty that never gets one would withhold rows
+            # forever: a permanently blank terminal, strictly worse than the refusal flash this
+            # whole state exists to hide. Thread.start() can genuinely fail under exhaustion, and
+            # the pty is already in PTYS by this point, so undo the flag rather than leak a
+            # wedged pane. The terminal still works -- it just loses the auto-fork recovery and
+            # shows whatever the CLI prints, which is exactly the old behaviour.
+            with pt.lock:
+                pt.starting = False
+            starting = False
+            print("[ai-tracker] terminal %s: could not start the resume backstop -- "
+                  "readiness disabled for this pane" % pt.id)
     # `renderer` is server-owned policy handed to the client, never asked of it (conventions rule
     # 5) -- see the TRACKER_TERM_RENDERER switch comment above raw_stream() below. Riding along on
     # the response that already exists (rather than a forced extra round trip) is what lets the
-    # modal open its Terminal/XtermTerminal without waiting on anything else.
-    handler._json({"tty": pt.id, "renderer": config.TERM_RENDERER, "forked": forked, "notice": None})
+    # modal open its Terminal/XtermTerminal without waiting on anything else. `starting` rides the
+    # same way: True only for a fresh `mode="resume"` pty (a "cwd"/"new" pty answers False here
+    # and never touches the flag again), so a viewer attaching later already knows to expect
+    # `_screen_stream_body()`'s rows-suppressed frames until the `starting` key in those frames
+    # itself goes False.
+    handler._json({"tty": pt.id, "renderer": config.TERM_RENDERER, "forked": forked, "notice": None,
+                   "starting": starting})
 
 
 CWD_LIST_CAP = 20
@@ -2086,9 +2210,21 @@ def _screen_stream_body(handler, pt):
       here.) The `: ping\\n\\n` heartbeat is a comment line, not a `data:`/`event:` frame, so
       EventSource ignores it for free -- that one is safe as-is.
     * The JSON object carries EXACTLY the keys `Screen.snapshot()` returns -- `v`, `rows`,
-      `cursor`, `alt`, `cursor_visible`, `bracketed_paste`, `bell` -- verbatim, unpadded, PLUS one
-      key this function adds itself: `notices` (see below). No other wrapping, no other extra
-      keys, ever.
+      `cursor`, `alt`, `cursor_visible`, `bracketed_paste`, `bell` -- verbatim, unpadded, PLUS two
+      keys this function adds itself: `notices` (see below) and `starting` (see next). No other
+      wrapping, no other extra keys, ever.
+    * `starting` is `Pty.starting`, read under the SAME lock acquisition as the snapshot, on
+      EVERY frame (not just while True) -- see `open_pty()`'s readiness-state section for what
+      sets/clears it. While it is True, `rows` in the OUTGOING frame is forced to `[]` regardless
+      of what `Screen.snapshot()` actually returned, and -- critically -- the local `since` is NOT
+      advanced to `snap["v"]` afterwards, so the NEXT poll asks `Screen.snapshot()` the same
+      question again. This is deliberate, not a missed update: once `starting` finally goes False,
+      that next poll's `since` is still whatever it was before `starting` ever began (`-1` on the
+      common case of a viewer attaching before the flag clears), so `Screen.snapshot()` naturally
+      returns a FULL, complete-so-far grid on the very first non-suppressed frame -- a real replay
+      of everything withheld, with no second code path and no separate buffer to keep in sync.
+      Cursor, `alt`, `cursor_visible`, `bracketed_paste`, `bell` and `notices` are UNAFFECTED by
+      `starting` and keep flowing normally throughout -- only row content is withheld.
     * `notices` is `[{"seq": <int>, "text": <str>}, ...]`, only entries THIS VIEWER has not yet
       been sent -- `[]` when there are none. Tracked with a local `since_notice`, exactly the way
       `since` already tracks the row diff per-viewer (see the very next bullet): two viewers on
@@ -2132,7 +2268,15 @@ def _screen_stream_body(handler, pt):
     quiet = time.time()
     while True:
         with pt.lock:
-            snap = pt.screen.snapshot(since)
+            starting = pt.starting
+            # While starting, ask for rows we already know we will throw away -- i.e. none.
+            # Passing `since` here would rebuild the ENTIRE grid on every 50ms tick (`since` is
+            # pinned, and a pinned `since == -1` makes `changed` unconditionally true), holding
+            # `pt.lock` against `_reader`/`_feed_note` ~20x a second for up to BACKSTOP_WINDOW.
+            # `snapshot(screen.v)` returns the same everything-else with `rows` already empty,
+            # because no row's version can exceed the screen's own. The viewer's real `since`
+            # stays pinned regardless, so the first post-`starting` frame is still a full replay.
+            snap = pt.screen.snapshot(pt.screen.v if starting else since)
             pending_notices = [n for n in pt.notices if n["seq"] > since_notice]
             done = pt.done
         cursor = tuple(snap["cursor"])
@@ -2142,24 +2286,40 @@ def _screen_stream_body(handler, pt):
         # `pending_notices` joins that same list for the identical reason -- see the docstring's
         # `notices` bullet: a notice with nothing else changed must still trigger a frame.
         changed = (
-            snap["rows"] or since == -1
+            snap["rows"] or (since == -1 and not starting)
             or cursor != last_cursor or snap["alt"] != last_alt
             or snap["cursor_visible"] != last_cv or snap["bracketed_paste"] != last_bp
             or snap["bell"] != last_bell
             or pending_notices
         )
         if changed:
-            since = snap["v"]
+            if starting:
+                # Withhold row content and DO NOT advance `since` -- see the docstring's
+                # `starting` bullet for why leaving it pinned is exactly what makes the first
+                # post-`starting` frame a full, correct replay with no extra machinery.
+                snap["rows"] = []
+            else:
+                since = snap["v"]
             last_cursor, last_alt = cursor, snap["alt"]
             last_cv, last_bp, last_bell = snap["cursor_visible"], snap["bracketed_paste"], snap["bell"]
             if pending_notices:
                 since_notice = pending_notices[-1]["seq"]
             snap["notices"] = pending_notices   # merged in here, NOT part of Screen.snapshot()
                                                  # itself -- the queue lives on Pty, see _feed_note
+            snap["starting"] = starting         # likewise -- see the docstring's `starting` bullet
             if not _write(handler, "data: %s\n\n" % json.dumps(snap)):
                 return
             quiet = time.time()
-        if done:
+        if done and not starting:
+            # `starting` keeps the stream ALIVE across a child's death. A refused resume exits(1)
+            # mid-recovery and `_retry_with_fork` revives this same Pty (same tty id) seconds
+            # later; returning here would close the SSE connection in between, the client's
+            # EventSource would fire onerror, and the pane would show the reconnect churn this
+            # whole readiness state exists to eliminate. The stream stays open, sees the
+            # replacement child's output, and ends normally on the NEXT `done` once `starting` has
+            # cleared. Bounded, not open-ended: every `starting` pane has a `_resume_backstop`
+            # whose `finally` clears the flag within BACKSTOP_WINDOW, so this can hold a dead
+            # pty's stream open for at most that long.
             return
         if _peer_gone(handler):                          # instant: the tab closed
             return

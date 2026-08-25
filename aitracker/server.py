@@ -422,7 +422,7 @@ class Server(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-def bind(host="127.0.0.1", port=8787, tries=20):
+def bind(host="127.0.0.1", port=8790, tries=20):
     """Bind to `port`, or the next free port after it (up to `tries`).
     Returns the listening Server — read its real port off server_address."""
     for p in range(port, port + tries):
@@ -441,7 +441,7 @@ _LOCAL_TTL = 30 * 86400   # ponytail: long-lived because it's rewritten at every
 
 def publish_endpoint(actual):
     """Tell local, non-browser callers (the notes drain hook) how to reach us: the port we
-    actually got — bind() walks past a busy 8787 — and, when a login is configured, a signed
+    actually got — bind() walks past a busy 8790 — and, when a login is configured, a signed
     token they can present. A hook is spawned by the AI tool, so it inherits neither the URL
     nor TRACKER_AUTH; without both it silently 401s and delivers nothing.
 
@@ -465,7 +465,7 @@ def publish_endpoint(actual):
         pass
 
 
-def run(host="127.0.0.1", port=8787, open_browser=True):
+def run(host="127.0.0.1", port=8790, open_browser=True):
     config.BIND_HOST = host    # term_gate reads this to know whether we're loopback-only
     srv = bind(host, port)
     actual = srv.server_address[1]
