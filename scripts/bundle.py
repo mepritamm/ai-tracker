@@ -11,6 +11,7 @@ PKG = os.path.join(ROOT, "aitracker")
 ORDER = [
     "config.py", "util.py", "store.py", "overview.py",
     "providers/base.py", "providers/claude.py", "providers/auggie.py",
+    "providers/augment_ext.py", "providers/opencode.py",
     "registry.py", "server.py", "cli.py",
 ]
 
@@ -26,11 +27,26 @@ __version__ = "%s"
 
 
 def strip_module(src):
-    out = []
-    for line in src.splitlines():
-        if re.match(r'^(import |from )', line):      # drop top-level imports (re-added in HEADER)
-            continue
-        out.append(line)
+    lines = src.splitlines()
+    skip_indices = set()
+
+    # identify all import lines (including multi-line continuations) to drop
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if re.match(r'^(import |from )', line):
+            skip_indices.add(i)
+            # if import spans multiple lines (has unclosed paren), skip continuation lines too
+            if '(' in line and ')' not in line:
+                i += 1
+                while i < len(lines):
+                    skip_indices.add(i)
+                    if ')' in lines[i]:
+                        break
+                    i += 1
+        i += 1
+
+    out = [line for i, line in enumerate(lines) if i not in skip_indices]
     body = "\n".join(out)
     body = re.sub(r'(?<![\w.])config\.', '', body)   # single namespace — config.X -> X
     return body.strip("\n")
@@ -54,6 +70,12 @@ def main():
         body = strip_module(open(os.path.join(PKG, rel)).read())
         if rel == "server.py":
             body = body.replace("build_page()", "PAGE")           # inline page
+            # remove optional module loading (terminal modules are inlined, not importable as separate modules)
+            body = re.sub(
+                r'for _m in \("term_launch", "term_run", "term_vt"\):[\s\S]*?raise',
+                '',
+                body
+            )
             parts.append(inlined_page())
         if rel == "cli.py":
             # the bundle has no test suite; make --selfcheck point at the repo

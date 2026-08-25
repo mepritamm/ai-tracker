@@ -2,7 +2,7 @@
 
 A local web dashboard that shows you **what your AI coding sessions are doing — live**, across tools. It reads the session logs each AI coding tool already writes to disk and turns them into one readable view: a plain-language summary, todos, files touched, commands run, background agents/shells, and the assistant's own narration — refreshing every 2 seconds.
 
-Works across tools via a small **provider** for each. Built in today: **Claude Code** and **Auggie / Augment**. Adding another is a ~2-function adapter (see [Adding a tool](#adding-a-tool)).
+Works across tools via a small **provider** for each. Built in today: **Claude Code**, **Auggie / Augment**, and **opencode**. Adding another is a ~2-function adapter (see [Adding a tool](#adding-a-tool)).
 
 Nothing is sent anywhere. The Python side uses only the standard library — nothing to install, no build step — and it serves a local page you open in your browser.
 
@@ -34,6 +34,7 @@ cd ai-tracker
   - **Auggie CLI** → `~/.augment/sessions/*.json`
   - **Augment VS Code** extension → `~/Library/Application Support/Code/User/workspaceStorage/**/Augment.vscode-augment/`
   - **Augment Cursor** extension → `~/Library/Application Support/Cursor/User/workspaceStorage/**/Augment.vscode-augment/`
+- **opencode** → `~/.local/share/opencode/opencode.db` (SQLite)
 
 A tool only appears if its data exists on the machine — install nothing, it just lights up what you already have.
 
@@ -109,7 +110,7 @@ Worth reading, especially if you expose the server over a tunnel.
 
 ## What it shows
 
-**Sidebar** — every session across all your tools and projects, newest first, each with a source badge (Claude Desktop / Claude CLI / Claude SDK / Claude VS Code / Auggie / Augment VS Code / Augment Cursor), a live dot, and a short title.
+**Sidebar** — every session across all your tools and projects, newest first, each with a source badge (Claude Desktop / Claude CLI / Claude SDK / Claude VS Code / Auggie / Augment VS Code / Augment Cursor / opencode), a live dot, and a short title.
 - **Background-agent sessions** (SDK-spawned, e.g. into a git worktree) are marked **🤖 Agent** and folded into a collapsible **🤖 Agents · &lt;repo&gt;** group per repo — so they don't bury your own sessions in the flat list. Click the group to expand its agents.
 - A session running **in-transcript background agents** (Task/Workflow subagents — which spawn no separate session) carries a **🤖 N running** badge, so you can see it's busy without opening it.
 - **End-state at a glance** — a session **waiting on your answer** (an unanswered `AskUserQuestion` / Auggie `ask-user`) is flagged **⏳ answer** with an amber highlight so you know to go respond; one that **just completed its last run** (the last turn was the assistant finishing, within the live window) shows a subtle **✅ done** — gated to fresh completions so it flags what just landed rather than every stale session. Both work for every tool.
@@ -173,6 +174,7 @@ All providers emit the **same result shape**, so the browser renders them identi
 | **Auggie CLI** | `~/.augment/sessions/*.json` | ✅ built in |
 | **Augment VS Code extension** | `~/Library/Application Support/Code/User/workspaceStorage/**/Augment.vscode-augment/` (JSON) + LevelDB (skipped) | ✅ built in (todos + files touched; chat transcript degraded — see the parity table above) |
 | **Augment Cursor extension** | `~/Library/Application Support/Cursor/User/workspaceStorage/**/Augment.vscode-augment/` (JSON) + LevelDB (skipped) | ✅ built in (same as VS Code) |
+| **opencode** | `~/.local/share/opencode/opencode.db` | ✅ built in |
 | Cursor's own AI, OpenAI Codex | SQLite databases | ⚙️ needs an adapter (format-specific reader) |
 | GitHub Copilot CLI | binary LMDB blobs | ⚙️ needs an adapter |
 

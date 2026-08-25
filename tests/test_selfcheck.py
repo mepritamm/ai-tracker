@@ -576,4 +576,58 @@ def _run():
     assert push_when(True, 0, LIVE_WINDOW) == "wake", "idle claude session -> lands on wake"
     assert push_when(True, 1, LIVE_WINDOW) == "turn", "just inside the live window -> this turn"
     assert push_when(False, LIVE_WINDOW, LIVE_WINDOW) == "none", "no drain beats liveness"
+
+    # opencode provider: SQLite-backed, epoch-MILLISECOND timestamps — the easiest bug to ship
+    # is a list() that forgets to divide by 1000, plus a tool part's error state must reach
+    # counts["errors"] (the same "reach the count" gap Auggie had for command exit status).
+    # Deep coverage lives in tests/test_opencode.py; this is the one-assertion trip-wire.
+    import sqlite3 as _sqlite3
+    from aitracker.providers.opencode import OpencodeProvider as _OpencodeProvider
+    _oc_path = tempfile.mktemp(suffix=".db")
+    _oc_conn = _sqlite3.connect(_oc_path)
+    _oc_conn.executescript("""
+        CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, workspace_id TEXT, parent_id TEXT,
+            slug TEXT, directory TEXT NOT NULL, path TEXT, title TEXT NOT NULL, version TEXT,
+            share_url TEXT, summary_additions INT, summary_deletions INT, summary_files INT,
+            summary_diffs INT, metadata TEXT, cost REAL, tokens_input INT, tokens_output INT,
+            tokens_reasoning INT, tokens_cache_read INT, tokens_cache_write INT, revert TEXT,
+            permission TEXT, agent TEXT, model TEXT, time_created INT, time_updated INT,
+            time_compacting INT, time_archived INT);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INT, time_updated INT, data TEXT);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INT,
+            time_updated INT, data TEXT);
+        CREATE TABLE todo (session_id TEXT, content TEXT, status TEXT, priority TEXT, position INT,
+            time_created INT, time_updated INT, PRIMARY KEY (session_id, position));
+        CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, vcs TEXT, name TEXT,
+            icon_url TEXT, time_created INT, time_updated INT, sandboxes TEXT, commands TEXT);
+    """)
+    _oc_now = int(time.time() * 1000)
+    _oc_conn.execute(
+        "INSERT INTO session (id, parent_id, directory, title, agent, model, tokens_input, tokens_output, "
+        "tokens_cache_read, tokens_cache_write, time_created, time_updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("ses_sc", "", "/work/repo", "Selfcheck opencode session", "build",
+         json.dumps({"id": "big-pickle", "providerID": "opencode", "variant": "default"}),
+         10, 5, 0, 0, _oc_now - 5000, _oc_now - 1000))
+    _oc_conn.execute("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?)",
+                      ("msg_sc", "ses_sc", _oc_now - 4000, _oc_now - 4000, json.dumps({"role": "assistant"})))
+    _oc_conn.execute(
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?,?)",
+        ("part_sc", "msg_sc", "ses_sc", _oc_now - 3000, _oc_now - 3000,
+         json.dumps({"type": "tool", "tool": "bash", "callID": "c1",
+                     "state": {"status": "error", "input": {"command": "npm test"}, "output": ""}})))
+    _oc_conn.commit()
+    _oc_conn.close()
+    _oc_snap = config.OPENCODE_DB
+    config.OPENCODE_DB = _oc_path
+    try:
+        _oc_items = {s["id"]: s for s in _OpencodeProvider().list()}
+        assert _oc_items["opencode:ses_sc"]["mtime"] < 1e11, \
+            "opencode mtime must be epoch SECONDS, not milliseconds: %r" % _oc_items["opencode:ses_sc"]["mtime"]
+        _oc_detail = _OpencodeProvider().parse("opencode:ses_sc")
+        assert _oc_detail["counts"]["errors"] == 1, \
+            "a bash part with state.status=='error' must reach counts['errors']"
+    finally:
+        config.OPENCODE_DB = _oc_snap
+        os.unlink(_oc_path)
+
     print("selfcheck ok")

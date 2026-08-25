@@ -9,7 +9,7 @@ A **zero-dependency** local web dashboard showing what your AI coding sessions a
 ```
 aitracker/            the Python package
   cli.py server.py page.py registry.py store.py overview.py util.py config.py
-  providers/base.py providers/claude.py providers/auggie.py
+  providers/base.py providers/claude.py providers/auggie.py providers/opencode.py
   web/index.html app.css app.js        the SPA as real files (inlined at serve time by page.py)
 tests/test_selfcheck.py                 the self-check, as stdlib unittest
 scripts/bundle.py                       make bundle -> dist/tracker.py (standalone single file)
@@ -27,7 +27,7 @@ python -m aitracker --version | --help | --selfcheck
 ```
 
 ## Architecture (the seams)
-- **Providers.** Each tool is a `Provider` (`available/list/parse/search`) in `aitracker/providers/`. Registry (`registry.py`): `PROVIDERS`, `all_sessions()`, `parse_any(sid)`, `search_all(q)`. Routes call the seam, never a source. Ids namespaced by prefix (`""`=Claude, `auggie:`). **Add a tool = one module in `providers/` + one line in `PROVIDERS` + a `SRC` label in `web/app.js`.**
+- **Providers.** Each tool is a `Provider` (`available/list/parse/search`) in `aitracker/providers/`. Registry (`registry.py`): `PROVIDERS`, `all_sessions()`, `parse_any(sid)`, `search_all(q)`. Routes call the seam, never a source. Ids namespaced by prefix (`""`=Claude, `auggie:`, `opencode:`). **Add a tool = one module in `providers/` + one line in `PROVIDERS` + a `SRC` label in `web/app.js` (opencode is the first SQLite-backed provider: read-only, one db).**
 - **Shared shapes** both providers emit: the session-list dict and the session-detail dict (`meta/todos/files/commands/narration/agents_bg/shells/overview/counts/…`). The SPA renders any source uniformly.
 - **Overridable paths are late-bound via `config.NAME`** (so tests and callers see one source of truth). `store.py`/`providers/*` reference `config.FLAGS_FILE` etc., not a copied import.
 - **App-owned state:** `flags.json`/`titles.json` via `store._load_json`/`_save_json` — read **live**. Both gitignored.

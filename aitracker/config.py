@@ -122,3 +122,13 @@ try:
     MAX_TERMS = max(1, min(64, int(os.environ.get("TRACKER_MAX_TERMS", MAX_TERMS))))
 except (TypeError, ValueError):
     MAX_TERMS = 12
+
+
+# opencode (anomalyco/opencode) keeps EVERYTHING — sessions, messages, parts, todos — in one
+# SQLite database, not per-session files like Claude/Auggie. Opened read-only (mode=ro) so the
+# tracker can never write to a live agent's store; see providers/opencode.py. Overridable for
+# tests / non-default XDG homes. Empty = provider disabled.
+OPENCODE_DB = os.environ.get(
+    "TRACKER_OPENCODE_DB",
+    os.path.expanduser("~/.local/share/opencode/opencode.db"),
+)
