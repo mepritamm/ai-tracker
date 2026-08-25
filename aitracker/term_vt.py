@@ -15,6 +15,18 @@ agent adds on top of it is mechanical.
         "alt": bool,                 # True while the alternate screen buffer is active
         "cursor_visible": bool,      # DECTCEM (`?25`) -- always current, regardless of `since`
         "bracketed_paste": bool,     # DEC private mode `?2004` -- always current, regardless of `since`
+        "mouse": {"mode": int, "sgr": bool},  # mouse-reporting REQUEST state -- always current,
+                                      # regardless of `since`. `mode` is 0 (no tracking) or the DEC
+                                      # private mode number of whichever tracking mode is currently
+                                      # in effect (1000/1002/1003, most inclusive wins -- see
+                                      # `_dispatch_private`). `sgr` reflects `?1006` independently.
+                                      # The emulator only TRACKS the request; it generates no mouse
+                                      # events itself -- that is the client's job.
+        "focus_events": bool,        # DEC private mode `?1004` -- always current, regardless of
+                                      # `since`. Tracked exactly like `bracketed_paste`/`mouse`: the
+                                      # emulator only records that a program asked for focus in/out
+                                      # reports (`ESC[I`/`ESC[O`); generating those from actual
+                                      # browser focus/blur events is the client's job.
         "bell": int,                 # monotonic count of BEL (\\x07) bytes fed so far, never reset
     }
 
@@ -82,8 +94,20 @@ buffer is capped at `MAX_REPLIES`.
 These are parsed just far enough to find their terminator and are then silently discarded; they
 never reach the grid and never leave dangling bytes for the next character to inherit:
 
-- **Mouse reporting** (private CSI modes `?1000`-`?1006`): consumed as unknown private DEC modes
-  (no-op set/reset).
+- **Mouse reporting**: private CSI modes `?1000` (press/release), `?1002` (press/release + drag),
+  `?1003` (any motion) and `?1006` (SGR extended coordinates) are TRACKED and published via
+  `snapshot()`'s `mouse` field -- the emulator records which mode a program asked for, nothing
+  more. It does not encode or emit mouse events itself; generating those from actual mouse input
+  is the client's job. `?1005` and `?1015` (the utf8 and urxvt coordinate encodings) remain
+  genuinely out of scope: consumed as no-op private-mode set/reset, same as any unrecognized code.
+- **Focus reporting** (`?1004`): TRACKED and published via `snapshot()`'s `focus_events` field,
+  exactly like `bracketed_paste` and `mouse` above -- the emulator records that a program asked
+  for `ESC[I`/`ESC[O` focus in/out reports, nothing more; generating those from actual browser
+  focus/blur events is the client's job.
+- **`?2031`**: Claude Code sets this at startup (confirmed by a raw pty capture -- see this
+  session's ground truth). What it MEANS was not determined, and no meaning is guessed here: it
+  is consumed as an unrecognized private mode set/reset, same as any other unknown code -- a
+  harmless no-op, not a tracked field.
 - **Sixel / other graphics** (DCS `ESC P ... ST`, and the sibling string types SOS `ESC X`, PM
   `ESC ^`, APC `ESC _`): the whole string is scanned for its terminator (`ESC \\` or `BEL`) and
   thrown away as one unit, so binary payload inside it (which can legitimately contain bytes
@@ -160,7 +184,7 @@ import threading
 import time
 import uuid
 
-from . import config, server, term_gate, term_run
+from . import config, server, store, term_gate, term_run
 # Circular by design, exactly like term_run's own import of `server` -- see that module's
 # docstring comment. server.py's bottom-of-file loader imports this module by name, and this
 # module registers its routes back into server.EXTRA_GET/EXTRA_POST. Safe because those two dicts
@@ -240,6 +264,18 @@ class Screen:
         self.cursor_visible = True
         self.bracketed_paste = False   # DEC private mode `?2004` -- reported in snapshot(), the
                                         # actual ESC[200~/201~ wrapping is the client's job
+        self.focus_events = False      # DEC private mode `?1004` -- reported in snapshot(), the
+                                        # actual ESC[I/ESC[O focus in/out reports are the client's
+                                        # job (mirrors bracketed_paste/mouse exactly)
+        self._mouse_1000 = False       # DEC private modes `?1000`/`?1002`/`?1003` -- tracked
+        self._mouse_1002 = False       # independently so that layering (e.g. disabling 1003
+        self._mouse_1003 = False       # while 1002 is still on) falls back correctly; see
+                                        # `_update_mouse_mode`
+        self.mouse_mode = 0            # computed from the three flags above -- 0, or the DEC
+                                        # number of the most inclusive mode currently enabled;
+                                        # reported in snapshot(), no events generated here
+        self.mouse_sgr = False         # DEC private mode `?1006` (SGR extended coordinates) --
+                                        # independent of mouse_mode, reported in snapshot()
         self.origin_mode = False    # DECOM (`?6`): row params are relative to the scroll region
 
         self.title = ""
@@ -320,9 +356,10 @@ class Screen:
             self.pending_replies += data
 
     def snapshot(self, since):
-        """Rows changed since version `since`, plus cursor/alt/cursor_visible/bracketed_paste/bell.
+        """Rows changed since version `since`, plus
+        cursor/alt/cursor_visible/bracketed_paste/mouse/focus_events/bell.
 
-        The last four are screen (or client-event) STATE, not row diffs -- like `cursor` and
+        The last six are screen (or client-event) STATE, not row diffs -- like `cursor` and
         `alt`, they are always the CURRENT value regardless of `since`, never filtered by it.
         """
         rows_out = []
@@ -332,6 +369,8 @@ class Screen:
         return {
             "v": self.v, "rows": rows_out, "cursor": [self.cur_r, self.cur_c], "alt": self.alt,
             "cursor_visible": self.cursor_visible, "bracketed_paste": self.bracketed_paste,
+            "mouse": {"mode": self.mouse_mode, "sgr": self.mouse_sgr},
+            "focus_events": self.focus_events,
             "bell": self.bell,
         }
 
@@ -796,7 +835,39 @@ class Screen:
                 self.cursor_visible = set_
             elif code == 2004:
                 self.bracketed_paste = set_
-            # 1000-1006 (mouse) and any other private mode: no-op
+            elif code == 1000:
+                self._mouse_1000 = set_
+                self._update_mouse_mode()
+            elif code == 1002:
+                self._mouse_1002 = set_
+                self._update_mouse_mode()
+            elif code == 1003:
+                self._mouse_1003 = set_
+                self._update_mouse_mode()
+            elif code == 1006:
+                self.mouse_sgr = set_
+            elif code == 1004:
+                self.focus_events = set_
+            # 1005/1015 (mouse utf8/urxvt coordinate encodings), 2031 (Claude Code sets it,
+            # meaning undetermined -- see module docstring) and any other private mode: no-op --
+            # see module docstring's "Explicitly out of scope" section
+
+    def _update_mouse_mode(self):
+        """Recompute `self.mouse_mode` from the three independent 1000/1002/1003 flags.
+
+        Most inclusive wins (1003 > 1002 > 1000), and each flag is tracked on its own so that
+        turning 1003 off while 1002 is still on falls back to 1002, not to 0 -- real programs do
+        enable and disable these in layers (e.g. vim raising 1002 then briefly promoting to 1003
+        for a drag-select mode, then dropping back).
+        """
+        if self._mouse_1003:
+            self.mouse_mode = 1003
+        elif self._mouse_1002:
+            self.mouse_mode = 1002
+        elif self._mouse_1000:
+            self.mouse_mode = 1000
+        else:
+            self.mouse_mode = 0
 
     # -- erase -----------------------------------------------------------
 
@@ -1144,11 +1215,13 @@ class Screen:
         Scrollback survives too, for the same real-xterm-behaviour reason documented in the
         module docstring's "Scrollback" section: RIS clears the visible grid, not your history.
 
-        `cursor_visible` and `bracketed_paste` are SCREEN state, so RIS resets them like real
-        xterm does -- `__init__` below already sets them back to (True, False), nothing extra to
-        preserve. `bell` is the opposite: it is a client-side EVENT counter, not screen state
-        (see its own field comment), so it survives the reinit exactly like `v` does, for the
-        same reason -- a viewer's `since`-style comparison against it must never appear to rewind.
+        `cursor_visible`, `bracketed_paste`, `focus_events` and the mouse-tracking state
+        (`mouse_mode`, `mouse_sgr`) are SCREEN state, so RIS resets them like real xterm does --
+        `__init__` below already sets them back to their power-on defaults (`True`, `False`,
+        `False`, `0`, `False`), nothing extra to preserve. `bell` is the opposite: it is a
+        client-side EVENT counter, not screen state (see its own field comment), so it survives
+        the reinit exactly like `v` does, for the same reason -- a viewer's `since`-style
+        comparison against it must never appear to rewind.
         """
         cols, rows, v, replies, scrollback, bell = (
             self.cols, self.rows, self.v, self.pending_replies, self.scrollback, self.bell)
@@ -1675,6 +1748,30 @@ def _retry_with_fork(pt, sid, cols, rows):
     # EXPECTED path for those, not a failure detector any more.
     print("[ai-tracker] terminal %s: resume refusal backstop fired for session %s -- "
           "retrying with --fork-session" % (pt.id, sid))
+    # Captured HERE, BEFORE _fork_child's execvp below -- not after, and not folded into the
+    # record_fork() call further down. store.record_fork's whole fork-lineage design (see
+    # store.py's "fork lineage" module comment) depends on `pre_existing` naming every session id
+    # that existed BEFORE the child could possibly have written its own transcript. Captured after
+    # the exec, a fast-writing child could land IN this very listing and get permanently excluded
+    # as "pre-existing" -- exactly the ordering bug store.py's defect-2 fix closes. A bookkeeping
+    # failure here must never turn the user-visible recovery (the fork retry itself) into a crash,
+    # so it's swallowed exactly like the record_fork() call below already is -- but see the
+    # `except` branch just below for why `fork_snapshot` must NOT simply come back `None` on
+    # that path.
+    try:
+        fork_snapshot = store.capture_fork_snapshot(sid)
+    except Exception as exc:
+        print("[ai-tracker] terminal %s: capture_fork_snapshot failed for session %s: %r"
+              % (pt.id, sid, exc))
+        # NOT `None` -- to record_fork(), `snapshot=None` means "no snapshot was
+        # supplied, please self-capture", and a self-capture here would run AFTER
+        # _fork_child's execvp below, reopening the exact pre-exec-vs-post-exec race
+        # this whole capture-before-exec dance exists to close. Passing an explicit,
+        # unusable snapshot instead makes record_fork() use it as given: `pre_existing:
+        # None` trips resolve_fork_child's refuse-gate, so the fork honestly stays
+        # unresolved (and is retried, then abandoned) rather than silently swallowing
+        # the child forever.
+        fork_snapshot = {"parent_uuids": [], "parent_dir": "", "pre_existing": None, "parent_ct": None}
     pid, fd = _fork_child(pt.cwd, argv, cols, rows)
     screen = Screen(cols=cols, rows=rows)     # allocate before the lock; it touches nothing shared
     # MUTUAL EXCLUSION, not another re-check. `close_pty` and this swap are two check-then-act
@@ -1716,6 +1813,19 @@ def _retry_with_fork(pt, sid, cols, rows):
             pass
         print("[ai-tracker] terminal %s: retry abandoned -- closed while forking" % pt.id)
         return
+    # This is the ONLY moment the parent/child fork link is knowable: Claude Code writes the
+    # fork to a brand-new session id and never reports it back (see store.py's "fork lineage"
+    # section), so `sid` (the parent) and `pt.cwd` (the terminal's cwd -- verbatim, matching what
+    # the parent's own transcript's first `cwd` line recorded, since `term_gate.session_cwd` reads
+    # it straight off that transcript with no path normalization) have to be captured right here,
+    # right now, or the association is gone for good. `fork_snapshot` itself was captured EARLIER
+    # still -- before _fork_child's execvp above, see that call site's own comment -- and is simply
+    # handed along here; record_fork never re-derives it. A failure to record must never turn a
+    # successful fork retry -- the user-visible recovery -- into a crash, so it's swallowed.
+    try:
+        store.record_fork(sid, pt.cwd, time.time(), fork_snapshot)
+    except Exception as exc:
+        print("[ai-tracker] terminal %s: record_fork failed for session %s: %r" % (pt.id, sid, exc))
     _feed_note(pt, "[ai-tracker] note: the resume was refused as a running background agent; "
                    "retried automatically with --fork-session -- this is now a COPY under a "
                    "new session id, not the live agent")
@@ -2210,9 +2320,9 @@ def _screen_stream_body(handler, pt):
       here.) The `: ping\\n\\n` heartbeat is a comment line, not a `data:`/`event:` frame, so
       EventSource ignores it for free -- that one is safe as-is.
     * The JSON object carries EXACTLY the keys `Screen.snapshot()` returns -- `v`, `rows`,
-      `cursor`, `alt`, `cursor_visible`, `bracketed_paste`, `bell` -- verbatim, unpadded, PLUS two
-      keys this function adds itself: `notices` (see below) and `starting` (see next). No other
-      wrapping, no other extra keys, ever.
+      `cursor`, `alt`, `cursor_visible`, `bracketed_paste`, `mouse`, `focus_events`, `bell` --
+      verbatim, unpadded, PLUS two keys this function adds itself: `notices` (see below) and
+      `starting` (see next). No other wrapping, no other extra keys, ever.
     * `starting` is `Pty.starting`, read under the SAME lock acquisition as the snapshot, on
       EVERY frame (not just while True) -- see `open_pty()`'s readiness-state section for what
       sets/clears it. While it is True, `rows` in the OUTGOING frame is forced to `[]` regardless
@@ -2223,8 +2333,9 @@ def _screen_stream_body(handler, pt):
       common case of a viewer attaching before the flag clears), so `Screen.snapshot()` naturally
       returns a FULL, complete-so-far grid on the very first non-suppressed frame -- a real replay
       of everything withheld, with no second code path and no separate buffer to keep in sync.
-      Cursor, `alt`, `cursor_visible`, `bracketed_paste`, `bell` and `notices` are UNAFFECTED by
-      `starting` and keep flowing normally throughout -- only row content is withheld.
+      Cursor, `alt`, `cursor_visible`, `bracketed_paste`, `mouse`, `focus_events`, `bell` and
+      `notices` are UNAFFECTED by `starting` and keep flowing normally throughout -- only row
+      content is withheld.
     * `notices` is `[{"seq": <int>, "text": <str>}, ...]`, only entries THIS VIEWER has not yet
       been sent -- `[]` when there are none. Tracked with a local `since_notice`, exactly the way
       `since` already tracks the row diff per-viewer (see the very next bullet): two viewers on
@@ -2264,7 +2375,8 @@ def _screen_stream_body(handler, pt):
     since_notice = 0    # this viewer's own delivery position into pt.notices -- see docstring's
                          # `notices` bullet. 0 is safe as "nothing delivered yet" because
                          # Pty.add_notice's seq starts at 1 and only ever increases.
-    last_cursor, last_alt, last_cv, last_bp, last_bell = None, None, None, None, None
+    last_cursor, last_alt, last_cv, last_bp, last_mouse, last_focus_events, last_bell = (
+        None, None, None, None, None, None, None)
     quiet = time.time()
     while True:
         with pt.lock:
@@ -2280,15 +2392,18 @@ def _screen_stream_body(handler, pt):
             pending_notices = [n for n in pt.notices if n["seq"] > since_notice]
             done = pt.done
         cursor = tuple(snap["cursor"])
-        # cursor_visible/bracketed_paste/bell are screen (or client-event) state, not row content
-        # -- exactly like cursor/alt, a change in any of them alone (no row, no cursor move) must
-        # still trigger a frame, or a bare `\a` with no other output would never reach the client.
-        # `pending_notices` joins that same list for the identical reason -- see the docstring's
-        # `notices` bullet: a notice with nothing else changed must still trigger a frame.
+        # cursor_visible/bracketed_paste/mouse/focus_events/bell are screen (or client-event)
+        # state, not row content -- exactly like cursor/alt, a change in any of them alone (no
+        # row, no cursor move) must still trigger a frame, or a bare `\a` with no other output
+        # would never reach the client. `pending_notices` joins that same list for the identical
+        # reason -- see the docstring's `notices` bullet: a notice with nothing else changed must
+        # still trigger a frame.
         changed = (
             snap["rows"] or (since == -1 and not starting)
             or cursor != last_cursor or snap["alt"] != last_alt
             or snap["cursor_visible"] != last_cv or snap["bracketed_paste"] != last_bp
+            or snap["mouse"] != last_mouse
+            or snap["focus_events"] != last_focus_events
             or snap["bell"] != last_bell
             or pending_notices
         )
@@ -2301,7 +2416,9 @@ def _screen_stream_body(handler, pt):
             else:
                 since = snap["v"]
             last_cursor, last_alt = cursor, snap["alt"]
-            last_cv, last_bp, last_bell = snap["cursor_visible"], snap["bracketed_paste"], snap["bell"]
+            last_cv, last_bp = snap["cursor_visible"], snap["bracketed_paste"]
+            last_mouse, last_focus_events = snap["mouse"], snap["focus_events"]
+            last_bell = snap["bell"]
             if pending_notices:
                 since_notice = pending_notices[-1]["seq"]
             snap["notices"] = pending_notices   # merged in here, NOT part of Screen.snapshot()

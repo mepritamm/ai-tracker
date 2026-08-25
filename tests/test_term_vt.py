@@ -395,6 +395,124 @@ class TestSnapshotScreenStateFields(unittest.TestCase):
         self.assertEqual(s.v, v1)
 
 
+class TestMouseReportingSnapshot(unittest.TestCase):
+    """`mouse` -- DEC private tracking modes `?1000`/`?1002`/`?1003` (most inclusive wins) and
+    `?1006` (SGR extended coordinates), tracked independently and published in `snapshot()`
+    exactly the way `bracketed_paste` already is. The emulator only records that a program
+    REQUESTED tracking; it generates no mouse events itself -- that is the client's job (see the
+    module docstring's "Explicitly out of scope" section)."""
+
+    def test_default_is_no_tracking(self):
+        s = Screen(cols=10, rows=3)
+        self.assertEqual(s.snapshot(-1)["mouse"], {"mode": 0, "sgr": False})
+
+    def test_mode_1000_flips_in_snapshot(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"\x1b[?1000h")
+        self.assertEqual(s.snapshot(-1)["mouse"]["mode"], 1000)
+        s.feed(b"\x1b[?1000l")
+        self.assertEqual(s.snapshot(-1)["mouse"]["mode"], 0)
+
+    def test_mode_1002_and_1003_each_set_their_own_mode(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"\x1b[?1002h")
+        self.assertEqual(s.snapshot(-1)["mouse"]["mode"], 1002)
+        s.feed(b"\x1b[?1002l\x1b[?1003h")
+        self.assertEqual(s.snapshot(-1)["mouse"]["mode"], 1003)
+        s.feed(b"\x1b[?1003l")
+        self.assertEqual(s.snapshot(-1)["mouse"]["mode"], 0)
+
+    def test_layering_falls_back_to_1002_when_1003_turns_off(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"\x1b[?1002h")
+        self.assertEqual(s.snapshot(-1)["mouse"]["mode"], 1002)
+        s.feed(b"\x1b[?1003h")
+        self.assertEqual(s.snapshot(-1)["mouse"]["mode"], 1003)   # most inclusive wins
+        s.feed(b"\x1b[?1003l")
+        self.assertEqual(s.snapshot(-1)["mouse"]["mode"], 1002)   # falls back, NOT to 0
+        s.feed(b"\x1b[?1002l")
+        self.assertEqual(s.snapshot(-1)["mouse"]["mode"], 0)
+
+    def test_sgr_flips_independently_of_mode(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"\x1b[?1006h")
+        self.assertEqual(s.snapshot(-1)["mouse"], {"mode": 0, "sgr": True})
+        s.feed(b"\x1b[?1006l")
+        self.assertEqual(s.snapshot(-1)["mouse"], {"mode": 0, "sgr": False})
+
+    def test_combined_real_world_sequence(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"\x1b[?1002h\x1b[?1006h")
+        self.assertEqual(s.snapshot(-1)["mouse"], {"mode": 1002, "sgr": True})
+        s.feed(b"\x1b[?1006l\x1b[?1002l")
+        self.assertEqual(s.snapshot(-1)["mouse"], {"mode": 0, "sgr": False})
+
+    def test_ris_resets_mouse_state(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"\x1b[?1003h\x1b[?1006h")
+        self.assertEqual(s.snapshot(-1)["mouse"], {"mode": 1003, "sgr": True})
+        s.feed(b"\x1bc")         # RIS
+        self.assertEqual(s.snapshot(-1)["mouse"], {"mode": 0, "sgr": False})
+
+    def test_mouse_mode_toggle_does_not_corrupt_surrounding_stream(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"A\x1b[?1000hB")
+        rows = _rows(s.snapshot(-1))
+        self.assertEqual(rows[0][1], "AB")
+
+    def test_mouse_mode_toggle_alone_does_not_bump_v(self):
+        s = Screen(cols=10, rows=3)
+        v1 = s.v
+        s.feed(b"\x1b[?1002h\x1b[?1006h\x1b[?1002l\x1b[?1006l")
+        self.assertEqual(s.v, v1)
+
+
+class TestFocusReportingSnapshot(unittest.TestCase):
+    """`focus_events` -- DEC private mode `?1004`, tracked and published in `snapshot()` exactly
+    the way `bracketed_paste`/`mouse` already are (see TestMouseReportingSnapshot, the model for
+    this class at every step). The emulator only records that a program REQUESTED focus in/out
+    reports; it generates no focus events itself -- that is the client's job."""
+
+    def test_default_is_false(self):
+        s = Screen(cols=10, rows=3)
+        self.assertFalse(s.snapshot(-1)["focus_events"])
+
+    def test_mode_1004_flips_in_snapshot(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"\x1b[?1004h")
+        self.assertTrue(s.snapshot(-1)["focus_events"])
+        s.feed(b"\x1b[?1004l")
+        self.assertFalse(s.snapshot(-1)["focus_events"])
+
+    def test_ris_resets_focus_events(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"\x1b[?1004h")
+        self.assertTrue(s.snapshot(-1)["focus_events"])
+        s.feed(b"\x1bc")         # RIS
+        self.assertFalse(s.snapshot(-1)["focus_events"])
+
+    def test_focus_events_toggle_does_not_corrupt_surrounding_stream(self):
+        s = Screen(cols=10, rows=3)
+        s.feed(b"A\x1b[?1004hB")
+        rows = _rows(s.snapshot(-1))
+        self.assertEqual(rows[0][1], "AB")
+
+    def test_focus_events_toggle_alone_does_not_bump_v(self):
+        s = Screen(cols=10, rows=3)
+        v1 = s.v
+        s.feed(b"\x1b[?1004h\x1b[?1004l")
+        self.assertEqual(s.v, v1)
+
+    def test_rides_the_sse_frame_the_way_mouse_does(self):
+        """Not just Screen.snapshot() in isolation -- pins that `focus_events` actually reaches
+        the wire the same way `mouse` does (see TestWireFormat, which pins the full key set)."""
+        s = Screen(cols=10, rows=3)
+        s.feed(b"\x1b[?1004h")
+        snap = s.snapshot(-1)
+        self.assertIn("focus_events", snap)
+        self.assertIs(snap["focus_events"], True)
+
+
 class TestSnapshotVersioning(unittest.TestCase):
     def test_only_changed_rows_returned_and_v_bumps(self):
         s = Screen(cols=20, rows=5)
@@ -510,7 +628,11 @@ class TestResize(unittest.TestCase):
 
 
 class TestOutOfScopeConsumed(unittest.TestCase):
-    def test_mouse_reporting_modes_are_noop(self):
+    def test_mouse_reporting_modes_consumed_without_corrupting_stream(self):
+        """Mouse tracking modes are now STATE, tracked and published via snapshot()["mouse"]
+        (see TestMouseReportingSnapshot) -- they are no longer discarded no-ops. What this test
+        protects is narrower and still true: the private-mode sequences must be consumed cleanly
+        at the byte level, without corrupting or dropping the surrounding text stream."""
         s = Screen(cols=20, rows=3)
         s.feed(b"\x1b[?1000h\x1b[?1002h\x1b[?1006habc\x1b[?1000l\x1b[?1006ldef")
         rows = _rows(s.snapshot(-1))
@@ -1387,8 +1509,8 @@ class TestWireFormat(unittest.TestCase):
         payload = json.loads(captured.split(b"data: ", 1)[1].split(b"\n\n", 1)[0])
         self.assertEqual(
             set(payload.keys()),
-            {"v", "rows", "cursor", "alt", "cursor_visible", "bracketed_paste", "bell", "notices",
-             "starting"},
+            {"v", "rows", "cursor", "alt", "cursor_visible", "bracketed_paste", "mouse",
+             "focus_events", "bell", "notices", "starting"},
         )
         self.assertEqual(payload["notices"], [])
         self.assertIs(payload["starting"], False)   # a plain Pty() defaults to starting=False

@@ -121,6 +121,18 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid var(--line)}
 .nowbanner .txt{font-size:14px;color:var(--text);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .cursor{animation:blink 1s steps(1) infinite}
 .srcnote{margin-top:12px;padding:8px 12px;background:var(--amber-deep);border:1px solid var(--amber-line);border-left:3px solid var(--gold);border-radius:8px;color:var(--amber);font-size:12px}
+/* Fork lineage banners (registry.py's continued_as/continued_from) — inserted dynamically by
+   app.js (index.html has no static slot for an optional, provider-agnostic feature). .forkas
+   mirrors .nowbanner's prominent clickable style: this session's live work moved elsewhere.
+   .forkfrom is a quiet one-liner: this session IS the fork, with a link back. */
+.forkbanner{margin-top:12px;display:flex;align-items:center;gap:12px;background:linear-gradient(90deg,var(--glow),var(--blue-deep));border:1px solid var(--blue-line);border-left:3px solid var(--blue);border-radius:10px;padding:11px 14px;cursor:pointer}
+.forkbanner:hover{border-color:var(--blue)}
+.forkbanner .dot{width:9px;height:9px;border-radius:50%;background:var(--blue)}
+.forkbanner .lbl{font-size:10px;letter-spacing:.6px;text-transform:uppercase;color:var(--muted)}
+.forkbanner .txt{font-size:13px;color:var(--text)}
+.forkbanner .chev{flex:0 0 auto;color:var(--blue);font-size:12px}
+.forkbanner.quiet{cursor:default;padding:7px 12px;background:none;border:1px solid var(--line3);border-left:3px solid var(--line3)}
+.forkbanner.quiet .txt{font-size:12px;color:var(--muted)}
 
 .body{padding:18px 28px 32px;display:grid;grid-template-columns:1fr 1fr;gap:16px 18px;align-items:start}
 /* State | Activity — two full-width halves; each half is a flex column (no nested grid) */

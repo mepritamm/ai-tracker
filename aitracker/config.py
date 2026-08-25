@@ -19,6 +19,23 @@ PINS_FILE = os.path.join(_HERE, "pins.json")
 NOTES_FILE = os.path.join(_HERE, "notes.json")
 
 
+# Fork lineage (a `claude --resume` retried with `--fork-session` because the CLI refused
+# to resume a session it considers a background agent). Keyed by the PARENT session id ->
+# {"at": unix-time-of-fork, "cwd": …, "child": resolved child id or "", "abandoned": bool,
+#  "parent_uuids": [...], "parent_dir": …, "pre_existing": [...], "parent_ct": float|None}.
+# There is no on-disk fork lineage from Claude Code itself (parentSessionId/forkedFrom don't
+# exist — verified against a real transcript), so this file IS the only record linking the
+# two: parent_uuids is the parent's own early-message uuid fingerprint, pre_existing is the
+# exact SET of session ids already present in parent_dir at fork time (a candidate in that
+# set can never be the child — the fact that replaced three rounds of a broken timestamp-
+# ordering heuristic), and parent_ct is the parent transcript's own creation time (a belt-
+# and-braces "child can't predate its parent" floor). All captured once, at fork time, by
+# store.record_fork, and matched against candidates by store.resolve_fork_child. See
+# store.py's "fork lineage" section for the full rationale. A sibling lock file (FORKS_FILE +
+# ".lock") serializes concurrent read-modify-write access — see store._update_forks.
+FORKS_FILE = os.path.join(_HERE, "forks.json")
+
+
 # Where the server is actually listening, written at startup. `run()` falls back to the next
 # free port when 8790 is taken, so anything outside the browser (the notes drain hook) has to
 # be told the real one rather than assume the default.

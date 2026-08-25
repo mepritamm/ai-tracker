@@ -1,7 +1,7 @@
 from .providers.claude import ClaudeProvider
 from .providers.auggie import AuggieProvider
 from .providers.augment_ext import AugmentVscodeProvider, AugmentCursorProvider
-from .store import load_pins, load_notes, load_flags
+from .store import load_pins, load_notes, load_flags, resolve_fork_child, fork_parent_of
 
 
 PROVIDERS = [ClaudeProvider(), AuggieProvider(),
@@ -23,11 +23,38 @@ def all_sessions():
     for f in load_flags():
         if not f.get("resolved"):
             open_flags[f.get("session", "")] = open_flags.get(f.get("session", ""), 0) + 1
+    # Fork lineage (shared seam — every provider inherits this from one implementation).
+    # resolve_fork_child() fast-paths to "" for any sid that isn't a recorded fork parent
+    # (a single dict lookup, cheap even across ~200 sessions on every poll); it only does
+    # real work — and only ONCE, memoized after — for a genuine parent. Non-Claude
+    # providers (Auggie, Augment ext) have no fork concept and no ids ever recorded here,
+    # so they get "" for both through this exact same loop, no per-provider branch.
+    continued_as = {}                              # parent sid -> child sid, for sids in `out`
+    for s in out:
+        child = resolve_fork_child(s.get("id", ""))
+        if child:
+            continued_as[s["id"]] = child
+    # child sid -> parent sid. Deliberately NOT a `{c: p for p, c in continued_as.items()}`
+    # reversal: that dict is built above in `out`'s (provider-list) order, which need not
+    # agree with fork_parent_of's own insertion-order first-match scan over forks.json
+    # (store.py:356-358) if a child were ever claimed by two parents at once -- store.py's
+    # creation-time-ordering fix makes that unreachable in practice, but this must not be
+    # silently order-dependent if it ever happens again. Calling fork_parent_of() directly
+    # keeps the two in agreement BY CONSTRUCTION (same function, same answer) instead of
+    # risking a second, independently-ordered derivation.
+    continued_from = {}
+    for s in out:
+        sid = s.get("id", "")
+        parent = fork_parent_of(sid)
+        if parent:
+            continued_from[sid] = parent
     for s in out:
         sid = s.get("id", "")
         s["pinned"] = sid in pins
         s["note_count"] = len(notes.get(sid, []))
         s["open_flags"] = open_flags.get(sid, 0)  # 🚩 badge + the cross-session flag list
+        s["continued_as"] = continued_as.get(sid, "")      # "" unless this session was forked
+        s["continued_from"] = continued_from.get(sid, "")  # "" unless this session IS a fork
     out.sort(key=lambda s: (not s.get("pinned"), -s.get("mtime", 0)))   # pinned first, then newest
     return out
 
@@ -47,7 +74,21 @@ def provider_for(sid):
 def parse_any(sid):
     """Route a namespaced session id to the provider that owns it."""
     p = provider_for(sid)
-    return p.parse(sid) if p else None
+    d = p.parse(sid) if p else None
+    if d is None:
+        return None
+    # Same two keys as all_sessions() above (shared seam, one implementation — Auggie/
+    # Augment ext ids never appear in forks.json, so they get "" here too, same as there).
+    # Deliberately NOT shipping a title for the other end: that would mean parsing the
+    # OTHER session on every ~2s poll of THIS session's detail view — exactly the cost
+    # store.resolve_fork_child's memoization exists to avoid, and it doesn't generalize
+    # across providers anyway. The client already holds every session's title from its
+    # own periodic session-list poll (all_sessions() above carries continued_as/
+    # continued_from too), so shipping the id here is enough for it to render the link
+    # with no extra round trip.
+    d["continued_as"] = resolve_fork_child(sid)
+    d["continued_from"] = fork_parent_of(sid)
+    return d
 
 
 DRILLS = ("output", "diff", "shell", "agent")

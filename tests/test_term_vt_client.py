@@ -941,5 +941,443 @@ class TestCursorSitsOnTheSameOriginAsTheRows(unittest.TestCase):
         self.assertIn("padX: padL, padY: padT", page)
 
 
+class TestModifierAwareKeyEncoding(unittest.TestCase):
+    """keyToBytes used to ignore modifiers on every non-letter key -- Ctrl+ArrowLeft fell through
+    to the unmodified \\x1b[D, Shift+Enter/Alt+Enter fell through to a plain \\r (so Claude Code's
+    newline-without-submit SUBMITS instead), and F1-F12/Ctrl+Space were swallowed entirely (fell
+    through to `return null`). Fixed per xterm ctlseqs (invisible-island.net/xterm/ctlseqs/
+    ctlseqs.html), Patch #411: a modifier parameter Pm = 1 + 1*Shift + 2*Alt + 4*Ctrl + 8*Meta,
+    appended only when some modifier is actually held."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def _key_body(self):
+        return _body_until(self.src, "function keyToBytes(ev) {", ["function b64utf8("])
+
+    def test_modifier_formula_is_present(self):
+        body = self._key_body()
+        self.assertIn(
+            "var pm = 1 + (ev.shiftKey ? 1 : 0) + (ev.altKey ? 2 : 0) + "
+            "(ev.ctrlKey ? 4 : 0) + (ev.metaKey ? 8 : 0);",
+            body,
+        )
+
+    def test_pm_equals_one_emits_the_plain_form(self):
+        # Pm === 1 (nothing held) must NOT get a ";1" suffix -- the plain form stays exactly what
+        # it was before this change, for every modified-key case below.
+        body = self._key_body()
+        self.assertIn("var plain = (pm === 1);", body)
+        self.assertIn('case "ArrowLeft": return plain ? "\\x1b[D" : "\\x1b[1;" + pm + "D";', body)
+
+    def test_ctrl_left_shaped_cursor_output_pins_the_dynamic_construction(self):
+        # Pin the actual expression the code builds (not a hardcoded "\x1b[1;5D" string) -- this
+        # is what makes Ctrl+Left emit \x1b[1;5D, Shift+Up emit \x1b[1;2A, Alt+Right emit
+        # \x1b[1;3C, all from the SAME construction with a different `pm`.
+        body = self._key_body()
+        self.assertIn('case "ArrowUp": return plain ? "\\x1b[A" : "\\x1b[1;" + pm + "A";', body)
+        self.assertIn('case "ArrowDown": return plain ? "\\x1b[B" : "\\x1b[1;" + pm + "B";', body)
+        self.assertIn('case "ArrowRight": return plain ? "\\x1b[C" : "\\x1b[1;" + pm + "C";', body)
+
+    def test_home_end_tilde_keys_also_take_the_modified_form(self):
+        body = self._key_body()
+        self.assertIn('case "Home": return plain ? "\\x1b[H" : "\\x1b[1;" + pm + "H";', body)
+        self.assertIn('case "End": return plain ? "\\x1b[F" : "\\x1b[1;" + pm + "F";', body)
+        self.assertIn('case "PageUp": return plain ? "\\x1b[5~" : "\\x1b[5;" + pm + "~";', body)
+        self.assertIn('case "PageDown": return plain ? "\\x1b[6~" : "\\x1b[6;" + pm + "~";', body)
+        self.assertIn('case "Delete": return plain ? "\\x1b[3~" : "\\x1b[3;" + pm + "~";', body)
+        self.assertIn('case "Insert": return plain ? "\\x1b[2~" : "\\x1b[2;" + pm + "~";', body)
+
+    def test_f1_to_f4_use_ss3_plain_and_csi_with_leading_one_modified(self):
+        body = self._key_body()
+        self.assertIn('case "F1": return plain ? "\\x1bOP" : "\\x1b[1;" + pm + "P";', body)
+        self.assertIn('case "F2": return plain ? "\\x1bOQ" : "\\x1b[1;" + pm + "Q";', body)
+        self.assertIn('case "F3": return plain ? "\\x1bOR" : "\\x1b[1;" + pm + "R";', body)
+        self.assertIn('case "F4": return plain ? "\\x1bOS" : "\\x1b[1;" + pm + "S";', body)
+
+    def test_f5_to_f12_tilde_numbers_are_all_present(self):
+        # F1-F12 were previously swallowed entirely (fell through to `return null`) -- this is a
+        # brand-new capability, not a modifier fix to an existing one.
+        body = self._key_body()
+        for n in (15, 17, 18, 19, 20, 21, 23, 24):
+            self.assertIn('"\\x1b[%d~" : "\\x1b[%d;" + pm + "~";' % (n, n), body)
+
+    def test_alt_enter_sends_esc_prefixed_form_plain_enter_still_sends_cr(self):
+        body = self._key_body()
+        self.assertIn(
+            'if (ev.altKey && !ev.ctrlKey && !ev.metaKey) return "\\x1b\\r";', body
+        )
+        # the Enter case's fallthrough (Shift+Enter, Ctrl+Enter, and plain Enter alike) must still
+        # be a bare \r -- no invented sequence for the two combos with no portable encoding.
+        enter_i = body.index('case "Enter":')
+        after_alt = body.index('return "\\x1b\\r";', enter_i)
+        tail = body[after_alt: body.index("\n", after_alt) + 40]
+        self.assertIn('return "\\r";', tail)
+
+    def test_ctrl_c_still_maps_to_x03_unconditionally_regression_guard(self):
+        # This must stay reachable and return BEFORE the new pm/plain machinery is ever computed --
+        # a new branch intercepting Ctrl+C ahead of this would be exactly the regression the brief
+        # calls out as the one thing this file must never get wrong.
+        body = self._key_body()
+        self.assertIn(
+            "if (/^[a-zA-Z]$/.test(k)) return String.fromCharCode(k.toUpperCase().charCodeAt(0) & 0x1f);",
+            body,
+        )
+        ctrl_letter_i = body.index("String.fromCharCode(k.toUpperCase()")
+        pm_i = body.index("var pm =")
+        self.assertLess(ctrl_letter_i, pm_i)
+
+    def test_ctrl_space_sends_nul_and_flags_it_as_unconfirmed_convention(self):
+        body = self._key_body()
+        self.assertIn('if (k === " ") return "\\x00";', body)
+        # must be flagged as the ASCII C0 convention, not an xterm ctlseqs-documented sequence --
+        # and must NOT guess at the unconfirmed siblings (Ctrl+2..8, Ctrl+/).
+        self.assertIn("FLAGGED", body)
+        self.assertIn("C0 convention", body)
+        self.assertNotIn('k === "/"', body)
+
+    def test_the_fix_reaches_the_browser_not_just_the_source_file(self):
+        page = build_page()
+        self.assertIn(
+            "var pm = 1 + (ev.shiftKey ? 1 : 0) + (ev.altKey ? 2 : 0) + "
+            "(ev.ctrlKey ? 4 : 0) + (ev.metaKey ? 8 : 0);",
+            page,
+        )
+        self.assertIn('if (k === " ") return "\\x00";', page)
+
+
+class TestMouseReportingIsGatedAndThrottled(unittest.TestCase):
+    """No mouse event was EVER sent to the PTY before this change -- the only mouse handler on the
+    pane was a bare `mousedown -> input.focus()`. Forwarding is added for mousedown/mousemove/
+    mouseup/wheel, but ONLY while a program has turned tracking on (`this.mouse.mode`, read
+    defensively off the SSE frame's new `mouse` field -- a parallel agent's addition to
+    term_vt.Screen.snapshot(), contract: {"mouse": {"mode": 0, "sgr": false}})."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_mouse_state_defaults_to_tracking_off(self):
+        body = _function_body(self.src, "function Terminal(container, ttyId) {")
+        self.assertIn("this.mouse = { mode: 0, sgr: false };", body)
+
+    def test_mouse_field_is_read_defensively_in_applypatch(self):
+        body = _function_body(self.src, "Terminal.prototype._applyPatch = function")
+        self.assertIn("if (msg.mouse !== undefined && msg.mouse) {", body)
+        self.assertIn('if (typeof msg.mouse.mode === "number") this.mouse.mode = msg.mouse.mode;', body)
+        self.assertIn("if (msg.mouse.sgr !== undefined) this.mouse.sgr = !!msg.mouse.sgr;", body)
+
+    def test_gate_checks_mode_then_shift_then_history_in_that_order(self):
+        # Order matters for readability/maintenance, and each is an independent early-return --
+        # pin all three so a future edit can't silently drop the shift bypass (the user's only
+        # escape hatch) or the viewingHistory guard (frozen-snapshot coordinates).
+        body = _function_body(self.src, "Terminal.prototype._mouseGate = function")
+        mode_i = body.index("if (this.mouse.mode === 0) return false;")
+        shift_i = body.index("if (ev.shiftKey) return false;")
+        hist_i = body.index("if (this.viewingHistory) return false;")
+        self.assertLess(mode_i, shift_i)
+        self.assertLess(shift_i, hist_i)
+
+    def test_every_mouse_entry_point_consults_the_shared_gate(self):
+        for fn in ("_onMouseDown", "_onMouseMove", "_onMouseUp"):
+            body = _function_body(self.src, "Terminal.prototype.%s = function" % fn)
+            self.assertIn("if (!this._mouseGate(ev)) return;", body)
+        wheel_body = _function_body(self.src, "Terminal.prototype._onWheel = function")
+        self.assertIn("if (this._mouseGate(ev)) {", wheel_body)
+
+    def test_mousedown_mousemove_mouseup_listeners_are_wired_on_the_pane(self):
+        body = _function_body(self.src, "function Terminal(container, ttyId) {")
+        self.assertIn(
+            'pane.addEventListener("mousedown", function (ev) { input.focus(); self._onMouseDown(ev); });',
+            body,
+        )
+        self.assertIn('pane.addEventListener("mousemove", function (ev) { self._onMouseMove(ev); });', body)
+        self.assertIn('pane.addEventListener("mouseup", function (ev) { self._onMouseUp(ev); });', body)
+
+    def test_coordinates_are_derived_from_rowsel_rect_not_the_panes(self):
+        # The exact off-by-one-cell bug _layoutCursor's own fix addressed: .vtpane is padded
+        # (8px 10px), so its border box is offset from where rows actually start.
+        body = _function_body(self.src, "Terminal.prototype._mouseCell = function")
+        self.assertIn("this.rowsEl.getBoundingClientRect()", body)
+        self.assertNotIn("this.pane.getBoundingClientRect()", body)
+
+    def test_coordinates_are_one_based_and_clamped_to_the_grid(self):
+        body = _function_body(self.src, "Terminal.prototype._mouseCell = function")
+        self.assertIn("+ 1;", body)
+        self.assertIn("col = Math.max(1, Math.min(this.cols, col));", body)
+        self.assertIn("row = Math.max(1, Math.min(this.rows, row));", body)
+
+    def test_motion_is_throttled_on_cell_change(self):
+        body = _function_body(self.src, "Terminal.prototype._onMouseMove = function")
+        self.assertIn(
+            "if (this._lastMouseCell && this._lastMouseCell.row === cell.row "
+            "&& this._lastMouseCell.col === cell.col) return;",
+            body,
+        )
+
+    def test_mode_1002_only_reports_motion_while_dragging(self):
+        body = _function_body(self.src, "Terminal.prototype._onMouseMove = function")
+        self.assertIn("if (this.mouse.mode === 1000) return;", body)
+        self.assertIn("if (this.mouse.mode === 1002 && !dragging) return;", body)
+        self.assertIn('var dragging = this._mouseButtonDown !== null;', body)
+
+    def test_sgr_release_uses_lowercase_m_final_character_with_the_real_button(self):
+        body = _function_body(self.src, "Terminal.prototype._sendMouseReport = function")
+        self.assertIn(
+            '"\\x1b[<" + pb + ";" + cell.col + ";" + cell.row + (isRelease ? "m" : "M")', body
+        )
+
+    def test_legacy_release_always_reports_button_3(self):
+        body = _function_body(self.src, "Terminal.prototype._sendMouseReport = function")
+        self.assertIn("var legacyPb = isRelease ? 3 : pb;", body)
+
+    def test_legacy_coordinates_are_clamped_to_223(self):
+        body = _function_body(self.src, "Terminal.prototype._sendMouseReport = function")
+        self.assertIn("Math.min(223, cell.col)", body)
+        self.assertIn("Math.min(223, cell.row)", body)
+
+    def test_wheel_sends_button_4_or_5_when_tracking_is_on(self):
+        body = _function_body(self.src, "Terminal.prototype._onWheel = function")
+        self.assertIn("var wcode = (ev.deltaY < 0 ? 0 : 1) + 64;", body)
+
+    def test_wheel_keeps_scrollback_behaviour_untouched_when_gate_is_closed(self):
+        # The pre-existing scrollback/alt-screen-arrow logic must still be present, reachable when
+        # _mouseGate returns false (mode 0, shift held, or viewingHistory).
+        body = _function_body(self.src, "Terminal.prototype._onWheel = function")
+        self.assertIn("if (this.alt) {", body)
+        self.assertIn("this._scrollToBottom();", body)
+
+    def test_the_fix_reaches_the_browser_not_just_the_source_file(self):
+        page = build_page()
+        self.assertIn("Terminal.prototype._mouseGate = function", page)
+        self.assertIn("Terminal.prototype._sendMouseReport = function", page)
+        self.assertIn('"\\x1b[<" + pb + ";" + cell.col + ";" + cell.row', page)
+
+
+class TestOutsidePaneReleaseFallback(unittest.TestCase):
+    """DEFECT 2: pane's own mousedown/mousemove/mouseup are wired on `pane` only, so a
+    press-inside/drag-outside/release-outside sequence never fires `_onMouseUp` and
+    `_mouseButtonDown` sticks forever -- every later hover then reads as a drag. These are
+    source-text checks that the wiring exists and is torn down; the actual runtime behaviour
+    (state really clears, no double-send for an in-pane release) is proven by executing the real
+    code in tests/test_term_vt_exec.py."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_document_level_mouseup_listener_is_wired_in_constructor(self):
+        body = _function_body(self.src, "function Terminal(container, ttyId) {")
+        self.assertIn("this._onDocMouseUp = function (ev) {", body)
+        self.assertIn('document.addEventListener("mouseup", this._onDocMouseUp);', body)
+
+    def test_fallback_skips_a_release_that_landed_inside_the_pane(self):
+        # must not double-send: the pane's own "mouseup" listener already handled an in-pane
+        # release by the time this document-level one fires (bubbling order).
+        body = _function_body(self.src, "function Terminal(container, ttyId) {")
+        i = body.index("this._onDocMouseUp = function (ev) {")
+        handler = body[i: body.index("document.addEventListener", i)]
+        self.assertIn("if (pane.contains(ev.target)) return;", handler)
+
+    def test_fallback_reuses_onmouseup_for_clamped_coordinates_and_the_report(self):
+        body = _function_body(self.src, "function Terminal(container, ttyId) {")
+        i = body.index("this._onDocMouseUp = function (ev) {")
+        handler = body[i: body.index("document.addEventListener", i)]
+        self.assertIn("self._onMouseUp(ev);", handler)
+
+    def test_fallback_unconditionally_clears_button_state(self):
+        # belt-and-suspenders: state must clear even if _onMouseUp's own gate declined to send.
+        body = _function_body(self.src, "function Terminal(container, ttyId) {")
+        i = body.index("this._onDocMouseUp = function (ev) {")
+        handler = body[i: body.index("document.addEventListener", i)]
+        self.assertIn("self._mouseButtonDown = null;", handler)
+        self.assertIn("self._lastMouseCell = null;", handler)
+
+    def test_listener_is_removed_in_destroy(self):
+        body = _function_body(self.src, "Terminal.prototype.destroy = function")
+        self.assertIn(
+            'document.removeEventListener("mouseup", this._onDocMouseUp);', body
+        )
+        self.assertIn("this._onDocMouseUp = null;", body)
+
+    def test_the_fix_reaches_the_browser_not_just_the_source_file(self):
+        page = build_page()
+        self.assertIn("this._onDocMouseUp = function (ev) {", page)
+        self.assertIn('document.removeEventListener("mouseup", this._onDocMouseUp);', page)
+
+
+class TestMouseButtonCodeCommentIsHonest(unittest.TestCase):
+    """DEFECT 3 (minor): `_mouseButtonCode` never adds +4 for Shift (Shift always bypasses mouse
+    reporting via `_mouseGate`, so a Shift-held event never reaches this function), but the old
+    comment claimed the encoder 'stays honest and general' about Shift -- a false claim about
+    dead code that was never added. Fix is comment-only: no +4 branch should exist or appear."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_no_shift_bit_is_encoded(self):
+        body = _function_body(self.src, "Terminal.prototype._mouseButtonCode = function")
+        self.assertNotIn("+ 4", body)
+        self.assertNotIn("shiftKey", body)
+
+    def test_stale_overstatement_is_gone(self):
+        self.assertNotIn("stays honest and general", self.src)
+
+    def test_comment_states_shift_never_reaches_this_function(self):
+        self.assertIn("Shift=4 is deliberately NOT encoded here", self.src)
+        self.assertIn("never reaches this function", self.src)
+
+
+class TestFocusReportingClient(unittest.TestCase):
+    """`?1004` focus in/out reporting, the client half of TestFocusReportingSnapshot
+    (tests/test_term_vt.py -- server side). Mirrors `mouse`'s own defensive-read pattern exactly:
+    default off, read off every SSE frame, no-op when the server hasn't turned it on."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_focus_events_defaults_to_false(self):
+        body = _function_body(self.src, "function Terminal(container, ttyId) {")
+        self.assertIn("this.focusEvents = false;", body)
+
+    def test_focus_events_read_defensively_in_applypatch(self):
+        body = _function_body(self.src, "Terminal.prototype._applyPatch = function")
+        self.assertIn("if (msg.focus_events !== undefined) this.focusEvents = !!msg.focus_events;", body)
+
+    def test_focus_sends_csi_i_gated_on_focus_events(self):
+        body = _function_body(self.src, "function Terminal(container, ttyId) {")
+        self.assertIn('input.addEventListener("focus", function () {', body)
+        i = body.index('input.addEventListener("focus", function () {')
+        focus_handler = body[i:body.index("});", i)]
+        self.assertIn("if (self.focusEvents) self._send(\"\\x1b[I\");", focus_handler)
+
+    def test_blur_sends_csi_o_gated_on_focus_events(self):
+        body = _function_body(self.src, "function Terminal(container, ttyId) {")
+        i = body.index('input.addEventListener("blur", function () {')
+        blur_handler = body[i:body.index("});", i)]
+        self.assertIn("if (self.focusEvents) self._send(\"\\x1b[O\");", blur_handler)
+
+    def test_the_fix_reaches_the_browser_not_just_the_source_file(self):
+        page = build_page()
+        self.assertIn("this.focusEvents = false;", page)
+        self.assertIn("\\x1b[I", page)
+        self.assertIn("\\x1b[O", page)
+
+
+class TestSendOrderingAndMotionCoalescing(unittest.TestCase):
+    """`?1003` any-motion tracking turns postKeys()'s pre-existing lack of send ordering from a
+    rare race into a routine one. Two fixes, pinned separately:
+    (a) motion reports are coalesced to at most one per animation frame, and ONLY motion --
+        keystrokes/press/release must never be dropped or merged;
+    (b) every send (motion included, once flushed) is serialized through one promise chain so
+        bytes reach /api/term/keys in production order, and a rejected send doesn't wedge it.
+
+    NOTE: these are all source-text substring checks -- they can confirm the SHAPE of the fix
+    (which function calls which) but, being static, cannot prove the actual byte ORDER two
+    real timers produce. That is a timing property, and a text search cannot fail against a
+    timing bug. The behavioural proof -- executing the real functions with a fake clock and
+    checking the actual POST order, including the reviewer's exact motion-then-early-discrete-send
+    regression scenario -- lives in tests/test_term_vt_exec.py, which runs the real code under
+    Node instead of grepping for it."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_send_chain_initialized_in_constructor(self):
+        body = _function_body(self.src, "function Terminal(container, ttyId) {")
+        self.assertIn("this._sendChain = Promise.resolve();", body)
+
+    def test_enqueue_appends_to_the_chain_in_order(self):
+        # `_enqueue` is the ONE place that appends to `_sendChain` -- both `_send` (discrete
+        # events) and `_flushMotion` (a flushed motion report) must go through it rather than
+        # each maintaining their own chain-append logic.
+        body = _function_body(self.src, "Terminal.prototype._enqueue = function")
+        self.assertIn("this._sendChain = this._sendChain.then(function () {", body)
+        self.assertIn("return postKeys(self.ttyId, s);", body)
+
+    def test_a_rejected_send_does_not_wedge_the_chain(self):
+        body = _function_body(self.src, "Terminal.prototype._enqueue = function")
+        self.assertIn("}).catch(function () { });", body)
+
+    def test_ordering_comment_explains_typing_is_also_protected(self):
+        # the explanatory comment sits directly ABOVE the `_enqueue` definition (a doc block, not
+        # code inside the function), so search the raw source rather than _function_body's
+        # marker-to-next-marker slice, which starts AT the marker and would miss it.
+        self.assertIn("makes fast typing safe", self.src)
+
+    def test_send_flushes_pending_motion_before_enqueueing_itself(self):
+        # This is the actual DEFECT 1 fix: a discrete `_send` must flush any pending motion into
+        # the chain FIRST, so a motion report produced earlier can never be overtaken by a later
+        # discrete event reaching the chain first.
+        body = _function_body(self.src, "Terminal.prototype._send = function")
+        self.assertIn("this._flushMotion();", body)
+        self.assertIn("this._enqueue(s);", body)
+
+    def test_flushmotion_does_not_call_send_to_avoid_recursion(self):
+        # `_send` -> `_flushMotion` -> `_send` would recurse (and re-trigger another flush check)
+        # -- `_flushMotion` must go straight to `_enqueue` instead.
+        body = _function_body(self.src, "Terminal.prototype._flushMotion = function")
+        self.assertIn("this._enqueue(s);", body)
+        self.assertNotIn("this._send(", body)
+
+    def test_flushmotion_is_a_noop_once_already_flushed(self):
+        # A late rAF callback firing after a discrete _send already flushed the same pending
+        # motion must not send it a second time -- `_pendingMotion` is already null by then.
+        body = _function_body(self.src, "Terminal.prototype._flushMotion = function")
+        self.assertIn("if (this._pendingMotion === null) return;", body)
+        self.assertIn("this._pendingMotion = null;", body)
+
+    def test_sendmotion_method_exists_and_uses_raf(self):
+        body = _function_body(self.src, "Terminal.prototype._sendMotion = function")
+        self.assertIn("requestAnimationFrame(function () {", body)
+
+    def test_sendmotion_keeps_only_the_newest_pending_report(self):
+        body = _function_body(self.src, "Terminal.prototype._sendMotion = function")
+        self.assertIn("this._pendingMotion = s;", body)
+        self.assertIn("if (this._motionRAFPending) return;", body)
+
+    def test_sendmotion_raf_callback_flushes_through_flushmotion_not_postkeys_directly(self):
+        # the flush must still go through _flushMotion/_enqueue (and therefore the ordering
+        # chain), not call postKeys() itself -- otherwise the flushed report could bypass the
+        # ordering guarantee.
+        body = _function_body(self.src, "Terminal.prototype._sendMotion = function")
+        self.assertIn("self._flushMotion();", body)
+        self.assertNotIn("postKeys(", body)
+
+    def test_only_mousemove_passes_ismotion_true(self):
+        body = _function_body(self.src, "Terminal.prototype._onMouseMove = function")
+        self.assertIn(
+            "this._sendMouseReport(this._mouseButtonCode(ev, true), cell, false, true);", body,
+        )
+
+    def test_mousedown_mouseup_wheel_do_not_coalesce(self):
+        # press, release and wheel must call _sendMouseReport WITHOUT isMotion=true -- each is a
+        # discrete event and must never be routed through _sendMotion's coalescing.
+        down_body = _function_body(self.src, "Terminal.prototype._onMouseDown = function")
+        self.assertIn("this._sendMouseReport(this._mouseButtonCode(ev, false), cell, false);", down_body)
+        up_body = _function_body(self.src, "Terminal.prototype._onMouseUp = function")
+        self.assertIn("this._sendMouseReport(this._mouseButtonCode(ev, false), cell, true);", up_body)
+        wheel_body = _function_body(self.src, "Terminal.prototype._onWheel = function")
+        self.assertIn("this._sendMouseReport(wcode, wcell, false);", wheel_body)
+
+    def test_sendmousereport_routes_motion_through_sendmotion_others_through_send(self):
+        body = _function_body(self.src, "Terminal.prototype._sendMouseReport = function")
+        self.assertIn("if (isMotion) this._sendMotion(s); else this._send(s);", body)
+
+    def test_keydown_sends_directly_never_coalesced(self):
+        # a keystroke is a discrete event -- _onKeyDown must call _send directly, never _sendMotion.
+        body = _function_body(self.src, "Terminal.prototype._onKeyDown = function")
+        self.assertIn("this._send(bytes);", body)
+        self.assertNotIn("_sendMotion", body)
+
+    def test_oninput_sends_directly_never_coalesced(self):
+        body = _function_body(self.src, "Terminal.prototype._onInput = function")
+        self.assertIn("this._send(v);", body)
+        self.assertNotIn("_sendMotion", body)
+
+    def test_the_fix_reaches_the_browser_not_just_the_source_file(self):
+        page = build_page()
+        self.assertIn("this._sendChain = this._sendChain.then(function () {", page)
+        self.assertIn("Terminal.prototype._sendMotion = function", page)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1022,6 +1022,48 @@ async function poll(){
   lastData=d;render(d);loadFlags();checkCompletions(d);
 }
 const KICON={commit:"⎇",test:"✓",install:"⬇",build:"🔨",git:"⎇",cmd:"$"};
+// Fork lineage banners (registry.py: d.continued_as/d.continued_from, on every provider's
+// detail dict). index.html has no static slot for this — it's an optional, provider-
+// agnostic feature — so the two banner elements are created once here and reused on every
+// render, inserted right after #srcnote (near the top of the detail view, same spot as the
+// other session-level notices). #forkas: this session was forked — the live work moved to
+// a new session, click to follow it (reuses `pick()`, the same nav the sidebar uses — no
+// second navigation path). #forkfrom: this session IS a fork of another one — a quieter
+// line with a link back. The server ships ids only (not titles, see registry.parse_any's
+// comment); the label falls back to the id's short form when the target isn't in the
+// already-polled `sessions` list yet.
+function renderForkLinks(d){
+  let as=$("forkas"), from=$("forkfrom");
+  if(!as){
+    as=document.createElement("div");
+    as.id="forkas"; as.className="forkbanner"; as.style.display="none";
+    $("srcnote").insertAdjacentElement("afterend",as);
+  }
+  if(!from){
+    from=document.createElement("div");
+    from.id="forkfrom"; from.className="forkbanner quiet"; from.style.display="none";
+    as.insertAdjacentElement("afterend",from);
+  }
+  const label=id=>{const hit=sessions.find(s=>s.id===id);return hit?(hit.title||hit.project||id.slice(0,8)):id.slice(0,8);};
+  if(d.continued_as){
+    const cid=d.continued_as;
+    as.style.display="flex";
+    as.onclick=()=>pick(cid);
+    as.innerHTML='<span class=dot></span><div style="min-width:0;flex:1"><div class=lbl>Continued in a new session</div>'+
+      `<div class=txt>Resumed as a fork — the live work is in <b>${esc(label(cid))}</b>.</div></div><span class=chev>open ›</span>`;
+  }else{
+    as.style.display="none"; as.onclick=null;
+  }
+  if(d.continued_from){
+    const pid=d.continued_from;
+    from.style.display="flex";
+    from.onclick=null;
+    from.innerHTML=`<span class=txt>↩ Forked from <span class="link blue" onclick="pick('${pid}')">${esc(label(pid))}</span></span>`;
+  }else{
+    from.style.display="none";
+  }
+}
+
 function render(d){
   if(dSid!==cur){   // switching sessions closes the search card and drops stale results
     clearDetailSearch();
@@ -1145,6 +1187,8 @@ function render(d){
 
   $("srcnote").style.display=d.note?"block":"none";
   $("srcnote").textContent=d.note||"";
+
+  renderForkLinks(d);   // fork lineage banner(s) — see function def for why
 
   // per-session notes stack (plan-ahead notes the user wrote, newest-first display)
   renderNotes(d.notes||[]);

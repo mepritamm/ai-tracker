@@ -3,6 +3,8 @@ flags.json
 titles.json
 pins.json
 notes.json
+forks.json
+forks.json.lock
 port
 token
 drain.log

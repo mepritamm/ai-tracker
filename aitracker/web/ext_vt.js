@@ -63,6 +63,22 @@
 //   program wants pasted text wrapped in `ESC[200~ … ESC[201~`. Read defensively as
 //   `msg.bracketed_paste` (default false) rather than guessing a value with no server backing.
 //
+//   A CONCURRENT agent (a separate worktree, mid-build as this file is being written) is adding a
+//   `mouse` field to the same SSE frame: `"mouse": {"mode": 0, "sgr": false}` — `mode` is 0
+//   (tracking off) or the DEC private-mode number in effect (1000 press/release, 1002
+//   press/release+drag, 1003 all motion); `sgr` is whether `?1006` (SGR extended coordinates) is
+//   also on. Read defensively the same way, defaulting to `{mode: 0, sgr: false}` in the
+//   constructor so nothing here breaks if term_vt.py in this worktree doesn't emit it yet.
+//
+// ===== FOCUS REPORTING (this session): `msg.focus_events` ===============================
+//   term_vt.Screen.snapshot() gained a `focus_events` boolean — DEC private mode `?1004`,
+//   tracked and published exactly like `bracketed_paste`/`mouse` above. Read defensively in
+//   _applyPatch, defaulting to false in the constructor. While on, the capture textarea's own
+//   focus/blur listeners (already wired for the `vtfocused` CSS class) additionally send
+//   `ESC[I` (focus) / `ESC[O` (blur) — the terminal equivalent of the `mouse` field driving
+//   _onMouseMove/_sendMouseReport. While off: unchanged, nothing sent, byte-for-byte today's
+//   behaviour.
+//
 // ===== CONTEXT BAR (this session): two more contracts =================================
 //   POST /api/term/inject {tty, text, submit: true, clear_first: true} -> {ok: true, ...}
 //     Waits for the terminal to go quiet, types `text`, then sends Enter separately (re-sending
@@ -132,23 +148,60 @@
       if (k === "\\") return "\x1c";
       if (k === "^") return "\x1e";
       if (k === "_") return "\x1f";
+      // Ctrl+Space -> NUL. FLAGGED: this is the plain ASCII C0 convention (Ctrl+@ = NUL), NOT
+      // something xterm's own ctlseqs document specifies -- the researcher could not confirm
+      // Ctrl+Space, Ctrl+2..8 or Ctrl+/ against that primary source. Only this one (unambiguous,
+      // universally relied on) is implemented; the others are deliberately left unguessed.
+      if (k === " ") return "\x00";
     }
     if (ev.altKey && !ev.ctrlKey && !ev.metaKey && ev.key.length === 1) return "\x1b" + ev.key;
+
+    // ===== modifier-aware cursor/nav/function keys =====
+    // xterm ctlseqs (invisible-island.net/xterm/ctlseqs/ctlseqs.html), Patch #411: modified cursor
+    // keys, PC-style Home/End, the tilde-numbered keys and the function keys all carry a modifier
+    // parameter Pm = 1 + 1*Shift + 2*Alt + 4*Ctrl + 8*Meta. Pm is only APPENDED when a modifier is
+    // actually held -- Pm === 1 (nothing held) must still emit the plain form the program already
+    // expects; sending ";1" unconditionally would break every unmodified arrow press.
+    var pm = 1 + (ev.shiftKey ? 1 : 0) + (ev.altKey ? 2 : 0) + (ev.ctrlKey ? 4 : 0) + (ev.metaKey ? 8 : 0);
+    var plain = (pm === 1);
+
     switch (ev.key) {
-      case "Enter": return "\r";
+      case "Enter":
+        // Plain Enter stays unmodified \r. Alt+Enter is the standard Meta encoding (ESC prefix) --
+        // what Claude Code reads as "insert a newline, don't submit". Shift+Enter and Ctrl+Enter
+        // have no portable xterm encoding of their own for Enter, so both fall back to plain \r
+        // rather than inventing one.
+        if (ev.altKey && !ev.ctrlKey && !ev.metaKey) return "\x1b\r";
+        return "\r";
       case "Backspace": return "\x7f";
       case "Tab": return ev.shiftKey ? "\x1b[Z" : "\t";
       case "Escape": return "\x1b";
-      case "ArrowUp": return "\x1b[A";
-      case "ArrowDown": return "\x1b[B";
-      case "ArrowRight": return "\x1b[C";
-      case "ArrowLeft": return "\x1b[D";
-      case "Home": return "\x1b[H";
-      case "End": return "\x1b[F";
-      case "PageUp": return "\x1b[5~";
-      case "PageDown": return "\x1b[6~";
-      case "Delete": return "\x1b[3~";
-      case "Insert": return "\x1b[2~";
+      case "ArrowUp": return plain ? "\x1b[A" : "\x1b[1;" + pm + "A";
+      case "ArrowDown": return plain ? "\x1b[B" : "\x1b[1;" + pm + "B";
+      case "ArrowRight": return plain ? "\x1b[C" : "\x1b[1;" + pm + "C";
+      case "ArrowLeft": return plain ? "\x1b[D" : "\x1b[1;" + pm + "D";
+      case "Home": return plain ? "\x1b[H" : "\x1b[1;" + pm + "H";
+      case "End": return plain ? "\x1b[F" : "\x1b[1;" + pm + "F";
+      case "PageUp": return plain ? "\x1b[5~" : "\x1b[5;" + pm + "~";
+      case "PageDown": return plain ? "\x1b[6~" : "\x1b[6;" + pm + "~";
+      case "Delete": return plain ? "\x1b[3~" : "\x1b[3;" + pm + "~";
+      case "Insert": return plain ? "\x1b[2~" : "\x1b[2;" + pm + "~";
+      // Function keys -- NEW: previously fell through to `return null` and were swallowed
+      // entirely. Plain F1-F4 use SS3 (\x1bO<letter>); modified substitutes CSI for SS3 with an
+      // explicit leading "1" (\x1b[1;Pm<letter>). Plain and modified F5-F12 both use the
+      // tilde form, same shape as the tilde keys above.
+      case "F1": return plain ? "\x1bOP" : "\x1b[1;" + pm + "P";
+      case "F2": return plain ? "\x1bOQ" : "\x1b[1;" + pm + "Q";
+      case "F3": return plain ? "\x1bOR" : "\x1b[1;" + pm + "R";
+      case "F4": return plain ? "\x1bOS" : "\x1b[1;" + pm + "S";
+      case "F5": return plain ? "\x1b[15~" : "\x1b[15;" + pm + "~";
+      case "F6": return plain ? "\x1b[17~" : "\x1b[17;" + pm + "~";
+      case "F7": return plain ? "\x1b[18~" : "\x1b[18;" + pm + "~";
+      case "F8": return plain ? "\x1b[19~" : "\x1b[19;" + pm + "~";
+      case "F9": return plain ? "\x1b[20~" : "\x1b[20;" + pm + "~";
+      case "F10": return plain ? "\x1b[21~" : "\x1b[21;" + pm + "~";
+      case "F11": return plain ? "\x1b[23~" : "\x1b[23;" + pm + "~";
+      case "F12": return plain ? "\x1b[24~" : "\x1b[24;" + pm + "~";
     }
     return null;   // not ours: let the browser handle it (Cmd+C/V, plain chars, dead keys, …)
   }
@@ -262,6 +315,27 @@
     this.cursorVisible = true;             // DECTCEM ?25 -- see the header comment's caveat
     this.bracketedPaste = false;           // ?2004 -- see the header comment's caveat
     this._bellSeen = null;                 // msg.bell baseline -- see the header comment's caveat
+    this.mouse = { mode: 0, sgr: false };  // msg.mouse -- see the header comment's caveat; default
+                                            // (tracking off) preserves today's native-selection/
+                                            // scrollback behaviour until the server sends otherwise.
+    this.focusEvents = false;              // msg.focus_events -- see the header comment's "FOCUS
+                                            // REPORTING" section; default (off) sends nothing on
+                                            // focus/blur, byte-for-byte today's behaviour.
+    this._mouseButtonDown = null;          // which button (0/1/2, ctlseqs numbering) is currently
+                                            // held, for mode 1002's drag-only motion gate; null
+                                            // when nothing is down.
+    this._lastMouseCell = null;            // {row, col} of the last motion report sent, so a drag
+                                            // is throttled to one report per CELL change, not per
+                                            // pixel (see _onMouseMove).
+    // ---- send ordering + motion coalescing (see _send/_sendMotion below) ----
+    this._sendChain = Promise.resolve();   // every send is queued onto this ONE promise chain, so
+                                            // bytes reach /api/term/keys in production order even
+                                            // though postKeys() fires independent fetch()es.
+    this._pendingMotion = null;            // newest not-yet-flushed motion report, or null.
+    this._motionRAFPending = false;        // an rAF flush is already scheduled for it.
+    this._motionRAFHandle = null;          // requestAnimationFrame()'s own id for that scheduled
+                                            // flush, or null -- kept ONLY so destroy() can
+                                            // cancelAnimationFrame() it; see _sendMotion/destroy.
     this._fontPx = null; this._linePx = null;   // null == use the CSS default, unzoomed
     // ---- scrollback view state: `this.grid` above stays the LIVE model always (fed by every SSE
     // patch, unconditionally); `this.historyGrid`/`viewingHistory` is a separate, frozen snapshot
@@ -325,11 +399,50 @@
     // same event still routes the next keystroke to the PTY without touching the emerging
     // selection -- selection anchoring is driven by the browser off the ORIGINAL mousedown target
     // (a .vtrow text node now that the input no longer overlays the pane), not by DOM focus.
-    pane.addEventListener("mousedown", function () { input.focus(); });
+    // _onMouseDown/_onMouseMove/_onMouseUp run AFTER focus() unconditionally fires, and are
+    // themselves a no-op (see _mouseGate) unless a program has actually turned mouse tracking on
+    // and Shift isn't held -- so this line's own native-selection behaviour is untouched whenever
+    // there's nothing to forward.
+    pane.addEventListener("mousedown", function (ev) { input.focus(); self._onMouseDown(ev); });
+    pane.addEventListener("mousemove", function (ev) { self._onMouseMove(ev); });
+    pane.addEventListener("mouseup", function (ev) { self._onMouseUp(ev); });
     pane.addEventListener("wheel", function (ev) { self._onWheel(ev); }, { passive: false });
+    // ===== outside-pane release fallback (stuck-drag fix) ==================================
+    // The three listeners above are wired on `pane` only. A press-inside/drag-outside/
+    // release-outside sequence (a very ordinary drag -- the pointer crosses the pane's edge before
+    // the button comes up) then never fires `pane`'s own "mouseup", so `_mouseButtonDown` sticks:
+    // every later plain hover reads as `dragging` (see _onMouseMove) with a stale button and the
+    // `+32` bit, until the user happens to press inside the pane again. No pointer capture is used
+    // here (setPointerCapture needs pointer events, a bigger surface change than this fix calls
+    // for) -- instead, a single document-level "mouseup" catches any release the pane itself
+    // didn't see. `pane.contains(ev.target)` skips a release that DID land inside the pane: the
+    // pane's own listener is earlier in the bubble path (pane is a descendant of document) and
+    // already ran by the time this one fires, so acting again here would double-send the release.
+    this._onDocMouseUp = function (ev) {
+      if (self._mouseButtonDown === null) return;   // no drag in progress -- nothing to clean up
+      if (pane.contains(ev.target)) return;          // pane's own mouseup listener already handled it
+      self._onMouseUp(ev);                            // clamped coords via _mouseCell; also clears
+                                                        // _mouseButtonDown/_lastMouseCell when the
+                                                        // gate (_mouseGate) allows the send
+      // Belt-and-suspenders: a release ANYWHERE must end the drag, even on the rare path where the
+      // gate above declined to send (e.g. Shift got pressed mid-drag) and so left state untouched.
+      self._mouseButtonDown = null;
+      self._lastMouseCell = null;
+    };
+    document.addEventListener("mouseup", this._onDocMouseUp);
     newOutEl.addEventListener("click", function () { self._scrollToBottom(); input.focus(); });
-    input.addEventListener("focus", function () { self.focused = true; pane.classList.add("vtfocused"); });
-    input.addEventListener("blur", function () { self.focused = false; pane.classList.remove("vtfocused"); });
+    // `?1004` focus reporting (this.focusEvents, read off every SSE frame -- see the header
+    // comment's "FOCUS REPORTING" section): while a program has asked for it, focus/blur on the
+    // capture textarea ALSO forward ESC[I / ESC[O to the PTY, on top of the pre-existing
+    // vtfocused class toggle. Off (the default): nothing extra sent, unchanged from before.
+    input.addEventListener("focus", function () {
+      self.focused = true; pane.classList.add("vtfocused");
+      if (self.focusEvents) self._send("\x1b[I");
+    });
+    input.addEventListener("blur", function () {
+      self.focused = false; pane.classList.remove("vtfocused");
+      if (self.focusEvents) self._send("\x1b[O");
+    });
     input.addEventListener("keydown", function (ev) { self._onKeyDown(ev); });
     input.addEventListener("input", function () { self._onInput(); });
     input.addEventListener("compositionstart", function () { self.composing = true; });
@@ -396,6 +509,11 @@
     // (stay at their existing value) until term_vt.py starts sending them.
     if (msg.cursor_visible !== undefined) this.cursorVisible = !!msg.cursor_visible;
     if (msg.bracketed_paste !== undefined) this.bracketedPaste = !!msg.bracketed_paste;
+    if (msg.mouse !== undefined && msg.mouse) {
+      if (typeof msg.mouse.mode === "number") this.mouse.mode = msg.mouse.mode;
+      if (msg.mouse.sgr !== undefined) this.mouse.sgr = !!msg.mouse.sgr;
+    }
+    if (msg.focus_events !== undefined) this.focusEvents = !!msg.focus_events;
     if (typeof msg.bell === "number") {
       if (this._bellSeen !== null && msg.bell !== this._bellSeen) this._flashBell();
       this._bellSeen = msg.bell;
@@ -599,11 +717,101 @@
       this.input.value = "";
     }
   };
+  // ===== send ordering =====================================================================
+  // postKeys() issues an independent fetch() per call with no sequencing of its own -- two sends
+  // in flight at once can land at the server out of order over the network (a PRE-EXISTING latent
+  // bug, not new here). For keystrokes that means fast typing can transpose characters; for mouse
+  // it means a release can land before its press, which `?1003` any-motion tracking turns from a
+  // rare race into a routine one (many more sends per second). Every discrete send -- keystrokes,
+  // pasted/composed text, mouse press/release, wheel-as-arrows/mouse-report -- goes through
+  // `_send`, below, which enqueues onto this ONE promise chain (`_enqueue`), so bytes reach
+  // /api/term/keys in the order they were PRODUCED, not the order their fetch()es happen to
+  // resolve. This is also what makes fast typing safe, not just mouse: it is the same ordering
+  // fix either way, chained once here rather than solved per call site.
+  //
+  // MOTION ORDERING GUARANTEE: coalesced motion reports (the motion-coalescing path further
+  // below) are only appended to the chain when their rAF callback fires -- strictly LATER than
+  // when they were produced. Left alone, that lets a discrete event produced AFTER a pending
+  // motion reach the chain BEFORE that motion's rAF fires -- reordering, say, a release ahead of
+  // the motion that preceded it. `_send` closes that gap: it flushes any pending motion into the
+  // chain FIRST (`_flushMotion`, which calls `_enqueue` directly -- NOT `_send` again, so there is
+  // no `_send` -> `_flushMotion` -> `_send` recursion), and only THEN enqueues its own bytes. A
+  // pending motion can therefore never be overtaken by a later discrete event. When the motion's
+  // own rAF callback eventually fires, `_pendingMotion` is already null (the discrete flush
+  // consumed it), so that callback's own `_flushMotion` call is a no-op -- the same report is
+  // never enqueued twice. `_enqueue` is the ONE place that appends to `_sendChain`; both `_send`
+  // and `_flushMotion` go through it.
+  //
+  // A rejected send (e.g. a network hiccup) must not wedge the chain forever -- the `.catch()`
+  // swallows the failure inside the chain itself, so the NEXT queued `.then()` still runs.
+  Terminal.prototype._enqueue = function (s) {
+    var self = this;
+    this._sendChain = this._sendChain.then(function () {
+      return postKeys(self.ttyId, s);
+    }).catch(function () { });
+  };
+  Terminal.prototype._flushMotion = function () {
+    if (this._pendingMotion === null) return;   // nothing pending, or already flushed -- no-op,
+                                                  // which is what makes a late rAF callback safe
+    var s = this._pendingMotion;
+    this._pendingMotion = null;
+    this._enqueue(s);
+  };
   Terminal.prototype._send = function (s) {
-    postKeys(this.ttyId, s);
+    this._flushMotion();   // any pending motion must reach the chain before this discrete event
+    this._enqueue(s);
+  };
+
+  // ===== motion coalescing =================================================================
+  // Only MOUSE MOTION reports (`?1003` any-motion, or `?1002` drag) are safe to coalesce: the
+  // remote program only ever cares about the CURRENT pointer position, so dropping a superseded
+  // motion report loses nothing it would have acted on differently. A press, a release, a wheel
+  // report, and every keystroke are DISCRETE events -- each one is a state transition the remote
+  // program must see individually (miss a button-up and it thinks the button is still held), so
+  // none of those ever go through this path; they call `_send` directly. Motion is batched to at
+  // most one flush per animation frame: the newest pending report wins, any superseded one is
+  // silently dropped. The eventual rAF callback flushes through `_flushMotion` (NOT `_send` --
+  // that would set up the `_send` -> `_flushMotion` -> `_send` recursion described in the ordering
+  // comment above `_send`); see that comment for how a discrete event produced in the meantime can
+  // still flush this same motion report first, and why the rAF callback below never sends it twice.
+  Terminal.prototype._sendMotion = function (s) {
+    this._pendingMotion = s;
+    if (this._motionRAFPending) return;
+    this._motionRAFPending = true;
+    var self = this;
+    // The id is kept on `self` (not just a local var) so destroy() -- called from OUTSIDE this
+    // closure, possibly before this callback ever fires -- can cancelAnimationFrame() it. Nulled
+    // here the instant the callback actually runs, BEFORE _flushMotion: once a frame has fired,
+    // its id is spent (the browser will never call this callback again for it), so there is
+    // nothing left for a later destroy() to cancel -- leaving the old id sitting in
+    // _motionRAFHandle would risk destroy() cancelling a DIFFERENT, newer frame if that id were
+    // ever reused. Only one rAF is ever outstanding at a time (guarded by _motionRAFPending
+    // above), so this null/(re)assign pair never races a second in-flight frame.
+    this._motionRAFHandle = requestAnimationFrame(function () {
+      self._motionRAFPending = false;
+      self._motionRAFHandle = null;
+      self._flushMotion();
+    });
   };
   Terminal.prototype.destroy = function () {
     if (this.es) { this.es.close(); this.es = null; }
+    // A motion flush scheduled via _sendMotion (see above) must never fire after teardown -- that
+    // was a real stray POST /api/term/keys for an already-destroyed terminal (proven by executing
+    // this exact sequence: schedule motion, destroy(), fire the pending rAF). Cancel the scheduled
+    // frame outright, and ALSO clear the coalescing state so that even if cancellation somehow
+    // failed to prevent the callback (or a motion was left pending with no rAF scheduled at all),
+    // _flushMotion has nothing to send: _pendingMotion is null. See _sendMotion's own comment for
+    // why _motionRAFHandle is never stale/pointing at a since-fired frame here.
+    if (this._motionRAFHandle !== null) {
+      cancelAnimationFrame(this._motionRAFHandle);
+      this._motionRAFHandle = null;
+    }
+    this._motionRAFPending = false;
+    this._pendingMotion = null;
+    // See the constructor's "outside-pane release fallback" comment -- this is a document-level
+    // listener, so it leaks past this terminal's own DOM teardown unless explicitly removed here
+    // (same pattern as ContextBar's own `_onDocClick`, below).
+    if (this._onDocMouseUp) { document.removeEventListener("mouseup", this._onDocMouseUp); this._onDocMouseUp = null; }
     // Clean up any displayed notices and reset the sequence tracker
     var hadNotices = this._noticeEls.length > 0;
     for (var i = 0; i < this._noticeEls.length; i++) {
@@ -622,11 +830,135 @@
     try { this.input.focus(); } catch (e) { }
   };
 
+  // ===== mouse reporting: forwarded to the PTY only when a running program has actually turned
+  // tracking on (`this.mouse.mode`, read off every SSE frame in _applyPatch above -- see the
+  // header comment for the exact {mode, sgr} contract term_vt.Screen.snapshot() sends). Every
+  // entry point below (mousedown/mousemove/mouseup/_onWheel) shares ONE gate, _mouseGate, checked
+  // in this order:
+  //   1. this.mouse.mode === 0 (tracking off) -> do exactly what the code already did: native
+  //      selection, wheel = scrollback/alt-screen arrows. Nothing below this file's pre-existing
+  //      behaviour changes.
+  //   2. ev.shiftKey -> ALSO the pre-existing behaviour. This is XTSHIFTESCAPE's documented
+  //      default (shiftEscape = 0): holding Shift lets the user make a native selection even while
+  //      an app has mouse tracking on. It is the user's only escape hatch and must exist.
+  //   3. this.viewingHistory -> never report. The grid on screen is a FROZEN scrollback snapshot
+  //      (see the constructor's own scrollback-view comment); its row/col do not correspond to the
+  //      live screen's, so there is nothing coherent to report coordinates against.
+  //   4. otherwise -> the caller preventDefault()s, encodes, and sends.
+  Terminal.prototype._mouseGate = function (ev) {
+    if (this.mouse.mode === 0) return false;
+    if (ev.shiftKey) return false;
+    if (this.viewingHistory) return false;
+    return true;
+  };
+
+  // Coordinates are 1-based, top-left is 1,1 (ctlseqs p.49). Derived from rowsEl's own
+  // getBoundingClientRect() -- NOT the pane's: .vtpane is padded (8px 10px) and its border box is
+  // offset from where rows actually start, so using the pane's rect would reintroduce exactly the
+  // off-by-one-cell bug _layoutCursor's own comment describes fixing (see computeColsRows and the
+  // cursor-origin comment above). Clamped to the live grid's own bounds.
+  Terminal.prototype._mouseCell = function (ev) {
+    var rect = this.rowsEl.getBoundingClientRect();
+    var col = Math.floor((ev.clientX - rect.left) / this.cellW) + 1;
+    var row = Math.floor((ev.clientY - rect.top) / this.cellH) + 1;
+    col = Math.max(1, Math.min(this.cols, col));
+    row = Math.max(1, Math.min(this.rows, row));
+    return { row: row, col: col };
+  };
+
+  // Button encoding (ctlseqs p.49-52): base button (left=0, middle=1, right=2, from
+  // this._mouseButtonDown -- the button a mousedown/mousemove/mouseup event is actually reporting
+  // on, not necessarily ev.button, which is unreliable mid-drag). Modifiers ADD: Meta=8, Ctrl=16,
+  // and motion/drag ADDS 32. Shift=4 is deliberately NOT encoded here: `_mouseGate` bypasses mouse
+  // reporting entirely whenever Shift is held (the user's native-selection escape hatch, see that
+  // function's own comment), so a Shift-held event never reaches this function at all -- there is
+  // no live path that would exercise a Shift bit, so none is added.
+  Terminal.prototype._mouseButtonCode = function (ev, isMotion) {
+    var code = (this._mouseButtonDown !== null) ? this._mouseButtonDown : 0;
+    if (ev.metaKey) code += 8;
+    if (ev.ctrlKey) code += 16;
+    if (isMotion) code += 32;
+    return code;
+  };
+
+  // SGR (`sgr === true`, `?1006`): press/motion end the sequence in 'M'; release is the SAME
+  // triplet ending in lowercase 'm', carrying `pb` UNCHANGED -- the real button number, not a
+  // fixed placeholder. That final-character/real-button distinction is the entire reason SGR
+  // exists over the legacy scheme, which cannot say which button came up (see the `else` branch).
+  // Legacy (`sgr === false`): `\x1b[M` + 3 raw bytes (32+Pb, 32+col, 32+row); the 1-byte-per-field
+  // encoding cannot represent a coordinate above 223 (32+224 overflows a byte), so both axes are
+  // clamped rather than corrupting the frame, and release is ALWAYS reported as button 3 -- X10
+  // tracking has no way to say which button was released.
+  // `isMotion` (default false = a discrete press/release/wheel report) routes the encoded bytes
+  // through `_sendMotion`'s coalescing instead of `_send`'s direct enqueue -- see that function's
+  // own comment for why motion alone is safe to coalesce and everything else here is not.
+  Terminal.prototype._sendMouseReport = function (pb, cell, isRelease, isMotion) {
+    var s;
+    if (this.mouse.sgr) {
+      s = "\x1b[<" + pb + ";" + cell.col + ";" + cell.row + (isRelease ? "m" : "M");
+    } else {
+      var legacyCol = Math.min(223, cell.col), legacyRow = Math.min(223, cell.row);
+      var legacyPb = isRelease ? 3 : pb;
+      s = "\x1b[M" + String.fromCharCode(32 + legacyPb, 32 + legacyCol, 32 + legacyRow);
+    }
+    if (isMotion) this._sendMotion(s); else this._send(s);
+  };
+
+  Terminal.prototype._onMouseDown = function (ev) {
+    if (!this._mouseGate(ev)) return;
+    ev.preventDefault();
+    this._mouseButtonDown = ev.button;   // ctlseqs numbering (left=0, middle=1, right=2) matches
+                                          // ev.button's own for the primary three buttons.
+    var cell = this._mouseCell(ev);
+    this._lastMouseCell = cell;          // seed the drag-throttle baseline at the press point
+    this._sendMouseReport(this._mouseButtonCode(ev, false), cell, false);
+  };
+
+  Terminal.prototype._onMouseMove = function (ev) {
+    if (!this._mouseGate(ev)) return;
+    var dragging = this._mouseButtonDown !== null;
+    // Which modes want motion at all: 1000 never does (press/release only); 1002 only while a
+    // button is held (drag); 1003 always. An unrecognized mode value reports nothing -- safer
+    // than guessing which of these three it most resembles.
+    if (this.mouse.mode === 1000) return;
+    if (this.mouse.mode === 1002 && !dragging) return;
+    if (this.mouse.mode !== 1002 && this.mouse.mode !== 1003) return;
+    var cell = this._mouseCell(ev);
+    // Throttle to one report per CELL change, not per pixel -- otherwise a single drag floods the
+    // PTY with hundreds of writes.
+    if (this._lastMouseCell && this._lastMouseCell.row === cell.row && this._lastMouseCell.col === cell.col) return;
+    this._lastMouseCell = cell;
+    ev.preventDefault();
+    this._sendMouseReport(this._mouseButtonCode(ev, true), cell, false, true);   // isMotion=true
+  };
+
+  Terminal.prototype._onMouseUp = function (ev) {
+    if (!this._mouseGate(ev)) return;
+    ev.preventDefault();
+    var cell = this._mouseCell(ev);
+    this._sendMouseReport(this._mouseButtonCode(ev, false), cell, true);
+    this._mouseButtonDown = null;
+    this._lastMouseCell = null;
+  };
+
   // ===== mouse wheel: scrollback on the primary screen, arrow keys on the alt screen ==========
   // Full-screen programs (vim/less/top/…) own the alt screen and read arrow keys for their own
   // scrolling/navigation -- forwarding wheel-as-history there instead of as arrows is exactly the
   // "every full-screen program feels broken" bug the plan calls out.
   Terminal.prototype._onWheel = function (ev) {
+    if (this._mouseGate(ev)) {
+      // Wheel buttons (ctlseqs p.49-52): button 4 (up) / 5 (down) = base 0/1 + 64. Replaces
+      // scrollback/alt-arrow forwarding entirely while a program owns mouse tracking -- see
+      // _mouseGate's own comment for the gating order this shares with every other mouse entry
+      // point.
+      ev.preventDefault();
+      var wcell = this._mouseCell(ev);
+      var wcode = (ev.deltaY < 0 ? 0 : 1) + 64;
+      if (ev.metaKey) wcode += 8;
+      if (ev.ctrlKey) wcode += 16;
+      this._sendMouseReport(wcode, wcell, false);
+      return;
+    }
     ev.preventDefault();   // never let it fall through to the page behind the modal
     var linesPerTick = Math.max(1, Math.round(Math.abs(ev.deltaY) / (this.cellH || 17)));
     if (this.alt) {
