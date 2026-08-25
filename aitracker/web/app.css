@@ -141,6 +141,15 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid var(--line)}
 .cbody{overflow:auto;max-height:46vh}
 .mini{background:var(--chipbg);border:1px solid var(--line3);color:var(--muted);font-size:11px;padding:3px 8px;border-radius:6px;cursor:pointer;font-family:inherit}
 .mini:hover{border-color:var(--blue)}
+/* collapsible body cards — chevron (injected by initCollapse in app.js) toggles a .collapsed class.
+   own class (.cardchev), not the row-affordance .chev; :not(.cardchev) so the title grows, not the button
+   (Session Summary's header is bare text, so :first-child would otherwise match the button and center it). */
+.card h2>:not(.cardchev):first-child{flex:1}
+.card h2 .cardchev{margin-left:8px;background:none;border:0;color:var(--muted);cursor:pointer;font:inherit;font-size:12px;line-height:1;padding:2px 5px;border-radius:5px;transition:transform .15s,color .15s}
+.card h2 .cardchev:hover{color:var(--blue)}
+.card.collapsed h2{border-bottom:0}
+.card.collapsed h2 .cardchev{transform:rotate(180deg)}
+.card.collapsed>:not(h2){display:none}
 
 /* background agents */
 .bggrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;background:var(--line);border-bottom-left-radius:12px;border-bottom-right-radius:12px;max-height:56vh;overflow:auto}
