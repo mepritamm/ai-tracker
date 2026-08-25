@@ -187,13 +187,25 @@
   }
   function computeColsRows(pane) {
     var cell = cellSize(pane);
-    var padX = 20, padY = 16;   // approx the pane's own CSS padding; harmless if pane isn't padded yet
+    // The pane is PADDED (.vtpane: 8px 10px), so its border box is wider/taller than the area the
+    // rows are actually drawn in. Read the real padding off the computed style -- one source of
+    // truth with the CSS, and it survives a padding change -- then use it TWICE:
+    //   1. subtract it here. cols/rows used to be measured against the *unpadded* box (padX/padY
+    //      were declared and then never subtracted), overcounting by ~2 cols / ~1 row, so the PTY
+    //      believed in a bottom row that overflow:hidden was clipping -- exactly the row the
+    //      cursor usually sits on.
+    //   2. hand back the top/left padding as padX/padY, so _layoutCursor can put the absolutely
+    //      positioned .vtcursor on the same origin as the in-flow .vtrows. See _layoutCursor.
+    var cs = getComputedStyle(pane);
+    var padL = parseFloat(cs.paddingLeft) || 0, padT = parseFloat(cs.paddingTop) || 0;
+    var padX = padL + (parseFloat(cs.paddingRight) || 0);
+    var padY = padT + (parseFloat(cs.paddingBottom) || 0);
     var rect = pane.getBoundingClientRect();
-    var innerW = rect.width || pane.clientWidth || (80 * cell.w + padX);
-    var innerH = rect.height || pane.clientHeight || (24 * cell.h + padY);
+    var innerW = (rect.width || pane.clientWidth || (80 * cell.w + padX)) - padX;
+    var innerH = (rect.height || pane.clientHeight || (24 * cell.h + padY)) - padY;
     var cols = Math.max(20, Math.min(300, Math.floor(innerW / cell.w)));
     var rows = Math.max(6, Math.min(120, Math.floor(innerH / cell.h)));
-    return { cols: cols, rows: rows, cellW: cell.w, cellH: cell.h };
+    return { cols: cols, rows: rows, cellW: cell.w, cellH: cell.h, padX: padL, padY: padT };
   }
 
   function debounce(fn, ms) {
@@ -238,6 +250,7 @@
     this.es = null;
     this.composing = false;
     this.cellW = 7.2; this.cellH = 17;
+    this.padX = 0; this.padY = 0;          // .vtpane's real padding; filled by measureAndResize
     this._sized = false;
     this._onStatusChange = null;
     this.focused = false;
@@ -338,6 +351,7 @@
   Terminal.prototype.measureAndResize = function () {
     var m = computeColsRows(this.pane);
     this.cellW = m.cellW; this.cellH = m.cellH;
+    this.padX = m.padX; this.padY = m.padY;
     if (!this._sized || m.cols !== this.cols || m.rows !== this.rows) {
       this._sized = true;
       this._resetGrid(m.cols, m.rows);
@@ -468,7 +482,12 @@
     var c = Math.max(0, Math.min(Math.max(0, this.cols - 1), this.cursor[1]));
     this.cursorEl.style.width = this.cellW + "px";
     this.cursorEl.style.height = this.cellH + "px";
-    this.cursorEl.style.transform = "translate(" + (c * this.cellW) + "px," + (r * this.cellH) + "px)";
+    // .vtcursor is position:absolute inside .vtpane, so its top:0/left:0 origin is the pane's
+    // PADDING box -- while .vtrows sits in normal flow at the CONTENT box, one padding further in.
+    // Without adding that padding back the cursor drew 8px above and 10px left of the cell it
+    // marks (visibly floating between the line above and the character before the real one).
+    this.cursorEl.style.transform =
+      "translate(" + (this.padX + c * this.cellW) + "px," + (this.padY + r * this.cellH) + "px)";
   };
 
   // Display an async notice streamed from the server. Maintains a stacked list of up to 3 notices

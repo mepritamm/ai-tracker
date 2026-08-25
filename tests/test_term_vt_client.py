@@ -874,5 +874,72 @@ class TestCapReclaimBlock(unittest.TestCase):
         self.assertIn(".vtcapx", page)
 
 
+class TestCursorSitsOnTheSameOriginAsTheRows(unittest.TestCase):
+    """The synthetic cursor drew one padding up-and-left of the character it marks.
+
+    `.vtcursor` is `position:absolute` inside `.vtpane`, so its top:0/left:0 origin is the pane's
+    PADDING box, while `.vtrows` is in normal flow and starts at the CONTENT box -- 8px down and
+    10px right of that. `_layoutCursor`'s translate() was pure `col*cellW, row*cellH`, so the block
+    floated between the previous line and the previous character. The same padding was also never
+    subtracted in `computeColsRows` (padX/padY were declared and then unused), so cols/rows were
+    measured against the unpadded box and overcounted -- the bottom row the cursor usually sits on
+    was clipped by .vtpane's overflow:hidden. Both halves read ONE source of truth: the pane's own
+    computed padding."""
+
+    def setUp(self):
+        self.js = _read("ext_vt.js")
+        self.css = _read("ext_vt.css")
+
+    def _ccr(self):
+        return _body_until(self.js, "function computeColsRows(", ["function debounce("])
+
+    def test_the_premise_still_holds_absolute_cursor_in_a_padded_pane(self):
+        # If either of these changes, the offset below is the thing to revisit -- so pin them.
+        pane = self.css[self.css.index(".vtpane {"):]
+        self.assertIn("padding: 8px 10px;", pane[:pane.index("}")])
+        cursor = self.css[self.css.index(".vtcursor {"):]
+        self.assertIn("position: absolute;", cursor[:cursor.index("}")])
+
+    def test_cursor_translate_adds_the_pane_padding(self):
+        body = _function_body(self.js, "Terminal.prototype._layoutCursor")
+        line = body[body.index('"translate("'):]
+        line = line[:line.index(";")]
+        self.assertIn("this.padX + c * this.cellW", line)
+        self.assertIn("this.padY + r * this.cellH", line)
+
+    def test_padding_comes_from_the_computed_style_not_a_second_hardcoded_copy(self):
+        ccr = self._ccr()
+        self.assertIn("getComputedStyle(pane)", ccr)
+        self.assertIn("cs.paddingLeft", ccr)
+        self.assertIn("cs.paddingTop", ccr)
+        self.assertNotIn("padX = 20", ccr)   # the old guessed constants are gone
+        self.assertNotIn("padY = 16", ccr)
+
+    def test_cols_and_rows_are_measured_against_the_content_box(self):
+        ccr = self._ccr()
+        for line in ccr.splitlines():
+            s = line.strip()
+            if s.startswith("var innerW ="):
+                self.assertTrue(s.endswith("- padX;"), s)
+            if s.startswith("var innerH ="):
+                self.assertTrue(s.endswith("- padY;"), s)
+        self.assertIn("var innerW =", ccr)
+        self.assertIn("var innerH =", ccr)
+
+    def test_the_measurement_hands_the_padding_to_the_cursor(self):
+        # computeColsRows returns it, measureAndResize stores it -- otherwise this.padX is the
+        # constructor's 0 forever and the translate() above silently reverts to the old bug.
+        self.assertIn("padX: padL, padY: padT", self._ccr())
+        body = _function_body(self.js, "Terminal.prototype.measureAndResize")
+        self.assertIn("this.padX = m.padX; this.padY = m.padY;", body)
+        self.assertIn("this.padX = 0; this.padY = 0;", self.js)   # safe default pre-measure
+
+    def test_the_fix_reaches_the_browser_not_just_the_source_file(self):
+        # ext_vt.js is inlined into PAGE at startup -- assert against what is actually served.
+        page = build_page()
+        self.assertIn("this.padX + c * this.cellW", page)
+        self.assertIn("padX: padL, padY: padT", page)
+
+
 if __name__ == "__main__":
     unittest.main()
