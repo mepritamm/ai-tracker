@@ -433,4 +433,51 @@ pre-existing against a clean `git archive HEAD`.
 
 ## Verification ledger
 
-_(filled in as work lands)_
+**Gate: 983 tests, `selfcheck ok`, run twice with no flakes.** Pushed as `53ab6a3` to
+`personal/main`; LICENSE intact.
+
+Note for whoever commits here next: the pre-commit hook runs the full gate (~110-126s), which
+exceeds a 2-minute command timeout. Commit with a longer timeout, or the commit is killed mid-hook
+and silently does not land.
+
+## Close-out (head-out step 4)
+
+### Shipped
+
+| | |
+|---|---|
+| **Selection restored** | mouse-reporting toggle in the terminal toolbar, default OFF; plain drag selects again, Shift+drag works either way, flip it on to click inside the TUI |
+| **Input death fixed** | at all three layers — poller in-flight guards, bounded sends, and a 2.4x faster `/api/list` (4.4x fewer file opens) |
+| **Option/AltGr fixed** | pre-existing; `Option+2` (euro) was being sent as `ESC` + the character |
+| **Standalone bundle fixed** | pre-existing; `dist/tracker.py` could not run at all |
+| **Two "tests that cannot fail" closed** | the mouse toggle and the forks memo were both provably unpinned |
+
+### Assumptions I ran with
+
+- Fixed forward rather than reverting `4bc3e08`; the diagnosis cleared its rendering, key-encoding
+  and focus-reporting changes by direct measurement, so reverting would have lost real capability
+  without fixing anything.
+- Took the bundler fix although it was out of scope, because it was cheap, `dist/` is gitignored so
+  the blast radius was small, and it is an artifact the README advertises. The leg had an explicit
+  bail-out; it did not need it.
+- The toggle is per-terminal and not persisted, matching font zoom. If you want it to remember,
+  that is a small follow-up.
+
+### Parked for your return
+
+1. **The exact reported visual is unconfirmed.** What was reproduced and fixed is *input never
+   arriving*. The screenshot's "text one line below a blank prompt line" was never reproduced, and
+   the diagnosing agent explicitly refused to guess at it. Worth retyping in a healthy dashboard
+   after a restart; if it persists, it is a separate bug and this record's eliminations
+   (focus events, mouse motion, `keyToBytes`, sizing, emulator rendering — all cleared by
+   measurement) will save the next investigation a lot of time.
+2. **`/api/list` is still ~4s warm on a large history**, dominated by
+   `providers/claude.py:_session_meta`'s cold pass (1.29s of head+tail reads per fresh process).
+   A 5% win was identified and deliberately parked as too risky to take unattended. The poller
+   guards make this survivable rather than fatal, but it is the next real performance target.
+3. **The standalone bundle ships without the in-browser terminal.** Flattening those four modules
+   needs real design work on the bundler's name substitution. README now states the limit.
+4. **`aitracker/forks.json` holds 4 leaked test records** (`raced-sid`, `retry-sid{,2,3}`) written by
+   test runs against the real config path. Harmless — all have `child: ""` — but they are why the
+   first payload-equivalence check was vacuous. Worth deleting, and worth asking why tests can write
+   there at all.
