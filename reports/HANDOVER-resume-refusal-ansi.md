@@ -235,6 +235,14 @@ you cannot access this content (createPullRequest)`. Direct push to `personal/ma
 this account ships here. End state is the same: the work is on `main`. Commits `3c79e9b`
 (the fix) and `9932d74` (README sync gate). `LICENSE ok` verified on the remote.
 
+**Restarting it detached is not optional.** A dashboard started as a harness-tracked background
+job is SIGTERM'd (exit 143) when the session's task ends, and its child can survive ORPHANED holding
+the port — at which point the next start walks past 8790 to 8791/8792 and writes the WRONG value
+into `aitracker/port`, which is what the notes-drain hook reads. Seen exactly that here. Start it
+with `nohup`/`disown` (parent PID 1) and afterwards verify all three: `lsof -nP -iTCP -sTCP:LISTEN |
+grep -i python`, `cat aitracker/port`, and an HTTP 200 on 8790. Currently: pid 89098, port file
+8790, ppid 1.
+
 **The dashboard restart, and the caveat that matters.** 8787 turned out to be **LinkPage**, not
 ai-tracker — ai-tracker was already on 8790 (pid 50847), running pre-fix code. Stopped by PID (never
 `pkill -f aitracker`) and restarted on 8790, now serving the new page (`vtstarting` present,
