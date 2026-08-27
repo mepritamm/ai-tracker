@@ -511,6 +511,43 @@ class TestZoomControlOverlapFix(unittest.TestCase):
         self.assertIn("container.appendChild(pane)", xterm_body)
 
 
+class TestShortViewportFooterFix(unittest.TestCase):
+    """Short-viewport fix (this session): `.vtctxbar` (the model-selector + token-readout footer)
+    used to be laid out entirely past `.modal`'s clipped bottom edge on any window short enough
+    that app.css's `.modal { max-height: 88vh; overflow: hidden }` left less room than two fixed
+    min-heights in this file (`.vtmodal .mb.vtmb`'s 360px, `.vtpane`'s 300px) together demanded --
+    with no scroll affordance to reach it either, the footer was simply gone. Both floors must be
+    able to yield to a starved container instead of forcing it to overflow, for BOTH renderers
+    (.vtpane is shared by the grid pane and .vtxpane's xterm.js pane alike)."""
+
+    def setUp(self):
+        self.css = _read("ext_vt.css")
+
+    def test_vtmb_no_longer_carries_a_fixed_360px_floor(self):
+        self.assertNotIn("min-height: 360px", self.css)
+        start = self.css.index(".vtmodal .mb.vtmb {")
+        rule = self.css[start:self.css.index("}", start)]
+        self.assertIn("min-height: 0", rule)
+
+    def test_vtpane_base_rule_can_shrink_below_300px(self):
+        # the BASE (non-media-query, non-fullscreen) `.vtpane` rule -- the one actually in force
+        # inside a modal wider than 600px, exactly the case the short-viewport repro hit (neither
+        # the max-width:600px mobile override nor #ext_vt.vtfull's own min-height:0 applied there).
+        start = self.css.index(".vtpane {")
+        block = self.css[start:self.css.index("}", start)]
+        self.assertNotIn("min-height: 300px;", block,
+                          "a bare 300px floor refuses to flex-shrink inside a height-capped .modal")
+        self.assertIn("min-height: min(300px,", block,
+                       "expected a shrinkable min(300px, <vh-based>) floor, mirroring the "
+                       "max-width:600px rule's own vh/dvh idiom below")
+
+    def test_reaches_the_browser(self):
+        page = build_page()
+        self.assertIn("min-height: 0", page)
+        self.assertIn("min-height: min(300px,", page)
+        self.assertNotIn("min-height: 360px", page)
+
+
 class TestXtermRendererSwitch(unittest.TestCase):
     """The client half of TRACKER_TERM_RENDERER: openVT()/bootStandalone() must read which
     renderer to build from the SERVER (POST /api/term/pty's `renderer` field, or GET
@@ -1705,6 +1742,183 @@ class TestRendererSwitchControl(unittest.TestCase):
         self.assertIn("vtrendererbtn", page)
         self.assertIn("function switchActiveRenderer(renderer) {", page)
         self.assertIn("function mountRenderer(renderer) {", page)
+
+
+class TestTerminalModalTitleIsUppercase(unittest.TestCase):
+    """The modal title now reads "TERMINAL" (uppercase) at both sites that set it:
+    buildOverlay()'s static default (painted before any terminal has opened) and openVT()'s
+    per-open title (which appends the resume/session suffix). Both must use the new uppercase
+    form, and the old mixed-case "Terminal" strings must be fully gone, not merely superseded --
+    precise enough that reverting either site alone fails this."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_static_default_title_is_uppercase(self):
+        self.assertIn('modalTitleEl.textContent = "TERMINAL";', self.src)
+
+    def test_per_open_title_is_uppercase_with_suffix(self):
+        self.assertIn(
+            'modalTitleEl.textContent = "TERMINAL — " + (mode === "resume" ? "resume · " : "") + sid;',
+            self.src)
+
+    def test_old_mixed_case_title_strings_are_gone(self):
+        self.assertNotIn('modalTitleEl.textContent = "Terminal";', self.src)
+        self.assertNotIn('modalTitleEl.textContent = "Terminal — "', self.src)
+
+    def test_reaches_the_browser(self):
+        page = build_page()
+        self.assertIn('modalTitleEl.textContent = "TERMINAL";', page)
+        self.assertIn('modalTitleEl.textContent = "TERMINAL — "', page)
+
+    def test_standalone_document_title_is_uppercase(self):
+        self.assertIn('document.title = "TERMINAL — AI Tracker";', self.src)
+        self.assertNotIn('document.title = "Terminal — AI Tracker";', self.src)
+
+    def test_standalone_document_title_reaches_the_browser(self):
+        page = build_page()
+        self.assertIn('document.title = "TERMINAL — AI Tracker";', page)
+        self.assertNotIn('document.title = "Terminal — AI Tracker";', page)
+
+
+class TestThemeFlipperInTerminal(unittest.TestCase):
+    """Dark/light flipper reachable from inside a terminal (the full-screen overlay otherwise
+    covers app.js's own top-bar #themebtn, leaving no way to flip theme mid-session). app.js's
+    setTheme() dispatches a "themechange" CustomEvent on `document` -- from INSIDE setTheme
+    itself, so it fires for every caller (the pre-existing top-bar button included), not just this
+    new one. ext_vt.js's shared buildToolbar() -- the same single place TestZoomControlOverlapFix/
+    TestMouseReportingToggle/TestRendererSwitchControl already pin -- builds the button so BOTH
+    renderers inherit it for free; it must call the global toggleTheme() rather than reimplement
+    theme logic, and XtermTerminal's live re-theme listener must be both added (constructor) and
+    removed (destroy) -- an add without a matching remove is a leak that outlives the DOM."""
+
+    def setUp(self):
+        self.app_js = _read("app.js")
+        self.src = _read("ext_vt.js")
+
+    def test_setTheme_dispatches_themechange(self):
+        self.assertIn(
+            'document.dispatchEvent(new CustomEvent("themechange",{detail:{theme:t}}));',
+            self.app_js)
+
+    def test_dispatch_lives_inside_setTheme_so_every_caller_gets_it(self):
+        # setTheme/toggleTheme are each one statement per line in this file; slicing from
+        # setTheme's own start up to toggleTheme's definition isolates setTheme's body, and
+        # confirms there is exactly one dispatch site for the whole file -- not a second one
+        # bolted onto just the new button's click handler.
+        start = self.app_js.index("function setTheme(t){")
+        end = self.app_js.index("function toggleTheme(")
+        body = self.app_js[start:end]
+        self.assertIn('CustomEvent("themechange"', body)
+        self.assertEqual(self.app_js.count('CustomEvent("themechange"'), 1)
+
+    def test_theme_button_built_in_shared_toolbar_not_per_renderer(self):
+        body = _function_body(self.src, "function buildToolbar(")
+        self.assertIn("vtthemebtn", body)
+        term_body = _function_body(self.src, "function Terminal(container, ttyId) {")
+        self.assertNotIn("vtthemebtn", term_body)
+        xterm_start = self.src.index("function XtermTerminal(container, ttyId")
+        xterm_ctor_body = self.src[xterm_start:self.src.index("XtermTerminal.prototype.attach")]
+        self.assertNotIn("vtthemebtn", xterm_ctor_body)
+
+    def test_button_calls_the_global_toggleTheme_not_reimplemented_logic(self):
+        body = _function_body(self.src, "function buildToolbar(")
+        self.assertIn("toggleTheme();", body)
+        # must not reach into the class toggle / persistence itself -- setTheme() alone owns that.
+        self.assertNotIn('classList.toggle("light"', body)
+        self.assertNotIn("localStorage.theme", body)
+
+    def test_button_label_rerenders_on_themechange_and_is_disposed(self):
+        body = _function_body(self.src, "function buildToolbar(")
+        self.assertIn('document.addEventListener("themechange", renderThemeBtn);', body)
+        self.assertIn("bar.disposeThemeBtn = function ()", body)
+        self.assertIn('document.removeEventListener("themechange", renderThemeBtn);', body)
+
+    def test_theme_button_dispose_is_wired_in_both_destroys(self):
+        term_destroy = _function_body(self.src, "Terminal.prototype.destroy = function")
+        self.assertIn("this._disposeThemeBtn()", term_destroy)
+        xterm_destroy = _body_until(self.src, "XtermTerminal.prototype.destroy = function",
+                                     ["// ===== the modal (reuses app.css"])
+        self.assertIn("this._disposeThemeBtn()", xterm_destroy)
+
+    def test_xterm_adds_and_removes_the_themechange_listener(self):
+        # add: in the constructor, alongside building this._onThemeChange.
+        xterm_start = self.src.index("function XtermTerminal(container, ttyId")
+        xterm_ctor_body = self.src[xterm_start:self.src.index("XtermTerminal.prototype.attach")]
+        self.assertIn(
+            "this._onThemeChange = function () { if (self.term) self.term.options.theme = _xtermTheme(); };",
+            xterm_ctor_body)
+        self.assertIn('document.addEventListener("themechange", this._onThemeChange);', xterm_ctor_body)
+        # remove: in destroy, or the listener leaks for the life of the tab.
+        xterm_destroy = _body_until(self.src, "XtermTerminal.prototype.destroy = function",
+                                     ["// ===== the modal (reuses app.css"])
+        self.assertIn(
+            'document.removeEventListener("themechange", this._onThemeChange); this._onThemeChange = null;',
+            xterm_destroy)
+
+    def test_control_is_not_hidden_by_host_or_viewport(self):
+        # hard project rule, same as TestMouseReportingToggle/TestRendererSwitchControl's own
+        # checks: no control here may be gated on location.hostname.
+        self.assertNotIn("location.hostname", self.src)
+
+    def test_reaches_the_browser(self):
+        page = build_page()
+        self.assertIn("vtthemebtn", page)
+        self.assertIn('document.dispatchEvent(new CustomEvent("themechange"', page)
+
+
+class TestObservePaneSharedResizeHelper(unittest.TestCase):
+    """Bottom-row clipping fix: a shared module-level `observePane(pane, fn)` helper wraps
+    ResizeObserver so Terminal (grid) and XtermTerminal (canvas) share ONE observe/dispose
+    implementation -- replacing xterm's old bespoke `this._ro` wiring -- instead of each renderer
+    forking its own. This is what makes the pane re-measure (and re-POST /api/term/resize) when
+    .vtctxbar's footer changes height, instead of leaving a stale row count clipped by
+    `.vtpane { overflow: hidden }`."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_observePane_defined_exactly_once(self):
+        self.assertEqual(self.src.count("function observePane(pane, fn)"), 1)
+
+    def test_observePane_is_the_only_ResizeObserver_construction_site(self):
+        # the actual forked-implementation regression bar: if either renderer goes back to wiring
+        # its own bespoke `new ResizeObserver(...)`, this fails even though observePane itself
+        # still exists and still works.
+        self.assertEqual(self.src.count("new ResizeObserver("), 1)
+
+    def test_no_leftover_bespoke_ro_field(self):
+        # the old xterm-only wiring this replaced kept its observer on `this._ro`.
+        self.assertNotIn("this._ro", self.src)
+
+    def test_grid_terminal_calls_observePane_in_its_constructor(self):
+        term_body = _function_body(self.src, "function Terminal(container, ttyId) {")
+        self.assertIn("this._disposePaneObserver = observePane(pane, this._resizeDebounced);", term_body)
+
+    def test_xterm_terminal_calls_observePane_when_it_builds(self):
+        # unlike the grid Terminal, XtermTerminal defers building its real pane/xterm.js instance
+        # to _build() (behind the lazy asset-load promise) -- observePane is wired there, not in
+        # the constructor itself.
+        body = _body_until(self.src, "XtermTerminal.prototype._build = function",
+                            ["XtermTerminal.prototype._doResize = function"])
+        self.assertIn("this._disposePaneObserver = observePane(this.pane, self._resizeDebounced);", body)
+
+    def test_both_destroys_dispose_the_observer(self):
+        term_destroy = _function_body(self.src, "Terminal.prototype.destroy = function")
+        self.assertIn("this._disposePaneObserver()", term_destroy)
+        xterm_destroy = _body_until(self.src, "XtermTerminal.prototype.destroy = function",
+                                     ["// ===== the modal (reuses app.css"])
+        self.assertIn("this._disposePaneObserver()", xterm_destroy)
+
+    def test_helper_disconnects_and_degrades_when_unsupported(self):
+        body = _body_until(self.src, "function observePane(pane, fn) {", ["function buildToolbar("])
+        self.assertIn("if (!window.ResizeObserver) return function () { };", body)
+        self.assertIn("ro.disconnect()", body)
+
+    def test_reaches_the_browser(self):
+        page = build_page()
+        self.assertIn("function observePane(pane, fn)", page)
+        self.assertEqual(page.count("new ResizeObserver("), 1)
 
 
 if __name__ == "__main__":

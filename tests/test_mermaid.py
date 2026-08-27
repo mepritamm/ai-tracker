@@ -20,7 +20,8 @@ _HARNESS = r"""
 const fs=require("fs");
 const stub=()=>new Proxy(function(){},{get:(t,k)=>k===Symbol.toPrimitive?()=>"":stub(),set:()=>true,apply:()=>stub()});
 globalThis.document={documentElement:{classList:{contains:()=>false,toggle:()=>{}}},
-  getElementById:()=>stub(),addEventListener:()=>{},querySelectorAll:()=>[],querySelector:()=>stub()};
+  getElementById:()=>stub(),addEventListener:()=>{},removeEventListener:()=>{},dispatchEvent:()=>true,
+  querySelectorAll:()=>[],querySelector:()=>stub()};
 globalThis.localStorage={getItem:()=>null,setItem:()=>{}};
 globalThis.location={host:"localhost:8790",href:"http://localhost:8790/"};
 globalThis.addEventListener=()=>{};

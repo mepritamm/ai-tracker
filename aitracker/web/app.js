@@ -1,6 +1,6 @@
 let cur=localStorage.getItem("sid")||"", timer=null;
 // Dark (default) / Light theme — the class is set pre-paint by the <head> script; sync button + meta here.
-function setTheme(t){document.documentElement.classList.toggle("light",t==="light");try{localStorage.theme=t}catch(e){}var b=document.getElementById("themebtn");if(b)b.textContent=t==="light"?"🌙":"☀️";var m=document.getElementById("themecolor");if(m)m.content=t==="light"?"#f4efe3":"#0c0f15";}
+function setTheme(t){document.documentElement.classList.toggle("light",t==="light");try{localStorage.theme=t}catch(e){}var b=document.getElementById("themebtn");if(b)b.textContent=t==="light"?"🌙":"☀️";var m=document.getElementById("themecolor");if(m)m.content=t==="light"?"#f4efe3":"#0c0f15";document.dispatchEvent(new CustomEvent("themechange",{detail:{theme:t}}));}
 function toggleTheme(){setTheme(document.documentElement.classList.contains("light")?"dark":"light");}
 setTheme(document.documentElement.classList.contains("light")?"light":"dark");
 const $=id=>document.getElementById(id);

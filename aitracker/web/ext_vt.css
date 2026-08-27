@@ -10,7 +10,14 @@
 
 /* ---- modal sizing (chrome itself comes from app.css's .overlay/.modal) ---- */
 .vtmodal { width: min(920px, 100%); }
-.vtmodal .mb.vtmb { padding: 0; display: flex; flex-direction: column; min-height: 360px; }
+/* min-height: 0 (not a fixed floor) -- SHORT-VIEWPORT FIX (this session): a fixed floor here
+   (formerly 360px) refused to shrink even when .modal's own max-height: 88vh (app.css) left less
+   room than that after the header, so the footer (.vtctxbar, appended as this element's own
+   sibling -- see openVT's DOM-assembly comment above) got laid out past the modal's clipped
+   bottom edge and was entirely unreachable. Zero here lets the natural stack (.vttermwrap +
+   .vtctxbar) size to whatever's actually available; .vtpane's own min-height below still gives a
+   comfortable default on roomy viewports, it just no longer fights a starved container. */
+.vtmodal .mb.vtmb { padding: 0; display: flex; flex-direction: column; min-height: 0; }
 .vtempty { padding: 18px 22px; }
 
 /* ---- cap-reached block: which terminals hold the slots, each with a kill button. No host
@@ -72,7 +79,18 @@
 .vtpane {
   position: relative;
   flex: 1 1 auto;
-  min-height: 300px;
+  /* min(300px, 40vh/40dvh) -- SHORT-VIEWPORT FIX (this session): a bare 300px floor refused to
+     flex-shrink inside a modal capped by app.css's .modal max-height: 88vh rule, so on a short
+     viewport the pane (and the .vtctxbar footer stacked after it -- see .vtmb's own min-height
+     comment above) got pushed past the modal's clipped bottom edge and became unreachable, with
+     no scroll affordance to reach it. 40vh matches 300px exactly at a 750px-tall viewport (the
+     shortest "normal" desktop/tablet height already implied elsewhere in this file), so every
+     viewport at or above that height keeps today's identical 300px default -- this only starts
+     yielding below it. Mirrors the same vh-capped idiom the max-width:600px rule below already
+     uses (46vh/46dvh) for the narrow/mobile case; #ext_vt.vtfull's own min-height: 0 (bottom of
+     this file) is the full-screen sibling of this same fix. */
+  min-height: min(300px, 40vh);
+  min-height: min(300px, 40dvh);
   background: var(--app);
   overflow: hidden;
   font-family: 'JetBrains Mono', monospace;

@@ -369,6 +369,27 @@
     };
   }
 
+  // ===== shared pane-resize watcher (Terminal + XtermTerminal) =====
+  // BUG this closes: .vtctxbar (ContextBar) starts hidden and later flips to display:"" the first
+  // time /api/session polling returns usage data -- an async, POST-ATTACH layout change. Both
+  // .vttermwrap (which holds the toolbar+pane) and .vtctxbar are flex:0/1 SIBLINGS inside the same
+  // flex-column container (.mb.vtmb in the modal, `mount` in the standalone tab -- see openVT's and
+  // bootStandalone's own DOM-assembly comments), so that flip shrinks .vttermwrap via ordinary
+  // flexbox, which in turn shrinks .vtpane (flex:1 1 auto inside .vttermwrap's own flex column).
+  // Neither renderer's explicit resize triggers (attach()'s one-shot rAF, the debounced `window`
+  // resize listener) fire for a sibling's height change -- only an observer on the pane itself
+  // does, and it's correct to observe the PANE regardless of which ancestor's flex recalculation
+  // caused the change: a ResizeObserver reports the target's own border box, however it moved.
+  // One tiny helper so Terminal (grid) and XtermTerminal (canvas) share this instead of each
+  // wiring/tearing down its own ResizeObserver. `fn` must already be debounced by the caller (see
+  // debounce() above) -- this stays a thin observe/dispose wrapper, not a second debouncer.
+  function observePane(pane, fn) {
+    if (!window.ResizeObserver) return function () { };
+    var ro = new ResizeObserver(fn);
+    ro.observe(pane);
+    return function () { ro.disconnect(); };
+  }
+
   // ===== shared zoom toolbar: ITS OWN flex row, ABOVE the pane -- never an overlay on top of
   // terminal output. LAYOUT-BUG FIX (see ext_vt.css's .vttoolbar comment for the full story): the
   // A-/A+ controls used to be absolutely positioned inside .vtpane's top-right corner, overlapping
@@ -378,6 +399,46 @@
   function buildToolbar(onZoomOut, onZoomIn, onAfterZoom, mouseToggle, rendererSwitch) {
     var bar = document.createElement("div");
     bar.className = "vttoolbar";
+    // ===== theme flipper (this session): the terminal opens in a full-screen .overlay (app.css,
+    // z-index 50) that COVERS app.js's own #themebtn in the top bar, so a user with a terminal
+    // open has no way to flip dark/light -- this button is the per-terminal escape hatch. It does
+    // NOT reimplement theme logic: it calls the exact same global toggleTheme() the top-bar button
+    // calls, so app.js's setTheme() stays the single owner of the class toggle/persistence/meta-
+    // color/the "themechange" event this button (and XtermTerminal's live re-theme, see that
+    // class's own constructor/destroy) listen for. Built once here so both renderers get it from
+    // one place, same as the mouse/renderer switches above.
+    var themeBtn = document.createElement("span");
+    themeBtn.className = "vtzoombtn vtthemebtn";
+    themeBtn.title = "Toggle dark/light theme";
+    themeBtn.setAttribute("role", "switch");
+    themeBtn.setAttribute("tabindex", "0");
+    function renderThemeBtn() {
+      // Mirrors app.js's own setTheme() convention exactly: "🌙" while light (tap for dark),
+      // "☀️" while dark (tap for light) -- read live off <html>'s class rather than cached, since
+      // this can be re-rendered long after the button was built (top-bar toggle, another pane's
+      // toggle, or this same button).
+      var light = document.documentElement.classList.contains("light");
+      themeBtn.textContent = light ? "🌙" : "☀️";
+      themeBtn.setAttribute("aria-pressed", light ? "true" : "false");
+    }
+    function activateThemeBtn() {
+      toggleTheme();   // app.js global -- flips the class, persists it, fires "themechange"
+      onAfterZoom();   // refocus the capture textarea, exactly like the zoom/mouse buttons above
+    }
+    themeBtn.addEventListener("click", activateThemeBtn);
+    themeBtn.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); activateThemeBtn(); }
+    });
+    // Document-level listener so this button stays in sync when theme is flipped some OTHER way
+    // (the top-bar button, or a second open terminal's own theme button) -- same "leaks past this
+    // element's own DOM teardown unless explicitly removed" situation Terminal.prototype's own
+    // _onDocMouseUp comment describes. `bar.disposeThemeBtn` is exposed exactly like
+    // `bar.refreshMouseToggle` above so each owning class (Terminal/XtermTerminal) can save it and
+    // call it from its own destroy() -- see those constructors/destroy methods.
+    document.addEventListener("themechange", renderThemeBtn);
+    bar.disposeThemeBtn = function () { document.removeEventListener("themechange", renderThemeBtn); };
+    renderThemeBtn();
+    bar.appendChild(themeBtn);
     var zoomOut = document.createElement("span");
     zoomOut.className = "vtzoombtn";
     zoomOut.textContent = "A−"; zoomOut.title = "Smaller (Ctrl/Cmd -)";
@@ -594,6 +655,7 @@
       rendererSwitch
     );
     this._refreshMouseToggle = toolbarEl.refreshMouseToggle;   // called from _applyPatch below
+    this._disposeThemeBtn = toolbarEl.disposeThemeBtn;   // called from destroy() below
     var pane = document.createElement("div");
     pane.className = "vtpane";
     var rowsEl = document.createElement("div");
@@ -628,6 +690,14 @@
 
     this.pane = pane; this.rowsEl = rowsEl; this.cursorEl = cursorEl; this.input = input;
     this.newOutEl = newOutEl; this.scrollbarEl = scrollbarEl; this.scrollThumbEl = scrollThumbEl;
+
+    // Re-measure whenever the pane's OWN box changes for a reason none of this class's other
+    // triggers cover -- most notably .vtctxbar flipping visible after attach (see observePane's
+    // own comment, just above buildToolbar, for the full mechanism). measureAndResize() already
+    // re-POSTs /api/term/resize when cols/rows actually change, so the server pty stays in sync
+    // for free; debounced the same way XtermTerminal debounces its own resize work (150ms).
+    this._resizeDebounced = debounce(function () { self.measureAndResize(); }, 150);
+    this._disposePaneObserver = observePane(pane, this._resizeDebounced);
 
     this._scrollHistoryDebounced = debounce(function (offset) { self._scrollHistory(offset); }, 30);
     // No preventDefault here (requirement 2's whole point): blocking the mousedown default is
@@ -1103,6 +1173,10 @@
     });
   };
   Terminal.prototype.destroy = function () {
+    if (this._disposeThemeBtn) { this._disposeThemeBtn(); this._disposeThemeBtn = null; }
+    // See the constructor's own comment on observePane -- a ResizeObserver, like the document-
+    // level listeners below, outlives its element unless explicitly disconnected.
+    if (this._disposePaneObserver) { this._disposePaneObserver(); this._disposePaneObserver = null; }
     if (this.es) { this.es.close(); this.es = null; }
     // A motion flush scheduled via _sendMotion (see above) must never fire after teardown -- that
     // was a real stray POST /api/term/keys for an already-destroyed terminal (proven by executing
@@ -1525,10 +1599,10 @@
     // Guards _build() firing after a mid-load destroy(): attach() defers _build() behind
     // _loadXtermAssets()'s promise, and if destroy() runs while that ~480KB asset load is still
     // in flight (e.g. the user switches renderers again before it resolves), destroy() completes
-    // as a clean no-op against a still-null this.term/this._ro -- then the deferred _build() would
-    // fire anyway and build a real xterm.js Terminal, ResizeObserver and window listener on an
-    // already-destroyed instance, none of which anything would ever clean up. Same pattern as
-    // ContextBar._destroyed (see that class's constructor/destroy).
+    // as a clean no-op against a still-null this.term/this._disposePaneObserver -- then the
+    // deferred _build() would fire anyway and build a real xterm.js Terminal, ResizeObserver and
+    // window listener on an already-destroyed instance, none of which anything would ever clean
+    // up. Same pattern as ContextBar._destroyed (see that class's constructor/destroy).
     this._destroyed = false;
     var self = this;
     this._resizeDebounced = debounce(function () { self._doResize(); }, 150);
@@ -1551,12 +1625,22 @@
       },
       rendererSwitch
     );
+    this._disposeThemeBtn = toolbarEl.disposeThemeBtn;   // called from destroy() below
     var pane = document.createElement("div");
     pane.className = "vtpane vtxpane";
     container.appendChild(toolbarEl);
     container.appendChild(pane);
     this.pane = pane;
     this.container = container;
+    // Live re-theme: _xtermTheme() is only read ONCE, by _build() below, at construction time --
+    // xterm.js takes an explicit JS colour object, not CSS, so an already-open pane has no other
+    // way to pick up a theme flip (from this toolbar's own button, the top-bar button, or another
+    // pane's button). Bound here (not in _build()) so the listener exists for the ENTIRE lifetime
+    // of this instance, including the window between attach() and the deferred _build() actually
+    // running -- self._onThemeChange checks `self.term` itself and is a no-op until _build() sets
+    // it. Removed in destroy() below; see that method's own comment for why.
+    this._onThemeChange = function () { if (self.term) self.term.options.theme = _xtermTheme(); };
+    document.addEventListener("themechange", this._onThemeChange);
   }
 
   XtermTerminal.prototype.attach = function () {
@@ -1616,11 +1700,10 @@
     term.onResize(function (sz) { postResize(self.ttyId, sz.cols, sz.rows); });
 
     window.addEventListener("resize", self._resizeDebounced);
-    this._ro = null;
-    if (window.ResizeObserver) {
-      this._ro = new ResizeObserver(function () { self._resizeDebounced(); });
-      this._ro.observe(this.pane);
-    }
+    // See observePane's own comment (just above buildToolbar) for the sibling-flex mechanism this
+    // covers -- shared with the grid Terminal class instead of each renderer wiring/tearing down
+    // its own ResizeObserver.
+    this._disposePaneObserver = observePane(this.pane, self._resizeDebounced);
     try { term.focus(); } catch (e) { }
     this._openStream();
   };
@@ -1666,8 +1749,13 @@
     // it created, below) and _build() is still pending behind attach()'s asset-load promise (this
     // makes that deferred call a no-op instead of building a leak onto a destroyed instance).
     this._destroyed = true;
+    // Both are document-level listeners (see the constructor's own comments) -- neither is cleaned
+    // up by container.innerHTML = "" or any other DOM teardown, so both must be removed explicitly
+    // here or every terminal open leaks one more "themechange" handler for the life of the tab.
+    if (this._disposeThemeBtn) { this._disposeThemeBtn(); this._disposeThemeBtn = null; }
+    if (this._onThemeChange) { document.removeEventListener("themechange", this._onThemeChange); this._onThemeChange = null; }
     if (this.es) { this.es.close(); this.es = null; }
-    if (this._ro) { this._ro.disconnect(); this._ro = null; }
+    if (this._disposePaneObserver) { this._disposePaneObserver(); this._disposePaneObserver = null; }
     window.removeEventListener("resize", this._resizeDebounced);
     if (this.term) { this.term.dispose(); this.term = null; }
   };
@@ -1702,7 +1790,7 @@
     mh.className = "mh";
     modalTitleEl = document.createElement("span");
     modalTitleEl.className = "fn";
-    modalTitleEl.textContent = "Terminal";
+    modalTitleEl.textContent = "TERMINAL";
     // Fork chip: appended after title, shown conditionally when forked=true
     modalForkChip = document.createElement("span");
     modalForkChip.className = "vtforkchip";
@@ -2113,7 +2201,7 @@
     activeMode = mode;
     var gen = ++openGen;             // this open's identity; see openGen's declaration above
 
-    modalTitleEl.textContent = "Terminal — " + (mode === "resume" ? "resume · " : "") + sid;
+    modalTitleEl.textContent = "TERMINAL — " + (mode === "resume" ? "resume · " : "") + sid;
     modalStatusEl.textContent = "connecting…";
     modalBodyEl.innerHTML = "";
     overlay.style.display = "flex";
@@ -2329,7 +2417,7 @@
     }
     if (!tty) return;
     document.documentElement.classList.add("vt-standalone");
-    document.title = "Terminal — AI Tracker";
+    document.title = "TERMINAL — AI Tracker";
     var mount = document.getElementById("ext_vt");
     if (!mount) return;
     // The mount lives inside .app, which .vt-standalone hides with display:none -- and a

@@ -1311,11 +1311,29 @@ function FakeFitAddon() {}
 FakeFitAddon.prototype.fit = function () {};
 window.FitAddon = { FitAddon: FakeFitAddon };
 
+// Real observePane() (module-scope in ext_vt.js, shared by Terminal and XtermTerminal) lives
+// BEFORE _b64ToBytes -- outside _XTERM_LEAK_SRC's slice -- so, like buildToolbar() below, it needs
+// its own stand-in here. Mirrors the real implementation exactly (same ResizeObserver construct/
+// observe/disconnect shape) so __roInstances/__resizeListenerSet keep counting real (fake)
+// instances instead of silently going stale once _build() starts calling through this instead of
+// constructing its own ResizeObserver inline.
+function observePane(pane, fn) {
+  if (!window.ResizeObserver) return function () {};
+  var ro = new ResizeObserver(fn);
+  ro.observe(pane);
+  return function () { ro.disconnect(); };
+}
+
 var document = {
   documentElement: {},
   createElement: function () {
     return { className: '', appendChild: function () {}, setAttribute: function () {} };
   },
+  // XtermTerminal's constructor/destroy add/remove a document-level "themechange" listener (see
+  // that class's own comments) -- this harness's buildToolbar() stub below is fully mocked out
+  // (no real theme-button listener of its own), so these only need to exist, not track anything.
+  addEventListener: function () {},
+  removeEventListener: function () {},
 };
 function getComputedStyle() { return { getPropertyValue: function () { return ''; } }; }
 
@@ -1350,7 +1368,8 @@ function resolveNextAssetLoad() {
 
 class TestXtermSwitchDestroyRace(unittest.TestCase):
     """DEFECT 1, executed: the reviewer's exact repro. `XtermTerminal.prototype.attach` defers
-    everything (the real `this.term`, `this._ro` ResizeObserver, and the `window` resize listener)
+    everything (the real `this.term`, the `observePane()`-backed `this._disposePaneObserver`
+    ResizeObserver, and the `window` resize listener)
     behind `_loadXtermAssets()`'s promise; `destroy()` called while that promise is still pending
     used to complete as a clean no-op (nothing was built yet to tear down) and then the deferred
     `_build()` fired anyway -- ON the already-destroyed instance -- building a real xterm.js
@@ -1376,7 +1395,8 @@ async function main() {
 
   console.log(JSON.stringify({
     termSetOnDestroyed: term.term !== null,
-    roSetOnDestroyed: !!term._ro,
+    roSetOnDestroyed: !!term._disposePaneObserver,   // see _disposePaneObserver comment in
+                                                       // test_normal_path_build_then_destroy_cleans_up_everything
     liveResizeListeners: __resizeListenerSet.size,
     liveResizeObservers: __roInstances.filter(function (r) { return !r.disconnected; }).length,
     xtermInstancesBuilt: __xtermBuilt,
@@ -1386,7 +1406,7 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
 """
         result = _run_node(script)
         self.assertFalse(result["termSetOnDestroyed"], "term.term must stay null on a destroyed instance")
-        self.assertFalse(result["roSetOnDestroyed"], "term._ro must stay null on a destroyed instance")
+        self.assertFalse(result["roSetOnDestroyed"], "term._disposePaneObserver must stay null on a destroyed instance")
         self.assertEqual(result["liveResizeListeners"], 0, "no window resize listener may survive")
         self.assertEqual(result["liveResizeObservers"], 0, "no live ResizeObserver may survive")
         self.assertEqual(
@@ -1441,7 +1461,10 @@ async function main() {
 
   var afterBuild = {
     termIsSet: term.term !== null,
-    roIsSet: !!term._ro,
+    // _ro was the pre-observePane-refactor field name (see TestObservePaneSharedResizeHelper in
+    // test_term_vt_client.py: "replacing xterm's old bespoke `this._ro` wiring") -- XtermTerminal
+    // now stores observePane()'s dispose closure on `_disposePaneObserver` instead.
+    roIsSet: !!term._disposePaneObserver,
     liveResizeListeners: __resizeListenerSet.size,
     liveResizeObservers: __roInstances.filter(function (r) { return !r.disconnected; }).length,
     xtermInstancesBuilt: __xtermBuilt,
@@ -1452,7 +1475,7 @@ async function main() {
   console.log(JSON.stringify({
     afterBuild: afterBuild,
     termAfterDestroy: term.term,
-    roAfterDestroy: term._ro,
+    roAfterDestroy: term._disposePaneObserver,
     liveResizeListenersAfterDestroy: __resizeListenerSet.size,
     liveResizeObserversAfterDestroy: __roInstances.filter(function (r) { return !r.disconnected; }).length,
     xtermInstancesDisposed: __xtermDisposed,
@@ -1469,7 +1492,7 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         self.assertEqual(before["xtermInstancesBuilt"], 1)
 
         self.assertIsNone(result["termAfterDestroy"], "destroy() must dispose and clear this.term")
-        self.assertIsNone(result["roAfterDestroy"], "destroy() must disconnect and clear this._ro")
+        self.assertIsNone(result["roAfterDestroy"], "destroy() must disconnect and clear this._disposePaneObserver")
         self.assertEqual(result["liveResizeListenersAfterDestroy"], 0, "destroy() must remove the window listener")
         self.assertEqual(result["liveResizeObserversAfterDestroy"], 0, "destroy() must disconnect the ResizeObserver")
         self.assertEqual(result["xtermInstancesDisposed"], 1, "destroy() must dispose() the xterm.js terminal")
