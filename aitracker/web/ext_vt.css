@@ -505,3 +505,35 @@ html.light {
   border-top: 1px solid var(--line);
   background: var(--side);
 }
+
+/* ---- "Manage terminals" panel. The ROWS are the cap block's rows -- literally, via the shared
+   buildTermRow() in ext_vt.js -- so `.vtcaprow`/`.vtcaplabel`/`.vtcapx` above already give this
+   panel its ellipsising label and its 28px-tall tap targets on phone and tablet, with no parallel
+   responsive rule to keep in sync (conventions rule 4). Only the panel's own chrome is new here,
+   and it reuses app.css's .overlay/.modal/.mh/.mb/.x exactly like the terminal modal does. ---- */
+.vtmgrmodal { width: min(720px, 100%); }
+.vtmgr .vtcaphead { color: var(--dim); font-size: 12px; line-height: 1.5; }
+.vtmgrfoot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line3);
+}
+.vtmgrwarn { flex: 1 1 200px; min-width: 0; font-size: 12px; color: var(--red); }
+.vtmgrall { margin-left: auto; }
+
+/* ---- manager panel: narrow breakpoints. Same two bands the pane's own overrides use
+   (601-900 tablet, <=600 phone) -- nothing here is hidden at any width, it only reflows. ---- */
+@media(min-width:601px) and (max-width:900px) {
+  .vtmgrfoot { gap: 6px; }
+  .vtmgrwarn { flex: 1 1 100%; }        /* the warning gets its own line before the two buttons */
+}
+@media(max-width:600px) {
+  .vtcaprow { flex-wrap: wrap; }        /* label on its own line, actions beneath it */
+  .vtcaplabel { flex: 1 1 100%; }
+  .vtmgrfoot .vtcapx { flex: 1 1 auto; }
+  .vtmgrall { margin-left: 0; }
+}

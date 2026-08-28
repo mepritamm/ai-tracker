@@ -187,6 +187,31 @@ if _HAS_NODE:
     _ctxbar_end = _SRC.index("function renderCapBlock(")
     _CONTEXT_BAR_SRC = _SRC[_ctxbar_start:_ctxbar_end]
 
+    # ===== "Manage terminals" panel: the kill-all safety guard (this task) =====
+    # A double-click on "Close all" SIGKILLed every running terminal without the confirmation ever
+    # being displayed for a single frame -- 15 source-text-grep tests all stayed green while this
+    # was true, because none of them ever ran the code. Extracted the same "span between two
+    # literal markers" way as `_XTERM_LEAK_SRC`/`_CONTEXT_BAR_SRC` above: `buildTermRow` (the row
+    # builder the cap block AND this panel share -- conventions rule 4, one row shape, not two)
+    # through `function renderCapBlock(` (the cap block itself is unrelated and not needed here),
+    # then the whole manager-panel banner comment through (but not including) `window.ExtVT =`.
+    #
+    # The second span's end is found via `_SRC.index("window.ExtVT =", _mgr_start)` -- i.e. a
+    # search that starts AFTER the manager section itself -- rather than a bare `_SRC.index(...)`
+    # from the top of the file: `"window.ExtVT ="` also appears verbatim in this file's own header
+    # comment near line 7 ("Exposes window.ExtVT = {open(sid, mode), manage()} ..."), which sits
+    # BEFORE `_mgr_start`. A bare `.index` would resolve to that comment instead, and slicing
+    # `_SRC[_mgr_start:end]` with an end index smaller than the start silently returns an empty
+    # string rather than raising -- so a test built on it would import zero code and pass on
+    # nothing asserted, not fail loudly. Confirmed by hand while building this harness.
+    _buildrow_start = _SRC.index("function buildTermRow(t, now, actions) {")
+    _buildrow_end = _SRC.index("function renderCapBlock(")
+    _BUILD_TERM_ROW_SRC = _SRC[_buildrow_start:_buildrow_end]
+
+    _mgr_start = _SRC.index('// ===== "Manage terminals" panel')
+    _mgr_end = _SRC.index("window.ExtVT =", _mgr_start)
+    _MANAGER_PANEL_SRC = _SRC[_mgr_start:_mgr_end]
+
 
 _HARNESS_PRELUDE = """
 'use strict';
@@ -2475,6 +2500,401 @@ console.log(JSON.stringify({
         ctor = src[start:src.index("Terminal.prototype.", start)]
         self.assertIn("this._destroyed = false;", ctor,
                        "the grid Terminal constructor must seed _destroyed, like XtermTerminal's does")
+
+
+# ===== "Manage terminals" panel: the kill-all safety guard (this task) ==========================
+# A real bug shipped here despite 15 GREEN tests: every one of them was a source-text grep against
+# tests/test_term_vt_client.py, so none of them ever ran the code. Reproduced live: a double-click
+# on "Close all" SIGKILLed three running terminals with the one-line confirmation warning never
+# painted for a single frame. Mirrors this file's own `_CONTEXT_BAR_MOCKS` in spirit -- a stub
+# `document`/`fetch`/`toast` layer plus a fake-DOM `.dispatch(type, ev)` that drives REAL listeners
+# registered via the real addEventListener/onclick assignments, never a test calling a private
+# method to simulate a click -- but adds two mocks that section didn't need: a controllable
+# `Date.now()` (the arm guard is time-based) and a controllable `setTimeout` (the post-close
+# refresh is scheduled, not immediate). Real Node global `setTimeout` is captured as
+# `__realSetTimeout` BEFORE the local `function setTimeout` shadows the bare identifier for the
+# whole script (top-level `function` declarations in a Node CommonJS module are hoisted to the
+# module-wrapper's own scope, never attached to `globalThis` -- so `globalThis.setTimeout` stays
+# real throughout), so `__flush()`'s real macrotask hop keeps working even though the extracted
+# manager code's OWN `setTimeout` calls land in a manually-driven queue instead.
+_MANAGER_MOCKS = """
+var __fetchCalls = [];
+var __listQueue = [{ terminals: [], max: 8 }];   // each entry: {terminals, max} or {reject:true}
+var __closeQueue = [{}];                          // each entry: {} (200 ok), {status:N}, {reject:true}
+var __closeCalls = [];                            // every tty POSTed to /api/term/close, in order
+var __toastCalls = [];
+
+function __nextFrom(queue) { return queue.length > 1 ? queue.shift() : queue[0]; }
+
+function __makeResponse(status, jsonBody) {
+  return {
+    ok: status >= 200 && status < 300, status: status,
+    json: function () { return Promise.resolve(jsonBody); },
+  };
+}
+
+function fetch(url, opts) {
+  __fetchCalls.push({ url: url, opts: opts });
+  if (url === "/api/term/list") {
+    var spec = __nextFrom(__listQueue);
+    if (spec.reject) return Promise.reject(new Error(spec.rejectMsg || "simulated network failure"));
+    var status = spec.status === undefined ? 200 : spec.status;
+    return Promise.resolve(__makeResponse(status, { terminals: spec.terminals || [], max: spec.max }));
+  }
+  if (url === "/api/term/close") {
+    var body = {};
+    try { body = JSON.parse(opts.body); } catch (e) {}
+    __closeCalls.push(body.tty);
+    var cspec = __nextFrom(__closeQueue);
+    if (cspec.reject) return Promise.reject(new Error("simulated network failure"));
+    var cstatus = cspec.status === undefined ? 200 : cspec.status;
+    return Promise.resolve(__makeResponse(cstatus, {}));
+  }
+  return Promise.resolve(__makeResponse(200, {}));
+}
+
+function toast(title, msg) { __toastCalls.push({ title: title, msg: msg }); }
+
+// ----- controllable clock: the 500ms arm guard is Date.now()-based -----------------------------
+var __now = 1000000;
+Date.now = function () { return __now; };
+
+// ----- controllable setTimeout: the post-close refresh (_refreshAfterReap) is scheduled, not
+// immediate -- see this section's own header comment for why __realSetTimeout is captured first.
+var __realSetTimeout = globalThis.setTimeout;
+var __timers = [];
+function setTimeout(fn, ms) { __timers.push({ fn: fn, ms: ms }); return __timers.length; }
+function clearTimeout(id) {}
+function __runTimers() {
+  var t = __timers; __timers = [];
+  t.forEach(function (x) { x.fn(); });
+}
+
+function __flush(n) {
+  var p = Promise.resolve();
+  for (var i = 0; i < (n || 6); i++) {
+    p = p.then(function () { return new Promise(function (r) { __realSetTimeout(r, 0); }); });
+  }
+  return p;
+}
+
+// ----- minimal fake DOM: same shape as _CONTEXT_BAR_MOCKS's __makeEl, plus a working
+// querySelectorAll(".class") (real code latches/finds buttons by class, e.g.
+// `mgrBodyEl.querySelectorAll(".vtcapx")`) and an innerHTML setter that actually clears
+// `children` (renderManagerBody does `mgrBodyEl.innerHTML = ""` before rebuilding) -- neither of
+// which the ContextBar harness needed, since ContextBar never queries by class or clears via
+// innerHTML. className and classList are kept in sync via a getter/setter, because the real code
+// sets `.className = "vtcapx vtmgrall"` as a plain string, never through `.classList.add`.
+function __makeEl(tag) {
+  var listeners = {};
+  var classes = new Set();
+  var _html = "";
+  var el = {
+    tagName: tag, style: {}, textContent: "", title: "", disabled: false,
+    children: [], parentNode: null, _attrs: {},
+    appendChild: function (child) { child.parentNode = el; el.children.push(child); return child; },
+    removeChild: function (child) {
+      var i = el.children.indexOf(child);
+      if (i !== -1) el.children.splice(i, 1);
+      child.parentNode = null;
+    },
+    setAttribute: function (k, v) { el._attrs[k] = String(v); },
+    getAttribute: function (k) { return el._attrs.hasOwnProperty(k) ? el._attrs[k] : null; },
+    addEventListener: function (type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+    removeEventListener: function (type, fn) {
+      var arr = listeners[type] || [];
+      var i = arr.indexOf(fn);
+      if (i !== -1) arr.splice(i, 1);
+    },
+    dispatch: function (type, ev) {
+      ev = ev || {};
+      if (ev.target === undefined) ev.target = el;
+      (listeners[type] || []).slice().forEach(function (fn) { fn(ev); });
+    },
+    contains: function (node) {
+      while (node) { if (node === el) return true; node = node.parentNode; }
+      return false;
+    },
+    querySelectorAll: function (selector) {
+      var cls = selector.charAt(0) === "." ? selector.slice(1) : null;
+      var out = [];
+      (function walk(node) {
+        (node.children || []).forEach(function (c) {
+          if (cls && c.classList && c.classList.contains(cls)) out.push(c);
+          walk(c);
+        });
+      })(el);
+      return out;
+    },
+    focus: function () { el._focused = true; },
+  };
+  Object.defineProperty(el, "className", {
+    get: function () { return Array.from(classes).join(" "); },
+    set: function (v) { classes = new Set(String(v).split(/\\s+/).filter(Boolean)); },
+  });
+  Object.defineProperty(el, "innerHTML", {
+    get: function () { return _html; },
+    set: function (v) {
+      _html = v;
+      el.children.forEach(function (c) { c.parentNode = null; });
+      el.children = [];
+    },
+  });
+  el.classList = {
+    add: function (c) { classes.add(c); },
+    remove: function (c) { classes.delete(c); },
+    toggle: function (c, force) {
+      if (force === undefined) { classes.has(c) ? classes.delete(c) : classes.add(c); }
+      else if (force) classes.add(c); else classes.delete(c);
+    },
+    contains: function (c) { return classes.has(c); },
+  };
+  return el;
+}
+
+var document = {
+  createElement: function (tag) { return __makeEl(tag); },
+  _listeners: {},
+  addEventListener: function (type, fn) { (document._listeners[type] = document._listeners[type] || []).push(fn); },
+  removeEventListener: function (type, fn) {
+    var arr = document._listeners[type] || [];
+    var i = arr.indexOf(fn);
+    if (i !== -1) arr.splice(i, 1);
+  },
+};
+document.body = document.createElement("body");
+var window = {};   // esc's own `window.esc ||` fallback needs this global, same as _CONTEXT_BAR_MOCKS
+
+// ----- test-driver helpers: find controls by the SAME classes/text the real renderManagerBody
+// gives them, never by reaching into a closure's private locals. `all` (the Close-all / "Yes,
+// kill all N" button) always carries "vtmgrall" in either state; `cancel` only exists once armed
+// and carries "vtcapx" but never "vtmgrall", distinguished here by its own fixed label.
+function makeTerm(id, cmd) {
+  return { tty: id, cmd: cmd || "bash", cwd: "/tmp", started: __now / 1000 - 60,
+           session: "", mode: "", forked: false };
+}
+function findAllBtn() { return mgrBodyEl.querySelectorAll(".vtmgrall")[0]; }
+function findCancelBtn() {
+  var btns = mgrBodyEl.querySelectorAll(".vtcapx");
+  for (var i = 0; i < btns.length; i++) { if (btns[i].textContent === "Cancel") return btns[i]; }
+  return null;
+}
+function findRowKillButtons() {
+  return mgrBodyEl.querySelectorAll(".vtcapx").filter(function (b) { return b.textContent === "✕"; });
+}
+function hasWarning() { return mgrBodyEl.querySelectorAll(".vtmgrwarn").length > 0; }
+"""
+
+
+class TestManagerPanelKillAllGuard(unittest.TestCase):
+    """Executes the REAL `openManager`/`refreshManager`/`renderManagerBody`/`closeAll`/
+    `closeOneFromManager`/`_armGuardActive` straight out of aitracker/web/ext_vt.js (never
+    retyped), against a fake DOM/fetch/clock, to pin the safety property a double-click on "Close
+    all" violated in production: 3 running terminals, 3 SIGKILLs, the confirmation warning never
+    displayed for a single frame -- while 15 source-text-only tests stayed green throughout,
+    because none of them ever ran the code.
+
+    PROVEN REAL for the two tests marked below: see this class's own docstring companion in the
+    task report for the full RED transcript from temporarily neutralising the corresponding guard
+    in aitracker/web/ext_vt.js via a `cp` backup (never git), and the restoration + `diff`/`shasum`
+    proof that the file was returned byte-identical afterwards."""
+
+    def _script(self, body):
+        return (_HARNESS_PRELUDE + _MANAGER_MOCKS + _ESC_SRC + _BUILD_TERM_ROW_SRC
+                + _MANAGER_PANEL_SRC + body)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_double_click_inside_the_guard_window_kills_nothing(self):
+        """THE test that would have caught the shipped bug: arm, then dispatch a second click on
+        the (synchronously re-rendered) confirm button immediately -- still inside the 500ms
+        guard window. Neither click may reach closeAll()."""
+        script = self._script("""
+async function main() {
+  __listQueue = [{ terminals: [makeTerm("t1"), makeTerm("t2"), makeTerm("t3")], max: 8 }];
+  openManager();
+  await __flush();
+
+  findAllBtn().onclick();          // click 1: arms, re-renders SYNCHRONOUSLY
+  var confirmBtn = findAllBtn();   // the confirm button that now exists, same tick
+  confirmBtn.onclick();            // click 2: still inside the 500ms guard window
+  await __flush();
+
+  console.log(JSON.stringify({
+    closeCalls: __closeCalls,
+    stillArmed: mgrConfirmAll,
+    stillHasWarning: hasWarning(),
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(result["closeCalls"], [], "a double-click inside the guard window must kill nothing")
+        self.assertTrue(result["stillArmed"], "the panel must stay armed, not silently reset")
+        self.assertTrue(result["stillHasWarning"], "the warning must still be showing, never skipped")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_click_after_the_guard_window_confirms_and_kills_all(self):
+        """The mirror property: the guard must not also break the honest case. A second click that
+        arrives AFTER the 500ms window is a deliberate confirmation and must kill every terminal."""
+        script = self._script("""
+async function main() {
+  var terms = [makeTerm("t1"), makeTerm("t2"), makeTerm("t3")];
+  __listQueue = [{ terminals: terms, max: 8 }];
+  openManager();
+  await __flush();
+
+  findAllBtn().onclick();     // arm
+  __now += 600;                // past the 500ms guard
+  findAllBtn().onclick();     // deliberate second click, well outside the window
+  await __flush(8);
+  __runTimers();               // fire the scheduled _refreshAfterReap
+  await __flush(6);
+
+  console.log(JSON.stringify({
+    closeCalls: __closeCalls.slice().sort(),
+    toasts: __toastCalls,
+    armedAfter: mgrConfirmAll,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(result["closeCalls"], ["t1", "t2", "t3"], "a genuine confirm must still kill every terminal")
+        self.assertTrue(any(t["title"] == "Closed all terminals" for t in result["toasts"]))
+        self.assertFalse(result["armedAfter"], "closeAll must leave the panel unarmed")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_single_click_only_arms_kills_nothing(self):
+        script = self._script("""
+async function main() {
+  __listQueue = [{ terminals: [makeTerm("t1")], max: 8 }];
+  openManager();
+  await __flush();
+  findAllBtn().onclick();
+  await __flush();
+  console.log(JSON.stringify({
+    closeCalls: __closeCalls,
+    armed: mgrConfirmAll,
+    hasWarning: hasWarning(),
+    label: findAllBtn().textContent,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(result["closeCalls"], [])
+        self.assertTrue(result["armed"])
+        self.assertTrue(result["hasWarning"])
+        self.assertTrue(result["label"].startswith("Yes, kill all"))
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_cancel_aborts_and_is_guarded_against_the_same_double_click_swallow(self):
+        script = self._script("""
+async function main() {
+  var terms = [makeTerm("t1"), makeTerm("t2")];
+  __listQueue = [{ terminals: terms, max: 8 }];
+  openManager();
+  await __flush();
+
+  findAllBtn().onclick();          // arm
+  var cancel1 = findCancelBtn();
+  cancel1.onclick();               // inside the SAME arm guard window -> swallowed
+  var armedAfterFirstCancel = mgrConfirmAll;
+  var cancel1b = findCancelBtn();  // no re-render happened -- same element
+  cancel1b.onclick();               // a second, still inside the window -> swallowed too
+  var armedAfterSecondCancel = mgrConfirmAll;
+
+  __now += 600;                     // past the guard -- a real cancel now
+  findCancelBtn().onclick();
+  await __flush();
+
+  console.log(JSON.stringify({
+    armedAfterFirstCancel: armedAfterFirstCancel,
+    armedAfterSecondCancel: armedAfterSecondCancel,
+    armedAfterRealCancel: mgrConfirmAll,
+    closeCalls: __closeCalls,
+    closeAllLabelRestored: findAllBtn().textContent === "Close all",
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertTrue(result["armedAfterFirstCancel"], "cancel inside the arm guard window must be swallowed")
+        self.assertTrue(result["armedAfterSecondCancel"])
+        self.assertFalse(result["armedAfterRealCancel"], "a cancel after the guard window must actually abort")
+        self.assertEqual(result["closeCalls"], [], "cancelling, at any point, must kill nothing")
+        self.assertTrue(result["closeAllLabelRestored"])
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_held_enter_repeat_does_not_confirm(self):
+        """The keyboard twin of the double-click hazard: a HELD Enter auto-repeats keydown at
+        ~30ms once past the OS's repeat delay -- long after the 500ms time guard has expired -- so
+        only the dedicated `ev.repeat` check stops it. Time is advanced past the guard window
+        FIRST so this test cannot pass merely because the time-based guard is still active; it
+        isolates the repeat-blocker specifically.
+
+        This fake DOM has no browser-level "unprevented Enter keydown becomes a click" behaviour
+        to fall back on, so the driver performs that translation explicitly here, exactly like a
+        real browser's default action would -- see the `if (!prevented)` line below."""
+        script = self._script("""
+async function main() {
+  var terms = [makeTerm("t1"), makeTerm("t2")];
+  __listQueue = [{ terminals: terms, max: 8 }];
+  openManager();
+  await __flush();
+
+  findAllBtn().onclick();     // arm
+  __now += 600;                // past the 500ms guard -- isolates the repeat-blocker
+  var confirmBtn = findAllBtn();
+
+  var prevented = false;
+  confirmBtn.dispatch("keydown", { repeat: true, preventDefault: function () { prevented = true; } });
+  if (!prevented) confirmBtn.onclick();   // the browser's default action, performed by hand
+  await __flush();
+
+  console.log(JSON.stringify({ prevented: prevented, closeCalls: __closeCalls, armed: mgrConfirmAll }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertTrue(result["prevented"], "ev.repeat must call preventDefault()")
+        self.assertEqual(result["closeCalls"], [], "a held-Enter repeat must never confirm the kill")
+        self.assertTrue(result["armed"], "the panel must stay armed, waiting for a real decision")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_arming_then_closing_one_row_redraws_the_panel_unarmed(self):
+        """`refreshManager` disarms on EVERY redraw (`mgrConfirmAll = false` at its own top), not
+        just on open/close -- this drives the REAL closeOneFromManager -> _refreshAfterReap ->
+        refreshManager -> renderManagerBody chain end to end and asserts the armed flag is cleared
+        by THAT path, not merely by re-checking after a manual openManager()/closeManager()."""
+        script = self._script("""
+async function main() {
+  var terms = [makeTerm("t1"), makeTerm("t2"), makeTerm("t3")];
+  __listQueue = [{ terminals: terms, max: 8 }];
+  openManager();
+  await __flush();
+
+  findAllBtn().onclick();               // arm
+  var armedBeforeClose = mgrConfirmAll;
+  findRowKillButtons()[0].onclick();    // closeOneFromManager(t1) -- an UNRELATED row kill
+  await __flush(6);
+  __runTimers();                         // fire the scheduled _refreshAfterReap -> refreshManager
+  await __flush(6);
+
+  console.log(JSON.stringify({
+    armedBeforeClose: armedBeforeClose,
+    armedAfterRefresh: mgrConfirmAll,
+    hasWarningAfterRefresh: hasWarning(),
+    closeAllLabelRestored: findAllBtn().textContent === "Close all",
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertTrue(result["armedBeforeClose"])
+        self.assertFalse(result["armedAfterRefresh"], "a row kill's refresh must clear the armed flag too")
+        self.assertFalse(result["hasWarningAfterRefresh"])
+        self.assertTrue(result["closeAllLabelRestored"])
 
 
 if __name__ == "__main__":

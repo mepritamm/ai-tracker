@@ -91,6 +91,9 @@ class TestBuildPage(unittest.TestCase):
         self.assertIn(".side{", p)              # a CSS rule made it in
         self.assertIn("function render", p)     # the JS made it in
         self.assertIn("AI Session Tracker", p)
+        # sidebar header: renamed to cover the terminal-manager panel it now also opens
+        self.assertIn("class=ttl>Sessions and Terminals<", p)
+        self.assertNotIn("class=ttl>Sessions<", p)
         self.assertIn("rel=icon", p)            # the favicon
         # installable-on-phone bits (Add to Home Screen -> fullscreen)
         self.assertIn("apple-mobile-web-app-capable", p)

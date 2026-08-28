@@ -1204,6 +1204,110 @@ class TestRoutes(unittest.TestCase):
         finally:
             term_gate.guard = old_guard
 
+    def test_list_is_registered_in_extra_get(self):
+        from aitracker import server
+        self.assertIs(server.EXTRA_GET["/api/term/list"], term_vt.term_list)
+
+    def test_list_returns_live_terminals_with_full_key_set(self):
+        """Assert the FULL key set so a dropped field fails loudly, not silently."""
+        pt = term_vt.Pty(tid="p1", cwd="/tmp/proj", cmd="claude --resume s1")
+        pt.session, pt.mode = "s1", "resume"
+        term_vt.PTYS["p1"] = pt
+        h = _FakeHandler()
+        term_vt.term_list(h, _Q(""))
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200)
+        self.assertEqual(len(obj["terminals"]), 1)
+        row = obj["terminals"][0]
+        self.assertEqual(set(row.keys()),
+                         {"tty", "cmd", "cwd", "started", "session", "mode", "forked"})
+        self.assertEqual(row["tty"], "p1")
+        self.assertEqual(row["cwd"], "/tmp/proj")
+        self.assertEqual(row["cmd"], "claude --resume s1")
+        self.assertEqual(row["session"], "s1")
+        self.assertEqual(row["mode"], "resume")
+
+    def test_list_max_is_read_late_bound_from_config(self):
+        """`max` must be `config.MAX_TERMS` re-read on every call, not a value frozen at import
+        time -- mirrors `test_cap_is_read_late_bound_from_config`'s discipline for the 429 path."""
+        old = config.MAX_TERMS
+        try:
+            config.MAX_TERMS = 3
+            h = _FakeHandler()
+            term_vt.term_list(h, _Q(""))
+            self.assertEqual(h.calls[-1][0]["max"], 3)
+            config.MAX_TERMS = 7
+            h2 = _FakeHandler()
+            term_vt.term_list(h2, _Q(""))
+            self.assertEqual(h2.calls[-1][0]["max"], 7)
+        finally:
+            config.MAX_TERMS = old
+
+    def test_list_excludes_finished_ptys_and_orders_oldest_first(self):
+        newer = term_vt.Pty(tid="newer")
+        newer.started = 2000.0
+        older = term_vt.Pty(tid="older")
+        older.started = 1000.0
+        gone = term_vt.Pty(tid="gone")
+        gone.done, gone.ended = True, time.time()
+        for pt in (newer, older, gone):
+            term_vt.PTYS[pt.id] = pt
+        h = _FakeHandler()
+        term_vt.term_list(h, _Q(""))
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200)
+        self.assertEqual([t["tty"] for t in obj["terminals"]], ["older", "newer"])
+
+    def test_list_empty_case(self):
+        h = _FakeHandler()
+        term_vt.term_list(h, _Q(""))
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200)
+        self.assertEqual(obj, {"terminals": [], "max": config.MAX_TERMS})
+
+    def test_list_is_behind_the_same_gate_as_every_other_term_route(self):
+        """A refused gate must short-circuit BEFORE any terminal is enumerated."""
+        pt = term_vt.Pty(tid="guarded")
+        term_vt.PTYS["guarded"] = pt
+        old_guard = term_gate.guard
+        try:
+            term_gate.guard = lambda handler: False
+            h = _FakeHandler()
+            term_vt.term_list(h, _Q(""))
+            self.assertEqual(h.calls, [])
+        finally:
+            term_gate.guard = old_guard
+
+    def test_list_session_and_mode_present_and_correct(self):
+        """A pty opened with a session/mode reports both; a plain `cwd` shell (never given
+        either) reports empty strings, not a missing key -- the client must never see
+        `undefined`."""
+        term_gate.session_cwd = lambda sid: "/tmp"
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {"session": "sess-42", "cols": 40, "rows": 10, "mode": "cwd"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200)
+        tid = obj["tty"]
+
+        h2 = _FakeHandler()
+        term_vt.term_list(h2, _Q(""))
+        rows = {r["tty"]: r for r in h2.calls[-1][0]["terminals"]}
+        self.assertEqual(rows[tid]["session"], "sess-42")
+        self.assertEqual(rows[tid]["mode"], "cwd")
+
+        # A plain, session-less shell (the sidebar picker's "cwd" form) gets empty strings.
+        h3 = _FakeHandler()
+        term_vt.open_pty(h3, None, {"cwd": "/tmp", "cols": 40, "rows": 10, "mode": "cwd"})
+        obj3, code3 = h3.calls[-1]
+        self.assertEqual(code3, 200)
+        tid3 = obj3["tty"]
+
+        h4 = _FakeHandler()
+        term_vt.term_list(h4, _Q(""))
+        rows2 = {r["tty"]: r for r in h4.calls[-1][0]["terminals"]}
+        self.assertEqual(rows2[tid3]["session"], "")
+        self.assertEqual(rows2[tid3]["mode"], "cwd")
+
     def test_open_pty_spawns_a_real_shell_and_registers_it(self):
         term_gate.session_cwd = lambda sid: "/tmp"
         h = _FakeHandler()

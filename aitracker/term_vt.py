@@ -1354,6 +1354,16 @@ class Pty:
         self.screen = screen
         self.cwd = cwd
         self.cmd = cmd
+        self.session = ""          # the session id this pty was opened against, or "" for a
+                                    # session-less `cwd` open (see open_pty()'s "Two ways in").
+                                    # Set once, right after construction, by open_pty() -- never
+                                    # by spawn() itself, which knows nothing of the request body.
+                                    # Exposed by _live_list() so a "peek into this terminal" link
+                                    # built from that list can carry `sid` and get the full
+                                    # ContextBar, not a degraded view. Write-once, read under
+                                    # _LOCK like every other PTYS-dict-visible field here.
+        self.mode = ""              # "cwd" | "resume" | "new", set alongside `session` above for
+                                    # the same reason (the standalone view's `?mode=` param).
         self.viewers = 0           # open SSE /api/term/screen connections; guarded by _LOCK
         self.raw_queues = []       # queue.Queue per open /api/term/raw viewer -- see raw_stream()
                                     # and the TRACKER_TERM_RENDERER switch comment below. Mutated
@@ -1603,8 +1613,18 @@ def _live_count():
 
 def _live_list():
     """The live PTYs as plain dicts, oldest first -- what `open_pty()`'s 429 hands back so the
-    client can show WHICH terminals hold the slots and close one. Call under `_LOCK`."""
-    return [{"tty": p.id, "cmd": p.cmd, "cwd": p.cwd, "started": p.started}
+    client can show WHICH terminals hold the slots and close one, and what `GET /api/term/list`
+    (below) hands back on demand for the same purpose. Call under `_LOCK`.
+
+    `session`/`mode` are always present, even when empty (a plain `cwd` shell has no session) --
+    the client must see `""`, never `undefined`, so a "peek into this terminal" link can always
+    be built the same way. `forked` rides along for the same reason: it is the LIVE value of
+    `Pty.forked`, so it reflects a LATE backstop retry too (unlike the POST /api/term/pty
+    response, which necessarily went out before `_resume_backstop` could flip it). Without it a
+    peeked terminal silently loses its `⑂ fork` chip, because the peek URL can only carry what
+    this row exposes."""
+    return [{"tty": p.id, "cmd": p.cmd, "cwd": p.cwd, "started": p.started,
+             "session": p.session, "mode": p.mode, "forked": p.forked}
             for p in sorted(PTYS.values(), key=lambda p: p.started) if not p.done]
 
 
@@ -2077,6 +2097,8 @@ def open_pty(handler, parsed, body):
         pt = spawn(cwd, argv, cols, rows)
     except OSError as e:
         return handler._json({"error": "spawn failed: %s" % e}, 500)
+    pt.session = sid    # "" for a session-less `cwd` open -- see Pty.__init__'s comment
+    pt.mode = mode
     pt.forked = forked
     starting = mode == "resume"
     if starting:
@@ -2242,6 +2264,25 @@ def close_pty(handler, parsed, body):
         return handler._json({"ok": True, "closed": False})
     pt.kill()                       # the syscall itself needs no lock; the decision did
     handler._json({"ok": True, "closed": True})
+
+
+def term_list(handler, parsed):
+    """GET /api/term/list -> {"terminals": [{tty, cmd, cwd, started, session, mode}, ...], "max": <int>}.
+
+    The on-demand counterpart to `open_pty()`'s 429 body: today a user can only see/manage their
+    running terminals once they hit the cap and get refused. A "Manage terminals" panel needs the
+    same list available any time, not just as a side effect of a rejection -- so this is a thin
+    wrapper around the SAME `_live_list()` the 429 path already builds (conventions rule 4: one
+    enumeration, not two). `max` is `config.MAX_TERMS`, read late-bound here exactly like the 429
+    check above reads it (never copied into a client-side constant -- conventions rule 5, server
+    owns policy; see `test_cap_is_read_late_bound_from_config` for the discipline this mirrors).
+    """
+    if not term_gate.guard(handler):
+        return
+    with _LOCK:
+        _reap()
+        terminals = _live_list()
+    handler._json({"terminals": terminals, "max": config.MAX_TERMS})
 
 
 def resize_pty(handler, parsed, body):
@@ -2965,5 +3006,6 @@ server.EXTRA_GET["/api/term/scrollback"] = term_scrollback
 server.EXTRA_GET["/api/term/renderer"] = renderer_info
 server.EXTRA_GET["/api/term/raw"] = raw_stream
 server.EXTRA_GET["/api/term/cwds"] = term_cwds
+server.EXTRA_GET["/api/term/list"] = term_list
 for _path, (_fname, _ctype) in _VENDOR_FILES.items():
     server.EXTRA_GET[_path] = (lambda h, p, fn=_fname, ct=_ctype: _serve_vendor(h, p, fn, ct))

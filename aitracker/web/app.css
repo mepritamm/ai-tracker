@@ -16,11 +16,15 @@ html,body{margin:0;height:100%;background:var(--app);color:var(--text);font-fami
 /* sidebar */
 .side{width:300px;flex:0 0 300px;background:var(--side);border-right:1px solid var(--line);display:flex;flex-direction:column}
 .sidehead{padding:16px 16px 12px;border-bottom:1px solid var(--line)}
-.sidetop{display:flex;align-items:center;gap:8px;margin-bottom:12px}
+/* row 1: logo + title, given the full row so "Sessions and Terminals" reads in full instead of
+   fighting the live badge + 3 icon buttons for a shared 94-112px sliver (was truncated to
+   "Sessi…" at tablet width). row 2: live badge (left) + theme/bell/flags icons (right). */
+.sidetop{display:flex;align-items:center;gap:8px;margin-bottom:6px}
 .sidetop .logo{width:22px;height:22px;flex:0 0 auto;display:block}
 .sidetop .logo svg{width:100%;height:100%;display:block}
-.sidetop #livecount{margin-left:auto}
-.sidetop .ttl{font-weight:700;font-size:15px;letter-spacing:.01em}
+.sidetop .ttl{font-weight:700;font-size:14px;letter-spacing:.01em;min-width:0;flex:1 1 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sidetop2{display:flex;align-items:center;gap:8px;margin-bottom:12px}
+.sidetop2 #livecount{margin-right:auto}
 .livebadge{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--green);background:var(--green-deep);border:1px solid var(--green-line);padding:2px 8px;border-radius:20px;cursor:pointer;user-select:none}
 .livebadge:hover{border-color:var(--green)}
 .livebadge.on{background:var(--green);color:var(--app);border-color:var(--green);font-weight:600}

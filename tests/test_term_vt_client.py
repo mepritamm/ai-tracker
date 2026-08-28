@@ -435,7 +435,8 @@ class TestContextBarDocksToBottomOfBothMounts(unittest.TestCase):
         self.assertIn("new ContextBar(mount, sid, tty, mode,", body)
 
     def test_standalone_carries_sid_and_mode_in_the_new_tab_url(self):
-        body = _body_until(self.src, "function openNewTab", ["window.ExtVT ="])
+        body = _body_until(self.src, "function openNewTab",
+                            ['// ===== "Manage terminals" panel'])
         self.assertIn('"&sid=" + encodeURIComponent(activeSid || "")', body)
         self.assertIn('"&mode=" + encodeURIComponent(activeMode || "")', body)
 
@@ -654,7 +655,8 @@ class TestXtermRendererSwitch(unittest.TestCase):
         self.assertIn('renderer === "xterm" ? XtermTerminal : Terminal', body)
 
     def test_new_tab_url_relays_the_server_chosen_renderer(self):
-        body = _body_until(self.js, "function openNewTab", ["window.ExtVT ="])
+        body = _body_until(self.js, "function openNewTab",
+                            ['// ===== "Manage terminals" panel'])
         self.assertIn('"&renderer=" + encodeURIComponent(activeRenderer || "grid")', body)
 
     def test_lazy_asset_loader_targets_the_vendored_paths_not_a_cdn(self):
@@ -2328,6 +2330,233 @@ class TestMountPointParity(unittest.TestCase):
                                "viewport width, defeating the mobile value from this @media block "
                                "entirely (this is the shape of the historical phone-padding bug)"
                                % (media_marker, prop))
+
+
+class TestTerminalManagerPanel(unittest.TestCase):
+    """"Manage terminals": a third sidebar button opening a panel that lists every RUNNING
+    terminal — peek into one, close one, or close them all.
+
+    Before this, the only way to see or close a running terminal was to hit the concurrency cap
+    and be handed renderCapBlock's list as the consolation prize for a refusal. The panel is that
+    same list, on purpose, any time — which is exactly why the row must be rendered by ONE shared
+    function: two hand-rolled copies of "a terminal, with a ✕" is the forked-implementation shape
+    conventions rule 4 forbids, and the shape this file's own header brief catalogues four bugs
+    from.
+    """
+
+    def setUp(self):
+        self.js = _read("ext_vt.js")
+        self.css = _read("ext_vt.css")
+        self.launch = _read("ext_launch.js")
+
+    # ----- 1. the sidebar button -----
+
+    def _side_controls(self):
+        return _body_until(self.launch, "function buildSideControls()", ["function buildPicker"])
+
+    def test_manage_button_is_in_the_same_group_as_the_other_two(self):
+        body = self._side_controls()
+        i = body.index('<div class="sidenewgroup">')
+        group = body[i:body.index('"</div>"', i)]
+        for btn in ("sidenewcwdbtn", "sidenewclaudebtn", "sidemanagetermbtn"):
+            self.assertIn(btn, group, "%s is not inside the .sidenewgroup markup" % btn)
+        # same idiom as its two neighbours: same classes, and a real title (not an icon alone)
+        self.assertIn('class="mini extlaunchbtn" id=sidemanagetermbtn', group)
+        self.assertIn('title="See every terminal running right now', group)
+
+    def test_manage_button_is_not_host_gated(self):
+        """conventions: no control hidden by host or viewport. This has to work from a phone or a
+        tablet over a tunnel exactly like every other panel in the app."""
+        body = self._side_controls()
+        self.assertNotIn("localOnly", body)
+        self.assertNotIn("location.hostname", body)
+        # ... and the terminal module it drives gained no host gate either
+        self.assertNotIn("location.hostname", self.js)
+
+    def test_button_calls_the_terminal_module_instead_of_reimplementing_it(self):
+        """ext_launch.js adds the button; ext_vt.js owns the terminal domain — the same seam the
+        detail-pane buttons already use (window.ExtVT.open(cur, ...))."""
+        self.assertIn("window.ExtVT.manage()", self.launch)
+        self.assertIn("window.ExtVT = { open: openVT, manage: openManager };", self.js)
+        for route in ("/api/term/list", "/api/term/close"):
+            self.assertNotIn(route, self.launch,
+                             "%s is being called from ext_launch.js -- terminal logic belongs in "
+                             "ext_vt.js" % route)
+
+    # ----- 2. the shared row renderer (the assertion that actually prevents the fork) -----
+
+    def test_manager_and_cap_block_share_exactly_one_row_renderer(self):
+        """Mirrors test_toolbar_is_built_once_and_shared_by_both_renderers: a raw COUNT, so a
+        future edit that hand-rolls a second row for either caller changes the number."""
+        self.assertIn("function buildTermRow(", self.js)
+        self.assertEqual(self.js.count("buildTermRow("), 3,   # 1 definition + 2 call sites
+                         "buildTermRow should be defined once and called from both the cap block "
+                         "and the manager panel")
+        cap = _body_until(self.js, "function renderCapBlock(", ["function openVT("])
+        mgr = _body_until(self.js, "function renderManagerBody(", ["function peekTerm("])
+        self.assertIn("buildTermRow(", cap)
+        self.assertIn("buildTermRow(", mgr)
+        # ... and neither caller still hand-rolls the row DOM alongside it
+        for hand_rolled in ('className = "vtcaprow"', 'className = "vtcaplabel"'):
+            self.assertNotIn(hand_rolled, cap)
+            self.assertNotIn(hand_rolled, mgr)
+        row = _body_until(self.js, "function buildTermRow(", ["function renderCapBlock("])
+        self.assertIn('row.className = "vtcaprow";', row)
+        self.assertIn('label.className = "vtcaplabel";', row)
+        self.assertIn('b.className = "vtcapx";', row)
+        # every row still shows command · cwd · age, all from the SERVER's own fields
+        self.assertIn('(t.cmd || "shell")', row)
+        self.assertIn("t.cwd", row)
+        self.assertIn("t.started", row)
+
+    def test_row_action_buttons_carry_titles_and_accessible_names(self):
+        row = _body_until(self.js, "function buildTermRow(", ["function renderCapBlock("])
+        self.assertIn("b.title = a.title;", row)
+        self.assertIn('b.setAttribute("aria-label", a.aria || a.title);', row)
+
+    # ----- 3. the cap number is the server's -----
+
+    def test_max_comes_from_the_server_response_not_a_client_constant(self):
+        """Mirrors test_cap_message_is_the_servers_text_not_a_client_copy_of_the_number: the
+        client renders server policy (conventions rule 5), so `max` is read off
+        GET /api/term/list and the number itself appears nowhere in the JS."""
+        refresh = _body_until(self.js, "function refreshManager(", ["function renderManagerBody("])
+        self.assertIn('fetch("/api/term/list")', refresh)
+        self.assertIn("res.j.max", refresh)
+        mgr = _body_until(self.js, "function renderManagerBody(", ["function peekTerm("])
+        self.assertIn('(max ? " of " + max : "")', mgr)
+        for hardcoded in ("max 4", "max 12", "MAX_TERMS", "MAX_PTYS"):
+            self.assertNotIn(hardcoded, self.js)
+
+    # ----- 4. close-all must be confirmed -----
+
+    def test_close_all_requires_a_confirmation_step_before_it_kills_anything(self):
+        """A misclick here destroys real work: it SIGKILLs every running terminal, Claude sessions
+        included. The first click may only ARM the button — it must not reach the close route."""
+        mgr = _body_until(self.js, "function renderManagerBody(", ["function peekTerm("])
+        i = mgr.index("if (mgrConfirmAll) {")
+        j = mgr.index("} else {", i)
+        armed, unarmed = mgr[i:j], mgr[j:]
+        self.assertIn("closeAll(terminals)", armed)
+        self.assertIn("Cancel", armed)                       # an explicit way back out
+        self.assertIn("are you sure — this kills ", armed)   # and it says what it is about to do
+        self.assertNotIn("closeAll(", unarmed,
+                         "the un-armed Close all button reaches the kill path directly -- the "
+                         "first click must only arm the confirmation")
+        self.assertIn("mgrConfirmAll = true;", unarmed)
+        # the armed state can never survive a dismissal or a re-open
+        self.assertIn("mgrConfirmAll = false;",
+                      _body_until(self.js, "function openManager(", ["function refreshManager("]))
+        self.assertIn("mgrConfirmAll = false;",
+                      _body_until(self.js, "function closeManager(", ["function openManager("]))
+        # no bulk server route was invented -- close-all loops the existing per-tty one
+        close_all = _body_until(self.js, "function closeAll(", ["window.ExtVT ="])
+        self.assertIn("closeTty(t.tty)", close_all)
+        self.assertIn('"/api/term/close"',
+                      _body_until(self.js, "function closeTty(", ["function _latchManager("]))
+
+    # ----- 5. peek -----
+
+    def test_peek_url_carries_tty_and_sid_and_mode(self):
+        """Peek opens the standalone ?tty= tab. Now that the list carries `session` and `mode`,
+        both ride along so the peeked terminal gets its full context bar, not a degraded one."""
+        peek = _body_until(self.js, "function peekTerm(", ["function closeTty("])
+        self.assertIn('"?tty=" + encodeURIComponent(t.tty)', peek)
+        self.assertIn('"&sid=" + encodeURIComponent(t.session || "")', peek)
+        self.assertIn('"&mode=" + encodeURIComponent(t.mode || "")', peek)
+        self.assertIn('window.open(url, "_blank")', peek)
+        self.assertIn("Popup blocked", peek)
+
+    # ----- 6. the overlay lives on <body> -----
+
+    def test_overlay_is_built_on_body_not_inside_the_sidebar_mount(self):
+        """Mirrors test_term_launch.py's test_built_on_body_not_inside_the_sidebar_mount: .side
+        gets a CSS transform for the phone drawer, and a transformed ancestor becomes the
+        containing block for any position:fixed descendant -- which .overlay is."""
+        build = _body_until(self.js, "function buildManager()", ["function closeManager("])
+        self.assertIn("document.body.appendChild(mgrOverlay);", build)
+        self.assertNotIn('getElementById("ext_launch_side")', self.js)
+        self.assertNotIn("mount.appendChild(mgrOverlay)", self.js)
+
+    def test_panel_reuses_the_shared_modal_chrome_and_the_usual_dismissals(self):
+        build = _body_until(self.js, "function buildManager()", ["function closeManager("])
+        self.assertIn('mgrOverlay.className = "overlay";', build)
+        self.assertIn('modal.className = "modal vtmgrmodal";', build)
+        self.assertIn('mh.className = "mh";', build)
+        self.assertIn('mgrBodyEl.className = "mb vtmgrmb";', build)
+        self.assertIn("if (ev.target === mgrOverlay) closeManager();", build)   # backdrop click
+        self.assertIsNotNone(
+            re.search(r'if \(ev\.key !== "Escape"\) return;\s*'
+                      r'if \(!mgrOverlay \|\| mgrOverlay\.style\.display !== "flex"\) return;\s*'
+                      r'closeManager\(\);', build),
+            "Escape must close this overlay, and only while it is the one showing")
+        # the panel's own ✕ is a DISMISSAL, not a kill -- say so, since the row ✕ IS a kill
+        self.assertIn("Close this panel — every terminal keeps running", build)
+
+    # ----- 7. server owns the truth; failures are surfaced -----
+
+    def test_a_close_refreshes_from_the_server_rather_than_mutating_the_local_list(self):
+        one = _body_until(self.js, "function closeOneFromManager(", ["function closeAll("])
+        self.assertIn("_refreshAfterReap();", one)
+        self.assertNotIn("splice(", one)
+        self.assertIn("toast(", one)                       # failures surface, never silently
+        self.assertIn("Couldn't close that terminal", one)
+        close_all = _body_until(self.js, "function closeAll(", ["window.ExtVT ="])
+        self.assertIn("_refreshAfterReap();", close_all)
+        self.assertIn("toast(", close_all)
+        self.assertNotIn("splice(", close_all)
+        # ... and the refresh really is a server round-trip, delayed by ONE shared beat: a pty
+        # leaves the list when the reader thread notices EOF, not when /api/term/close returns, so
+        # refreshing on the response alone redraws a row for a terminal that is already dead.
+        # Same 250ms the cap block's retry already waits for the same reason.
+        helper = _body_until(self.js, "function _refreshAfterReap(", ["function _latchManager("])
+        self.assertIn("setTimeout(refreshManager, _REAP_SETTLE_MS)", helper)
+        self.assertIn("var _REAP_SETTLE_MS = 250;", self.js)
+
+    def test_empty_state_and_a_failed_fetch_are_both_handled(self):
+        mgr = _body_until(self.js, "function renderManagerBody(", ["function peekTerm("])
+        self.assertIn("if (!terminals.length) {", mgr)
+        self.assertIn("no terminals running", mgr)
+        refresh = _body_until(self.js, "function refreshManager(", ["function renderManagerBody("])
+        self.assertIn(".catch(function (e)", refresh)
+        self.assertIn("failed to reach the server", refresh)
+        self.assertIn("if (!res.ok) {", refresh)
+        self.assertIn("esc(", refresh)             # server text never reaches raw innerHTML
+
+    def test_kill_wording_distinguishes_it_from_merely_detaching(self):
+        """POST /api/term/close SIGKILLs the process group; the terminal modal's own ✕ only stops
+        watching. The user must be able to tell those apart from the control itself."""
+        mgr = _body_until(self.js, "function renderManagerBody(", ["function peekTerm("])
+        self.assertIn("process group", mgr)
+        self.assertIn("SIGKILL", mgr)
+        self.assertIn("nothing is killed", mgr)    # ... and peek says plainly that it is harmless
+
+    # ----- 8. responsive -----
+
+    def test_panel_is_usable_on_phone_and_tablet(self):
+        """The rows inherit the cap block's responsive behaviour by BEING the cap block's rows
+        (buildTermRow) rather than by a parallel rule; only the panel's own chrome needs its own
+        breakpoints, and it must have one in each narrow band."""
+        self.assertIn(".vtmgrmodal { width: min(720px, 100%); }", self.css)
+        self.assertIn(".vtmgrfoot {", self.css)
+        foot = self.css[self.css.index(".vtmgrfoot {"):
+                        self.css.index("}", self.css.index(".vtmgrfoot {"))]
+        self.assertIn("flex-wrap: wrap;", foot)
+        self.assertNotIn("width:", foot)               # no fixed widths anywhere in the panel
+        tail = self.css[self.css.index("/* ---- manager panel: narrow breakpoints"):]
+        self.assertIn("@media(min-width:601px) and (max-width:900px) {", tail)   # tablet
+        self.assertIn("@media(max-width:600px) {", tail)                          # phone
+        self.assertIn(".vtmgrfoot", tail)
+        self.assertIn(".vtcaprow { flex-wrap: wrap; }", tail)   # the shared rows wrap on a phone
+        self.assertNotIn("display: none", tail)                 # nothing hidden by viewport
+
+    # ----- 9. it actually reaches the served page -----
+
+    def test_manager_survives_into_the_served_page(self):
+        page = build_page()
+        for marker in ("sidemanagetermbtn", "window.ExtVT.manage()", "buildTermRow",
+                       "/api/term/list", ".vtmgrfoot", "vtmgrmodal"):
+            self.assertIn(marker, page)
 
 
 if __name__ == "__main__":

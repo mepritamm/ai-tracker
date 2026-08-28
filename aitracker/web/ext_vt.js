@@ -4,8 +4,9 @@
 // below are the real globals from app.js, not a guess at their shape (see ext_launch.js's own
 // header comment for the same note).
 //
-// Exposes window.ExtVT = {open(sid, mode)} so ext_launch.js's two buttons can drive this module
-// without either file reaching into the other's internals.
+// Exposes window.ExtVT = {open(sid, mode), manage()} so ext_launch.js's buttons — the detail
+// pane's "…here" pair and the sidebar's "Manage terminals" — can drive this module without
+// either file reaching into the other's internals.
 //
 // ===== SERVER CONTRACT THIS FILE ASSUMES (term_vt.py did not exist yet when this was written —
 // reconcile against the real Screen.snapshot()) =====================================
@@ -2340,6 +2341,41 @@
     if (this.el && this.el.parentNode) this.el.parentNode.removeChild(this.el);
   };
 
+  // ===== ONE terminal row, shared by the cap block AND the "Manage terminals" panel ==========
+  // Both need exactly the same thing: a running terminal identified by command · cwd · age, with
+  // action buttons on the right. They differ only in WHICH actions (the cap block offers one kill;
+  // the manager offers peek + kill) and in what those actions then do -- never in what a row IS.
+  // Landing it once is conventions rule 4: a second hand-rolled copy of this markup is precisely
+  // how the divergences this file's header brief catalogues got in.
+  //
+  // `t` is one entry of the SERVER's terminal list -- the 429 body's `terminals` array from
+  // POST /api/term/pty, or GET /api/term/list's, which are the same shape by construction (both
+  // come from term_vt.py's single `_live_list()`). `actions` is an ordered list of
+  // {text, title, aria, onClick}; every button gets the shared .vtcapx class, so one CSS rule and
+  // one latch selector (`querySelectorAll(".vtcapx")`) cover both callers.
+  function buildTermRow(t, now, actions) {
+    var row = document.createElement("div");
+    row.className = "vtcaprow";
+    var mins = Math.max(0, Math.round((now - (t.started || now)) / 60));
+    var label = document.createElement("span");
+    label.className = "vtcaplabel";
+    label.textContent = (t.cmd || "shell") + "  ·  " + (t.cwd || "") + "  ·  " + mins + "m";
+    label.title = t.tty;
+    row.appendChild(label);
+    (actions || []).forEach(function (a) {
+      var b = document.createElement("button");
+      b.className = "vtcapx";
+      b.textContent = a.text;
+      b.title = a.title;
+      // Icon-only controls (the ✕) would otherwise announce as "✕" and nothing else -- give every
+      // action a real accessible name naming the terminal it acts on.
+      b.setAttribute("aria-label", a.aria || a.title);
+      b.onclick = a.onClick;
+      row.appendChild(b);
+    });
+    return row;
+  }
+
   // The cap is a slot problem, not a wall: show what is holding the slots and let the user free
   // one. `j` is the 429 body from POST /api/term/pty -- {error, terminals:[{tty,cmd,cwd,started}]}.
   // The error text and the cap number are the SERVER's (conventions rule 5); nothing here
@@ -2354,51 +2390,44 @@
     head.textContent = j.error + " — close one to free a slot:";
     wrap.appendChild(head);
     j.terminals.forEach(function (t) {
-      var row = document.createElement("div");
-      row.className = "vtcaprow";
-      var mins = Math.max(0, Math.round((now - (t.started || now)) / 60));
-      var label = document.createElement("span");
-      label.className = "vtcaplabel";
-      label.textContent = (t.cmd || "shell") + "  ·  " + (t.cwd || "") + "  ·  " + mins + "m";
-      label.title = t.tty;
-      var x = document.createElement("button");
-      x.className = "vtcapx";
-      x.textContent = "✕";
-      x.title = "kill this terminal";
-      x.onclick = function () {
-        // Latch the WHOLE block, not just this button. Freeing two slots is the natural move when
-        // you want headroom, but each click schedules its own retry and each retry calls openVT
-        // again -- and openVT's destroy() only closes the client's SSE, it never kills the pty it
-        // is replacing. Two clicks would therefore attach two terminals, orphan the first one
-        // viewer-less for the full 30-minute IDLE_TIMEOUT, and recreate the exact cap this block
-        // exists to clear. One click, one retry.
-        var unlatch = function () {
+      // The row itself comes from the SHARED row builder above -- this block contributes only
+      // the one action it needs and what that action does.
+      wrap.appendChild(buildTermRow(t, now, [{
+        text: "✕",
+        title: "kill this terminal",
+        aria: "kill this terminal — " + (t.cmd || "shell"),
+        onClick: function () {
+          // Latch the WHOLE block, not just this button. Freeing two slots is the natural move when
+          // you want headroom, but each click schedules its own retry and each retry calls openVT
+          // again -- and openVT's destroy() only closes the client's SSE, it never kills the pty it
+          // is replacing. Two clicks would therefore attach two terminals, orphan the first one
+          // viewer-less for the full 30-minute IDLE_TIMEOUT, and recreate the exact cap this block
+          // exists to clear. One click, one retry.
+          var unlatch = function () {
+            Array.prototype.forEach.call(wrap.querySelectorAll(".vtcapx"),
+                                         function (b) { b.disabled = false; });
+          };
           Array.prototype.forEach.call(wrap.querySelectorAll(".vtcapx"),
-                                       function (b) { b.disabled = false; });
-        };
-        Array.prototype.forEach.call(wrap.querySelectorAll(".vtcapx"),
-                                     function (b) { b.disabled = true; });
-        fetch("/api/term/close", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ tty: t.tty })
-        }).then(function (r) {
-          if (!r.ok) { unlatch(); return; }
-          // The slot frees on the reader thread noticing EOF, not on this response, so give it a
-          // beat before retrying rather than racing straight into another 429. Re-check on the
-          // way in: in those 250ms the user may have closed the modal (don't re-open it behind
-          // their back) or opened anything else at all (don't hijack it back to this one). The
-          // generation check covers both a different session and a different mode on the same
-          // one, which is exactly the case an `activeSid` comparison cannot see.
-          setTimeout(function () {
-            if (gen !== openGen) return;
-            if (!overlay || overlay.style.display === "none") return;
-            openVT(sid, mode);
-          }, 250);
-        }).catch(unlatch);
-      };
-      row.appendChild(label);
-      row.appendChild(x);
-      wrap.appendChild(row);
+                                       function (b) { b.disabled = true; });
+          fetch("/api/term/close", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ tty: t.tty })
+          }).then(function (r) {
+            if (!r.ok) { unlatch(); return; }
+            // The slot frees on the reader thread noticing EOF, not on this response, so give it a
+            // beat before retrying rather than racing straight into another 429. Re-check on the
+            // way in: in those 250ms the user may have closed the modal (don't re-open it behind
+            // their back) or opened anything else at all (don't hijack it back to this one). The
+            // generation check covers both a different session and a different mode on the same
+            // one, which is exactly the case an `activeSid` comparison cannot see.
+            setTimeout(function () {
+              if (gen !== openGen) return;
+              if (!overlay || overlay.style.display === "none") return;
+              openVT(sid, mode);
+            }, 250);
+          }).catch(unlatch);
+        }
+      }]));
     });
     modalBodyEl.innerHTML = "";
     modalBodyEl.appendChild(wrap);
@@ -2629,7 +2658,328 @@
     if (!w) alert("Popup blocked — allow popups for this page to open a new tab.");
   }
 
-  window.ExtVT = { open: openVT };
+  // ===== "Manage terminals" panel ===========================================================
+  // Until now the ONLY way to see or close a running terminal was to hit the concurrency cap and
+  // be shown renderCapBlock's list as a consolation prize. This is that same list, on purpose,
+  // any time: GET /api/term/list (live terminals, oldest first, plus the server's own `max`).
+  // The rows come from the SHARED row builder above -- the cap block and this panel cannot drift
+  // into two different ideas of what a terminal row is (conventions rule 4).
+  //
+  // The overlay is built on <body>, NEVER inside #ext_launch_side/.side: .side gets
+  // `transform:translateX(...)` at max-width:600px (app.css's phone drawer), and a transformed
+  // ancestor becomes the containing block for any position:fixed descendant -- which is exactly
+  // what .overlay is. Same trap, same fix, as ext_launch.js's directory picker (see buildPicker's
+  // comment there) and as this file's own modal, whose #ext_vt mount already sits outside .side.
+  var mgrOverlay = null, mgrStatusEl = null, mgrBodyEl = null;
+  // Inline two-step confirm for "Close all" (see renderManagerBody): closing every terminal
+  // SIGKILLs real running Claude sessions and cannot be undone, so the first click only arms the
+  // button. Reset on open, on close, and on every refresh, so the armed state can never survive a
+  // dismissal OR an unrelated redraw (a row's ✕ goes through refreshManager too -- redrawing
+  // ALREADY ARMED would turn the user's next "let me arm it" click into a confirmed kill-all).
+  var mgrConfirmAll = false;
+  // When it was armed. The arm handler re-renders SYNCHRONOUSLY, so the confirm button exists
+  // before the SECOND click of a double-click is dispatched -- measured live, one double-click on
+  // "Close all" killed three terminals with the confirmation never being read. The confirm path
+  // therefore ignores anything arriving within this window of the arm.
+  var mgrArmedAt = 0;
+  // 500ms: exactly the platform double-click threshold (the macOS and Windows defaults both sit
+  // at 500ms), so every pair of clicks the OS itself would call a double-click is rejected, while
+  // a user who actually READS the one-line warning is far past it before deciding.
+  var _ARM_GUARD_MS = 500;
+  function _armGuardActive() { return Date.now() - mgrArmedAt < _ARM_GUARD_MS; }
+
+  function buildManager() {
+    mgrOverlay = document.createElement("div");
+    mgrOverlay.className = "overlay";
+    mgrOverlay.id = "vtmgrmodal";
+    mgrOverlay.addEventListener("click", function (ev) { if (ev.target === mgrOverlay) closeManager(); });
+
+    var modal = document.createElement("div");
+    modal.className = "modal vtmgrmodal";
+
+    var mh = document.createElement("div");
+    mh.className = "mh";
+    var title = document.createElement("span");
+    title.className = "fn";
+    title.textContent = "TERMINALS";
+    mgrStatusEl = document.createElement("span");
+    mgrStatusEl.className = "pp";
+    var x = document.createElement("span");
+    x.className = "x";
+    x.textContent = "✕";
+    x.title = "Close this panel — every terminal keeps running";
+    x.setAttribute("aria-label", "Close this panel — every terminal keeps running");
+    x.addEventListener("click", closeManager);
+    mh.appendChild(title);
+    mh.appendChild(mgrStatusEl);
+    mh.appendChild(x);
+
+    mgrBodyEl = document.createElement("div");
+    mgrBodyEl.className = "mb vtmgrmb";
+
+    modal.appendChild(mh);
+    modal.appendChild(mgrBodyEl);
+    mgrOverlay.appendChild(modal);
+    document.body.appendChild(mgrOverlay);
+
+    // Same convention as this file's own modal-Escape listener and ext_launch.js's picker: acts
+    // only while THIS overlay is the one showing, so it never fights app.js's document-level
+    // Escape handler (diffmodal/msgmodal/bgdrawer) or the terminal modal's.
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key !== "Escape") return;
+      if (!mgrOverlay || mgrOverlay.style.display !== "flex") return;
+      closeManager();
+    });
+  }
+
+  function closeManager() {
+    if (mgrOverlay) mgrOverlay.style.display = "none";
+    mgrConfirmAll = false;
+  }
+
+  function openManager() {
+    // On a phone the button that opens this only exists INSIDE the open sidebar drawer (.side,
+    // z-index 60) -- the shared .overlay is z-index 50, so left open the drawer would sit on top
+    // of the panel. Every other place that leaves the drawer closes it first; so does this.
+    if (typeof closeDrawer === "function") closeDrawer();
+    if (!mgrOverlay) buildManager();
+    mgrConfirmAll = false;
+    mgrOverlay.style.display = "flex";
+    refreshManager();
+  }
+
+  function refreshManager() {
+    if (!mgrBodyEl) return;
+    // Disarm on EVERY refresh, not just on open/close. Killing one row goes
+    // closeOneFromManager -> _refreshAfterReap -> here -> renderManagerBody, and a panel that came
+    // back already armed (with the latch released) hands the user's next footer click straight to
+    // "kill everything". This is the one place all three redraw paths pass through.
+    mgrConfirmAll = false;
+    mgrStatusEl.textContent = "loading…";
+    mgrBodyEl.innerHTML = '<div class="empty vtempty">loading…</div>';
+    fetch("/api/term/list")
+      .then(function (r) {
+        return r.json().catch(function () { return {}; })
+          .then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
+      })
+      .then(function (res) {
+        if (!res.ok) {
+          mgrStatusEl.textContent = "";
+          mgrBodyEl.innerHTML = '<div class="empty vtempty">' + esc(
+            (res.j && res.j.error) ||
+            (res.status === 403
+              ? "in-browser terminal is disabled — set TRACKER_TERMINAL=1 and TRACKER_AUTH"
+              : res.status === 404
+                ? "managing terminals isn't available on this server yet"
+                : "couldn't list the running terminals")
+          ) + "</div>";
+          return;
+        }
+        renderManagerBody((res.j && res.j.terminals) || [], res.j && res.j.max);
+      })
+      .catch(function (e) {
+        mgrStatusEl.textContent = "";
+        mgrBodyEl.innerHTML = '<div class="empty vtempty">failed to reach the server: ' + esc(String(e)) + "</div>";
+      });
+  }
+
+  function renderManagerBody(terminals, max) {
+    var now = Date.now() / 1000;
+    // The cap is the SERVER's number (conventions rule 5) -- read straight off the response and
+    // rendered, never a constant in this file. Omitted entirely if the server didn't send one,
+    // rather than substituting a guess.
+    mgrStatusEl.textContent = terminals.length + (max ? " of " + max : "") + " running";
+    mgrBodyEl.innerHTML = "";
+    var wrap = document.createElement("div");
+    wrap.className = "empty vtempty vtmgr";
+    if (!terminals.length) {
+      var none = document.createElement("div");
+      none.className = "vtcaphead";
+      none.textContent = "no terminals running — use “+ New terminal” to start one.";
+      wrap.appendChild(none);
+      mgrBodyEl.appendChild(wrap);
+      return;
+    }
+    var head = document.createElement("div");
+    head.className = "vtcaphead";
+    // Say plainly what ✕ does HERE, because it is not what ✕ does on the modal: this one is
+    // POST /api/term/close, which SIGKILLs the whole process group; the modal's merely detaches
+    // the viewer and leaves the terminal running.
+    head.textContent = "Peek opens a terminal in its own tab. ✕ kills it — SIGKILLs the whole "
+      + "process group, unlike closing a terminal window, which only stops watching it.";
+    wrap.appendChild(head);
+    terminals.forEach(function (t) {
+      wrap.appendChild(buildTermRow(t, now, [
+        {
+          text: "peek",
+          title: "open this terminal in its own tab — nothing is killed",
+          aria: "peek at " + (t.cmd || "shell"),
+          onClick: function () { peekTerm(t); }
+        },
+        {
+          text: "✕",
+          title: "kill this terminal — SIGKILLs its process group, it does not just stop watching",
+          aria: "kill this terminal — " + (t.cmd || "shell"),
+          onClick: function () { closeOneFromManager(t); }
+        }
+      ]));
+    });
+
+    var foot = document.createElement("div");
+    foot.className = "vtmgrfoot";
+    var all = document.createElement("button");
+    all.className = "vtcapx vtmgrall";
+    if (mgrConfirmAll) {
+      var warn = document.createElement("span");
+      warn.className = "vtmgrwarn";
+      warn.textContent = "are you sure — this kills " + terminals.length + " running terminal"
+        + (terminals.length === 1 ? "" : "s") + ", including any Claude session inside them. It cannot be undone.";
+      var cancel = document.createElement("button");
+      cancel.className = "vtcapx";
+      cancel.textContent = "Cancel";
+      cancel.title = "Leave every terminal running";
+      cancel.setAttribute("aria-label", "Cancel — leave every terminal running");
+      // Guarded too, so an accidental double-click doesn't silently DISARM the panel either --
+      // the second click is swallowed whole and the user is left looking at the warning they were
+      // meant to read, which is the entire point of the two-step.
+      cancel.onclick = function () {
+        if (_armGuardActive()) return;
+        mgrConfirmAll = false; renderManagerBody(terminals, max);
+      };
+      all.textContent = "Yes, kill all " + terminals.length;
+      all.title = "Confirm: kill every one of these terminals now";
+      all.setAttribute("aria-label", "Confirm killing all " + terminals.length + " terminals");
+      all.onclick = function () {
+        // THE data-loss guard. Without it the second click of a double-click on "Close all" lands
+        // on this button (it is created synchronously, inside the first click's own handler) and
+        // kills every terminal with the warning never displayed for a single frame.
+        if (_armGuardActive()) return;
+        closeAll(terminals);
+      };
+      // The keyboard twin of the same hazard: a HELD Enter auto-repeats keydown at ~30ms once the
+      // OS repeat delay elapses, and each repeat activates the focused button -- so the timing
+      // guard alone would only postpone the kill past 500ms, not prevent it. A repeat is never a
+      // deliberate second decision, so it never activates this button at all.
+      all.addEventListener("keydown", function (ev) {
+        if (ev.repeat) ev.preventDefault();
+      });
+      // Confirm FIRST, Cancel last: defence in depth for the double-click above. `.vtmgrall`
+      // pins `all` rightward with margin-left:auto, so with Cancel appended after it the
+      // destructive button no longer occupies the hit area the "Close all" button just vacated --
+      // the harmless Cancel does. (A CSS `order:` would keep the visual Cancel/Confirm order and
+      // still move the box; this file cannot touch ext_vt.css this round.)
+      foot.appendChild(warn);
+      foot.appendChild(all);
+      foot.appendChild(cancel);
+    } else {
+      all.textContent = "Close all";
+      all.title = "Kill every running terminal — asks you to confirm first";
+      all.setAttribute("aria-label", "Close all terminals — asks you to confirm first");
+      all.onclick = function () {
+        mgrConfirmAll = true;
+        mgrArmedAt = Date.now();
+        renderManagerBody(terminals, max);
+      };
+      foot.appendChild(all);
+    }
+    wrap.appendChild(foot);
+    mgrBodyEl.appendChild(wrap);
+    // Arming blows away the focused node (mgrBodyEl.innerHTML = ""), which drops keyboard focus
+    // to <body> and loses a keyboard user's place entirely. Put it on the control the warning is
+    // asking about. Safe ONLY because of the two guards above -- landing focus on a live kill
+    // button while a held Enter repeats is exactly the hazard `ev.repeat` refuses.
+    if (mgrConfirmAll) { try { all.focus(); } catch (e) {} }
+  }
+
+  function peekTerm(t) {
+    // Peek opens the terminal in ITS OWN TAB rather than attaching it inside this panel: the
+    // ?tty= standalone route already attaches to an EXISTING pty, whereas openVT() can only
+    // CREATE one -- attaching in place would be brand-new machinery for no gain, and a new tab
+    // is also exactly what the modal's own "⤢ New tab" does. Same URL scheme openNewTab() builds
+    // above. `session`/`mode` come from GET /api/term/list (empty strings for a plain shell, never
+    // missing), so a peeked terminal gets its FULL context bar instead of the degraded bare-?tty=
+    // one. `forked` likewise, so a peeked --fork-session terminal keeps its `⑂ fork` chip instead
+    // of silently losing it -- the value is the LIVE Pty.forked, so a late backstop retry shows up
+    // here even though the original POST /api/term/pty response could not carry it.
+    // No `renderer` param on purpose: the list carries none, and bootStandalone() already
+    // falls back to GET /api/term/renderer -- the server picks it, this file never guesses.
+    var url = location.origin + location.pathname + "?tty=" + encodeURIComponent(t.tty) +
+      "&sid=" + encodeURIComponent(t.session || "") +
+      "&mode=" + encodeURIComponent(t.mode || "") +
+      "&forked=" + (t.forked ? "1" : "0");
+    var w = window.open(url, "_blank");
+    if (!w) alert("Popup blocked — allow popups for this page to open a new tab.");
+  }
+
+  // The existing route -- no bulk variant was added server-side for "close all"; looping this one
+  // is the smaller diff and the server already does the only dangerous part exactly once per tty.
+  function closeTty(tty) {
+    return fetch("/api/term/close", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tty: tty })
+    }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r;
+    });
+  }
+
+  // A pty leaves the list when the READER THREAD notices EOF, not when /api/term/close returns --
+  // the same lag the cap block gives 250ms for before retrying (see its comment). Refreshing on
+  // the response alone can therefore redraw a row for a terminal that is already dead. Give it the
+  // same beat, from ONE place, so the two callers can't disagree about how long that is.
+  var _REAP_SETTLE_MS = 250;
+
+  function _refreshAfterReap() {
+    setTimeout(refreshManager, _REAP_SETTLE_MS);
+  }
+
+  // Same whole-panel latch discipline as the cap block's: one destructive click at a time, so a
+  // double-tap can't fire two kills against a list that is about to be redrawn under it.
+  function _latchManager(disabled) {
+    if (!mgrBodyEl) return;
+    Array.prototype.forEach.call(mgrBodyEl.querySelectorAll(".vtcapx"),
+                                 function (b) { b.disabled = disabled; });
+  }
+
+  function closeOneFromManager(t) {
+    _latchManager(true);
+    closeTty(t.tty)
+      .then(function () {
+        // Guarded like every other toast() in this file: `toast` lives in app.js, and this module
+        // is also loaded by the standalone ?tty= tab, so it must never be the thing that throws.
+        if (typeof toast === "function") toast("Terminal closed", t.cmd || t.tty);
+        // Re-fetch instead of splicing the local array: the SERVER owns which ptys are alive, and
+        // another tab (or the reaper) may have changed the list since it was drawn.
+        _refreshAfterReap();
+      })
+      .catch(function (e) {
+        _latchManager(false);
+        if (typeof toast === "function") toast("Couldn't close that terminal", String(e));
+      });
+  }
+
+  function closeAll(terminals) {
+    mgrConfirmAll = false;
+    _latchManager(true);
+    // Sequential, not Promise.all: a dozen simultaneous SIGKILL+reap cycles on one server thread
+    // pool is needless, and a serial chain gives a deterministic failure count to report.
+    var failures = 0;
+    var chain = Promise.resolve();
+    terminals.forEach(function (t) {
+      chain = chain.then(function () {
+        return closeTty(t.tty).catch(function () { failures++; });
+      });
+    });
+    chain.then(function () {
+      if (typeof toast === "function") {
+        if (failures) toast("Some terminals could not be closed", failures + " of " + terminals.length + " failed");
+        else toast("Closed all terminals", terminals.length + " killed");
+      }
+      _refreshAfterReap();
+    });
+  }
+
+  window.ExtVT = { open: openVT, manage: openManager };
 
   // ===== render hook: participates in the normal 2s poll like every other ext module, and is
   // what genuinely puts #ext_vt to use (the modal is built as its child, not appended to

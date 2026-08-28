@@ -97,11 +97,25 @@
       '<button class="mini extlaunchbtn" id=sidenewclaudebtn ' +
       'title="Start a brand-new Claude session in the browser at a directory you choose — it will appear in the sidebar on its own once it starts">' +
       "+ New Claude session</button>" +
+      '<button class="mini extlaunchbtn" id=sidemanagetermbtn ' +
+      'title="See every terminal running right now — peek into one, close one, or close them all">' +
+      "☰ Manage terminals</button>" +
       "</div>";
     var nc = document.getElementById("sidenewcwdbtn");
     if (nc) nc.onclick = function () { openPicker("cwd"); };
     var ncl = document.getElementById("sidenewclaudebtn");
     if (ncl) ncl.onclick = function () { openPicker("new"); };
+    // Terminal domain logic stays in ext_vt.js -- this file only adds the button and calls the
+    // module, exactly as the detail pane's "…here" buttons call window.ExtVT.open(cur, ...).
+    // Deliberately NOT decorated with a live count: nothing in app.js's existing 2s poll payload
+    // carries the number of running terminals, so a count on this button would mean a NEW fetch
+    // of the terminal-list route on every tick (and a 403 every 2s wherever the feature is off)
+    // purely for cosmetics. The panel's own header shows "N of <server max> running" instead.
+    var mt = document.getElementById("sidemanagetermbtn");
+    if (mt) mt.onclick = function () {
+      if (window.ExtVT && window.ExtVT.manage) window.ExtVT.manage();
+      else alert("in-browser terminal unavailable");
+    };
   }
 
   // ===== the directory picker ==============================================================
