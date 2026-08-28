@@ -1668,7 +1668,12 @@
     term.loadAddon(fit);
     term.open(this.pane);
     this.term = term; this.fitAddon = fit;
+    // Wired BEFORE the first fit() below (moved up from its old spot next to onData further down)
+    // so that fit()'s OWN initial resize -- and any _correctFitOverflow() correction it triggers --
+    // POSTs the corrected size to the server immediately, not just from the next resize onward.
+    term.onResize(function (sz) { postResize(self.ttyId, sz.cols, sz.rows); });
     try { fit.fit(); } catch (e) { }
+    this._correctFitOverflow();
 
     // Ctrl+C/Cmd+C copies the selection instead of sending SIGINT -- see this class's own header
     // comment ("Selection copy-on-Ctrl+C is reimplemented here") for why xterm.js needs this at
@@ -1697,7 +1702,8 @@
     });
 
     term.onData(function (data) { postKeys(self.ttyId, data); });
-    term.onResize(function (sz) { postResize(self.ttyId, sz.cols, sz.rows); });
+    // onResize is wired earlier, above -- before the initial fit.fit() call -- see that call
+    // site's own comment for why.
 
     window.addEventListener("resize", self._resizeDebounced);
     // See observePane's own comment (just above buildToolbar) for the sibling-flex mechanism this
@@ -1711,6 +1717,57 @@
   XtermTerminal.prototype._doResize = function () {
     if (!this.fitAddon) return;
     try { this.fitAddon.fit(); } catch (e) { }   // onResize above POSTs /api/term/resize itself
+    this._correctFitOverflow();   // fit()'s proposed row count can still render taller than it
+                                   // estimated -- see that method's own comment -- so every resize
+                                   // path (window resize, zoom, sibling flex change via
+                                   // observePane), not just first mount, needs this same check.
+  };
+
+  // FitAddon.fit() (called just above, and in _build's initial call) proposes a row count from ITS
+  // OWN fractional cell-height estimate (see vendor/addon-fit.js's proposeDimensions(): it reads
+  // term._core._renderService.dimensions.css.cell.height, which is `canvas.height / CURRENT rows`
+  // -- a value that shifts every time rows change, not a fixed per-row size). But every row the
+  // renderer actually paints lands on a WHOLE device pixel (dimensions.device.cell.height is
+  // floor()'d in xterm.js's own _updateDimensions -- confirmed against vendor/xterm.js), so the row
+  // count fit() proposes can render taller than fit()'s own fractional estimate implied, and
+  // `.vtpane { overflow: hidden }` (ext_vt.css) silently clips the surplus off the bottom row.
+  // Verified live: at 1280x1600 the mismatch reached +1.4px -- enough to clip the last row's text.
+  // The error is per-row and accumulates linearly with row count, so it's invisible in a short
+  // terminal and only bites once the pane is tall (e.g. many background agents pushing the TUI's
+  // footer down into the marginal last row that was always being clipped).
+  //
+  // Fix: re-measure the ACTUAL rendered geometry from the DOM right after fit() runs, and correct
+  // down by a row if it overflows. This vendored build of xterm.js ships ONLY the DomRenderer (no
+  // canvas/WebGL path -- confirmed against vendor/xterm.js: `t.DomRenderer=` is the sole renderer
+  // class exported; neither `CanvasRenderer` nor `WebglAddon` appears anywhere in the bundle), so
+  // `.xterm-screen` -- the element the renderer sizes to exactly rows*cellHeight on every resize,
+  // synchronously (DomRenderer.prototype.handleResize -> _updateDimensions sets its style.height
+  // directly, off term.resize()'s own synchronous event chain -- no rAF wait needed before reading
+  // it back) -- is a real, always-present DOM node. Measuring it is the same discipline
+  // computeColsRows() already uses for the grid renderer (actual rendered pixels, not an internal
+  // estimate); it's also a public DOM class, not a private `_core` reach-in, so it survives an
+  // xterm.js upgrade that only touches internals.
+  XtermTerminal.prototype._correctFitOverflow = function () {
+    var term = this.term, pane = this.pane;
+    if (!term || !pane) return;
+    // Bounded to 2 iterations, never an unbounded loop. Each iteration shrinks `.xterm-screen`
+    // itself (one fewer row => smaller rows*cellHeight); it does NOT touch `.vtpane`'s own box,
+    // whose size is driven by its flex ancestors (see observePane's comment above, just before
+    // buildToolbar) -- so the term.resize() below cannot change what the ResizeObserver watching
+    // the pane sees, cannot re-trigger _doResize through that path, and so cannot oscillate. Two
+    // iterations is cushion for a rare multi-pixel accumulated error; one is the expected case.
+    for (var i = 0; i < 2; i++) {
+      if (term.rows <= 1) return;   // never resize below 1 row
+      var screenEl = pane.querySelector(".xterm-screen");
+      if (!screenEl) return;   // future xterm.js build changed its DOM shape -- fail safe, no-op
+      var cs = getComputedStyle(pane);
+      var paneContentBottom = pane.getBoundingClientRect().bottom - (parseFloat(cs.paddingBottom) || 0);
+      var screenBottom = screenEl.getBoundingClientRect().bottom;
+      if (screenBottom <= paneContentBottom + 0.5) return;   // fits (0.5px slack for subpixel noise)
+      term.resize(term.cols, term.rows - 1);   // onResize (wired in _build, BEFORE the first
+                                                // fit()) POSTs the corrected size to the server --
+                                                // the same sync path any other resize takes.
+    }
   };
 
   XtermTerminal.prototype._zoom = function (dir) {
@@ -1855,6 +1912,18 @@
   // array is the one place to update.
   var MODEL_LADDER = ["haiku", "sonnet", "opus", "fable"];
 
+  // The effort ladder is likewise HARDCODED, low -> high, mirroring MODEL_LADDER's own reasoning
+  // above -- this is the CLI's OWN slash-command ladder for `/effort`, not anything discoverable
+  // from a session log or any API. CONFIRMED (high confidence) against the installed Claude Code
+  // CLI 2.1.247: its own `/effort` usage string is generated from exactly this five-entry array,
+  // `claude --help` documents `--effort <level>` with the same five, and the official docs list
+  // the same five with "high" as the default. Deliberately excludes "ultracode" and "auto", which
+  // `/effort` also accepts but are NOT effort levels -- "ultracode" is an alias for xhigh plus an
+  // orchestration flag, "auto" is a thinking mode, and the docs explicitly say not to pass it as
+  // an effort value. If the CLI ever renames/adds a tier, this literal array is the one place to
+  // update.
+  var EFFORT_LADDER = ["low", "medium", "high", "xhigh", "max"];
+
   // Best-effort "which model is this" label for the switcher button/dropdown. There is no live,
   // CLI-reported "current model" anywhere this app can read — meta.model (set in
   // aitracker/providers/claude.py from the last transcript message's `message.model`) is only a
@@ -1902,12 +1971,24 @@
   // ===== ContextBar: one instance per open terminal (modal or standalone), destroyed with it. ==
   function ContextBar(container, sid, ttyId, mode, getInput) {
     this.sid = sid; this.ttyId = ttyId; this.getInput = getInput;
-    // Only a Claude CLI is listening for "/model ..." — mode is "resume"|"new" for that, "cwd"
-    // for a plain shell. Typing a slash command at a bash prompt would just leave junk on the
-    // line, so the switcher is never merely disabled outside those two modes — it isn't built.
-    this.showSwitcher = (mode === "resume" || mode === "new");
-    this.dropdownOpen = false;
+    // Whether a Claude CLI is actually listening for "/model ..."/"/effort ..." on THIS pty RIGHT
+    // NOW — the server's own answer (GET /api/term/attached, term_vt.py's _foreground_is_claude),
+    // NEVER `mode`. `mode` ("resume"/"new"/"cwd" — how this terminal was OPENED) used to gate this
+    // directly, and that was wrong in both directions: a `cwd`-mode plain shell where the user
+    // later typed `claude` themselves has one listening, with no way to tell from `mode` alone —
+    // this was the reported regression ("the model picker has been removed entirely") — and a
+    // `resume`/`new` pane whose `claude` has since exited to a bash prompt would keep showing the
+    // switcher, ready to type a slash command into bash instead. Starts false/unknown until the
+    // first poll answers (see start()/_setAttached() below) — conventions rule 5: the server owns
+    // this policy, this file only renders it.
+    this.attached = false;
+    this.modelDropdownOpen = false;
+    this.effortDropdownOpen = false;
     this.currentModel = null;
+    this.currentEffort = null;
+    this._hasUsage = false;   // does the usage readout currently have anything to show — see
+                               // _syncBarVisibility() below, which this and `attached` jointly
+                               // gate the WHOLE bar's visibility on.
     this._pollStop = null;
     this._destroyed = false;
 
@@ -1916,56 +1997,117 @@
     bar.className = "vtctxbar";
     this.el = bar;
 
-    if (this.showSwitcher) {
-      var btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "vtmodelbtn";
-      btn.textContent = "model ▾";
-      btn.title = "Switch model — types /model <name> into the CLI";
-      var dd = document.createElement("div");
-      dd.className = "vtmodeldd";
-      MODEL_LADDER.forEach(function (name) {
-        var item = document.createElement("div");
-        item.className = "vtmodelitem";
-        item.textContent = name;
-        item.setAttribute("data-model", name);
-        dd.appendChild(item);
-      });
-      bar.appendChild(btn);
-      bar.appendChild(dd);
-      this.modelBtn = btn; this.modelDd = dd;
+    // Both switchers are always BUILT now (unlike the old mode-gated version) — `attached` is
+    // dynamic, so a picker that doesn't exist yet could never later appear when the answer flips
+    // true mid-session. Grouped under one wrapper (.vtswitchers) so both toggle together as one
+    // unit as `attached` changes — see _setAttached() below.
+    var switchers = document.createElement("span");
+    switchers.className = "vtswitchers";
+    switchers.style.display = "none";
+    bar.appendChild(switchers);
+    this.switchersEl = switchers;
 
-      // preventDefault on mousedown, not just handling click: a <button> takes native DOM focus
-      // on mousedown in most browsers, and this bar must never steal keyboard focus from the
-      // terminal's own capture textarea — not even for the instant between mousedown and click.
-      btn.addEventListener("mousedown", function (ev) { ev.preventDefault(); });
-      btn.addEventListener("click", function (ev) {
-        ev.stopPropagation();
-        if (self.dropdownOpen) self._closeDropdown(); else self._openDropdown();
-        self._focusTerminal();
-      });
-      dd.addEventListener("mousedown", function (ev) { ev.preventDefault(); });
-      dd.addEventListener("click", function (ev) {
-        ev.stopPropagation();
-        var name = ev.target && ev.target.getAttribute && ev.target.getAttribute("data-model");
-        if (!name) return;
-        self._pickModel(name);
-      });
-      this._onDocClick = function (ev) {
-        if (!self.dropdownOpen || bar.contains(ev.target)) return;
-        self._closeDropdown();
-      };
-      document.addEventListener("click", this._onDocClick);
-    }
+    // ---- model switcher. Each picker's wrap is its OWN position:relative anchor — see
+    // ext_vt.css's .vtswitcher comment for why that's neither .vtctxbar (a single shared anchor
+    // there would stack both dropdowns at one hardcoded offset again) nor the <button> itself
+    // (nesting the dropdown's clickable items inside a native <button> puts interactive content
+    // inside interactive content). ----
+    var modelWrap = document.createElement("span");
+    modelWrap.className = "vtswitcher";
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "vtmodelbtn";
+    btn.textContent = "model ▾";
+    btn.title = "Switch model — types /model <name> into the CLI";
+    var dd = document.createElement("div");
+    dd.className = "vtmodeldd";
+    MODEL_LADDER.forEach(function (name) {
+      var item = document.createElement("div");
+      item.className = "vtmodelitem";
+      item.textContent = name;
+      item.setAttribute("data-model", name);
+      dd.appendChild(item);
+    });
+    modelWrap.appendChild(btn);
+    modelWrap.appendChild(dd);
+    switchers.appendChild(modelWrap);
+    this.modelBtn = btn; this.modelDd = dd;
+
+    // preventDefault on mousedown, not just handling click: a <button> takes native DOM focus
+    // on mousedown in most browsers, and this bar must never steal keyboard focus from the
+    // terminal's own capture textarea — not even for the instant between mousedown and click.
+    btn.addEventListener("mousedown", function (ev) { ev.preventDefault(); });
+    btn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      if (self.modelDropdownOpen) self._closeModelDropdown(); else self._openModelDropdown();
+      self._focusTerminal();
+    });
+    dd.addEventListener("mousedown", function (ev) { ev.preventDefault(); });
+    dd.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      var name = ev.target && ev.target.getAttribute && ev.target.getAttribute("data-model");
+      if (!name) return;
+      self._pickModel(name);
+    });
+
+    // ---- effort switcher: mirrors the model switcher exactly, same idioms, same focus-safety
+    // pattern (see EFFORT_LADDER's own comment above for the ladder's provenance). ----
+    var effortWrap = document.createElement("span");
+    effortWrap.className = "vtswitcher";
+    var ebtn = document.createElement("button");
+    ebtn.type = "button";
+    ebtn.className = "vteffortbtn";
+    ebtn.textContent = "effort ▾";
+    ebtn.title = "Switch reasoning effort — types /effort <level> into the CLI";
+    var edd = document.createElement("div");
+    edd.className = "vteffortdd";
+    EFFORT_LADDER.forEach(function (level) {
+      var item = document.createElement("div");
+      item.className = "vteffortitem";
+      item.textContent = level;
+      item.setAttribute("data-effort", level);
+      edd.appendChild(item);
+    });
+    effortWrap.appendChild(ebtn);
+    effortWrap.appendChild(edd);
+    switchers.appendChild(effortWrap);
+    this.effortBtn = ebtn; this.effortDd = edd;
+
+    // Same preventDefault-on-mousedown pattern as the model button above — a picker that steals
+    // focus breaks typing into the terminal.
+    ebtn.addEventListener("mousedown", function (ev) { ev.preventDefault(); });
+    ebtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      if (self.effortDropdownOpen) self._closeEffortDropdown(); else self._openEffortDropdown();
+      self._focusTerminal();
+    });
+    edd.addEventListener("mousedown", function (ev) { ev.preventDefault(); });
+    edd.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      var level = ev.target && ev.target.getAttribute && ev.target.getAttribute("data-effort");
+      if (!level) return;
+      self._pickEffort(level);
+    });
+
+    // One document-level click listener closes whichever dropdown is open when the click lands
+    // outside the bar — registered unconditionally now that both switchers always exist (only
+    // their CONTAINER's visibility is conditional, via _setAttached()).
+    this._onDocClick = function (ev) {
+      if (bar.contains(ev.target)) return;
+      self._closeModelDropdown();
+      self._closeEffortDropdown();
+    };
+    document.addEventListener("click", this._onDocClick);
 
     var readout = document.createElement("div");
     readout.className = "vtctxreadout";
     bar.appendChild(readout);
     this.readoutEl = readout;
 
-    // Nothing to show yet (no switcher, no data fetched) — stay invisible rather than showing an
-    // empty docked strip; _renderReadout() reveals it the moment there's real content.
-    bar.style.display = this.showSwitcher ? "" : "none";
+    // Nothing to show yet (attached unknown, no data fetched) — stay invisible rather than
+    // showing an empty docked strip; _setAttached()/_renderReadout() reveal it once there's real
+    // content (see _syncBarVisibility()).
+    bar.style.display = "none";
 
     container.appendChild(bar);
   }
@@ -1975,25 +2117,42 @@
     if (input) { try { input.focus(); } catch (e) { } }
   };
 
-  ContextBar.prototype._openDropdown = function () {
-    this.dropdownOpen = true;
+  ContextBar.prototype._openModelDropdown = function () {
+    this._closeEffortDropdown();   // never two dropdowns open at once
+    this.modelDropdownOpen = true;
     this.modelDd.classList.add("show");
     var items = this.modelDd.children;
     for (var i = 0; i < items.length; i++) {
       items[i].classList.toggle("cur", items[i].getAttribute("data-model") === this.currentModel);
     }
   };
-  ContextBar.prototype._closeDropdown = function () {
-    this.dropdownOpen = false;
+  ContextBar.prototype._closeModelDropdown = function () {
+    this.modelDropdownOpen = false;
     if (this.modelDd) this.modelDd.classList.remove("show");
   };
 
-  // Sends "/model <name>" via the inject route another agent is building in parallel:
+  ContextBar.prototype._openEffortDropdown = function () {
+    this._closeModelDropdown();   // never two dropdowns open at once
+    this.effortDropdownOpen = true;
+    this.effortDd.classList.add("show");
+    var items = this.effortDd.children;
+    // Marking `.cur` only ever finds a match when currentEffort is a real EFFORT_LADDER entry —
+    // an out-of-ladder value (see _applySessionData's own comment) simply marks nothing, exactly
+    // the "show it as-is, don't crash, don't mark anything current" guard the spec asked for.
+    for (var i = 0; i < items.length; i++) {
+      items[i].classList.toggle("cur", items[i].getAttribute("data-effort") === this.currentEffort);
+    }
+  };
+  ContextBar.prototype._closeEffortDropdown = function () {
+    this.effortDropdownOpen = false;
+    if (this.effortDd) this.effortDd.classList.remove("show");
+  };
+
+  // Sends "/model <name>" via the inject route:
   //   POST /api/term/inject {tty, text, submit: true, clear_first: true} -> {ok: true, ...}
-  // That route may not exist yet in this worktree — a 404/400 (or any non-ok response) surfaces
-  // a toast rather than failing silently, per the spec.
+  // A 404/400 (or any non-ok response) surfaces a toast rather than failing silently, per the spec.
   ContextBar.prototype._pickModel = function (name) {
-    this._closeDropdown();
+    this._closeModelDropdown();
     this._focusTerminal();
     fetch("/api/term/inject", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -2012,10 +2171,42 @@
     });
   };
 
+  // Mirrors _pickModel exactly — same inject contract ("/effort <level>" instead of
+  // "/model <name>"), same toast-on-failure handling, see that function's own comment.
+  ContextBar.prototype._pickEffort = function (level) {
+    this._closeEffortDropdown();
+    this._focusTerminal();
+    fetch("/api/term/inject", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tty: this.ttyId, text: "/effort " + level, submit: true, clear_first: true })
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
+    }).then(function (res) {
+      if (res.ok && res.j && res.j.ok === true) return;
+      var reason = (res.j && res.j.error) ||
+        (res.status === 404 ? "the effort-switch route isn't available in this build yet" :
+         res.status === 400 ? "the terminal rejected that request" :
+         "the terminal didn't confirm the switch");
+      if (typeof toast === "function") toast("Couldn't switch effort", reason);
+    }).catch(function () {
+      if (typeof toast === "function") toast("Couldn't reach the server", "the effort switch wasn't sent");
+    });
+  };
+
   ContextBar.prototype._applySessionData = function (d) {
     var meta = (d && d.meta) || {};
     this.currentModel = _matchLadderModel(meta.model);
     if (this.modelBtn) this.modelBtn.textContent = (this.currentModel || "model") + " ▾";
+
+    // Unlike the model label (a heuristic string-match against MODEL_LADDER — see
+    // _matchLadderModel's own comment), meta.effort is a clean literal straight off the
+    // transcript's own top-level `effort` field (aitracker/providers/claude.py); Auggie sessions
+    // simply omit the key. Still guarded against a value outside EFFORT_LADDER (a future CLI
+    // tier, or "auto"/"ultracode" — not effort levels at all, see EFFORT_LADDER's own comment):
+    // shown as-is rather than crashing; _openEffortDropdown's `.cur` match then simply finds no
+    // item, so nothing gets marked current.
+    this.currentEffort = (typeof meta.effort === "string" && meta.effort) ? meta.effort : null;
+    if (this.effortBtn) this.effortBtn.textContent = (this.currentEffort || "effort") + " ▾";
 
     var usage = readContextUsage(d);
     // Session-CUMULATIVE total (all turns, all time, monotonically increasing) — a DIFFERENT
@@ -2055,8 +2246,33 @@
       }
     }
     // Hide the whole bar when it would have nothing to show at all (no switcher AND no usage
-    // data) — a visible-but-empty docked strip is worse than no strip.
-    this.el.style.display = (this.showSwitcher || !!usage) ? "" : "none";
+    // data) — a visible-but-empty docked strip is worse than no strip. `attached` is now dynamic
+    // (see _setAttached() below), so this is re-evaluated from both sides via _syncBarVisibility.
+    this._hasUsage = !!usage;
+    this._syncBarVisibility();
+  };
+
+  // The server's own answer to "is a Claude CLI listening on this pty right now" (GET
+  // /api/term/attached — term_vt.py's attached()/_foreground_is_claude) — polled alongside
+  // /api/session in start() below, on the SAME 2s cycle, never a second timer. Reactive: flips
+  // the switchers' visibility live if Claude exits mid-session (hide) or the user launches
+  // `claude` inside a plain shell terminal (show) — see ContextBar's own constructor comment for
+  // the false-negative/false-positive this replaces (mode as a proxy for "Claude is listening").
+  ContextBar.prototype._setAttached = function (attached) {
+    if (this._destroyed || this.attached === attached) return;
+    this.attached = attached;
+    if (this.switchersEl) this.switchersEl.style.display = attached ? "" : "none";
+    // A stale open dropdown pointing at a pty that no longer has Claude listening would let a
+    // queued click type into whatever's there now instead — close both defensively.
+    if (!attached) { this._closeModelDropdown(); this._closeEffortDropdown(); }
+    this._syncBarVisibility();
+  };
+
+  // Whole-bar visibility: shown when there's EITHER a live switcher OR usage data to show,
+  // hidden (not just left empty) when there's neither — the same "no empty chrome" rule
+  // _renderReadout always followed, now covering the switcher's own dynamic state too.
+  ContextBar.prototype._syncBarVisibility = function () {
+    if (this.el) this.el.style.display = (this.attached || this._hasUsage) ? "" : "none";
   };
 
   ContextBar.prototype.start = function () {
@@ -2067,6 +2283,16 @@
         .then(function (r) { return r.json(); })
         .then(function (d) { if (!self._destroyed && d && !d.error) self._applySessionData(d); })
         .catch(function () { });
+      // Folded into the SAME 2s poll cycle as the session fetch above — one timer, two fetches —
+      // rather than a second independent setInterval. A 404 (dead tty) or any network failure is
+      // treated as "not attached", mirroring the server's own conservative default
+      // (_foreground_is_claude: any failure there reports False too): hiding the switchers is the
+      // harmless failure, leaving a stale one visible would type a slash command into whatever's
+      // now listening on this pty instead.
+      fetch("/api/term/attached?tty=" + encodeURIComponent(self.ttyId))
+        .then(function (r) { return r.ok ? r.json() : { claude_attached: false }; })
+        .then(function (j) { if (!self._destroyed) self._setAttached(!!(j && j.claude_attached)); })
+        .catch(function () { if (!self._destroyed) self._setAttached(false); });
     }
     tick();
     var timer = setInterval(tick, 2000);   // mirrors app.js's own 2s poll cadence

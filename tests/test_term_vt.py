@@ -734,6 +734,48 @@ class TestClampAndIsClaude(unittest.TestCase):
         self.assertFalse(term_vt._is_claude(prefixed[0].prefix + "some-id"))
 
 
+class _FakePs:
+    """Stands in for subprocess.run's CompletedProcess -- only .returncode/.stdout are read."""
+
+    def __init__(self, returncode=0, stdout=""):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+class TestForegroundIsClaude(unittest.TestCase):
+    """`_foreground_is_claude()` -- the pty-liveness check behind GET /api/term/attached.
+    `os.tcgetpgrp`/`subprocess.run` are mocked throughout: this asserts the function's own
+    logic, not the real `ps`/tty machinery (which `TestAttachedRoute` doesn't touch either,
+    per the task's own guidance to mock rather than depend on a real `claude` process)."""
+
+    def test_true_when_ps_reports_claude(self):
+        with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=4242), \
+             mock.patch.object(term_vt.subprocess, "run", return_value=_FakePs(0, "claude\n")):
+            self.assertTrue(term_vt._foreground_is_claude(7))
+
+    def test_false_when_ps_reports_a_different_command(self):
+        with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=4242), \
+             mock.patch.object(term_vt.subprocess, "run", return_value=_FakePs(0, "bash\n")):
+            self.assertFalse(term_vt._foreground_is_claude(7))
+
+    def test_false_when_tcgetpgrp_raises(self):
+        """A dead/invalid fd: tcgetpgrp raises OSError -- report False, never propagate."""
+        with mock.patch.object(term_vt.os, "tcgetpgrp", side_effect=OSError("bad fd")):
+            self.assertFalse(term_vt._foreground_is_claude(7))
+
+    def test_false_when_ps_raises(self):
+        """Unsupported platform / no `ps` on PATH -- report False, never propagate."""
+        with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=4242), \
+             mock.patch.object(term_vt.subprocess, "run", side_effect=FileNotFoundError("no ps")):
+            self.assertFalse(term_vt._foreground_is_claude(7))
+
+    def test_false_when_ps_exits_nonzero(self):
+        """The pgid raced out from under us between tcgetpgrp and ps -p -- no such process."""
+        with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=4242), \
+             mock.patch.object(term_vt.subprocess, "run", return_value=_FakePs(1, "")):
+            self.assertFalse(term_vt._foreground_is_claude(7))
+
+
 class TestSpawnAndScreen(unittest.TestCase):
     """Real pty.fork() + a real Screen -- the feasibility spike for Tier 3's plumbing."""
 
@@ -876,6 +918,7 @@ class TestRoutes(unittest.TestCase):
         self.assertIs(server.EXTRA_POST["/api/term/resize"], term_vt.resize_pty)
         self.assertIs(server.EXTRA_POST["/api/term/close"], term_vt.close_pty)
         self.assertIs(server.EXTRA_GET["/api/term/screen"], term_vt.screen_stream)
+        self.assertIs(server.EXTRA_GET["/api/term/attached"], term_vt.attached)
 
     def test_pty_403s_when_terminal_disabled(self):
         config.TERMINAL = False
@@ -1252,6 +1295,55 @@ class TestRoutes(unittest.TestCase):
         h = _FakeHandler()
         term_vt.screen_stream(h, _Q("tty=nope"))
         self.assertEqual(h.calls[-1][1], 404)
+
+    def test_attached_404s_an_unknown_tty(self):
+        h = _FakeHandler()
+        term_vt.attached(h, _Q("tty=nope"))
+        self.assertEqual(h.calls[-1][1], 404)
+
+    def test_attached_reports_true_when_claude_is_in_the_foreground(self):
+        term_vt.PTYS["p1"] = term_vt.Pty(tid="p1", pid=0, fd=-1)
+        old = term_vt._foreground_is_claude
+        try:
+            term_vt._foreground_is_claude = lambda fd: True
+            h = _FakeHandler()
+            term_vt.attached(h, _Q("tty=p1"))
+            self.assertEqual(h.calls[-1], ({"claude_attached": True}, 200))
+        finally:
+            term_vt._foreground_is_claude = old
+
+    def test_attached_reports_false_when_something_else_is_in_the_foreground(self):
+        term_vt.PTYS["p1"] = term_vt.Pty(tid="p1", pid=0, fd=-1)
+        old = term_vt._foreground_is_claude
+        try:
+            term_vt._foreground_is_claude = lambda fd: False
+            h = _FakeHandler()
+            term_vt.attached(h, _Q("tty=p1"))
+            self.assertEqual(h.calls[-1], ({"claude_attached": False}, 200))
+        finally:
+            term_vt._foreground_is_claude = old
+
+    def test_attached_reports_false_when_the_check_cannot_be_made(self):
+        """End to end through the real (unmocked) `_foreground_is_claude`: a dead/placeholder
+        fd (-1, same default `Pty(tid=...)` uses everywhere else in this file for a fake
+        placeholder) makes `os.tcgetpgrp` raise -- the route must still answer 200/False, never
+        a 500 or a raise, exactly like TestForegroundIsClaude.test_false_when_tcgetpgrp_raises."""
+        term_vt.PTYS["p1"] = term_vt.Pty(tid="p1", pid=0, fd=-1)
+        h = _FakeHandler()
+        term_vt.attached(h, _Q("tty=p1"))
+        self.assertEqual(h.calls[-1], ({"claude_attached": False}, 200))
+
+    def test_attached_is_behind_the_same_gate_as_every_other_term_route(self):
+        """A refused gate must short-circuit BEFORE the tty is looked up at all."""
+        term_vt.PTYS["guarded"] = term_vt.Pty(tid="guarded")
+        old_guard = term_gate.guard
+        try:
+            term_gate.guard = lambda handler: False
+            h = _FakeHandler()
+            term_vt.attached(h, _Q("tty=guarded"))
+            self.assertEqual(h.calls, [])
+        finally:
+            term_gate.guard = old_guard
 
 
 class TestTermCwds(unittest.TestCase):

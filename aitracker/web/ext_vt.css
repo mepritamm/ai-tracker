@@ -287,10 +287,11 @@
 
 /* ---- context bar: docked to the bottom of the terminal pane (see ContextBar in ext_vt.js) --
    a slim strip, NOT a second modal/toolbar system: same tokens (--chipbg/--line3/--dim/…) as
-   .vtzoom above and .chip/.mini in app.css. Model button first, then the usage readout, matching
-   the reference layout the user pointed at. Never steals focus (JS side handles that); this side
-   just keeps it visually quiet until there's something to say (see .vtctxbar's JS-driven
-   display:none default). ---- */
+   .vtzoom above and .chip/.mini in app.css. Switchers (model, then effort) first, then the usage
+   readout, matching the reference layout the user pointed at. Never steals focus (JS side handles
+   that); this side just keeps it visually quiet until there's something to say (see .vtctxbar's
+   JS-driven display:none default -- now gated on the server's claude_attached answer rather than
+   on how the terminal was opened, see ContextBar's own constructor comment). ---- */
 .vtctxbar {
   flex: 0 0 auto;
   display: flex;
@@ -305,7 +306,20 @@
   position: relative;
 }
 
-.vtmodelbtn {
+/* ---- switchers (model + effort), side by side. Each picker's OWN wrap (.vtswitcher) carries
+   `position: relative` -- NOT .vtctxbar (a single shared anchor there is what stacked both
+   dropdowns at one hardcoded offset before this) and NOT the <button> itself (nesting the
+   dropdown's clickable items inside a native <button> element puts interactive content inside
+   interactive content -- invalid content model, and risks the button's own native activation
+   firing alongside the item's click handler). A wrap sized to its button gives an identical
+   visual result -- the dropdown opens flush with ITS OWN button's left edge, whatever that
+   button's label width ("opus" vs "xhigh") -- without either problem. Both wraps are grouped
+   under one .vtswitchers container so ContextBar's JS can toggle them together as one unit as its
+   attached/not-attached state changes. ---- */
+.vtswitchers { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.vtswitcher { position: relative; flex: 0 0 auto; }
+
+.vtmodelbtn, .vteffortbtn {
   flex: 0 0 auto;
   cursor: pointer;
   font: 700 11px/1 'JetBrains Mono', monospace;
@@ -315,12 +329,14 @@
   border-radius: 6px;
   padding: 4px 8px;
 }
-.vtmodelbtn:hover { color: var(--text); border-color: var(--blue); }
+.vtmodelbtn:hover, .vteffortbtn:hover { color: var(--text); border-color: var(--blue); }
 
-.vtmodeldd {
+.vtmodeldd, .vteffortdd {
   display: none;
   position: absolute;
-  left: 10px;
+  left: 0;   /* relative to .vtswitcher, i.e. flush with THIS switcher's own button -- see the
+                comment above .vtswitchers for why this isn't a second hardcoded bar-relative
+                offset the way a literal pixel value here would be */
   bottom: calc(100% + 4px);
   z-index: 4;
   flex-direction: column;
@@ -331,17 +347,17 @@
   padding: 4px;
   box-shadow: 0 6px 20px rgba(0, 0, 0, .35);
 }
-.vtmodeldd.show { display: flex; }
-.vtmodelitem {
+.vtmodeldd.show, .vteffortdd.show { display: flex; }
+.vtmodelitem, .vteffortitem {
   cursor: pointer;
   padding: 5px 8px;
   border-radius: 5px;
   font: 12px/1.3 'JetBrains Mono', monospace;
   color: var(--head);
 }
-.vtmodelitem:hover { background: var(--raised); color: var(--text); }
-.vtmodelitem.cur { color: var(--green2); }
-.vtmodelitem.cur::after { content: ' ✓'; }
+.vtmodelitem:hover, .vteffortitem:hover { background: var(--raised); color: var(--text); }
+.vtmodelitem.cur, .vteffortitem.cur { color: var(--green2); }
+.vtmodelitem.cur::after, .vteffortitem.cur::after { content: ' ✓'; }
 
 .vtctxreadout {
   flex: 1 1 auto;
@@ -370,11 +386,13 @@
    figure wrap out of view before anything overflows -- never by hiding a control outright. */
 @media(min-width:601px) and (max-width:900px) {
   .vtctxbar { font-size: 10.5px; gap: 6px; padding: 5px 8px; }
+  .vtswitchers { gap: 6px; }
   .vtctxbarwrap { flex-basis: 64px; }
 }
 @media(max-width:600px) {
   .vtctxbar { font-size: 10px; gap: 5px; padding: 5px 6px; }
-  .vtmodelbtn { padding: 3px 6px; }
+  .vtswitchers { gap: 5px; }
+  .vtmodelbtn, .vteffortbtn { padding: 3px 6px; }
   .vtctxbarwrap { flex-basis: 40px; }
   .vtctxcum { display: none; }   /* cumulative total is the least essential number at this width */
 }

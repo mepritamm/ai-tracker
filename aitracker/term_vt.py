@@ -180,6 +180,7 @@ import select
 import signal
 import socket
 import struct
+import subprocess
 import threading
 import time
 import uuid
@@ -2258,6 +2259,60 @@ def resize_pty(handler, parsed, body):
     handler._json({"ok": True})
 
 
+def _foreground_is_claude(fd):
+    """Best-effort: is a Claude CLI actually sitting in the foreground of this pty right now?
+
+    `mode` (how the terminal was opened -- "cwd"/"resume"/"new") is only a PROXY for this. A
+    `cwd`-mode plain shell where the user later typed `claude` themselves is running one with no
+    way to tell from `mode` alone; a `resume`/`new` pane whose `claude` process already exited is
+    the mirror-image false positive. `os.tcgetpgrp(fd)` (stdlib, POSIX -- macOS and Linux both)
+    gives the terminal's foreground process GROUP; when a shell launches a foreground command it
+    normally becomes that group's own leader, so its pid equals the pgid, and `ps -o comm= -p
+    <pgid>` reads back that process's command name.
+
+    Deliberately conservative: ANY failure here (pty already dead, platform without
+    `tcgetpgrp`/`ps`, the process racing to exit between the two calls, `ps` missing) reports
+    False rather than raising or guessing True. Hiding the model-switcher button is the harmless
+    failure; showing it when nothing is listening for "/model ..." would type a slash command
+    into a bash prompt instead -- the harmful one. This is POLICY the server decides once here;
+    callers must not re-derive it (conventions rule 5).
+    """
+    try:
+        pgid = os.tcgetpgrp(fd)
+    except OSError:
+        return False
+    try:
+        out = subprocess.run(["ps", "-o", "comm=", "-p", str(pgid)],
+                              capture_output=True, text=True, timeout=1)
+    except Exception:
+        return False
+    if out.returncode != 0:
+        return False
+    comm = os.path.basename((out.stdout or "").strip()).lower()
+    return comm == "claude"
+
+
+def attached(handler, parsed):
+    """GET /api/term/attached?tty=<id> -> {"claude_attached": bool}.
+
+    The server-owned answer to "is a Claude CLI listening on this pty" -- see
+    `_foreground_is_claude()` above for why `mode` alone can't answer this and why a failure here
+    reports False. Same guard/lookup/404 shape as every other `/api/term/*` route (`resize_pty`
+    just above is the closest analogue): no weaker auth than a route that can already write bytes
+    to this same pty via `/api/term/keys`.
+    """
+    if not term_gate.guard(handler):
+        return
+    from urllib.parse import parse_qs
+    tid = parse_qs(parsed.query).get("tty", [""])[0]
+    with _LOCK:
+        _reap()
+        pt = PTYS.get(tid)
+    if pt is None or pt.done:
+        return handler._json({"error": "no such terminal"}, 404)
+    handler._json({"claude_attached": _foreground_is_claude(pt.fd)})
+
+
 def screen_stream(handler, parsed):
     """GET /api/term/screen?tty=<id> -> SSE of `Screen.snapshot(since)` payloads, one connection
     per viewer.
@@ -2861,6 +2916,7 @@ server.EXTRA_POST["/api/term/keys"] = keys
 server.EXTRA_POST["/api/term/resize"] = resize_pty
 server.EXTRA_POST["/api/term/inject"] = inject
 server.EXTRA_POST["/api/term/close"] = close_pty
+server.EXTRA_GET["/api/term/attached"] = attached
 server.EXTRA_GET["/api/term/screen"] = screen_stream
 server.EXTRA_GET["/api/term/scrollback"] = term_scrollback
 server.EXTRA_GET["/api/term/renderer"] = renderer_info

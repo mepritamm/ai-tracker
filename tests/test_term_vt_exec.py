@@ -1260,7 +1260,8 @@ console.log(JSON.stringify({ style: sgrRunClass("48;5;" + """ + str(n) + """).st
 """)["style"], "", "index %d must stay on the class path, not fall through to inline style" % n)
 
 
-def _xterm_leak_harness():
+def _xterm_leak_harness(pane_bottom=100, initial_overflow_px=0, has_screen_el=True,
+                         term_cols=80, term_rows=24, row_height_px=17, always_overflow=False):
     """Mock infrastructure for XtermTerminal, standing in for the browser globals `_build()`/
     `destroy()` touch: `window.Terminal`/`window.FitAddon.FitAddon` (fake xterm.js), a fake
     `ResizeObserver` global (matching real DOM behaviour: `window.ResizeObserver` is just a
@@ -1270,7 +1271,32 @@ def _xterm_leak_harness():
     a controllable `_loadXtermAssets()` (returns a Promise this harness resolves on command,
     simulating the real ~480KB asset fetch staying pending for an arbitrary amount of time), and
     counters for how many real xterm.js Terminal instances were ever constructed/disposed. Every
-    counter is a plain running total -- the tests read it directly rather than eyeballing calls."""
+    counter is a plain running total -- the tests read it directly rather than eyeballing calls.
+
+    Every keyword arg defaults to the exact geometry `TestXtermSwitchDestroyRace` (below) was
+    already written against -- a 100px pane with a 100px `.xterm-screen` (zero overflow, i.e.
+    `_correctFitOverflow`'s early "fits" return) -- so calling this with no args reproduces the
+    prior fixed harness byte-for-byte in behaviour. `TestCorrectFitOverflowExecuted` (further
+    below) is what actually exercises the non-default geometry:
+
+    - `initial_overflow_px`: how many px `.xterm-screen`'s measured bottom starts out past the
+      pane's content-box bottom (`pane_bottom`). The real, live-measured range was ~1.4px-7.4px
+      (see `_correctFitOverflow`'s own header comment in ext_vt.js) -- enough to clip the last
+      row's text without `_correctFitOverflow`'s correction.
+    - `row_height_px`: how many px the real DomRenderer's `.xterm-screen` shrinks by when
+      `term.resize()` removes one row (rows render at a whole device pixel each -- see that same
+      comment). The stub's `resize()` subtracts this from the tracked overflow on every call, so a
+      correction that removes enough rows genuinely stops overflowing, exactly like the real DOM.
+    - `always_overflow`: pins the pathological case where `.xterm-screen` overflows no matter how
+      many rows are removed (ignores `row_height_px` entirely) -- for proving the loop's 2-
+      iteration bound actually stops it rather than hanging.
+    - `has_screen_el`: False reproduces a future xterm.js build changing `.xterm-screen`'s DOM
+      shape -- `pane.querySelector('.xterm-screen')` returns null, which `_correctFitOverflow`
+      must treat as a safe no-op, not a throw.
+    - `term_cols`/`term_rows`: the stub `window.Terminal` instance's starting `cols`/`rows` --
+      real fields now (not the prior harness's absent ones), read and written by
+      `_correctFitOverflow`'s `term.resize(term.cols, term.rows - 1)` call.
+    """
     return """
 // Real addEventListener/removeEventListener are keyed on the FUNCTION REFERENCE, not a counter --
 // adding the same listener twice is a no-op, and removing one that was never added is *also* a
@@ -1281,6 +1307,9 @@ var __resizeListenerSet = new Set();
 var __roInstances = [];          // every ResizeObserver ever constructed, in creation order
 var __xtermBuilt = 0;            // how many real (fake) xterm.js Terminal instances were built
 var __xtermDisposed = 0;
+var __termResizeCalls = [];      // {cols, rows} for every term.resize() call _correctFitOverflow makes
+var __postResizeCalls = [];      // {ttyId, cols, rows} for every postResize() call -- i.e. what the
+                                  // server actually learns, via term.onResize's registered handler
 
 function ResizeObserver(cb) {
   this._cb = cb;
@@ -1298,12 +1327,26 @@ var window = {
 window.Terminal = function (opts) {
   __xtermBuilt++;
   this._opts = opts;
+  this.cols = %(term_cols)d;
+  this.rows = %(term_rows)d;
+  this._onResizeHandlers = [];
 };
 window.Terminal.prototype.loadAddon = function () {};
 window.Terminal.prototype.open = function () {};
 window.Terminal.prototype.attachCustomKeyEventHandler = function () {};
 window.Terminal.prototype.onData = function () {};
-window.Terminal.prototype.onResize = function () {};
+// Real xterm.js: onResize(fn) registers a listener that FIRES synchronously, off resize()'s own
+// call, whenever rows/cols actually change -- including a resize the terminal makes to correct
+// its own fit (see _build's onResize-before-fit() comment in ext_vt.js). This stub mirrors that
+// exactly: resize() below both updates this.cols/this.rows AND calls every registered handler,
+// so a correction genuinely reaches postResize() the same synchronous way any other resize does.
+window.Terminal.prototype.onResize = function (fn) { this._onResizeHandlers.push(fn); };
+window.Terminal.prototype.resize = function (cols, rows) {
+  __termResizeCalls.push({ cols: cols, rows: rows });
+  this.cols = cols; this.rows = rows;
+  if (!__alwaysOverflow) __screenOverflowPx -= %(row_height_px)d;
+  this._onResizeHandlers.forEach(function (fn) { fn({ cols: cols, rows: rows }); });
+};
 window.Terminal.prototype.focus = function () {};
 window.Terminal.prototype.hasSelection = function () { return false; };
 window.Terminal.prototype.dispose = function () { __xtermDisposed++; };
@@ -1324,10 +1367,41 @@ function observePane(pane, fn) {
   return function () { ro.disconnect(); };
 }
 
+// __alwaysOverflow/__screenOverflowPx drive the fake `.xterm-screen`'s reported geometry -- see
+// this function's own docstring above for what each constructor kwarg controls.
+var __alwaysOverflow = %(always_overflow_js)s;
+var __screenOverflowPx = %(initial_overflow_px)r;
+
 var document = {
   documentElement: {},
+  // The real pane XtermTerminal builds is a live DOM node -- xterm.js's DomRenderer appends the
+  // real `.xterm-screen` element underneath it, and _correctFitOverflow() (ext_vt.js) reads BOTH
+  // the pane's own getBoundingClientRect() and pane.querySelector(".xterm-screen")'s to detect
+  // bottom-row clipping (see that method's own header comment). This stub models both: a plausible
+  // `.xterm-screen` stand-in with its own getBoundingClientRect(), sized per this call's kwargs
+  // (the default geometry fits inside the pane's rect, matching the harness's prior fixed
+  // behaviour; TestCorrectFitOverflowExecuted below drives the overflowing variants). Returning a
+  // real element here -- not null, unless has_screen_el is False -- means _correctFitOverflow()
+  // actually runs its geometry comparison instead of short-circuiting at the "no screen element"
+  // guard the way a null stub would.
   createElement: function () {
-    return { className: '', appendChild: function () {}, setAttribute: function () {} };
+    var screenEl = %(has_screen_el_js)s ? {
+      getBoundingClientRect: function () {
+        // Recomputed on every read (not cached at creation) so a term.resize() call in between
+        // two _correctFitOverflow loop iterations is actually reflected -- exactly like the real
+        // DomRenderer, whose handleResize() sets .xterm-screen's style.height synchronously, off
+        // term.resize()'s own call, before _correctFitOverflow ever reads it back again.
+        var bottom = __alwaysOverflow ? (%(pane_bottom)r + 999) : (%(pane_bottom)r + __screenOverflowPx);
+        return { top: 0, left: 0, right: 200, bottom: bottom, width: 200, height: bottom };
+      }
+    } : null;
+    return {
+      className: '',
+      appendChild: function () {},
+      setAttribute: function () {},
+      querySelector: function (sel) { return sel === '.xterm-screen' ? screenEl : null; },
+      getBoundingClientRect: function () { return { top: 0, left: 0, right: 200, bottom: %(pane_bottom)r, width: 200, height: %(pane_bottom)r }; },
+    };
   },
   // XtermTerminal's constructor/destroy add/remove a document-level "themechange" listener (see
   // that class's own comments) -- this harness's buildToolbar() stub below is fully mocked out
@@ -1338,7 +1412,7 @@ var document = {
 function getComputedStyle() { return { getPropertyValue: function () { return ''; } }; }
 
 function postKeys() {}
-function postResize() {}
+function postResize(ttyId, cols, rows) { __postResizeCalls.push({ ttyId: ttyId, cols: cols, rows: rows }); }
 function EventSource(url) { this.url = url; this.closed = false; }
 EventSource.prototype.close = function () { this.closed = true; };
 
@@ -1363,7 +1437,15 @@ function resolveNextAssetLoad() {
   var r = __assetLoadResolvers.shift();
   if (r) r();
 }
-"""
+""" % {
+        "pane_bottom": pane_bottom,
+        "initial_overflow_px": initial_overflow_px,
+        "has_screen_el_js": json.dumps(bool(has_screen_el)),
+        "term_cols": term_cols,
+        "term_rows": term_rows,
+        "row_height_px": row_height_px,
+        "always_overflow_js": json.dumps(bool(always_overflow)),
+    }
 
 
 class TestXtermSwitchDestroyRace(unittest.TestCase):
@@ -1496,6 +1578,198 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         self.assertEqual(result["liveResizeListenersAfterDestroy"], 0, "destroy() must remove the window listener")
         self.assertEqual(result["liveResizeObserversAfterDestroy"], 0, "destroy() must disconnect the ResizeObserver")
         self.assertEqual(result["xtermInstancesDisposed"], 1, "destroy() must dispose() the xterm.js terminal")
+
+
+class TestCorrectFitOverflowExecuted(unittest.TestCase):
+    """`XtermTerminal.prototype._correctFitOverflow` (ext_vt.js), executed: an adversarial review
+    found this method -- the headline fix of this change, which stops the terminal's bottom row
+    being clipped -- shipped with ZERO coverage of its corrective branch. The pre-existing
+    `_xterm_leak_harness()` always measured a `.xterm-screen` that exactly fit its pane (bottom:100
+    vs. bottom:100), so `_correctFitOverflow` only ever took its "fits, nothing to do" early
+    return; its stub `window.Terminal.prototype` also defined no `.resize()`/`.cols`/`.rows`, so
+    the corrective branch (`term.resize(term.cols, term.rows - 1)`) would have thrown a TypeError
+    had it ever been reached.
+
+    `_xterm_leak_harness()` now takes geometry/behaviour kwargs (see that function's own
+    docstring) that make the corrective branch, the postResize/server-desync path it exists to
+    prevent, the 2-iteration bound, and both defensive guards all genuinely reachable and
+    assertable -- while its zero-argument call (used throughout `TestXtermSwitchDestroyRace`
+    above) reproduces the prior fixed "fits" geometry byte-for-byte."""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_overflowing_screen_triggers_exactly_one_corrective_resize(self):
+        # Realistic measured overflow (see _correctFitOverflow's own header comment in ext_vt.js:
+        # "the mismatch reached +1.4px" up to the ~7.4px this test uses) with rows rendering at
+        # exactly 17px each -- one row removed (7.4 - 17 = -9.6, well past the 0.5px fits
+        # threshold) is enough to bring `.xterm-screen` back inside the pane, so the loop must
+        # correct exactly once and then stop on its own "fits" check, not run out the 2-iteration
+        # bound.
+        script = _HARNESS_PRELUDE + _xterm_leak_harness(
+            initial_overflow_px=7.4, row_height_px=17, term_cols=80, term_rows=24,
+        ) + _XTERM_LEAK_SRC + """
+async function main() {
+  var container = makeContainer();
+  var term = new XtermTerminal(container, 'tty-overflow');
+  term.attach();
+  resolveNextAssetLoad();
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+
+  console.log(JSON.stringify({
+    resizeCalls: __termResizeCalls,
+    finalRows: term.term.rows,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertEqual(
+            result["resizeCalls"], [{"cols": 80, "rows": 23}],
+            "an overflowing .xterm-screen must be corrected by exactly one term.resize() call to "
+            "cols, rows-1",
+        )
+        self.assertEqual(result["finalRows"], 23)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_correction_posts_the_corrected_row_count_not_the_pre_correction_one(self):
+        # The desync bug class this whole fix exists to prevent: term.onResize is registered
+        # BEFORE the first fit() specifically so that any _correctFitOverflow() correction it
+        # triggers also reaches postResize() -> POST /api/term/resize (see _build's own comment in
+        # ext_vt.js). If the server only ever learned the PRE-correction row count (24), its PTY
+        # would stay sized for a row the browser is no longer actually rendering.
+        script = _HARNESS_PRELUDE + _xterm_leak_harness(
+            initial_overflow_px=7.4, row_height_px=17, term_cols=80, term_rows=24,
+        ) + _XTERM_LEAK_SRC + """
+async function main() {
+  var container = makeContainer();
+  var term = new XtermTerminal(container, 'tty-post-resize');
+  term.attach();
+  resolveNextAssetLoad();
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+
+  console.log(JSON.stringify({ postResizeCalls: __postResizeCalls }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertEqual(
+            result["postResizeCalls"], [{"ttyId": "tty-post-resize", "cols": 80, "rows": 23}],
+            "the server must learn the CORRECTED row count (23), not the pre-correction one (24) "
+            "-- that mismatch is exactly the client/server desync this fix exists to prevent",
+        )
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_a_screen_that_already_fits_triggers_no_correction(self):
+        # Guards against an over-eager fix that shrinks a row every time regardless of whether one
+        # is actually needed, which would permanently waste a row on every terminal. Uses the
+        # harness's DEFAULT geometry (zero overflow) -- the same "fits" case
+        # TestXtermSwitchDestroyRace already relies on above.
+        script = _HARNESS_PRELUDE + _xterm_leak_harness() + _XTERM_LEAK_SRC + """
+async function main() {
+  var container = makeContainer();
+  var term = new XtermTerminal(container, 'tty-fits');
+  term.attach();
+  resolveNextAssetLoad();
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+
+  console.log(JSON.stringify({
+    resizeCalls: __termResizeCalls,
+    postResizeCalls: __postResizeCalls,
+    finalRows: term.term.rows,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertEqual(result["resizeCalls"], [], "a screen that already fits must never be resized")
+        self.assertEqual(result["postResizeCalls"], [], "no correction means no extra resize POST")
+        self.assertEqual(result["finalRows"], 24)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_a_pathologically_always_overflowing_screen_is_bounded_to_two_corrections(self):
+        # Constructs a screen that overflows NO MATTER how many rows are removed (always_overflow
+        # ignores row_height_px entirely -- see the harness's own docstring) to prove the loop's
+        # documented 2-iteration bound is what actually stops it, not the "fits" check -- i.e. it
+        # neither hangs nor keeps shrinking indefinitely. (`_run_node`'s own 30s subprocess timeout
+        # is a second, independent backstop against an actual hang.)
+        script = _HARNESS_PRELUDE + _xterm_leak_harness(
+            always_overflow=True, term_cols=80, term_rows=24,
+        ) + _XTERM_LEAK_SRC + """
+async function main() {
+  var container = makeContainer();
+  var term = new XtermTerminal(container, 'tty-always-overflow');
+  term.attach();
+  resolveNextAssetLoad();
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+
+  console.log(JSON.stringify({
+    resizeCalls: __termResizeCalls,
+    finalRows: term.term.rows,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertEqual(
+            result["resizeCalls"], [{"cols": 80, "rows": 23}, {"cols": 80, "rows": 22}],
+            "a screen that never fits must still stop after exactly 2 corrective resizes, not "
+            "hang or keep shrinking indefinitely",
+        )
+        self.assertEqual(result["finalRows"], 22)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_rows_at_one_is_never_shrunk_to_zero_or_negative(self):
+        # `if (term.rows <= 1) return;` -- a legitimate defensive guard in the source, pinned here.
+        # Paired with a large overflow (50px) so the ONLY thing stopping a resize is this guard,
+        # not the geometry happening to already fit.
+        script = _HARNESS_PRELUDE + _xterm_leak_harness(
+            initial_overflow_px=50, term_rows=1,
+        ) + _XTERM_LEAK_SRC + """
+async function main() {
+  var container = makeContainer();
+  var term = new XtermTerminal(container, 'tty-one-row');
+  term.attach();
+  resolveNextAssetLoad();
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+
+  console.log(JSON.stringify({
+    resizeCalls: __termResizeCalls,
+    finalRows: term.term.rows,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertEqual(result["resizeCalls"], [], "a 1-row terminal must never be resized smaller")
+        self.assertEqual(result["finalRows"], 1)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_missing_xterm_screen_node_returns_safely_without_throwing(self):
+        # `pane.querySelector(".xterm-screen")` returning null -- e.g. a future xterm.js build that
+        # changed its DOM shape -- must be a safe no-op (per the source's own comment: "fail safe,
+        # no-op"), not a throw. A throw here would propagate out of _build() (the node harness would
+        # exit non-zero / _run_node would raise), so this test's own success is part of the proof.
+        script = _HARNESS_PRELUDE + _xterm_leak_harness(
+            has_screen_el=False, initial_overflow_px=50,
+        ) + _XTERM_LEAK_SRC + """
+async function main() {
+  var container = makeContainer();
+  var term = new XtermTerminal(container, 'tty-no-screen-el');
+  term.attach();
+  resolveNextAssetLoad();
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+
+  console.log(JSON.stringify({
+    resizeCalls: __termResizeCalls,
+    finalRows: term.term.rows,
+    built: __xtermBuilt,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertEqual(result["resizeCalls"], [], "no .xterm-screen node means no correction can be computed")
+        self.assertEqual(result["finalRows"], 24, "rows must be left untouched")
+        self.assertEqual(result["built"], 1, "sanity: _build() itself must have completed, not thrown")
 
 
 if __name__ == "__main__":

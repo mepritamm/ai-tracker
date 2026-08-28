@@ -382,6 +382,8 @@ def parse_auggie(session_id):
         "meta": {"cwd": cwd, "title": title, "source": "auggie", "entrypoint": "auggie",
                  "gitBranch": branch,
                  "model": ((d.get("chatHistory") or [{}])[-1].get("exchange") or {}).get("model_id") or ""},
+                 # no "effort" key here: Auggie logs have no reasoning-effort concept
+                 # (unlike model, which Auggie has but may be empty) — omit rather than fake
         "todos": todos,
         "files": sorted(files.values(), key=lambda x: x.get("last") or "", reverse=True),
         "reads": [{"path": p, "t": t} for p, t in

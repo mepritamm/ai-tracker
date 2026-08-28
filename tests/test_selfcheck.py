@@ -43,7 +43,9 @@ def _run():
         # isMeta system notices arrive as a plain STRING too (skill reload, /context) → NOT a prompt
         {"type": "user", "isMeta": True,
          "message": {"role": "user", "content": "Skill /foo is already loaded above; instructions unchanged."}},
-        {"type": "assistant", "timestamp": "2026-06-22T10:00:00.000Z",
+        # "effort" is a TOP-LEVEL field of the record, a sibling of "message" -- never nested
+        # inside it (confirmed against a real ~/.claude/projects/*/*.jsonl transcript).
+        {"type": "assistant", "timestamp": "2026-06-22T10:00:00.000Z", "effort": "high",
          "message": {"usage": {"input_tokens": 100, "output_tokens": 20},
                      "content": [
                          {"type": "text", "text": "starting"},
@@ -58,6 +60,10 @@ def _run():
                           "input": {"command": "pytest -q"}},
                          {"type": "tool_use", "id": "t2", "name": "Bash",
                           "input": {"command": "git commit -m \"add foo\""}}]}},
+        # a second assistant turn with a DIFFERENT top-level effort -- proves last-value-wins,
+        # same as "model". Empty usage/content so it doesn't disturb any other assertion below.
+        {"type": "assistant", "timestamp": "2026-06-22T10:00:05.000Z", "effort": "low",
+         "message": {}},
         {"type": "user", "message": {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "t1", "is_error": True, "content": "boom"}]}},
     ]
@@ -98,6 +104,9 @@ def _run():
     assert "ran 2 command(s)" in ov["sofar"] and "1 commit" in ov["sofar"], ov
     assert ov["commits"] == ["add foo"], ov
     assert d["meta"]["title"] == "Build the thing", d["meta"].get("title")
+    # reasoning effort: last non-empty top-level "effort" wins, exactly like "model" —
+    # the fixture's two assistant turns carry "high" then "low".
+    assert d["meta"]["effort"] == "low", d["meta"].get("effort")
 
     # short-title derivation: strips filler, shortens, keeps it readable
     assert _short_title("Can you create a HTML tracker where I paste the session id and track it") \
@@ -134,6 +143,9 @@ def _run():
     mt_bg, bg_n = _mtime_and_bg(spath)
     assert bg_n == 1 and mt_bg == _active_mtime(spath), (bg_n, mt_bg)
     ds = parse_session(spath)
+    # no assistant record in THIS session's own transcript carries "effort" at all (only its
+    # subagent file does, and that's a separate transcript) -- absent, not a crash or a fake "".
+    assert "effort" not in ds["meta"], ds["meta"]
     assert len(ds["agents_bg"]) == 1 and "background agent" in ds["overview"]["now"], ds["overview"]["now"]
     afile = next((x for x in ds["files"] if x["path"] == "/x/.worktrees/wt/auth.py"), None)
     assert afile and afile.get("agent"), "agent-edited file must surface in files, tagged"  # the gap
@@ -447,6 +459,9 @@ def _run():
     assert drill("auggie:missing", "output", "c1") is None, "unknown session -> the route 404s"
     assert drill("auggie:sess1", "shell", "x") == {"cmd": "", "out": "", "running": False}  # safe default
     assert "gitBranch" in pa["meta"], "auggie meta must carry gitBranch like Claude"
+    # reasoning effort is a Claude-only concept -- Auggie degrades by OMITTING the key
+    # entirely (unlike "model", which Auggie has but may report as ""), never faking a value.
+    assert "effort" not in pa["meta"], "auggie meta must not fake a reasoning-effort field"
     assert pa["waiting"] is False, "no open ask-user -> not waiting"
     assert parse_auggie("missing") is None
 

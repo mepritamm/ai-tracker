@@ -823,6 +823,8 @@ def parse_session(path):
                                + u.get("cache_creation_input_tokens", 0))
             if msg.get("model"):
                 meta["model"] = msg["model"]
+            if o.get("effort"):  # top-level sibling of "message", not nested in it; last value wins
+                meta["effort"] = o["effort"]
             content = msg.get("content")
             # user prompts arrive as a plain string, OR — when the message carries an
             # image/paste/slash-command — as a LIST of blocks (text + maybe image).

@@ -265,7 +265,8 @@ class TestExtLaunchStillPassesTier1Contract(unittest.TestCase):
 
 class TestContextBarModelSwitcher(unittest.TestCase):
     """The model switcher: hardcoded ladder, sends /model <name> via the inject route, gated on
-    Claude-vs-shell mode, and never steals keyboard focus from the terminal."""
+    the server's claude_attached answer (not on how the terminal was opened), and never steals
+    keyboard focus from the terminal."""
 
     def setUp(self):
         self.src = _read("ext_vt.js")
@@ -274,10 +275,16 @@ class TestContextBarModelSwitcher(unittest.TestCase):
         self.assertIn('var MODEL_LADDER = ["haiku", "sonnet", "opus", "fable"];', self.src)
         self.assertIn("HARDCODED", self.src)
 
-    def test_gated_on_resume_or_new_never_cwd(self):
+    def test_gating_uses_server_attached_not_the_old_mode_proxy(self):
+        # The user's actual regression: a plain `cwd` shell where they typed `claude` themselves
+        # used to hide the switcher forever, because `mode === "resume" || mode === "new"` was
+        # used as a proxy for "Claude is listening". That literal proxy must be GONE from the
+        # constructor -- the only gate left is the server's own claude_attached answer.
         body = _body_until(self.src, "function ContextBar(", ["ContextBar.prototype."])
-        self.assertIn('mode === "resume"', body)
-        self.assertIn('mode === "new"', body)
+        self.assertNotIn('mode === "resume"', body)
+        self.assertNotIn('mode === "new"', body)
+        self.assertNotIn("showSwitcher", self.src)
+        self.assertIn("this.attached = false;", body)
 
     def test_picking_a_model_sends_the_documented_inject_contract(self):
         body = _body_until(self.src, "ContextBar.prototype._pickModel = function", ["ContextBar.prototype."])
@@ -297,6 +304,90 @@ class TestContextBarModelSwitcher(unittest.TestCase):
         # preventDefault on mousedown is what stops a <button> from stealing DOM focus at all.
         self.assertIn('btn.addEventListener("mousedown", function (ev) { ev.preventDefault(); });', self.src)
         self.assertIn("_focusTerminal", body)
+
+
+class TestContextBarEffortSwitcher(unittest.TestCase):
+    """The effort picker: mirrors the model switcher exactly -- same component, same idioms
+    (hardcoded ladder, same inject contract, same toast-on-failure, same focus-safety pattern)."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_effort_ladder_is_hardcoded_low_to_high_with_provenance(self):
+        ladder_line = 'var EFFORT_LADDER = ["low", "medium", "high", "xhigh", "max"];'
+        self.assertIn(ladder_line, self.src)
+        # Not effort levels at all -- must never be offered in the picker (the ARRAY itself, not
+        # the surrounding comment, which legitimately names both to explain the exclusion).
+        self.assertNotIn("ultracode", ladder_line)
+        self.assertNotIn("auto", ladder_line)
+        # Provenance recorded, mirroring MODEL_LADDER's own self-documenting comment.
+        self.assertIn("2.1.247", self.src)
+        self.assertIn("CONFIRMED", self.src)
+
+    def test_picking_an_effort_sends_the_documented_inject_contract(self):
+        body = _body_until(self.src, "ContextBar.prototype._pickEffort = function", ["ContextBar.prototype."])
+        self.assertIn('"/api/term/inject"', body)
+        self.assertIn('tty: this.ttyId', body)
+        self.assertIn('text: "/effort " + level', body)
+        self.assertIn("submit: true", body)
+        self.assertIn("clear_first: true", body)
+
+    def test_inject_failure_surfaces_a_toast_not_silence(self):
+        body = _body_until(self.src, "ContextBar.prototype._pickEffort = function", ["ContextBar.prototype."])
+        self.assertIn("404", body)
+        self.assertIn("toast(", body)
+
+    def test_effort_button_never_takes_native_focus(self):
+        body = _body_until(self.src, "function ContextBar(", ["ContextBar.prototype."])
+        self.assertIn('ebtn.addEventListener("mousedown", function (ev) { ev.preventDefault(); });', self.src)
+        self.assertIn("_focusTerminal", body)
+
+    def test_current_effort_read_from_meta_effort_with_fallback_label(self):
+        body = _body_until(self.src, "ContextBar.prototype._applySessionData = function", ["ContextBar.prototype."])
+        self.assertIn("meta.effort", body)
+        self.assertIn('"effort") + " ▾"', body)
+
+    def test_unrecognized_effort_value_is_shown_not_crashed_on(self):
+        # An effort value outside EFFORT_LADDER (a future CLI tier) must still render as the raw
+        # label rather than throwing -- _applySessionData only type/truthiness-guards meta.effort,
+        # it never validates against the ladder.
+        body = _body_until(self.src, "ContextBar.prototype._applySessionData = function", ["ContextBar.prototype."])
+        self.assertIn('typeof meta.effort === "string"', body)
+
+    def test_current_item_marked_the_same_way_as_the_model_dropdown(self):
+        body = _body_until(self.src, "ContextBar.prototype._openEffortDropdown = function", ["ContextBar.prototype."])
+        self.assertIn('classList.toggle("cur", items[i].getAttribute("data-effort") === this.currentEffort)', body)
+
+
+class TestContextBarAttachGating(unittest.TestCase):
+    """Task 1: the switcher's visibility is a REACTIVE, server-driven answer (GET
+    /api/term/attached), polled on the same 2s cycle as /api/session -- not a second timer, and
+    not derived from `mode`. A 404/network failure is treated as not-attached."""
+
+    def setUp(self):
+        self.src = _read("ext_vt.js")
+
+    def test_attached_endpoint_is_polled_inside_the_same_tick_as_session(self):
+        body = _body_until(self.src, "ContextBar.prototype.start = function", ["ContextBar.prototype."])
+        self.assertIn('"/api/session?id="', body)
+        self.assertIn('"/api/term/attached?tty="', body)
+        # exactly one timer call driving both fetches out of tick(), not two independent timers.
+        self.assertEqual(body.count("= setInterval("), 1)
+
+    def test_404_or_network_error_is_treated_as_not_attached(self):
+        body = _body_until(self.src, "ContextBar.prototype.start = function", ["ContextBar.prototype."])
+        self.assertIn("r.ok ? r.json() : { claude_attached: false }", body)
+        self.assertIn("self._setAttached(false)", body)
+
+    def test_set_attached_toggles_the_switchers_container(self):
+        body = _body_until(self.src, "ContextBar.prototype._setAttached = function", ["ContextBar.prototype."])
+        self.assertIn('this.switchersEl.style.display = attached ? "" : "none";', body)
+
+    def test_bar_visibility_accounts_for_dynamic_attached_state(self):
+        body = _body_until(self.src, "ContextBar.prototype._syncBarVisibility = function", ["ContextBar.prototype."])
+        self.assertIn("this.attached || this._hasUsage", body)
+        # the old fixed-at-construction proxy must be gone from the display logic entirely.
+        self.assertNotIn("this.showSwitcher", self.src)
 
 
 class TestContextUsageIsIsolatedAndDocumented(unittest.TestCase):
@@ -439,13 +530,26 @@ class TestContextBarCss(unittest.TestCase):
         self.css = _read("ext_vt.css")
 
     def test_bar_classes_present(self):
-        for cls in (".vtctxbar", ".vtmodelbtn", ".vtmodeldd", ".vtctxreadout"):
+        for cls in (".vtctxbar", ".vtmodelbtn", ".vtmodeldd", ".vtctxreadout",
+                    ".vteffortbtn", ".vteffortdd", ".vtswitchers", ".vtswitcher"):
             self.assertIn(cls, self.css)
 
     def test_reuses_existing_design_tokens_not_new_colors(self):
         body = self.css[self.css.index(".vtctxbar {"):self.css.index(".vtmodelitem.cur::after")]
         self.assertIn("var(--chipbg)", body)
         self.assertIn("var(--line3)", body)
+        # the effort button/dropdown/item rules are GROUPED with the model ones (comma selectors),
+        # not a forked second copy of the chrome -- both share these same literal declarations.
+        self.assertIn(".vtmodelbtn, .vteffortbtn {", body)
+        self.assertIn(".vtmodeldd, .vteffortdd {", body)
+
+    def test_dropdown_is_anchored_to_its_own_switcher_not_the_bar(self):
+        # each picker's dropdown is positioned relative to ITS OWN wrap (.vtswitcher), not a
+        # second hardcoded pixel offset on .vtctxbar -- robust to "opus" vs "xhigh" label widths.
+        self.assertIn(".vtswitcher { position: relative", self.css)
+        dd = self.css[self.css.index(".vtmodeldd, .vteffortdd {"):self.css.index(".vtmodeldd.show")]
+        self.assertIn("left: 0;", dd)
+        self.assertNotIn("left: 10px;", dd)
 
     def test_both_breakpoints_present(self):
         self.assertIn("min-width:601px) and (max-width:900px)", self.css)
@@ -458,6 +562,41 @@ class TestContextBarCss(unittest.TestCase):
         phone = phone[:phone.index("}\n\n") + 1] if "}\n\n" in phone else phone
         self.assertNotIn(".vtmodelbtn { display: none", phone)
         self.assertNotIn(".vtmodeldd { display: none", phone)
+
+    def test_effort_button_never_hidden_by_breakpoint(self):
+        phone = self.css[self.css.index("@media(max-width:600px) {\n  .vtctxbar"):]
+        phone = phone[:phone.index("}\n\n") + 1] if "}\n\n" in phone else phone
+        self.assertNotIn(".vteffortbtn { display: none", phone)
+        self.assertNotIn(".vteffortdd { display: none", phone)
+        # explicitly present (grouped with the model button) rather than simply absent-by-luck.
+        self.assertIn(".vtmodelbtn, .vteffortbtn { padding: 3px 6px; }", phone)
+
+    def test_switchers_pinned_left_so_effort_dropdown_cannot_reach_the_right_edge(self):
+        # Adversarial review flagged (unproven) that the effort dropdown -- second in the row,
+        # anchored to a button further right than the old single picker ever sat -- might overflow
+        # a narrow viewport's right edge, since neither dropdown has a max-width or right-edge
+        # fallback. EMPIRICALLY SETTLED (live browser, getBoundingClientRect against the viewport
+        # and .vtctxbar) at 375x812, 600x800, 768x1024 and a 1280-wide desktop, even forcing the
+        # widest ladder label ("xhigh") onto the effort button: no overflow at any width. The
+        # reason is structural, not incidental, so THAT structure is what this pins -- not a
+        # max-width band-aid nothing measured requires. `.vtswitchers` is `flex: 0 0 auto` and is
+        # appended to `.vtctxbar` BEFORE `.vtctxreadout` (a flex row, so DOM order is visual
+        # order), which keeps both pickers pinned at the bar's LEFT edge regardless of label width;
+        # `.vtctxreadout` is `flex: 1 1 auto` with `overflow: hidden` and is what absorbs a narrow
+        # bar by truncating, never by pushing the switchers rightward. Break any one of these and
+        # the empirical no-overflow result above no longer holds.
+        bar = self.css[self.css.index(".vtctxbar {"):self.css.index(".vtswitchers {")]
+        self.assertIn("display: flex;", bar)   # a flex row -> DOM order is left-to-right visual order
+        self.assertIn(".vtswitchers { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }",
+                       self.css)
+        readout = self.css[self.css.index(".vtctxreadout {"):self.css.index(".vtctxbarwrap {")]
+        self.assertIn("flex: 1 1 auto;", readout)
+        self.assertIn("overflow: hidden;", readout)
+        # switchers must appear BEFORE the readout in JS's DOM-assembly order (bar.appendChild
+        # calls), not just in the CSS -- otherwise "first flex child" above is meaningless.
+        js = _read("ext_vt.js")
+        self.assertLess(js.index("switchers.className = \"vtswitchers\";\n    switchers.style.display"),
+                         js.index("readout.className = \"vtctxreadout\";"))
 
 
 class TestZoomControlOverlapFix(unittest.TestCase):
