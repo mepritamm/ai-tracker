@@ -239,6 +239,35 @@ if _HAS_NODE:
     _mgr_end = _SRC.index("window.ExtVT =", _mgr_start)
     _MANAGER_PANEL_SRC = _SRC[_mgr_start:_mgr_end]
 
+    # ===== openVT's peek-before-spawn reuse check (this task) =====================================
+    # `openVT` now does GET /api/term/list FIRST and, on a live session+mode match, opens that
+    # terminal via `peekTerm` instead of POSTing a brand-new pty -- the entire pre-existing body of
+    # `openVT` was renamed to `_openVTFresh` (a plain top-level function, not a closure) so the new
+    # check could fall through to it unchanged. Both are pulled out whole via the same "between two
+    # literal markers" span strategy `_MANAGER_PANEL_SRC` above already uses: `openVT` ends exactly
+    # where `_openVTFresh` begins (no marker needed between them, they're adjacent), and
+    # `_openVTFresh` itself ends at `closeVT`, the next top-level function after it.
+    #
+    # This is a MARKER-based slice, not a content-based one, so it keeps working unchanged across
+    # the internal reshuffle openVT's own promise chain went through during this task: the `.catch`
+    # that degrades a failed/blocked /api/term/list check to "nothing is running" moved from the
+    # END of the chain onto the fetch alone (see openVT's own comment on why -- a trailing catch
+    # also caught a throw from `_openVTFresh`/`peekTerm` and re-ran `_openVTFresh`, spawning a
+    # second pty silently). `TestOpenVTPeekBeforeSpawn.test_openvtfresh_throwing_is_never_retried`
+    # below is the regression guard for exactly that defect.
+    _openvt_start = _SRC.index("function openVT(sid, mode) {")
+    _openvt_end = _SRC.index("function closeVT() {")
+    _OPENVT_SRC = _SRC[_openvt_start:_openvt_end]
+
+    # `peekTerm` is ALSO reachable through `_MANAGER_PANEL_SRC` above (it lives inside that same
+    # section, wired to the manager panel's own "peek" button), but pulling the whole manager panel
+    # in here just to reach one function would drag buildManager/openManager/closeAll/etc. into a
+    # harness that has nothing to do with them -- so it gets its own narrow span instead, bounded by
+    # the next top-level function declared after it (`closeTty`).
+    _peekterm_start = _SRC.index("function peekTerm(t) {")
+    _peekterm_end = _SRC.index("function closeTty(tty) {")
+    _PEEK_TERM_SRC = _SRC[_peekterm_start:_peekterm_end]
+
 
 _HARNESS_PRELUDE = """
 'use strict';
@@ -3641,6 +3670,430 @@ console.log(JSON.stringify({ before: before, after: __bannerTexts(mount) }));
         self.assertEqual(result["before"], ["refused resume"])
         self.assertEqual(result["after"], ["refused resume"],
                           "a renderer switch must neither drop nor duplicate a standing banner")
+
+
+# ===== openVT peek-before-spawn reuse (this task) ================================================
+# Previously, openVT(sid, mode) always POSTed a brand-new pty. tests/test_term_vt_client.py can only
+# assert that the string "GET /api/term/list"-shaped fetch call and the string "_openVTFresh" both
+# appear somewhere in the source -- it stays green even if the reuse check were, say, always false
+# (never matches, always falls through to a fresh spawn) or always true (peeks even on a session/mode
+# mismatch), because neither of those is a difference in WHAT LITERALLY APPEARS in the file, only in
+# what the code DOES when run. This is exactly the gap this whole module exists to close (see the
+# module docstring) -- so these tests actually execute the real `openVT`/`_openVTFresh`/`peekTerm`,
+# extracted verbatim above, and observe the real fetch calls and the real `window.open` call.
+_OPENVT_MOCKS = """
+// ===== module-scope state openVT/_openVTFresh close over in the real file (see the `var overlay =
+// null, ...` block sitting just above `function buildOverlay` in ext_vt.js) -- declared here as
+// plain vars because our extracted span starts mid-closure and has no module wrapper of its own to
+// supply them.
+var overlay = null, modalTitleEl = null, modalStatusEl = null, modalBodyEl = null;
+var activeTerm = null, activeTty = null, activeSid = null, activeMode = null, activeBar = null;
+var activeRenderer = null, activeTermWrap = null;
+var activeForked = false, activeNotice = null;
+var openGen = 0;
+var modalForkChip = null, modalNotices = null;
+
+// buildOverlay is stubbed, not extracted for real: the reuse-vs-fresh DECISION (openVT's own new
+// logic) is what these tests pin, not the modal's DOM construction -- the real buildOverlay pulls in
+// click-outside-closes wiring, the modal header, the fork chip, none of it relevant here.
+function buildOverlay(mount) {
+  overlay = __makeEl("div");
+  modalTitleEl = __makeEl("span");
+  modalStatusEl = __makeEl("span");
+  modalBodyEl = __makeEl("div");
+  modalForkChip = __makeEl("span");
+  modalNotices = { show: function () {}, clear: function () {} };
+}
+
+// computeColsRows is stubbed for the same reason: its real implementation measures a canvas 2D
+// context via getComputedStyle, which has nothing to do with the reuse decision and would otherwise
+// need a full fake-canvas rig just to get _openVTFresh past the probePane measurement on the way to
+// the POST these tests actually care about.
+function computeColsRows(pane) { return { cols: 80, rows: 24, cellW: 8, cellH: 16, padX: 0, padY: 0 }; }
+
+// The real one-liner from ext_vt.js's own top of file -- reproduced (not concatenated in) so this
+// mock block stays self-contained; see `_ESC_SRC` elsewhere in this module for the original.
+function esc(s) { return (s || "").replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+
+// renderCapBlock/Terminal/XtermTerminal/ContextBar/_wireModalTerm/switchActiveRenderer are only ever
+// reached down the SUCCESS (or 429) branch of _openVTFresh's POST /api/term/pty. Every scenario
+// below resolves that POST as a rejection instead (see fetch() below) specifically so the decision
+// under test -- reuse vs. fresh-spawn -- is provable without a full fake Terminal/ContextBar. Made
+// throwing stubs (not silent no-ops) so a test that accidentally drives the success branch fails
+// loudly instead of silently passing on unexercised code.
+function renderCapBlock() { throw new Error("renderCapBlock should not run in these tests"); }
+function _wireModalTerm() {}
+function switchActiveRenderer() {}
+function Terminal() { throw new Error("Terminal should not be constructed in these tests"); }
+function XtermTerminal() { throw new Error("XtermTerminal should not be constructed in these tests"); }
+function ContextBar() { throw new Error("ContextBar should not be constructed in these tests"); }
+
+// ----- requestAnimationFrame: manually driven, same "nothing fires until told to" contract as
+// `_harness_mocks()`'s flushRAF elsewhere in this module -- _openVTFresh schedules its
+// probe-then-POST work inside one, and the generation-guard test needs that held open across a
+// SECOND openVT() call before anything runs.
+var __rafQueue = [];
+function requestAnimationFrame(cb) { __rafQueue.push(cb); return __rafQueue.length; }
+function flushRAF() { var q = __rafQueue; __rafQueue = []; q.forEach(function (cb) { cb(); }); }
+
+// ----- fetch -----------------------------------------------------------------------------------
+// /api/term/list is served from a manually-consumed queue (__listQueue, "queue" mode -- immediate
+// resolution, same one-shot-then-repeat-last convention as _MANAGER_MOCKS's own __listQueue) OR,
+// in "manual" mode, held open as a deferred promise pushed onto __listResolvers -- the generation
+// guard test needs to hold ONE list-fetch open while a second, superseding openVT() call runs all
+// the way to completion, which an immediately-resolving mock can't do.
+// /api/term/pty ALWAYS rejects here (see the comment above the Terminal/ContextBar stubs) -- every
+// fresh-spawn scenario below only needs to prove the POST was attempted, never that it succeeds.
+var __fetchCalls = [];
+var __listMode = "queue";
+var __listQueue = [{ terminals: [] }];
+var __listResolvers = [];
+var __ptyCalls = [];
+function __nextFromListQueue() { return __listQueue.length > 1 ? __listQueue.shift() : __listQueue[0]; }
+function __makeListResponse(spec) {
+  var status = spec.status === undefined ? 200 : spec.status;
+  return {
+    ok: status >= 200 && status < 300, status: status,
+    json: function () { return Promise.resolve({ terminals: spec.terminals || [] }); },
+  };
+}
+function fetch(url, opts) {
+  __fetchCalls.push(url);
+  if (url === "/api/term/list") {
+    if (__listMode === "manual") {
+      return new Promise(function (resolve, reject) { __listResolvers.push({ resolve: resolve, reject: reject }); });
+    }
+    var spec = __nextFromListQueue();
+    if (spec.reject) return Promise.reject(new Error("simulated network failure"));
+    return Promise.resolve(__makeListResponse(spec));
+  }
+  if (url === "/api/term/pty") {
+    __ptyCalls.push(JSON.parse(opts.body));
+    return Promise.reject(new Error("simulated network failure -- see this class's own header"));
+  }
+  return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({}); } });
+}
+
+// ----- minimal fake element/DOM: just enough for buildOverlay's stub and the probePane
+// appendChild/innerHTML _openVTFresh itself does -- a slimmed copy of _MANAGER_MOCKS's own __makeEl
+// (same shape, minus classList/querySelectorAll, which nothing here needs).
+function __makeEl(tag) {
+  var _html = "";
+  var el = {
+    tagName: tag, style: {}, textContent: "",
+    children: [],
+    appendChild: function (child) { el.children.push(child); return child; },
+    addEventListener: function () {},
+  };
+  Object.defineProperty(el, "innerHTML", {
+    get: function () { return _html; },
+    set: function (v) { _html = v; el.children = []; },
+  });
+  return el;
+}
+var document = {
+  createElement: function (tag) { return __makeEl(tag); },
+  getElementById: function (id) { return id === "ext_vt" ? __makeEl("div") : null; },
+};
+
+// ----- window.open / location / alert: peekTerm's own three dependencies (see its own source).
+var __windowOpenCalls = [];
+var window = { open: function (url) { __windowOpenCalls.push(url); return { closed: false }; } };
+var location = { origin: "http://tracker.test", pathname: "/" };
+function alert() {}
+
+// Real setTimeout is untouched by this mock block (unlike _MANAGER_MOCKS/_harness_mocks, nothing
+// here needs a controllable clock), so __flush can hop through it directly to drain the promise
+// chains openVT/_openVTFresh build -- fetch->then->then(->catch) is several microtask turns deep.
+function __flush(n) {
+  var p = Promise.resolve();
+  for (var i = 0; i < (n || 8); i++) {
+    p = p.then(function () { return new Promise(function (r) { setTimeout(r, 0); }); });
+  }
+  return p;
+}
+
+// openVT's own final `.then(function (j) { ...decide... })` now has NO trailing `.catch` (see the
+// extraction comment above `_OPENVT_SRC`) -- a throw from inside it (e.g. `_openVTFresh` itself
+// blowing up) rejects that `.then`'s returned promise with nothing left in the file to handle it.
+// That is deliberate in a browser (an unhandled rejection is logged, not fatal) but Node's default
+// is to CRASH the process on one -- which would make `_run_node` see a non-zero exit and report an
+// unrelated-looking harness failure instead of the thing under test. Recorded here instead of
+// swallowed silently, so `test_openvtfresh_throwing_is_never_retried` below can still assert the
+// throw actually happened, not just that nothing crashed.
+var __unhandledRejections = [];
+process.on("unhandledRejection", function (reason) {
+  __unhandledRejections.push(String((reason && reason.message) || reason));
+});
+"""
+
+
+class TestOpenVTPeekBeforeSpawn(unittest.TestCase):
+    """Executes the REAL `openVT`/`_openVTFresh`/`peekTerm` straight out of aitracker/web/ext_vt.js
+    (never retyped -- see `_OPENVT_SRC`/`_PEEK_TERM_SRC` above) to pin the new peek-before-spawn
+    behaviour: openVT(sid, mode) now checks GET /api/term/list FIRST, and only POSTs a brand-new pty
+    (via _openVTFresh, the renamed entire old openVT body) when no LIVE terminal already matches
+    both `session` AND `mode`.
+
+    This closes exactly the gap this whole module exists for (see the module docstring): a
+    source-text test can confirm the string "/api/term/list" and the string "_openVTFresh" both
+    appear in openVT's body, but that stays true even if the match condition were wrong (e.g. session
+    alone, ignoring mode -- so clicking "Resume" while a plain shell is open for the same session
+    would wrongly peek at the shell instead of starting `claude --resume`), or even if the whole
+    check were a no-op that always falls through to a fresh spawn. Only running the code catches
+    that; see `test_matching_session_and_mode_peeks_instead_of_spawning` below for the one assertion
+    that would go red first if the reuse check were ripped out and openVT reverted to always calling
+    `_openVTFresh` immediately, the way it used to."""
+
+    def _script(self, body):
+        return (_HARNESS_PRELUDE + _OPENVT_MOCKS + _PEEK_TERM_SRC + _OPENVT_SRC + body)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_matching_session_and_mode_peeks_instead_of_spawning(self):
+        """Scenario 1: a live terminal for this exact session+mode already exists -> peekTerm runs
+        (window.open with a URL carrying that terminal's tty) and NO POST /api/term/pty happens.
+        THE assertion that catches a regression to the old always-spawn behaviour: revert openVT to
+        immediately call _openVTFresh (skip the GET /api/term/list check entirely, as it did before
+        this task) and `ptyCalls` here goes from `[]` to `[{session: 'sess1', ...}]` while
+        `windowOpenCalls` drops to `[]` -- both assertions below flip red together."""
+        script = self._script("""
+async function main() {
+  __listQueue = [{ terminals: [{ tty: "tty-42", session: "sess1", mode: "resume", forked: false }] }];
+  openVT("sess1", "resume");
+  await __flush();
+  console.log(JSON.stringify({
+    windowOpenCalls: __windowOpenCalls,
+    ptyCalls: __ptyCalls,
+    rafScheduled: __rafQueue.length,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(len(result["windowOpenCalls"]), 1,
+                          "a matching live terminal must be peeked via window.open")
+        self.assertIn("tty-42", result["windowOpenCalls"][0],
+                       "the peek URL must carry the EXISTING terminal's tty, not a freshly spawned one")
+        self.assertEqual(result["ptyCalls"], [], "no new pty may be spawned when one is reused")
+        self.assertEqual(result["rafScheduled"], 0,
+                          "_openVTFresh (which schedules the probe-then-POST rAF) must never run")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_same_session_different_mode_is_not_reused(self):
+        """Scenario 2: a live 'cwd' shell exists for this session, but the user clicked "Resume"
+        (mode='resume') -- these must NOT be treated as interchangeable. Reusing the plain shell
+        instead of starting 'claude --resume <sid>' would silently hand the user the wrong terminal."""
+        script = self._script("""
+async function main() {
+  __listQueue = [{ terminals: [{ tty: "tty-shell", session: "sess1", mode: "cwd" }] }];
+  openVT("sess1", "resume");
+  await __flush();
+  flushRAF();
+  await __flush();
+  console.log(JSON.stringify({ windowOpenCalls: __windowOpenCalls, ptyCalls: __ptyCalls }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(result["windowOpenCalls"], [], "a mode mismatch must never be peeked")
+        self.assertEqual(len(result["ptyCalls"]), 1, "a mode mismatch must fall through to a fresh spawn")
+        self.assertEqual(result["ptyCalls"][0]["session"], "sess1")
+        self.assertEqual(result["ptyCalls"][0]["mode"], "resume")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_different_session_same_mode_is_not_reused(self):
+        """Scenario 3: a live terminal exists with the right mode but for SOMEONE ELSE'S session --
+        matching on mode alone would hand one session's terminal to a completely different one."""
+        script = self._script("""
+async function main() {
+  __listQueue = [{ terminals: [{ tty: "tty-other", session: "sess-OTHER", mode: "resume" }] }];
+  openVT("sess1", "resume");
+  await __flush();
+  flushRAF();
+  await __flush();
+  console.log(JSON.stringify({ windowOpenCalls: __windowOpenCalls, ptyCalls: __ptyCalls }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(result["windowOpenCalls"], [])
+        self.assertEqual(len(result["ptyCalls"]), 1)
+        self.assertEqual(result["ptyCalls"][0]["session"], "sess1")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_empty_terminal_list_falls_through_to_fresh_spawn(self):
+        """Scenario 4: nothing is running at all -- the ordinary, most common case."""
+        script = self._script("""
+async function main() {
+  __listQueue = [{ terminals: [] }];
+  openVT("sess1", "cwd");
+  await __flush();
+  flushRAF();
+  await __flush();
+  console.log(JSON.stringify({ windowOpenCalls: __windowOpenCalls, ptyCalls: __ptyCalls }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(result["windowOpenCalls"], [])
+        self.assertEqual(len(result["ptyCalls"]), 1)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_list_non_ok_status_falls_back_to_fresh_spawn_without_throwing(self):
+        """Scenario 5: GET /api/term/list answers 403 (the feature-gated case -- TRACKER_TERMINAL
+        unset). openVT's own `r.ok ? r.json()... : {}` ternary must treat this as "no terminals",
+        not throw and not get stuck -- the fresh-spawn path is the honest fallback, matching
+        _openVTFresh's own pre-existing 403 handling once the POST also fails the same way."""
+        script = self._script("""
+async function main() {
+  __listQueue = [{ status: 403, terminals: [] }];
+  openVT("sess1", "cwd");
+  await __flush();
+  flushRAF();
+  await __flush();
+  console.log(JSON.stringify({ windowOpenCalls: __windowOpenCalls, ptyCalls: __ptyCalls }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(result["windowOpenCalls"], [])
+        self.assertEqual(len(result["ptyCalls"]), 1,
+                          "a 403 from the list check must still fall back to a fresh spawn")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_list_fetch_network_failure_falls_back_to_fresh_spawn_without_throwing(self):
+        """Scenario 6: GET /api/term/list itself REJECTS (e.g. offline) -- openVT's own `.catch`
+        handler is the fallback path here, distinct from the non-ok-status path above (that one
+        goes through the SUCCESS side of the promise chain with an empty {} body; this one never
+        gets a response at all). Both must land in the same place: a fresh spawn, no throw."""
+        script = self._script("""
+async function main() {
+  __listQueue = [{ reject: true }];
+  openVT("sess1", "cwd");
+  await __flush();
+  flushRAF();
+  await __flush();
+  console.log(JSON.stringify({ windowOpenCalls: __windowOpenCalls, ptyCalls: __ptyCalls }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(result["windowOpenCalls"], [])
+        self.assertEqual(len(result["ptyCalls"]), 1,
+                          "a rejected list check must still fall back to a fresh spawn")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_stale_generation_does_neither_peek_nor_spawn(self):
+        """Scenario 7, the generation guard: openVT claims `gen = ++openGen` BEFORE its async list
+        check even starts (see openVT's own comment on why -- "a second click while this one is
+        still checking supersedes it via the same openGen mechanism"). Call A's list-fetch is held
+        open (deferred) while call B -- a second, later openVT() for a DIFFERENT session -- runs all
+        the way through to its own fresh spawn, bumping openGen out from under A. When A's list-fetch
+        FINALLY resolves, it is fed a response that WOULD have matched (session='sess1', mode='cwd',
+        exactly what A asked for) -- if the generation check were missing or broken, this stale
+        response would peek at that terminal anyway. It must do neither: no new window.open, no new
+        pty POST, and no new rAF even scheduled (proving `_openVTFresh` itself never ran for the
+        stale call, not just that its eventual POST was somehow suppressed)."""
+        script = self._script("""
+async function main() {
+  __listMode = "manual";
+  openVT("sess1", "cwd");             // call A: gen=1, list-fetch held open via __listResolvers[0]
+  var listResolversLenAfterA = __listResolvers.length;
+
+  __listMode = "queue";
+  __listQueue = [{ terminals: [] }];  // call B: gen=2, resolves immediately -> empty list -> fresh spawn
+  openVT("sess2", "cwd");
+  await __flush();
+  flushRAF();                          // run B's _openVTFresh rAF -> its own pty POST
+  await __flush();
+
+  var ptyCallsAfterB = __ptyCalls.slice();
+  var windowOpenAfterB = __windowOpenCalls.slice();
+
+  // NOW resolve A's long-held list-fetch, with a response that WOULD match A's own request.
+  __listResolvers[0].resolve(__makeListResponse({
+    terminals: [{ tty: "tty-STALE", session: "sess1", mode: "cwd" }]
+  }));
+  await __flush();
+  var rafScheduledByStaleA = __rafQueue.length;
+  flushRAF();
+  await __flush();
+
+  console.log(JSON.stringify({
+    listResolversAfterA: listResolversLenAfterA,
+    ptyCallsAfterB: ptyCallsAfterB,
+    windowOpenAfterB: windowOpenAfterB,
+    rafScheduledByStaleA: rafScheduledByStaleA,
+    windowOpenFinal: __windowOpenCalls,
+    ptyCallsFinal: __ptyCalls,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(result["listResolversAfterA"], 1, "call A's list-fetch must actually be held open")
+        self.assertEqual(len(result["ptyCallsAfterB"]), 1, "call B must have completed its own fresh spawn")
+        self.assertEqual(result["ptyCallsAfterB"][0]["session"], "sess2")
+        self.assertEqual(result["windowOpenAfterB"], [])
+        self.assertEqual(result["rafScheduledByStaleA"], 0,
+                          "a stale (superseded) list response must not even schedule _openVTFresh's rAF")
+        self.assertEqual(result["windowOpenFinal"], [],
+                          "a stale response must never trigger peekTerm, even one that would have matched")
+        self.assertEqual(result["ptyCallsFinal"], result["ptyCallsAfterB"],
+                          "a stale response must never trigger a second fresh spawn either")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_openvtfresh_throwing_is_never_retried(self):
+        """Regression guard for the defect the coordinator just fixed in ext_vt.js: the `.catch`
+        that degrades a failed/blocked /api/term/list check to "nothing is running" used to sit at
+        the END of openVT's whole promise chain -- which ALSO caught a throw from `_openVTFresh`
+        (invoked by the preceding `.then`) and, in that old shape, re-ran `_openVTFresh` as its own
+        fallback. That is a SILENT double spawn: one `claude --resume <sid>` (or plain shell) started
+        by the first attempt before it threw, a second one started by the mis-triggered retry, and
+        nothing in the UI to say so. The fix moved the `.catch` onto the fetch alone (see the
+        extraction comment above `_OPENVT_SRC`), so a throw from `_openVTFresh` now has nothing
+        downstream to catch it at all -- it simply becomes an unhandled rejection, not a retry.
+
+        Driven here by making the (stubbed) `buildOverlay` -- the very first thing `_openVTFresh`
+        calls when no modal exists yet -- throw, and counting how many times it was actually called.
+        THE assertion that goes red if the `.catch` is ever moved back to the end of the chain:
+        `buildOverlayCalls` flips from 1 to 2."""
+        script = self._script("""
+var __buildOverlayCalls = 0;
+// Overrides _OPENVT_MOCKS's own no-op buildOverlay -- a later top-level `function` declaration in
+// the same scope replaces an earlier one of the same name (both are hoisted, source order decides
+// the final binding), so this is a plain, safe redefinition, not a hack.
+function buildOverlay(mount) {
+  __buildOverlayCalls++;
+  throw new Error("simulated failure inside _openVTFresh");
+}
+async function main() {
+  __listQueue = [{ terminals: [] }];   // no match -> falls through to _openVTFresh
+  openVT("sess1", "cwd");
+  await __flush();
+  console.log(JSON.stringify({
+    buildOverlayCalls: __buildOverlayCalls,
+    ptyCalls: __ptyCalls,
+    windowOpenCalls: __windowOpenCalls,
+    unhandledRejections: __unhandledRejections,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertTrue(
+            any("simulated failure inside _openVTFresh" in r for r in result["unhandledRejections"]),
+            "sanity check: the throw must actually have happened (and gone unhandled), or this "
+            "test is proving nothing",
+        )
+        self.assertEqual(
+            result["buildOverlayCalls"], 1,
+            "_openVTFresh must be invoked EXACTLY ONCE even when it throws -- 2 here means the "
+            "chain's `.catch` caught the throw and re-ran it, the exact double-spawn defect this "
+            "test guards against",
+        )
+        self.assertEqual(result["ptyCalls"], [], "the throw happened before any POST /api/term/pty")
+        self.assertEqual(result["windowOpenCalls"], [], "a throw must never fall back to peeking either")
 
 
 if __name__ == "__main__":

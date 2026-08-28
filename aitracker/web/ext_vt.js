@@ -2631,17 +2631,48 @@
     term.attach();
   }
 
+  // Before spawning a brand-new pty, check whether one is ALREADY running for this exact
+  // session+mode -- visible in the "Manage terminals" panel as e.g. `claude --resume <sid>` still
+  // live. Without this, clicking "Resume terminal here" a second time (the session's terminal is
+  // already open, just not the tab the user is looking at) spawned a SECOND `claude --resume`
+  // against the same conversation instead of surfacing the one already running. Reuses the exact
+  // shared "open the existing pty in its own tab" path the manager panel's peek button already
+  // has (peekTerm, below) -- conventions rule 4, don't fork a second way to attach to a live tty.
+  // `gen` is claimed HERE, before the async list check, so a second click while this one is still
+  // checking supersedes it via the same openGen mechanism _openVTFresh's POST already relies on.
   function openVT(sid, mode) {
     if (!sid) return;
     var mount = document.getElementById("ext_vt");
     if (!mount) return;
+    var gen = ++openGen;
+    fetch("/api/term/list")
+      .then(function (r) { return r.ok ? r.json().catch(function () { return {}; }) : {}; })
+      // The catch sits HERE, on the FETCH alone, not on the end of the chain: a route that is off
+      // (403), 404 on an older server, or unreachable must degrade to "nothing is running" and
+      // spawn exactly as before this check existed. Tailing it after the decision step instead
+      // would ALSO swallow a throw from _openVTFresh/peekTerm and then re-run _openVTFresh --
+      // spawning the second pty this whole function exists to prevent, and silently.
+      .catch(function () { return {}; })
+      .then(function (j) {
+        if (gen !== openGen) return;    // a newer open()/peek() already won
+        var terms = (j && j.terminals) || [];
+        for (var i = 0; i < terms.length; i++) {
+          if (terms[i].session === sid && terms[i].mode === mode) {
+            peekTerm(terms[i]);
+            return;
+          }
+        }
+        _openVTFresh(sid, mode, mount, gen);
+      });
+  }
+
+  function _openVTFresh(sid, mode, mount, gen) {
     if (!overlay) buildOverlay(mount);
     if (activeTerm) { activeTerm.destroy(); activeTerm = null; }
     if (activeBar) { activeBar.destroy(); activeBar = null; }
     activeTty = null;
     activeSid = sid;
     activeMode = mode;
-    var gen = ++openGen;             // this open's identity; see openGen's declaration above
 
     modalTitleEl.textContent = "TERMINAL — " + (mode === "resume" ? "resume · " : "") + sid;
     modalStatusEl.textContent = "connecting…";
