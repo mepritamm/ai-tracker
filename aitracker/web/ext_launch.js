@@ -107,16 +107,47 @@
     if (ncl) ncl.onclick = function () { openPicker("new"); };
     // Terminal domain logic stays in ext_vt.js -- this file only adds the button and calls the
     // module, exactly as the detail pane's "…here" buttons call window.ExtVT.open(cur, ...).
-    // Deliberately NOT decorated with a live count: nothing in app.js's existing 2s poll payload
-    // carries the number of running terminals, so a count on this button would mean a NEW fetch
-    // of the terminal-list route on every tick (and a 403 every 2s wherever the feature is off)
-    // purely for cosmetics. The panel's own header shows "N of <server max> running" instead.
     var mt = document.getElementById("sidemanagetermbtn");
     if (mt) mt.onclick = function () {
       if (window.ExtVT && window.ExtVT.manage) window.ExtVT.manage();
       else alert("in-browser terminal unavailable");
     };
+    renderTermBadge();   // the button was just rebuilt -- paint whatever count app.js already has
   }
+
+  // ===== live-terminal count badge on "☰ Manage terminals" ================================
+  // Rides app.js's EXISTING sidebar poll (loadSide -> SIDE_EXT) instead of a second timer: no
+  // new fetch of the terminal-list route on a tick, and no 403 spam wherever the feature is off.
+  // The count itself comes from the server -- app.js only carries the number it read off
+  // /api/list's X-Term-Count header (null when the server omitted it), this file never
+  // re-derives or hardcodes it (conventions rule 5). `termCount` is app.js's global; see its
+  // declaration there. (Terminal-list itself stays owned by ext_vt.js's own manager panel --
+  // this file must never call that route directly; see the "reimplementing it" guard test.)
+  //
+  // null (feature off, or gated off without TRACKER_AUTH) -> no badge at all, not "0" -- the
+  // server already decided the count is meaningless here, so showing a chip would imply a
+  // working "Manage terminals" panel that will just 403 on click. 0 -> a badge reading "0"
+  // (dim/neutral), the honest "feature's on, nothing running" state. >0 -> the same badge,
+  // highlighted, exactly like the sidebar's own "N live" chip.
+  function renderTermBadge() {
+    var mt = document.getElementById("sidemanagetermbtn");
+    if (!mt) return;
+    var badge = document.getElementById("sidetermbadge");
+    if (typeof termCount !== "number" || !isFinite(termCount)) {
+      if (badge) badge.remove();
+      return;
+    }
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "termcountbadge";
+      badge.id = "sidetermbadge";
+      mt.appendChild(badge);
+    }
+    badge.textContent = String(termCount);
+    badge.classList.toggle("live", termCount > 0);
+    badge.title = termCount + " terminal" + (termCount === 1 ? "" : "s") + " running now";
+  }
+  SIDE_EXT.push(renderTermBadge);
 
   // ===== the directory picker ==============================================================
   // Reuses app.css's .overlay/.modal/.mh/.mb/.x — the same classes ext_vt.js's own terminal

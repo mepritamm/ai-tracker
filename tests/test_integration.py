@@ -755,6 +755,181 @@ class TestServerEndToEnd(unittest.TestCase):
         self.assertIn("session", j["error"])
 
 
+class TestTermCountBadge(unittest.TestCase):
+    """The sidebar's "☰ Manage terminals" badge (aitracker/web/ext_launch.js) folds the live
+    terminal count into /api/list's response as an X-Term-Count header -- the same
+    header-not-body trick X-Server-Now uses (see test_liveness_clock.py and the comment at the
+    /api/list route + server._term_count() in aitracker/server.py), so the sidebar reads it off
+    the poll it already makes instead of a second timer hitting GET /api/term/list. Real HTTP,
+    real spawned PTYs -- not a stubbed count."""
+
+    def setUp(self):
+        self.snap = _snap()
+        _empty_env()
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, ""     # loopback + terminal on -> the count is live
+        self.srv = _server.Server(("127.0.0.1", 0), _server.Handler)
+        self.port = self.srv.server_address[1]
+        self.t = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.t.start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        _restore(self.snap)
+
+    def _headers(self, path):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", path)
+        r = c.getresponse()
+        r.read()
+        h = dict(r.getheaders())
+        c.close()
+        return h
+
+    def _post(self, path, payload):
+        body = json.dumps(payload).encode()
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("POST", path, body=body, headers={"Content-Type": "application/json", "Content-Length": str(len(body))})
+        r = c.getresponse()
+        resp = json.loads(r.read())
+        c.close()
+        return r.status, resp
+
+    def test_zero_when_nothing_running(self):
+        h = self._headers("/api/list")
+        self.assertEqual(h.get("X-Term-Count"), "0")
+
+    def test_count_reflects_real_live_terminals_and_excludes_finished(self):
+        from aitracker import term_vt
+        d1, d2 = tempfile.mkdtemp(), tempfile.mkdtemp()
+        st, j1 = self._post("/api/term/pty", {"cwd": d1, "cols": 40, "rows": 10, "mode": "cwd"})
+        self.assertEqual(st, 200)
+        st, j2 = self._post("/api/term/pty", {"cwd": d2, "cols": 40, "rows": 10, "mode": "cwd"})
+        self.assertEqual(st, 200)
+        try:
+            self.assertEqual(self._headers("/api/list").get("X-Term-Count"), "2")
+
+            pt1 = term_vt.PTYS.get(j1["tty"])
+            self.assertIsNotNone(pt1)
+            pt1.kill()
+            for _ in range(100):          # the reader thread marks .done asynchronously
+                if pt1.done:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(pt1.done, "the killed terminal never finished")
+
+            # the finished one no longer counts -- a bare "still 2" would mean _live_count()
+            # (or the reap it doesn't need) is being miscounted
+            self.assertEqual(self._headers("/api/list").get("X-Term-Count"), "1")
+        finally:
+            for j in (j1, j2):
+                pt = term_vt.PTYS.get(j["tty"])
+                if pt is not None and not pt.done:
+                    pt.kill()
+
+    def test_body_shape_is_unchanged_a_bare_array(self):
+        # the count rides the header, exactly like X-Server-Now -- /api/list's body must stay a
+        # bare array, not gain a sibling key (that would break every existing consumer/test).
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", "/api/list")
+        r = c.getresponse()
+        body = r.read()
+        c.close()
+        self.assertIsInstance(json.loads(body), list)
+
+    def test_header_omitted_when_terminal_disabled(self):
+        config.TERMINAL = False
+        h = self._headers("/api/list")
+        self.assertNotIn("X-Term-Count", h)
+
+
+class TestTermCountGating(unittest.TestCase):
+    """server._term_count()'s degrade-to-None branches, exercised directly rather than over full
+    HTTP (TestTermCountBadge above already proves the header round-trips) -- this is the branch
+    that will silently rot if nothing pins it: reachable beyond loopback with no TRACKER_AUTH
+    must degrade exactly like GET /api/term/list's own term_gate.guard() does, since a count
+    promising a working "Manage terminals" panel that then 403s on click would be worse than no
+    badge at all."""
+
+    def setUp(self):
+        self._terminal0 = config.TERMINAL
+        self._auth0 = config.AUTH
+        self._bind0 = config.BIND_HOST
+
+    def tearDown(self):
+        config.TERMINAL = self._terminal0
+        config.AUTH = self._auth0
+        config.BIND_HOST = self._bind0
+
+    def test_none_when_terminal_disabled(self):
+        config.TERMINAL = False
+        self.assertIsNone(_server._term_count())
+
+    def test_none_when_terminal_disabled_even_if_otherwise_allowed(self):
+        config.TERMINAL = False
+        config.BIND_HOST = "127.0.0.1"
+        config.AUTH = ""
+        self.assertIsNone(_server._term_count())
+
+    def test_none_when_reachable_beyond_loopback_without_auth(self):
+        config.TERMINAL = True
+        config.BIND_HOST = "0.0.0.0"
+        config.AUTH = ""
+        self.assertIsNone(_server._term_count())
+
+    def test_an_int_when_reachable_beyond_loopback_with_auth_configured(self):
+        config.TERMINAL = True
+        config.BIND_HOST = "0.0.0.0"
+        config.AUTH = "u:p"
+        self.assertIsInstance(_server._term_count(), int)
+
+    def test_an_int_on_the_default_loopback_config(self):
+        config.TERMINAL = True
+        config.BIND_HOST = "127.0.0.1"
+        config.AUTH = ""
+        self.assertIsInstance(_server._term_count(), int)
+
+    def test_count_acquires_the_module_lock(self):
+        # _term_count() reads term_vt.PTYS via term_vt._live_count(), which just iterates the
+        # dict -- and PTYS is mutated from other request threads by open_pty()/_reap()
+        # (ThreadingHTTPServer). term_vt's own discipline (see _live_list()'s docstring, "Call
+        # under _LOCK", and the pre-existing caller at term_vt.py ~2079-2081) says that read must
+        # happen under term_vt._LOCK. The actual race -- a RuntimeError from a dict resize
+        # mid-iteration -- isn't reliably reproducible under the GIL (a tight loop of concurrent
+        # mutators can run clean for a long time), so instead of chasing a flaky repro this pins
+        # the CONTRACT: swap in an instrumented lock standing in for term_vt._LOCK and assert
+        # _term_count() actually acquires it. Removing the `with term_vt._LOCK:` wrapper around
+        # the call makes this go red even though the underlying race stays silent.
+        from aitracker import term_vt
+        config.TERMINAL = True
+        config.BIND_HOST = "127.0.0.1"
+        config.AUTH = ""
+
+        real_lock = term_vt._LOCK
+        acquired = []
+
+        class _SpyLock:
+            def __enter__(self):
+                acquired.append(True)
+                return real_lock.__enter__()
+
+            def __exit__(self, *exc):
+                return real_lock.__exit__(*exc)
+
+        term_vt._LOCK = _SpyLock()
+        try:
+            result = _server._term_count()
+        finally:
+            term_vt._LOCK = real_lock
+
+        self.assertIsInstance(result, int)
+        self.assertTrue(acquired, "_term_count() must acquire term_vt._LOCK while reading PTYS "
+                                   "-- iterating the dict unlocked can raise RuntimeError under "
+                                   "a concurrent open_pty()/_reap() mutation")
+
+
 class TestBasicAuth(unittest.TestCase):
     """config.AUTH gates every route with HTTP Basic Auth; empty (default) lets all through."""
 
@@ -1461,6 +1636,10 @@ function loadFlags(){ __loadFlagsCalls++; }
 function render(d){ __renderCalls++; }
 function checkCompletions(d){ __checkCompletionsCalls++; }
 function esc(s){ return String(s); }
+var termCount = null;   // loadSide()'s X-Term-Count read target -- see app.js's own declaration
+var SIDE_EXT = [];      // loadSide() fires this after renderSide(); empty here, same as a page
+                         // with no terminal-feature module loaded -- the guard behaviour under
+                         // test doesn't depend on any hook actually being registered
 function $(id){ return { innerHTML: '', textContent: '' }; }
 
 var __fetchCalls = [];

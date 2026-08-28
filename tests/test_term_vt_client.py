@@ -727,29 +727,37 @@ class TestServerNoticeAdvisory(unittest.TestCase):
     def test_notice_stored_as_active_module_variable(self):
         self.assertIn("activeNotice = null", self.js)  # part of comma-separated variable declaration
 
-    def test_notice_element_created_in_buildoverlay(self):
-        self.assertIn("modalNoticeEl = document.createElement", self.js)
+    def test_notice_banner_created_by_the_mount_in_buildoverlay(self):
+        """The modal MOUNT owns the banner stack, built once against its own flex column, so it
+        survives every renderer switch inside it (the terminals are rebuilt, the mount is not)."""
+        self.assertIn("modalNotices = createNoticeBanner(modalBodyEl);", self.js)
 
     def test_notice_extracted_from_response_defensively(self):
         # activeNotice gets the string if notice is present, or null otherwise
         self.assertIn('activeNotice = (typeof res.j.notice === "string") ? res.j.notice : null;', self.js)
 
-    def test_notice_text_is_escaped_not_inserted_raw_html(self):
-        body = _body_until(self.js, "if (activeNotice) {", ["} else if (modalNoticeEl"])
-        # textContent property escapes; innerHTML with pre-created elements is safe
-        self.assertIn("noticeText.textContent = activeNotice", body)
-        self.assertNotIn("noticeText.innerHTML = activeNotice", body)
+    def test_open_time_notice_goes_through_the_shared_banner_helper(self):
+        """No second copy of the build-a-.vtnotice-div logic here any more -- the open-time
+        advisory is just a seq-less entry in the same stack every streamed notice lands in.
+        Escaping is proven by execution, not by grep: see tests/test_term_vt_exec.py's
+        TestNoticeBannerSharedPolicy.test_text_is_escaped_via_textContent_never_parsed_as_html."""
+        body = _body_until(self.js, "function openVT(", ["function closeVT()"])
+        self.assertIn("if (activeNotice) modalNotices.show({ text: activeNotice });", body)
+        self.assertNotIn("modalNoticeEl", self.js,
+                          "the modal's private notice element is gone -- one shared helper now")
 
-    def test_notice_renders_nothing_when_null(self):
-        # When activeNotice is null/falsy, the else clause removes the notice element from DOM
-        self.assertIn("} else if (modalNoticeEl && modalNoticeEl.parentNode) {", self.js)
-        self.assertIn("modalNoticeEl.parentNode.removeChild(modalNoticeEl);", self.js)
+    def test_notice_stack_is_cleared_for_each_newly_opened_pty(self):
+        """A new pty restarts its notice `seq` at 1, so the mount must reset the dedupe high-water
+        mark as well as the DOM -- otherwise the new pty's first notices would be swallowed as
+        replays. Executed proof of the reset itself:
+        TestNoticeBannerSharedPolicy.test_clear_removes_the_banners_and_resets_the_seq_tracker."""
+        body = _body_until(self.js, "function openVT(", ["function closeVT()"])
+        self.assertIn("if (modalNotices) modalNotices.clear();", body)
 
     def test_notice_removed_on_close(self):
         body = _body_until(self.js, "function closeVT()", ["function openNewTab"])
         self.assertIn("activeNotice = null;", body)
-        self.assertIn("if (modalNoticeEl && modalNoticeEl.parentNode)", body)
-        self.assertIn("modalNoticeEl.parentNode.removeChild(modalNoticeEl);", body)
+        self.assertIn("if (modalNotices) modalNotices.clear();", body)
 
     def test_notice_passed_to_standalone_view_in_url(self):
         self.assertIn('(activeNotice ? "&notice=" + encodeURIComponent(activeNotice) : "")', self.js)
@@ -758,11 +766,12 @@ class TestServerNoticeAdvisory(unittest.TestCase):
         body = _body_until(self.js, "function bootStandalone", ["})();\n})();"])
         self.assertIn('var standaloneNotice = qs.get("notice") || null;', body)
 
-    def test_standalone_displays_notice_element(self):
+    def test_standalone_displays_notice_through_the_same_shared_helper(self):
+        """The third of the three collapsed copies. The standalone tab builds its own banner stack
+        against `mount` and shows the ?notice= advisory as its first, seq-less entry."""
         body = _body_until(self.js, "function bootStandalone", ["})();\n})();"])
-        self.assertIn('if (standaloneNotice) {', body)
-        self.assertIn('noticeEl.className = "vtnotice"', body)
-        self.assertIn("noticeText.textContent = standaloneNotice", body)
+        self.assertIn("curNotices = createNoticeBanner(mount);", body)
+        self.assertIn("if (standaloneNotice) curNotices.show({ text: standaloneNotice });", body)
 
     def test_notice_css_class_exists_and_is_muted_not_error(self):
         self.assertIn(".vtnotice {", self.css)
@@ -799,81 +808,93 @@ class TestForkedAndNoticeResponsiveness(unittest.TestCase):
         self.assertIn("font-family: 'JetBrains Mono', monospace;", self.css)
 
 
-class TestAsyncNoticesFromScreenFrame(unittest.TestCase):
-    """POST /api/term/screen (SSE) now carries async notices in each frame. The client must:
-    - Consume and dedupe by seq
-    - Render multiple notices (capped at 3)
-    - Escape text safely
-    - Handle missing/malformed notices defensively
-    - Reset state when terminal changes"""
+class TestAsyncNoticesReachBothRenderers(unittest.TestCase):
+    """Async notices used to be a GRID-ONLY capability (conventions rule 4 broken): the xterm
+    renderer -- the DEFAULT -- drew no banner at all, and its own header comment said so. Both
+    renderers now forward the SAME {seq, text} object up through `term._onNotice`, and ONE
+    mount-owned helper (`createNoticeBanner`) draws it.
+
+    This class pins the SEAM -- who calls whom. The BEHAVIOUR (dedupe by seq, the 3-banner cap,
+    escaping, insertion position, listener teardown) is pinned by EXECUTED tests in
+    tests/test_term_vt_exec.py: TestNoticeBannerXtermPath / TestNoticeBannerGridPath /
+    TestNoticeBannerSharedPolicy. The source-text assertions that used to stand in for those are
+    deliberately gone -- every one of them was green the whole time the DEFAULT renderer showed no
+    banner at all, which is exactly the class of defect a grep cannot see."""
 
     def setUp(self):
         self.js = _read("ext_vt.js")
 
-    def test_terminal_constructor_initializes_notice_tracking(self):
-        # Terminal must set up _noticeHighestSeq and _noticeEls on construction
-        body = _function_body(self.js, "function Terminal(container, ttyId) {")
-        self.assertIn("this._noticeHighestSeq = -1;", body)
-        self.assertIn("this._noticeEls = [];", body)
+    def test_the_shared_helper_exists_at_module_scope(self):
+        """Module scope, not on either renderer's prototype -- that is what lets the MOUNT own it
+        and both renderers inherit it."""
+        self.assertIn("function createNoticeBanner(container) {", self.js)
+        self.assertIn("var NOTICE_MAX = 3;", self.js)
 
-    def test_applyPatch_processes_notices_array_defensively(self):
-        # _applyPatch must read notices array only if it's an Array
+    def test_the_three_old_copies_are_gone(self):
+        """The whole point of the collapse: exactly ONE place in this file may build a .vtnotice
+        element (it used to be three -- _displayNotice, openVT's open-time block, bootStandalone's
+        ?notice= block)."""
+        self.assertNotIn("Terminal.prototype._displayNotice", self.js)
+        self.assertNotIn("this._noticeEls", self.js)
+        self.assertNotIn("this._noticeHighestSeq", self.js)
+        self.assertEqual(self.js.count('className = "vtnotice"'), 1,
+                          "exactly one place may build a .vtnotice element")
+
+    def test_both_renderers_declare_the_notice_callback(self):
+        """Same shape and same precedent as `_onStatusChange`, which both renderers already fire
+        and both mounts already render."""
+        grid = _function_body(self.js, "function Terminal(container, ttyId) {")
+        self.assertIn("this._onNotice = null;", grid)
+        xterm = _body_until(self.js, "function XtermTerminal(container, ttyId",
+                             ["XtermTerminal.prototype.attach"])
+        self.assertIn("this._onNotice = null;", xterm)
+
+    def test_grid_forwards_its_json_frame_notices_up_to_the_mount(self):
         body = _function_body(self.js, "Terminal.prototype._applyPatch = function")
-        self.assertIn("Array.isArray(notices)", body)
+        self.assertIn("Array.isArray(notices)", body)       # the defensive read is unchanged
+        self.assertIn("this._onNotice(notices[k])", body)
+        # The dedupe moved OUT of the renderer -- no second implementation may live here.
+        self.assertNotIn("_noticeHighestSeq", body)
 
-    def test_applyPatch_extracts_seq_and_text_from_each_notice(self):
-        body = _function_body(self.js, "Terminal.prototype._applyPatch = function")
-        # Must extract seq as number and text as string
-        self.assertIn('typeof notice.seq === "number"', body)
-        self.assertIn('typeof notice.text === "string"', body)
+    def test_xterm_subscribes_to_the_streams_named_notice_event(self):
+        """It MUST be a named-event listener: `onmessage` runs every UNNAMED frame through
+        _b64ToBytes and writes the result into xterm.js as terminal bytes."""
+        body = _body_until(self.js, "XtermTerminal.prototype._openStream = function",
+                            ["XtermTerminal.prototype._closeStream"])
+        self.assertIn('self.es.addEventListener("notice", self._onNoticeEvent);', body)
+        self.assertIn("JSON.parse(ev.data)", body)
+        self.assertIn("self._onNotice(n)", body)
 
-    def test_applyPatch_dedupes_by_seq(self):
-        # Only display notices with seq > _noticeHighestSeq; update high water mark
-        body = _function_body(self.js, "Terminal.prototype._applyPatch = function")
-        self.assertIn("seq > this._noticeHighestSeq", body)
-        self.assertIn("this._noticeHighestSeq = seq", body)
+    def test_xterm_teardown_removes_the_notice_listener(self):
+        body = _body_until(self.js, "XtermTerminal.prototype._closeStream = function",
+                            ["XtermTerminal.prototype.measureAndResize"])
+        self.assertIn('this.es.removeEventListener("notice", this._onNoticeEvent);', body)
+        self.assertIn("this.es.close();", body)
+        destroy = _body_until(self.js, "XtermTerminal.prototype.destroy = function",
+                               ["// ===== the modal"])
+        self.assertIn("this._closeStream();", destroy)
 
-    def test_applyPatch_calls_displayNotice_for_new_notices(self):
-        body = _function_body(self.js, "Terminal.prototype._applyPatch = function")
-        self.assertIn("this._displayNotice(text)", body)
+    def test_both_mounts_wire_the_callback_into_their_own_banner(self):
+        """Modal (_wireModalTerm, shared by the initial build AND switchActiveRenderer) and
+        standalone (mountRenderer, likewise) -- neither may be left out, or that mount would
+        silently drop notices for whichever renderer it built."""
+        modal = _body_until(self.js, "function _wireModalTerm(term) {",
+                             ["function switchActiveRenderer"])
+        self.assertIn("term._onNotice = function (n) {", modal)
+        self.assertIn("if (modalNotices && modalNotices.show(n)) term.measureAndResize();", modal)
+        standalone = _body_until(self.js, "function mountRenderer(renderer) {",
+                                  ["function boot(renderer)"])
+        self.assertIn("term._onNotice = function (n) {", standalone)
+        self.assertIn("if (curNotices && curNotices.show(n)) term.measureAndResize();", standalone)
 
-    def test_displayNotice_method_exists(self):
-        self.assertIn("Terminal.prototype._displayNotice = function", self.js)
-
-    def test_displayNotice_creates_vtnotice_div(self):
-        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
-        self.assertIn('el.className = "vtnotice"', body)
-
-    def test_displayNotice_escapes_text_via_textContent(self):
-        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
-        self.assertIn("span.textContent = text;", body)
-        self.assertNotIn("span.innerHTML = text;", body)
-
-    def test_displayNotice_inserts_as_sibling_before_pane(self):
-        # Notices are now inserted as siblings BEFORE the pane (not as children of it) to avoid
-        # consuming the pane's vertical space and clipping rows. The insertion uses
-        # pane.parentNode.insertBefore(el, pane), placing notices in the same flex container.
-        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
-        self.assertIn("this.pane.parentNode.insertBefore(el, this.pane)", body)
-
-    def test_displayNotice_tracks_elements_in_noticeEls_array(self):
-        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
-        self.assertIn("this._noticeEls.push(el);", body)
-
-    def test_displayNotice_caps_stacked_notices_at_3(self):
-        # When 4th notice arrives, oldest is removed
-        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
-        self.assertIn("var maxNotices = 3", body)
-        self.assertIn("while (this._noticeEls.length > maxNotices)", body)
-        self.assertIn("this._noticeEls.shift()", body)
-
-    def test_destroy_cleans_up_async_notices(self):
-        # When terminal is destroyed, remove all async notice DOM elements and reset state
-        body = _function_body(self.js, "Terminal.prototype.destroy = function")
-        self.assertIn("this._noticeEls = [];", body)
-        self.assertIn("this._noticeHighestSeq = -1;", body)
-        # Check that it removes elements from DOM
-        self.assertIn("el.parentNode.removeChild(el)", body)
+    def test_xterm_known_gaps_no_longer_claims_notices_are_missing(self):
+        """The class header listed mid-session notices as a PARKED gap. Leaving that in place would
+        send the next reader hunting for a hole that no longer exists."""
+        header = _body_until(self.js, "//   - NO repaint of a PTY's pre-existing screen content",
+                              ["var _xtermAssetsPromise = null;"])
+        self.assertIn("MID-SESSION SERVER NOTICES", header)
+        self.assertIn("CLOSED -- no longer a gap", header)
+        self.assertNotIn("PARKED, deliberately", header)
 
     def test_sync_notice_path_still_works(self):
         # The synchronous notice from POST /api/term/pty response (activeNotice) must still render
@@ -881,32 +902,52 @@ class TestAsyncNoticesFromScreenFrame(unittest.TestCase):
         self.assertIn("activeNotice = (typeof res.j.notice === \"string\") ? res.j.notice : null;", self.js)
 
 
-class TestAsyncNoticesMovedOutOfPane(unittest.TestCase):
-    """Layout defect fix: notices used to be inserted as children of .vtpane, consuming its
-    vertical space and clipping rows. They are now siblings of .vtpane, and measureAndResize()
-    is called whenever the notice list changes to renegotiate the row count."""
+class TestNoticeBannerLayoutContract(unittest.TestCase):
+    """The banner sits OUTSIDE the pane so it never consumes the pane's rows. It moved one level
+    further out this round -- from `.vttermwrap` (inserted before `.vtpane`) to the mount's own
+    flex column (`.mb.vtmb` / `#ext_vt.vtfull`) -- which is a change of CONTAINER, not of kind, and
+    needs no CSS change: `.vtnotice` is already `flex: 0 0 auto` and both containers are already
+    flex columns. These pin exactly that."""
 
     def setUp(self):
         self.js = _read("ext_vt.js")
 
-    def test_notices_inserted_as_pane_siblings_not_pane_children(self):
-        # The key fix: use pane.parentNode.insertBefore(el, pane) not rowsEl.parentNode.insertBefore
-        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
-        self.assertIn("this.pane.parentNode.insertBefore(el, this.pane)", body)
-        # Old code path must be gone entirely
-        self.assertNotIn("rowsEl.parentNode.insertBefore(el, rowsEl)", body)
+    def test_banner_is_never_inserted_into_the_pane(self):
+        body = _body_until(self.js, "function createNoticeBanner(container) {",
+                            ["// ===== shared zoom toolbar"])
+        self.assertIn("container.insertBefore(el, last ? last.nextSibling : container.firstChild);",
+                       body)
+        self.assertNotIn("pane", body,
+                          "the banner must know nothing about either renderer's pane any more")
 
-    def test_displayNotice_calls_measureAndResize_after_adding(self):
-        # After adding a notice, the pane's available height has decreased (notices consume space
-        # in the flex container). measureAndResize() recalculates cols/rows for the new pane height.
-        body = _function_body(self.js, "Terminal.prototype._displayNotice = function")
-        self.assertIn("this.measureAndResize()", body)
-
-    def test_destroy_calls_measureAndResize_if_notices_were_shown(self):
-        # When the terminal is destroyed and notices exist, removing them frees up space in the
-        # container. Though the terminal itself is going away, the resize ensures consistency.
+    def test_grid_destroy_no_longer_tears_down_banners(self):
+        """BEHAVIOUR CHANGE, pinned deliberately: destroy() used to drop the banner elements AND
+        the seq tracker, so a renderer switch re-flashed every notice. The mount owns both now, and
+        a switch does not touch the mount -- so standing banners survive it. Executed proof:
+        TestNoticeBannerSharedPolicy.test_banners_survive_a_renderer_switch_without_reflashing."""
         body = _function_body(self.js, "Terminal.prototype.destroy = function")
-        self.assertIn("measureAndResize()", body)
+        self.assertNotIn("_noticeEls", body)
+        self.assertNotIn("_noticeHighestSeq", body)
+
+    def test_a_new_banner_makes_the_terminal_renegotiate_its_rows(self):
+        """show() returns true only when the DOM actually changed, and the mounts turn that into
+        one measureAndResize(). observePane's ResizeObserver covers this too, but it is a no-op
+        when window.ResizeObserver is absent -- so the explicit call is the fallback, not a
+        duplicate. Executed proof of the count: TestNoticeBannerXtermPath's `resizes` assertion."""
+        body = _body_until(self.js, "function createNoticeBanner(container) {",
+                            ["// ===== shared zoom toolbar"])
+        self.assertIn("return true;", body)
+        self.assertIn("return false;", body)
+
+    def test_both_mount_containers_are_flex_columns(self):
+        """The move relies on this and nothing else -- `.vtnotice`'s own `flex: 0 0 auto` is
+        asserted by test_notice_css_is_flex_container_item below."""
+        css = _read("ext_vt.css")
+        self.assertIn(".vtmodal .mb.vtmb { padding: 0; display: flex; flex-direction: column;", css)
+        full_start = css.index("#ext_vt.vtfull {")
+        full_block = css[full_start:css.index("}", full_start)]
+        self.assertIn("display: flex;", full_block)
+        self.assertIn("flex-direction: column;", full_block)
 
     def test_notice_css_is_flex_container_item(self):
         # .vtnotice must be `flex: 0 0 auto` so it doesn't consume the pane's shrinking space
@@ -2112,7 +2153,7 @@ def _iter_top_level_rules(block):
 class TestMountPointParity(unittest.TestCase):
     """Structural guard against the ext_vt.{js,css} bug this file's header brief opens with: FOUR
     past bugs where a control/behaviour landed in the MODAL (openVT/switchActiveRenderer, plus the
-    buildOverlay/_wireModalStatus helpers they share) but not the STANDALONE full-tab mount
+    buildOverlay/_wireModalTerm helpers they share) but not the STANDALONE full-tab mount
     (bootStandalone/mountRenderer), or vice versa -- caught only by adversarial review, never by a
     test, because every existing "both mounts" test asserts a PAIR of independently-worded
     one-sided literals (`activeTerm` vs `curTerm`, `modalStatusEl` vs `statusEl`, ...) against each
@@ -2141,7 +2182,7 @@ class TestMountPointParity(unittest.TestCase):
         # (an artifact of file layout, not a real duplication) and silently invalidate the
         # not-duplicated assertion in test_shared_once_helpers_are_not_reimplemented_per_mount.
         build_overlay = _body_until(js, "function buildOverlay", ["function _matchLadderModel"])
-        wire_status = _body_until(js, "function _wireModalStatus", ["function switchActiveRenderer"])
+        wire_status = _body_until(js, "function _wireModalTerm", ["function switchActiveRenderer"])
         switch = _body_until(js, "function switchActiveRenderer", ["function openVT"])
         modal = _body_until(js, "function openVT(sid, mode)", ["function closeVT"])
         standalone = _body_until(js, "function bootStandalone", ["})();\n})();"])
@@ -2156,7 +2197,7 @@ class TestMountPointParity(unittest.TestCase):
         # built from), just large enough that a near-empty slice trips them.
         build_overlay, wire_status, switch, modal, standalone = self._slices()
         self.assertGreater(len(build_overlay), 500, "buildOverlay slice looks truncated")
-        self.assertGreater(len(wire_status), 200, "_wireModalStatus slice looks truncated")
+        self.assertGreater(len(wire_status), 200, "_wireModalTerm slice looks truncated")
         self.assertGreater(len(switch), 200, "switchActiveRenderer slice looks truncated")
         self.assertGreater(len(modal), 2000, "openVT slice looks truncated")
         self.assertGreater(len(standalone), 2000, "bootStandalone slice looks truncated")
@@ -2169,7 +2210,7 @@ class TestMountPointParity(unittest.TestCase):
 
     def test_shared_capability_markers_present_in_both_mount_points(self):
         """For each marker below, assert it appears BOTH in the modal-side code (buildOverlay +
-        _wireModalStatus + switchActiveRenderer + openVT) AND in the standalone tab's code
+        _wireModalTerm + switchActiveRenderer + openVT) AND in the standalone tab's code
         (bootStandalone/mountRenderer/renderStandaloneStatus/boot). A control shipped to one mount
         only fails this immediately, unlike the existing PAIR-style tests described in the class
         docstring. Every marker was verified present at a specific line on both sides against the
@@ -2182,18 +2223,26 @@ class TestMountPointParity(unittest.TestCase):
         table = [
             # ContextBar (the model/effort switcher + token readout footer) built by both mounts.
             ("new ContextBar(", "openVT L2582 / mountRenderer L2769"),
-            # the advisory-notice element's class -- bug: "the notice placement" (header brief #4).
-            ("vtnotice", "openVT L2529 / boot() L2796"),
+            # The advisory-notice banner -- bug: "the notice placement" (header brief #4). Anchored
+            # to the SHARED helper each mount builds its own stack from, not to the `vtnotice` class
+            # literal it used to be: that literal now occurs exactly once in the whole file (inside
+            # createNoticeBanner), which is the same shape as `new ContextBar(` above -- one shared
+            # definition, one construction per mount -- and is what closing the xterm-renderer
+            # notice gap actually consisted of.
+            ("createNoticeBanner(", "buildOverlay L1990 / boot() L3273"),
+            # the notice callback hook each mount wires onto its Terminal/XtermTerminal instance,
+            # the exact counterpart of _onStatusChange below.
+            ("_onNotice", "_wireModalTerm L2589 / mountRenderer L3196"),
             # the terminal's dedicated wrap class, kept separate from the notice/status/bar chrome.
             ("vttermwrap", "openVT L2553 / boot() L2809"),
             # the status callback hook each mount wires onto its Terminal/XtermTerminal instance.
-            ("_onStatusChange", "_wireModalStatus L2411 / mountRenderer L2772"),
+            ("_onStatusChange", "_wireModalTerm L2411 / mountRenderer L2772"),
             # the call that actually opens the SSE stream, on both the initial build and a switch.
             ("term.attach()", "switchActiveRenderer L2449 / openVT L2584 / mountRenderer L2782"),
             # the resume-refusal status guard -- bug: header brief #4's "status guard" existed on
             # one side only. Both sides must suppress connecting/reconnecting churn identically
             # while a mode="resume" pane is still coming up.
-            ("if (term.starting)", "_wireModalStatus L2418 / mountRenderer L2779"),
+            ("if (term.starting)", "_wireModalTerm L2418 / mountRenderer L2779"),
             # the fork chip's accessible name -- bug: header brief #4's "fork-chip aria-label"
             # existed on one side only. Anchored to the `aria-label` attribute NAME, not just the
             # tooltip text: both sides also set an identical `title` attribute (the hover tooltip),
@@ -2206,7 +2255,7 @@ class TestMountPointParity(unittest.TestCase):
         ]
         for marker, where in table:
             self.assertIn(marker, modal_side,
-                           "modal-side code (buildOverlay/_wireModalStatus/switchActiveRenderer/"
+                           "modal-side code (buildOverlay/_wireModalTerm/switchActiveRenderer/"
                            "openVT) is missing %r -- expected at %s" % (marker, where))
             self.assertIn(marker, standalone,
                            "standalone code (bootStandalone/mountRenderer/renderStandaloneStatus) "
@@ -2557,6 +2606,188 @@ class TestTerminalManagerPanel(unittest.TestCase):
         for marker in ("sidemanagetermbtn", "window.ExtVT.manage()", "buildTermRow",
                        "/api/term/list", ".vtmgrfoot", "vtmgrmodal"):
             self.assertIn(marker, page)
+
+
+class TestTerminalRowShowsSessionIdentity(unittest.TestCase):
+    """The gap: the user's screenshot showed three "claude --resume <uuid>" rows rendering
+    character-for-character identical -- same command, same leading-truncated cwd -- because the
+    row never showed the uuid in full and nothing else told them apart. `t.session` (term_vt's
+    `_live_list()` contract: always present, "" for a plain shell -- never undefined) is now
+    resolved to a human title instead of staying a bare id, and the cwd shows its trailing
+    (project-naming) segment instead of the leading one every terminal shares."""
+
+    def setUp(self):
+        self.js = _read("ext_vt.js")
+        self.css = _read("ext_vt.css")
+        self.row = _body_until(self.js, "function buildTermRow(", ["function renderCapBlock("])
+
+    def test_resolves_against_the_sidebar_session_list_already_in_memory(self):
+        """No new fetch, no new server route -- reads the exact `sessions` array app.js already
+        polls every 2s and holds client-side (app.js:692 `let sessions=[]`, populated at
+        app.js:866 `sessions=await res.json()`). Guarded defensively (`typeof sessions !==
+        "undefined"`), matching this file's existing style for reading state app.js owns."""
+        self.assertIn('typeof sessions !== "undefined"', self.row)
+        self.assertIn("list[i].id === t.session", self.row)
+        self.assertNotIn("fetch(", self.row)
+        for route in ("/api/session", "/api/sessions", "/api/term/session"):
+            self.assertNotIn(route, self.row)
+
+    def test_matched_session_prefers_title_then_project(self):
+        self.assertIn("hit.title || hit.project", self.row)
+
+    def test_unmatched_session_falls_back_to_the_apps_usual_short_id_not_the_raw_uuid(self):
+        """Matches the exact abbreviation app.js's own narration-jump helper already uses for
+        the identical id -> title -> short-id chain (app.js ~line 1067's
+        `id.slice(0,8)`) -- not a new format invented here."""
+        self.assertIn("t.session.slice(0, 8)", self.row)
+
+    def test_plain_shell_degrades_cleanly(self):
+        """`t.session === ""` is falsy, so the lookup is skipped entirely and the row falls
+        straight through to the pre-existing `(t.cmd || "shell")` branch -- never "undefined",
+        never a dangling separator where an identity would have gone."""
+        self.assertIn("if (t.session) {", self.row)
+        self.assertIn('identity || (t.cmd || "shell")', self.row)
+        # `identity` starts "" (falsy) and is only ever assigned inside the `if (t.session)`
+        # branch above -- there is no path that leaves it as the string "undefined".
+        self.assertIn('var identity = "";', self.row)
+
+    def test_identity_reaches_the_row_only_through_textcontent_and_the_title_property(self):
+        """Session titles are user-controlled (renameable via titles.json) and terminal cwd/cmd
+        come straight off the filesystem/argv -- none of it is trusted. `textContent` and the
+        `.title` PROPERTY (not `setAttribute` with a hand-built string, and never `innerHTML`)
+        never parse their argument as markup, so no escaping call can be missing here."""
+        self.assertIn("label.textContent = (identity ||", self.row)
+        self.assertIn("label.title = t.tty", self.row)
+        self.assertNotIn("innerHTML", self.row)
+
+    def test_cwd_shows_the_trailing_project_segment_not_the_shared_leading_one(self):
+        """Same formula as app.js's existing `base()` basename helper (split on "/", take the
+        last segment) -- computed inline rather than calling `base()` itself, because `base` is
+        not one of this file's documented always-present app.js globals (`cur`/`EXT`/`esc`/
+        `toast`, see the file's own header comment) the way `sessions` above is defensively
+        checked for. The untruncated path and the raw command aren't lost, just moved to the
+        tooltip."""
+        self.assertIn('(t.cwd || "").split("/").pop()', self.row)
+        self.assertIn('(t.cwd || "")', self.row)   # full path still lives in label.title
+
+    def test_cap_block_keeps_sharing_the_one_row_renderer(self):
+        """Regression guard for conventions rule 4: the fix must land once, on the shared row
+        builder buildTermRow(), so a cap-reached user -- picking which of several `--resume`
+        terminals to free a slot from is exactly when this confusion bites hardest -- gets the
+        same identity too, not just the manager panel."""
+        cap = _body_until(self.js, "function renderCapBlock(", ["function openVT("])
+        self.assertIn("buildTermRow(", cap)
+        self.assertEqual(self.js.count("buildTermRow("), 3,
+                         "buildTermRow should still be defined once and called from both the cap "
+                         "block and the manager panel")
+
+    def test_rows_stay_usable_on_phone_and_tablet(self):
+        """The identity text lands in the SAME single .vtcaplabel span the cap block's own pinned
+        phone/tablet test already covers (TestCapReclaimBlock.
+        test_reclaim_rows_are_usable_on_phone_and_tablet) -- no second element, no parallel CSS
+        rule introduced to keep in sync (conventions rule 4)."""
+        self.assertEqual(self.row.count('document.createElement("span")'), 1)
+        self.assertIn(".vtcaprow {", self.css)
+        self.assertIn("min-width: 0;", self.css)
+        self.assertIn("text-overflow: ellipsis;", self.css)
+        self.assertIn(".vtcapx {", self.css)
+        self.assertIn("min-height: 28px;", self.css)
+        self.assertIn("@media(max-width:600px)", self.css)
+
+    def test_reaches_the_served_page(self):
+        page = build_page()
+        self.assertIn("t.session.slice(0, 8)", page)
+        self.assertIn('(t.cwd || "").split("/").pop()', page)
+
+
+class TestBellFlashReachesBothRenderers(unittest.TestCase):
+    """The terminal bell used to reach the user on the grid renderer only -- xterm.js (now the
+    DEFAULT renderer) fires its own `onBell` event on a real BEL byte, but nothing in ext_vt.js
+    ever subscribed to it, so by default a BEL produced nothing visible at all. Fixed in ext_vt.js
+    by hoisting the pulse itself into ONE shared `_flashBellPane(pane)` helper both renderers call
+    (see that function's own header comment for why the two different TRIGGERS -- the grid's
+    server-owned `msg.bell` counter vs. xterm.js's client-side `onBell` -- don't make this two
+    competing implementations under conventions rule 4).
+
+    tests/test_term_vt_exec.py's TestXtermBellFlash/TestGridBellFlashRegression actually EXECUTE
+    this behaviour under Node; this class only pins what genuinely can't be executed there -- the
+    CSS rule existing and being selector-compatible with both panes, and the KNOWN GAPS comment no
+    longer claiming the gap this session closed."""
+
+    def setUp(self):
+        self.js = _read("ext_vt.js")
+        self.css = _read("ext_vt.css")
+
+    def test_vtbell_css_rule_and_keyframes_exist(self):
+        # Quoted verbatim -- this is the SAME rule both renderers' panes rely on; there is no
+        # second `.vtxpane`-scoped copy to keep in sync with it.
+        self.assertIn("@keyframes vtbellflash {", self.css)
+        self.assertIn(".vtpane.vtbell { animation: vtbellflash .18s ease-out; }", self.css)
+
+    def test_vtbell_rule_is_not_forked_per_renderer(self):
+        # A second, `.vtxpane`-scoped `@keyframes`/`.vtbell` rule would be exactly the duplicated-
+        # capability bug conventions rule 4 warns about -- only one of each may exist.
+        self.assertEqual(self.css.count("@keyframes vtbellflash"), 1)
+        self.assertEqual(self.css.count(".vtbell"), self.css.count(".vtpane.vtbell"),
+                          "every '.vtbell' occurrence in the CSS must be the shared "
+                          "'.vtpane.vtbell' selector -- no renderer-specific variant")
+
+    def test_xterm_pane_carries_the_plain_vtpane_class_the_css_rule_targets(self):
+        # `.vtpane.vtbell` (asserted above) only reaches XtermTerminal's pane because that pane's
+        # className ALSO includes the bare "vtpane" token -- confirmed here so the CSS rule and the
+        # DOM shape it depends on can't silently drift apart (e.g. a future className rename that
+        # drops "vtpane" would break the bell flash on xterm with no test noticing otherwise).
+        self.assertIn('pane.className = "vtpane vtxpane";', self.js)
+
+    def test_flash_bell_pane_is_the_one_shared_implementation(self):
+        # Exactly one DEFINITION, and exactly two CALL SITES (the grid's own _flashBell delegate,
+        # and XtermTerminal._build's onBell handler) -- a third call site or a second function
+        # doing the same `classList.add("vtbell")` + timeout dance would be the forked-capability
+        # regression this whole design avoids.
+        self.assertEqual(self.js.count("function _flashBellPane(pane) {"), 1)
+        self.assertEqual(self.js.count("_flashBellPane("), 3,
+                          "expected exactly 3 occurrences: the definition, Terminal.prototype."
+                          "_flashBell's delegate call, and XtermTerminal's onBell handler call")
+        self.assertIn("_flashBellPane(this.pane);", self.js,
+                       "the grid renderer's _flashBell must delegate to the shared helper, not "
+                       "keep its own inline classList.add/setTimeout copy")
+        self.assertIn("_flashBellPane(self.pane);", self.js,
+                       "XtermTerminal's onBell handler must call the SAME shared helper")
+
+    def test_xterm_subscribes_to_onbell_and_disposes_it_on_destroy(self):
+        # Source-level companion to test_term_vt_exec.py's executed leak test: pins that the
+        # subscription and its teardown both exist, at the two specific call sites, using the same
+        # store-then-dispose idiom this class's other listeners (_disposeThemeBtn, _onThemeChange,
+        # _disposePaneObserver) already use.
+        # NOT `_function_body`: `_build`'s own body contains a comment referencing
+        # "Terminal.prototype._onKeyDown" (a substring match for that helper's next-marker scan),
+        # which would truncate the extracted body before reaching the onBell wiring below it.
+        # `_body_until` takes an explicit end marker instead, sidestepping that false match.
+        build = _body_until(self.js, "XtermTerminal.prototype._build = function () {",
+                             ["XtermTerminal.prototype._doResize = function"])
+        self.assertIn("this._disposeBell = term.onBell(", build)
+        destroy = _function_body(self.js, "XtermTerminal.prototype.destroy = function")
+        self.assertIn(
+            'if (this._disposeBell) { this._disposeBell.dispose(); this._disposeBell = null; }',
+            destroy,
+        )
+
+    def test_known_gaps_comment_no_longer_claims_no_bell_flash(self):
+        # This bullet used to PARK the gap deliberately ("NO BELL FLASH ... PARKED for the same
+        # reason") -- it must be gone now that the capability is actually implemented, or the
+        # comment is actively lying about the code beneath it.
+        gaps_start = self.js.index("// KNOWN GAPS vs the grid (`Terminal`) renderer")
+        gaps_end = self.js.index("var _xtermAssetsPromise = null;", gaps_start)
+        gaps_block = self.js[gaps_start:gaps_end]
+        self.assertNotIn("NO BELL FLASH", gaps_block)
+        self.assertNotIn("PARKED for the same reason", gaps_block)
+
+    def test_reaches_the_served_page(self):
+        page = build_page()
+        self.assertIn("@keyframes vtbellflash {", page)
+        self.assertIn(".vtpane.vtbell { animation: vtbellflash .18s ease-out; }", page)
+        self.assertIn("function _flashBellPane(pane) {", page)
+        self.assertIn("this._disposeBell = term.onBell(", page)
 
 
 if __name__ == "__main__":

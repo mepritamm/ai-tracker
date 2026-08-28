@@ -391,6 +391,79 @@
     return function () { ro.disconnect(); };
   }
 
+  // ===== shared notice banner, owned by the MOUNT POINT (not by either renderer) ==============
+  // ONE implementation of "raise a .vtnotice banner above the terminal", replacing what used to be
+  // THREE near-copies of the same build-a-div-with-a-textContent-span logic: Terminal.prototype.
+  // _displayNotice (grid only), openVT's open-time `res.j.notice` block, and bootStandalone's
+  // `?notice=` block. Living at the mount means BOTH renderers inherit it (conventions rule 4):
+  // the grid Terminal forwards its JSON frame's `notices` array and XtermTerminal forwards
+  // /api/term/raw's named `event: notice` frames, through the SAME `term._onNotice` callback --
+  // mirroring the `term._onStatusChange` precedent both renderers already fire and both mounts
+  // already render.
+  //
+  // `container` is the mount's own flex COLUMN (.mb.vtmb in the modal, #ext_vt.vtfull in the
+  // standalone tab) -- one level further out than the old _displayNotice, which inserted before
+  // .vtpane inside .vttermwrap. No CSS change is needed for that move: .vtnotice is already
+  // `flex: 0 0 auto` (ext_vt.css) and both containers are already flex columns.
+  //
+  // Consequences of the mount owning this, both deliberate:
+  //   - The `seq` dedupe lives HERE, once, instead of once per renderer. A transport reconnect
+  //     (EventSource auto-retry) makes the server replay from seq 0 on both routes; `highestSeq`
+  //     is what stops an already-displayed banner being raised a second time.
+  //   - A RENDERER SWITCH no longer re-flashes the banners. destroy() used to drop both the
+  //     elements and the seq tracker, so the rebuilt renderer's first frame re-showed everything;
+  //     now the banners simply stay on screen, untouched, exactly like the ContextBar the two
+  //     switch paths deliberately re-wire rather than destroy.
+  //
+  // Insertion point: after the LAST banner already shown, else before `container.firstChild` --
+  // so banners stay in arrival order AND always sit above the .vttermwrap/.vtctxbar/.vtfullstatus
+  // siblings, whether they were raised before those existed (open time) or long after (streamed).
+  // `insertBefore(el, null)` is a plain append, which is the empty-container case.
+  //
+  // show() returns TRUE when the DOM actually changed, so the caller can hand the terminal one
+  // measureAndResize(). observePane()'s ResizeObserver already covers this (a banner shrinks the
+  // pane exactly like .vtctxbar appearing does), but it returns a no-op when window.ResizeObserver
+  // is absent -- so the explicit call is the belt to that braces.
+  var NOTICE_MAX = 3;   // cap on stacked banners, oldest evicted -- see _displayNotice's history
+  function createNoticeBanner(container) {
+    var els = [], highestSeq = -1;
+    return {
+      show: function (notice) {
+        var text = (notice && typeof notice.text === "string") ? notice.text : "";
+        if (!text) return false;
+        // A notice with no `seq` (the open-time advisory relayed on POST /api/term/pty's response
+        // or in the ?notice= link) is never deduped -- it has no position in the stream at all.
+        var seq = (notice && typeof notice.seq === "number") ? (notice.seq | 0) : null;
+        if (seq !== null) {
+          if (seq <= highestSeq) return false;
+          highestSeq = seq;
+        }
+        var el = document.createElement("div");
+        el.className = "vtnotice";
+        var span = document.createElement("span");
+        span.textContent = text;   // textContent escapes HTML -- notice text is server-supplied
+        el.appendChild(span);
+        var last = els.length ? els[els.length - 1] : null;
+        container.insertBefore(el, last ? last.nextSibling : container.firstChild);
+        els.push(el);
+        while (els.length > NOTICE_MAX) {
+          var oldest = els.shift();
+          if (oldest && oldest.parentNode) oldest.parentNode.removeChild(oldest);
+        }
+        return true;
+      },
+      // Resets the seq tracker too: clear() marks a NEW pty (openVT/closeVT), whose seqs restart
+      // at 1 -- never a renderer switch, which deliberately leaves both the banners and the
+      // tracker alone (see this helper's header).
+      clear: function () {
+        for (var i = 0; i < els.length; i++) {
+          if (els[i] && els[i].parentNode) els[i].parentNode.removeChild(els[i]);
+        }
+        els = []; highestSeq = -1;
+      }
+    };
+  }
+
   // ===== shared zoom toolbar: ITS OWN flex row, ABOVE the pane -- never an overlay on top of
   // terminal output. LAYOUT-BUG FIX (see ext_vt.css's .vttoolbar comment for the full story): the
   // A-/A+ controls used to be absolutely positioned inside .vtpane's top-right corner, overlapping
@@ -586,6 +659,11 @@
     this.padX = 0; this.padY = 0;          // .vtpane's real padding; filled by measureAndResize
     this._sized = false;
     this._onStatusChange = null;
+    // Fired once per {seq, text} notice read off this renderer's SSE frames; the MOUNT renders it
+    // (see createNoticeBanner above -- the dedupe, the 3-banner cap and the DOM all live there,
+    // shared with XtermTerminal, which fires the same callback off /api/term/raw's named `notice`
+    // event). Same shape/precedent as _onStatusChange just above.
+    this._onNotice = null;
     // Guards attach()'s deferred frame firing after a destroy(): attach() does its first measure
     // and opens the EventSource inside a requestAnimationFrame, so a closeVT()/renderer switch
     // landing in that gap used to run the callback ANYWAY -- opening a stream on an already-
@@ -645,9 +723,6 @@
     this.scrollTotal = 0;
     this.pendingNewOutput = false;
     this._scrollReqSeq = 0;
-    // ---- async notices streamed via SSE frames (server sends {seq, text} for each notice) ----
-    this._noticeHighestSeq = -1;           // tracks highest seq seen to dedup re-sent frames
-    this._noticeEls = [];                  // array of displayed notice <div> elements (stacked)
 
     container.innerHTML = "";
     var self = this;
@@ -861,20 +936,14 @@
     if (msg.cursor && msg.cursor.length === 2) {
       this.cursor = [msg.cursor[0] | 0, msg.cursor[1] | 0];
     }
-    // Async notices: process if present (server sends [{"seq": <int>, "text": "<str>"}, ...])
-    // Defensively handle missing/malformed notices (older server sends nothing, or key absent).
+    // Async notices: forwarded UP to the mount, which raises the banner (createNoticeBanner
+    // above). This renderer only reads them off its JSON frame -- the dedupe-by-seq, the 3-banner
+    // cap and the DOM are the mount's, shared with XtermTerminal, which forwards the identical
+    // {seq, text} objects off /api/term/raw's named `notice` event. `Array.isArray` stays the
+    // defensive read it always was: an older server sends nothing and the key is simply absent.
     var notices = msg.notices;
-    if (Array.isArray(notices)) {
-      for (var k = 0; k < notices.length; k++) {
-        var notice = notices[k];
-        var seq = (typeof notice.seq === "number") ? (notice.seq | 0) : -1;
-        var text = (typeof notice.text === "string") ? notice.text : "";
-        // Dedupe: skip if we've already seen this seq or higher
-        if (seq > this._noticeHighestSeq) {
-          this._noticeHighestSeq = seq;
-          this._displayNotice(text);
-        }
-      }
+    if (Array.isArray(notices) && this._onNotice) {
+      for (var k = 0; k < notices.length; k++) this._onNotice(notices[k]);
     }
     // The single most infuriating thing a terminal can do (requirement 1): while the user is
     // scrolled back into history, a live SSE diff must NEVER repaint the screen out from under
@@ -953,32 +1022,9 @@
       "translate(" + (this.padX + c * this.cellW) + "px," + (this.padY + r * this.cellH) + "px)";
   };
 
-  // Display an async notice streamed from the server. Maintains a stacked list of up to 3 notices
-  // to avoid filling the pane; older notices are removed when a 4th arrives. Text is escaped
-  // via textContent to prevent XSS. MOVED OUT OF THE PANE (inserted as siblings, not children)
-  // to prevent consuming the pane's vertical space and clipping rows. measureAndResize() is
-  // called whenever the notice list changes so the terminal renegotiates its row count.
-  Terminal.prototype._displayNotice = function (text) {
-    if (!text) return;
-    if (!this.pane || !this.pane.parentNode) return;   // guard: terminal destroyed or pane not ready
-    var maxNotices = 3;   // cap on displayed notices to prevent flooding the pane
-    // Create a new notice element
-    var el = document.createElement("div");
-    el.className = "vtnotice";
-    var span = document.createElement("span");
-    span.textContent = text;   // textContent escapes HTML
-    el.appendChild(span);
-    // Add to the DOM as a sibling BEFORE .vtpane (outside the pane, not a child of it)
-    this.pane.parentNode.insertBefore(el, this.pane);
-    this._noticeEls.push(el);
-    // Remove oldest notices if we exceed the cap
-    while (this._noticeEls.length > maxNotices) {
-      var oldest = this._noticeEls.shift();
-      if (oldest && oldest.parentNode) oldest.parentNode.removeChild(oldest);
-    }
-    // Renegotiate rows because the pane is now shorter (notices consume space in the container)
-    this.measureAndResize();
-  };
+  // The grid renderer's private `_displayNotice` used to live here -- it is now `createNoticeBanner`
+  // (above, module level), owned by the MOUNT so XtermTerminal inherits it too. See that helper's
+  // header for the seq dedupe, the 3-banner cap and the renderer-switch consequence.
 
   // Copy/paste/zoom are page-level UI actions, not terminal input -- they are intercepted here,
   // BEFORE the generic "any key returns to the live view" rule below, and each returns early
@@ -1217,16 +1263,10 @@
     // listener, so it leaks past this terminal's own DOM teardown unless explicitly removed here
     // (same pattern as ContextBar's own `_onDocClick`, below).
     if (this._onDocMouseUp) { document.removeEventListener("mouseup", this._onDocMouseUp); this._onDocMouseUp = null; }
-    // Clean up any displayed notices and reset the sequence tracker
-    var hadNotices = this._noticeEls.length > 0;
-    for (var i = 0; i < this._noticeEls.length; i++) {
-      var el = this._noticeEls[i];
-      if (el && el.parentNode) el.parentNode.removeChild(el);
-    }
-    this._noticeEls = [];
-    this._noticeHighestSeq = -1;
-    // Renegotiate rows if notices were removed (the pane will expand to fill the space)
-    if (hadNotices) this.measureAndResize();
+    // Notice banners are deliberately NOT torn down here any more: they belong to the MOUNT
+    // (createNoticeBanner above), which clears them when the pty itself goes away (closeVT /
+    // openVT) -- NOT when one renderer is swapped for the other against the same live pty. See
+    // that helper's header for why surviving the switch is the right behaviour.
   };
   // Generic focus entry point shared with XtermTerminal (see that class's own .focus) -- so
   // ContextBar's getInput() callback can hand back the TERMINAL object itself, one interface for
@@ -1498,10 +1538,32 @@
   };
 
   // ===== bell: a brief visual flash, no audio (requirement 3) ==========================
+  // ONE shared implementation for BOTH renderers (conventions rule 4): the capability is "flash
+  // the pane when the terminal rings", and the visual half of that -- toggle `.vtbell`, let the
+  // existing @keyframes vtbellflash rule (ext_vt.css) do the pulse -- is identical regardless of
+  // which renderer is asking. Only the TRIGGER differs, and it has to: the grid Terminal below
+  // derives it from the SSE snapshot's server-owned `msg.bell` counter (`_applyPatch`, further
+  // down), because its screen is parsed server-side and has no BEL byte of its own to observe;
+  // XtermTerminal derives it from xterm.js's own `onBell` event (see that class's `_build`),
+  // because it never sees a parsed snapshot at all, only the raw byte stream xterm.js consumes
+  // itself. Neither renderer could use the other's trigger, so this is one function fed by two
+  // sources, not two competing implementations of the flash itself. `.vtbell` (ext_vt.css) is
+  // scoped to the bare `.vtpane` class, which both renderers' panes carry (grid: "vtpane";
+  // XtermTerminal: "vtpane vtxpane") -- so no CSS change was needed to reach the xterm pane too.
+  //
+  // Burst safety: re-adding a class the element already has is a DOM no-op and does not restart
+  // a running CSS animation, so a program spamming BEL never stacks overlapping `vtbellflash`
+  // animations -- there is only ever the one `.vtbell` class, present or absent. Each call's own
+  // setTimeout independently tries to remove it 180ms after THAT call; removing an already-absent
+  // class is equally a no-op, so whichever timeout fires last is simply the one that clears it.
+  function _flashBellPane(pane) {
+    if (!pane) return;
+    pane.classList.add("vtbell");
+    setTimeout(function () { pane.classList.remove("vtbell"); }, 180);
+  }
+
   Terminal.prototype._flashBell = function () {
-    var self = this;
-    this.pane.classList.add("vtbell");
-    setTimeout(function () { self.pane.classList.remove("vtbell"); }, 180);
+    _flashBellPane(this.pane);
   };
 
   // ===== font size: a small in-pane control, or Ctrl/Cmd +/- (requirement 3) ===========
@@ -1553,24 +1615,15 @@
   //   - The zoom control changes xterm's `fontSize` option + re-fits; xterm.js's internal row
   //     metrics are not pixel-identical to the grid painter's CSS line-height, so the two panes'
   //     exact row count at the "same" zoom step can differ by one row.
-  //   - MID-SESSION SERVER NOTICES arrive only as INLINE TERMINAL TEXT, never as the styled
-  //     `.vtnotice` banner the grid renderer raises. `/api/term/raw` has no JSON envelope, so
-  //     the SSE frame's `notices` key (which `Terminal._applyPatch` turns into a banner via
-  //     `_displayNotice`) has no channel to reach this renderer. It is NOT invisible, though:
-  //     term_vt.py's `_feed_note()` also tees the same text through `_tee_raw()`, so the words
-  //     do land in the xterm.js buffer as an ordinary "[ai-tracker] note: …" line -- including
-  //     the refused-resume advisory. Two real differences remain: no banner chrome, and the
-  //     tee is LIVE-ONLY (a tab attaching after the note fired never sees it, per the first gap
-  //     above). PARKED, deliberately: closing it properly means a renderer-independent notice
-  //     channel owned by the MOUNT POINT (which already owns the open-time `res.j.notice`
-  //     banner for both renderers), i.e. new server work -- not something to bolt on here.
-  //   - NO BELL FLASH. The grid renderer's `_flashBell()` (the brief `.vtbell` pulse) is driven
-  //     by the SSE frame's monotonic `bell` counter, which likewise cannot cross a raw byte
-  //     stream. The BEL byte itself does arrive in the stream, so xterm.js's own `onBell` could
-  //     drive an equivalent pulse -- but that would be a SECOND implementation of one capability
-  //     (conventions rule 4) fed by a different source than the grid's server-owned counter, so
-  //     it belongs on the same renderer-independent channel as the notices above, not here.
-  //     PARKED for the same reason.
+  //   - (CLOSED -- no longer a gap, kept as a pointer.) MID-SESSION SERVER NOTICES now raise the
+  //     same styled `.vtnotice` banner the grid renderer does, including full REPLAY for a tab
+  //     that attaches after the note fired. `/api/term/raw` still has no JSON envelope, so the
+  //     channel is a NAMED `event: notice` frame on that same connection (term_vt.py's
+  //     `_raw_stream_body`, per-viewer `since_notice` cursor), consumed by `_openStream`'s
+  //     `addEventListener("notice", …)` below and forwarded up through `_onNotice` to the mount's
+  //     `createNoticeBanner` -- one banner implementation for both renderers, not two. The
+  //     `_feed_note()` inline "[ai-tracker] note: …" tee still happens as well; that is the
+  //     terminal's own scrollback record, unrelated to the banner.
   //   - Selection copy-on-Ctrl+C is reimplemented here (xterm.js sends \x03 for a plain Ctrl+C
   //     UNCONDITIONALLY by default, selection or not -- there is no built-in copy-on-select/
   //     copy-on-Ctrl+C) via `attachCustomKeyEventHandler`, mirroring Terminal's own copyCombo
@@ -1628,6 +1681,10 @@
     this.term = null;
     this.fitAddon = null;
     this._onStatusChange = null;
+    this._onNotice = null;        // see Terminal's own _onNotice comment -- the SAME callback both
+                                   // renderers fire and both mounts render (createNoticeBanner).
+    this._onNoticeEvent = null;   // the addEventListener("notice", ...) handler on `this.es`,
+                                   // kept only so _closeStream below can remove it by reference.
     this._fontSize = 12.5;   // matches .vtpane's default font-size in ext_vt.css
     // Guards _build() firing after a mid-load destroy(): attach() defers _build() behind
     // _loadXtermAssets()'s promise, and if destroy() runs while that ~480KB asset load is still
@@ -1738,6 +1795,18 @@
     // onResize is wired earlier, above -- before the initial fit.fit() call -- see that call
     // site's own comment for why.
 
+    // Bell: confirmed against this vendored build that `onBell` is a plain, ungated getter on the
+    // PUBLIC Terminal class (`get onBell(){return this._core.onBell}` -- unlike the handful of
+    // genuinely-proposed getters elsewhere in the same class, it never calls `_checkProposedApi()`
+    // first, so no `allowProposedApi` option is needed here), and that it actually fires off a
+    // real BEL byte (`this._register(this._inputHandler.onRequestBell((()=>this._onBell.fire())))`
+    // in the core terminal). `.onBell()` returns a Disposable (same VS Code-style Emitter every
+    // other `term.onX` in this class already relies on) -- stored and disposed in destroy() below,
+    // alongside this class's other listeners, per its teardown discipline. `_flashBellPane` is the
+    // SAME function the grid renderer's `_flashBell` calls -- see its own comment for why one
+    // shared implementation is correct here despite the two renderers' different triggers.
+    this._disposeBell = term.onBell(function () { _flashBellPane(self.pane); });
+
     window.addEventListener("resize", self._resizeDebounced);
     // See observePane's own comment (just above buildToolbar) for the sibling-flex mechanism this
     // covers -- shared with the grid Terminal class instead of each renderer wiring/tearing down
@@ -1815,7 +1884,7 @@
     // envelope, so it has no `starting` key to read -- that asymmetry with Terminal's grid-path
     // _openStream (below) is intentional, not an oversight.
     var self = this;
-    if (self.es) self.es.close();
+    self._closeStream();
     if (self._onStatusChange) self._onStatusChange("connecting…");
     self.es = new EventSource("/api/term/raw?tty=" + encodeURIComponent(self.ttyId));
     self.es.onopen = function () { if (self._onStatusChange) self._onStatusChange("connected"); };
@@ -1823,7 +1892,36 @@
       if (!self.term) return;
       try { self.term.write(_b64ToBytes(ev.data)); } catch (e) { }
     };
+    // The notice channel this renderer used to lack entirely (it was a documented parked gap in
+    // this class's header until now). `/api/term/raw` emits `event: notice\ndata: {"seq":<int>,
+    // "text":"<str>"}` on THIS SAME connection -- verified on the wire against
+    // term_vt._raw_stream_body -- so there is no second EventSource to double-count pt.viewers
+    // with. It MUST be a named-event listener: `onmessage` above runs every UNNAMED frame through
+    // _b64ToBytes and writes the result into xterm.js as terminal bytes, and a named event is
+    // inert to it. Forwarded straight up to the mount, unparsed of meaning: the seq dedupe (which
+    // is what makes EventSource's own auto-retry -- the server replays from seq 0 -- not re-raise
+    // a banner already on screen) belongs to createNoticeBanner, once, for both renderers.
+    self._onNoticeEvent = function (ev) {
+      if (!self._onNotice) return;
+      var n = null;
+      try { n = JSON.parse(ev.data); } catch (e) { return; }   // malformed frame: ignore, never throw
+      self._onNotice(n);
+    };
+    self.es.addEventListener("notice", self._onNoticeEvent);
     self.es.onerror = function () { if (self._onStatusChange) self._onStatusChange("reconnecting…"); };
+  };
+
+  // Closes `this.es` AND removes the named-event listener wired onto it above. One helper because
+  // both callers need both halves: _openStream (which replaces the stream) and destroy(). Removing
+  // the listener by reference is belt-and-braces over close() -- a closed EventSource dispatches
+  // nothing -- but it is the same teardown discipline every other listener in this class follows,
+  // and it is what keeps `_onNoticeEvent` from pinning this instance through a stale handler.
+  XtermTerminal.prototype._closeStream = function () {
+    if (!this.es) { this._onNoticeEvent = null; return; }
+    if (this._onNoticeEvent) this.es.removeEventListener("notice", this._onNoticeEvent);
+    this._onNoticeEvent = null;
+    this.es.close();
+    this.es = null;
   };
 
   // Same public name as Terminal.prototype.measureAndResize -- called identically by openVT's
@@ -1844,7 +1942,10 @@
     // here or every terminal open leaks one more "themechange" handler for the life of the tab.
     if (this._disposeThemeBtn) { this._disposeThemeBtn(); this._disposeThemeBtn = null; }
     if (this._onThemeChange) { document.removeEventListener("themechange", this._onThemeChange); this._onThemeChange = null; }
-    if (this.es) { this.es.close(); this.es = null; }
+    // The onBell subscription (see _build's own comment) -- disposed explicitly here rather than
+    // left to term.dispose() below, matching every other listener this method tears down by hand.
+    if (this._disposeBell) { this._disposeBell.dispose(); this._disposeBell = null; }
+    this._closeStream();   // closes the SSE stream AND removes its "notice" listener -- see above
     if (this._disposePaneObserver) { this._disposePaneObserver(); this._disposePaneObserver = null; }
     window.removeEventListener("resize", this._resizeDebounced);
     if (this.term) { this.term.dispose(); this.term = null; }
@@ -1865,7 +1966,10 @@
                       // never closed -- so pt.viewers never returned to 0 and the server could not
                       // idle-reap that pty for the life of the tab. A counter cannot miss a case
                       // the way an identity comparison can.
-  var modalForkChip = null, modalNoticeEl = null;   // UI elements for forked status and notice
+  var modalForkChip = null;      // fork chip in the modal header
+  var modalNotices = null;       // this mount's createNoticeBanner (see that helper) -- renders
+                                  // BOTH the open-time advisory and every streamed {seq, text}
+                                  // notice, from whichever renderer is currently attached.
 
   function buildOverlay(mount) {
     overlay = document.createElement("div");
@@ -1909,6 +2013,9 @@
 
     modalBodyEl = document.createElement("div");
     modalBodyEl.className = "mb vtmb";
+    // The mount owns the notice banners, not the renderer -- built here, once, against the modal's
+    // own flex COLUMN, so it survives every renderer switch inside it (see createNoticeBanner).
+    modalNotices = createNoticeBanner(modalBodyEl);
 
     modal.appendChild(mh);
     modal.appendChild(modalBodyEl);
@@ -2342,9 +2449,10 @@
   };
 
   // ===== ONE terminal row, shared by the cap block AND the "Manage terminals" panel ==========
-  // Both need exactly the same thing: a running terminal identified by command · cwd · age, with
-  // action buttons on the right. They differ only in WHICH actions (the cap block offers one kill;
-  // the manager offers peek + kill) and in what those actions then do -- never in what a row IS.
+  // Both need exactly the same thing: a running terminal identified by session-or-command ·
+  // project · age, with action buttons on the right. They differ only in WHICH actions (the cap
+  // block offers one kill; the manager offers peek + kill) and in what those actions then do --
+  // never in what a row IS.
   // Landing it once is conventions rule 4: a second hand-rolled copy of this markup is precisely
   // how the divergences this file's header brief catalogues got in.
   //
@@ -2359,8 +2467,42 @@
     var mins = Math.max(0, Math.round((now - (t.started || now)) / 60));
     var label = document.createElement("span");
     label.className = "vtcaplabel";
-    label.textContent = (t.cmd || "shell") + "  ·  " + (t.cwd || "") + "  ·  " + mins + "m";
-    label.title = t.tty;
+    // Session identity: `t.session` is the Claude session id this terminal is running under --
+    // "" for a plain shell, always present and never undefined (term_vt._live_list's own
+    // contract). Three "claude --resume <uuid>" rows used to render character-for-character
+    // identical, because the uuid was the only thing that differed and nothing here showed it in
+    // full -- exactly the bug the user's screenshot caught. Resolved against `sessions`, the
+    // REAL global array from app.js (see this file's header comment: concatenated into the same
+    // top-level <script>, so this is the sidebar's own list, already polled every 2s and held in
+    // memory) -- no new fetch, no new server route. Conventions rule 5 ("server owns policy") is
+    // about thresholds/labels/ranking the client would otherwise re-derive; a session's title is
+    // just data the client already holds, and app.js's own narration-jump helper resolves the
+    // identical id -> title -> id.slice(0,8) chain for the same reason (app.js's `label` closure,
+    // ~line 1067). A session with no match in that list yet (sidebar hasn't polled, or the
+    // session isn't in scope) falls back to the short id, matching that same convention -- never
+    // the raw 36-char uuid.
+    var identity = "";
+    if (t.session) {
+      var list = (typeof sessions !== "undefined" && sessions) || [];
+      var hit = null;
+      for (var i = 0; i < list.length; i++) {
+        if (list[i] && list[i].id === t.session) { hit = list[i]; break; }
+      }
+      identity = (hit && (hit.title || hit.project)) || t.session.slice(0, 8);
+    }
+    // cwd: the LEADING segment of a long path is the part every terminal in the SAME project
+    // shares (/Users/<name>/Documents/...) -- and the part a leading-anchored ellipsis was
+    // truncating the row DOWN TO, telling the user nothing. The TRAILING segment is what
+    // actually names the project, same formula as app.js's own `base()` helper (already used
+    // elsewhere in this app to name a file by its trailing path segment) -- computed inline
+    // rather than calling `base()` itself, because unlike `cur`/`EXT`/`esc`/`toast` (this file's
+    // documented, always-present app.js globals -- see the header comment) `base` is not one of
+    // them, and every OTHER app.js-only reference in this file (`toast`) is guarded with
+    // `typeof ... === "function"` before use for exactly that reason. The untruncated path and
+    // the raw command still reach the user via the tooltip below.
+    var cwdTail = (t.cwd || "").split("/").pop() || (t.cwd || "");
+    label.textContent = (identity || (t.cmd || "shell")) + "  ·  " + cwdTail + "  ·  " + mins + "m";
+    label.title = t.tty + "  ·  " + (t.cmd || "shell") + "  ·  " + (t.cwd || "");
     row.appendChild(label);
     (actions || []).forEach(function (a) {
       var b = document.createElement("button");
@@ -2433,10 +2575,21 @@
     modalBodyEl.appendChild(wrap);
   }
 
-  // Wires a modal terminal's status callback -- shared by openVT's initial build AND
+  // Wires a modal terminal's mount-facing callbacks -- shared by openVT's initial build AND
   // switchActiveRenderer's rebuild below, so the two never drift into two slightly different
-  // copies of the same "starting…" suppression logic.
-  function _wireModalStatus(term) {
+  // copies of the same "starting…" suppression logic, and so BOTH renderers' notices reach the
+  // one banner stack this mount owns.
+  function _wireModalTerm(term) {
+    // Notices: whichever renderer is attached forwards the same {seq, text} object here (grid off
+    // its JSON frame's `notices`, xterm off /api/term/raw's named `notice` event) and the MOUNT
+    // decides what to draw. show() returns true only when it actually added a banner (a replayed
+    // seq after an EventSource reconnect returns false), and a banner shrinks the pane -- so the
+    // terminal renegotiates its row count exactly then. observePane's ResizeObserver would catch
+    // this too; the explicit call is the fallback for browsers without ResizeObserver.
+    term._onNotice = function (n) {
+      if (activeTerm !== term) return;
+      if (modalNotices && modalNotices.show(n)) term.measureAndResize();
+    };
     term._onStatusChange = function (s) {
       if (activeTerm !== term) return;
       // Suppress the connecting/connected/reconnecting churn while starting -- in particular
@@ -2468,7 +2621,7 @@
       getActive: function () { return activeRenderer; },
       switchTo: switchActiveRenderer
     });
-    _wireModalStatus(term);
+    _wireModalTerm(term);
     activeTerm = term;
     // Re-wire, don't destroy: the ContextBar's polling/dropdown state has nothing to do with which
     // renderer is on screen -- only its getInput() callback (used by _focusTerminal) needs to stop
@@ -2493,6 +2646,11 @@
     modalTitleEl.textContent = "TERMINAL — " + (mode === "resume" ? "resume · " : "") + sid;
     modalStatusEl.textContent = "connecting…";
     modalBodyEl.innerHTML = "";
+    // A NEW pty is about to be opened, whose notice `seq`s restart at 1 -- so the banner stack and
+    // its dedupe high-water mark both reset here. (The innerHTML wipe above already detached the
+    // old elements; clear() is what stops the tracker from suppressing the new pty's seq 1..N.)
+    // Deliberately NOT done on a renderer switch -- see createNoticeBanner's header.
+    if (modalNotices) modalNotices.clear();
     overlay.style.display = "flex";
 
     // Build the real pane first so we can measure its ACTUAL rendered size (requirement 5) and
@@ -2551,20 +2709,10 @@
           activeNotice = (typeof res.j.notice === "string") ? res.j.notice : null;
           // Update fork chip display
           if (modalForkChip) modalForkChip.style.display = activeForked ? "" : "none";
-          // Create and display notice if present
-          if (activeNotice) {
-            if (!modalNoticeEl) {
-              modalNoticeEl = document.createElement("div");
-              modalNoticeEl.className = "vtnotice";
-            }
-            modalNoticeEl.innerHTML = "";   // clear any previous content
-            var noticeText = document.createElement("span");
-            noticeText.textContent = activeNotice;  // textContent escapes HTML
-            modalNoticeEl.appendChild(noticeText);
-            if (!modalNoticeEl.parentNode) modalBodyEl.insertBefore(modalNoticeEl, modalBodyEl.firstChild);
-          } else if (modalNoticeEl && modalNoticeEl.parentNode) {
-            modalNoticeEl.parentNode.removeChild(modalNoticeEl);
-          }
+          // The OPEN-TIME advisory goes through the SAME banner stack every streamed notice uses
+          // (createNoticeBanner) -- it just carries no `seq`, so it is never deduped against them.
+          // Nothing to remove in the absent case: the clear() at the top of openVT already did it.
+          if (activeNotice) modalNotices.show({ text: activeNotice });
           // Server-owned (conventions rule 5): the client reads which renderer to build off the
           // response `open_pty()` already sent, never decides it locally -- see term_vt.py's
           // TRACKER_TERM_RENDERER switch comment. An unrecognized/missing value falls back to
@@ -2600,7 +2748,7 @@
             term.pane.classList.toggle("vtstarting", term.starting);
             if (term.starting) modalStatusEl.textContent = "tty " + activeTty + " · starting…";
           }
-          _wireModalStatus(term);
+          _wireModalTerm(term);
           activeTerm = term;
           // Built AFTER the Terminal/XtermTerminal (both do container.innerHTML = "" in their own
           // constructor, now confined to `wrap` above) so the bar's own DOM survives — appended as
@@ -2637,7 +2785,8 @@
     activeTermWrap = null;
     activeForked = false; activeNotice = null;
     if (modalForkChip) modalForkChip.style.display = "none";
-    if (modalNoticeEl && modalNoticeEl.parentNode) modalNoticeEl.parentNode.removeChild(modalNoticeEl);
+    // The pty is gone, so the banners go with it -- and the seq tracker resets for the next one.
+    if (modalNotices) modalNotices.clear();
   }
 
   function openNewTab() {
@@ -3060,6 +3209,9 @@
     // mountRenderer below) -- plain `var term`/`bar` locals inside a one-shot boot() can't be
     // reassigned by a switch button that outlives that single call.
     var curTerm = null, curBar = null, curRenderer = null, termWrap = null, statusEl = null;
+    // This mount's own createNoticeBanner (see that helper) -- built in boot() against `mount`,
+    // outliving every renderer switch mountRenderer performs, exactly like curBar does.
+    var curNotices = null;
 
     // Re-renders the standalone status line from scratch -- shared by boot()'s own initial
     // "connecting…" placeholder and by every term._onStatusChange callback wired in
@@ -3119,9 +3271,16 @@
         curBar = new ContextBar(mount, sid, tty, mode, function () { return term; });
         curBar.start();
       }
+      // Notices: identical wiring to the modal's own _wireModalTerm -- the renderer forwards the
+      // {seq, text} object, the MOUNT dedupes/caps/draws it (createNoticeBanner). Hoisted here for
+      // the same reason _onStatusChange is: both renderers, and every later switch, run this path.
+      term._onNotice = function (n) {
+        if (curTerm !== term) return;
+        if (curNotices && curNotices.show(n)) term.measureAndResize();
+      };
       term._onStatusChange = function (s) {
         if (curTerm !== term) return;
-        // Same suppression the modal's _wireModalStatus applies, hoisted here so the two mount
+        // Same suppression the modal's _wireModalTerm applies, hoisted here so the two mount
         // points don't drift: while a mode="resume" pane is still coming up (server-owned
         // `starting`, tracked per SSE frame in _applyPatch) the refused-resume child's stream
         // drop would otherwise flash "reconnecting…" into this status line even though the
@@ -3134,21 +3293,20 @@
 
     function boot(renderer) {
       // The notice banner goes in FIRST, so it lands ABOVE the terminal -- exactly where the
-      // modal puts it (`modalBodyEl.insertBefore(modalNoticeEl, modalBodyEl.firstChild)` in
-      // openVT). It used to be appended AFTER mountRenderer(), i.e. below the pane AND below the
+      // modal puts it (the shared helper's own insertion rule now guarantees that for both mounts
+      // alike; it inserts before the container's first child when no banner is up yet). It used to
+      // be appended AFTER mountRenderer(), i.e. below the pane AND below the
       // context bar, so the identical server message rendered at opposite ends of the two mount
       // points. The old "matching the order this code built in before the renderer switch
       // existed" note on statusEl below documents history, not a requirement; the one REAL
       // constraint it also states -- statusEl must exist before mountRenderer() calls attach() --
-      // is untouched here.
-      if (standaloneNotice) {
-        var noticeEl = document.createElement("div");
-        noticeEl.className = "vtnotice";
-        var noticeText = document.createElement("span");
-        noticeText.textContent = standaloneNotice;  // textContent escapes HTML
-        noticeEl.appendChild(noticeText);
-        mount.appendChild(noticeEl);
-      }
+      // is untouched here. The banner itself is no longer built inline: `mount` gets its own
+      // createNoticeBanner (the SAME helper the modal uses, and the same one every streamed
+      // {seq, text} notice from either renderer lands in via mountRenderer's `_onNotice` above),
+      // and the ?notice= advisory is just its first, seq-less entry. Created BEFORE termWrap so
+      // "first child of `mount`" and "above the terminal" are the same position.
+      curNotices = createNoticeBanner(mount);
+      if (standaloneNotice) curNotices.show({ text: standaloneNotice });
 
       // The term's own toolbar+pane live in a DEDICATED wrap, never directly in `mount`: both
       // Terminal and XtermTerminal's constructors do `container.innerHTML = ""` on whatever

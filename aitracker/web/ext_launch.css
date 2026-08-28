@@ -46,6 +46,35 @@
   text-align: center;
 }
 
+/* Live-terminal count on "☰ Manage terminals" -- same pill shape as .livebadge, but sized to
+   sit inline inside a .mini button rather than stand alone in the header. Neutral (.mini's own
+   chipbg/line3/muted) at 0, switches to the green "live" tokens (matching .livebadge.on) once
+   count > 0 -- legible at a glance whether it's "off" (no badge, see ext_launch.js), "on, idle"
+   (dim "0"), or "on, busy" (green Nn), and two digits fit without the button reflowing. */
+.termcountbadge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  margin-left: 6px;
+  border-radius: 20px;
+  font-size: 10px;
+  font-weight: 700;
+  font-family: 'JetBrains Mono', monospace;
+  line-height: 1;
+  background: var(--chipbg);
+  color: var(--muted);
+  border: 1px solid var(--line3);
+  vertical-align: middle;
+}
+.termcountbadge.live {
+  background: var(--green-deep);
+  color: var(--green);
+  border-color: var(--green-line);
+}
+
 /* ===== the directory picker ==============================================================
    Built as a child of <body> (see ext_launch.js's buildPicker comment for why: .side gets a
    CSS transform for its phone slide-in drawer, which would break position:fixed on anything

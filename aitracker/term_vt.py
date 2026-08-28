@@ -1747,12 +1747,16 @@ def _feed_note(pt, text):
        **Never write `line` to `pt.fd`** -- these bytes are a synthesized notice for viewers, not
        input to the child process; writing them to the pty would send them to the running program
        as keystrokes.
-    3. `pt.add_notice(text)` -- the structured, per-viewer-tracked queue `_screen_stream_body()`
-       delivers as the SSE frame's `notices` key (added alongside `screen.snapshot()`'s own
-       fields, never inside `Screen` itself -- the queue lives on `Pty`, `Screen` has no notion of
-       it). Only a `screen_stream()` viewer ever sees this key: `raw_stream()` carries no JSON
-       envelope at all, so there is no channel through which an xterm.js viewer could receive a
-       structured notice either -- (1)/(2) above are the only way that renderer learns anything.
+    3. `pt.add_notice(text)` -- the structured, per-viewer-tracked queue BOTH stream routes now
+       deliver from: `_screen_stream_body()` merges it into the SSE frame's `notices` key (added
+       alongside `screen.snapshot()`'s own fields, never inside `Screen` itself -- the queue lives
+       on `Pty`, `Screen` has no notion of it), and `_raw_stream_body()` walks the SAME queue to
+       emit a named `event: notice\\ndata: <json>\\n\\n` frame on the raw byte SSE connection --
+       see that function's own docstring for the mechanism. This is what gives a `raw_stream()`/
+       xterm.js viewer a REPLAY channel despite (2) above being live-only-by-construction: a raw
+       viewer that attaches or reconnects AFTER this fires still receives the notice from this
+       queue, even though it never saw the tee'd bytes (2) pushed to viewers already attached at
+       the time.
 
     All three happen under ONE `pt.lock` acquisition -- the same lock `_tee_raw`'s other caller
     (`_reader`) and every other mutator of `pt.screen`/`pt.raw_queues` already holds -- so a
@@ -2455,7 +2459,12 @@ def _screen_stream_body(handler, pt):
     * Every data frame is a PLAIN, UNNAMED `data: <json>\\n\\n` line -- never `event: <name>`.
       The client's `EventSource.onmessage` only fires for unnamed events; one named `event:`
       frame and the terminal goes permanently, silently dark. (Tier 2's `term_run.stream()` right
-      next door DOES send `event: end` -- that pattern is Tier 2-only, deliberately not mirrored
+      next door DOES send `event: end` -- that pattern is deliberately not mirrored on THIS route.
+      `raw_stream()`'s `_raw_stream_body()`, by contrast, DOES now mirror it: it sends named
+      `event: notice` frames on its own connection, for the reason given in that function's own
+      docstring -- unlike this route, it has no JSON envelope for an unnamed frame to carry a
+      structured notice inside, so a named event is the only channel it has. That divergence is
+      real and scoped to the raw stream; this route's own wire format stays exactly as documented
       here.) The `: ping\\n\\n` heartbeat is a comment line, not a `data:`/`event:` frame, so
       EventSource ignores it for free -- that one is safe as-is.
     * The JSON object carries EXACTLY the keys `Screen.snapshot()` returns -- `v`, `rows`,
@@ -2882,12 +2891,23 @@ def raw_stream(handler, parsed):
     its own VT100 interpretation, so unlike `screen_stream()` there is no JSON envelope and no
     `since`/versioning concept here at all: this is a plain byte tee, not a diffed snapshot.
 
-    KNOWN GAP (see the module docstring's "raw byte tee" section above and the build report this
-    shipped with): there is no raw-byte scrollback. `screen_stream()` can always answer a fresh
-    viewer with a full `since=-1` repaint because `Screen` retains the interpreted grid; this
-    route only tees bytes emitted AFTER the connection opens, so a second tab (or a reconnect)
-    opened against a PTY that already has content on screen starts on a BLANK xterm.js buffer
-    until the next write -- there is nothing here to replay.
+    Byte replay is a KNOWN GAP (see the module docstring's "raw byte tee" section above and the
+    build report this shipped with): there is no raw-byte scrollback. `screen_stream()` can always
+    answer a fresh viewer with a full `since=-1` repaint because `Screen` retains the interpreted
+    grid; this route only tees bytes emitted AFTER the connection opens, so a second tab (or a
+    reconnect) opened against a PTY that already has content on screen starts on a BLANK xterm.js
+    buffer until the next write -- there is nothing here to replay.
+
+    NOTICES are the one deliberate exception to that gap: `Pty.notices` (see `_feed_note()`/
+    `Pty.add_notice`) is retained independently of the raw byte tee, so `_raw_stream_body()` below
+    also walks that queue on every loop tick and replays any entry a given viewer has not yet
+    seen -- including one that fired before this viewer ever attached -- as a named
+    `event: notice\\ndata: <json>\\n\\n` SSE frame on this SAME connection (no second route, no
+    second EventSource, no new server state; see that function's own docstring for the mechanism
+    and why the event must be NAMED, never a bare `data:` frame). This closes what used to be a
+    standing gap for the xterm renderer: a viewer that attaches or reconnects after a notice fired
+    now sees it, exactly like the grid renderer's `notices` field already provides via
+    `_screen_stream_body()`.
     """
     global _STREAMS
     if not term_gate.guard(handler):
@@ -2926,6 +2946,37 @@ def _raw_stream_body(handler, pt, q):
     `_reader()`'s tee, see `Pty.raw_queues`) rather than polling `Screen` like
     `_screen_stream_body()` does -- there is no shared version counter to diff against here, just
     bytes arriving in order. Mirrors that function's peer-gone check and 10s ping heartbeat.
+
+    Also delivers/replays `Pty.notices` as named `event: notice\\ndata: <json>\\n\\n` frames on
+    this SAME connection -- no new route, no second `EventSource` (a second one would double-count
+    `pt.viewers`, whose leak was a real bug here before), no new timer, no new server state. This
+    MUST be a named event, never folded into a bare `data:` frame: the client's default
+    `onmessage` handler runs every unnamed frame through `_b64ToBytes()` and writes the result
+    straight into xterm.js as terminal bytes, so a JSON notice sent unnamed would render as
+    garbage on screen. A named event is inert to a plain `onmessage` listener and requires its own
+    `addEventListener("notice", ...)` to be seen at all -- exactly the precedent `term_run.stream`
+    already sets with its own `event: end` frame (see `aitracker/term_run.py`'s `stream()`),
+    consumed the same way by `ext_run.js`'s `addEventListener("end", ...)` alongside its
+    `onmessage`.
+
+    Per-viewer delivery cursor `since_notice` mirrors `_screen_stream_body()`'s own local of the
+    same name for the identical reason: `seq` is monotonic and never reused (`Pty.add_notice`), so
+    each independently-attached raw viewer tracks its own position into `pt.notices` and one
+    viewer consuming a notice can never starve another.
+
+    Checked BEFORE the `pt.done` branch below, deliberately: a viewer attaching to an
+    already-finished pty sees an immediately-empty byte queue, and returning on that alone (the
+    ORIGINAL bug this guards against) would exit before ever giving a still-unreplayed notice a
+    chance to go out -- a finished pty with queued notices must still replay them.
+
+    The `pt._notice_seq` read that gates the `with pt.lock` block below is deliberately UNLOCKED --
+    a plain, cheap int comparison safe to make every 0.2s tick even while the child is silent (and
+    exactly the informal "no lock needed for a monotonic single-writer int" style `last_output`
+    already uses elsewhere in this file). `_raw_stream_body()` otherwise never takes `pt.lock` at
+    all; when the child is chatty, `q.get()` above returns instantly and this loop spins hot, so
+    taking the lock unconditionally on every iteration would put new, frequent lock traffic on a
+    path that would then contend with `_reader()`'s own `feed()` -- only take it, to build the
+    actual pending list, once the cheap peek says there is something new to send.
     """
     try:
         handler.send_response(200)
@@ -2935,6 +2986,9 @@ def _raw_stream_body(handler, pt, q):
         handler.end_headers()
     except (BrokenPipeError, ConnectionResetError):
         return
+    since_notice = 0    # this viewer's own delivery position into pt.notices -- 0 is safe as
+                         # "nothing delivered yet" because Pty.add_notice's seq starts at 1 and
+                         # only ever increases (mirrors _screen_stream_body()'s own local).
     quiet = time.time()
     while True:
         try:
@@ -2946,7 +3000,16 @@ def _raw_stream_body(handler, pt, q):
             if not _write(handler, "data: %s\n\n" % b64):
                 return
             quiet = time.time()
-        elif pt.done:                                    # nothing left queued and the pty is gone
+        if pt._notice_seq > since_notice:      # cheap unlocked peek -- see docstring's lock note
+            with pt.lock:
+                pending = [n for n in pt.notices if n["seq"] > since_notice]
+            for n in pending:
+                since_notice = n["seq"]
+                if not _write(handler, "event: notice\ndata: %s\n\n" % json.dumps(n)):
+                    return
+            quiet = time.time()
+        if not data and pt.done:                # nothing left queued and the pty is gone -- but
+                                                  # only after the notice check above (trap 1)
             return
         if _peer_gone(handler):                           # instant: the tab closed
             return

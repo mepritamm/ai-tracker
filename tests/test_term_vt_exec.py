@@ -168,6 +168,33 @@ if _HAS_NODE:
     _xterm_leak_end = _SRC.index("// ===== the modal")
     _XTERM_LEAK_SRC = _SRC[_xterm_leak_start:_xterm_leak_end]
 
+    # ===== bell flash: the ONE shared helper both renderers call (this task) =====
+    # `_flashBellPane` sits in the GRID section of the file (right before `Terminal.prototype.
+    # _flashBell`, which is itself outside `_XTERM_LEAK_SRC` above) but XtermTerminal._build's own
+    # onBell handler calls it directly -- so any XtermTerminal-bell test needs this pulled in
+    # separately, span-extracted the same "between two literal markers" way as `_XTERM_LEAK_SRC`.
+    # Also grabs `Terminal.prototype._flashBell` itself (the grid delegate), used by the grid-path
+    # regression test below via `_APPLY_PATCH_SRC`.
+    _flashbell_start = _SRC.index("function _flashBellPane(pane) {")
+    _flashbell_end = _SRC.index("// ===== font size:")
+    _FLASH_BELL_SRC = _SRC[_flashbell_start:_flashbell_end]
+
+    # `Terminal.prototype._applyPatch` -- the grid renderer's server-counter-driven bell trigger
+    # (`if (typeof msg.bell === "number") { if (this._bellSeen !== null && msg.bell !==
+    # this._bellSeen) this._flashBell(); this._bellSeen = msg.bell; }`), extracted whole via the
+    # same `_function_body` helper the rest of this module already uses for single methods.
+    _APPLY_PATCH_SRC = _function_body(_SRC, "Terminal.prototype._applyPatch = function")
+
+    # ===== notice banner: the ONE mount-owned helper both renderers feed (this task) =====
+    # `createNoticeBanner` (plus its `NOTICE_MAX` constant) replaced THREE near-copies of the same
+    # build-a-.vtnotice-div logic -- Terminal.prototype._displayNotice, openVT's open-time
+    # `res.j.notice` block, and bootStandalone's `?notice=` block. It is module-scope in ext_vt.js
+    # between `observePane` and `buildToolbar`, so it is span-extracted the same "between two
+    # literal markers" way as _XTERM_LEAK_SRC/_CONTEXT_BAR_SRC above.
+    _notice_start = _SRC.index("var NOTICE_MAX = 3;")
+    _notice_end = _SRC.index("// ===== shared zoom toolbar")
+    _NOTICE_BANNER_SRC = _SRC[_notice_start:_notice_end]
+
     # ===== ContextBar: model/effort switchers, attach-gating, usage readout (this task) =====
     # tests/test_term_vt_client.py used to assert the WHOLE of this behaviour by grepping the
     # source text (e.g. "the inject POST body contains these substrings"), which stays true even
@@ -1394,6 +1421,32 @@ window.Terminal.prototype.resize = function (cols, rows) {
 window.Terminal.prototype.focus = function () {};
 window.Terminal.prototype.hasSelection = function () { return false; };
 window.Terminal.prototype.dispose = function () { __xtermDisposed++; };
+// Real xterm.js: onBell(fn) is a VS Code-style Emitter subscription -- it returns a Disposable
+// (an object with its own .dispose()), NOT a plain unsubscribe function, and calling that
+// Disposable's .dispose() removes the listener so a later fireBell() no longer reaches it. This
+// stub mirrors both halves exactly, because XtermTerminal._build stores what onBell() returns and
+// calls .dispose() on it from destroy() -- a stub that returned a bare function instead would let
+// a "disposed" test pass without proving the real Disposable contract holds.
+var __bellDisposeCount = 0;
+window.Terminal.prototype.onBell = function (fn) {
+  this._bellHandlers = this._bellHandlers || [];
+  this._bellHandlers.push(fn);
+  var handlers = this._bellHandlers, disposed = false;
+  return {
+    dispose: function () {
+      if (disposed) return;
+      disposed = true;
+      __bellDisposeCount++;
+      var i = handlers.indexOf(fn);
+      if (i !== -1) handlers.splice(i, 1);
+    }
+  };
+};
+// Test-only helper (not part of real xterm.js): fires every STILL-REGISTERED onBell handler, the
+// same way the real DomRenderer/InputHandler would when a BEL byte is processed.
+window.Terminal.prototype.fireBell = function () {
+  (this._bellHandlers || []).slice().forEach(function (fn) { fn(); });
+};
 function FakeFitAddon() {}
 FakeFitAddon.prototype.fit = function () {};
 window.FitAddon = { FitAddon: FakeFitAddon };
@@ -1439,8 +1492,25 @@ var document = {
         return { top: 0, left: 0, right: 200, bottom: bottom, width: 200, height: bottom };
       }
     } : null;
+    // classList: a real Set-backed mock (same shape __makeEl's below already uses for the
+    // ContextBar/manager-panel harnesses) -- needed because XtermTerminal's own pane is what
+    // _flashBellPane (ext_vt.js) toggles "vtbell" on; `addCalls` records every literal class name
+    // ever passed to .add(), which the burst-safety test reads to prove the SAME class name is
+    // reused every time (never a fresh per-event class that would stack independent animations).
+    var __classes = new Set();
+    var __classAddCalls = [];
     return {
       className: '',
+      classList: {
+        add: function (c) { __classAddCalls.push(c); __classes.add(c); },
+        remove: function (c) { __classes.delete(c); },
+        contains: function (c) { return __classes.has(c); },
+        toggle: function (c, force) {
+          if (force === undefined) { __classes.has(c) ? __classes.delete(c) : __classes.add(c); }
+          else if (force) __classes.add(c); else __classes.delete(c);
+        },
+        _addCalls: __classAddCalls,
+      },
       appendChild: function () {},
       setAttribute: function () {},
       querySelector: function (sel) { return sel === '.xterm-screen' ? screenEl : null; },
@@ -1457,8 +1527,26 @@ function getComputedStyle() { return { getPropertyValue: function () { return ''
 
 function postKeys() {}
 function postResize(ttyId, cols, rows) { __postResizeCalls.push({ ttyId: ttyId, cols: cols, rows: rows }); }
-function EventSource(url) { this.url = url; this.closed = false; }
+// EventSource: `close()` plus the named-event listener API. XtermTerminal._openStream subscribes
+// to `/api/term/raw`'s `event: notice` frames with addEventListener("notice", ...) and
+// _closeStream removes that listener by reference -- a stub without both halves could not tell a
+// real teardown from a no-op. `__emit`/`__listenerCount` are TEST-ONLY (not part of the real
+// EventSource API): the former dispatches a named event exactly like the browser would, with the
+// raw `data` string the server put on the wire; the latter is how a leak test reads the truth.
+function EventSource(url) { this.url = url; this.closed = false; this._listeners = {}; }
 EventSource.prototype.close = function () { this.closed = true; };
+EventSource.prototype.addEventListener = function (name, fn) {
+  (this._listeners[name] = this._listeners[name] || []).push(fn);
+};
+EventSource.prototype.removeEventListener = function (name, fn) {
+  var a = this._listeners[name] || [];
+  var i = a.indexOf(fn);
+  if (i !== -1) a.splice(i, 1);
+};
+EventSource.prototype.__emit = function (name, data) {
+  (this._listeners[name] || []).slice().forEach(function (fn) { fn({ data: data }); });
+};
+EventSource.prototype.__listenerCount = function (name) { return (this._listeners[name] || []).length; };
 
 function debounce(fn) { return fn; }   // real debounce timing is not what this module tests
 
@@ -2895,6 +2983,664 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         self.assertFalse(result["armedAfterRefresh"], "a row kill's refresh must clear the armed flag too")
         self.assertFalse(result["hasWarningAfterRefresh"])
         self.assertTrue(result["closeAllLabelRestored"])
+
+
+# ===== Bell flash: one shared helper, two triggers (this task) ==================================
+# The bell reached the user on the grid renderer (a `.vtbell` pulse driven off the SSE frame's
+# `msg.bell` counter, in `_applyPatch`) but produced NOTHING on XtermTerminal, now the DEFAULT
+# renderer: xterm.js's own `onBell` event fires on a real BEL byte (confirmed against the vendored
+# build -- see the comment above XtermTerminal._build's onBell wiring in ext_vt.js) but nothing
+# ever subscribed to it. Fixed by hoisting the pulse itself -- `pane.classList.add("vtbell")` plus
+# the 180ms removal -- into ONE shared `_flashBellPane(pane)` helper that both `Terminal.prototype.
+# _flashBell` (grid) and XtermTerminal's new onBell handler call. Only the TRIGGER differs per
+# renderer (server counter vs. xterm's own event) -- see `_flashBellPane`'s own header comment in
+# ext_vt.js for why that is one implementation fed by two sources, not a forked capability under
+# conventions rule 4.
+class TestXtermBellFlash(unittest.TestCase):
+    """XtermTerminal side: onBell -> the shared _flashBellPane -> the pane gets 'vtbell'; disposed
+    cleanly on destroy(); a burst of bells never stacks more than the one class."""
+
+    def _script(self, body):
+        # _FLASH_BELL_SRC (the shared helper + the grid's own _flashBell delegate) must precede
+        # _XTERM_LEAK_SRC so XtermTerminal._build's onBell handler has _flashBellPane to call --
+        # see _FLASH_BELL_SRC's own comment above for why it lives outside that span in the real
+        # file and has to be pulled in separately here.
+        return _HARNESS_PRELUDE + _xterm_leak_harness() + _FLASH_BELL_SRC + _XTERM_LEAK_SRC + body
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_xterm_onbell_flashes_the_pane(self):
+        """The exact gap: ring xterm.js's own bell event and confirm the pane actually pulses --
+        not a source-text grep, the real handler chain end to end."""
+        script = self._script("""
+async function main() {
+  var container = makeContainer();
+  var t = new XtermTerminal(container, 'tty-bell');
+  t.attach();               // starts the (controllable) asset load
+  resolveNextAssetLoad();   // let the deferred _build() run
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+
+  var beforeFlash = t.pane.classList.contains('vtbell');
+  t.term.fireBell();        // the real xterm.js Emitter firing, via the mock's fireBell() helper
+  var afterFlash = t.pane.classList.contains('vtbell');
+
+  console.log(JSON.stringify({
+    beforeFlash: beforeFlash,
+    afterFlash: afterFlash,
+    disposeBellIsDisposable: !!(t._disposeBell && typeof t._disposeBell.dispose === 'function'),
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertFalse(result["beforeFlash"], "sanity: the pane must start with no 'vtbell' class")
+        self.assertTrue(result["afterFlash"],
+                         "firing xterm's onBell must reach _flashBellPane and add 'vtbell' to the pane")
+        self.assertTrue(result["disposeBellIsDisposable"],
+                         "_build() must store the Disposable onBell() returns, for destroy() to dispose")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_bell_listener_disposed_on_destroy_no_leak(self):
+        """Mirrors this file's own TestXtermSwitchDestroyRace idiom: destroy() must leave nothing
+        behind. Keeps a reference to the RAW fake xterm.js instance from before destroy() nulls
+        `t.term`, then fires its bell directly -- proving the listener list is actually empty
+        afterward (a real leak, not just an untested assumption that dispose() was called)."""
+        script = self._script("""
+async function main() {
+  var container = makeContainer();
+  var t = new XtermTerminal(container, 'tty-dispose');
+  t.attach();
+  resolveNextAssetLoad();
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+
+  var innerTerm = t.term;   // the raw stub xterm.js Terminal -- destroy() will null t.term itself
+  var disposeCountBefore = __bellDisposeCount;
+  t.destroy();
+  var disposeCountAfter = __bellDisposeCount;
+
+  innerTerm.fireBell();     // ring the bell on the UNDERLYING stub directly, post-destroy
+  var handlersLeftAfterDestroy = (innerTerm._bellHandlers || []).length;
+
+  console.log(JSON.stringify({
+    disposeCountBefore: disposeCountBefore,
+    disposeCountAfter: disposeCountAfter,
+    disposeBellFieldAfter: t._disposeBell,
+    handlersLeftAfterDestroy: handlersLeftAfterDestroy,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(result["disposeCountBefore"], 0)
+        self.assertEqual(result["disposeCountAfter"], 1,
+                          "destroy() must call the onBell Disposable's .dispose() exactly once")
+        self.assertIsNone(result["disposeBellFieldAfter"], "destroy() must null out _disposeBell")
+        self.assertEqual(result["handlersLeftAfterDestroy"], 0,
+                          "a bell fired on the raw xterm.js instance AFTER destroy() must reach "
+                          "zero handlers -- anything else is exactly the leak this test guards")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_bell_burst_does_not_stack_animations(self):
+        """A program spamming BEL (e.g. a build script on every error) must not queue N overlapping
+        pulses. `_flashBellPane` always (re-)adds the SAME literal class name -- re-adding an
+        already-present class is a DOM no-op and can't restart/stack a CSS animation -- so this
+        proves the class name never varies per event (which would be the actual way to stack
+        independent animations) and that the pane is still (simply) flashing afterward."""
+        script = self._script("""
+async function main() {
+  var container = makeContainer();
+  var t = new XtermTerminal(container, 'tty-burst');
+  t.attach();
+  resolveNextAssetLoad();
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+
+  for (var i = 0; i < 50; i++) t.term.fireBell();   // a burst, well within any 180ms pulse window
+
+  console.log(JSON.stringify({
+    stillFlashing: t.pane.classList.contains('vtbell'),
+    addCallCount: t.pane.classList._addCalls.length,
+    distinctClassesAdded: Array.from(new Set(t.pane.classList._addCalls)),
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertTrue(result["stillFlashing"])
+        self.assertEqual(result["addCallCount"], 50, "sanity: every fireBell() reached the helper")
+        self.assertEqual(result["distinctClassesAdded"], ["vtbell"],
+                          "every bell in the burst must (re-)add the SAME class -- a fresh "
+                          "per-event class name is what would actually stack overlapping animations")
+
+
+class TestGridBellFlashRegression(unittest.TestCase):
+    """The grid renderer's OWN trigger (`_applyPatch`'s `msg.bell` counter) must keep working after
+    the pulse itself was hoisted into `_flashBellPane` -- a regression guard for the refactor: a
+    bad extraction could easily break the flash for BOTH renderers by leaving `Terminal.prototype.
+    _flashBell` calling something that no longer exists, or the wrong `this`."""
+
+    @staticmethod
+    def _self_helper():
+        return """
+function makePaneEl() {
+  var classes = new Set();
+  return {
+    classList: {
+      add: function (c) { classes.add(c); },
+      remove: function (c) { classes.delete(c); },
+      contains: function (c) { return classes.has(c); },
+      toggle: function (c, force) {
+        if (force === undefined) { classes.has(c) ? classes.delete(c) : classes.add(c); }
+        else if (force) classes.add(c); else classes.delete(c);
+      },
+    },
+  };
+}
+function makeGridBellSelf() {
+  return {
+    pane: makePaneEl(),
+    grid: [],
+    cursor: [0, 0],
+    version: 0,
+    alt: false,
+    starting: false,
+    cursorVisible: true,
+    bracketedPaste: false,
+    focusEvents: false,
+    mouse: { mode: 0, sgr: false },
+    _refreshMouseToggle: null,
+    _bellSeen: null,
+    viewingHistory: false,
+    _onStatusChange: null,
+    _onNotice: null,
+    _paintRow: function () {},
+    _layoutCursor: function () {},
+    _updateNewOutputBadge: function () {},
+    _flashBell: Terminal.prototype._flashBell,
+    _applyPatch: Terminal.prototype._applyPatch,
+  };
+}
+"""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_server_bell_counter_still_flashes_the_grid_pane(self):
+        script = _HARNESS_PRELUDE + _FLASH_BELL_SRC + _APPLY_PATCH_SRC + self._self_helper() + """
+var self1 = makeGridBellSelf();
+self1._applyPatch({ v: 1, bell: 1 });   // baseline frame: seeds _bellSeen, must NOT flash
+var flashedOnBaseline = self1.pane.classList.contains('vtbell');
+self1._applyPatch({ v: 2, bell: 2 });   // counter advanced -- must flash
+var flashedOnIncrement = self1.pane.classList.contains('vtbell');
+
+var self2 = makeGridBellSelf();
+self2._applyPatch({ v: 1, bell: 5 });
+self2._applyPatch({ v: 2, bell: 5 });   // counter UNCHANGED between frames -- must not (re-)flash
+console.log(JSON.stringify({
+  flashedOnBaseline: flashedOnBaseline,
+  flashedOnIncrement: flashedOnIncrement,
+}));
+"""
+        result = _run_node(script)
+        self.assertFalse(result["flashedOnBaseline"],
+                          "the FIRST frame only establishes the _bellSeen baseline -- it must not flash")
+        self.assertTrue(result["flashedOnIncrement"],
+                         "a server bell counter that actually advanced must still flash the grid pane")
+
+
+# ===== notice banners: ONE mount-owned helper, fed by BOTH renderers ===========================
+# tests/test_term_vt_client.py used to pin this behaviour with ~15 source-text greps against
+# `Terminal.prototype._displayNotice`'s exact body and `_applyPatch`'s notice block -- every one of
+# which stayed green while the DEFAULT renderer (xterm) raised no banner at all, because none of
+# them ever ran anything. These execute the real extracted code instead.
+#
+# A proper little DOM is needed here, not the append-only stubs elsewhere in this module:
+# createNoticeBanner's whole insertion rule is positional (`insertBefore(el, last ? last.nextSibling
+# : container.firstChild)`), so `firstChild`/`nextSibling`/`removeChild` have to behave like the
+# real thing or the test would prove nothing about where a banner actually lands.
+_NOTICE_DOM_MOCKS = """
+function __makeNode(tag) {
+  var node = {
+    tagName: tag || 'div',
+    className: '',
+    textContent: '',
+    parentNode: null,
+    childNodes: [],
+    // Real DOM semantics for the three operations createNoticeBanner uses. insertBefore(el, null)
+    // appends (that IS the spec, and it is the empty-container case the mounts rely on).
+    insertBefore: function (el, ref) {
+      if (el.parentNode) el.parentNode.removeChild(el);
+      var i = ref ? this.childNodes.indexOf(ref) : -1;
+      if (ref && i === -1) throw new Error('insertBefore: reference node is not a child');
+      if (i === -1) this.childNodes.push(el); else this.childNodes.splice(i, 0, el);
+      el.parentNode = this;
+      return el;
+    },
+    appendChild: function (el) { return this.insertBefore(el, null); },
+    removeChild: function (el) {
+      var i = this.childNodes.indexOf(el);
+      if (i === -1) throw new Error('removeChild: not a child');
+      this.childNodes.splice(i, 1);
+      el.parentNode = null;
+      return el;
+    },
+    setAttribute: function () {},
+    // Present so XtermTerminal's own pane can be one of these too: `.xterm-screen` never exists
+    // here, which _correctFitOverflow treats as a safe no-op (its `if (!screenEl) return` guard).
+    querySelector: function () { return null; },
+    getBoundingClientRect: function () { return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }; },
+  };
+  var __classes = new Set();
+  node.classList = {
+    add: function (c) { __classes.add(c); },
+    remove: function (c) { __classes.delete(c); },
+    contains: function (c) { return __classes.has(c); },
+    toggle: function (c, force) {
+      if (force === undefined) { __classes.has(c) ? __classes.delete(c) : __classes.add(c); }
+      else if (force) __classes.add(c); else __classes.delete(c);
+    },
+  };
+  Object.defineProperty(node, 'firstChild', {
+    get: function () { return this.childNodes.length ? this.childNodes[0] : null; },
+  });
+  Object.defineProperty(node, 'nextSibling', {
+    get: function () {
+      if (!this.parentNode) return null;
+      var i = this.parentNode.childNodes.indexOf(this);
+      return (i !== -1 && i + 1 < this.parentNode.childNodes.length)
+        ? this.parentNode.childNodes[i + 1] : null;
+    },
+  });
+  Object.defineProperty(node, 'innerHTML', {
+    get: function () { return this.__html || ''; },
+    set: function (v) { this.__html = v; this.childNodes.length = 0; },
+  });
+  return node;
+}
+
+// Reads back what a viewer would actually SEE: the text of every .vtnotice banner in `container`,
+// top to bottom. Goes through textContent only -- if the implementation ever switched to innerHTML
+// this returns '' and every text assertion below fails, which is the point.
+function __bannerTexts(container) {
+  return container.childNodes
+    .filter(function (n) { return n.className === 'vtnotice'; })
+    .map(function (n) { return n.childNodes.map(function (s) { return s.textContent; }).join(''); });
+}
+"""
+
+# The MOUNT's own wiring, verbatim in spirit with `_wireModalTerm` / bootStandalone's
+# `mountRenderer`: forward the renderer's notice into the shared banner, and hand the terminal one
+# measureAndResize() only when the DOM actually changed.
+_NOTICE_MOUNT_WIRING = """
+function __wireMount(term, banner) {
+  term.__resizes = 0;
+  term.measureAndResize = function () { term.__resizes++; };
+  term._onNotice = function (n) { if (banner.show(n)) term.measureAndResize(); };
+}
+"""
+
+
+class TestNoticeBannerXtermPath(unittest.TestCase):
+    """The GAP this task closed, executed: the xterm renderer -- the DEFAULT -- drew no notice
+    banner at all. `/api/term/raw` emits `event: notice\\ndata: {"seq":<int>,"text":"<str>"}`
+    (verified on the wire against term_vt._raw_stream_body), and `_openStream`'s
+    addEventListener("notice", ...) must turn that into a real banner through the shared,
+    mount-owned helper."""
+
+    def _script(self, body):
+        return (_HARNESS_PRELUDE + _xterm_leak_harness() + _NOTICE_DOM_MOCKS
+                + _NOTICE_BANNER_SRC + _XTERM_LEAK_SRC + _NOTICE_MOUNT_WIRING
+                # Every element XtermTerminal builds is a real tree node here too, so the pane and
+                # the banners live in one consistent DOM.
+                + "\ndocument.createElement = __makeNode;\n" + body)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_named_notice_event_on_the_raw_stream_raises_a_banner(self):
+        result = _run_node(self._script("""
+var mount = __makeNode('div');
+var banner = createNoticeBanner(mount);
+var term = new XtermTerminal(makeContainer(), 'tty-1', _noopRendererSwitch);
+__wireMount(term, banner);
+term.attach();
+resolveNextAssetLoad();
+setTimeout(function () {
+  var listeners = term.es.__listenerCount('notice');
+  term.es.__emit('notice', JSON.stringify({ seq: 1, text: 'the resume was refused' }));
+  console.log(JSON.stringify({
+    listeners: listeners,
+    texts: __bannerTexts(mount),
+    resizes: term.__resizes,
+  }));
+}, 0);
+"""))
+        self.assertEqual(result["listeners"], 1,
+                          "_openStream must subscribe to the stream's named `notice` event")
+        self.assertEqual(result["texts"], ["the resume was refused"],
+                          "a `notice` frame on /api/term/raw must raise a real .vtnotice banner")
+        self.assertEqual(result["resizes"], 1,
+                          "a new banner shrinks the pane -- the mount must renegotiate the rows")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_unnamed_data_frames_never_become_banners(self):
+        """The raw stream's UNNAMED frames are base64 PTY bytes. A regression that listened on
+        onmessage instead of the named event would both corrupt the terminal and raise garbage
+        banners; this pins that the two channels stay separate."""
+        result = _run_node(self._script("""
+var mount = __makeNode('div');
+var banner = createNoticeBanner(mount);
+var term = new XtermTerminal(makeContainer(), 'tty-1', _noopRendererSwitch);
+__wireMount(term, banner);
+term.attach();
+resolveNextAssetLoad();
+setTimeout(function () {
+  term.es.onmessage({ data: Buffer.from('plain pty bytes').toString('base64') });
+  console.log(JSON.stringify({ texts: __bannerTexts(mount) }));
+}, 0);
+"""))
+        self.assertEqual(result["texts"], [])
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_malformed_notice_frame_is_ignored_not_thrown(self):
+        result = _run_node(self._script("""
+var mount = __makeNode('div');
+var banner = createNoticeBanner(mount);
+var term = new XtermTerminal(makeContainer(), 'tty-1', _noopRendererSwitch);
+__wireMount(term, banner);
+term.attach();
+resolveNextAssetLoad();
+setTimeout(function () {
+  var threw = false;
+  try { term.es.__emit('notice', 'not json at all'); } catch (e) { threw = true; }
+  term.es.__emit('notice', JSON.stringify({ seq: 4, text: 'still working' }));
+  console.log(JSON.stringify({ threw: threw, texts: __bannerTexts(mount) }));
+}, 0);
+"""))
+        self.assertFalse(result["threw"], "a malformed frame must not throw out of the listener")
+        self.assertEqual(result["texts"], ["still working"],
+                          "the stream must keep working after a malformed frame")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_destroy_removes_the_notice_listener_and_closes_the_stream(self):
+        """Teardown discipline, executed: destroy() goes through _closeStream, which removes the
+        named-event listener BY REFERENCE and then closes the stream. A leaked listener would keep
+        firing `_onNotice` into a mount whose terminal is gone."""
+        result = _run_node(self._script("""
+var mount = __makeNode('div');
+var banner = createNoticeBanner(mount);
+var term = new XtermTerminal(makeContainer(), 'tty-1', _noopRendererSwitch);
+__wireMount(term, banner);
+term.attach();
+resolveNextAssetLoad();
+setTimeout(function () {
+  var es = term.es;                       // destroy() nulls term.es -- keep our own handle
+  var before = es.__listenerCount('notice');
+  term.destroy();
+  var after = es.__listenerCount('notice');
+  es.__emit('notice', JSON.stringify({ seq: 9, text: 'after teardown' }));
+  console.log(JSON.stringify({
+    before: before, after: after, closed: es.closed,
+    texts: __bannerTexts(mount), esNulled: term.es === null,
+  }));
+}, 0);
+"""))
+        self.assertEqual(result["before"], 1)
+        self.assertEqual(result["after"], 0, "destroy() must remove the `notice` listener")
+        self.assertTrue(result["closed"])
+        self.assertTrue(result["esNulled"])
+        self.assertEqual(result["texts"], [],
+                          "a torn-down terminal must not still be able to raise banners")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_reopening_the_stream_does_not_stack_notice_listeners(self):
+        """_openStream replaces the stream (it is called again on a reconnect path); it must tear
+        the old subscription down rather than leave the previous EventSource holding one."""
+        result = _run_node(self._script("""
+var mount = __makeNode('div');
+var banner = createNoticeBanner(mount);
+var term = new XtermTerminal(makeContainer(), 'tty-1', _noopRendererSwitch);
+__wireMount(term, banner);
+term.attach();
+resolveNextAssetLoad();
+setTimeout(function () {
+  var first = term.es;
+  term._openStream();
+  console.log(JSON.stringify({
+    firstClosed: first.closed,
+    firstListeners: first.__listenerCount('notice'),
+    secondListeners: term.es.__listenerCount('notice'),
+    isNewStream: term.es !== first,
+  }));
+}, 0);
+"""))
+        self.assertTrue(result["isNewStream"])
+        self.assertTrue(result["firstClosed"])
+        self.assertEqual(result["firstListeners"], 0,
+                          "the replaced stream must not keep its `notice` listener")
+        self.assertEqual(result["secondListeners"], 1)
+
+
+class TestNoticeBannerGridPath(unittest.TestCase):
+    """REGRESSION guard for collapsing the three copies: the grid renderer's own trigger -- the
+    `notices` array inside /api/term/screen's JSON frame -- must still reach the same shared
+    banner, now via `_onNotice` instead of the deleted `Terminal.prototype._displayNotice`."""
+
+    @staticmethod
+    def _grid_self():
+        return """
+function makeGridSelf() {
+  return {
+    pane: __makeNode('div'),
+    grid: [], cursor: [0, 0], version: 0, alt: false, starting: false,
+    cursorVisible: true, bracketedPaste: false, focusEvents: false,
+    mouse: { mode: 0, sgr: false },
+    _refreshMouseToggle: null, _bellSeen: null, viewingHistory: false,
+    _onStatusChange: null, _onNotice: null,
+    _paintRow: function () {}, _layoutCursor: function () {},
+    _updateNewOutputBadge: function () {}, _flashBell: function () {},
+    _applyPatch: Terminal.prototype._applyPatch,
+  };
+}
+"""
+
+    def _script(self, body):
+        return (_HARNESS_PRELUDE + _NOTICE_DOM_MOCKS + _NOTICE_BANNER_SRC + _APPLY_PATCH_SRC
+                + _NOTICE_MOUNT_WIRING + self._grid_self()
+                + "\nvar document = { createElement: __makeNode };\n" + body)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_notices_in_the_json_frame_still_raise_banners(self):
+        result = _run_node(self._script("""
+var mount = __makeNode('div');
+var banner = createNoticeBanner(mount);
+var term = makeGridSelf();
+__wireMount(term, banner);
+term._applyPatch({ v: 1, notices: [{ seq: 1, text: 'first' }, { seq: 2, text: 'second' }] });
+console.log(JSON.stringify({ texts: __bannerTexts(mount), resizes: term.__resizes }));
+"""))
+        self.assertEqual(result["texts"], ["first", "second"],
+                          "the grid renderer's JSON-frame notices must still become banners")
+        self.assertEqual(result["resizes"], 2)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_absent_or_malformed_notices_key_is_a_no_op(self):
+        """Older server, or a frame with no notices at all -- the defensive read `_applyPatch`
+        always had must survive the refactor."""
+        result = _run_node(self._script("""
+var mount = __makeNode('div');
+var banner = createNoticeBanner(mount);
+var term = makeGridSelf();
+__wireMount(term, banner);
+var threw = false;
+try {
+  term._applyPatch({ v: 1 });                       // key absent entirely
+  term._applyPatch({ v: 2, notices: null });        // present but null
+  term._applyPatch({ v: 3, notices: 'nope' });      // present but not an array
+  term._applyPatch({ v: 4, notices: [{ seq: 1 }] }); // an entry with no text at all
+} catch (e) { threw = true; }
+console.log(JSON.stringify({ threw: threw, texts: __bannerTexts(mount) }));
+"""))
+        self.assertFalse(result["threw"])
+        self.assertEqual(result["texts"], [])
+
+
+class TestNoticeBannerSharedPolicy(unittest.TestCase):
+    """The policy that used to be duplicated per renderer -- seq dedupe, the 3-banner cap, escaping,
+    insertion position -- now lives once in createNoticeBanner. These execute it directly, which is
+    also what makes it true for BOTH renderers at once."""
+
+    def _script(self, body):
+        return (_HARNESS_PRELUDE + _NOTICE_DOM_MOCKS + _NOTICE_BANNER_SRC
+                + "\nvar document = { createElement: __makeNode };\n" + body)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_replayed_seq_is_suppressed_but_a_higher_seq_still_shows(self):
+        """EventSource auto-retries the transport on its own, and the server replays from seq 0 for
+        the reconnected viewer -- so the SAME notices arrive again. Already-displayed ones must not
+        re-flash; anything genuinely new must."""
+        result = _run_node(self._script("""
+var mount = __makeNode('div');
+var b = createNoticeBanner(mount);
+var shown = [];
+shown.push(b.show({ seq: 1, text: 'one' }));
+shown.push(b.show({ seq: 2, text: 'two' }));
+// ---- transport reconnect: the server replays from seq 0 ----
+shown.push(b.show({ seq: 1, text: 'one' }));
+shown.push(b.show({ seq: 2, text: 'two' }));
+shown.push(b.show({ seq: 3, text: 'three' }));   // genuinely new
+console.log(JSON.stringify({ shown: shown, texts: __bannerTexts(mount) }));
+"""))
+        self.assertEqual(result["shown"], [True, True, False, False, True])
+        self.assertEqual(result["texts"], ["one", "two", "three"],
+                          "a replayed notice must not be raised twice, a new one must be")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_a_new_viewer_gets_the_whole_replay_as_banners(self):
+        """The other half of the same server behaviour: a viewer attaching LATE receives every
+        queued notice from seq 1. A fresh mount has seen nothing, so all of them must show."""
+        result = _run_node(self._script("""
+var mount = __makeNode('div');
+var b = createNoticeBanner(mount);
+[{ seq: 1, text: 'a' }, { seq: 2, text: 'b' }].forEach(function (n) { b.show(n); });
+console.log(JSON.stringify({ texts: __bannerTexts(mount) }));
+"""))
+        self.assertEqual(result["texts"], ["a", "b"])
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_stack_caps_at_three_and_evicts_the_oldest(self):
+        result = _run_node(self._script("""
+var mount = __makeNode('div');
+var b = createNoticeBanner(mount);
+for (var i = 1; i <= 5; i++) b.show({ seq: i, text: 'n' + i });
+console.log(JSON.stringify({ texts: __bannerTexts(mount), children: mount.childNodes.length }));
+"""))
+        self.assertEqual(result["texts"], ["n3", "n4", "n5"],
+                          "the cap is 3 displayed banners, oldest evicted first")
+        self.assertEqual(result["children"], 3,
+                          "an evicted banner must leave the DOM, not just the tracking array")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_text_is_escaped_via_textContent_never_parsed_as_html(self):
+        """Notice text is SERVER-supplied. `__bannerTexts` reads textContent only, so a switch to
+        innerHTML would make this return the empty string rather than the markup."""
+        result = _run_node(self._script("""
+var mount = __makeNode('div');
+var b = createNoticeBanner(mount);
+b.show({ seq: 1, text: '<img src=x onerror=alert(1)>' });
+var banner = mount.childNodes[0];
+console.log(JSON.stringify({
+  texts: __bannerTexts(mount),
+  bannerInnerHtml: banner.__html || '',
+  spanInnerHtml: banner.childNodes[0].__html || '',
+  className: banner.className,
+}));
+"""))
+        self.assertEqual(result["texts"], ["<img src=x onerror=alert(1)>"],
+                          "the raw text must land in textContent, verbatim and inert")
+        self.assertEqual(result["bannerInnerHtml"], "")
+        self.assertEqual(result["spanInnerHtml"], "",
+                          "nothing may be assigned through innerHTML on the notice path")
+        self.assertEqual(result["className"], "vtnotice")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_empty_and_seqless_notices(self):
+        """An empty/absent text is dropped (there is nothing to say); a notice with NO seq -- the
+        open-time advisory from POST /api/term/pty's response, or the ?notice= link -- is always
+        shown, because it has no position in the stream to be deduped against."""
+        result = _run_node(self._script("""
+var mount = __makeNode('div');
+var b = createNoticeBanner(mount);
+var shown = [
+  b.show({ seq: 1, text: '' }),
+  b.show({ seq: 2 }),
+  b.show(null),
+  b.show({ text: 'open-time advisory' }),
+  b.show({ text: 'another seqless one' }),
+  b.show({ seq: 1, text: 'streamed one' }),
+];
+console.log(JSON.stringify({ shown: shown, texts: __bannerTexts(mount) }));
+"""))
+        self.assertEqual(result["shown"], [False, False, False, True, True, True])
+        self.assertEqual(result["texts"],
+                          ["open-time advisory", "another seqless one", "streamed one"],
+                          "a seqless notice must never consume or be blocked by the seq tracker")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_banners_stay_above_the_terminal_in_arrival_order(self):
+        """The mount's container also holds .vttermwrap / .vtctxbar / .vtfullstatus. A banner
+        raised long after those exist must still land ABOVE the terminal, and after the banners
+        already on screen -- never reversed, never below the pane."""
+        result = _run_node(self._script("""
+var mount = __makeNode('div');
+var b = createNoticeBanner(mount);
+b.show({ text: 'open-time' });          // raised BEFORE the terminal exists
+var wrap = __makeNode('div'); wrap.className = 'vttermwrap'; mount.appendChild(wrap);
+var status = __makeNode('div'); status.className = 'vtfullstatus'; mount.appendChild(status);
+b.show({ seq: 1, text: 'mid-session' }); // raised long AFTER
+b.show({ seq: 2, text: 'later still' });
+console.log(JSON.stringify({
+  order: mount.childNodes.map(function (n) { return n.className; }),
+  texts: __bannerTexts(mount),
+}));
+"""))
+        self.assertEqual(result["order"],
+                          ["vtnotice", "vtnotice", "vtnotice", "vttermwrap", "vtfullstatus"])
+        self.assertEqual(result["texts"], ["open-time", "mid-session", "later still"])
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_clear_removes_the_banners_and_resets_the_seq_tracker(self):
+        """clear() is what openVT/closeVT call for a NEW pty, whose seqs restart at 1 -- so it must
+        reset the high-water mark, not only the DOM, or the next pty's notices would be swallowed."""
+        result = _run_node(self._script("""
+var mount = __makeNode('div');
+var b = createNoticeBanner(mount);
+b.show({ seq: 1, text: 'old pty' });
+b.show({ seq: 2, text: 'old pty 2' });
+b.clear();
+var afterClear = mount.childNodes.length;
+var reshown = b.show({ seq: 1, text: 'new pty seq 1' });
+console.log(JSON.stringify({ afterClear: afterClear, reshown: reshown, texts: __bannerTexts(mount) }));
+"""))
+        self.assertEqual(result["afterClear"], 0)
+        self.assertTrue(result["reshown"],
+                         "after clear(), a fresh pty's seq 1 must not be suppressed as a replay")
+        self.assertEqual(result["texts"], ["new pty seq 1"])
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_banners_survive_a_renderer_switch_without_reflashing(self):
+        """BEHAVIOUR CHANGE, pinned deliberately. Terminal.prototype.destroy used to drop both the
+        banner elements AND the seq tracker, so switching renderers re-showed every notice as the
+        rebuilt renderer replayed them. The tracker now belongs to the MOUNT, which a switch does
+        not touch (only closeVT/openVT clear it) -- so the banners simply stay put, exactly like
+        the ContextBar both switch paths deliberately re-wire rather than destroy."""
+        result = _run_node(self._script("""
+var mount = __makeNode('div');
+var b = createNoticeBanner(mount);
+b.show({ seq: 1, text: 'refused resume' });
+var before = __bannerTexts(mount);
+// ---- switchActiveRenderer / mountRenderer: old term destroyed, new one attached to the SAME
+// pty, whose stream replays from seq 0 for this fresh viewer. The mount is untouched. ----
+b.show({ seq: 1, text: 'refused resume' });
+console.log(JSON.stringify({ before: before, after: __bannerTexts(mount) }));
+"""))
+        self.assertEqual(result["before"], ["refused resume"])
+        self.assertEqual(result["after"], ["refused resume"],
+                          "a renderer switch must neither drop nor duplicate a standing banner")
 
 
 if __name__ == "__main__":

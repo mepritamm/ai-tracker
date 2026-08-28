@@ -6,13 +6,37 @@ proxied requests refused, term_gate first) is tested with a fake handler. No tes
 a real `osascript`: every path either returns an error response *before* that call, or patches
 `term_launch.subprocess.run` -- so running this suite never pops a Terminal/iTerm window.
 """
+import json
 import os
 import re
 import shlex
+import shutil
+import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
 from aitracker import config, term_gate, term_launch
+
+
+def _iter_named_functions(src):
+    """Yields (name, full source including braces) for every `function name(...) { ... }` /
+    `async function name(...) { ... }` declaration in `src`, body extracted by brace-matching (not
+    a fixed-indent guess like the "\\n  }" trick this file's other source-text tests use) -- so it
+    stays correct regardless of how deeply the function's own body happens to be indented."""
+    for m in re.finditer(r"(?:async\s+)?function\s+(\w+)\s*\([^)]*\)\s*\{", src):
+        name = m.group(1)
+        i = m.end() - 1  # index of the opening '{'
+        depth = 0
+        while i < len(src):
+            if src[i] == "{":
+                depth += 1
+            elif src[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        yield name, src[m.end() - 1:i + 1]
 
 
 def _applescript_unescape(s):
@@ -595,6 +619,423 @@ class TestRouteRegistered(unittest.TestCase):
     def test_open_terminal_registered_into_extra_post(self):
         from aitracker import server
         self.assertIs(server.EXTRA_POST.get("/api/term/open"), term_launch.open_terminal)
+
+
+_APP_JS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "aitracker", "web", "app.js")
+
+
+class TestSidebarPollCarriesTermCount(unittest.TestCase):
+    """app.js's global `termCount` and the `SIDE_EXT` hook array (parallel to the existing `EXT`
+    array, but fired after every SIDEBAR poll -- loadSide() -- not just while a session is
+    selected). Asserted against the asset's source: there is no JS engine here."""
+
+    def setUp(self):
+        self.src = open(_APP_JS, encoding="utf-8").read()
+
+    def test_term_count_global_declared(self):
+        self.assertIn("let termCount=null;", self.src)
+
+    def test_side_ext_array_declared(self):
+        self.assertIn("const SIDE_EXT=[];", self.src)
+
+    def test_loadside_reads_the_header_into_term_count(self):
+        i = self.src.index("async function loadSide()")
+        seg = self.src[i:i + 700]
+        self.assertIn('res.headers.get("X-Term-Count")', seg)
+        self.assertIn("termCount=", seg)
+
+    def test_loadside_falls_back_to_null_when_header_absent(self):
+        # fetch's Headers.get() returns null, not undefined, for a missing header -- the ternary
+        # must check against that, not just falsiness (0 is a valid, falsy count that must NOT
+        # collapse to null).
+        i = self.src.index("async function loadSide()")
+        seg = self.src[i:i + 700]
+        self.assertIn("tc!==null", seg)
+
+    def test_loadside_fires_side_ext_after_rendering(self):
+        i = self.src.index("async function loadSide()")
+        end = self.src.index("\n}", i)
+        body = self.src[i:end]
+        self.assertIn("SIDE_EXT.forEach", body)
+        # renderSide() must run first -- SIDE_EXT hooks (the badge) rebuild off DOM renderSide
+        # just produced, not the other way around.
+        self.assertLess(body.index("renderSide();"), body.index("SIDE_EXT.forEach"))
+
+    def test_no_second_polling_timer_was_introduced(self):
+        # the gap this closes is explicitly about NOT adding a new timer -- the only two
+        # setInterval calls in the whole SPA must still be the pre-existing sidebar (5s) and
+        # per-session (2s) polls.
+        self.assertEqual(self.src.count("setInterval("), 2)
+
+    def test_no_recursive_settimeout_poll_disguised_as_a_one_shot_timer(self):
+        """Adversarial review finding: `count("setInterval(") == 2` alone stays green if a SECOND
+        poll is added shaped as a self-rescheduling `setTimeout` instead of `setInterval` -- a
+        function like `function f(){ fetch(...); ...; setTimeout(f, N); }` never adds a literal
+        "setInterval(" anywhere, so the count-based assertion above cannot see it. This walks every
+        named function in app.js (brace-matched, not regex-guessed) and flags any whose body BOTH
+        calls `fetch(` and reschedules ITSELF via `setTimeout(<its own name>` -- the exact
+        fingerprint of a recursive polling loop. Legitimate one-shot timers in this file (the
+        180ms search debounce, toast auto-dismiss, "✓ Copied" reverts, flash-class cleanup) all
+        pass: none of them references its own enclosing function name inside a setTimeout call, so
+        none of them is caught here.
+
+        This is still a structural/source-text check, not an executing one -- app.js is the SPA's
+        state/poll layer (not a pure DOM function), so it doesn't fit this repo's node/DOM-exec
+        harness pattern the way aitracker/web/ext_launch.js's renderTermBadge does (see
+        TestTermCountBadgeClientExecuted below). It is, however, a materially stronger structural
+        check than a bare setInterval() count: it inspects what each function's body actually DOES
+        (fetch + self-reschedule), not just which timer API name appears in the file.
+        """
+        offenders = []
+        for name, body in _iter_named_functions(self.src):
+            if "fetch(" in body and re.search(r"setTimeout\(\s*" + re.escape(name) + r"\b", body):
+                offenders.append(name)
+        self.assertEqual(offenders, [],
+                          "recursive setTimeout-driven fetch poll found in: %r" % offenders)
+
+    def test_known_pollers_still_use_setinterval_not_a_recursive_settimeout(self):
+        # Belt and braces on the same defect from the other direction: the two functions the
+        # legitimate pollers actually call (poll/loadSide, scheduled via setInterval at start()/
+        # track()) must not themselves contain ANY setTimeout call -- if a future edit converted
+        # either to self-rescheduling via setTimeout, this catches it even before it grows a
+        # fetch() call of its own (which is what the offender-scan above keys on).
+        seen = set()
+        for name, body in _iter_named_functions(self.src):
+            if name in ("poll", "loadSide"):
+                seen.add(name)
+                self.assertNotIn("setTimeout(", body, "%s must not self-reschedule" % name)
+        self.assertEqual(seen, {"poll", "loadSide"})
+
+
+class TestTermCountBadgeClient(unittest.TestCase):
+    """The badge itself (aitracker/web/ext_launch.js): rendered from the SERVER's number,
+    absent (not "0") when the server omits it, rides the existing sidebar poll, and is never
+    host-gated. Asserted against the asset's source, same as the classes above."""
+
+    def setUp(self):
+        self.src = open(_EXT_LAUNCH_JS, encoding="utf-8").read()
+
+    def test_registers_into_side_ext_not_a_new_timer(self):
+        self.assertIn("SIDE_EXT.push(renderTermBadge);", self.src)
+        self.assertNotIn("setInterval", self.src)
+        # Also forbid setTimeout outright: this file has zero timer usage today (the badge rides
+        # app.js's existing sidebar poll via SIDE_EXT), so a recursive `setTimeout`-driven poll
+        # smuggled in here -- which a bare setInterval-count check elsewhere can't see, since it
+        # never touches that literal -- is caught immediately by this file containing the string
+        # at all, with no need to reason about self-reference the way app.js's check must.
+        self.assertNotIn("setTimeout", self.src)
+
+    def test_never_fetches_term_list_outside_the_panel(self):
+        # the panel itself (window.ExtVT.manage()) owns GET /api/term/list -- this file must
+        # never call it directly, on a tick or otherwise; the count comes from app.js's
+        # X-Term-Count-derived `termCount` global instead. A comment may name the route (to
+        # explain why it's avoided); actually fetching it is what must never appear.
+        self.assertNotIn('fetch("/api/term/list', self.src)
+        self.assertNotIn("fetch('/api/term/list", self.src)
+
+    def test_badge_reads_the_server_global_not_a_recomputed_value(self):
+        start = self.src.index("function renderTermBadge()")
+        end = self.src.index("\n  }", start)
+        body = self.src[start:end]
+        self.assertIn("termCount", body)
+        # it must not derive its own count from anything DOM/session-shaped -- only the one
+        # server-supplied number, formatted.
+        self.assertNotIn("sessions.", body)
+        self.assertNotIn(".length", body)
+
+    def test_absent_not_zero_when_server_omits_the_count(self):
+        start = self.src.index("function renderTermBadge()")
+        end = self.src.index("\n  }", start)
+        body = self.src[start:end]
+        # null (not a number) removes/never creates the badge element entirely
+        self.assertIn('typeof termCount !== "number"', body)
+        self.assertIn("badge.remove()", body)
+        # the zero case is handled separately, further down the same function, and must still
+        # render (not be folded into the same early-return as the absent case)
+        self.assertNotIn("termCount === 0", body[:body.index("badge.remove()")])
+
+    def test_badge_never_gated_by_host(self):
+        start = self.src.index("function renderTermBadge()")
+        end = self.src.index("\n  }", start)
+        body = self.src[start:end]
+        self.assertNotIn("location.hostname", body)
+        self.assertNotIn("localOnly", body)
+
+    def test_badge_distinguishes_zero_from_positive_counts(self):
+        start = self.src.index("function renderTermBadge()")
+        end = self.src.index("\n  }", start)
+        body = self.src[start:end]
+        self.assertIn('classList.toggle("live", termCount > 0)', body)
+
+    def test_build_side_controls_repaints_the_badge_after_rebuilding_the_button(self):
+        # the button's innerHTML is fully replaced on every buildSideControls() call (e.g. a
+        # rename-free re-render never happens today, but nothing prevents a future one) -- the
+        # badge element would be silently destroyed along with it unless repainted right after.
+        start = self.src.index("function buildSideControls()")
+        end = self.src.index("function renderTermBadge()")
+        body = self.src[start:end]
+        self.assertIn("renderTermBadge();", body)
+
+
+# ===== executing harness for renderTermBadge (aitracker/web/ext_launch.js) =====================
+# TestTermCountBadgeClient above (and the classes before it) only ever `assertIn`/`assertNotIn`
+# against ext_launch.js's SOURCE TEXT -- it can confirm the shape of the fix (which literal guard
+# appears, which classList call is present) but it never actually RUNS renderTermBadge, so it
+# cannot fail against a real behavioural bug. That is exactly how a real data-loss bug shipped
+# once already in this repo's terminal work: a double-click that SIGKILLed every running terminal
+# without ever showing the confirmation sailed past 15 source-text-grep tests, because none of
+# them executed the code (see tests/test_term_vt_exec.py's own module docstring for the full
+# account, and its _MANAGER_MOCKS-based tests for the fix). This section closes the same class of
+# gap for renderTermBadge specifically: it slices the real function verbatim out of the shipped
+# ext_launch.js (never retyped) and executes it under Node against a minimal stub DOM, following
+# the extraction/`_run_node` pattern tests/test_term_vt_exec.py already established for ext_vt.js.
+#
+# Concretely, this closes two named weaknesses from that source-text suite:
+#   - test_absent_not_zero_when_server_omits_the_count only checks that the literal string
+#     "termCount === 0" does not appear in the source before "badge.remove()". A guard WIDENED to
+#     `!termCount` (which also treats a legitimate 0 as absent) contains that literal exactly as
+#     little as the correct `typeof termCount !== "number" || !isFinite(termCount)` guard does --
+#     the test cannot tell them apart. Running the real function against termCount===0 can.
+#   - test_no_second_polling_timer_was_introduced (TestSidebarPollCarriesTermCount, above) counted
+#     literal setInterval() calls, which a recursive setTimeout poll would not touch at all; see
+#     the strengthened structural checks added next to it for that half of the gap.
+#
+# Node is NOT a dependency of this project (CLAUDE.md: "stdlib only"; conventions.md rule 2) --
+# this whole section is skipped when `node` isn't on PATH, so `make check` stays green on a
+# machine without it, exactly like tests/test_term_vt_exec.py's own `_HAS_NODE` gate.
+_HAS_NODE = shutil.which("node") is not None
+
+
+def _run_node(js_source):
+    """Writes `js_source` to a temp file, runs it with `node`, and returns the JSON the script's
+    own final `console.log(JSON.stringify(...))` printed. Identical contract to
+    tests/test_term_vt_exec.py's own `_run_node` (kept as a self-contained duplicate here rather
+    than imported, so this file's node harness has no import-time dependency on that module)."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "harness.js")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(js_source)
+        proc = subprocess.run(["node", path], capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        raise AssertionError(
+            "node harness exited %d\n--- stdout ---\n%s\n--- stderr ---\n%s"
+            % (proc.returncode, proc.stdout, proc.stderr)
+        )
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except Exception as e:
+        raise AssertionError(
+            "could not parse JSON from node harness output: %r\nfull stdout:\n%s\nstderr:\n%s"
+            % (e, proc.stdout, proc.stderr)
+        )
+
+
+def _extract_render_term_badge():
+    """Slices the real `renderTermBadge` function verbatim out of the shipped ext_launch.js, by
+    literal span from its declaration through the first dedent back to its own 2-space indent
+    level -- the same "\\n  }" fixed-indent technique TestTermCountBadgeClient above already
+    relies on (13 existing source-text tests depend on that same boundary being correct), so this
+    reuses a boundary already validated rather than inventing a second extraction strategy."""
+    src = open(_EXT_LAUNCH_JS, encoding="utf-8").read()
+    start = src.index("function renderTermBadge() {")
+    end = src.index("\n  }", start) + len("\n  }")
+    return src[start:end]
+
+
+# Minimal fake DOM: exactly the surface renderTermBadge touches (document.getElementById/
+# createElement, element id/className/textContent/title, classList.add/remove/toggle/contains,
+# appendChild, and Element.remove()'s real semantics -- detach from whatever parent recorded it).
+# Mirrors tests/test_term_vt_exec.py's own `__makeEl` helper in spirit (same shape: a plain object
+# with a hand-rolled classList), scoped down to only what this one function needs.
+_BADGE_DOM_HARNESS = """
+'use strict';
+
+function __makeEl(tag) {
+  var classes = new Set();
+  var el = {
+    tagName: tag, id: '', className: '', textContent: '', title: '',
+    parentNode: null, children: [],
+    appendChild: function (child) { child.parentNode = el; el.children.push(child); return child; },
+    remove: function () {
+      if (el.parentNode) {
+        var i = el.parentNode.children.indexOf(el);
+        if (i !== -1) el.parentNode.children.splice(i, 1);
+        el.parentNode = null;
+      }
+    },
+  };
+  el.classList = {
+    add: function (c) { classes.add(c); },
+    remove: function (c) { classes.delete(c); },
+    toggle: function (c, force) {
+      if (force === undefined) { classes.has(c) ? classes.delete(c) : classes.add(c); }
+      else if (force) classes.add(c); else classes.delete(c);
+    },
+    contains: function (c) { return classes.has(c); },
+  };
+  return el;
+}
+
+var __root = { children: [] };
+function __findById(nodes, id) {
+  for (var i = 0; i < nodes.length; i++) {
+    if (nodes[i].id === id) return nodes[i];
+    var found = __findById(nodes[i].children, id);
+    if (found) return found;
+  }
+  return null;
+}
+var document = {
+  createElement: function (tag) { return __makeEl(tag); },
+  getElementById: function (id) { return __findById(__root.children, id); },
+};
+
+// The one pre-existing element renderTermBadge requires ("if (!mt) return;" is the early-out for
+// its ABSENCE, not exercised here -- every test below wants the badge logic to actually run).
+var mt = __makeEl('button');
+mt.id = 'sidemanagetermbtn';
+__root.children.push(mt);
+
+var termCount = null;   // app.js's real global; each test overwrites this before calling render
+"""
+
+
+def _badge_observation_snippet():
+    """Appended after each renderTermBadge() call in a test script: reports everything the
+    assertions below need in one JSON blob, including `mtChildCount` (how many children the
+    button actually has right now) -- the guard against a badge getting appended TWICE across
+    repeated calls instead of being reused."""
+    return """
+var __badge = document.getElementById('sidetermbadge');
+console.log(JSON.stringify({
+  badgeExists: !!__badge,
+  text: __badge ? __badge.textContent : null,
+  live: __badge ? __badge.classList.contains('live') : null,
+  title: __badge ? __badge.title : null,
+  className: __badge ? __badge.className : null,
+  mtChildCount: mt.children.length,
+}));
+"""
+
+
+@unittest.skipUnless(_HAS_NODE, "node not on PATH")
+class TestTermCountBadgeExecuted(unittest.TestCase):
+    """Executes the real renderTermBadge -- see the module-level comment block above this class
+    for why TestTermCountBadgeClient's source-text tests can't catch what these do."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._fn_src = _extract_render_term_badge()
+
+    def _run(self, term_count_js_literal, extra=""):
+        script = (
+            _BADGE_DOM_HARNESS
+            + self._fn_src
+            + "\ntermCount = %s;\n" % term_count_js_literal
+            + extra
+            + "renderTermBadge();\n"
+            + _badge_observation_snippet()
+        )
+        return _run_node(script)
+
+    def test_zero_count_renders_a_badge_showing_0_and_is_not_removed(self):
+        # The exact case the source-text guard-literal check cannot see (see module comment):
+        # termCount === 0 is a NUMBER, so the real guard (`typeof !== "number" || !isFinite`) must
+        # NOT treat it as absent. A regression widened to `!termCount` would fail this.
+        r = self._run("0")
+        self.assertTrue(r["badgeExists"], "a 0 count must still render a badge, not remove it")
+        self.assertEqual(r["text"], "0")
+        self.assertFalse(r["live"], "0 running terminals must not get the 'live' highlight")
+        self.assertEqual(r["mtChildCount"], 1)
+        self.assertIn("0 terminals running now", r["title"])
+
+    def test_null_count_renders_no_badge_at_all(self):
+        # Server omitted X-Term-Count (feature off, or gated without TRACKER_AUTH) -> app.js's
+        # loadSide() leaves termCount === null. No badge must exist -- not a "0" badge.
+        r = self._run("null")
+        self.assertFalse(r["badgeExists"])
+        self.assertEqual(r["mtChildCount"], 0)
+
+    def test_positive_count_renders_the_number_and_the_live_class(self):
+        r = self._run("3")
+        self.assertTrue(r["badgeExists"])
+        self.assertEqual(r["text"], "3")
+        self.assertTrue(r["live"])
+        self.assertIn("3 terminals running now", r["title"])
+
+    def test_singular_terminal_wording_for_count_one(self):
+        r = self._run("1")
+        self.assertEqual(r["text"], "1")
+        self.assertTrue(r["live"])
+        self.assertIn("1 terminal running now", r["title"])
+        self.assertNotIn("1 terminals", r["title"])
+
+    def test_two_digit_count_renders_correctly(self):
+        # Reviewer-flagged legibility case: nothing in renderTermBadge truncates/formats the
+        # number specially, but this proves it end to end rather than assuming String(12) is fine.
+        r = self._run("12")
+        self.assertTrue(r["badgeExists"])
+        self.assertEqual(r["text"], "12")
+        self.assertTrue(r["live"])
+        self.assertIn("12 terminals running now", r["title"])
+        self.assertEqual(r["mtChildCount"], 1)
+
+    def test_transition_sequence_null_then_3_then_0_then_null(self):
+        # This runs on every sidebar poll (SIDE_EXT.forEach), so the real question is whether
+        # repeated calls across a changing count leave the DOM correct at EVERY step -- and never
+        # accumulate a second badge element inside the button.
+        script = _BADGE_DOM_HARNESS + self._fn_src + """
+var __steps = [];
+function __observe(label) {
+  var b = document.getElementById('sidetermbadge');
+  __steps.push({
+    label: label,
+    badgeExists: !!b,
+    text: b ? b.textContent : null,
+    live: b ? b.classList.contains('live') : null,
+    mtChildCount: mt.children.length,
+  });
+}
+termCount = null; renderTermBadge(); __observe('null');
+termCount = 3;    renderTermBadge(); __observe('3');
+termCount = 0;    renderTermBadge(); __observe('0');
+termCount = null; renderTermBadge(); __observe('null2');
+console.log(JSON.stringify(__steps));
+"""
+        steps = {s["label"]: s for s in _run_node(script)}
+
+        self.assertFalse(steps["null"]["badgeExists"])
+        self.assertEqual(steps["null"]["mtChildCount"], 0)
+
+        self.assertTrue(steps["3"]["badgeExists"])
+        self.assertEqual(steps["3"]["text"], "3")
+        self.assertTrue(steps["3"]["live"])
+        self.assertEqual(steps["3"]["mtChildCount"], 1)
+
+        self.assertTrue(steps["0"]["badgeExists"], "0 must still render, not disappear")
+        self.assertEqual(steps["0"]["text"], "0")
+        self.assertFalse(steps["0"]["live"])
+        self.assertEqual(steps["0"]["mtChildCount"], 1, "must reuse the existing badge, not add a second one")
+
+        self.assertFalse(steps["null2"]["badgeExists"])
+        self.assertEqual(steps["null2"]["mtChildCount"], 0)
+
+    def test_repeated_calls_with_the_same_count_never_duplicate_the_badge(self):
+        # A badge appended on every poll instead of reused would be a real, user-visible bug (a
+        # growing pile of "3" chips) that no source-text grep could ever catch -- it depends on
+        # calling the function more than once. renderTermBadge() runs on EVERY sidebar poll
+        # (SIDE_EXT.forEach), so this is the realistic case, not an edge case.
+        script = _BADGE_DOM_HARNESS + self._fn_src + """
+termCount = 4;
+renderTermBadge();
+renderTermBadge();
+renderTermBadge();
+""" + _badge_observation_snippet()
+        r = _run_node(script)
+        self.assertTrue(r["badgeExists"])
+        self.assertEqual(r["text"], "4")
+        self.assertEqual(r["mtChildCount"], 1, "three calls must still leave exactly one badge")
 
 
 if __name__ == "__main__":

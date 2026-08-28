@@ -698,6 +698,14 @@ let sessions=[], searchResults=null, liveOnly=false;
 let listNow=Date.now()/1000;   // seeded before the first poll lands; overwritten immediately after
 const LIVE=300; // seconds since last activity a session stays "live" (5 min)
 const EXT=[];   // feature modules (web/ext_*.js) push a fn(d); called at the end of every render
+// Live terminal count for the sidebar's "Manage terminals" badge, read off /api/list's
+// X-Term-Count response header (same header-not-body trick as X-Server-Now above -- see
+// aitracker/server.py's _term_count() for why). null = the server omitted the header (terminal
+// feature off, or gated off without TRACKER_AUTH) -- a feature module renders that as NO badge,
+// never as "0". Server owns the policy; this file only carries the number, never re-derives it.
+let termCount=null;
+const SIDE_EXT=[];   // feature modules push a fn(); called after every SIDEBAR poll (loadSide),
+                      // unlike EXT above which only fires while a session is selected (render(d))
 function hl(text,q){
   const e=esc(text); if(!q)return e;
   const re=new RegExp("("+q.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")+")","ig");
@@ -863,10 +871,13 @@ async function loadSide(){
     const res=await fetch("/api/list");
     const t=res.headers.get("X-Server-Now");   // the same clock /api/session's `now` uses
     if(t)listNow=+t;
+    const tc=res.headers.get("X-Term-Count");   // absent -> null -> no badge (see termCount above)
+    termCount=tc!==null?+tc:null;
     sessions=await res.json();
   }catch(e){return}
   finally{sideBusy=false;}
   renderSide();
+  SIDE_EXT.forEach(f=>{try{f()}catch(e){console.error("side ext render",e)}});
   loadFlags();   // flags were only fetched by poll(), i.e. never until a session was selected
 }
 function pick(id){$("sid").value=id;track();renderSide();closeDrawer();}   // renderSide auto-expands the selected agent's container; closeDrawer no-ops off-phone

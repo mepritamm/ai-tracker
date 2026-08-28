@@ -78,6 +78,55 @@ def login_page():
       "return false}</script></body></html>")
 
 
+def _term_count():
+    """Live terminal count for the sidebar's "Manage terminals" badge, or None when the count
+    would be meaningless to show.
+
+    Folded into /api/list's response the SAME way the server clock is (see the X-Server-Now
+    comment at the /api/list route below): a response header, not a body reshape, so the sidebar
+    gets this on its EXISTING poll instead of a second timer hitting GET /api/term/list every
+    tick (a 403 on every one of those wherever the feature is off, purely for cosmetics — the
+    gap this closes).
+
+    Degrades to None -- the caller omits the header entirely -- in exactly the states where the
+    Manage terminals panel itself would 403 on open: TRACKER_TERMINAL=0, or reachable beyond
+    loopback without TRACKER_AUTH configured (term_gate.allowed() is the SAME check GET
+    /api/term/list's own term_gate.guard() makes; conventions rule 5 -- server decides, client
+    only renders what it's given, never re-derives the gate itself).
+
+    term_vt/term_gate are optional modules while the terminal tiers are built in parallel (see
+    the loader at the bottom of this file) -- this file doesn't own them, so it only calls the
+    accessor they already export (term_vt._live_count()) rather than reaching into their
+    internals. Deliberately does NOT import them here: the loader below already imports both,
+    unconditionally, at server startup, so by request time they're either sitting in sys.modules
+    (real bug inside one of them would already have crashed the loader, not this function) or
+    they were never there to begin with -- a parallel-dev worktree missing the module, or the
+    flattened `make bundle` standalone script, which regex-strips that loader entirely and ships
+    without the terminal feature (see scripts/bundle.py's comment on it). A plain sys.modules
+    lookup handles every one of those states as the same "not available -> None" outcome, with
+    no import attempt of its own -- which also means this function carries none of the
+    package-relative-import text the bundler has to special-case for the loader below (that
+    string-replace already asserts nothing ELSE in this file needs the same treatment)."""
+    term_gate = sys.modules.get("aitracker.term_gate")
+    term_vt = sys.modules.get("aitracker.term_vt")
+    if term_gate is None or term_vt is None:
+        return None
+    if not term_gate.allowed():
+        return None
+    # _live_count() iterates the module-global PTYS dict; open_pty()/_reap() mutate it from other
+    # request threads (ThreadingHTTPServer), so the iteration must run under term_vt._LOCK -- the
+    # same discipline _live_list()'s docstring states and the one pre-existing caller (the 429
+    # path above open_pty(), term_vt.py ~2079-2081) already follows. Skipped: the _reap() sibling
+    # call that path also makes under the lock. This is a read-only display count on a 5s poll,
+    # not a slot-allocation decision, so a pty that finished moments ago and hasn't been reaped
+    # yet is an acceptable staleness -- and it's already excluded from the number regardless,
+    # since _live_count()'s own `if not p.done` filter drops it whether or not it's still resident
+    # in PTYS. Reaping here would just do another route's cleanup work on every poll tick for no
+    # change in the reported value.
+    with term_vt._LOCK:
+        return term_vt._live_count()
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code=200, headers=None):
         body = json.dumps(obj).encode()
@@ -184,7 +233,13 @@ class Handler(BaseHTTPRequestHandler):
             # session. The sidebar reads this header and uses it for every now-s.mtime<LIVE
             # check, so it can never compute liveness from a different clock than the detail
             # pane does (see .claude/rules/conventions.md rule 5 -- server owns policy, client renders it).
-            self._json(all_sessions(), headers={"X-Server-Now": str(time.time())})
+            # X-Term-Count rides the same header-not-body trick, for the same reason -- see
+            # _term_count()'s docstring above for why a header, and why it degrades to None/omitted.
+            headers = {"X-Server-Now": str(time.time())}
+            tc = _term_count()
+            if tc is not None:
+                headers["X-Term-Count"] = str(tc)
+            self._json(all_sessions(), headers=headers)
         elif p.path == "/api/flags":
             self._json(load_flags())
         elif p.path == "/api/search":

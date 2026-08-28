@@ -3205,15 +3205,23 @@ class TestNoticeReachesRawViewer(unittest.TestCase):
             pt.kill()
             _drain(pt, 5)
 
-    def test_a_raw_viewer_attaching_after_the_notice_does_not_get_it_retroactively(self):
-        """The raw stream is a plain live byte tee with no scrollback (see `raw_stream()`'s own
-        "KNOWN GAP" docstring paragraph) -- a notice fired BEFORE any raw viewer attaches is
-        therefore invisible to one that attaches afterward. This is a REAL, INTENDED behavioural
-        difference from the grid path, which replays it via a full `since=-1` snapshot plus the
-        `notices` queue (0 is always "nothing delivered yet") -- see
-        TestNoticeDeliveryOverScreenStream.
-        test_notice_queued_before_attach_is_delivered_on_the_first_frame for that side. Pinned
-        here, not papered over."""
+    def test_a_raw_viewer_attaching_after_the_notice_now_gets_it_as_a_named_event(self):
+        """POLICY REVERSAL, deliberate: this test used to be named
+        `test_a_raw_viewer_attaching_after_the_notice_does_not_get_it_retroactively` and PINNED
+        the opposite of what it asserts below -- it asserted `assertNotIn` on the notice text,
+        with a comment calling the gap "a REAL, INTENDED behavioural difference ... Pinned here,
+        not papered over." That invariant is now REVERSED on purpose, not papered over a second
+        time: `raw_stream()`'s "KNOWN GAP" was about raw PTY BYTES having no scrollback (`Screen`
+        retains the interpreted grid for a fresh `since=-1` repaint; the raw byte tee never did,
+        and still doesn't -- that part is unchanged). But `Pty.notices` was never part of that
+        byte tee -- it is retained independently (see `Pty.add_notice`/`_feed_note`) -- so there
+        was never an inherent reason a raw/xterm viewer couldn't also replay it. `_raw_stream_body`
+        now does exactly that: it walks `pt.notices` against its own per-viewer `since_notice`
+        cursor on every loop tick and replays anything unseen, INCLUDING a notice that fired
+        before this viewer ever attached, as a named `event: notice\\ndata: <json>\\n\\n` SSE
+        frame on the SAME `/api/term/raw` connection (see that function's docstring for why the
+        event must be NAMED: an unnamed frame would be run through the client's `_b64ToBytes()`
+        and written into xterm.js as garbage). This test is now the PIN for that new behaviour."""
         pt = term_vt.Pty(tid="rawlate1", screen=Screen(cols=10, rows=2))
         term_vt.PTYS[pt.id] = pt
         term_vt._feed_note(pt, "fired before any raw viewer attached")
@@ -3224,20 +3232,228 @@ class TestNoticeReachesRawViewer(unittest.TestCase):
         t.start()
         try:
             self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
-            h.peer.settimeout(1)
-            try:
-                chunk = h.peer.recv(65536)
-            except OSError:
-                chunk = b""       # the expected outcome: the 1s wait timed out, nothing arrived
-            self.assertNotIn(b"fired before any raw viewer attached", chunk,
-                              "a late raw viewer must not receive a notice queued before it "
-                              "attached -- the raw stream is live-only by design")
+            h.peer.settimeout(10)
+            seen = b""
+            deadline = time.time() + 10
+            while b"event: notice" not in seen and time.time() < deadline:
+                try:
+                    chunk = h.peer.recv(65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                seen += chunk
+            self.assertIn(b"event: notice", seen,
+                          "a late raw viewer must now receive a notice queued before it attached "
+                          "-- as a NAMED event frame")
+            frames = seen.split(b"\n\n")
+            notice_frames = [f for f in frames if f.startswith(b"event: notice")]
+            self.assertTrue(notice_frames, "no event: notice frame found in: %r" % seen)
+            data_line = next(ln for ln in notice_frames[0].split(b"\n") if ln.startswith(b"data: "))
+            payload = json.loads(data_line[len(b"data: "):])
+            self.assertEqual(payload["text"], "fired before any raw viewer attached")
+            self.assertIn("seq", payload)
         finally:
             h.close_peer()
             t.join(5)
             h.close()
             pt.kill()
             _drain(pt, 5)
+
+
+class TestRawStreamNoticeEventDelivery(unittest.TestCase):
+    """Further coverage of the gap closed above (see `TestNoticeReachesRawViewer.
+    test_a_raw_viewer_attaching_after_the_notice_now_gets_it_as_a_named_event`, the inverted pin):
+    the wire-format safety property (never a bare `data:` frame), multi-viewer fan-out, live
+    delivery, non-duplication across loop ticks, the finished-pty replay trap, and a regression
+    guard that the grid path's own wire format did not move."""
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        term_vt._STREAMS = 0
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        for pt in list(term_vt.PTYS.values()):
+            pt.kill()
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+        term_vt._STREAMS = 0
+
+    @staticmethod
+    def _open_raw(pt):
+        h = _StreamHandler()
+        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("tty=" + pt.id)))
+        t.daemon = True
+        t.start()
+        return h, t
+
+    @staticmethod
+    def _recv_until(h, marker, timeout=10):
+        h.peer.settimeout(timeout)
+        seen = b""
+        deadline = time.time() + timeout
+        while marker not in seen and time.time() < deadline:
+            try:
+                chunk = h.peer.recv(65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            seen += chunk
+        return seen
+
+    def test_notice_json_never_arrives_as_a_bare_unnamed_data_frame(self):
+        """Guards the exact client-side failure mode: `EventSource.onmessage` fires for every
+        UNNAMED `data:` frame and runs it through `_b64ToBytes()`, writing the result straight
+        into xterm.js as terminal bytes. If a notice's JSON payload were ever sent as a bare
+        `data:` frame instead of inside a NAMED `event: notice` frame, that JSON (`{`, `"`, `:`)
+        would fail to base64-decode and land as garbage on screen. So every bare `data:` frame on
+        this connection -- one NOT immediately preceded by an `event:` line -- must always be
+        valid base64 (the genuine byte tee), never raw JSON."""
+        pt = term_vt.Pty(tid="rawbare1", screen=Screen(cols=10, rows=2))
+        term_vt.PTYS[pt.id] = pt
+        term_vt._feed_note(pt, "must not leak as a bare data frame")
+        h, t = self._open_raw(pt)
+        try:
+            self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
+            seen = self._recv_until(h, b"event: notice")
+            self.assertIn(b"event: notice", seen, "notice event never arrived")
+            for block in seen.split(b"\n\n"):
+                if not block.strip() or block.startswith(b"event: notice") or block.startswith(b": "):
+                    continue
+                if block.startswith(b"data: "):
+                    payload = block[len(b"data: "):]
+                    try:
+                        base64.b64decode(payload, validate=True)
+                    except Exception:
+                        self.fail("a bare data: frame carried non-base64 content -- looks like "
+                                  "raw JSON leaked onto the unnamed-event channel: %r" % payload)
+        finally:
+            h.close_peer(); t.join(5); h.close()
+            pt.kill(); _drain(pt, 5)
+
+    def test_two_independent_raw_viewers_each_receive_the_notice(self):
+        """Per-viewer `since_notice` cursor -- mirrors _screen_stream_body's own guarantee that
+        one viewer consuming a notice can never starve another attached to the same Pty."""
+        pt = term_vt.Pty(tid="rawtwo1", screen=Screen(cols=10, rows=2))
+        term_vt.PTYS[pt.id] = pt
+        ha, ta = self._open_raw(pt)
+        hb, tb = self._open_raw(pt)
+        try:
+            self.assertTrue(_wait_for(lambda: pt.viewers >= 2, 5))
+            term_vt._feed_note(pt, "for both raw viewers")
+            for h in (ha, hb):
+                seen = self._recv_until(h, b"event: notice")
+                self.assertIn(b"event: notice", seen)
+                self.assertIn(b"for both raw viewers", seen)
+        finally:
+            ha.close_peer(); ta.join(5); ha.close()
+            hb.close_peer(); tb.join(5); hb.close()
+            pt.kill(); _drain(pt, 5)
+
+    def test_a_notice_fired_while_attached_is_delivered_live(self):
+        pt = term_vt.Pty(tid="rawlive1", screen=Screen(cols=10, rows=2))
+        term_vt.PTYS[pt.id] = pt
+        h, t = self._open_raw(pt)
+        try:
+            self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
+            term_vt._feed_note(pt, "fired live while attached")
+            seen = self._recv_until(h, b"event: notice")
+            self.assertIn(b"event: notice", seen)
+            self.assertIn(b"fired live while attached", seen)
+        finally:
+            h.close_peer(); t.join(5); h.close()
+            pt.kill(); _drain(pt, 5)
+
+    def test_the_same_notice_is_not_resent_on_a_later_loop_tick(self):
+        """The per-viewer cursor must ADVANCE once a notice is sent, or the 0.2s-tick loop would
+        re-deliver the same entry on every subsequent iteration."""
+        pt = term_vt.Pty(tid="rawonce1", screen=Screen(cols=10, rows=2))
+        term_vt.PTYS[pt.id] = pt
+        h, t = self._open_raw(pt)
+        try:
+            self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
+            term_vt._feed_note(pt, "sent exactly once")
+            seen = self._recv_until(h, b"event: notice")
+            self.assertEqual(seen.count(b"event: notice"), 1)
+            # several more 0.2s ticks elapse here -- a re-send would show up as a second frame
+            h.peer.settimeout(1.0)
+            try:
+                more = h.peer.recv(65536)
+            except OSError:
+                more = b""
+            self.assertNotIn(b"event: notice", more,
+                              "the same seq must never be re-sent once the cursor has advanced")
+        finally:
+            h.close_peer(); t.join(5); h.close()
+            pt.kill(); _drain(pt, 5)
+
+    def test_a_finished_pty_with_queued_notices_still_replays_them(self):
+        """Trap 1 from the design pass: notices must be checked BEFORE the `pt.done` branch in
+        `_raw_stream_body`, or a viewer attaching to an already-finished pty -- an immediately
+        empty byte queue -- would return before ever getting a chance to replay them."""
+        pt = term_vt.Pty(tid="rawdone1", screen=Screen(cols=10, rows=2))
+        term_vt.PTYS[pt.id] = pt
+        term_vt._feed_note(pt, "queued, then the pty finished")
+        pt.done, pt.ended = True, time.time()   # what finish() leaves behind -- ended=0.0 (the
+                                                 # __init__ default) would look like it finished
+                                                 # 600s+ ago and get dropped by _reap() before the
+                                                 # raw_stream() route ever sees it (see _reap()'s
+                                                 # `t.ended < cut` check)
+        h, t = self._open_raw(pt)
+        try:
+            self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
+            seen = self._recv_until(h, b"event: notice")
+            self.assertIn(b"event: notice", seen,
+                          "a finished pty must still replay a queued notice before the stream "
+                          "ends")
+            self.assertIn(b"queued, then the pty finished", seen)
+        finally:
+            h.close_peer(); t.join(5); h.close()
+            pt.kill(); _drain(pt, 5)
+
+    def test_screen_stream_wire_format_is_unchanged_by_this(self):
+        """Regression guard: closing the raw-stream gap must not leak into the grid path, whose
+        wire format is FIXED (see `_screen_stream_body`'s own docstring) -- `EventSource.
+        onmessage` only fires for UNNAMED frames, so any `event:` line on this connection would go
+        silently unseen by the real client. The grid path keeps delivering a notice via the
+        existing `notices` JSON key, never as a named event."""
+        pt = term_vt.Pty(tid="screenreg1", screen=Screen(cols=10, rows=2))
+        term_vt.PTYS[pt.id] = pt
+        h = _StreamHandler()
+        t = threading.Thread(target=term_vt.screen_stream, args=(h, _Q("tty=" + pt.id)))
+        t.daemon = True
+        t.start()
+        try:
+            self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
+            term_vt._feed_note(pt, "still delivered via the notices key, not a named event")
+            marker = b"still delivered via the notices key"
+            h.peer.settimeout(5)
+            seen = b""
+            deadline = time.time() + 5
+            while marker not in seen and time.time() < deadline:
+                try:
+                    chunk = h.peer.recv(65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                seen += chunk
+            self.assertNotIn(b"event:", seen,
+                              "the grid /api/term/screen wire format must never carry a named "
+                              "event frame")
+            frames = seen.split(b"\n\n")
+            target = next(f for f in frames if marker in f)
+            frame = json.loads(target.split(b"data: ", 1)[1])
+            self.assertIn("still delivered via the notices key, not a named event",
+                           [n["text"] for n in frame.get("notices", [])])
+        finally:
+            h.close_peer(); t.join(5); h.close()
+            pt.kill(); _drain(pt, 5)
 
 
 class TestRawQueueOverflow(unittest.TestCase):
