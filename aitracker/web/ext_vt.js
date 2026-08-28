@@ -585,6 +585,13 @@
     this.padX = 0; this.padY = 0;          // .vtpane's real padding; filled by measureAndResize
     this._sized = false;
     this._onStatusChange = null;
+    // Guards attach()'s deferred frame firing after a destroy(): attach() does its first measure
+    // and opens the EventSource inside a requestAnimationFrame, so a closeVT()/renderer switch
+    // landing in that gap used to run the callback ANYWAY -- opening a stream on an already-
+    // destroyed terminal that nothing would ever close (destroy() had already seen a null
+    // this.es), pinning the server's `pt.viewers > 0` so the pty could never be idle-reaped.
+    // Same pattern (and same reason) as XtermTerminal._destroyed -- see that constructor.
+    this._destroyed = false;
     // `starting`: true only while a mode="resume" pane is still coming up after the server's
     // refused-resume auto-recovery (see openVT, which seeds this off the POST /api/term/pty
     // response before this pane's EventSource even opens, and _applyPatch below, which tracks the
@@ -788,6 +795,9 @@
   Terminal.prototype.attach = function () {
     var self = this;
     requestAnimationFrame(function () {
+      // Bail out if destroy() already ran between attach() and this frame -- see the
+      // constructor's own comment on `this._destroyed` for the leaked EventSource this closes.
+      if (self._destroyed) return;
       self.measureAndResize();
       self._openStream();
     });
@@ -1173,6 +1183,10 @@
     });
   };
   Terminal.prototype.destroy = function () {
+    // Set FIRST, unconditionally: attach()'s deferred rAF may still be queued at this point, and
+    // this is what makes it a no-op instead of opening an SSE stream on a destroyed terminal --
+    // see the constructor's own comment on `this._destroyed`. Mirrors XtermTerminal.destroy().
+    this._destroyed = true;
     if (this._disposeThemeBtn) { this._disposeThemeBtn(); this._disposeThemeBtn = null; }
     // See the constructor's own comment on observePane -- a ResizeObserver, like the document-
     // level listeners below, outlives its element unless explicitly disconnected.
@@ -1538,6 +1552,24 @@
   //   - The zoom control changes xterm's `fontSize` option + re-fits; xterm.js's internal row
   //     metrics are not pixel-identical to the grid painter's CSS line-height, so the two panes'
   //     exact row count at the "same" zoom step can differ by one row.
+  //   - MID-SESSION SERVER NOTICES arrive only as INLINE TERMINAL TEXT, never as the styled
+  //     `.vtnotice` banner the grid renderer raises. `/api/term/raw` has no JSON envelope, so
+  //     the SSE frame's `notices` key (which `Terminal._applyPatch` turns into a banner via
+  //     `_displayNotice`) has no channel to reach this renderer. It is NOT invisible, though:
+  //     term_vt.py's `_feed_note()` also tees the same text through `_tee_raw()`, so the words
+  //     do land in the xterm.js buffer as an ordinary "[ai-tracker] note: …" line -- including
+  //     the refused-resume advisory. Two real differences remain: no banner chrome, and the
+  //     tee is LIVE-ONLY (a tab attaching after the note fired never sees it, per the first gap
+  //     above). PARKED, deliberately: closing it properly means a renderer-independent notice
+  //     channel owned by the MOUNT POINT (which already owns the open-time `res.j.notice`
+  //     banner for both renderers), i.e. new server work -- not something to bolt on here.
+  //   - NO BELL FLASH. The grid renderer's `_flashBell()` (the brief `.vtbell` pulse) is driven
+  //     by the SSE frame's monotonic `bell` counter, which likewise cannot cross a raw byte
+  //     stream. The BEL byte itself does arrive in the stream, so xterm.js's own `onBell` could
+  //     drive an equivalent pulse -- but that would be a SECOND implementation of one capability
+  //     (conventions rule 4) fed by a different source than the grid's server-owned counter, so
+  //     it belongs on the same renderer-independent channel as the notices above, not here.
+  //     PARKED for the same reason.
   //   - Selection copy-on-Ctrl+C is reimplemented here (xterm.js sends \x03 for a plain Ctrl+C
   //     UNCONDITIONALLY by default, selection or not -- there is no built-in copy-on-select/
   //     copy-on-Ctrl+C) via `attachCustomKeyEventHandler`, mirroring Terminal's own copyCombo
@@ -1851,7 +1883,9 @@
     // Fork chip: appended after title, shown conditionally when forked=true
     modalForkChip = document.createElement("span");
     modalForkChip.className = "vtforkchip";
+    // Both attributes, same text -- see the standalone chip's own comment (renderStandaloneStatus).
     modalForkChip.setAttribute("aria-label", "This terminal is a copy of a background agent — the original is still running separately");
+    modalForkChip.setAttribute("title", "This terminal is a copy of a background agent — the original is still running separately");
     modalForkChip.textContent = "⑂ fork";
     modalForkChip.style.display = "none";
     modalStatusEl = document.createElement("span");
@@ -2600,8 +2634,20 @@
   // ===== render hook: participates in the normal 2s poll like every other ext module, and is
   // what genuinely puts #ext_vt to use (the modal is built as its child, not appended to
   // document.body) — see buildOverlay(mount) above. =====
+  // The standalone tab's own document.title, set once by bootStandalone() below and RE-ASSERTED
+  // from render() on every poll. app.js's own render() unconditionally does
+  // `document.title = title + " · tracker"` from the polled session (app.js ~1098), and it keeps
+  // polling in this tab too -- so a title written only at boot is clobbered ~2s later and every
+  // ⤢-opened tab ends up wearing the sidebar session's name instead of its own. EXT hooks run at
+  // the very END of that same render (app.js ~1330), so this re-assert is the last write of each
+  // tick and wins without app.js needing to know this mode exists.
+  var standaloneTitle = null;
+
   function render(d) {
-    if (document.documentElement.classList.contains("vt-standalone")) return;   // that mode owns #ext_vt itself
+    if (document.documentElement.classList.contains("vt-standalone")) {
+      if (standaloneTitle && document.title !== standaloneTitle) document.title = standaloneTitle;
+      return;   // that mode owns #ext_vt itself
+    }
     var mount = document.getElementById("ext_vt");
     if (!mount) return;
     if (!overlay) buildOverlay(mount);
@@ -2643,7 +2689,14 @@
     }
     if (!tty) return;
     document.documentElement.classList.add("vt-standalone");
-    document.title = "TERMINAL — AI Tracker";
+    // Identify WHICH session this tab is, exactly like the modal's own header does
+    // (modalTitleEl, in openVT) -- multiple standalone tabs are the whole point of the "⤢ New
+    // tab" button, and a constant title makes them indistinguishable in the tab strip. `sid` is
+    // optional on a bare ?tty= link (see above), so fall back to the tty, which always exists by
+    // this line. Stored on `standaloneTitle` (see its declaration above render()) rather than
+    // only written here, because app.js's poll rewrites document.title every 2s.
+    standaloneTitle = "TERMINAL — " + (mode === "resume" ? "resume · " : "") + (sid || "tty " + tty);
+    document.title = standaloneTitle;
     var mount = document.getElementById("ext_vt");
     if (!mount) return;
     // The mount lives inside .app, which .vt-standalone hides with display:none -- and a
@@ -2673,7 +2726,11 @@
         if (i === 1 && standaloneForked) {
           var chip = document.createElement("span");
           chip.className = "vtstatus-fork";
+          // Both attributes, same text: `title` is the hover tooltip, `aria-label` is what a
+          // screen reader announces instead of the bare "⑂ fork" glyph. The modal's own chip
+          // (buildOverlay) carries the same pair -- neither site may set just one.
           chip.setAttribute("title", "This terminal is a copy of a background agent — the original is still running separately");
+          chip.setAttribute("aria-label", "This terminal is a copy of a background agent — the original is still running separately");
           chip.textContent = "⑂ fork";
           statusEl.appendChild(chip);
         } else {
@@ -2714,12 +2771,35 @@
       }
       term._onStatusChange = function (s) {
         if (curTerm !== term) return;
+        // Same suppression the modal's _wireModalStatus applies, hoisted here so the two mount
+        // points don't drift: while a mode="resume" pane is still coming up (server-owned
+        // `starting`, tracked per SSE frame in _applyPatch) the refused-resume child's stream
+        // drop would otherwise flash "reconnecting…" into this status line even though the
+        // server recovers on its own seconds later. One steady "starting…" instead.
+        if (term.starting) { renderStandaloneStatus("starting…"); return; }
         renderStandaloneStatus(s);
       };
       term.attach();
     }
 
     function boot(renderer) {
+      // The notice banner goes in FIRST, so it lands ABOVE the terminal -- exactly where the
+      // modal puts it (`modalBodyEl.insertBefore(modalNoticeEl, modalBodyEl.firstChild)` in
+      // openVT). It used to be appended AFTER mountRenderer(), i.e. below the pane AND below the
+      // context bar, so the identical server message rendered at opposite ends of the two mount
+      // points. The old "matching the order this code built in before the renderer switch
+      // existed" note on statusEl below documents history, not a requirement; the one REAL
+      // constraint it also states -- statusEl must exist before mountRenderer() calls attach() --
+      // is untouched here.
+      if (standaloneNotice) {
+        var noticeEl = document.createElement("div");
+        noticeEl.className = "vtnotice";
+        var noticeText = document.createElement("span");
+        noticeText.textContent = standaloneNotice;  // textContent escapes HTML
+        noticeEl.appendChild(noticeText);
+        mount.appendChild(noticeEl);
+      }
+
       // The term's own toolbar+pane live in a DEDICATED wrap, never directly in `mount`: both
       // Terminal and XtermTerminal's constructors do `container.innerHTML = ""` on whatever
       // they're given, and a later renderer switch (mountRenderer, above) rebuilds THIS wrap
@@ -2733,24 +2813,13 @@
       // XtermTerminal.prototype.attach calls _onStatusChange SYNCHRONOUSLY the instant attach() is
       // called (before any async asset loading) -- so `statusEl` must already exist and be
       // wireable the moment mountRenderer() below calls term.attach(). Mutating a still-detached
-      // node is harmless; it's appended for real once the notice banner (if any) has taken its
-      // spot ahead of it, so the final DOM order stays pane -> context bar -> notice -> status,
-      // matching the order this code built in before the renderer switch existed.
+      // node is harmless; it's appended for real last of all, so the final DOM order is
+      // notice -> pane -> context bar -> status, matching the modal's own top-to-bottom order.
       statusEl = document.createElement("div");
       statusEl.className = "vtfullstatus";
       renderStandaloneStatus("connecting…");
 
       mountRenderer(renderer);   // builds the terminal into termWrap, and the context bar right after it
-
-      // Build notice element if present (same as modal, but in standalone context)
-      if (standaloneNotice) {
-        var noticeEl = document.createElement("div");
-        noticeEl.className = "vtnotice";
-        var noticeText = document.createElement("span");
-        noticeText.textContent = standaloneNotice;  // textContent escapes HTML
-        noticeEl.appendChild(noticeText);
-        mount.appendChild(noticeEl);
-      }
 
       mount.appendChild(statusEl);
       window.addEventListener("resize", debounce(function () { if (curTerm) curTerm.measureAndResize(); }, 150));

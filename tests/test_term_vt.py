@@ -746,7 +746,16 @@ class TestForegroundIsClaude(unittest.TestCase):
     """`_foreground_is_claude()` -- the pty-liveness check behind GET /api/term/attached.
     `os.tcgetpgrp`/`subprocess.run` are mocked throughout: this asserts the function's own
     logic, not the real `ps`/tty machinery (which `TestAttachedRoute` doesn't touch either,
-    per the task's own guidance to mock rather than depend on a real `claude` process)."""
+    per the task's own guidance to mock rather than depend on a real `claude` process).
+
+    setUp/tearDown clear the pgid cache so these tests (several of which reuse pgid 4242) never
+    depend on run order or leak state into `TestForegroundIsClaudeCache` below."""
+
+    def setUp(self):
+        term_vt._FG_CACHE.clear()
+
+    def tearDown(self):
+        term_vt._FG_CACHE.clear()
 
     def test_true_when_ps_reports_claude(self):
         with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=4242), \
@@ -774,6 +783,95 @@ class TestForegroundIsClaude(unittest.TestCase):
         with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=4242), \
              mock.patch.object(term_vt.subprocess, "run", return_value=_FakePs(1, "")):
             self.assertFalse(term_vt._foreground_is_claude(7))
+
+
+class TestForegroundIsClaudeCache(unittest.TestCase):
+    """The pgid -> comm cache inside `_foreground_is_claude()`, added to cut the sustained
+    `ps`-fork rate the client's 2s-per-open-terminal poll of GET /api/term/attached otherwise
+    causes. `tcgetpgrp` still runs on every single call -- only the `ps` fork that resolves a
+    pgid to a command name is ever skipped. Each test uses pgids not used elsewhere in this file,
+    and setUp/tearDown clear the cache anyway so nothing here can depend on run order."""
+
+    def setUp(self):
+        term_vt._FG_CACHE.clear()
+
+    def tearDown(self):
+        term_vt._FG_CACHE.clear()
+
+    def test_second_call_same_pgid_is_a_cache_hit_no_second_fork(self):
+        ps = mock.Mock(return_value=_FakePs(0, "claude\n"))
+        with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=5001), \
+             mock.patch.object(term_vt.subprocess, "run", ps):
+            self.assertTrue(term_vt._foreground_is_claude(7))
+            self.assertTrue(term_vt._foreground_is_claude(7))
+            self.assertTrue(term_vt._foreground_is_claude(7))
+        self.assertEqual(ps.call_count, 1, "a repeat poll of the same pgid must not fork ps again")
+
+    def test_changed_pgid_is_a_cache_miss_forks_again(self):
+        """A different pgid is a different cache key entirely -- no reuse of the old entry."""
+        ps = mock.Mock(side_effect=[_FakePs(0, "claude\n"), _FakePs(0, "vim\n")])
+        pgids = iter([5002, 5003])
+        with mock.patch.object(term_vt.os, "tcgetpgrp", side_effect=lambda fd: next(pgids)), \
+             mock.patch.object(term_vt.subprocess, "run", ps):
+            self.assertTrue(term_vt._foreground_is_claude(7))
+            self.assertFalse(term_vt._foreground_is_claude(7))
+        self.assertEqual(ps.call_count, 2)
+
+    def test_ttl_expiring_forces_a_fresh_fork(self):
+        ps = mock.Mock(return_value=_FakePs(0, "claude\n"))
+        clock = [1000.0]
+        with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=5004), \
+             mock.patch.object(term_vt.subprocess, "run", ps), \
+             mock.patch.object(term_vt.time, "monotonic", side_effect=lambda: clock[0]):
+            self.assertTrue(term_vt._foreground_is_claude(7))
+            clock[0] += term_vt.FG_CACHE_TTL - 0.01     # still inside the TTL window
+            self.assertTrue(term_vt._foreground_is_claude(7))
+            self.assertEqual(ps.call_count, 1, "still within TTL -- must be a cache hit")
+            clock[0] += 1.0                              # now past the TTL
+            self.assertTrue(term_vt._foreground_is_claude(7))
+        self.assertEqual(ps.call_count, 2, "expired entry must trigger a fresh ps fork")
+
+    def test_fail_closed_paths_still_hold_with_cache_in_place(self):
+        """Every existing failure path from TestForegroundIsClaude, re-run with the cache live,
+        using pgids not touched by any other test. None of these may be cached as a hit -- a
+        failure must never calcify into a stale True on a later call."""
+        with mock.patch.object(term_vt.os, "tcgetpgrp", side_effect=OSError("bad fd")):
+            self.assertFalse(term_vt._foreground_is_claude(7))
+
+        with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=5005), \
+             mock.patch.object(term_vt.subprocess, "run", side_effect=FileNotFoundError("no ps")):
+            self.assertFalse(term_vt._foreground_is_claude(7))
+        self.assertNotIn(5005, term_vt._FG_CACHE)
+
+        with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=5006), \
+             mock.patch.object(term_vt.subprocess, "run", return_value=_FakePs(1, "")):
+            self.assertFalse(term_vt._foreground_is_claude(7))
+        self.assertNotIn(5006, term_vt._FG_CACHE)
+
+        # A pgid that just failed must still resolve correctly (not short-circuited to False by
+        # a phantom cache entry) once ps actually succeeds for it.
+        with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=5005), \
+             mock.patch.object(term_vt.subprocess, "run", return_value=_FakePs(0, "claude\n")):
+            self.assertTrue(term_vt._foreground_is_claude(7))
+
+    def test_claude_exiting_flips_the_answer_on_the_very_next_call(self):
+        """The most important case: the user quits Claude, the pty's foreground pgid changes to
+        the shell's, and the answer must flip to False on the VERY NEXT poll -- driven by
+        tcgetpgrp (which runs unconditionally on every call), not delayed by the cache TTL."""
+        ps = mock.Mock(side_effect=[_FakePs(0, "claude\n"), _FakePs(0, "zsh\n")])
+        pgids = iter([6001, 6002])
+        with mock.patch.object(term_vt.os, "tcgetpgrp", side_effect=lambda fd: next(pgids)), \
+             mock.patch.object(term_vt.subprocess, "run", ps):
+            self.assertTrue(term_vt._foreground_is_claude(7))   # claude in the foreground
+            self.assertFalse(term_vt._foreground_is_claude(7))  # quit -> shell resumes, same poll
+        self.assertEqual(ps.call_count, 2, "the pgid change must not be served from cache")
+
+    def test_cache_cannot_grow_unbounded(self):
+        with mock.patch.object(term_vt.subprocess, "run", return_value=_FakePs(0, "bash\n")):
+            for pgid in range(7000, 7000 + term_vt.FG_CACHE_MAX + 50):
+                with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=pgid):
+                    term_vt._foreground_is_claude(7)
+        self.assertLessEqual(len(term_vt._FG_CACHE), term_vt.FG_CACHE_MAX)
 
 
 class TestSpawnAndScreen(unittest.TestCase):

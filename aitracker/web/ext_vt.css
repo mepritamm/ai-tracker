@@ -458,6 +458,15 @@ html.light {
 @media(max-width:600px) {
   .vtpane { font-size: 11.5px; line-height: 15px; padding: 6px 8px; min-height: 46vh; min-height: 46dvh; }
   .vtrow { height: 15px; line-height: 15px; }
+  /* The standalone tab's pane needs the SAME phone padding -- without this line it keeps the
+     10px/14px desktop padding from `#ext_vt.vtfull .vtpane` below and loses ~2 columns on a
+     phone, while the modal's pane shrinks correctly. That rule is (1,2,0) and lives LATER in
+     this file, so a bare `#ext_vt.vtfull .vtpane` here would tie on specificity and lose on
+     source order; qualifying with the `.vt-standalone` root class (always set together with
+     .vtfull -- see bootStandalone) makes this (1,3,0) and lets the override live next to the
+     other phone metrics instead of being stranded at the bottom of the file. Only `padding` is
+     restated: `flex`/`min-height: 0` from that rule are deliberate and still apply. */
+  .vt-standalone #ext_vt.vtfull .vtpane { padding: 6px 8px; }
 }
 
 /* ---- standalone tab ("New tab" button / ?tty=<id>): #ext_vt takes over the whole viewport and
@@ -465,12 +474,20 @@ html.light {
    the same #ext_vt mount every render() call already targets, just given a fullscreen layout. */
 .vt-standalone .app,
 .vt-standalone .foot,
-.vt-standalone .toasts,
 .vt-standalone .bgscrim,
 .vt-standalone .bgdrawer,
 .vt-standalone .overlay {
   display: none !important;
 }
+/* ...but NOT #toasts. It is a body-level SIBLING of .app (index.html), so hiding it here was a
+   second, deliberate rule rather than fallout from hiding .app -- and it swallowed every toast
+   the standalone tab raises: the context bar's "Couldn't switch model"/"Couldn't switch effort"
+   and the clipboard-paste failures all fired into a display:none container, so a click on
+   `opus` simply did nothing with nothing to explain why. Un-hiding alone is not enough: app.css
+   gives .toasts z-index:200 while #ext_vt.vtfull below is z-index:1000, and both are fixed,
+   body-level stacking contexts -- so the toast stack has to be lifted above the fullscreen
+   layer too. Everything else (position/layout) still comes from app.css's own .toasts rule. */
+.vt-standalone .toasts { z-index: 1001; }
 #ext_vt.vtfull {
   position: fixed;
   inset: 0;

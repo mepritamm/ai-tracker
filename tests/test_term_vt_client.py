@@ -6,6 +6,7 @@ not against runtime behaviour. term_vt.py (the server-side emulator/routes) is a
 concurrently-built half and is deliberately not imported or required here.
 """
 import os
+import re
 import unittest
 
 from aitracker.page import build_page
@@ -286,29 +287,24 @@ class TestContextBarModelSwitcher(unittest.TestCase):
         self.assertNotIn("showSwitcher", self.src)
         self.assertIn("this.attached = false;", body)
 
-    def test_picking_a_model_sends_the_documented_inject_contract(self):
-        body = _body_until(self.src, "ContextBar.prototype._pickModel = function", ["ContextBar.prototype."])
-        self.assertIn('"/api/term/inject"', body)
-        self.assertIn('tty: this.ttyId', body)
-        self.assertIn('text: "/model " + name', body)
-        self.assertIn("submit: true", body)
-        self.assertIn("clear_first: true", body)
-
-    def test_inject_failure_surfaces_a_toast_not_silence(self):
-        body = _body_until(self.src, "ContextBar.prototype._pickModel = function", ["ContextBar.prototype."])
-        self.assertIn("404", body)
-        self.assertIn("toast(", body)
-
-    def test_button_never_takes_native_focus(self):
-        body = _body_until(self.src, "function ContextBar(", ["ContextBar.prototype."])
-        # preventDefault on mousedown is what stops a <button> from stealing DOM focus at all.
-        self.assertIn('btn.addEventListener("mousedown", function (ev) { ev.preventDefault(); });', self.src)
-        self.assertIn("_focusTerminal", body)
+    # test_picking_a_model_sends_the_documented_inject_contract,
+    # test_inject_failure_surfaces_a_toast_not_silence and test_button_never_takes_native_focus
+    # were REMOVED here: they were grep-only checks of the inject-contract/toast/preventDefault
+    # wiring, which no longer executes. Real behaviour is now proven by driving the actual click
+    # path under Node -- see tests/test_term_vt_exec.py's TestContextBarModelInject (inject
+    # contract + toast-on-failure) and TestContextBarFocusSafety (preventDefault actually fires).
 
 
 class TestContextBarEffortSwitcher(unittest.TestCase):
     """The effort picker: mirrors the model switcher exactly -- same component, same idioms
-    (hardcoded ladder, same inject contract, same toast-on-failure, same focus-safety pattern)."""
+    (hardcoded ladder, same inject contract, same toast-on-failure, same focus-safety pattern).
+
+    Only the ladder's own literal contents/ordering/provenance stay here -- that is genuinely
+    static-only (there is nothing to "execute" about an array literal). Every behavioural claim
+    this class used to grep for (inject contract, toast-on-failure, focus safety, meta.effort
+    labelling, current-item marking) is now proven by driving the real code under Node -- see
+    tests/test_term_vt_exec.py's TestContextBarEffortInject, TestContextBarFocusSafety and
+    TestContextBarEffortLabel."""
 
     def setUp(self):
         self.src = _read("ext_vt.js")
@@ -324,70 +320,15 @@ class TestContextBarEffortSwitcher(unittest.TestCase):
         self.assertIn("2.1.247", self.src)
         self.assertIn("CONFIRMED", self.src)
 
-    def test_picking_an_effort_sends_the_documented_inject_contract(self):
-        body = _body_until(self.src, "ContextBar.prototype._pickEffort = function", ["ContextBar.prototype."])
-        self.assertIn('"/api/term/inject"', body)
-        self.assertIn('tty: this.ttyId', body)
-        self.assertIn('text: "/effort " + level', body)
-        self.assertIn("submit: true", body)
-        self.assertIn("clear_first: true", body)
 
-    def test_inject_failure_surfaces_a_toast_not_silence(self):
-        body = _body_until(self.src, "ContextBar.prototype._pickEffort = function", ["ContextBar.prototype."])
-        self.assertIn("404", body)
-        self.assertIn("toast(", body)
-
-    def test_effort_button_never_takes_native_focus(self):
-        body = _body_until(self.src, "function ContextBar(", ["ContextBar.prototype."])
-        self.assertIn('ebtn.addEventListener("mousedown", function (ev) { ev.preventDefault(); });', self.src)
-        self.assertIn("_focusTerminal", body)
-
-    def test_current_effort_read_from_meta_effort_with_fallback_label(self):
-        body = _body_until(self.src, "ContextBar.prototype._applySessionData = function", ["ContextBar.prototype."])
-        self.assertIn("meta.effort", body)
-        self.assertIn('"effort") + " ▾"', body)
-
-    def test_unrecognized_effort_value_is_shown_not_crashed_on(self):
-        # An effort value outside EFFORT_LADDER (a future CLI tier) must still render as the raw
-        # label rather than throwing -- _applySessionData only type/truthiness-guards meta.effort,
-        # it never validates against the ladder.
-        body = _body_until(self.src, "ContextBar.prototype._applySessionData = function", ["ContextBar.prototype."])
-        self.assertIn('typeof meta.effort === "string"', body)
-
-    def test_current_item_marked_the_same_way_as_the_model_dropdown(self):
-        body = _body_until(self.src, "ContextBar.prototype._openEffortDropdown = function", ["ContextBar.prototype."])
-        self.assertIn('classList.toggle("cur", items[i].getAttribute("data-effort") === this.currentEffort)', body)
-
-
-class TestContextBarAttachGating(unittest.TestCase):
-    """Task 1: the switcher's visibility is a REACTIVE, server-driven answer (GET
-    /api/term/attached), polled on the same 2s cycle as /api/session -- not a second timer, and
-    not derived from `mode`. A 404/network failure is treated as not-attached."""
-
-    def setUp(self):
-        self.src = _read("ext_vt.js")
-
-    def test_attached_endpoint_is_polled_inside_the_same_tick_as_session(self):
-        body = _body_until(self.src, "ContextBar.prototype.start = function", ["ContextBar.prototype."])
-        self.assertIn('"/api/session?id="', body)
-        self.assertIn('"/api/term/attached?tty="', body)
-        # exactly one timer call driving both fetches out of tick(), not two independent timers.
-        self.assertEqual(body.count("= setInterval("), 1)
-
-    def test_404_or_network_error_is_treated_as_not_attached(self):
-        body = _body_until(self.src, "ContextBar.prototype.start = function", ["ContextBar.prototype."])
-        self.assertIn("r.ok ? r.json() : { claude_attached: false }", body)
-        self.assertIn("self._setAttached(false)", body)
-
-    def test_set_attached_toggles_the_switchers_container(self):
-        body = _body_until(self.src, "ContextBar.prototype._setAttached = function", ["ContextBar.prototype."])
-        self.assertIn('this.switchersEl.style.display = attached ? "" : "none";', body)
-
-    def test_bar_visibility_accounts_for_dynamic_attached_state(self):
-        body = _body_until(self.src, "ContextBar.prototype._syncBarVisibility = function", ["ContextBar.prototype."])
-        self.assertIn("this.attached || this._hasUsage", body)
-        # the old fixed-at-construction proxy must be gone from the display logic entirely.
-        self.assertNotIn("this.showSwitcher", self.src)
+# TestContextBarAttachGating was REMOVED here: every one of its four assertions was a grep-only
+# check of behaviour that is now executed for real under Node --
+# tests/test_term_vt_exec.py's TestContextBarAttachToggle (polling both endpoints off one timer,
+# reacting to true->false->true across successive polls) and TestContextBarVisibility (the
+# attached||hasUsage display rule). The one genuinely-static claim in the removed class -- that
+# the old `this.showSwitcher` proxy is gone -- is already covered by
+# TestContextBarModelSwitcher.test_gating_uses_server_attached_not_the_old_mode_proxy's own
+# broader `assertNotIn("showSwitcher", self.src)` above, so nothing was lost.
 
 
 class TestContextUsageIsIsolatedAndDocumented(unittest.TestCase):
@@ -502,11 +443,12 @@ class TestContextBarDocksToBottomOfBothMounts(unittest.TestCase):
         body = _body_until(self.src, "function closeVT", ["function openNewTab"])
         self.assertIn("activeBar.destroy()", body)
 
-    def test_destroy_stops_the_poll_and_the_document_listener(self):
-        body = _body_until(self.src, "ContextBar.prototype.destroy", ["function openVT"])
-        self.assertIn("clearInterval", self.src)   # inside _pollStop, referenced from destroy
-        self.assertIn("_pollStop()", body)
-        self.assertIn('document.removeEventListener("click", this._onDocClick)', body)
+    # test_destroy_stops_the_poll_and_the_document_listener was REMOVED here: it grepped for
+    # `clearInterval`/`_pollStop()`/`removeEventListener` appearing in destroy()'s source text.
+    # The real behaviour -- that destroy() actually stops the poll (no further fetches occur
+    # afterward) and actually removes the document click listener -- is now proven by executing
+    # the real destroy() under Node: tests/test_term_vt_exec.py's
+    # TestContextBarTeardown.test_destroy_stops_polling_and_removes_the_doc_listener.
 
 
 class TestContextBarUsesSharedTokensNotRawHtml(unittest.TestCase):
@@ -1910,14 +1852,37 @@ class TestTerminalModalTitleIsUppercase(unittest.TestCase):
         self.assertIn('modalTitleEl.textContent = "TERMINAL";', page)
         self.assertIn('modalTitleEl.textContent = "TERMINAL — "', page)
 
-    def test_standalone_document_title_is_uppercase(self):
-        self.assertIn('document.title = "TERMINAL — AI Tracker";', self.src)
-        self.assertNotIn('document.title = "Terminal — AI Tracker";', self.src)
+    # The standalone tab's title used to be the constant "TERMINAL — AI Tracker", which made
+    # several ⤢-opened tabs indistinguishable in the tab strip -- and several tabs is the whole
+    # point of that button. It now carries the SAME session identifier the modal's own header
+    # does (mode prefix + sid, falling back to the tty for a bare ?tty= link). These two tests
+    # keep their original job -- the word is TERMINAL, never "Terminal" -- against the new string.
+    def test_standalone_document_title_is_uppercase_and_identifies_the_session(self):
+        self.assertIn(
+            'standaloneTitle = "TERMINAL — " + (mode === "resume" ? "resume · " : "") '
+            '+ (sid || "tty " + tty);',
+            self.src)
+        self.assertIn("document.title = standaloneTitle;", self.src)
+        self.assertNotIn('document.title = "Terminal — ', self.src)
+        self.assertNotIn('document.title = "TERMINAL — AI Tracker";', self.src)
+
+    def test_standalone_title_survives_app_js_own_two_second_retitle(self):
+        # app.js's render() does `document.title = title + " · tracker"` on EVERY poll, and it
+        # keeps polling in the standalone tab -- so a title written only at boot is clobbered
+        # seconds later (observed live before this assertion existed). ext_vt.js's own render
+        # hook, which app.js calls at the END of that same render, must re-assert it.
+        self.assertIn(
+            'if (standaloneTitle && document.title !== standaloneTitle) document.title = standaloneTitle;',
+            self.src)
 
     def test_standalone_document_title_reaches_the_browser(self):
         page = build_page()
-        self.assertIn('document.title = "TERMINAL — AI Tracker";', page)
-        self.assertNotIn('document.title = "Terminal — AI Tracker";', page)
+        self.assertIn(
+            'standaloneTitle = "TERMINAL — " + (mode === "resume" ? "resume · " : "") '
+            '+ (sid || "tty " + tty);',
+            page)
+        self.assertIn("document.title = standaloneTitle;", page)
+        self.assertNotIn('document.title = "Terminal — ', page)
 
 
 class TestThemeFlipperInTerminal(unittest.TestCase):
@@ -2058,6 +2023,311 @@ class TestObservePaneSharedResizeHelper(unittest.TestCase):
         page = build_page()
         self.assertIn("function observePane(pane, fn)", page)
         self.assertEqual(page.count("new ResizeObserver("), 1)
+
+
+# ===== CSS-rule helpers for TestMountPointParity's assertion 3 only. Deliberately NOT a general
+# CSS parser (this file's own convention -- see _body_until's docstring for the same philosophy
+# applied to JS): brace-depth matching to find one rule's `{...}` body, and a `prop: value;` ->
+# name split within it. Good enough to answer "which properties does this selector set inside this
+# @media block", nothing more. =====
+def _matching_brace_block(text, open_brace_idx):
+    """The full `{...}` block starting at `open_brace_idx` (which must point AT a '{'), matched by
+    brace depth so a block containing nested rules (an @media body full of other rules) still ends
+    at its OWN closing brace, not the first '}' encountered."""
+    depth = 0
+    i = open_brace_idx
+    n = len(text)
+    while i < n:
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_brace_idx:i + 1]
+        i += 1
+    raise AssertionError("unterminated CSS block starting at %d" % open_brace_idx)
+
+
+def _all_indices(text, marker):
+    out, start = [], 0
+    while True:
+        i = text.find(marker, start)
+        if i == -1:
+            return out
+        out.append(i)
+        start = i + 1
+
+
+def _props_from_body(body):
+    props = set()
+    for decl in body.split(";"):
+        decl = decl.strip()
+        if not decl or ":" not in decl:
+            continue
+        prop = decl.split(":", 1)[0].strip()
+        if prop:
+            props.add(prop)
+    return props
+
+
+def _props_of_rule(text, selector_with_brace):
+    """Properties set by the FIRST `selector_with_brace { ... }` rule in `text`. `selector_with_brace`
+    must end in '{' so a qualified selector (`.vt-standalone #ext_vt.vtfull .vtpane {`) can never be
+    mistaken for the bare one (`#ext_vt.vtfull .vtpane {`) it contains as a substring -- see the
+    css.index hazard documented on the call site below."""
+    idx = text.index(selector_with_brace)
+    brace = idx + len(selector_with_brace) - 1
+    end = text.index("}", brace)
+    return _props_from_body(text[brace + 1:end])
+
+
+def _media_block_containing(css, media_marker, needle):
+    """The brace-matched body of the @media block opened by `media_marker` (which must end in '{')
+    that contains `needle` -- there are TWO same-named @media blocks in this file (one for
+    .vtctxbar, one for .vtpane), and `media_marker` alone is also not reliably unique: it appears a
+    second time as plain PROSE inside a comment a few lines above the real .vtpane block (see the
+    comment right before that block), so a naive css.index(media_marker) can find the comment
+    instead of the rule and then brace-match into the wrong following block entirely. Iterating
+    every occurrence and keeping the one whose block actually contains `needle` sidesteps both
+    hazards at once."""
+    for idx in _all_indices(css, media_marker):
+        block = _matching_brace_block(css, idx + len(media_marker) - 1)
+        if needle in block:
+            return block
+    raise AssertionError("no %r block containing %r found in ext_vt.css" % (media_marker, needle))
+
+
+def _iter_top_level_rules(block):
+    """Yield (selector, body) for every `selector { body }` rule directly inside `block` (which must
+    itself be a full `{...}` block, e.g. an @media body). None of this file's @media blocks nest a
+    rule inside another rule, so a single non-nesting regex over the block's inner text is enough --
+    no recursive brace matching needed here."""
+    inner = block[block.index("{") + 1: block.rindex("}")]
+    for m in re.finditer(r"([^{}]+)\{([^{}]*)\}", inner):
+        yield m.group(1).strip(), m.group(2)
+
+
+class TestMountPointParity(unittest.TestCase):
+    """Structural guard against the ext_vt.{js,css} bug this file's header brief opens with: FOUR
+    past bugs where a control/behaviour landed in the MODAL (openVT/switchActiveRenderer, plus the
+    buildOverlay/_wireModalStatus helpers they share) but not the STANDALONE full-tab mount
+    (bootStandalone/mountRenderer), or vice versa -- caught only by adversarial review, never by a
+    test, because every existing "both mounts" test asserts a PAIR of independently-worded
+    one-sided literals (`activeTerm` vs `curTerm`, `modalStatusEl` vs `statusEl`, ...) against each
+    side SEPARATELY, so a change to one side that leaves its own literal alone still passes. The one
+    test that structurally can't be fooled that way is
+    TestZoomControlOverlapFix.test_toolbar_is_built_once_and_shared_by_both_renderers -- it asserts
+    a SINGLE shared count (`buildToolbar(` appears exactly 3 times: 1 definition + 2 call sites), so
+    a control missing from one call site changes that number. This class generalises that shape to
+    the rest of the per-mount surface, plus the two other kinds of parity bug (title, CSS
+    specificity) the header brief calls out.
+    """
+
+    def setUp(self):
+        self.js = _read("ext_vt.js")
+        self.css = _read("ext_vt.css")
+
+    # ----- shared slices, verified against the CURRENT file (see class docstring) -----
+
+    def _slices(self):
+        js = self.js
+        # BUILD_OVERLAY/WIRE_STATUS are sliced TIGHTLY (ending at the very next function, not at
+        # switchActiveRenderer several functions later) specifically so they do NOT swallow
+        # ContextBar/ContextBar.prototype/renderCapBlock, which sit in between in the file and are
+        # a genuinely SHARED class (one definition, `new ContextBar(...)` from both mounts) -- if
+        # included here, its own toast(...) calls would make "toast(" look like modal-only code
+        # (an artifact of file layout, not a real duplication) and silently invalidate the
+        # not-duplicated assertion in test_shared_once_helpers_are_not_reimplemented_per_mount.
+        build_overlay = _body_until(js, "function buildOverlay", ["function _matchLadderModel"])
+        wire_status = _body_until(js, "function _wireModalStatus", ["function switchActiveRenderer"])
+        switch = _body_until(js, "function switchActiveRenderer", ["function openVT"])
+        modal = _body_until(js, "function openVT(sid, mode)", ["function closeVT"])
+        standalone = _body_until(js, "function bootStandalone", ["})();\n})();"])
+        return build_overlay, wire_status, switch, modal, standalone
+
+    def test_slices_are_nonempty_and_plausibly_sized(self):
+        # Guard against the markers silently drifting out of date: if a future refactor renames or
+        # moves one of these functions, _body_until's src.index(start_marker) raises outright (a
+        # loud failure) -- but if a marker still matches while the REAL boundary moved, the slice
+        # could come back tiny/empty instead, which would make every assertion below vacuously pass.
+        # Minimums are well under each slice's actual current size (see the probe this class was
+        # built from), just large enough that a near-empty slice trips them.
+        build_overlay, wire_status, switch, modal, standalone = self._slices()
+        self.assertGreater(len(build_overlay), 500, "buildOverlay slice looks truncated")
+        self.assertGreater(len(wire_status), 200, "_wireModalStatus slice looks truncated")
+        self.assertGreater(len(switch), 200, "switchActiveRenderer slice looks truncated")
+        self.assertGreater(len(modal), 2000, "openVT slice looks truncated")
+        self.assertGreater(len(standalone), 2000, "bootStandalone slice looks truncated")
+        # and the two function-identity spot checks _body_until can't give us for free -- the slice
+        # actually opens where it should, not somewhere `start_marker` merely appears as a comment.
+        self.assertTrue(modal.startswith("function openVT(sid, mode)"))
+        self.assertTrue(standalone.startswith("function bootStandalone"))
+
+    # ----- assertion 1: shared-capability parity -----
+
+    def test_shared_capability_markers_present_in_both_mount_points(self):
+        """For each marker below, assert it appears BOTH in the modal-side code (buildOverlay +
+        _wireModalStatus + switchActiveRenderer + openVT) AND in the standalone tab's code
+        (bootStandalone/mountRenderer/renderStandaloneStatus/boot). A control shipped to one mount
+        only fails this immediately, unlike the existing PAIR-style tests described in the class
+        docstring. Every marker was verified present at a specific line on both sides against the
+        CURRENT file before being added here (not guessed from the task brief) -- see the per-marker
+        comment for where.
+        """
+        build_overlay, wire_status, switch, modal, standalone = self._slices()
+        modal_side = build_overlay + wire_status + switch + modal
+
+        table = [
+            # ContextBar (the model/effort switcher + token readout footer) built by both mounts.
+            ("new ContextBar(", "openVT L2582 / mountRenderer L2769"),
+            # the advisory-notice element's class -- bug: "the notice placement" (header brief #4).
+            ("vtnotice", "openVT L2529 / boot() L2796"),
+            # the terminal's dedicated wrap class, kept separate from the notice/status/bar chrome.
+            ("vttermwrap", "openVT L2553 / boot() L2809"),
+            # the status callback hook each mount wires onto its Terminal/XtermTerminal instance.
+            ("_onStatusChange", "_wireModalStatus L2411 / mountRenderer L2772"),
+            # the call that actually opens the SSE stream, on both the initial build and a switch.
+            ("term.attach()", "switchActiveRenderer L2449 / openVT L2584 / mountRenderer L2782"),
+            # the resume-refusal status guard -- bug: header brief #4's "status guard" existed on
+            # one side only. Both sides must suppress connecting/reconnecting churn identically
+            # while a mode="resume" pane is still coming up.
+            ("if (term.starting)", "_wireModalStatus L2418 / mountRenderer L2779"),
+            # the fork chip's accessible name -- bug: header brief #4's "fork-chip aria-label"
+            # existed on one side only. Anchored to the `aria-label` attribute NAME, not just the
+            # tooltip text: both sides also set an identical `title` attribute (the hover tooltip),
+            # so a marker on the bare sentence alone would still find a match via `title` even with
+            # the `aria-label` attribute itself missing -- exactly the shape of the original bug,
+            # and exactly what a plain-text marker here would have missed.
+            ('setAttribute("aria-label", "This terminal is a copy of a background agent — the '
+             'original is still running separately")',
+             "buildOverlay L1887 / renderStandaloneStatus L2733"),
+        ]
+        for marker, where in table:
+            self.assertIn(marker, modal_side,
+                           "modal-side code (buildOverlay/_wireModalStatus/switchActiveRenderer/"
+                           "openVT) is missing %r -- expected at %s" % (marker, where))
+            self.assertIn(marker, standalone,
+                           "standalone code (bootStandalone/mountRenderer/renderStandaloneStatus) "
+                           "is missing %r -- expected at %s" % (marker, where))
+
+    def test_shared_once_helpers_are_not_reimplemented_per_mount(self):
+        """`buildToolbar(` and `toast(` are deliberately NOT in the table above: both are called
+        through a genuinely SHARED code path (Terminal/XtermTerminal's constructor for
+        buildToolbar; ContextBar.prototype's methods for toast), reached identically by
+        `new Cls(...)`/`new ContextBar(...)` from both mounts, so textually neither call ever
+        appears inside either mount's OWN slice -- a substring check for them in the table above
+        would either be vacuous or (as buildToolbar's own existing
+        test_toolbar_is_built_once_and_shared_by_both_renderers already checks with a raw count)
+        redundant. What this DOES need to confirm is the premise: that neither mount has quietly
+        grown its OWN local reimplementation instead of calling the shared one -- which is exactly
+        what "not present in either per-mount slice" proves.
+        """
+        build_overlay, wire_status, switch, modal, standalone = self._slices()
+        modal_side = build_overlay + wire_status + switch + modal
+        for marker in ("buildToolbar(", "toast("):
+            self.assertNotIn(marker, modal_side,
+                              "%r found inside the modal's own slice -- expected it to only be "
+                              "reached through the shared Terminal/XtermTerminal/ContextBar code" % marker)
+            self.assertNotIn(marker, standalone,
+                              "%r found inside the standalone tab's own slice -- expected it to "
+                              "only be reached through the shared Terminal/XtermTerminal/ContextBar "
+                              "code" % marker)
+
+    # ----- assertion 2: title symmetry -----
+
+    def test_title_symmetry_shares_prefix_and_interpolates_session_identifier(self):
+        """Bug: header brief #1 -- "the modal title was uppercased but the standalone document.title
+        was not". Assert both title assignments share the SAME literal `TERMINAL — ` prefix (not
+        just "both happen to say TERMINAL somewhere") AND both continue past that literal with a `+`
+        that interpolates a session identifier, rather than one side being a bare hardcoded string a
+        future edit could leave un-synced with the other.
+        """
+        modal_line = _body_until(self.js, 'modalTitleEl.textContent = "TERMINAL — "', [";"])
+        standalone_line = _body_until(self.js, 'standaloneTitle = "TERMINAL — "', [";"])
+
+        # Same literal prefix, verbatim (including the em dash) -- a future edit that reworded one
+        # side ("TERMINAL:" or a plain hyphen) without touching the other fails right here.
+        self.assertTrue(modal_line.startswith('modalTitleEl.textContent = "TERMINAL — "'),
+                         "modal title assignment does not start with the TERMINAL prefix: %r" % modal_line)
+        self.assertTrue(standalone_line.startswith('standaloneTitle = "TERMINAL — "'),
+                         "standalone title assignment does not start with the TERMINAL prefix: %r"
+                         % standalone_line)
+
+        # Both INTERPOLATE a session identifier -- i.e. the statement doesn't end right after the
+        # literal prefix (which would make it a hardcoded constant, the exact shape of bug #1: the
+        # modal recomputed its title per-open while the standalone tab's document.title was set
+        # once from a fixed string and never revisited).
+        self.assertIn("+ sid", modal_line,
+                       "modal title no longer interpolates `sid` -- looks hardcoded: %r" % modal_line)
+        self.assertTrue("+ (sid ||" in standalone_line or "+ sid" in standalone_line,
+                         "standalone title no longer interpolates a session identifier -- looks "
+                         "hardcoded: %r" % standalone_line)
+
+    # ----- assertion 3: CSS specificity guard -----
+
+    def test_media_query_overrides_for_vtpane_are_mirrored_for_the_fullscreen_pane(self):
+        """Bug: header brief #4's "phone padding" -- no other source-text test can see this one,
+        because both the mobile `.vtpane` rule and the fullscreen `#ext_vt.vtfull .vtpane` rule
+        individually look correct in isolation; the bug only exists in how CSS resolves the
+        conflict BETWEEN them. `#ext_vt.vtfull .vtpane` (specificity (1,2,0): one ID + two classes)
+        sits OUTSIDE any @media block and beats the bare `.vtpane` (0,1,0) inside one on specificity
+        alone, regardless of source order -- so any property both rules set, the fullscreen rule
+        silently wins on every viewport, including narrow ones where the @media rule was supposed to
+        take over. The only way out is a same-or-higher-specificity selector INSIDE that @media
+        block restating the property -- which is exactly what
+        `.vt-standalone #ext_vt.vtfull .vtpane` (1,3,0) does for `padding` there.
+
+        Restricted to `padding` on purpose (not a fully general "assert every collision is
+        restated" loop) -- see KNOWN_IMPORTANT_OVERRIDE_PROPS below for why a fully general version
+        would be WRONG here, not just fiddlier.
+        """
+        # The one property whose silent loss was an actual historical bug. `min-height` ALSO
+        # collides (the base rule sets `min-height: 0`; the max-width:600px `.vtpane` rule sets
+        # `min-height: 46vh`/`46dvh`) but is DELIBERATELY left un-restated -- ext_vt.css's own
+        # comment beside the override rule says so explicitly ("Only `padding` is restated:
+        # `flex`/`min-height: 0` from that rule are deliberate and still apply"): the fullscreen
+        # base rule's min-height:0 is meant to WIN there, so a generic "every collision must be
+        # restated" assertion would be a false positive on min-height, not a real regression bar.
+        KNOWN_IMPORTANT_OVERRIDE_PROPS = {"padding"}
+
+        base_props = _props_of_rule(self.css, "\n#ext_vt.vtfull .vtpane {")
+        self.assertTrue(base_props, "could not find the base #ext_vt.vtfull .vtpane rule at all")
+
+        for media_marker in ("@media(min-width:601px) and (max-width:900px) {",
+                              "@media(max-width:600px) {"):
+            block = _media_block_containing(self.css, media_marker, ".vtpane {")
+            self.assertGreater(len(block), 20, "media block for %r looks truncated" % media_marker)
+            vtpane_props = _props_of_rule(block, ".vtpane {")
+
+            override_props = set()
+            found_override = False
+            for selector, body in _iter_top_level_rules(block):
+                if "#ext_vt.vtfull" in selector and ".vtpane" in selector and selector != ".vtpane":
+                    found_override = True
+                    override_props |= _props_from_body(body)
+
+            for prop in KNOWN_IMPORTANT_OVERRIDE_PROPS:
+                if prop not in vtpane_props:
+                    continue    # this media block doesn't touch this property -- nothing to guard
+                # sanity: this scenario is only a real bug if the base rule ALSO sets it (otherwise
+                # there is no specificity fight to lose in the first place).
+                self.assertIn(prop, base_props,
+                               "%r is asserted as a known-important collision but the base "
+                               "#ext_vt.vtfull .vtpane rule doesn't set it -- update "
+                               "KNOWN_IMPORTANT_OVERRIDE_PROPS" % prop)
+                self.assertTrue(found_override,
+                                 "%s sets %r on .vtpane, which collides with the higher-specificity "
+                                 "#ext_vt.vtfull .vtpane rule, but this @media block has no "
+                                 "`#ext_vt.vtfull ... .vtpane` override selector to restate it -- "
+                                 "the fullscreen rule will silently win at every viewport width "
+                                 "instead of just widths above this @media's range"
+                                 % (media_marker, prop))
+                self.assertIn(prop, override_props,
+                               "%s's fullscreen-pane override exists but doesn't restate %r -- "
+                               "the higher-specificity base rule wins on this property at every "
+                               "viewport width, defeating the mobile value from this @media block "
+                               "entirely (this is the shape of the historical phone-padding bug)"
+                               % (media_marker, prop))
 
 
 if __name__ == "__main__":

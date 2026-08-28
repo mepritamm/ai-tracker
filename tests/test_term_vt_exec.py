@@ -168,6 +168,25 @@ if _HAS_NODE:
     _xterm_leak_end = _SRC.index("// ===== the modal")
     _XTERM_LEAK_SRC = _SRC[_xterm_leak_start:_xterm_leak_end]
 
+    # ===== ContextBar: model/effort switchers, attach-gating, usage readout (this task) =====
+    # tests/test_term_vt_client.py used to assert the WHOLE of this behaviour by grepping the
+    # source text (e.g. "the inject POST body contains these substrings"), which stays true even
+    # if the feature is completely broken at runtime -- an adversarial review's actual finding.
+    # These two spans pull the real code out verbatim (never retyped) so it can be executed under
+    # Node instead: MODEL_LADDER/EFFORT_LADDER/_matchLadderModel/fmtTok/readContextUsage (plain
+    # top-level helpers ContextBar's own methods call), then the ContextBar constructor through
+    # the end of `ContextBar.prototype.destroy` -- one contiguous span, the same "between two
+    # literal markers" strategy `_XTERM_LEAK_SRC` above already uses. `renderCapBlock` (the next
+    # top-level function after destroy) is the bound; it is unrelated to ContextBar and not needed
+    # here.
+    _ctxbar_helpers_start = _SRC.index("var MODEL_LADDER = [")
+    _ctxbar_helpers_end = _SRC.index("function ContextBar(container, sid, ttyId, mode, getInput) {")
+    _CONTEXT_BAR_HELPERS_SRC = _SRC[_ctxbar_helpers_start:_ctxbar_helpers_end]
+
+    _ctxbar_start = _ctxbar_helpers_end
+    _ctxbar_end = _SRC.index("function renderCapBlock(")
+    _CONTEXT_BAR_SRC = _SRC[_ctxbar_start:_ctxbar_end]
+
 
 _HARNESS_PRELUDE = """
 'use strict';
@@ -1770,6 +1789,692 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         self.assertEqual(result["resizeCalls"], [], "no .xterm-screen node means no correction can be computed")
         self.assertEqual(result["finalRows"], 24, "rows must be left untouched")
         self.assertEqual(result["built"], 1, "sanity: _build() itself must have completed, not thrown")
+
+
+# ===== ContextBar: executed behaviour, replacing the grep-only assertions this task's brief =====
+# flagged in tests/test_term_vt_client.py (TestContextBarModelSwitcher/EffortSwitcher's inject/
+# toast/focus-safety methods, all of TestContextBarAttachGating, and
+# TestContextBarDocksToBottomOfBothMounts's destroy-teardown method -- see that file for exactly
+# which methods were removed and why). Mirrors `_xterm_leak_harness()`'s own style: a stub
+# `document`, a stub network layer (here `fetch` -- XtermTerminal has no fetch of its own, so that
+# harness didn't need one), and recorded calls the tests assert on directly, rather than grepping
+# ext_vt.js's source text for the right substrings.
+
+_CONTEXT_BAR_MOCKS = """
+// fetch() is a small router keyed on URL prefix, backed by a per-endpoint QUEUE the test pushes
+// canned {status, json, badJson, reject} responses onto -- draining left-to-right, one queue
+// entry per call, except a queue with exactly one entry left repeats it forever (so a test that
+// only cares about the FIRST response can leave the queue at length 1 and every later poll still
+// gets something sane). This is what lets a test drive a real true -> false -> true sequence
+// across three separate polls of the SAME endpoint.
+var __fetchCalls = [];
+var __toastCalls = [];
+var __sessionQueue = [{ json: {} }];
+var __attachedQueue = [{ json: { claude_attached: false } }];
+var __injectQueue = [{ json: { ok: true } }];
+
+function __nextFrom(queue) {
+  return queue.length > 1 ? queue.shift() : queue[0];
+}
+
+function __makeResponse(status, jsonBody, jsonFails) {
+  return {
+    ok: status >= 200 && status < 300,
+    status: status,
+    json: function () {
+      return jsonFails ? Promise.reject(new Error('invalid json')) : Promise.resolve(jsonBody);
+    },
+  };
+}
+
+function fetch(url, opts) {
+  __fetchCalls.push({ url: url, opts: opts });
+  var queue = null;
+  if (url.indexOf('/api/session') === 0) queue = __sessionQueue;
+  else if (url.indexOf('/api/term/attached') === 0) queue = __attachedQueue;
+  else if (url.indexOf('/api/term/inject') === 0) queue = __injectQueue;
+  if (!queue) return Promise.resolve(__makeResponse(200, {}));
+  var b = __nextFrom(queue);
+  if (b.reject) return Promise.reject(new Error(b.rejectMsg || 'simulated network failure'));
+  return Promise.resolve(__makeResponse(b.status === undefined ? 200 : b.status, b.json, !!b.badJson));
+}
+
+function toast(title, msg) { __toastCalls.push({ title: title, msg: msg }); }
+
+// A controllable setInterval: ContextBar.prototype.start calls this exactly ONCE and stashes the
+// tick function -- the test then invokes __tick() by hand instead of waiting on a real 2000ms
+// timer, exactly like _xterm_leak_harness's own manually-driven ResizeObserver/asset-load
+// stand-ins do for XtermTerminal.
+var __setIntervalCallCount = 0;
+var __intervalFn = null;
+var __intervalCleared = false;
+function setInterval(fn, ms) {
+  __setIntervalCallCount++;
+  __intervalFn = fn;
+  return 1;
+}
+function clearInterval(id) { __intervalCleared = true; __intervalFn = null; }
+function __tick() { if (__intervalFn) __intervalFn(); }
+
+// Drains the microtask queue: every fetch() above resolves SYNCHRONOUSLY (Promise.resolve, no
+// real I/O), so any depth of .then()/.catch() chaining off of it fully settles before Node's
+// event loop ever reaches a macrotask -- one hop through a real setTimeout is enough to prove
+// "the chain is done"; this loops a few times purely for safety margin.
+function __flush(n) {
+  var p = Promise.resolve();
+  for (var i = 0; i < (n || 4); i++) {
+    p = p.then(function () { return new Promise(function (r) { setTimeout(r, 0); }); });
+  }
+  return p;
+}
+
+// ===== minimal fake DOM: just enough for ContextBar's own document.createElement/addEventListener
+// calls -- classList, innerHTML, textContent, appendChild/removeChild, a `.dispatch(type, ev)`
+// helper the tests use to drive REAL listeners registered via REAL addEventListener calls (never
+// calling a `_pick*`/`_open*Dropdown` method directly to simulate a click), and `.contains()` for
+// the outside-click-closes-dropdown wiring. =====
+function __makeEl(tag) {
+  var listeners = {};
+  var classes = new Set();
+  var el = {
+    tagName: tag, className: '', style: {}, textContent: '', title: '', innerHTML: '',
+    children: [], parentNode: null, _attrs: {},
+    appendChild: function (child) { child.parentNode = el; el.children.push(child); return child; },
+    removeChild: function (child) {
+      var i = el.children.indexOf(child);
+      if (i !== -1) el.children.splice(i, 1);
+      child.parentNode = null;
+    },
+    setAttribute: function (k, v) { el._attrs[k] = String(v); },
+    getAttribute: function (k) { return el._attrs.hasOwnProperty(k) ? el._attrs[k] : null; },
+    addEventListener: function (type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+    removeEventListener: function (type, fn) {
+      var arr = listeners[type] || [];
+      var i = arr.indexOf(fn);
+      if (i !== -1) arr.splice(i, 1);
+    },
+    dispatch: function (type, ev) {
+      ev = ev || {};
+      if (ev.target === undefined) ev.target = el;
+      (listeners[type] || []).slice().forEach(function (fn) { fn(ev); });
+    },
+    contains: function (node) {
+      while (node) { if (node === el) return true; node = node.parentNode; }
+      return false;
+    },
+    querySelectorAll: function () { return []; },
+  };
+  el.classList = {
+    add: function (c) { classes.add(c); },
+    remove: function (c) { classes.delete(c); },
+    toggle: function (c, force) {
+      if (force === undefined) { classes.has(c) ? classes.delete(c) : classes.add(c); }
+      else if (force) classes.add(c); else classes.delete(c);
+    },
+    contains: function (c) { return classes.has(c); },
+  };
+  return el;
+}
+
+var document = {
+  createElement: function (tag) { return __makeEl(tag); },
+  _listeners: {},
+  addEventListener: function (type, fn) { (document._listeners[type] = document._listeners[type] || []).push(fn); },
+  removeEventListener: function (type, fn) {
+    var arr = document._listeners[type] || [];
+    var i = arr.indexOf(fn);
+    if (i !== -1) arr.splice(i, 1);
+  },
+};
+var window = {};   // esc's own `window.esc ||` fallback (its extracted line, below) needs this global
+
+function fakeEvent(overrides) {
+  var ev = { stopPropagation: function () {}, preventDefault: function () {} };
+  for (var k in (overrides || {})) ev[k] = overrides[k];
+  return ev;
+}
+"""
+
+
+class TestContextBarAttachToggle(unittest.TestCase):
+    """Task 1, executed: the switchers' visibility is a REACTIVE answer driven by real polls of
+    GET /api/term/attached, not just the first one. Drives the real `ContextBar.prototype.start`
+    and manually advances the SAME stored tick function across three separate polls, proving the
+    switchers container's real `style.display` actually flips true -> false -> true -- the
+    grep-only version this replaces could only confirm the right URL strings and call shape
+    appeared in the source, which stays true even if `_setAttached` were a no-op.
+
+    PROVEN REAL (see the task report for the full RED transcript): temporarily reverting
+    `ContextBar.prototype._setAttached` to a no-op in aitracker/web/ext_vt.js (via a `cp` backup,
+    never git) made `test_attach_state_reacts_across_successive_polls` fail before the file was
+    restored."""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_attach_state_reacts_across_successive_polls(self):
+        script = _HARNESS_PRELUDE + _CONTEXT_BAR_MOCKS + _ESC_SRC + _CONTEXT_BAR_HELPERS_SRC + _CONTEXT_BAR_SRC + """
+async function main() {
+  __attachedQueue = [
+    { json: { claude_attached: true } },
+    { json: { claude_attached: false } },
+    { json: { claude_attached: true } },
+  ];
+  var container = document.createElement('div');
+  var bar = new ContextBar(container, 'sid1', 'tty1', 'cwd', function () { return null; });
+  bar.start();
+  await __flush();
+  var afterFirst = bar.switchersEl.style.display;
+
+  __tick();
+  await __flush();
+  var afterSecond = bar.switchersEl.style.display;
+
+  __tick();
+  await __flush();
+  var afterThird = bar.switchersEl.style.display;
+
+  console.log(JSON.stringify({
+    afterFirst: afterFirst, afterSecond: afterSecond, afterThird: afterThird,
+    setIntervalCalls: __setIntervalCallCount,
+    sessionCalls: __fetchCalls.filter(function (c) { return c.url.indexOf('/api/session') === 0; }).length,
+    attachedCalls: __fetchCalls.filter(function (c) { return c.url.indexOf('/api/term/attached') === 0; }).length,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertEqual(result["afterFirst"], "", "attached:true must show the switchers")
+        self.assertEqual(result["afterSecond"], "none", "attached:false must hide them again")
+        self.assertEqual(result["afterThird"], "", "attached:true must show them a third time -- reactive, not latched")
+        # one timer drives both fetches out of ONE tick(), not two independent timers/polls.
+        self.assertEqual(result["setIntervalCalls"], 1)
+        self.assertEqual(result["sessionCalls"], 3)
+        self.assertEqual(result["attachedCalls"], 3)
+
+
+class TestContextBarFailClosed(unittest.TestCase):
+    """Task 2, executed: a 404, a non-JSON body, and a rejected fetch on GET /api/term/attached
+    must each flip an already-attached bar back to not-attached. This is a safety property -- the
+    task's own framing is that typing a slash command into a plain bash prompt is the harm a stale
+    "attached" answer would cause -- so all three failure SHAPES are pinned separately rather than
+    trusting one to stand in for the others.
+
+    PROVEN REAL: temporarily changing the `.catch` branch in `ContextBar.prototype.start` to call
+    `self._setAttached(true)` instead of `false` (a plausible-looking but wrong "fail open"
+    mistake, via a `cp` backup, never git) made all three of these go RED before the file was
+    restored -- see the task report."""
+
+    def _run(self, attached_queue):
+        script = _HARNESS_PRELUDE + _CONTEXT_BAR_MOCKS + _ESC_SRC + _CONTEXT_BAR_HELPERS_SRC + _CONTEXT_BAR_SRC + """
+async function main() {
+  __attachedQueue = %s;
+  var container = document.createElement('div');
+  var bar = new ContextBar(container, 'sid1', 'tty1', 'cwd', function () { return null; });
+  bar.start();
+  await __flush();
+  var afterFirst = { attached: bar.attached, display: bar.switchersEl.style.display };
+  __tick();
+  await __flush();
+  var afterSecond = { attached: bar.attached, display: bar.switchersEl.style.display };
+  console.log(JSON.stringify({ afterFirst: afterFirst, afterSecond: afterSecond }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""" % json.dumps(attached_queue)
+        return _run_node(script)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_404_flips_to_not_attached(self):
+        result = self._run([{"json": {"claude_attached": True}}, {"status": 404, "json": {}}])
+        self.assertTrue(result["afterFirst"]["attached"])
+        self.assertFalse(result["afterSecond"]["attached"])
+        self.assertEqual(result["afterSecond"]["display"], "none")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_non_json_body_flips_to_not_attached(self):
+        result = self._run([{"json": {"claude_attached": True}}, {"json": None, "badJson": True}])
+        self.assertTrue(result["afterFirst"]["attached"])
+        self.assertFalse(result["afterSecond"]["attached"])
+        self.assertEqual(result["afterSecond"]["display"], "none")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_rejected_fetch_flips_to_not_attached(self):
+        result = self._run([{"json": {"claude_attached": True}}, {"reject": True}])
+        self.assertTrue(result["afterFirst"]["attached"])
+        self.assertFalse(result["afterSecond"]["attached"])
+        self.assertEqual(result["afterSecond"]["display"], "none")
+
+
+class TestContextBarVisibility(unittest.TestCase):
+    """Task 3, executed: the bar's own `.el.style.display` must follow `attached || hasUsage`
+    exactly. Driven by calling the real `_setAttached`/`_renderReadout` methods directly (no
+    fetch/poll needed to prove this rule -- it's pure state -> display logic, not a network
+    concern), covering all three combinations the task names: not-attached+no-usage (hidden),
+    not-attached+usage (visible), attached+no-usage (visible)."""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_visibility_follows_attached_or_has_usage(self):
+        script = _HARNESS_PRELUDE + _CONTEXT_BAR_MOCKS + _ESC_SRC + _CONTEXT_BAR_HELPERS_SRC + _CONTEXT_BAR_SRC + """
+async function main() {
+  var container = document.createElement('div');
+  var bar = new ContextBar(container, 'sid1', 'tty1', 'cwd', function () { return null; });
+  var results = {};
+  results.initial = bar.el.style.display;               // not attached, no usage -> hidden
+
+  bar._renderReadout({ current: 100, limit: null, pct: null }, 0);
+  results.notAttachedWithUsage = bar.el.style.display;   // not attached, HAS usage -> visible
+
+  bar._renderReadout(null, 0);
+  results.backToNothing = bar.el.style.display;          // usage cleared again -> hidden
+
+  bar._setAttached(true);
+  results.attachedNoUsage = bar.el.style.display;        // attached, no usage -> visible
+
+  bar._setAttached(false);
+  results.neitherAgain = bar.el.style.display;           // back to neither -> hidden
+
+  console.log(JSON.stringify(results));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertEqual(result["initial"], "none")
+        self.assertEqual(result["notAttachedWithUsage"], "")
+        self.assertEqual(result["backToNothing"], "none")
+        self.assertEqual(result["attachedNoUsage"], "")
+        self.assertEqual(result["neitherAgain"], "none")
+
+
+class TestContextBarInjectContract(unittest.TestCase):
+    """Task 4, executed: picking a model or an effort from the REAL dropdown -- a real click on
+    the real button opens it, a real click on a real dropdown item picks it, both dispatched
+    through listeners registered via real `addEventListener` calls, never a direct
+    `_pickModel`/`_pickEffort` call standing in for the click -- must send exactly the documented
+    POST /api/term/inject body. This is what actually types the slash command into the CLI; a
+    wrong body silently sends nothing useful.
+
+    PROVEN REAL: temporarily dropping `clear_first: true` from `ContextBar.prototype._pickModel`'s
+    request body (via a `cp` backup, never git) made
+    `test_model_pick_drives_the_dropdown_and_sends_the_inject_contract` go RED before the file was
+    restored -- see the task report."""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_model_pick_drives_the_dropdown_and_sends_the_inject_contract(self):
+        script = _HARNESS_PRELUDE + _CONTEXT_BAR_MOCKS + _ESC_SRC + _CONTEXT_BAR_HELPERS_SRC + _CONTEXT_BAR_SRC + """
+async function main() {
+  var container = document.createElement('div');
+  var bar = new ContextBar(container, 'sid1', 'tty42', 'cwd', function () { return null; });
+  bar._setAttached(true);
+
+  bar.modelBtn.dispatch('click', fakeEvent());
+  var openedAfterClick = bar.modelDropdownOpen;
+
+  var item = null;
+  for (var i = 0; i < bar.modelDd.children.length; i++) {
+    if (bar.modelDd.children[i].getAttribute('data-model') === 'opus') item = bar.modelDd.children[i];
+  }
+  bar.modelDd.dispatch('click', fakeEvent({ target: item }));
+  await __flush();
+
+  var closedAfterPick = bar.modelDropdownOpen;
+  var call = __fetchCalls[__fetchCalls.length - 1];
+  console.log(JSON.stringify({
+    openedAfterClick: openedAfterClick,
+    closedAfterPick: closedAfterPick,
+    url: call.url,
+    method: call.opts.method,
+    body: JSON.parse(call.opts.body),
+    toasts: __toastCalls,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertTrue(result["openedAfterClick"])
+        self.assertFalse(result["closedAfterPick"], "picking must close the dropdown again")
+        self.assertEqual(result["url"], "/api/term/inject")
+        self.assertEqual(result["method"], "POST")
+        self.assertEqual(result["body"], {
+            "tty": "tty42", "text": "/model opus", "submit": True, "clear_first": True,
+        })
+        self.assertEqual(result["toasts"], [], "a successful inject must not surface a toast")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_effort_pick_drives_the_dropdown_and_sends_the_inject_contract(self):
+        script = _HARNESS_PRELUDE + _CONTEXT_BAR_MOCKS + _ESC_SRC + _CONTEXT_BAR_HELPERS_SRC + _CONTEXT_BAR_SRC + """
+async function main() {
+  var container = document.createElement('div');
+  var bar = new ContextBar(container, 'sid1', 'tty42', 'cwd', function () { return null; });
+  bar._setAttached(true);
+
+  bar.effortBtn.dispatch('click', fakeEvent());
+  var openedAfterClick = bar.effortDropdownOpen;
+
+  var item = null;
+  for (var i = 0; i < bar.effortDd.children.length; i++) {
+    if (bar.effortDd.children[i].getAttribute('data-effort') === 'xhigh') item = bar.effortDd.children[i];
+  }
+  bar.effortDd.dispatch('click', fakeEvent({ target: item }));
+  await __flush();
+
+  var closedAfterPick = bar.effortDropdownOpen;
+  var call = __fetchCalls[__fetchCalls.length - 1];
+  console.log(JSON.stringify({
+    openedAfterClick: openedAfterClick,
+    closedAfterPick: closedAfterPick,
+    url: call.url,
+    method: call.opts.method,
+    body: JSON.parse(call.opts.body),
+    toasts: __toastCalls,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertTrue(result["openedAfterClick"])
+        self.assertFalse(result["closedAfterPick"], "picking must close the dropdown again")
+        self.assertEqual(result["url"], "/api/term/inject")
+        self.assertEqual(result["method"], "POST")
+        self.assertEqual(result["body"], {
+            "tty": "tty42", "text": "/effort xhigh", "submit": True, "clear_first": True,
+        })
+        self.assertEqual(result["toasts"], [], "a successful inject must not surface a toast")
+
+
+class TestContextBarInjectFailureToast(unittest.TestCase):
+    """Task 5, executed: an inject POST that comes back 404, or one whose fetch() itself rejects
+    (server unreachable), must surface a toast rather than fail silently -- the user has no other
+    signal that "/model opus" never reached the CLI."""
+
+    def _pick_model_and_capture_toasts(self, inject_queue):
+        script = _HARNESS_PRELUDE + _CONTEXT_BAR_MOCKS + _ESC_SRC + _CONTEXT_BAR_HELPERS_SRC + _CONTEXT_BAR_SRC + """
+async function main() {
+  __injectQueue = %s;
+  var container = document.createElement('div');
+  var bar = new ContextBar(container, 'sid1', 'tty1', 'cwd', function () { return null; });
+  bar._pickModel('opus');
+  await __flush();
+  console.log(JSON.stringify({ toasts: __toastCalls }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""" % json.dumps(inject_queue)
+        return _run_node(script)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_404_response_surfaces_a_toast(self):
+        result = self._pick_model_and_capture_toasts([{"status": 404, "json": {}}])
+        self.assertEqual(len(result["toasts"]), 1)
+        self.assertIn("model", result["toasts"][0]["title"].lower())
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_rejected_fetch_surfaces_a_toast(self):
+        result = self._pick_model_and_capture_toasts([{"reject": True}])
+        self.assertEqual(len(result["toasts"]), 1)
+        self.assertIn("reach", result["toasts"][0]["title"].lower())
+
+
+class TestContextBarFocusSafety(unittest.TestCase):
+    """Task 6, executed: mousedown on either button or either dropdown must call
+    `ev.preventDefault()` -- a real DOM `<button>`/click target takes native focus on mousedown,
+    and stealing focus from the terminal's own capture textarea breaks typing while a dropdown is
+    open. Driven with a real fake mousedown event whose `preventDefault` is a recording function,
+    dispatched through the REAL listener registered via the REAL `addEventListener` call in the
+    constructor -- not a source-text check for the literal `ev.preventDefault()` call."""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_all_four_mousedown_targets_prevent_default(self):
+        script = _HARNESS_PRELUDE + _CONTEXT_BAR_MOCKS + _ESC_SRC + _CONTEXT_BAR_HELPERS_SRC + _CONTEXT_BAR_SRC + """
+async function main() {
+  var container = document.createElement('div');
+  var bar = new ContextBar(container, 'sid1', 'tty1', 'cwd', function () { return null; });
+  var results = {};
+  ['modelBtn', 'effortBtn', 'modelDd', 'effortDd'].forEach(function (name) {
+    var calls = 0;
+    bar[name].dispatch('mousedown', { preventDefault: function () { calls++; } });
+    results[name] = calls;
+  });
+  console.log(JSON.stringify(results));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        for name in ("modelBtn", "effortBtn", "modelDd", "effortDd"):
+            self.assertEqual(result[name], 1, "%s's mousedown handler must call preventDefault()" % name)
+
+
+class TestContextBarEffortLabel(unittest.TestCase):
+    """Task 7, executed: `ContextBar.prototype._applySessionData`'s real handling of
+    `meta.effort` -- labelled when present, falls back to "effort ▾" when absent, and survives an
+    unrecognised value (a future CLI tier) without throwing, rendering it as-is and marking no
+    dropdown item current."""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_effort_label_present_absent_and_unrecognized(self):
+        script = _HARNESS_PRELUDE + _CONTEXT_BAR_MOCKS + _ESC_SRC + _CONTEXT_BAR_HELPERS_SRC + _CONTEXT_BAR_SRC + """
+async function main() {
+  var container = document.createElement('div');
+  var bar = new ContextBar(container, 'sid1', 'tty1', 'cwd', function () { return null; });
+  var results = {};
+
+  bar._applySessionData({ meta: { effort: 'high' }, tokens: { in: 0, out: 0 } });
+  results.withEffort = bar.effortBtn.textContent;
+  bar._openEffortDropdown();
+  var highCur = false;
+  for (var i = 0; i < bar.effortDd.children.length; i++) {
+    if (bar.effortDd.children[i].getAttribute('data-effort') === 'high') {
+      highCur = bar.effortDd.children[i].classList.contains('cur');
+    }
+  }
+  results.highMarkedCurrent = highCur;
+  bar._closeEffortDropdown();
+
+  bar._applySessionData({ meta: {}, tokens: { in: 0, out: 0 } });
+  results.withoutEffort = bar.effortBtn.textContent;
+
+  var threw = false;
+  try {
+    bar._applySessionData({ meta: { effort: 'banana' }, tokens: { in: 0, out: 0 } });
+  } catch (e) { threw = true; }
+  results.threwOnUnrecognized = threw;
+  results.unrecognizedLabel = bar.effortBtn.textContent;
+
+  bar._openEffortDropdown();
+  var anyCurrent = false;
+  for (var j = 0; j < bar.effortDd.children.length; j++) {
+    if (bar.effortDd.children[j].classList.contains('cur')) anyCurrent = true;
+  }
+  results.anyItemMarkedCurrentForUnrecognized = anyCurrent;
+
+  console.log(JSON.stringify(results));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertEqual(result["withEffort"], "high ▾")
+        self.assertTrue(result["highMarkedCurrent"], "a recognised effort must mark its own dropdown item current")
+        self.assertEqual(result["withoutEffort"], "effort ▾")
+        self.assertFalse(result["threwOnUnrecognized"])
+        self.assertEqual(result["unrecognizedLabel"], "banana ▾")
+        self.assertFalse(result["anyItemMarkedCurrentForUnrecognized"])
+
+
+class TestContextBarTeardown(unittest.TestCase):
+    """Task 8, executed: `destroy()` must actually stop the poll -- the stored tick function,
+    invoked directly (bypassing this harness's own `clearInterval` bookkeeping so the REAL
+    `_destroyed` guard is what's on trial, not this test's mock) -- must no-op, and `destroy()`
+    must actually remove the document-level click listener. A leaked 2s poll per closed terminal
+    is a real resource leak, the exact thing the task calls out by name.
+
+    PROVEN REAL: temporarily deleting the `if (self._destroyed) return;` guard at the top of
+    `tick()` inside `ContextBar.prototype.start` (via a `cp` backup, never git) made this go RED
+    -- fetches kept happening after destroy() -- before the file was restored; see the task
+    report."""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_destroy_stops_polling_and_removes_the_doc_listener(self):
+        script = _HARNESS_PRELUDE + _CONTEXT_BAR_MOCKS + _ESC_SRC + _CONTEXT_BAR_HELPERS_SRC + _CONTEXT_BAR_SRC + """
+async function main() {
+  var container = document.createElement('div');
+  var bar = new ContextBar(container, 'sid1', 'tty1', 'cwd', function () { return null; });
+  bar.start();
+  await __flush();
+  var callsBeforeDestroy = __fetchCalls.length;
+  var savedTick = __intervalFn;              // captured BEFORE destroy -- see class docstring
+  var onDocClickRef = bar._onDocClick;
+  var listenerPresentBefore = (document._listeners['click'] || []).indexOf(onDocClickRef) !== -1;
+
+  bar.destroy();
+
+  savedTick();                               // simulate a timer firing that our own
+                                              // clearInterval stub failed to cancel
+  await __flush();
+  var callsAfterDestroy = __fetchCalls.length;
+  var listenerPresentAfter = (document._listeners['click'] || []).indexOf(onDocClickRef) !== -1;
+
+  console.log(JSON.stringify({
+    callsBeforeDestroy: callsBeforeDestroy,
+    callsAfterDestroy: callsAfterDestroy,
+    intervalCleared: __intervalCleared,
+    listenerPresentBefore: listenerPresentBefore,
+    listenerPresentAfter: listenerPresentAfter,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = _run_node(script)
+        self.assertTrue(result["listenerPresentBefore"])
+        self.assertFalse(result["listenerPresentAfter"], "destroy() must remove the document click listener")
+        self.assertTrue(result["intervalCleared"])
+        self.assertEqual(result["callsAfterDestroy"], result["callsBeforeDestroy"],
+                          "a tick firing after destroy() must not issue any further fetches")
+
+
+def _grid_attach_race_harness():
+    """Mocks for the grid `Terminal`'s attach()/destroy() race: a counting `EventSource` (every
+    construction is recorded, so "did a stream get opened after destroy()?" is a number, not an
+    inference), plus the handful of instance fields those two methods actually touch. Deliberately
+    a plain object with the REAL prototype methods bolted on -- the same `makeSelf` strategy the
+    rest of this module already uses, because the grid Terminal's constructor needs a full DOM
+    (toolbar, pane, textarea, ResizeObserver) that has nothing to do with this race."""
+    return """
+var __esBuilt = [];          // one entry per EventSource CONSTRUCTION -- the leak counter
+var __esClosed = 0;
+function EventSource(url) {
+  this.url = url;
+  this.closed = false;
+  __esBuilt.push(url);
+}
+EventSource.prototype.close = function () { this.closed = true; __esClosed++; };
+// `document` (destroy()'s removeEventListener) and the manual rAF queue both come from
+// _harness_mocks() above -- this harness is always concatenated after it.
+var __measureCalls = 0;
+function makeGridSelf(ttyId) {
+  return {
+    ttyId: ttyId,
+    es: null,
+    // Mirrors the production constructor's own `this._destroyed = false;` -- a double that left
+    // this undefined would make the guard read "falsy" for the wrong reason and could not tell a
+    // present guard from an absent one. (TestGridAttachDestroyRace also pins the constructor
+    // line itself by source text, so this default cannot silently drift from the real one.)
+    _destroyed: false,
+    _onStatusChange: null,
+    _disposeThemeBtn: null,
+    _disposePaneObserver: null,
+    _motionRAFHandle: null,
+    _motionRAFPending: false,
+    _pendingMotion: null,
+    _sendTimers: [],
+    _onDocMouseUp: null,
+    _noticeEls: [],
+    _noticeHighestSeq: -1,
+    measureAndResize: function () { __measureCalls++; },
+    attach: Terminal.prototype.attach,
+    _openStream: Terminal.prototype._openStream,
+    destroy: Terminal.prototype.destroy,
+  };
+}
+"""
+
+
+class TestGridAttachDestroyRace(unittest.TestCase):
+    """The grid renderer's mirror of TestXtermSwitchDestroyRace, for the same class of leak.
+    `Terminal.prototype.attach` defers BOTH the first measure and `_openStream()` behind a
+    `requestAnimationFrame`. `destroy()` running in that gap (closeVT, or switchActiveRenderer /
+    mountRenderer swapping to xterm) used to complete as a clean no-op -- `this.es` is still null
+    at that point, and nothing cancelled the pending frame -- and then the frame fired anyway,
+    constructing an `EventSource` against `/api/term/screen` on an already-destroyed terminal that
+    NOTHING would ever close. Server-side that pins `pt.viewers > 0`, so the pty can never be
+    idle-reaped. `XtermTerminal` has guarded this exact race with `_destroyed` since the switch
+    button landed; the grid renderer had neither the guard nor a test."""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_destroy_between_attach_and_the_pending_frame_opens_no_stream(self):
+        src = _read_src()
+        script = _HARNESS_PRELUDE + _harness_mocks() + _grid_attach_race_harness() + "\n".join([
+            _function_body(src, "Terminal.prototype.attach = function"),
+            _function_body(src, "Terminal.prototype._openStream = function"),
+            _function_body(src, "Terminal.prototype.destroy = function"),
+        ]) + """
+var term = makeGridSelf('tty-race');
+term.attach();       // schedules the rAF; nothing has run yet (flushRAF is manual)
+term.destroy();      // the race: teardown lands BEFORE the frame fires
+flushRAF();          // now let the deferred callback run, if it still would
+
+console.log(JSON.stringify({
+  esBuilt: __esBuilt.length,
+  esUrls: __esBuilt,
+  measureCalls: __measureCalls,
+  esFieldAfter: term.es,
+  destroyedFlag: term._destroyed,
+}));
+"""
+        result = _run_node(script)
+        self.assertEqual(
+            result["esBuilt"], 0,
+            "the pending frame must open ZERO EventSources after destroy() -- each one is a "
+            "stream nothing will ever close, pinning pt.viewers server-side (opened: %r)"
+            % (result["esUrls"],),
+        )
+        self.assertEqual(result["measureCalls"], 0,
+                          "the frame must bail out BEFORE measureAndResize(), like XtermTerminal._build()")
+        self.assertIsNone(result["esFieldAfter"], "destroy() must leave this.es null")
+        self.assertTrue(result["destroyedFlag"], "destroy() must set this._destroyed")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_the_non_racing_path_still_opens_exactly_one_stream(self):
+        # The guard must not break the normal case: attach() with no destroy() in between still
+        # measures once and opens exactly one stream, which a later destroy() then closes.
+        src = _read_src()
+        script = _HARNESS_PRELUDE + _harness_mocks() + _grid_attach_race_harness() + "\n".join([
+            _function_body(src, "Terminal.prototype.attach = function"),
+            _function_body(src, "Terminal.prototype._openStream = function"),
+            _function_body(src, "Terminal.prototype.destroy = function"),
+        ]) + """
+var term = makeGridSelf('tty-normal');
+term.attach();
+flushRAF();
+var afterAttach = { esBuilt: __esBuilt.length, measureCalls: __measureCalls, esSet: !!term.es };
+term.destroy();
+console.log(JSON.stringify({
+  afterAttach: afterAttach,
+  esClosed: __esClosed,
+  esFieldAfterDestroy: term.es,
+}));
+"""
+        result = _run_node(script)
+        self.assertEqual(result["afterAttach"]["esBuilt"], 1, "sanity: the normal path must open one stream")
+        self.assertEqual(result["afterAttach"]["measureCalls"], 1)
+        self.assertTrue(result["afterAttach"]["esSet"])
+        self.assertEqual(result["esClosed"], 1, "destroy() must close the stream attach() opened")
+        self.assertIsNone(result["esFieldAfterDestroy"])
+
+    def test_the_constructor_seeds_the_flag_that_guard_reads(self):
+        # Source-text companion to the executed tests above: they drive a hand-built double, so
+        # only this assertion catches a fix where the guard and destroy() exist but the real
+        # constructor never seeds `_destroyed` (leaving it undefined on a live terminal).
+        src = _read_src()
+        start = src.index("  function Terminal(container, ttyId")
+        ctor = src[start:src.index("Terminal.prototype.", start)]
+        self.assertIn("this._destroyed = false;", ctor,
+                       "the grid Terminal constructor must seed _destroyed, like XtermTerminal's does")
 
 
 if __name__ == "__main__":

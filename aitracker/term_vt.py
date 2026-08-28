@@ -1284,6 +1284,17 @@ PTYS = {}                # id -> Pty
 _STREAMS = 0              # open SSE connections across all PTYs; guarded by _LOCK
 _LOCK = threading.Lock()
 
+FG_CACHE_TTL = 5          # seconds a resolved pgid -> comm mapping is trusted before the next
+                          # `ps` fork -- see `_foreground_is_claude()`'s docstring for why this is
+                          # keyed on pgid (the exit-detection signal) and what this TTL actually
+                          # bounds (pid-recycle exposure), not exit-detection latency.
+FG_CACHE_MAX = 128        # hard cap on distinct pgids remembered at once -- generous headroom
+                          # over config.MAX_TERMS's ceiling of 64 (each open terminal contributes
+                          # at most one live entry at a time; a churn of many short-lived foreground
+                          # commands in one terminal must still not grow this without bound).
+_FG_CACHE = {}            # pgid -> (comm, expires_at monotonic); guarded by _FG_CACHE_LOCK
+_FG_CACHE_LOCK = threading.Lock()
+
 
 def _clamp_int(v, lo, hi, default):
     """`int(v)` clamped to [lo, hi], or `default` if `v` isn't an int-like value at all. Used for
@@ -2276,11 +2287,39 @@ def _foreground_is_claude(fd):
     failure; showing it when nothing is listening for "/model ..." would type a slash command
     into a bash prompt instead -- the harmful one. This is POLICY the server decides once here;
     callers must not re-derive it (conventions rule 5).
+
+    ## The pgid->comm cache
+
+    The client polls `attached()` every ~2s per open terminal; at the terminal cap that is a
+    sustained fork-per-poll just to read a command name that essentially never changes between
+    polls. `tcgetpgrp` is a cheap syscall and runs on EVERY call, unconditionally -- it is also
+    the exit-detection signal (see below), so it must never be skipped. Only the `ps` fork that
+    resolves a pgid to a command name is cached, keyed on the pgid itself, not on `fd`/tty.
+
+    That keying is what makes this safe to cache at all: when the user quits Claude, the pty's
+    foreground process GROUP changes synchronously, in-kernel, the instant control returns to the
+    shell -- `tcgetpgrp` reflects that on the very next call, before any cache is even consulted.
+    So a cache miss on the new (shell's) pgid happens immediately; there is no TTL-shaped delay in
+    detecting the exit. `FG_CACHE_TTL` (5s, roughly 2 poll intervals) instead bounds a different,
+    much rarer risk: a pid/pgid getting reused by an unrelated process while a stale "claude"
+    entry for that same number is still cached, which would need the OS to hand out that exact
+    recently-freed pgid again AND that new process to become this same pty's foreground within the
+    TTL window -- pids are allocated ~monotonically with wraparound over tens of thousands, so an
+    immediate exact-number reuse is already unlikely; the TTL just puts a hard ceiling (a few
+    seconds) on how long a coincidence like that could show a stale True. A cache MISS or any `ps`
+    failure is never cached -- only a resolved comm is stored, so "unknown" can never calcify into
+    a stale True (fail-closed holds with or without a hit). `FG_CACHE_MAX` bounds the dict itself
+    against unbounded growth from a terminal that churns through many distinct foreground pgids.
     """
     try:
         pgid = os.tcgetpgrp(fd)
     except OSError:
         return False
+    now = time.monotonic()
+    with _FG_CACHE_LOCK:
+        hit = _FG_CACHE.get(pgid)
+        if hit is not None and hit[1] > now:
+            return hit[0] == "claude"
     try:
         out = subprocess.run(["ps", "-o", "comm=", "-p", str(pgid)],
                               capture_output=True, text=True, timeout=1)
@@ -2289,6 +2328,10 @@ def _foreground_is_claude(fd):
     if out.returncode != 0:
         return False
     comm = os.path.basename((out.stdout or "").strip()).lower()
+    with _FG_CACHE_LOCK:
+        if pgid not in _FG_CACHE and len(_FG_CACHE) >= FG_CACHE_MAX:
+            _FG_CACHE.pop(next(iter(_FG_CACHE)), None)  # oldest entry -- bound growth, not precise LRU
+        _FG_CACHE[pgid] = (comm, now + FG_CACHE_TTL)
     return comm == "claude"
 
 
