@@ -669,9 +669,10 @@
   }
   .tracker-next .cr-rail.cr-rail--overlay-open { transform: translateX(0); }
   .tracker-next .cr-rail--collapsed { width: 232px; } /* an opened overlay is always the full row rail */
-  /* ...except in the detail view, which keeps its 56px orb rail even as a
-   * mobile overlay (decision 1 has no mobile exception) — wins over the rule
-   * above by appearing later, same specificity. */
+  /* ...except in the detail view, which defaults to its 56px orb rail on
+   * mobile overlay (the default under 'auto'); explicit toggles override to
+   * the full 232px row rail. `.cr-rail--detail` is applied only when
+   * collapsed and wins over the rule above by appearing later, same specificity. */
   .tracker-next .cr-rail--detail { width: 56px; }
 }
 @media (prefers-reduced-motion: reduce) {

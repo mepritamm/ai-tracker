@@ -42,6 +42,24 @@ silently testing stale text), and execute each inside a tiny harness that
 supplies just its free variables (`els`, `railMode`, `currentView`,
 `window.innerWidth`, `localStorage`, …), with a real Set-backed classList so
 class add/remove/toggle/contains are actually observable.
+
+TWO THINGS CHANGED SINCE THIS FILE WAS FIRST WRITTEN (both pinned below):
+
+  1. The localStorage key was RENAMED from 'tracker.rail' to 'tracker.rail.mode'.
+     The old key's vocabulary was 'open'|'collapsed' with 'open' as the literal
+     default, so a stored 'open' was indistinguishable from "never chose" —
+     and the old dead toggle wrote one on every frustrated click. Reading a
+     legacy 'tracker.rail' value as an explicit 'open' would hand existing
+     users an expanded rail in the detail view they never asked for, so the
+     new key starts everyone at 'auto' (byte-for-byte the old default
+     behaviour) and the legacy key is deliberately never read. See
+     TestRailToggleNotADeadControl.test_default_railmode_ignores_legacy_key_and_stays_auto
+     and TestRailPrefTriState.test_read_rail_pref_ignores_legacy_key_and_stays_auto
+     for the guarantee itself.
+  2. ext_cr_board.js's mount() now subscribes to the shared 'cr:pref' bus
+     event, so Config's "Session rail" row actually moves the live rail
+     instead of writing localStorage into a void. See
+     TestBoardSubscribesToConfigPrefChanges below.
 """
 import json
 import os
@@ -252,7 +270,7 @@ OUT["%s"] = (function () {
   toggleRail();
   return {
     railModeAfter: railMode,
-    storedAfter: localStorageStore['tracker.rail'] || null,
+    storedAfter: localStorageStore['tracker.rail.mode'] || null,
     collapsedAfter: els.rail.classList.contains('cr-rail--collapsed'),
   };
 })();
@@ -263,10 +281,28 @@ OUT["%s"] = (function () {
 def _default_rail_mode_case_js():
     # Confirms the DEFAULT-VALUE expression itself, executed for real (not
     # regexed for the string 'auto') against a localStorage that has never
-    # seen 'tracker.rail' -- the exact state of a first-ever page load.
+    # seen 'tracker.rail.mode' -- the exact state of a first-ever page load.
     return r"""
 OUT["default_railmode_is_auto"] = (function () {
   var localStorage = { getItem: function () { return null; } };
+  %s
+  return railMode;
+})();
+"""
+
+
+def _default_rail_mode_ignores_legacy_key_case_js():
+    # THE MIGRATION GUARANTEE, executed for real: models a browser that has
+    # ONLY ever written the OLD 'tracker.rail' key (to 'open', the two-state
+    # world's own literal default) and has NEVER written the new
+    # 'tracker.rail.mode' key. The default-value statement must still resolve
+    # to 'auto' -- reading the legacy value as an explicit 'open' would hand
+    # an existing user an expanded 232px rail in the detail view they never
+    # asked for. This is the whole point of the rename; if a future change
+    # "helpfully" reads the old key again, this must fail loudly.
+    return r"""
+OUT["default_railmode_ignores_legacy_key"] = (function () {
+  var localStorage = { getItem: function (k) { return (k === 'tracker.rail') ? 'open' : null; } };
   %s
   return railMode;
 })();
@@ -298,6 +334,7 @@ def _full_driver_js():
     # (b) tri-state default: 'auto' defers to the forced conditions (unlike
     #     the old default 'open', which -- per (a) above -- no longer does).
     parts.append(_default_rail_mode_case_js() % default_railmode_stmt)
+    parts.append(_default_rail_mode_ignores_legacy_key_case_js() % default_railmode_stmt)
     parts.append(_apply_rail_mode_case_js(
         "auto_mode_still_follows_detail_force", apply_rail_mode_src,
         rail_mode="auto", current_view="detail", inner_width=1600))
@@ -343,9 +380,13 @@ console.log(JSON.stringify(OUT));
 # ---------------------------------------------------------------------------
 
 def _read_rail_pref_case_js(case_id, read_rail_pref_src, stored_value):
-    """stored_value=None simulates a 'tracker.rail' key that was never written
-    (localStorage.getItem returns null) -- a first-ever page load. Any other
-    value simulates that exact string already being stored."""
+    """stored_value=None simulates a 'tracker.rail.mode' key that was never
+    written (localStorage.getItem returns null) -- a first-ever page load.
+    Any other value simulates that exact string already being stored under
+    'tracker.rail.mode' (the getItem stub ignores which key is requested, so
+    this also happens to model "no key at all was ever written" for
+    stored_value=None -- see _read_rail_pref_legacy_key_only_case_js below
+    for the case that distinguishes the two keys)."""
     getitem_body = "return null;" if stored_value is None else ("return %s;" % json.dumps(stored_value))
     return r"""
 OUT["%s"] = (function () {
@@ -354,6 +395,23 @@ OUT["%s"] = (function () {
   return readRailPref();
 })();
 """ % (case_id, getitem_body, read_rail_pref_src)
+
+
+def _read_rail_pref_legacy_key_only_case_js(case_id, read_rail_pref_src):
+    """THE MIGRATION GUARANTEE, executed for real: models a browser that has
+    ONLY ever written the OLD 'tracker.rail' key (to 'open') and has NEVER
+    written the new 'tracker.rail.mode' key readRailPref() actually reads.
+    Must resolve to 'auto' -- reading the legacy key as an explicit 'open'
+    would hand an existing user a rail state they never asked for. This is
+    the whole point of the rename; make it fail loudly if 'tracker.rail' is
+    ever read again."""
+    return r"""
+OUT["%s"] = (function () {
+  var localStorage = { getItem: function (k) { return (k === 'tracker.rail') ? 'open' : null; } };
+  %s
+  return readRailPref();
+})();
+""" % (case_id, read_rail_pref_src)
 
 
 def _write_rail_pref_case_js(case_id, write_rail_pref_src, mode_to_write):
@@ -367,7 +425,7 @@ OUT["%s"] = (function () {
   };
   %s
   writeRailPref(%s);
-  return (store['tracker.rail'] !== undefined) ? store['tracker.rail'] : null;
+  return (store['tracker.rail.mode'] !== undefined) ? store['tracker.rail.mode'] : null;
 })();
 """ % (case_id, write_rail_pref_src, json.dumps(mode_to_write))
 
@@ -380,7 +438,7 @@ def _rail_pref_driver_js():
 
     parts = ["var OUT = {};"]
 
-    # (1) a first-ever page load: 'tracker.rail' was never written.
+    # (1) a first-ever page load: 'tracker.rail.mode' was never written.
     parts.append(_read_rail_pref_case_js("read_default_is_auto", read_rail_pref_src, None))
 
     # (2) round-trips each of the three real modes.
@@ -390,6 +448,11 @@ def _rail_pref_driver_js():
     # (3) an unrecognised/garbage stored value falls back to 'auto'.
     parts.append(_read_rail_pref_case_js(
         "read_garbage_falls_back_to_auto", read_rail_pref_src, "not-a-real-mode"))
+
+    # (3b) THE MIGRATION GUARANTEE: only the legacy 'tracker.rail' key was
+    # ever written (to 'open') -- must still read back as 'auto'.
+    parts.append(_read_rail_pref_legacy_key_only_case_js(
+        "read_ignores_legacy_key_and_stays_auto", read_rail_pref_src))
 
     # (4) writeRailPref persists all three real modes, and coerces garbage to 'auto'.
     for mode in ("auto", "open", "collapsed"):
@@ -402,6 +465,59 @@ console.log("===RAIL_TOGGLE_JSON_START===");
 console.log(JSON.stringify(OUT));
 """)
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# ext_cr_board.js's mount() `ctx.on('cr:pref', ...)` subscription -- Config's
+# "Session rail" row emits this (writeRailPref(), ext_cr_dialogs.js) so the
+# LIVE rail actually moves when a user picks a mode in Config, instead of
+# only changing what the next chevron click happens to read.
+#
+# UNLIKE applyRailMode()/toggleRail(), this handler is registered INLINE
+# inside mount() rather than being its own top-level named function, so it
+# cannot be pulled out with _extract_function() (which brace-matches a
+# `function NAME(...) {...}` declaration). _extract_call() works here instead:
+# the entire `ctx.on('cr:pref', function (payload) {...});` expression is
+# itself one balanced-paren call -- every paren inside the callback body is a
+# balanced pair (`(!payload || payload.key !== 'tracker.rail.mode')`,
+# `(v === 'open' || v === 'collapsed')`, `applyRailMode()`) -- so paren-depth
+# matching from the marker's own `(` captures exactly the call, verbatim from
+# the real bundle. Executed against a fake `ctx.on` that just records the
+# handler by event name, then invoked directly with synthetic payloads.
+# ---------------------------------------------------------------------------
+
+def _cr_pref_subscription_driver_js():
+    html = _read_page()
+    bundle = _extract_script_content(html)
+    call_src = _extract_call(bundle, "ctx.on('cr:pref'")
+
+    return r"""
+var OUT = {};
+(function () {
+  var REGISTRY = {};
+  var ctx = { on: function (name, fn) { REGISTRY[name] = fn; } };
+  var railMode = 'unrelated-seed-value';
+  var applyRailModeCalls = 0;
+  function applyRailMode() { applyRailModeCalls++; }
+
+  %s
+
+  function fire(payload) {
+    railMode = 'unrelated-seed-value';
+    applyRailModeCalls = 0;
+    REGISTRY['cr:pref'](payload);
+    return { railModeAfter: railMode, applyRailModeCalls: applyRailModeCalls };
+  }
+
+  OUT['wrong_key_is_ignored'] = fire({ key: 'cr.boardTileCount', value: 'open' });
+  OUT['missing_payload_is_ignored'] = fire(null);
+  OUT['explicit_open'] = fire({ key: 'tracker.rail.mode', value: 'open' });
+  OUT['explicit_collapsed'] = fire({ key: 'tracker.rail.mode', value: 'collapsed' });
+  OUT['garbage_coerces_to_auto'] = fire({ key: 'tracker.rail.mode', value: 'not-a-real-mode' });
+})();
+console.log("===RAIL_TOGGLE_JSON_START===");
+console.log(JSON.stringify(OUT));
+""" % call_src
 
 
 @unittest.skipUnless(_HAS_NODE, "node not available")
@@ -431,10 +547,20 @@ class TestRailPrefTriState(unittest.TestCase):
         cls.OUT = _extract_json(stdout)
 
     def test_read_rail_pref_default_is_auto_not_open(self):
-        """A first-ever page load (localStorage has never seen 'tracker.rail')
-        must report 'auto' -- the board's real default -- not 'open', the
-        pre-fix two-state default that misreported this exact case in Config."""
+        """A first-ever page load (localStorage has never seen
+        'tracker.rail.mode') must report 'auto' -- the board's real default
+        -- not 'open', the pre-fix two-state default that misreported this
+        exact case in Config."""
         self.assertEqual(self.OUT["read_default_is_auto"], "auto")
+
+    def test_read_rail_pref_ignores_legacy_key_and_stays_auto(self):
+        """THE MIGRATION GUARANTEE, on the Config-dialog side: a browser
+        where only the OLD 'tracker.rail' key was ever written (to 'open')
+        must still report 'auto' from readRailPref(), because the new
+        'tracker.rail.mode' key it actually reads was never written. If a
+        future change "helpfully" reads the legacy key again, this fails
+        loudly instead of quietly handing existing users an 'open' rail."""
+        self.assertEqual(self.OUT["read_ignores_legacy_key_and_stays_auto"], "auto")
 
     def test_read_rail_pref_round_trips_all_three_modes(self):
         for mode in ("auto", "open", "collapsed"):
@@ -587,9 +713,19 @@ class TestRailToggleNotADeadControl(unittest.TestCase):
 
     def test_default_railmode_is_auto_not_open(self):
         """Executes railMode's own default-value initializer for real, against
-        a localStorage that has never seen 'tracker.rail' (a first-ever page
-        load). Must resolve to 'auto', not the pre-fix default 'open'."""
+        a localStorage that has never seen 'tracker.rail.mode' (a first-ever
+        page load). Must resolve to 'auto', not the pre-fix default 'open'."""
         self.assertEqual(self.OUT["default_railmode_is_auto"], "auto")
+
+    def test_default_railmode_ignores_legacy_key_and_stays_auto(self):
+        """THE MIGRATION GUARANTEE, precisely: a browser where only the OLD
+        'tracker.rail' key was ever written (to 'open') must still resolve
+        railMode to 'auto', because the new 'tracker.rail.mode' key was
+        never written. Reading the legacy key as an explicit 'open' would
+        hand an existing user an expanded rail in the detail view they never
+        asked for -- this is the entire reason for the key rename, so this
+        must fail loudly if the legacy key is ever read again."""
+        self.assertEqual(self.OUT["default_railmode_ignores_legacy_key"], "auto")
 
     def test_auto_mode_still_defers_to_detail_force(self):
         """Unlike explicit 'open' (which now wins, per test above), the
@@ -637,6 +773,71 @@ class TestRailToggleNotADeadControl(unittest.TestCase):
         expanded_case = self.OUT["detail_class_absent_when_detail_explicitly_expanded"]
         self.assertFalse(expanded_case["collapsed"])
         self.assertFalse(expanded_case["detail"])
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestBoardSubscribesToConfigPrefChanges(unittest.TestCase):
+    """Pins that ext_cr_board.js's mount() actually subscribes to the shared
+    'cr:pref' bus event, wired to 'tracker.rail.mode' and applyRailMode() --
+    against the REAL shipped source (paren-matched out of the bundle via
+    _extract_call(), same honest-extraction idiom as the rest of this file),
+    not a hand-retyped paraphrase of it.
+
+    THE BUG this closes: before this subscription existed, `railMode` was a
+    closure variable read ONCE at mount time. Picking a mode in Config's
+    "Session rail" row called writeRailPref() (ext_cr_dialogs.js), which
+    wrote localStorage and emitted 'cr:pref' -- but nothing on the board was
+    listening, so nothing on screen moved. The NEXT chevron click
+    (toggleRail(), which reads the RENDERED class and writes) then silently
+    overwrote the user's Config choice. Same dead-control bug the whole
+    tri-state change exists to remove, on a different door.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        js = _cr_pref_subscription_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "cr:pref subscription harness failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_json(stdout)
+
+    def test_ignores_a_payload_for_a_different_config_key(self):
+        """The handler must filter on `payload.key` -- a 'cr:pref' emission
+        for an unrelated Config row (e.g. the board-tile-count slider) must
+        not touch railMode or trigger a re-render."""
+        r = self.OUT["wrong_key_is_ignored"]
+        self.assertEqual(r["railModeAfter"], "unrelated-seed-value")
+        self.assertEqual(r["applyRailModeCalls"], 0)
+
+    def test_ignores_a_missing_payload(self):
+        r = self.OUT["missing_payload_is_ignored"]
+        self.assertEqual(r["railModeAfter"], "unrelated-seed-value")
+        self.assertEqual(r["applyRailModeCalls"], 0)
+
+    def test_applies_explicit_open_and_calls_applyRailMode(self):
+        """THE FIX, precisely: an 'open' picked in Config must update the
+        board's own `railMode` AND call applyRailMode() so it actually
+        renders -- not just sit in localStorage until the next click."""
+        r = self.OUT["explicit_open"]
+        self.assertEqual(r["railModeAfter"], "open")
+        self.assertEqual(r["applyRailModeCalls"], 1)
+
+    def test_applies_explicit_collapsed_and_calls_applyRailMode(self):
+        r = self.OUT["explicit_collapsed"]
+        self.assertEqual(r["railModeAfter"], "collapsed")
+        self.assertEqual(r["applyRailModeCalls"], 1)
+
+    def test_coerces_unrecognised_value_to_auto_not_open(self):
+        """The handler's own coercion must match applyRailMode()'s tri-state
+        vocabulary: an unrecognised value lands on 'auto', never on 'open' --
+        a stray/garbage payload value must not be able to silently expand
+        the rail."""
+        r = self.OUT["garbage_coerces_to_auto"]
+        self.assertEqual(r["railModeAfter"], "auto")
+        self.assertEqual(r["applyRailModeCalls"], 1)
 
 
 if __name__ == "__main__":

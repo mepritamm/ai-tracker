@@ -742,10 +742,14 @@
 
   var CFG_PREF_KEYS = {
     theme: null, // routed through ctx.theme, not localStorage, to avoid a second source of truth
-    // Fix 2a: the rail's REAL key is 'tracker.rail' (a raw string 'open'|'collapsed' —
-    // see readRailPref/writeRailPref below, ground-truthed against ext_cr_board.js:187,
-    // 322), not a JSON boolean under 'cr.railOpen'. 'cr.railOpen' is kept here ONLY so
-    // "Reset to defaults" still clears a stray value written by an earlier build.
+    // Fix 2a: the rail's REAL key is 'tracker.rail.mode' (a raw string
+    // 'auto'|'open'|'collapsed' — see readRailPref/writeRailPref below), not a JSON
+    // boolean under 'cr.railOpen'. Reset to defaults must clear the key the rail
+    // actually reads, or it silently resets everything EXCEPT the rail. The two dead
+    // predecessors are listed after it so a stray value from an earlier build still
+    // gets cleared.
+    railMode: 'tracker.rail.mode',
+    railLegacy: 'tracker.rail',
     railOpen: 'cr.railOpen',
     cardsFolded: 'cr.cardsFolded',
     // The owner's call (see the board-tile-count decision in the PR that wired this row up):
@@ -789,7 +793,7 @@
   }
 
   // Fix 2a — the session rail (ext_cr_board.js) reads/writes the RAW STRING key
-  // 'tracker.rail' (never JSON, never a boolean). Config must write that SAME
+  // 'tracker.rail.mode' (never JSON, never a boolean). Config must write that SAME
   // key/vocabulary, not a parallel 'cr.railOpen' boolean nothing reads.
   // The vocabulary is TRI-state — 'auto' | 'open' | 'collapsed', default 'auto'
   // — and must stay in lockstep with applyRailMode() in ext_cr_board.js. 'auto'
@@ -799,14 +803,14 @@
   // 'auto' the first time anyone touched this row.
   function readRailPref() {
     try {
-      var v = localStorage.getItem('tracker.rail');
+      var v = localStorage.getItem('tracker.rail.mode');
       return (v === 'open' || v === 'collapsed') ? v : 'auto';
     } catch (e) { return 'auto'; }
   }
   function writeRailPref(mode) {
     if (mode !== 'open' && mode !== 'collapsed') mode = 'auto';
-    try { localStorage.setItem('tracker.rail', mode); } catch (e) {}
-    if (_ctx && typeof _ctx.emit === 'function') _ctx.emit('cr:pref', { key: 'tracker.rail', value: mode });
+    try { localStorage.setItem('tracker.rail.mode', mode); } catch (e) {}
+    if (_ctx && typeof _ctx.emit === 'function') _ctx.emit('cr:pref', { key: 'tracker.rail.mode', value: mode });
   }
 
   function cfgRow(label, envVar, sub, control, restart) {

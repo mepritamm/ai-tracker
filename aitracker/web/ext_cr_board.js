@@ -361,7 +361,14 @@ window.CR = window.CR || {};
     // conditions on top, so a click in the detail view (or on the board at
     // 1025-1279px) was written to localStorage and then silently discarded --
     // a visible button, correctly labelled, that did nothing.
-    var railMode = (localStorage.getItem('tracker.rail') || 'auto');
+    // NOTE the key is 'tracker.rail.mode', not the older 'tracker.rail'. The old
+    // key's vocabulary was 'open'|'collapsed' with 'open' as the literal default,
+    // so a stored 'open' was indistinguishable from 'never chose' -- and the dead
+    // toggle wrote one on every frustrated click. Reading those values as an
+    // EXPLICIT 'open' here would hand existing users a 232px rail in the detail
+    // view they never asked for. A new key starts everyone at 'auto', which is
+    // byte-for-byte the old default behaviour. The stale key is left alone.
+    var railMode = (localStorage.getItem('tracker.rail.mode') || 'auto');
     var railOverlayOpen = false;      // < 1024px only: the rail as a slide-in overlay drawer
     var activeFilter = null;          // 'awaiting' | 'working' | 'flagged' | null
     var searchQuery = '';
@@ -645,7 +652,7 @@ window.CR = window.CR || {};
       // collapsed while railMode still reads 'auto'/'open'), and flipping the
       // stored value there produced a no-op first click.
       railMode = els.rail.classList.contains('cr-rail--collapsed') ? 'open' : 'collapsed';
-      localStorage.setItem('tracker.rail', railMode);
+      localStorage.setItem('tracker.rail.mode', railMode);
       applyRailMode();
     }
 
@@ -1784,6 +1791,18 @@ window.CR = window.CR || {};
           renderRail(lastState);
         });
         ctx.on('theme:changed', function () { els.themeRepaint && els.themeRepaint(); });
+        // Config's "Session rail" row writes the SAME key this module owns. Without
+        // this subscription railMode is a closure var read once at mount, so picking
+        // a mode in Config moved nothing on screen and the next chevron click -- which
+        // reads the rendered class, then writes -- silently overwrote the choice. That
+        // is the same dead-control bug this whole change exists to remove, so the board
+        // has to actually listen rather than assume it is the only writer.
+        ctx.on('cr:pref', function (payload) {
+          if (!payload || payload.key !== 'tracker.rail.mode') return;
+          var v = payload.value;
+          railMode = (v === 'open' || v === 'collapsed') ? v : 'auto';
+          applyRailMode();
+        });
         // Clicking (or Enter-activating) an agent-group row/tile toggles that group's
         // sessions open inline in the rail — own expand state, this module only.
         ctx.on('rail:expandAgents', function (payload) {
