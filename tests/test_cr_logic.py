@@ -660,5 +660,247 @@ class TestCRLogic(unittest.TestCase):
         self.assertLess(times[0], times[-1])
 
 
+# ---------------------------------------------------------------------------
+# Theme-scope regression: "selecting Dark leaves the whole app light".
+#
+# Root cause (measured live): ext_cr.css's dark tokens are declared as
+# `.tracker-next.is-dark`, and the light tokens as a BARE `.tracker-next`.
+# `#cr-shell` used to carry its own bare `tracker-next` class in addition to
+# `#nextRoot` (its ancestor) — so it re-declared the light token block
+# directly on itself, shadowing every dark value it should have inherited.
+# The invariant that must hold from now on: once the theme has resolved to
+# dark, EVERY element carrying `.tracker-next` also carries `.is-dark`.
+#
+# This exercises the REAL init -> ensureMounted -> CR.board.mount ->
+# applyTheme flow (not just the pure derivations TestCRLogic reaches into
+# above), under a purpose-built DOM stub with an actual element tree + real
+# classList tracking — the generic stub used above returns ONE shared dummy
+# node for every query, which can't express "this specific element carries
+# this specific class", so it can't see this bug at all.
+# ---------------------------------------------------------------------------
+
+_THEME_JS_PREAMBLE = r"""
+globalThis.window = globalThis;
+
+function makeDummy() {
+  var self = {
+    classList: { add: function () {}, remove: function () {}, toggle: function () { return false; }, contains: function () { return false; } },
+    style: {}, dataset: {},
+    setAttribute: function () {}, getAttribute: function () { return null; }, removeAttribute: function () {},
+    appendChild: function (c) { return c; }, append: function () {}, remove: function () {}, insertBefore: function (c) { return c; },
+    addEventListener: function () {}, removeEventListener: function () {},
+    querySelector: function () { return self; }, querySelectorAll: function () { return [self]; },
+    closest: function () { return self; }, firstElementChild: null, children: [],
+    innerHTML: "", textContent: "", value: "", hidden: false,
+    focus: function () {}, click: function () {}, scrollIntoView: function () {}
+  };
+  return self;
+}
+var dummy = makeDummy();
+
+var _idRegistry = {};
+
+// Walks REAL descendants only (never the root itself) collecting elements
+// whose real classList (a Set, see makeReal below) contains `sel`'s class.
+// Used for BOTH document.querySelectorAll(...) (root = the fake <body>) and
+// a real element's own .querySelectorAll(...) (root = that element) — real
+// DOM semantics never include the calling node itself either way.
+function queryAllReal(root, sel) {
+  var out = [];
+  if (!sel || sel.charAt(0) !== '.') return out;
+  var cls = sel.slice(1);
+  (function walk(node) {
+    (node._children || []).forEach(function (c) {
+      if (c && c._classes && c._classes.has(cls)) out.push(c);
+      walk(c);
+    });
+  })(root);
+  return out;
+}
+
+function makeReal(tag) {
+  var el = {
+    tagName: String(tag || 'div').toUpperCase(),
+    _classes: new Set(),
+    _children: [],
+    _attrs: {},
+    _id: '',
+    style: {}, dataset: {},
+    hidden: false, innerHTML: '', textContent: '', value: '',
+    parentNode: null
+  };
+  el.classList = {
+    add: function () { for (var i = 0; i < arguments.length; i++) if (arguments[i]) el._classes.add(arguments[i]); },
+    remove: function () { for (var i = 0; i < arguments.length; i++) el._classes.delete(arguments[i]); },
+    toggle: function (c, force) {
+      var has = el._classes.has(c);
+      var want = (force === undefined) ? !has : !!force;
+      if (want) el._classes.add(c); else el._classes.delete(c);
+      return want;
+    },
+    contains: function (c) { return el._classes.has(c); }
+  };
+  Object.defineProperty(el, 'className', {
+    get: function () { return Array.from(el._classes).join(' '); },
+    set: function (v) { el._classes = new Set(String(v == null ? '' : v).split(/\s+/).filter(Boolean)); }
+  });
+  Object.defineProperty(el, 'id', {
+    get: function () { return el._id; },
+    set: function (v) { el._id = v; if (v) _idRegistry[v] = el; }
+  });
+  el.setAttribute = function (k, v) { el._attrs[k] = v; if (k === 'class') el.className = v; if (k === 'id') el.id = v; };
+  el.getAttribute = function (k) { return (k in el._attrs) ? el._attrs[k] : null; };
+  el.removeAttribute = function (k) { delete el._attrs[k]; };
+  el.appendChild = function (c) { if (c) { el._children.push(c); c.parentNode = el; } return c; };
+  el.append = function () { for (var i = 0; i < arguments.length; i++) el.appendChild(arguments[i]); };
+  el.insertBefore = function (c) { if (c) { el._children.push(c); c.parentNode = el; } return c; };
+  el.removeChild = function (c) { var idx = el._children.indexOf(c); if (idx >= 0) el._children.splice(idx, 1); return c; };
+  el.remove = function () { if (el.parentNode) el.parentNode.removeChild(el); };
+  el.addEventListener = function () {}; el.removeEventListener = function () {};
+  el.focus = function () {}; el.click = function () {}; el.scrollIntoView = function () {};
+  el.querySelectorAll = function (sel) { return queryAllReal(el, sel); };
+  el.querySelector = function (sel) { return queryAllReal(el, sel)[0] || null; };
+  el.closest = function () { return null; };
+  Object.defineProperty(el, 'firstElementChild', { get: function () { return el._children[0] || null; } });
+  Object.defineProperty(el, 'children', { get: function () { return el._children.slice(); } });
+  return el;
+}
+
+var docBody = makeReal('body');
+var nextRoot = makeReal('div');
+nextRoot.id = 'nextRoot';
+nextRoot.className = 'tracker-next cr';
+nextRoot.hidden = true;
+docBody.appendChild(nextRoot);
+
+window.document = {
+  createElement: function (tag) { return makeReal(tag); },
+  createElementNS: function (ns, tag) { return makeReal(tag); },
+  createTextNode: function (text) { var t = makeReal('#text'); t.textContent = text; return t; },
+  getElementById: function (id) { return _idRegistry[id] || dummy; },
+  querySelector: function (sel) { return queryAllReal(docBody, sel)[0] || null; },
+  querySelectorAll: function (sel) { return queryAllReal(docBody, sel); },
+  addEventListener: function () {}, removeEventListener: function () {}, dispatchEvent: function () {},
+  documentElement: dummy, body: docBody, head: dummy, readyState: "complete"
+};
+
+var _THEME_STORAGE = {};
+window.localStorage = {
+  getItem: function (k) { return (k in _THEME_STORAGE) ? _THEME_STORAGE[k] : null; },
+  setItem: function (k, v) { _THEME_STORAGE[k] = String(v); },
+  removeItem: function (k) { delete _THEME_STORAGE[k]; }
+};
+// Seeded BEFORE the bundle runs -- the exact live scenario: preference already
+// 'dark', UI already 'next' (a returning user with Dark selected), so init()
+// actually mounts Control Room and calls applyTheme() for real.
+window.localStorage.setItem('tracker.theme', 'dark');
+window.localStorage.setItem('tracker.ui', 'next');
+
+window.matchMedia = function () { return { matches: false, addEventListener: function () {}, addListener: function () {}, removeEventListener: function () {} }; };
+window.fetch = function () { return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); }, text: function () { return Promise.resolve(""); }, headers: { get: function () { return null; } } }); };
+// setTimeout runs its callback IMMEDIATELY (still inside the current
+// synchronous script). ext_cr_boot.js's whole init() flow (buildRoots ->
+// wireEntryButton -> setUiMode('next') -> ensureMounted -> CR.board.mount ->
+// applyTheme) is queued via exactly one `setTimeout(init, 0)` at the end of
+// its own IIFE (deferred there only so every OTHER concatenated ext_*.js
+// file has finished defining window.CR.* first) -- running it synchronously
+// here is safe for what this test exercises: CR.board is already defined
+// (board.js sorts before boot.js), so its mount() runs for real; CR.detail/
+// dialogs/term are not yet defined at that point, so their mounts fall back
+// to safeMount()'s own try/catch placeholder path -- exactly what already
+// happens if any of them ever throws for real.
+window.setTimeout = function (fn) { if (typeof fn === 'function') fn(); return 0; };
+window.setInterval = function () { return 0; };
+window.clearInterval = function () {}; window.clearTimeout = function () {};
+window.location = { href: "", search: "", pathname: "/", host: "localhost" };
+window.navigator = { userAgent: "node", clipboard: { writeText: function () { return Promise.resolve(); } } };
+window.CustomEvent = function (type, opts) { this.type = type; this.detail = opts && opts.detail; };
+window.Event = window.CustomEvent;
+window.requestAnimationFrame = function () { return 0; };
+window.getComputedStyle = function () { return { getPropertyValue: function () { return ""; } }; };
+window.getSelection = function () { return { toString: function () { return ""; } }; };
+window.addEventListener = function () {}; window.removeEventListener = function () {}; window.dispatchEvent = function () {};
+window.URLSearchParams = function () { return { get: function () { return null; } }; };
+process.on("unhandledRejection", function () {});
+
+try {
+"""
+
+_THEME_JS_MID = r"""
+} catch (e) {
+  console.error("BUNDLE-THREW: " + (e && e.stack || e));
+  process.exit(1);
+}
+"""
+
+_THEME_JS_TAIL = r"""
+var out = { scopes: [], mountedIds: Object.keys(_idRegistry) };
+queryAllReal(docBody, '.tracker-next').forEach(function (el) {
+  out.scopes.push({ id: el.id || null, classes: Array.from(el._classes).sort() });
+});
+out.nextRootIsDark = nextRoot.classList.contains('is-dark');
+console.log("===CR_THEME_JSON_START===");
+console.log(JSON.stringify(out));
+"""
+
+
+def _theme_scope_driver_js():
+    bundle_html = _read_page()
+    bundle_js = _extract_script_content(bundle_html)
+    return "\n".join([_THEME_JS_PREAMBLE, bundle_js, _THEME_JS_MID, _THEME_JS_TAIL])
+
+
+def _extract_theme_json(stdout):
+    marker = "===CR_THEME_JSON_START==="
+    idx = stdout.find(marker)
+    if idx < 0:
+        raise ValueError("marker not found in node output:\n" + stdout)
+    return json.loads(stdout[idx + len(marker):].strip())
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestCRThemeScope(unittest.TestCase):
+    """Regression for the '#cr-shell renders light under a dark #nextRoot' bug.
+
+    Runs the REAL init -> ensureMounted -> CR.board.mount -> applyTheme flow
+    (not just the pure derivations TestCRLogic reaches into above) with
+    tracker.theme=dark and tracker.ui=next already seeded in localStorage --
+    the exact state a returning user with Dark selected loads into.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        js = _theme_scope_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Theme-scope driver failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_theme_json(stdout)
+
+    def test_nextroot_resolves_dark(self):
+        self.assertTrue(self.OUT["nextRootIsDark"], "resolved theme should be dark per seeded localStorage")
+
+    def test_shell_actually_mounted(self):
+        """Sanity check so the invariant below can't pass VACUOUSLY on an empty
+        tree: if CR.board.mount() silently failed to run under this stub,
+        #cr-shell would never have been built (and registered) at all. (It is
+        correctly ABSENT from the tracker-next scope list itself -- that is
+        the fix: the shell no longer carries the class.)"""
+        self.assertIn("cr-shell", self.OUT["mountedIds"],
+                      "CR.board.mount() should have built #cr-shell; ids seen: %r" % self.OUT["mountedIds"])
+
+    def test_every_tracker_next_element_also_carries_is_dark(self):
+        """The actual regression guard: no element carrying `.tracker-next` may
+        lack `is-dark` once the theme has resolved to dark -- otherwise that
+        element's own bare `.tracker-next {...}` rule (ext_cr.css) re-declares
+        the LIGHT token block directly on itself, shadowing the dark values it
+        should inherit from its #nextRoot ancestor (the live bug this pins:
+        `#cr-shell` used to carry a redundant bare `tracker-next` class)."""
+        offenders = [s for s in self.OUT["scopes"] if "is-dark" not in s["classes"]]
+        self.assertEqual(offenders, [], "these elements carry tracker-next without is-dark: %r" % offenders)
+
+
 if __name__ == "__main__":
     unittest.main()

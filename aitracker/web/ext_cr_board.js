@@ -477,7 +477,21 @@ window.CR = window.CR || {};
     // slots did (same `.cr-view`/[hidden] CSS contract from ext_cr_boot.css,
     // just one level deeper in the DOM).
     function buildShell() {
-      root.classList.add('tracker-next', 'cr-app');
+      // BUG FIX (theme shadowing): this used to also add `tracker-next` here
+      // ("defensively", per this file's old header comment) — but `root` (the
+      // `#cr-shell` element boot.js hands in) is always a DESCENDANT of
+      // #nextRoot, which already carries `tracker-next` (and the JS-toggled
+      // `is-dark`). ext_cr.css's `.tracker-next { --surface-raised: #FFFFFF; ... }`
+      // rule is unconditional: any element that ALSO carries the bare class
+      // re-declares every light-theme custom property directly on itself,
+      // shadowing the dark values it would otherwise inherit from #nextRoot —
+      // regardless of that element's own ancestry. That is exactly what made
+      // `#cr-shell` (and everything under it: rail, top bar, board) render
+      // light while `#nextRoot` correctly resolved dark. `.tracker-next .cr-app`
+      // below (a descendant selector, not `.tracker-next.cr-app` — see
+      // ext_cr_board.css) still matches this element via its #nextRoot
+      // ancestor, so `cr-app` alone is enough for this file's own selectors.
+      root.classList.add('cr-app');
       root.innerHTML = '';
 
       els.rail = h('aside', { class: 'cr-rail', role: 'complementary', 'aria-label': 'All sessions' });

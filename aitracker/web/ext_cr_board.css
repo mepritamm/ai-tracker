@@ -10,9 +10,16 @@
  * would read undefined custom properties and silently fall back to `initial`
  * everywhere. Following the doc + the real token file that exists on disk,
  * not the paraphrased contract summary: every selector below is scoped under
- * `.tracker-next`. `CR.board.mount()` defensively adds the `tracker-next`
- * class to its root element so this file's selectors always have something
- * to match even if the bootstrap forgets to.
+ * `.tracker-next`. `CR.board.mount()`'s root element (`#cr-shell`) never
+ * carries the `tracker-next` class itself — it is always a DESCENDANT of
+ * #nextRoot, which already carries it (and the JS-toggled `is-dark`), and
+ * every selector below reaches it through that ancestor via a descendant
+ * combinator (`.tracker-next .cr-app`, not `.tracker-next.cr-app`). An
+ * earlier version of this file/board.js's mount() DID add `tracker-next`
+ * directly to `#cr-shell` too, "defensively" — that duplicate declaration is
+ * exactly what caused the shell (and everything under it) to re-declare the
+ * LIGHT token block on itself, shadowing the dark values it should have
+ * inherited from #nextRoot. Fixed; see ext_cr_board.js's buildShell().
  *
  * Component classes are still namespaced (`cr-*`) so nothing here can
  * collide with `app.css`'s classic-dashboard selectors, and every color /
@@ -27,7 +34,10 @@
 /* ============================================================
    APP SHELL
    ============================================================ */
-.tracker-next.cr-app {
+/* Descendant combinator, not a compound selector: `#cr-shell` (the element
+   this matches) carries only `cr-app` — `tracker-next` lives on its #nextRoot
+   ancestor. See the file header note above. */
+.tracker-next .cr-app {
   display: flex;
   width: 100%;
   height: 100%;

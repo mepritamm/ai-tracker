@@ -126,9 +126,28 @@ window.CR = window.CR || {};
   }
 
   function applyTheme() {
-    var root = document.getElementById('nextRoot');
     var resolved = resolveTheme();
-    if (root) root.classList.toggle('is-dark', resolved === 'dark');
+    var dark = resolved === 'dark';
+    // Defensive (found via a real theme-shadowing bug: `#cr-shell` briefly
+    // carried a redundant bare `tracker-next` class alongside #nextRoot,
+    // re-declaring ext_cr.css's LIGHT token block directly on itself and
+    // shadowing every dark value it should have inherited — see
+    // ext_cr_board.js's buildShell() for the actual fix). ext_cr.css's dark
+    // override only wins over the bare `.tracker-next` rule on an element
+    // that ALSO carries `is-dark` itself (`.tracker-next.is-dark` has higher
+    // specificity than `.tracker-next` alone) — inheritance of the CSS
+    // *custom properties* is not enough once something re-declares them.
+    // Toggling `is-dark` on EVERY element carrying `.tracker-next`, not just
+    // #nextRoot, means a future stray `tracker-next` class (anywhere, for
+    // any reason) can never again silently render half the app in the wrong
+    // theme: whatever picks up the scope class also and always gets `is-dark`
+    // kept in sync with it. The first-run scrim (buildFirstRun() below) is a
+    // deliberate SECOND, independent scope root — it lives outside #nextRoot
+    // entirely and already manages its own `is-dark` via a live
+    // 'theme:changed' listener; this sweep also covers it once it exists,
+    // redundantly but harmlessly (classList.toggle(_, dark) is idempotent).
+    var scopes = document.querySelectorAll('.tracker-next');
+    for (var i = 0; i < scopes.length; i++) scopes[i].classList.toggle('is-dark', dark);
     if (!syncClassicTheme(resolved)) {
       // Defensive fallback only — should be unreachable, since app.js (and
       // its setTheme) is always concatenated before this file (page.py's
@@ -874,71 +893,65 @@ window.CR = window.CR || {};
   }
 
   // ----------------------------------------------------------------------
-  // Fix 1b — completion notifications. Doc 04's "Notifications" section: when a
-  // session finishes, a toast fires AND that session's board tile flips to Landed
-  // ("the toast is the nudge, the tile is the record"). Today the bus and session
-  // state were completely disconnected — the ~20 existing 'notify' emitters
-  // (rename/note/flag/etc., wired above) are all user-action confirmations, not
-  // completions, and nothing detected one.
+  // Completion notifications — REUSE app.js's real detector, don't fork one.
   //
-  // The tile's own "Landed" derivation (ext_cr_board.js's sessionState(): `live &&
-  // s.ended`) is fed by the list dict this SIDE_EXT hook already receives every 5s
-  // (loadSide()/`/api/list` — the same hook above) — reusing that SAME transition
-  // (`ended` false -> true) as the completion signal is what ties the toast to the
-  // tile the doc asks for, without touching ext_cr_board.js at all.
+  // BUG (reported with a screenshot, fixed here): the previous version of
+  // this block built its OWN completion detector — watching `ended` flip
+  // false->true across EVERY session in the /api/list payload (~950 sessions
+  // on a real machine), with a baseline (`_completionInited`) that only ever
+  // ran ONCE, on the very first tick, and was never reset. Any session id not
+  // in that one-time snapshot forever reads as `was === false` — so a
+  // machine with hundreds of already-finished sessions kept re-announcing
+  // them, with sound, on every later poll. Deleted entirely, along with
+  // `_priorEnded`/`_completionInited`/checkSessionCompletions()/
+  // fireCompletionNotice() and their SIDE_EXT registration.
   //
-  // Deliberately NOT calling app.js's own checkCompletions()/notifyDone() here: those
-  // already run on every poll() tick (2s, for the CURRENTLY TRACKED session's
-  // background agents/shells only) regardless of UI mode, and notifyDone()'s own
-  // toast() writes into the CLASSIC `#toasts` div — hidden by setUiMode('next')'s
-  // CLASSIC_SIBLINGS list, so it would be invisible here. Calling it AND emitting a
-  // CR toast would also double the desktop Notification (notifyDone's own path fires
-  // one when `document.hidden && soundOn`; cr_dialogs.js's toast() fires a SECOND,
-  // independent one whenever `document.hidden`, regardless of soundOn — per doc 04's
-  // Notifications spec, the desktop alert is not gated on the sound preference).
-  // So: the sound toggle is reused directly (`soundOn`/`beep()`, respecting
-  // toggleSound() — no parallel sound preference), and the visible toast + the
-  // backgrounded-tab desktop Notification both come from the ONE call to
-  // `emit('notify', ...)`, which cr_dialogs.js's toast() already implements per spec.
-  var _priorEnded = {};   // sid -> last-seen `ended` boolean
-  var _completionInited = false;
-  function checkSessionCompletions(list, now) {
-    if (!_completionInited) {
-      // First tick after mount: record a baseline without notifying — otherwise
-      // every already-finished session would fire a toast the moment CR mode opens
-      // (mirrors app.js's own checkCompletions() "reset baseline on first poll").
-      list.forEach(function (s) { _priorEnded[s.id] = !!s.ended; });
-      _completionInited = true;
-      return;
-    }
-    list.forEach(function (s) {
-      var was = !!_priorEnded[s.id];
-      var is = !!s.ended;
-      if (!was && is) fireCompletionNotice(s, now);
-      _priorEnded[s.id] = is;
-    });
-  }
-  function fireCompletionNotice(s, now) {
-    var title = (s.title || s.project || (s.id || '').slice(0, 8) || 'Session') + ' finished';
-    var meta = [s.project, s.source ? srcLabel(s.source) : ''].filter(Boolean).join(' · ');
-    if (typeof soundOn !== 'undefined' && soundOn && typeof beep === 'function') { try { beep(); } catch (e) {} }
-    emit('notify', {
-      title: title,
-      meta: meta,
-      actionLabel: 'Read it',
-      onAction: function () { go('detail', s.id); },
-    });
-    if (window.CR.dialogs && typeof window.CR.dialogs.showNudgeIfNeeded === 'function') {
-      window.CR.dialogs.showNudgeIfNeeded();
-    }
-  }
-  if (typeof SIDE_EXT !== 'undefined' && SIDE_EXT && SIDE_EXT.push) {
-    SIDE_EXT.push(function () {
+  // The CORRECT existing pattern is app.js's own checkCompletions(d) (~line
+  // 1156 there): it watches exactly ONE session — `cur`, the one actually
+  // open — and only ITS `agents_bg`/`shells`, keyed by "a:"+id / "s:"+id,
+  // firing only on that item's running -> not-running transition, and it
+  // silently re-baselines (no notify) on a session switch OR the very first
+  // poll: `if(notifSession!==cur||notifRunning===null){...return;}`. Verified
+  // by reading it, not assumed: poll() (app.js) already calls it — `render(d)
+  // ... checkCompletions(d)` — on EVERY 2s tick, unconditionally, regardless
+  // of which UI mode is visible. So the detection itself is not missing for
+  // Control Room; it already runs.
+  //
+  // checkCompletions() is deliberately NOT called a second time from here.
+  // poll()'s own order is `render(d)` (which drives EXT — this file's own
+  // detail-update hook above) THEN `checkCompletions(d)`. Calling it again
+  // from an EXT hook would run BEFORE app.js's real call for the same tick,
+  // racing ahead of (and corrupting) `notifRunning`'s baseline, and would
+  // double-fire notifyDone() outright once both calls have run a few ticks.
+  //
+  // notifyDone(title,sub) is the ONE place a real completion actually
+  // surfaces — checkCompletions() calls nothing else. It already beeps
+  // (gated on soundOn) and, only while the tab is hidden, raises a desktop
+  // Notification (also gated on soundOn) — both exactly as classic does,
+  // unchanged, and already firing regardless of UI mode. Its own toast()
+  // call writes into the classic `#toasts` div, which setUiMode('next')
+  // hides — invisible in Control Room. So the one thing missing here is a
+  // VISIBLE toast, added by wrapping notifyDone exactly like `track()` a
+  // few lines up (call the real implementation, then do the CR-specific
+  // extra) — reuse, not a second implementation of the detector.
+  //
+  // Double-notification guard: skip the CR toast while `document.hidden` is
+  // true. At that point `_origNotifyDone` above already raised the (soundOn-
+  // gated) desktop Notification; cr_dialogs.js's own toast() ALSO raises its
+  // own separate Notification() whenever `document.hidden`, UNGATED by
+  // soundOn (verified by reading that function) — emitting 'notify' here too
+  // would double THAT desktop alert. Nobody is looking at either toast stack
+  // while the tab is hidden anyway, so skipping the CR one costs nothing.
+  var _origNotifyDone = (typeof notifyDone === 'function') ? notifyDone : null;
+  if (_origNotifyDone) {
+    notifyDone = function (title, sub) {
+      _origNotifyDone(title, sub);   // unchanged: classic toast (hidden here) + soundOn-gated beep/Notification
       if (getUiMode() !== 'next' || !mounted) return;
-      var now = (typeof listNow === 'number') ? listNow : Date.now() / 1000;
-      var list = (typeof sessions !== 'undefined' && Array.isArray(sessions)) ? sessions : [];
-      try { checkSessionCompletions(list, now); } catch (e) { console.error('[CR] checkSessionCompletions threw', e); }
-    });
+      if (!document.hidden) emit('notify', { title: title, meta: sub || '' });
+      if (window.CR.dialogs && typeof window.CR.dialogs.showNudgeIfNeeded === 'function') {
+        window.CR.dialogs.showNudgeIfNeeded();
+      }
+    };
   }
 
   // ----------------------------------------------------------------------

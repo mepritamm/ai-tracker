@@ -26,11 +26,12 @@
   var MODEL_LADDER = ["haiku", "sonnet", "opus", "fable"];
   var EFFORT_LADDER = ["low", "medium", "high", "xhigh", "max"];
 
-  function esc(s) {
-    return String(s == null ? "" : s).replace(/[&<>]/g, function (c) {
-      return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c];
-    });
-  }
+  // FIX 4: this used to redeclare its own esc() here, byte-for-byte identical to app.js's
+  // top-level `esc()` (app.js:7) — a pure duplicate, not even the quote-escaping variant
+  // ext_cr_detail.js's version adds. Removed: with no local shadow, the bare `esc(...)`
+  // calls below (lines ~874, 884, both plain text nodes, no attribute interpolation)
+  // resolve to app.js's own global, reachable by name like any other app.js top-level
+  // declaration.
   function fmtTok(n) {
     // FIX 3: doc 05's status-bar section shows raw comma-grouped digits ("128,412"), never an
     // abbreviated "128.4k" — the doc's point is a real number. toLocaleString comma-groups without
@@ -764,16 +765,42 @@
   // _attachEngine) when one is attached. The selection-only fallback below is for the one case
   // where there is no engine handle at all — the classic-overlay fallback path in _openInline
   // above, which never returns a handle to this file. ==========================================
+  // FIX 1: _writeClipboard()/_fallbackWriteClipboard() below reuse app.js's own
+  // fallbackCopy(el, done) (app.js ~1704 — the SAME Selection+execCommand fallback
+  // copyModal()/copyCode() use) instead of the bare navigator.clipboard.writeText() this
+  // used to call directly, which had no fallback at all when the Clipboard API was
+  // missing/denied (an insecure context, an old browser, a permission prompt dismissed).
+  // fallbackCopy() Range-selects an existing DOM node's contents, and this file only ever
+  // has a plain string (a copyBuffer() result or a getSelection() string) — not a node —
+  // so a throwaway off-screen node carries the text into that same shared call rather
+  // than reimplementing the textarea+execCommand dance a second time.
+  function _fallbackWriteClipboard(text) {
+    return new Promise(function (resolve, reject) {
+      if (typeof fallbackCopy !== "function") { reject(new Error("no fallback available")); return; }
+      var el = document.createElement("div");
+      el.textContent = text;
+      el.style.position = "fixed"; el.style.opacity = "0"; el.style.pointerEvents = "none";
+      document.body.appendChild(el);
+      fallbackCopy(el, resolve);
+      document.body.removeChild(el);
+    });
+  }
+  function _writeClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).catch(function () { return _fallbackWriteClipboard(text); });
+    }
+    return _fallbackWriteClipboard(text);
+  }
   function _copyPane() {
     if (st.engineHandle && typeof st.engineHandle.copyBuffer === "function") {
       Promise.resolve(st.engineHandle.copyBuffer()).then(function (text) {
-        if (text) return navigator.clipboard.writeText(text);
+        if (text) return _writeClipboard(text);
       }).then(function () { showToast("Copied."); }).catch(function () { showToast("Couldn't copy."); });
       return;
     }
     var sel = window.getSelection ? window.getSelection().toString() : "";
     if (!sel) { showToast("Nothing selected to copy."); return; }
-    navigator.clipboard.writeText(sel).then(function () { showToast("Copied selection."); })
+    _writeClipboard(sel).then(function () { showToast("Copied selection."); })
       .catch(function () { showToast("Couldn't copy."); });
   }
 
