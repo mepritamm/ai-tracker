@@ -198,7 +198,7 @@ def list_auggie():
         # Recomputed every call (not cached alongside `e`): a task's status can change without
         # touching this session's own file, so gating it on the session file's mtime would go stale.
         # _auggie_todos_for_list only reads this session's own task-tree files, so it's still cheap.
-        todo_total, todo_done, todo_current = todo_summary(_auggie_todos_for_list(e.get("root")))
+        todo_total, todo_done, todo_current, todo_current_index = todo_summary(_auggie_todos_for_list(e.get("root")))
         out.append({
             "id": gid, "project": os.path.basename(cwd) if cwd else "Augment", "cwd": cwd,
             "title": titles.get(gid) or e["title"],
@@ -206,6 +206,7 @@ def list_auggie():
             "agent": False, "group": "", "groupLabel": "", "parentId": "", "bg": 0, "first": 0,   # Auggie has no background-agent/SDK model
             "waiting": e.get("waiting", False), "ended": e.get("ended", False),
             "todo_total": todo_total, "todo_done": todo_done, "todo_current": todo_current,
+            "todo_current_index": todo_current_index,
         })
     return out
 

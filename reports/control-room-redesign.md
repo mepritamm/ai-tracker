@@ -115,6 +115,68 @@ purely *asynchronous* failure arriving after the synchronous epilogue prints
 `BUNDLE-OK` would not be caught. Load-time throws and failed registration are covered;
 async rejection is not.
 
+## Post-implementation audit (five agents, one per design doc)
+
+After the first commit, each design doc was audited against the shipped code. Docs 01
+and 05 came back near-clean (48/48 tokens exact both themes; terminal 30 shipped /
+0 missing — its "nothing dropped" criterion genuinely met). Docs 02, 03 and 04 found
+real gaps, since fixed:
+
+**Controls that rendered but did nothing** (the worst class — they invite interaction):
+- Config's rail toggle wrote `cr.railOpen`; the rail reads `tracker.rail`. Also
+  "Cards start folded", "Board tiles" and "Poll interval" wrote keys nothing read.
+  All now write the keys their consumers actually read, or are honestly read-only.
+- The Config footer claimed "editing one writes an override the server picks up" —
+  false for every env-backed row. Rewritten to state the truth.
+- "Terminal enabled" was hardcoded `true`. Now a real tri-state that shows
+  **unknown** rather than guessing.
+- Notifications: ~20 emitters sent `{text}` while `toast()` read `opts.title` — every
+  toast was a generic "Finished" with a blank body. The doc's actual requirement (an
+  agent finishes -> toast fires AND the tile flips to Landed) had no implementation.
+  Now detected off the same `ended` false->true transition the tile derives from, so
+  toast and tile agree by construction.
+
+**Built but unreachable:** the narration-diagram pop-out, `CR.dialogs.degraded()`, and
+`emptyState()`/`errorState()` all existed to spec with zero callers. All now wired.
+
+**Genuinely missing, now added:** markdown rendering in the detail view (`ctx.markdown`
+existed and was called zero times), the live pinned timeline entry, real scroll-up
+paging against the existing `/api/narration` route, j/k navigation in the detail view,
+focus-visible rings across the whole board (doc 02 predicted this as "the single most
+likely regression" — and it was missed exactly as predicted), and the mobile rail,
+which was styled as an overlay but never opened, leaving the session list unreachable
+below 1024px.
+
+**A bug the audit found that reading would not have:** `ext_cr_board.css` wrote
+`transition: width var(--motion-pulse-duration, .24s)`. That token is defined as
+`2.4s` (the working-dot pulse), so the fallback never applied and the rail took
+**2.4 seconds** to collapse. Now `.24s`.
+
+**An error in the design docs themselves:** doc 04's Coverage tab hardcodes "58
+capabilities" while its own map enumerates 60. 60 is correct (both items marked New
+shipped). The stat is now derived from `CAPABILITIES.length` and pinned by
+`tests/test_capability_table.py` — which is the anti-drift guarantee doc 04 asked for
+and did not previously have.
+
+**A doc conflict arbitrated, not guessed:** doc 04's config table specifies a 3-12
+board-tile slider; the handoff README's decision #2 fixes the board at 8. Shipped as
+read-only 8 with the reason stated, since a slider silently capped at 8 is worse than
+no control. **This is a product call and may want reversing.**
+
+### Still open after the audit
+
+- Capability #33 (copy button per code block): `ctx.markdown` wraps the classic
+  *inline* renderer, which never emits `<pre>`/`<code>` blocks, so there is nothing to
+  attach a button to. Skipped rather than writing a second fence parser.
+- Diagram wiring is **forward-looking**: no session data in this codebase currently
+  writes mermaid fences into narration, so the path is verified against synthetic
+  input only.
+- Phone layout still lacks the back chevron + breadcrumb, the 34px presence orb, the
+  21px serif live narration, and the awaiting-question card.
+- Board source badge collapses 7 sources into 4 labels; session search does not rank
+  name matches above project/prompt matches.
+- No selfcheck assertions for `spineSegments` / `boardTiles` / `sessionState`.
+
 ## Not verified — be aware before trusting this
 
 - **No real browser load.** The Chrome extension was not connected, so the UI was

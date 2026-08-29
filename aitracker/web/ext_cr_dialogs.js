@@ -235,20 +235,47 @@
     return row;
   }
 
+  // CR.dialogs.showNudgeIfNeeded() — Fix 1c: notificationNudge() was fully built to
+  // spec but had ZERO call sites, so it never appeared. This mounts it (floating,
+  // top-left, above the toast stack) the first time this module is asked to — the
+  // caller (ext_cr_boot.js) calls it right when it has a real notify-worthy event
+  // (a session landing), satisfying "never on first paint". Idempotent per page life:
+  // notificationNudge() itself already returns null once dismissed/granted/denied, and
+  // _nudgeAttempted stops this from re-querying/re-inserting on every later completion.
+  var _nudgeAttempted = false;
+  function showNudgeIfNeeded() {
+    if (_nudgeAttempted || !_root) return;
+    _nudgeAttempted = true;
+    var el = notificationNudge();
+    if (!el) return;
+    el.classList.add('cr-nudge-float');
+    _root.appendChild(el);
+  }
+
   // ---------------------------------------------------------------------------
   // toast notifications (capability #51) — a stack in the corner, plus a real
   // Notification() when the tab is backgrounded.
   // ---------------------------------------------------------------------------
 
+  // toast(opts) — opts is EITHER a bare string (used as the title) OR an object.
+  // NOTE (Fix 1a — payload contract): ext_cr_boot.js's ~20 confirmation emitters
+  // (rename/note/flag/etc.) call `ctx.emit('notify', {text: "..."})`; this function
+  // used to read only `opts.title`/`opts.meta`, so every one of those rendered as a
+  // blank-bodied generic "Finished" toast. `opts.text` is now accepted as an alias for
+  // `opts.title` — the ONE shape going forward is {title, meta} (meta optional, mono
+  // submeta line per doc 04's Toast spec), with `text` kept only for that existing
+  // caller population and a bare string tolerated too.
   function toast(opts) {
+    if (typeof opts === 'string') opts = { title: opts };
     opts = opts || {};
     if (!_toastHost) return;
+    var title = opts.title || opts.text || 'Finished';
     var dismissed = false;
     var timer = null;
     var el = h('div', { class: 'cr-toast', role: 'status' }, [
       emoji(opts.icon || '✅', opts.iconClass || 'tn-emo-d'),
       h('div', { class: 'cr-toast-body' }, [
-        h('div', { class: 'cr-toast-title' }, [opts.title || 'Finished']),
+        h('div', { class: 'cr-toast-title' }, [title]),
         opts.meta ? h('div', { class: 'cr-toast-meta' }, [opts.meta]) : null,
       ]),
       opts.actionLabel ? h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: opts.actionLabel }) : null,
@@ -268,7 +295,7 @@
     if (!document.hidden) arm(); // "never auto-dismiss while [the tab is] focused" — see NOTE below
 
     if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
-      try { new Notification(opts.title || 'Finished', { body: opts.meta || '' }); } catch (e) {}
+      try { new Notification(title, { body: opts.meta || '' }); } catch (e) {}
     }
     return dismiss;
   }
@@ -456,12 +483,33 @@
 
   // Providers actually registered in aitracker/registry.py (4, matching "4 tools" in
   // the stat block) and where each is known — from the project README — to degrade.
+  //
+  // Fix 3: each entry now also carries `ids` — the REAL source/provider identifier(s)
+  // a session can carry (aitracker/web/app.js's own SRC map: "auggie", "augment-vscode",
+  // "augment-cursor", plus Claude's own cli/claude-desktop/sdk-cli/claude-vscode/"" —
+  // registry.py's unprefixed provider is the fallback). The audit's "live path silently
+  // skipped Auggie" finding was a caller pattern-matching a display NAME (or a fuzzy
+  // /augment/i.test() that a literal "auggie" string never trips, so it fell through to
+  // a default) instead of the real value — providerNoteFor() below is the single correct
+  // lookup so every consumer (this dialog's Per-tool tab, ext_cr_detail.js's degraded()
+  // callers) shares one answer instead of re-deriving it.
   var PROVIDER_NOTES = [
-    { name: 'Claude Code', ok: 'Full support, incl. background agents & shells and PR attribution.' },
-    { name: 'Auggie', ok: 'Full narration/todos/files/commands.', degraded: 'No background-work model — capability 48 shows empty-because-it-cannot-exist, not broken.' },
-    { name: 'Augment (VS Code)', degraded: 'Chat transcript lives in a per-workspace LevelDB the tracker cannot decode — narration degrades honestly; todos and files still read in full.' },
-    { name: 'Augment (Cursor)', degraded: 'Same LevelDB limitation as Augment (VS Code).' },
+    { name: 'Claude Code', ids: ['', 'cli', 'claude-desktop', 'sdk-cli', 'claude-vscode'], ok: 'Full support, incl. background agents & shells and PR attribution.' },
+    { name: 'Auggie', ids: ['auggie'], ok: 'Full narration/todos/files/commands.', degraded: 'No background-work model — capability 48 shows empty-because-it-cannot-exist, not broken.' },
+    { name: 'Augment (VS Code)', ids: ['augment-vscode'], degraded: 'Chat transcript lives in a per-workspace LevelDB the tracker cannot decode — narration degrades honestly; todos and files still read in full.' },
+    { name: 'Augment (Cursor)', ids: ['augment-cursor'], degraded: 'Same LevelDB limitation as Augment (VS Code).' },
   ];
+
+  // CR.dialogs.providerNoteFor(source) -> the matching PROVIDER_NOTES entry, or null if
+  // `source` isn't one of the four known providers. `source` is the session's real
+  // meta.source/source value (case-insensitive) — never a display name.
+  function providerNoteFor(source) {
+    var key = String(source == null ? '' : source).toLowerCase();
+    for (var i = 0; i < PROVIDER_NOTES.length; i++) {
+      if (PROVIDER_NOTES[i].ids.indexOf(key) !== -1) return PROVIDER_NOTES[i];
+    }
+    return null;
+  }
 
   var HELP_SHORTCUTS = [
     ['?', 'Open Help'], ['Esc', 'Close the topmost dialog'], ['⌘K / Ctrl+K', 'Search sessions'],
@@ -491,16 +539,18 @@
       'It reads the session logs your tools already write. Nothing is sent anywhere, and it never writes into a session.',
     ]));
     wrap.appendChild(h('div', { class: 'cr-stat-row' }, [
-      h('div', { class: 'cr-stat cr-stat-forest' }, [h('div', { class: 'cr-stat-num' }, ['58']), h('div', { class: 'cr-stat-label' }, ['capabilities'])]),
-      h('div', { class: 'cr-stat cr-stat-neutral' }, [h('div', { class: 'cr-stat-num' }, ['4']), h('div', { class: 'cr-stat-label' }, ['tools'])]),
+      h('div', { class: 'cr-stat cr-stat-forest' }, [h('div', { class: 'cr-stat-num' }, [String(CAPABILITIES.length)]), h('div', { class: 'cr-stat-label' }, ['capabilities'])]),
+      h('div', { class: 'cr-stat cr-stat-neutral' }, [h('div', { class: 'cr-stat-num' }, [String(PROVIDER_NOTES.length)]), h('div', { class: 'cr-stat-label' }, ['tools'])]),
       h('div', { class: 'cr-stat cr-stat-dusk' }, [h('div', { class: 'cr-stat-num' }, ['0']), h('div', { class: 'cr-stat-label' }, ['bytes leaving'])]),
     ]));
-    // NOTE: doc 04's Coverage-tab copy is literal ("58 capabilities · 4 tools · 0 bytes
-    // leaving") even though the capability map below it enumerates 60 rows (2 are
-    // explicitly marked New: the Config dialog and the progress spine). Fidelity rule
-    // says copy is final, so the stat block keeps the doc's literal "58" rather than
-    // deriving len(CAPABILITIES); the state->colour table and per-tool grid below DO
-    // derive from the live data structure, per the doc's explicit instruction to do so.
+    // NOTE (Fix 5, supersedes a prior NOTE here): doc 04's Coverage-tab copy literally
+    // said "58 capabilities" while the capability map below it enumerates 60 rows (2
+    // marked New: the Config dialog and the progress spine, both genuinely shipped —
+    // see docs 03/04) — an audit caught Help disagreeing with what shipped, which is
+    // exactly the drift "Generate the capability table from the same data structure the
+    // tests assert against" (doc 04) exists to prevent. Reconciled by deriving the stat
+    // from CAPABILITIES.length (60) instead of repeating the doc's stale literal;
+    // tests/test_capability_table.py pins this number so the two can't drift again.
     var table = h('table', { class: 'cr-state-table' });
     table.appendChild(h('thead', {}, [h('tr', {}, [h('th', {}, ['State']), h('th', {}, ['Colour']), h('th', {}, ['Word shown'])])]));
     var tbody = h('tbody');
@@ -647,8 +697,14 @@
 
   var CFG_PREF_KEYS = {
     theme: null, // routed through ctx.theme, not localStorage, to avoid a second source of truth
+    // Fix 2a: the rail's REAL key is 'tracker.rail' (a raw string 'open'|'collapsed' —
+    // see readRailPref/writeRailPref below, ground-truthed against ext_cr_board.js:187,
+    // 322), not a JSON boolean under 'cr.railOpen'. 'cr.railOpen' is kept here ONLY so
+    // "Reset to defaults" still clears a stray value written by an earlier build.
     railOpen: 'cr.railOpen',
     cardsFolded: 'cr.cardsFolded',
+    // Fix 2d: 'cr.boardTileCount' is no longer written (the row is read-only — see
+    // below); kept here only for the same stale-key cleanup as railOpen above.
     boardTiles: 'cr.boardTileCount',
     pollMs: 'cr.pollIntervalMs',
     desktopNotif: 'cr.notif.enabled',
@@ -665,6 +721,20 @@
   function writePref(key, val) {
     try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {}
     if (_ctx && typeof _ctx.emit === 'function') _ctx.emit('cr:pref', { key: key, value: val });
+  }
+
+  // Fix 2a — the session rail (ext_cr_board.js) reads/writes the RAW STRING key
+  // 'tracker.rail' with values 'open' | 'collapsed' (never JSON, never a boolean) —
+  // see ext_cr_board.js:187 (`localStorage.getItem('tracker.rail') || 'open'`) and
+  // :322 (`localStorage.setItem('tracker.rail', railMode)`). Config must write that
+  // SAME key/vocabulary, not a parallel 'cr.railOpen' boolean nothing reads.
+  function readRailPref() {
+    try { return localStorage.getItem('tracker.rail') || 'open'; } catch (e) { return 'open'; }
+  }
+  function writeRailPref(mode) {
+    mode = (mode === 'collapsed') ? 'collapsed' : 'open';
+    try { localStorage.setItem('tracker.rail', mode); } catch (e) {}
+    if (_ctx && typeof _ctx.emit === 'function') _ctx.emit('cr:pref', { key: 'tracker.rail', value: mode });
   }
 
   function cfgRow(label, envVar, sub, control, restart) {
@@ -724,8 +794,13 @@
 
   // Config's payload contract (documented in the handoff report): the caller
   // (bootstrap) supplies `payload.server` with the values it already fetched from
-  // existing routes (GET /api/term/renderer, GET /api/term/list) or embedded at page-
-  // build time — this module never fetches. Missing fields render as "unknown".
+  // existing routes (GET /api/term/list) or embedded at page-build time — this module
+  // never fetches. ext_cr_boot.js's fetchTermsMax() is today the only populated source:
+  // it learns `maxTerms` AND (Fix 2e) `terminalEnabled` from that SAME one-shot
+  // /api/term/list probe (its guard() 403 is distinguishable from an auth-required 403 —
+  // see that function's own comment). Every other field stays undefined and renders via
+  // each row's own honest fallback ("unknown" for terminalEnabled specifically, per Fix
+  // 2e — never a confidently wrong default).
   function renderConfig(payload) {
     var srv = (payload && payload.server) || {};
     var chrome = buildChrome('config', 'Config', '⚙️', 'ai-tracker', true);
@@ -746,7 +821,7 @@
             if (_ctx && _ctx.theme && _ctx.theme.set) _ctx.theme.set(v);
           })));
         body.appendChild(cfgRow('Session rail', null, 'Open by default; collapses to 48px orbs.',
-          toggleCtl(readPref(CFG_PREF_KEYS.railOpen, true), function (v) { writePref(CFG_PREF_KEYS.railOpen, v); })));
+          toggleCtl(readRailPref() === 'open', function (v) { writeRailPref(v ? 'open' : 'collapsed'); })));
         body.appendChild(cfgRow('Cards start folded', null, 'Every detail-view panel starts collapsed except Conversation.',
           toggleCtl(readPref(CFG_PREF_KEYS.cardsFolded, true), function (v) { writePref(CFG_PREF_KEYS.cardsFolded, v); })));
         body.appendChild(cfgRow('Desktop notifications', null, 'Ask once; shows the permission nudge if not yet granted.',
@@ -754,9 +829,19 @@
         body.appendChild(cfgRow('Sound', null, 'Plays alongside the toast and desktop notification.',
           toggleCtl(readPref(CFG_PREF_KEYS.sound, true), function (v) { writePref(CFG_PREF_KEYS.sound, v); })));
       } else if (active === 'Board') {
-        body.appendChild(cfgRow('Board tiles', null, 'Default 8. Decision 2 caps the board at 8 regardless of this slider — raising it only affects how many can appear before the cap wins.',
-          sliderCtl(3, 12, readPref(CFG_PREF_KEYS.boardTiles, 8), function (v) { writePref(CFG_PREF_KEYS.boardTiles, v); })));
-        body.appendChild(cfgRow('Poll interval', null, 'How often the board/rail re-poll /api/list.',
+        // Fix 2d — DOC CONFLICT: 04's config table specifies a 3–12 slider here, but the
+        // handoff README's decision #2 is "the board never renders more than 8 tiles" as
+        // a fixed product decision, and ext_cr_board.js hardcodes that cap (never reads
+        // any pref). A slider that "works" but is silently capped is worse than no
+        // control at all, so this row is read-only, states the real number, and says why
+        // — it does not write cr.boardTileCount any more.
+        body.appendChild(cfgRow('Board tiles', null, 'Fixed at 8 — a product decision (handoff README decision 2), not a live setting despite 04’s slider spec.',
+          readonlyField('8')));
+        // Fix 2b — this is the SAME poll() /api/session timer app.js's track() already
+        // runs (2s by default, and the project's hard rule keeps that the default) —
+        // ext_cr_boot.js re-arms that one timer at the chosen cadence instead of adding a
+        // second loop. It does not touch the separate 5s /api/list (board/rail) poll.
+        body.appendChild(cfgRow('Poll interval', null, 'How often the open session’s detail view re-polls the server. (The board/rail list poll stays fixed at 5s.)',
           segmented([[1000, '1s'], [2000, '2s'], [5000, '5s']], readPref(CFG_PREF_KEYS.pollMs, 2000), function (v) { writePref(CFG_PREF_KEYS.pollMs, v); })));
         body.appendChild(cfgRow('Live window', null,
           'Fixed at ' + (srv.liveWindowSec != null ? Math.round(srv.liveWindowSec / 60) : 5) + ' min server-side (config.py LIVE_WINDOW) — not yet configurable; see Help.',
@@ -766,7 +851,7 @@
           readonlyField(srv.termRenderer || 'xterm')));
         body.appendChild(cfgRow('Max terminals', 'TRACKER_MAX_TERMS', 'Clamped to 1–64.',
           readonlyField(String(srv.maxTerms != null ? srv.maxTerms : 12))));
-        body.appendChild(cfgRow('Terminal enabled', 'TRACKER_TERMINAL', 'Turns the tracker from a read-only viewer into something that can start processes.', restartFlag(true),
+        body.appendChild(cfgRow('Terminal enabled', 'TRACKER_TERMINAL', 'Turns the tracker from a read-only viewer into something that can start processes.', restartFlag(srv.terminalEnabled),
           true));
         body.appendChild(cfgRow('External terminal app', 'TRACKER_TERM_APP', 'Terminal or iTerm, for the ↗ external-terminal buttons.',
           readonlyField(srv.termApp || 'Terminal')));
@@ -790,8 +875,13 @@
         });
       }
     }
+    // Fix 2e: `on` is a real tri-state (true/false/undefined-or-anything-else), never a
+    // hardcoded literal — a caller with no data for this (payload.server.terminalEnabled
+    // unset) must render "unknown" rather than a confident, possibly-wrong "on"/"off".
     function restartFlag(on) {
-      return h('span', { class: 'cr-restart-badge' }, [on ? 'on' : 'off']);
+      if (on === true) return h('span', { class: 'cr-restart-badge' }, ['on']);
+      if (on === false) return h('span', { class: 'cr-restart-badge cr-restart-badge-off' }, ['off']);
+      return h('span', { class: 'cr-restart-badge cr-restart-badge-unknown' }, ['unknown']);
     }
     sections.forEach(function (s) {
       var btn = h('button', { class: 'cr-cfg-nav-btn' + (s === active ? ' is-active' : ''), type: 'button', text: s });
@@ -803,9 +893,17 @@
     var main = h('div', { class: 'cr-cfg-main' }, [nav, body]);
     chrome.body.appendChild(main);
     chrome.body.appendChild(h('div', { class: 'cr-cfg-footer' }, [
+      // Fix 2f: the old copy claimed "editing one writes an override the server picks
+      // up" — false for every env-backed row (there is no /api/config write route at
+      // all — verified). The truth: rows WITHOUT an env-var chip are plain browser
+      // preferences, saved to this browser the moment you change them, nothing to
+      // "apply". Rows WITH an env-var chip are read from the server process at
+      // startup and have no live write path from here, so they're shown read-only —
+      // change the env var and restart (the rows marked *needs a restart* really do
+      // need one; the rest of the env-backed rows just have no control to change).
       h('p', { class: 'cr-cfg-footer-note' }, [
-        'Rows with an env-var name are read from the process. Editing one writes an override the server picks up; the two marked *needs a restart* take effect on the next ',
-        h('code', {}, ['make serve']), '.',
+        'Rows without an env-var chip are plain browser preferences — saved to this browser the moment you change them. Rows with an env-var chip are read from the server process at startup; there’s no live write path from here, so they’re shown read-only — set the env var and restart (',
+        h('code', {}, ['make serve']), ') to change them.',
       ]),
       h('div', { class: 'cr-cfg-actions' }, [
         h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Reset to defaults', onclick: function () {
@@ -915,11 +1013,21 @@
       h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Jump to latest', onclick: function () { if (payload.onLatest) payload.onLatest(); } }),
     ]);
     var card = h('div', { class: 'cr-diagram-card' });
-    var row = h('div', { class: 'cr-diagram-row' });
-    (payload.nodes || []).forEach(function (n) {
-      row.appendChild(h('span', { class: 'cr-diagram-pill' + (n.active ? ' is-active' : '') }, [n.label]));
-    });
-    card.appendChild(row);
+    var nodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+    // Fix 4: a missing/short `nodes` array degrades to an honest empty state instead of
+    // an empty (and confusing-looking) diagram card — nothing here can throw either way,
+    // since a node missing `.label` already renders as a blank pill (h()'s child-append
+    // skips a null/undefined child), but zero nodes deserves a real message.
+    if (!nodes.length) {
+      card.appendChild(emptyState({ title: 'No narration steps to diagram', body: 'This entry has nothing to draw yet.' }));
+    } else {
+      var row = h('div', { class: 'cr-diagram-row' });
+      nodes.forEach(function (n) {
+        n = n || {};
+        row.appendChild(h('span', { class: 'cr-diagram-pill' + (n.active ? ' is-active' : '') }, [n.label || '']));
+      });
+      card.appendChild(row);
+    }
     var caption = h('div', { class: 'cr-diagram-caption' }, [
       (payload.family || 'stateDiagram-v2') + ' · drawn locally in plain SVG, no mermaid.js',
     ]);
@@ -1274,7 +1382,9 @@
     degraded: degraded,
     toast: toast,
     notificationNudge: notificationNudge,
+    showNudgeIfNeeded: showNudgeIfNeeded,
+    providerNoteFor: providerNoteFor,
     addHelpShortcuts: addHelpShortcuts,
-    CAPABILITIES: CAPABILITIES, // exposed read-only for a future shared self-check
+    CAPABILITIES: CAPABILITIES, // exposed read-only — tests/test_capability_table.py asserts against this directly
   };
 })();

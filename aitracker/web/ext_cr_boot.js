@@ -225,12 +225,66 @@ window.CR = window.CR || {};
   // to learn a static config value, cached forever after, never a poll.
   // ----------------------------------------------------------------------
   var termsMax = null;
+  // Fix 2e — Config's "Terminal enabled" row hardcoded `restartFlag(true)`, showing a
+  // confident "on" no matter the real TRACKER_TERMINAL value. There is no dedicated
+  // route for this, but term_gate.guard() (the SAME gate GET /api/term/list already runs
+  // first) 403s with a distinguishable error when config.TERMINAL is off ("...unset
+  // TRACKER_TERMINAL or set it to anything other than 0" — term_gate.py) versus when
+  // terminal IS enabled but this server needs TRACKER_AUTH to use it off-loopback
+  // ("...needs TRACKER_AUTH"). So this SAME one-shot probe also resolves terminalEnabled:
+  // true on 200, false when the error names TRACKER_TERMINAL, else 'unknown' (a network
+  // failure, an auth-gate 403, or anything not confidently one of the first two) — never
+  // a guessed true/false. No new request is added; this reuses the max-terms probe.
+  var termEnabled = null; // null (not yet resolved) | true | false | 'unknown'
   function fetchTermsMax() {
     if (termsMax !== null || typeof fetch !== 'function') return;
-    fetch('/api/term/list').then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (j) { if (j && typeof j.max === 'number') termsMax = j.max; })
-      .catch(function () {});
+    fetch('/api/term/list').then(function (r) {
+      return r.json().catch(function () { return null; }).then(function (j) { return { ok: r.ok, j: j }; });
+    }).then(function (res) {
+      if (res.ok && res.j) {
+        if (typeof res.j.max === 'number') termsMax = res.j.max;
+        termEnabled = true;
+      } else {
+        var errText = (res.j && res.j.error) || '';
+        termEnabled = /TRACKER_TERMINAL/.test(errText) ? false : 'unknown';
+      }
+    }).catch(function () { termEnabled = 'unknown'; });
   }
+
+  // ----------------------------------------------------------------------
+  // Fix 2b — Config's "Poll interval" row (1s / 2s / 5s) wrote `cr.pollIntervalMs`
+  // but nothing read it. This is the SAME `poll()`/`timer` loop app.js's track()
+  // already runs for the open session's /api/session detail poll (2s default) — the
+  // project's hard rule keeps 2s the default, so readPollMs() falls back to it for
+  // anything unset or outside the doc's allowed values. Re-arming the existing
+  // `timer` at the chosen cadence (instead of adding a second loop) satisfies "no new
+  // round-trips": still exactly one interval alive. This does NOT touch the separate
+  // 5s /api/list (board/rail) poll — that interval is armed once, at startup, with no
+  // seam to change it without editing app.js.
+  // ----------------------------------------------------------------------
+  function readPollMs() {
+    var v;
+    try { v = JSON.parse(localStorage.getItem('cr.pollIntervalMs') || 'null'); } catch (e) { v = null; }
+    return (v === 1000 || v === 5000) ? v : 2000;
+  }
+  function applyPollPref() {
+    if (typeof timer === 'undefined' || !timer || typeof poll !== 'function') return;
+    clearInterval(timer);
+    timer = setInterval(poll, readPollMs());
+  }
+  // track() (app.js) always re-arms `timer` at its own hardcoded 2000ms — reused
+  // as-is (not forked) and just re-applied afterward, so a chosen cadence survives a
+  // session switch instead of resetting to the default every time you pick a session.
+  var _origTrack = (typeof track === 'function') ? track : null;
+  if (_origTrack) {
+    track = function () {
+      _origTrack();
+      applyPollPref();
+    };
+  }
+  on('cr:pref', function (payload) {
+    if (payload && payload.key === 'cr.pollIntervalMs') applyPollPref();
+  });
 
   // ----------------------------------------------------------------------
   // ctx.dialog(name, payload) — cr_term.js calls this as a plain ctx method
@@ -292,7 +346,13 @@ window.CR = window.CR || {};
   on('ui:backToClassic', function () { setUiMode('classic'); });
 
   on('open:help', function () { dialog('help', {}); });
-  on('open:config', function () { dialog('config', {}); });
+  // Fix 2e: Config's payload contract (cr_dialogs.js's own doc-comment on renderConfig)
+  // says the caller supplies `payload.server` from data it already has — this used to
+  // pass {} always, so every server-backed row silently fell to its hardcoded fallback.
+  // Only pass what this file has genuinely already learned (via fetchTermsMax's single
+  // /api/term/list probe); every other field is left undefined on purpose so its row
+  // renders its own honest fallback instead of a second guess made here.
+  on('open:config', function () { dialog('config', { server: { terminalEnabled: termEnabled, maxTerms: termsMax } }); });
 
   on('open:flags', function () {
     dialog('flags', buildFlagsPayload());
@@ -685,6 +745,7 @@ window.CR = window.CR || {};
     safeMount('board', els.viewBoard);
     safeMount('detail', els.viewDetail);
     fetchTermsMax();
+    applyPollPref(); // pick up a previously-chosen cadence for a `timer` that predates this mount
   }
 
   // ----------------------------------------------------------------------
@@ -723,6 +784,74 @@ window.CR = window.CR || {};
       if (window.CR.detail && typeof window.CR.detail.update === 'function') {
         try { window.CR.detail.update({ session: d, now: d.now }); } catch (e) { console.error('[CR] detail.update threw', e); }
       }
+    });
+  }
+
+  // ----------------------------------------------------------------------
+  // Fix 1b — completion notifications. Doc 04's "Notifications" section: when a
+  // session finishes, a toast fires AND that session's board tile flips to Landed
+  // ("the toast is the nudge, the tile is the record"). Today the bus and session
+  // state were completely disconnected — the ~20 existing 'notify' emitters
+  // (rename/note/flag/etc., wired above) are all user-action confirmations, not
+  // completions, and nothing detected one.
+  //
+  // The tile's own "Landed" derivation (ext_cr_board.js's sessionState(): `live &&
+  // s.ended`) is fed by the list dict this SIDE_EXT hook already receives every 5s
+  // (loadSide()/`/api/list` — the same hook above) — reusing that SAME transition
+  // (`ended` false -> true) as the completion signal is what ties the toast to the
+  // tile the doc asks for, without touching ext_cr_board.js at all.
+  //
+  // Deliberately NOT calling app.js's own checkCompletions()/notifyDone() here: those
+  // already run on every poll() tick (2s, for the CURRENTLY TRACKED session's
+  // background agents/shells only) regardless of UI mode, and notifyDone()'s own
+  // toast() writes into the CLASSIC `#toasts` div — hidden by setUiMode('next')'s
+  // CLASSIC_SIBLINGS list, so it would be invisible here. Calling it AND emitting a
+  // CR toast would also double the desktop Notification (notifyDone's own path fires
+  // one when `document.hidden && soundOn`; cr_dialogs.js's toast() fires a SECOND,
+  // independent one whenever `document.hidden`, regardless of soundOn — per doc 04's
+  // Notifications spec, the desktop alert is not gated on the sound preference).
+  // So: the sound toggle is reused directly (`soundOn`/`beep()`, respecting
+  // toggleSound() — no parallel sound preference), and the visible toast + the
+  // backgrounded-tab desktop Notification both come from the ONE call to
+  // `emit('notify', ...)`, which cr_dialogs.js's toast() already implements per spec.
+  var _priorEnded = {};   // sid -> last-seen `ended` boolean
+  var _completionInited = false;
+  function checkSessionCompletions(list, now) {
+    if (!_completionInited) {
+      // First tick after mount: record a baseline without notifying — otherwise
+      // every already-finished session would fire a toast the moment CR mode opens
+      // (mirrors app.js's own checkCompletions() "reset baseline on first poll").
+      list.forEach(function (s) { _priorEnded[s.id] = !!s.ended; });
+      _completionInited = true;
+      return;
+    }
+    list.forEach(function (s) {
+      var was = !!_priorEnded[s.id];
+      var is = !!s.ended;
+      if (!was && is) fireCompletionNotice(s, now);
+      _priorEnded[s.id] = is;
+    });
+  }
+  function fireCompletionNotice(s, now) {
+    var title = (s.title || s.project || (s.id || '').slice(0, 8) || 'Session') + ' finished';
+    var meta = [s.project, s.source ? srcLabel(s.source) : ''].filter(Boolean).join(' · ');
+    if (typeof soundOn !== 'undefined' && soundOn && typeof beep === 'function') { try { beep(); } catch (e) {} }
+    emit('notify', {
+      title: title,
+      meta: meta,
+      actionLabel: 'Read it',
+      onAction: function () { go('detail', s.id); },
+    });
+    if (window.CR.dialogs && typeof window.CR.dialogs.showNudgeIfNeeded === 'function') {
+      window.CR.dialogs.showNudgeIfNeeded();
+    }
+  }
+  if (typeof SIDE_EXT !== 'undefined' && SIDE_EXT && SIDE_EXT.push) {
+    SIDE_EXT.push(function () {
+      if (getUiMode() !== 'next' || !mounted) return;
+      var now = (typeof listNow === 'number') ? listNow : Date.now() / 1000;
+      var list = (typeof sessions !== 'undefined' && Array.isArray(sessions)) ? sessions : [];
+      try { checkSessionCompletions(list, now); } catch (e) { console.error('[CR] checkSessionCompletions threw', e); }
     });
   }
 

@@ -267,16 +267,21 @@ def cmd_kind(c):
 
 
 def todo_summary(todos):
-    """(total, done, current-label-or-None) from a list of normalized todo dicts
-    ({"content"/"activeForm"/"status"} — the shape both providers already emit:
-    Claude's store.load_tasks() and Auggie's task-tree resolver). The one place
-    this gets computed, so the session-list dict's todo_total/todo_done/todo_current
-    (registry.py's shared seam) aren't derived twice, once per provider."""
+    """(total, done, current-label-or-None, current-index-or-None) from a list of
+    normalized todo dicts ({"content"/"activeForm"/"status"} — the shape both
+    providers already emit: Claude's store.load_tasks() and Auggie's task-tree
+    resolver). The one place this gets computed, so the session-list dict's
+    todo_total/todo_done/todo_current/todo_current_index (registry.py's shared
+    seam) aren't derived twice, once per provider. current_index is the same
+    todo's 0-based position in `todos` that current was picked from (the FIRST
+    in_progress one) — kept in lockstep so a tick-highlighter can point at the
+    exact row the label came from."""
     total = len(todos)
     done = sum(1 for t in todos if t.get("status") == "completed")
-    cur = next((t for t in todos if t.get("status") == "in_progress"), None)
+    current_index = next((i for i, t in enumerate(todos) if t.get("status") == "in_progress"), None)
+    cur = todos[current_index] if current_index is not None else None
     current = (cur.get("activeForm") or cur.get("content") or None) if cur else None
-    return total, done, current
+    return total, done, current, current_index
 
 
 def unified(old, new, cap=20000):

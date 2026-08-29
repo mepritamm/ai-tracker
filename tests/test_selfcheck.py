@@ -423,7 +423,8 @@ def _run():
     # the todo summary rides the session-LIST shape too (todo_total/todo_done/todo_current) — a
     # compact progress tick for the sidebar, off root1/s1(completed)/s2(in_progress) above, without
     # a full detail parse. (Claude's half of this is asserted below, once the task store is set up.)
-    assert (al[0]["todo_total"], al[0]["todo_done"], al[0]["todo_current"]) == (2, 1, "step two"), al[0]
+    assert (al[0]["todo_total"], al[0]["todo_done"], al[0]["todo_current"], al[0]["todo_current_index"]) == \
+        (2, 1, "step two", 1), al[0]  # s2 is in_progress at index 1, not 0 -- pins the index, not just the label
     assert al[0]["title"] == "List Home Dir", al                       # customTitle wins
     pa = parse_auggie("sess1")
     assert pa and pa["counts"]["done"] == 1 and pa["counts"]["todos"] == 2, pa   # todos via rootTaskUuid
@@ -566,7 +567,8 @@ def _run():
     d5 = os.path.join(pdir, "-x-sess-x"); os.makedirs(d5)
     _mk(d5, "sess-x.jsonl", "/x", "cli", "2026-06-01T09:00:00Z", "do the thing")
     lst = {s["id"]: s for s in list_sessions()}
-    assert (lst["sess-x"]["todo_total"], lst["sess-x"]["todo_done"], lst["sess-x"]["todo_current"]) == (2, 1, "Second"), lst["sess-x"]
+    assert (lst["sess-x"]["todo_total"], lst["sess-x"]["todo_done"], lst["sess-x"]["todo_current"], lst["sess-x"]["todo_current_index"]) == \
+        (2, 1, "Second", 1), lst["sess-x"]  # Second is in_progress at index 1, not 0
 
     # time-proportional progress-spine segments: started_at/ended_at per todo (epoch seconds),
     # reconstructed from TaskUpdate tool calls already being walked in parse_session's one
@@ -616,7 +618,8 @@ def _run():
     ep = AugmentVscodeProvider()
     erows = {r["id"]: r for r in ep.list()}
     eroot = erows["augment-vscode:wshash-ext:root"]
-    assert (eroot["todo_total"], eroot["todo_done"], eroot["todo_current"]) == (2, 1, "wire tests"), eroot
+    assert (eroot["todo_total"], eroot["todo_done"], eroot["todo_current"], eroot["todo_current_index"]) == \
+        (2, 1, "wire tests", 1), eroot  # "wire tests" (b) is in_progress at index 1, not 0
     ed = ep.parse("augment-vscode:wshash-ext:root")
     assert ed["todos"] and all(t["started_at"] is None and t["ended_at"] is None for t in ed["todos"]), ed["todos"]
 

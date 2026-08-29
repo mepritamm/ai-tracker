@@ -4,8 +4,8 @@
 // aitracker/web/ext_launch.js, aitracker/term_vt.py, aitracker/term_launch.py). It must not
 // duplicate that subsystem's transport (the SSE/raw-byte stream), resize logic (computeColsRows,
 // the ResizeObserver dance) or buffer handling (the grid model / xterm.js Terminal instance) —
-// see this file's own "SEAM NEEDED" blocks below for the one piece that genuinely has no public
-// hook to reuse yet. Everything else here talks to server endpoints ext_vt.js/ext_launch.js
+// see this file's own ExtVT `mountInto` seam comment below for that shared core. Everything
+// else here talks to server endpoints ext_vt.js/ext_launch.js
 // ALREADY call directly from client code (POST /api/term/pty, /api/term/open, /api/term/close,
 // /api/term/inject, GET /api/term/list, /api/term/cwds, /api/term/attached, GET /api/session) —
 // using a public REST route directly is not "duplicating ext_vt.js", it's the same pattern
@@ -32,10 +32,12 @@
     });
   }
   function fmtTok(n) {
+    // FIX 3: doc 05's status-bar section shows raw comma-grouped digits ("128,412"), never an
+    // abbreviated "128.4k" — the doc's point is a real number. toLocaleString comma-groups without
+    // pulling in a dependency. The "never invent a %" behaviour this doc also calls out lives
+    // entirely in _syncStatusBar's own st.ctx.pct !== null gate, untouched by this change.
     n = n || 0;
-    if (n >= 1000000) return (n / 1000000).toFixed(1).replace(/\.0$/, "") + "m";
-    if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
-    return String(n);
+    return Math.round(n).toLocaleString("en-US");
   }
   function localOnly() {
     return location.hostname === "localhost" || location.hostname === "127.0.0.1";
@@ -283,41 +285,60 @@
     }
   }
 
-  // ===== the ONE seam this module actually needs — see the file header and README for why ===
-  // SEAM NEEDED: ext_vt.js exposes only `window.ExtVT.open(sid, mode)` and `.manage()`, both of
-  // which build their OWN fixed-position overlay on <body> (the "vtmodal") rather than mounting
-  // into a container this file supplies — so there is no way today to host the live Terminal /
-  // XtermTerminal engine (+ its ContextBar, notice banner, resize/bell/copy-paste wiring, and the
-  // lazy xterm.js loader) INSIDE `.cr-term-pane`. Requested shape:
+  // ===== the seam this module relies on — window.ExtVT.mountInto(container, target, opts) =====
+  // (doc 05; ext_vt.js's own `mountInto` header comment carries the full contract). It renders a
+  // live terminal INSIDE `.cr-term-pane` instead of ext_vt.js's own body-level "vtmodal" overlay,
+  // and hands back a handle synchronously:
   //
   //   window.ExtVT.mountInto(container, target, opts) -> {
-  //     tty, renderer,              // "grid" | "xterm", the server's choice for THIS pty
-  //     forked, notice,             // exactly POST /api/term/pty's own {forked, notice} fields
+  //     tty, renderer,              // "grid" | "xterm" — filled in once resolution finishes; see
+  //                                 // _openInline's own onForked comment for why nothing here may
+  //                                 // read these synchronously
+  //     forked, notice,             // the same {forked, notice} fields POST /api/term/pty returns
   //     setRenderer(next),          // switches the live renderer in place (repaint-vs-blank
   //                                 // caveat from doc 05's last section is the engine's to honour)
-  //     setTheme(themeObj),         // {background, foreground, cursor} — lets a CALLER-OWNED dark
-  //                                 // palette drive xterm.js's colours instead of _xtermTheme()'s
-  //                                 // own read of the CLASSIC global --app/--text/--ring2 tokens
-  //                                 // (see "How theme swap reaches xterm" in this run's report)
-  //     copyBuffer(),               // -> Promise<string> | string; the ⧉ Copy button's action —
-  //                                 // buffer contents live only inside Terminal/XtermTerminal today
+  //     setTheme({background, foreground, cursor}),   // drives THIS mount's colours — see FIX 1's
+  //                                 // _applyDarkTheme below for how this file uses it to force
+  //                                 // the PTY pane dark in both app themes
+  //     copyBuffer(),               // -> string; the ⧉ Copy button's action (_copyPane below)
   //     focus(), destroy(),
   //     onStatus(cb), onNotice(cb), onForked(cb),
   //   }
-  //   `target` is `{session, mode}` to dedupe-or-spawn exactly like openVT() already does, OR
-  //   `{tty}` to attach to an EXISTING pty without spawning (this is "peek", done in-place instead
-  //   of in a new tab).
+  //   `target` is `{session, mode}` to dedupe-or-spawn exactly like openVT() already does, or
+  //   `{tty}` to attach to an EXISTING pty without spawning ("peek", done in-place instead of in a
+  //   new tab) — nothing in this file calls the {tty} form today; _peekTerminal below still opens
+  //   a new tab.
   //
-  // Until that exists, this file falls back to the CURRENT working behaviour — the classic
-  // floating modal — so a real terminal still opens, with 100% of the real transport/resize/
-  // buffer handling, just outside the new chrome's own pane. That fallback is intentional and
-  // safe: spawning a pty from THIS file without any way to render/attach it would leak a live,
-  // viewer-less pty exactly like the leak ext_vt.js's own openVT() comments describe fixing.
+  // `_attachEngine` still guards on `window.ExtVT && typeof mountInto === "function"` rather than
+  // calling it unconditionally — not because the seam might be missing (ext_vt.js's own IIFE
+  // always assigns it, unconditionally, at the bottom of that file) but as a defensive fallback
+  // for the one failure mode that could actually leave it undefined: a throw earlier in the same
+  // concatenated <script> tag (page.py inlines every ext_*.js into ONE tag; an exception in any
+  // one of them aborts every script after it). See _openInline's own fallback branch below for
+  // what happens in that case.
   function _attachEngine(container, target, opts) {
     if (window.ExtVT && typeof window.ExtVT.mountInto === "function") {
       return window.ExtVT.mountInto(container, target, opts);
     }
     return null;
+  }
+
+  // ===== FIX 1: force the PTY pane dark in both app themes (doc 05 "Layout") =================
+  // mountInto()'s `opts` argument only ever reads `opts.renderer` (see the seam comment above) —
+  // passing {theme:"dark"} there, as this file used to, was silently ignored. The grid renderer's
+  // palette instead comes from var(--app)/var(--text)/var(--ring2) (ext_vt.css:94,106), which flip
+  // with the CLASSIC dashboard's <html>.light class — a class ext_cr_boot.js deliberately never
+  // touches — so a user who had ever set classic to light mode saw this inline pane render light,
+  // contradicting the doc. Fixed caller-side via the handle's real setTheme(), called once the
+  // handle actually resolves (see _openInline's onForked below) and again after any renderer
+  // switch (see _setRenderer below). The values are the SAME frozen dark literals ext_cr_term.css
+  // already uses for this pane/status bar — not a second, invented palette:
+  //   background #12100E — cr_term.css's own frozen --surface-inverse (.cr-term-pane's background)
+  //   foreground #FBFAF7 — cr_term.css's own frozen --text-primary (.cr-term-pane's color)
+  //   cursor     #E5CB79 — the one frozen accent literal in that file (.cr-term-ctxbarfill)
+  var DARK_PANE_THEME = { background: "#12100E", foreground: "#FBFAF7", cursor: "#E5CB79" };
+  function _applyDarkTheme(handle) {
+    if (handle && typeof handle.setTheme === "function") handle.setTheme(DARK_PANE_THEME);
   }
 
   // ===== open / close ========================================================================
@@ -405,7 +426,9 @@
     el.placeholder.textContent = "connecting…";
     el.status.hidden = true;
     el.newTab.disabled = true;
-    var handle = _attachEngine(el.pane, { session: sid, mode: mode }, { theme: "dark" });
+    // FIX 1: theme is applied via handle.setTheme() below once the handle resolves (onForked) —
+    // mountInto() ignores an opts.theme key, so none is passed here.
+    var handle = _attachEngine(el.pane, { session: sid, mode: mode }, {});
     if (handle) {
       st.engineHandle = handle;
       // Loading state: the placeholder stays up (whatever text onStatus reports) until onForked
@@ -415,6 +438,17 @@
           if (gen !== engineGen) return;
           if (st.tty) { showToast(text); return; }   // already attached — a later status is a
                                                        // reconnect, not "still connecting"
+          // FIX 2: mountInto()'s fail() path (ext_vt.js) forwards only res.j.error as a plain
+          // string — never the HTTP status or the `terminals` list the 429 body actually carries
+          // (term_vt.py open_pty) — so this is the one structured signal available caller-side
+          // without editing ext_vt.js. The text matched is the server's own stable message, not a
+          // guessed heuristic: term_vt.py's open_pty returns exactly
+          // "too many running terminals (max %d)" at 429, and fail() passes it through verbatim.
+          if (typeof text === "string" && text.indexOf("too many running terminals") === 0) {
+            el.placeholder.textContent = text;
+            _openCapDialog(function () { _openInline(sid, mode); });
+            return;
+          }
           el.placeholder.textContent = text;
         });
       }
@@ -437,12 +471,16 @@
           _syncNotice();
           el.status.hidden = false;
           el.newTab.disabled = !st.tty;
+          _applyDarkTheme(handle);   // FIX 1: doc 05 — the PTY pane stays dark in both app themes
         });
       }
       return;
     }
-    // Fallback: no mountInto seam yet. Delegate to the classic, fully-working floating terminal
-    // so the feature is not dead in the meantime — see the SEAM NEEDED block above.
+    // Fallback: this file's _attachEngine() couldn't find window.ExtVT.mountInto — see that
+    // function's own comment for the one real way that happens (a script-load failure earlier in
+    // the same concatenated <script> tag), since mountInto itself always ships in ext_vt.js.
+    // Delegate to the classic, fully-working floating terminal so the feature is not dead even
+    // then.
     el.placeholder.hidden = false;
     el.placeholder.textContent =
       "This build's terminal engine isn't wired into the new chrome yet — opening the classic " +
@@ -526,6 +564,13 @@
     if (!path) { showToast("Choose or type a directory first."); return; }
     post("/api/term/pty", { cwd: path, cols: 100, rows: 30, mode: mode }).then(j).then(function (res) {
       if (!res.ok || !res.j || !res.j.tty) {
+        // FIX 2: 429 is the server's real structured cap-reached signal — term_vt.py's open_pty
+        // returns {error, terminals} at status 429 when config.MAX_TERMS is hit — not a guessed
+        // string match (this call hits /api/term/pty directly, so the status code is right here).
+        if (res.status === 429) {
+          _openCapDialog(function () { _pickDirectory(path, mode); });
+          return;
+        }
         showToast((res.j && res.j.error) ||
           (res.status === 404 ? "Opening a terminal at a chosen directory isn't available yet." :
            res.status === 403 ? "In-browser terminal is disabled." : "Failed to open a terminal there."));
@@ -540,6 +585,45 @@
       var w = window.open(url, "_blank");
       if (!w) showToast("Popup blocked — allow popups for this page to open a new tab.");
     }).catch(function (e) { showToast("Failed to reach the server: " + e); });
+  }
+
+  // ===== FIX 2: cap-reached dialog — doc 05, "Cap reached": "killing one immediately opens the
+  // terminal you asked for." Reuses the SAME "manage-terminals" dialog and {terminals, max, onPeek,
+  // onKill, onCloseAll, error} payload contract ☰ Manage terminals already uses below (renderManage-
+  // Terminals derives its own "N of max running — free a slot" header purely from
+  // terminals.length >= max — see that function's own comment — so no separate "atCap" flag needs
+  // threading through here). The one difference: this onKill also closes the dialog and replays
+  // `retry` — the original action the user asked for — once the kill confirms, instead of just
+  // refreshing the list in place.
+  function _openCapDialog(retry) {
+    fetch("/api/term/list").then(j).then(function (res) {
+      if (!res.ok) {
+        ctx.dialog("manage-terminals", {
+          error: (res.j && res.j.error) ||
+            (res.status === 403 ? "in-browser terminal is disabled" :
+             res.status === 404 ? "managing terminals isn't available on this server yet" :
+             "couldn't list the running terminals"),
+        });
+        return;
+      }
+      st.running = (res.j && res.j.terminals) || [];
+      st.maxRunning = res.j && res.j.max;
+      _syncBadge();
+      ctx.dialog("manage-terminals", {
+        terminals: st.running,
+        max: st.maxRunning,
+        onPeek: _peekTerminal,
+        onKill: function (t) {
+          _killTerminal(t).then(function () {
+            if (window.CR.dialogs && typeof window.CR.dialogs.close === "function") window.CR.dialogs.close();
+            if (typeof retry === "function") retry();
+          }).catch(function () { showToast("Failed to kill terminal."); });
+        },
+        onCloseAll: _closeAllTerminals,
+      });
+    }).catch(function (e) {
+      ctx.dialog("manage-terminals", { error: "failed to reach the server: " + e });
+    });
   }
 
   // ===== ☰ Manage terminals — dialog owned by CR.dialogs; this file supplies data + actions ===
@@ -612,9 +696,15 @@
     _syncRendererSeg();
     if (st.engineHandle && typeof st.engineHandle.setRenderer === "function") {
       st.engineHandle.setRenderer(next);
+      _applyDarkTheme(st.engineHandle);   // FIX 1: setRenderer() rebuilds the engine — reapply
     }
     // Doc 05: "Switching TO xterm shows a blank pane until the next write — say so in the UI, do
     // not fake a repaint." Grid, conversely, repaints in full immediately.
+    // NOTE (FIX 5): ideally this clears itself once the pty actually writes fresh output, but the
+    // mountInto handle's callback contract (onStatus/onNotice/onForked — see the seam comment
+    // above _attachEngine) has no "output/activity" signal, only status-text/notice/resolution
+    // events — so there is no way to detect that moment without editing ext_vt.js. It stays
+    // cleared only by _resetPaneChrome() or another manual renderer switch, same as before.
     el.blank.hidden = next !== "xterm";
     _updateFootnote();
   }
@@ -626,8 +716,8 @@
   }
 
   // ===== theme — CR's own Light/Dark, duplicated here per doc 05 (the terminal overlay covers
-  // the top bar). The PTY pane itself never light-themes; see the SEAM NEEDED block for how a
-  // live xterm.js re-theme would reach it once mountInto exists. ===========================
+  // the top bar). The PTY pane itself never light-themes regardless of this toggle — see FIX 1's
+  // _applyDarkTheme above for how the live engine is kept forced-dark via handle.setTheme(). =====
   function _cycleTheme() {
     if (!ctx || !ctx.theme) return;
     var cur = ctx.theme.get ? ctx.theme.get() : "dark";
@@ -669,9 +759,10 @@
       }).catch(function () { showToast("Couldn't reach the server — the switch wasn't sent"); });
   }
 
-  // ===== ⧉ Copy — SEAM NEEDED (see _attachEngine's comment: buffer contents are private to
-  // Terminal/XtermTerminal). Best-effort fallback below copies whatever text is CURRENTLY
-  // selected inside the pane, which is honest today but is not "copy the whole pane". =========
+  // ===== ⧉ Copy — uses the mounted engine's real handle.copyBuffer() (see the seam comment above
+  // _attachEngine) when one is attached. The selection-only fallback below is for the one case
+  // where there is no engine handle at all — the classic-overlay fallback path in _openInline
+  // above, which never returns a handle to this file. ==========================================
   function _copyPane() {
     if (st.engineHandle && typeof st.engineHandle.copyBuffer === "function") {
       Promise.resolve(st.engineHandle.copyBuffer()).then(function (text) {

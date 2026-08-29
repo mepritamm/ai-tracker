@@ -272,7 +272,7 @@ def list_sessions(limit=200):
         # enough for every /api/list poll, unlike a full parse_session() re-read of the jsonl.
         # Sessions that predate the task store (still in-transcript TodoWrite-only) get 0/0/None
         # here: that would need a full transcript parse to recover, which the list path must not do.
-        todo_total, todo_done, todo_current = todo_summary(load_tasks(sid))
+        todo_total, todo_done, todo_current, todo_current_index = todo_summary(load_tasks(sid))
         out.append({
             "id": sid,
             "project": os.path.basename(sm["cwd"]) if sm["cwd"] else os.path.basename(os.path.dirname(f)),
@@ -288,6 +288,7 @@ def list_sessions(limit=200):
             "ended": sm["ended"],                    # last turn was the assistant finishing -> ✅ completed
             "mtime": mt,  # counts background-agent activity too
             "todo_total": todo_total, "todo_done": todo_done, "todo_current": todo_current,
+            "todo_current_index": todo_current_index,
         })
     return out
 

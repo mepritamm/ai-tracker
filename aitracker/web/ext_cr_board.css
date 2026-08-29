@@ -201,7 +201,7 @@
   background: var(--surface-top);
   border-right: 1px solid var(--line-subtle);
   overflow: hidden;
-  transition: width var(--motion-pulse-duration, .24s) ease;
+  transition: width .24s ease; /* collapse/expand, no token (pulse is 2.4s, unrelated) */
 }
 @media (prefers-reduced-motion: reduce) {
   .tracker-next .cr-rail { transition: none; }
@@ -426,9 +426,44 @@
     width: 232px;
     box-shadow: var(--shadow-overlay);
     transform: translateX(-100%);
+    transition: transform .24s ease;
   }
   .tracker-next .cr-rail.cr-rail--overlay-open { transform: translateX(0); }
   .tracker-next .cr-rail--collapsed { width: 232px; } /* an opened overlay is always the full row rail */
+}
+@media (prefers-reduced-motion: reduce) {
+  .tracker-next .cr-rail { transition: none; }
+}
+
+/* Mobile rail scrim — sits behind the overlay-open rail, in front of the
+ * board. No scrim/backdrop token exists in 01-foundations.md, so the fill is
+ * a literal rgba (same precedent as the working-tile pulse keyframes, which
+ * also use a literal rgba where no token covers the need). Only present
+ * below 1024px, i.e. exactly the width band where the rail is an overlay. */
+.tracker-next .cr-rail-scrim {
+  display: none;
+}
+@media (max-width: 1023px) {
+  .tracker-next .cr-rail-scrim {
+    display: block;
+    position: fixed;
+    top: 54px;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 39;
+    background: rgba(0, 0, 0, .35);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .24s ease;
+  }
+  .tracker-next .cr-rail-scrim.cr-rail-scrim--visible {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tracker-next .cr-rail-scrim { transition: none; }
 }
 
 /* ============================================================
@@ -453,8 +488,14 @@
   text-align: left;
   font: inherit;
 }
-.tracker-next .cr-triage-cell:last-of-type { border-right: 0; }
-.tracker-next .cr-triage-cell--active { border-bottom-color: currentColor; }
+/* NOTE: no `:last-of-type` reset here — the histogram cell (`.cr-triage-hist`)
+ * isn't a `.cr-triage-cell` and never had a border-right to begin with, so all
+ * three count cells keep their divider (3 of 3) and the strip still ends
+ * without a trailing border after the histogram. The removed reset used to
+ * strip the divider off the *last* `.cr-triage-cell` (Flagged) instead. */
+.tracker-next .cr-triage-cell--awaiting.cr-triage-cell--active { border-bottom-color: var(--text-awaiting); }
+.tracker-next .cr-triage-cell--working.cr-triage-cell--active { border-bottom-color: var(--text-thinking); }
+.tracker-next .cr-triage-cell--flagged.cr-triage-cell--active { border-bottom-color: var(--state-flagged); }
 .tracker-next .cr-triage-count {
   display: block;
   font: var(--fw-triage-count) var(--fs-triage-count-max)/var(--lh-triage-count) var(--font-serif);
@@ -745,4 +786,26 @@
   font-weight: 600;
   cursor: pointer;
   padding: 0;
+}
+
+/* ============================================================
+   FOCUS RING — 01-foundations.md contrast floor: "Keyboard focus is a 2px
+   solid --line-focus outline with 2px offset, and it must stay visible on
+   every surface the control can sit on." 02-shell-and-board.md calls this
+   out explicitly as "the single most likely regression; test it explicitly."
+   One rule set covers every focusable element this file renders — every
+   real control here is a <button>, an <input>, or a plain div/row given
+   tabindex="0" (board tiles, rail rows/orbs, the agent-group row) — rather
+   than a dozen near-duplicate per-component rules. Using :focus-visible so
+   a mouse click doesn't paint a ring, only keyboard/programmatic focus does.
+   outline (not box-shadow) is used on purpose: it paints outside the box on
+   whatever surface sits behind the element, so it stays legible on every
+   background here, including the awaiting-hero's gradient frame and the
+   agent-active tiles.
+   ============================================================ */
+.tracker-next button:focus-visible,
+.tracker-next input:focus-visible,
+.tracker-next [tabindex]:focus-visible {
+  outline: 2px solid var(--line-focus);
+  outline-offset: 2px;
 }

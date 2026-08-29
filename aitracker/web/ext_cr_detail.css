@@ -214,6 +214,9 @@
   color: var(--text-failed);
 }
 .cr .crd-chip-failing .crd-chip-label { color: var(--text-failed); }
+/* FIX 9b: N/A chips (genuinely can't exist for this session) carry a native tooltip
+   via title="Not Applicable"; cursor:help signals there's more to read on hover. */
+.cr .crd-chip[title="Not Applicable"] { cursor: help; }
 
 .cr .crd-actions {
   flex: 0 0 auto;
@@ -978,6 +981,49 @@
   line-height: 1.6;
   color: var(--text-secondary);
   white-space: pre-wrap;
+}
+.cr .crd-narration-text code { font-family: var(--font-mono); background: var(--surface-sunken); padding: 1px 4px; border-radius: 3px; }
+
+/* FIX 2: the narration timeline's inline diagram card — a prose entry that also
+   contains a fenced mermaid block gets its prefix/suffix text plus the SAME
+   cr-diagram-card/-row/-pill classes ext_cr_dialogs.css already styles for the
+   narration-diagram pop-out (shared `.cr` scope, read not forked). */
+.cr .crd-narration-body { display: flex; flex-direction: column; gap: 8px; min-width: 0; flex: 1 1 auto; }
+.cr .crd-diagram-inline { cursor: pointer; }
+.cr .crd-diagram-inline .cr-diagram-caption { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.cr .crd-diagram-expand { margin-left: auto; flex: 0 0 auto; }
+
+/* FIX 4a: a small status strip pinned above the oldest loaded entry while older
+   narration is being fetched, or if that fetch failed (FIX 6: errorState). */
+.cr .crd-timeline-loading { text-align: center; font-size: 10px; color: var(--text-muted); padding: 4px 0 2px; }
+
+/* FIX 3: the live pinned entry — fixed below the scrolling history (never part of
+   it), so repainting its text every poll can't reflow anything above it. */
+.cr .crd-timeline-live {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 15px 10px;
+  padding: 9px 12px;
+  border: 2px solid var(--line-agent);
+  border-radius: 8px;
+  background: var(--surface-agent-active);
+  box-shadow: var(--glow-agent);
+  font-size: 12.5px;
+}
+.cr .crd-live-badge {
+  flex: 0 0 auto;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  color: var(--text-thinking);
+}
+.cr .crd-live-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
 }
 
 .cr .crd-entry-ask { align-items: flex-start; }

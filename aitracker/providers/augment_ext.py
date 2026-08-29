@@ -176,7 +176,7 @@ def _list(kind, prefix, src_label):
             gid = "%s%s:%s" % (prefix, ws, uu)
             mt = _mtime_of(task, aug_dir) or mt_file
             title = _title_for(task, folder)
-            todo_total, todo_done, todo_current = todo_summary(_todos_from(task, allmap))
+            todo_total, todo_done, todo_current, todo_current_index = todo_summary(_todos_from(task, allmap))
             out.append({
                 "id": gid, "project": os.path.basename(folder) if folder else "Augment", "cwd": folder,
                 "title": titles.get(gid) or title,
@@ -185,6 +185,7 @@ def _list(kind, prefix, src_label):
                 "agent": False, "group": "", "groupLabel": "", "parentId": "", "bg": 0, "first": 0,
                 "waiting": False, "ended": (task.get("state") or "").upper() in ("COMPLETE", "COMPLETED", "DONE"),
                 "todo_total": todo_total, "todo_done": todo_done, "todo_current": todo_current,
+                "todo_current_index": todo_current_index,
             })
     return out
 

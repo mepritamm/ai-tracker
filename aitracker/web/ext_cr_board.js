@@ -185,6 +185,7 @@ window.CR = window.CR || {};
     var root, ctx;
     var els = {};
     var railMode = (localStorage.getItem('tracker.rail') || 'open');   // 'open' | 'collapsed'
+    var railOverlayOpen = false;      // < 1024px only: the rail as a slide-in overlay drawer
     var activeFilter = null;          // 'awaiting' | 'working' | 'flagged' | null
     var searchQuery = '';
     var focusedTileId = null;         // preserved across update() re-renders
@@ -259,6 +260,12 @@ window.CR = window.CR || {};
       root.appendChild(els.rail);
       root.appendChild(els.main);
 
+      // < 1024px only (see the media query in the CSS): a scrim behind the
+      // overlay-open rail, in front of the board. Created once; visibility
+      // is a class toggle, kept in lockstep with cr-rail--overlay-open.
+      els.railScrim = h('div', { class: 'cr-rail-scrim', onclick: closeRailOverlay });
+      root.appendChild(els.railScrim);
+
       buildRailShell();
       buildTopBar();
       buildTriageShell();
@@ -304,9 +311,43 @@ window.CR = window.CR || {};
     }
 
     function toggleRail() {
+      // Below 1024px the rail isn't in-flow (open vs collapsed doesn't apply —
+      // doc 02's breakpoint table has it "hidden; rail becomes an overlay"),
+      // so the same toggle drives the overlay drawer instead.
+      if (window.innerWidth < 1024) {
+        if (railOverlayOpen) closeRailOverlay(); else openRailOverlay();
+        return;
+      }
       railMode = (railMode === 'open') ? 'collapsed' : 'open';
       localStorage.setItem('tracker.rail', railMode);
       applyRailMode();
+    }
+
+    function railOverlayLabels() {
+      var label = railOverlayOpen ? 'Close session rail' : 'Open session rail';
+      [els.railChevron, els.railToggleTop].forEach(function (btn) {
+        if (!btn) return;
+        btn.setAttribute('title', label);
+        btn.setAttribute('aria-label', label);
+      });
+    }
+
+    function openRailOverlay() {
+      railOverlayOpen = true;
+      els.rail.classList.add('cr-rail--overlay-open');
+      if (els.railScrim) els.railScrim.classList.add('cr-rail-scrim--visible');
+      railOverlayLabels();
+    }
+
+    // Closes the mobile overlay drawer. Called on: the toggle (chevron / top-bar
+    // button), the scrim click, Escape (bindKeyboard), selecting a session
+    // (openSession), and a resize back above 1024px (bindResize) — safe to call
+    // when already closed.
+    function closeRailOverlay() {
+      railOverlayOpen = false;
+      els.rail.classList.remove('cr-rail--overlay-open');
+      if (els.railScrim) els.railScrim.classList.remove('cr-rail-scrim--visible');
+      railOverlayLabels();
     }
 
     function applyRailMode() {
@@ -325,7 +366,7 @@ window.CR = window.CR || {};
     function bindResize() {
       window.addEventListener('resize', function () {
         var underlay = window.innerWidth < 1024;
-        if (!underlay) els.rail.classList.remove('cr-rail--overlay-open');
+        if (!underlay) closeRailOverlay();   // resizing back above 1024px cleans up the overlay + scrim
         applyRailMode();
       });
     }
@@ -450,6 +491,7 @@ window.CR = window.CR || {};
     }
 
     function openSession(id) {
+      closeRailOverlay();   // selecting a session closes the mobile overlay drawer, if open
       selectedSessionId = id;
       if (ctx && typeof ctx.go === 'function') ctx.go('detail', id);
     }
@@ -607,13 +649,22 @@ window.CR = window.CR || {};
 
       var hist = activityHistogram(sessions, now);
       els.histBars.innerHTML = '';
+      var n = hist.bins.length;
       hist.bins.forEach(function (v, i) {
-        var isLast3 = i >= hist.bins.length - 3;
+        var isLast3 = i >= n - 3;
+        // NOTE: doc 02 wants THREE tiers — oldest (`--line-subtle`/`--state-idle`),
+        // middle neutral, newest three (wheat + glow on the last bar) — but only
+        // pins exact colours for the oldest tier (the default below) and the
+        // newest three; it gives no cut point for where "middle" starts. Splitting
+        // the remaining bars evenly in half is the sensible reading, not literal
+        // doc text.
+        var isMiddle = !isLast3 && i >= Math.floor((n - 3) / 2);
         var cls = 'cr-hist-bar';
         var h1 = 4 + (hist.peak ? Math.round((v / hist.peak) * 26) : 0);
         var bar = h('span', { class: cls, style: 'height:' + h1 + 'px' });
         if (isLast3) bar.style.background = 'var(--state-thinking)';
-        if (i === hist.bins.length - 1) bar.classList.add('is-glow');
+        else if (isMiddle) bar.style.background = 'var(--line-default)';
+        if (i === n - 1) bar.classList.add('is-glow');
         els.histBars.appendChild(bar);
       });
       els.histBars.setAttribute('aria-label', 'Activity, last hour: peak ' + hist.peak + ' events per minute');
@@ -678,19 +729,33 @@ window.CR = window.CR || {};
     }
 
     function todoTicks(s) {
-      // REQUIRED ADDITION: the list-endpoint dict carries no per-session todo
-      // summary (todos live only in the parsed detail dict, which this
-      // module never fetches). Rendered only if a future list endpoint adds
-      // a lightweight summary — e.g. `todo_done` / `todo_total` — matching
-      // these optional field names; otherwise this block is skipped
-      // entirely rather than guessing at shape.
+      // todo_total/todo_done/todo_current (the in-progress todo's TEXT) are
+      // emitted by every provider's list() today — verified: providers/claude.py
+      // (list_sessions()), providers/auggie.py (list_auggie()), providers/
+      // augment_ext.py all call the same util.todo_summary(). todo_current_index
+      // (0-based INT, or null when nothing is in progress) is that same
+      // function's newest return value — the shared-seam field this fix
+      // consumes for the current-tick highlight. Guarded below so a provider
+      // that ever lacks it (or genuinely has nothing in progress) just renders
+      // with no tick highlighted, never a crash.
       if (typeof s.todo_total !== 'number' || !s.todo_total) return null;
-      var done = s.todo_done || 0, total = s.todo_total, current = s.todo_current_index;
-      var ticks = h('div', { class: 'cr-tile-ticks', role: 'img', 'aria-label': done + ' of ' + total + ' todos done' });
+      var done = s.todo_done || 0, total = s.todo_total;
+      var currentIndex = (typeof s.todo_current_index === 'number') ? s.todo_current_index : null;
+      var currentLabel = s.todo_current || '';
+      var ticks = h('div', {
+        class: 'cr-tile-ticks', role: 'img',
+        'aria-label': done + ' of ' + total + ' todos done',
+        // NOTE: doc 02's todo-ticks section only specifies this count aria-label
+        // ("7 of 11 todos done"); it never asks for the in-progress todo's own
+        // text in the tile anatomy. Surfaced as a plain tooltip instead — it
+        // doesn't touch the mandated aria-label, but the label text is free and
+        // otherwise just gets dropped on the floor.
+        title: currentLabel ? ('In progress: ' + currentLabel) : null
+      });
       for (var i = 0; i < total; i++) {
         var cls = 'cr-tick';
         if (i < done) cls += ' cr-tick--done';
-        else if (i === current) cls += ' cr-tick--current';
+        else if (currentIndex !== null && i === currentIndex) cls += ' cr-tick--current';
         ticks.appendChild(h('span', { class: cls }));
       }
       return h('div', { class: 'cr-tile-todos' }, [ticks,
@@ -709,7 +774,15 @@ window.CR = window.CR || {};
         var dot = h('span', { class: 'cr-tile-dot is-working' });
         head.insertBefore(dot, head.firstChild);
       }
-      head.appendChild(h('span', { class: 'cr-tile-meta' }, [ago(now - (s.mtime || 0)) + ' · ' + toolLabel(s.source)]));
+      // NOTE: 01-foundations.md's state vocabulary bakes the age straight into the
+      // "Waiting on you · <age>" word itself; 02's generic tile-anatomy trailing
+      // "[age · tool]" would then repeat it for awaiting tiles specifically (the
+      // bug this fixed — age was printed twice). The explicit per-state word text
+      // wins: trailing meta drops the age for awaiting tiles and shows tool only,
+      // every other state keeps the full "age · tool".
+      var trailing = (state === 'awaiting') ? toolLabel(s.source)
+        : (ago(now - (s.mtime || 0)) + ' · ' + toolLabel(s.source));
+      head.appendChild(h('span', { class: 'cr-tile-meta' }, [trailing]));
       return head;
     }
 
@@ -717,10 +790,20 @@ window.CR = window.CR || {};
       if (state === 'flagged') {
         return h('div', { class: 'cr-tile-line' }, [(s.open_flags || 0) + ' flag' + (s.open_flags === 1 ? '' : 's') + ' open']);
       }
-      // NOTE: no live-narration line or run summary exists in the list dict
-      // (only `prompt`, the session's opening ask). Used as the best
-      // available stand-in for "the summary" the doc calls for; a truer
-      // implementation needs a REQUIRED ADDITION — see report.
+      // NOTE: doc 02's Landed row also wants a "PR number if any" (`.cr-tile-pr`
+      // is styled in ext_cr_board.css but deliberately never instantiated here) —
+      // verified against registry.all_sessions() and every provider's list()
+      // (providers/claude.py's list_sessions(), providers/auggie.py's
+      // list_auggie(), providers/augment_ext.py): none of them put a PR field on
+      // the session-LIST dict. PR discovery (collect_prs/pr_create_ids/
+      // note_pr_states) only runs inside claude.py's per-session PARSE/detail
+      // path, and this module fetches nothing beyond {sessions, now}. Left
+      // unrendered rather than inventing a field or adding a fetch; the CSS rule
+      // stands as documentation of the still-open gap.
+      //
+      // No live-narration line or run summary exists in the list dict either
+      // (only `prompt`, the session's opening ask) — used as the best available
+      // stand-in for "the summary" the doc calls for.
       return h('div', { class: 'cr-tile-line' }, [s.prompt || '']);
     }
 
@@ -821,6 +904,7 @@ window.CR = window.CR || {};
           return;
         }
         if (e.key === 'Escape') {
+          if (railOverlayOpen) { closeRailOverlay(); return; }
           if (activeFilter) { setFilter(activeFilter); }
           return;
         }
