@@ -354,7 +354,14 @@ window.CR = window.CR || {};
   function createBoard() {
     var root, ctx;
     var els = {};
-    var railMode = (localStorage.getItem('tracker.rail') || 'open');   // 'open' | 'collapsed'
+    // 'auto' | 'open' | 'collapsed'. 'auto' (the default) defers to the
+    // view/breakpoint rules in applyRailMode(); 'open'/'collapsed' are an
+    // EXPLICIT user toggle and beat those rules. Before this tri-state the
+    // mode was only 'open'|'collapsed' and applyRailMode() OR-ed the forced
+    // conditions on top, so a click in the detail view (or on the board at
+    // 1025-1279px) was written to localStorage and then silently discarded --
+    // a visible button, correctly labelled, that did nothing.
+    var railMode = (localStorage.getItem('tracker.rail') || 'auto');
     var railOverlayOpen = false;      // < 1024px only: the rail as a slide-in overlay drawer
     var activeFilter = null;          // 'awaiting' | 'working' | 'flagged' | null
     var searchQuery = '';
@@ -633,7 +640,11 @@ window.CR = window.CR || {};
         if (railOverlayOpen) closeRailOverlay(); else openRailOverlay();
         return;
       }
-      railMode = (railMode === 'open') ? 'collapsed' : 'open';
+      // Flip against what is ACTUALLY on screen, not against the stored mode:
+      // under 'auto' the two disagree (detail view and the 1025-1279px tier are
+      // collapsed while railMode still reads 'auto'/'open'), and flipping the
+      // stored value there produced a no-op first click.
+      railMode = els.rail.classList.contains('cr-rail--collapsed') ? 'open' : 'collapsed';
       localStorage.setItem('tracker.rail', railMode);
       applyRailMode();
     }
@@ -667,11 +678,11 @@ window.CR = window.CR || {};
 
     function applyRailMode() {
       // Doc 03 "The collapsed orb rail" / README decision 1: in the detail view
-      // the rail is ALWAYS the collapsed 56px orb rail, regardless of the
-      // board's own open/collapsed preference or breakpoint. `.cr-rail--detail`
-      // (56px, see ext_cr_board.css) wins over `.cr-rail--collapsed` (48px, doc
-      // 02's rail table — the board's own collapse-toggle width, left as-is)
-      // wherever both classes are present.
+      // the rail defaults to the collapsed 56px orb rail (under 'auto' mode);
+      // explicit toggles override it, regardless of the board's own
+      // open/collapsed preference or breakpoint. `.cr-rail--detail` (56px, see
+      // ext_cr_board.css) wins over `.cr-rail--collapsed` (48px, doc 02's rail
+      // table — the board's own collapse-toggle width, left as-is) where both.
       var isDetail = (currentView === 'detail');
       // Requirement 2: no last-opened/active session -> the Sessions tab shows
       // the browse list and the rail is hidden outright (not merely collapsed
@@ -684,9 +695,14 @@ window.CR = window.CR || {};
       // "collapsed icon rail" tier (1025-1279) never overlaps the <=1024
       // rail-overlay tier above — 1024 itself is now overlay-only, agreeing
       // with the CSS's `max-width: 1024px` boundary.
-      var collapsed = isDetail || (railMode === 'collapsed') || (window.innerWidth < 1280 && window.innerWidth >= 1025);
+      // The detail view and the 1025-1279px tier collapse the rail BY DEFAULT,
+      // but an explicit toggle overrides them -- otherwise the control is dead.
+      var autoCollapsed = isDetail || (window.innerWidth < 1280 && window.innerWidth >= 1025);
+      var collapsed = (railMode === 'auto') ? autoCollapsed : (railMode === 'collapsed');
       els.rail.classList.toggle('cr-rail--collapsed', collapsed);
-      els.rail.classList.toggle('cr-rail--detail', isDetail);
+      // 56px orb styling is the COLLAPSED detail rail; once the user expands it
+      // explicitly the full 232px row rail must win, so --detail comes off too.
+      els.rail.classList.toggle('cr-rail--detail', isDetail && collapsed);
       var label = collapsed ? 'Expand session rail' : 'Collapse session rail';
       els.railChevron.setAttribute('title', label);
       els.railChevron.setAttribute('aria-label', label);

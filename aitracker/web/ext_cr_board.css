@@ -368,10 +368,11 @@
 }
 .tracker-next .cr-rail--collapsed { width: 48px; }
 /* Doc 03 "The collapsed orb rail" / README decision 1: the detail view's rail
- * is ALWAYS 56px, distinct from the board's own 48px collapse-toggle width
- * (doc 02's rail table, left unchanged above). `.cr-rail--detail` is applied
- * alongside `.cr-rail--collapsed` (see applyRailMode() in ext_cr_board.js) and
- * wins over it here by appearing later in the source, same specificity. */
+ * defaults to 56px when collapsed (the default under 'auto'), distinct from
+ * the board's own 48px collapse-toggle width (doc 02's rail table, left
+ * unchanged above). `.cr-rail--detail` is applied only alongside
+ * `.cr-rail--collapsed` (see applyRailMode() in ext_cr_board.js) and wins
+ * over it here by appearing later in the source, same specificity. */
 .tracker-next .cr-rail--detail { width: 56px; }
 /* Requirement 2 — the Sessions destination's no-seed browse state hides the
  * rail outright (not the 48/56px collapsed strip — genuinely absent), so the
@@ -1175,10 +1176,11 @@
      row's internal type scale. 34px -> 44px. */
   .tracker-next .cr-rail-row { min-height: 44px; }
 
-  /* Collapsed orb rail (always in effect for the detail view's 56px rail,
-     `.cr-rail--detail`, regardless of breakpoint — decision 1 has no mobile
-     exception): explicit 28x28. Grown to 44x44; the 56px-wide detail rail
-     column has room (56 - 44 = 12px, 6px each side). 28px -> 44px. */
+  /* Collapsed orb rail (defaults to in effect for the detail view's 56px rail,
+     `.cr-rail--detail` under 'auto'; explicit toggles override, regardless of
+     breakpoint — decision 1 has no mobile exception): explicit 28x28. Grown to
+     44x44; the 56px-wide detail rail column has room (56 - 44 = 12px, 6px
+     each side). 28px -> 44px. */
   .tracker-next .cr-orb { width: 44px; height: 44px; }
 
   /* Sessions page-size select: padding 5px6 + font 12px/1.25 (15px line) +

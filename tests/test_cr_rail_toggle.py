@@ -1,0 +1,643 @@
+"""Regression tests for: the "Expand session rail" toggle was a no-op in the
+detail view / 1025-1279px board tier (aitracker/web/ext_cr_board.js).
+
+THE BUG: applyRailMode() computed
+
+    var collapsed = isDetail || (railMode === 'collapsed') ||
+                     (innerWidth < 1280 && innerWidth >= 1025);
+
+so the FORCED conditions (detail view; the 1025-1279px board tier) OR-ed over
+the user's stored `railMode`. Clicking "Expand session rail" wrote
+localStorage['tracker.rail'] and called applyRailMode(), which immediately
+re-forced collapsed=true — a visible button, correctly labelled, that did
+nothing.
+
+THE FIX pinned here (read from the real shipped source, not retyped by hand —
+see _extract_function() below):
+  - `railMode` is tri-state 'auto' | 'open' | 'collapsed', DEFAULT 'auto'
+    (was 'open').
+  - applyRailMode() only applies the forced conditions when railMode==='auto';
+    an explicit 'open'/'collapsed' choice always wins over them.
+  - toggleRail() derives the next mode from what's actually RENDERED
+    (the `cr-rail--collapsed` class), not from the previous stored value —
+    under 'auto' those two could disagree, and flipping the stored value
+    produced a dead first click.
+  - `cr-rail--detail` (the 56px orb styling) is now gated on `collapsed` too,
+    so an explicitly expanded detail rail gets the full 232px row rail
+    instead of staying stuck in orb mode.
+
+IDIOM: same "assemble the real page, pull the bundle out of its <script> tag"
+idiom as test_cr_logic.py (aitracker.page.build_page()). That file then runs
+the WHOLE bundle under a full stub DOM to reach window.CR.board's EXPORTED
+pure functions — but applyRailMode()/toggleRail() are internal closures over
+`els`/`railMode`/`currentView` inside createBoard(), never exported, and that
+file's own DOM stub gives every element a no-op classList (add/remove/toggle
+do nothing, contains() always returns false) — fine for pure functions, but
+it would make every assertion here vacuously pass regardless of the fix.
+
+So instead: brace-match the exact `function applyRailMode() {...}` /
+`function toggleRail() {...}` text out of the REAL bundle (never a hand-copied
+paraphrase — if the source drifts, extraction fails loudly rather than
+silently testing stale text), and execute each inside a tiny harness that
+supplies just its free variables (`els`, `railMode`, `currentView`,
+`window.innerWidth`, `localStorage`, …), with a real Set-backed classList so
+class add/remove/toggle/contains are actually observable.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_TESTS_DIR)
+_HAS_NODE = shutil.which("node") is not None
+
+sys.path.insert(0, _ROOT)
+
+
+def _read_page():
+    from aitracker import page
+    return page.build_page()
+
+
+def _extract_script_content(html):
+    script_pattern = re.compile(r'<script[^>]*>(.*?)</script>', re.DOTALL)
+    matches = list(script_pattern.finditer(html))
+    if not matches:
+        raise ValueError("No <script> tag found in assembled page")
+    return matches[-1].group(1)
+
+
+def _extract_function(source, name):
+    """Brace-matches the exact `function NAME(...) { ... }` text out of the
+    real bundle. Raises loudly (never returns a guess) if the shape has moved,
+    so this test fails honestly instead of silently exercising stale text."""
+    m = re.search(r'function\s+' + re.escape(name) + r'\s*\([^)]*\)\s*\{', source)
+    if not m:
+        raise AssertionError("function %s() not found in the real bundle" % name)
+    brace_start = source.index('{', m.start())
+    depth = 0
+    for i in range(brace_start, len(source)):
+        c = source[i]
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return source[m.start():i + 1]
+    raise AssertionError("unterminated function %s() (brace mismatch)" % name)
+
+
+def _extract_statement(source, var_name):
+    """Grabs a single `var NAME = ...;` statement verbatim (no nested braces
+    expected), e.g. railMode's own default-value line."""
+    m = re.search(r'var\s+' + re.escape(var_name) + r'\s*=\s*[^\n;]+;', source)
+    if not m:
+        raise AssertionError("`var %s = ...;` not found in the real bundle" % var_name)
+    return m.group(0)
+
+
+def _extract_call(source, marker):
+    """Grabs a full `marker(...)` call expression verbatim, paren-matched from
+    the marker's own opening `(` through its balanced close. Unlike
+    _extract_function() this isn't a function *definition* -- it's used to
+    pull the "Session rail" `cfgRow('Session rail', ..., segmented(...))` call
+    site out of renderConfig(), matched the same honest way: if the call moves
+    or its shape changes so the marker text no longer appears verbatim, this
+    raises loudly instead of silently checking stale text."""
+    idx = source.find(marker)
+    if idx < 0:
+        raise AssertionError("%r not found in the real bundle" % (marker,))
+    paren_start = source.index('(', idx)
+    depth = 0
+    for i in range(paren_start, len(source)):
+        c = source[i]
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0:
+                return source[idx:i + 1]
+    raise AssertionError("unterminated call for marker %r (paren mismatch)" % (marker,))
+
+
+# ---------------------------------------------------------------------------
+# rail-mode VOCABULARY extraction -- used by the drift guard between
+# ext_cr_dialogs.js (readRailPref/writeRailPref) and ext_cr_board.js
+# (applyRailMode/toggleRail/the module-level default). See
+# TestRailPrefConfigRowAndVocabulary.test_rail_mode_vocabulary_agrees_across_both_files
+# below for what this is protecting against.
+# ---------------------------------------------------------------------------
+
+_MODE_LITERAL_RE = re.compile(r"'([a-z]+)'")
+
+# Exactly one documented exclusion: writeRailPref's `_ctx.emit(...)` line
+# happens to share its source line with `typeof _ctx.emit === 'function'`
+# (a capability check, not a rail-mode value) -- the ONLY lowercase
+# single-quoted word on any line that mentions the mode variable/parameter
+# that isn't actually a rail mode. If a real 'function'-named mode is ever
+# introduced this will need revisiting, but that's not a real mode name.
+_NON_MODE_WORDS = frozenset({'function'})
+
+
+def _mode_literals_on_lines_mentioning(source, var_name):
+    """Collects lowercase single-quoted string literals ('auto', 'open',
+    'collapsed', ...) that appear on the same source line as `var_name` -- the
+    actual local variable/parameter each function threads the rail-mode value
+    through ('v' in readRailPref, 'mode' in writeRailPref, 'railMode' in
+    applyRailMode/toggleRail/the module-level default statement). Line-scoped
+    and anchored to that name rather than a blanket scan of the whole function
+    text, so CSS/view-name literals elsewhere in the same function body
+    ('cr-rail--collapsed', 'detail', 'sessions') are never mistaken for a rail
+    mode just because they happen to live in the same function."""
+    anchor = re.compile(r'\b' + re.escape(var_name) + r'\b')
+    out = set()
+    for line in source.splitlines():
+        if anchor.search(line):
+            out |= set(_MODE_LITERAL_RE.findall(line))
+    return out - _NON_MODE_WORDS
+
+
+def _run_node(js_source, timeout=30):
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "harness.js")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(js_source)
+        proc = subprocess.run(["node", path], capture_output=True, text=True, timeout=timeout)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _extract_json(stdout):
+    marker = "===RAIL_TOGGLE_JSON_START==="
+    idx = stdout.find(marker)
+    if idx < 0:
+        raise ValueError("marker not found in node output:\n" + stdout)
+    return json.loads(stdout[idx + len(marker):].strip())
+
+
+# A real, honest classList backed by a Set -- deliberately NOT the no-op stub
+# test_cr_logic.py uses for its full-bundle-under-stub-DOM runs (fine there,
+# since that file never inspects class state; it would be a silent false-pass
+# here, since every assertion below is exactly about class state).
+_CLASSLIST_STUB = r"""
+function makeClassList() {
+  var set = new Set();
+  return {
+    add: function (c) { set.add(c); },
+    remove: function (c) { set.delete(c); },
+    toggle: function (c, force) {
+      if (force === undefined) force = !set.has(c);
+      if (force) set.add(c); else set.delete(c);
+      return force;
+    },
+    contains: function (c) { return set.has(c); },
+  };
+}
+"""
+
+
+def _apply_rail_mode_case_js(case_id, apply_rail_mode_src, rail_mode, current_view, inner_width):
+    return r"""
+OUT["%s"] = (function () {
+  var railMode = %s;
+  var currentView = %s;
+  var window = { innerWidth: %d };
+  var lastState = { sessions: [], now: 0 };
+  function renderRail() {}
+  var els = {
+    rail: { classList: makeClassList() },
+    railChevron: { setAttribute: function () {} },
+    railToggleTop: null,
+  };
+  %s
+  applyRailMode();
+  return {
+    collapsed: els.rail.classList.contains('cr-rail--collapsed'),
+    detail: els.rail.classList.contains('cr-rail--detail'),
+    hidden: els.rail.classList.contains('cr-rail--hidden'),
+  };
+})();
+""" % (case_id, json.dumps(rail_mode), json.dumps(current_view), inner_width, apply_rail_mode_src)
+
+
+def _toggle_rail_case_js(case_id, toggle_rail_src, apply_rail_mode_src,
+                          rail_mode, current_view, inner_width, rendered_collapsed):
+    return r"""
+OUT["%s"] = (function () {
+  var railMode = %s;
+  var currentView = %s;
+  var window = { innerWidth: %d };
+  var railOverlayOpen = false;
+  var lastState = { sessions: [], now: 0 };
+  var localStorageStore = {};
+  var localStorage = {
+    getItem: function (k) { return (k in localStorageStore) ? localStorageStore[k] : null; },
+    setItem: function (k, v) { localStorageStore[k] = v; },
+  };
+  function renderRail() {}
+  function closeRailOverlay() {}
+  function openRailOverlay() {}
+  var els = {
+    rail: { classList: makeClassList() },
+    railChevron: { setAttribute: function () {} },
+    railToggleTop: null,
+  };
+  if (%s) els.rail.classList.add('cr-rail--collapsed');
+  %s
+  %s
+  toggleRail();
+  return {
+    railModeAfter: railMode,
+    storedAfter: localStorageStore['tracker.rail'] || null,
+    collapsedAfter: els.rail.classList.contains('cr-rail--collapsed'),
+  };
+})();
+""" % (case_id, json.dumps(rail_mode), json.dumps(current_view), inner_width,
+       json.dumps(bool(rendered_collapsed)), toggle_rail_src, apply_rail_mode_src)
+
+
+def _default_rail_mode_case_js():
+    # Confirms the DEFAULT-VALUE expression itself, executed for real (not
+    # regexed for the string 'auto') against a localStorage that has never
+    # seen 'tracker.rail' -- the exact state of a first-ever page load.
+    return r"""
+OUT["default_railmode_is_auto"] = (function () {
+  var localStorage = { getItem: function () { return null; } };
+  %s
+  return railMode;
+})();
+"""
+
+
+def _full_driver_js():
+    html = _read_page()
+    bundle = _extract_script_content(html)
+    apply_rail_mode_src = _extract_function(bundle, "applyRailMode")
+    toggle_rail_src = _extract_function(bundle, "toggleRail")
+    default_railmode_stmt = _extract_statement(bundle, "railMode")
+
+    parts = [_CLASSLIST_STUB, "var OUT = {};"]
+
+    # (a) explicit 'open' beats the FORCED conditions (isDetail; the
+    #     1025-1279px tier) that used to be OR-ed in unconditionally.
+    parts.append(_apply_rail_mode_case_js(
+        "explicit_open_beats_detail_force", apply_rail_mode_src,
+        rail_mode="open", current_view="detail", inner_width=1600))
+    parts.append(_apply_rail_mode_case_js(
+        "explicit_open_beats_tier_force", apply_rail_mode_src,
+        rail_mode="open", current_view="board", inner_width=1100))
+    # explicit 'collapsed' still collapses outside any forced tier/view too.
+    parts.append(_apply_rail_mode_case_js(
+        "explicit_collapsed_applies_outside_forced_zone", apply_rail_mode_src,
+        rail_mode="collapsed", current_view="board", inner_width=1600))
+
+    # (b) tri-state default: 'auto' defers to the forced conditions (unlike
+    #     the old default 'open', which -- per (a) above -- no longer does).
+    parts.append(_default_rail_mode_case_js() % default_railmode_stmt)
+    parts.append(_apply_rail_mode_case_js(
+        "auto_mode_still_follows_detail_force", apply_rail_mode_src,
+        rail_mode="auto", current_view="detail", inner_width=1600))
+    parts.append(_apply_rail_mode_case_js(
+        "auto_mode_still_follows_tier_force", apply_rail_mode_src,
+        rail_mode="auto", current_view="board", inner_width=1100))
+
+    # (c) toggleRail derives the next mode from the RENDERED class, not the
+    #     previous stored value -- seed `railMode` with a value unrelated to
+    #     either outcome so a same-as-before pass can't hide a wrong wiring.
+    parts.append(_toggle_rail_case_js(
+        "toggle_from_rendered_collapsed_to_open", toggle_rail_src, apply_rail_mode_src,
+        rail_mode="not-a-real-mode-1", current_view="board", inner_width=1600,
+        rendered_collapsed=True))
+    parts.append(_toggle_rail_case_js(
+        "toggle_from_rendered_open_to_collapsed", toggle_rail_src, apply_rail_mode_src,
+        rail_mode="not-a-real-mode-2", current_view="board", inner_width=1600,
+        rendered_collapsed=False))
+
+    # (d) cr-rail--detail is gated on `collapsed`: forced-collapsed detail
+    #     gets the 56px orb; an explicitly EXPANDED detail rail must not.
+    parts.append(_apply_rail_mode_case_js(
+        "detail_class_present_when_detail_collapsed", apply_rail_mode_src,
+        rail_mode="collapsed", current_view="detail", inner_width=1600))
+    parts.append(_apply_rail_mode_case_js(
+        "detail_class_absent_when_detail_explicitly_expanded", apply_rail_mode_src,
+        rail_mode="open", current_view="detail", inner_width=1600))
+
+    parts.append(r"""
+console.log("===RAIL_TOGGLE_JSON_START===");
+console.log(JSON.stringify(OUT));
+""")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# readRailPref() / writeRailPref() (ext_cr_dialogs.js) -- the Config dialog's
+# "Session rail" row reads/writes through these, and they must agree with
+# ext_cr_board.js's own railMode vocabulary (tri-state 'auto' | 'open' |
+# 'collapsed', default/fallback 'auto'). Same brace-matched-real-source idiom
+# as _full_driver_js() above; no classList stub needed since neither function
+# touches the DOM.
+# ---------------------------------------------------------------------------
+
+def _read_rail_pref_case_js(case_id, read_rail_pref_src, stored_value):
+    """stored_value=None simulates a 'tracker.rail' key that was never written
+    (localStorage.getItem returns null) -- a first-ever page load. Any other
+    value simulates that exact string already being stored."""
+    getitem_body = "return null;" if stored_value is None else ("return %s;" % json.dumps(stored_value))
+    return r"""
+OUT["%s"] = (function () {
+  var localStorage = { getItem: function (k) { %s } };
+  %s
+  return readRailPref();
+})();
+""" % (case_id, getitem_body, read_rail_pref_src)
+
+
+def _write_rail_pref_case_js(case_id, write_rail_pref_src, mode_to_write):
+    return r"""
+OUT["%s"] = (function () {
+  var _ctx = null; // writeRailPref optionally emits via _ctx.emit(...); harmless no-op here
+  var store = {};
+  var localStorage = {
+    setItem: function (k, v) { store[k] = v; },
+    getItem: function (k) { return (k in store) ? store[k] : null; },
+  };
+  %s
+  writeRailPref(%s);
+  return (store['tracker.rail'] !== undefined) ? store['tracker.rail'] : null;
+})();
+""" % (case_id, write_rail_pref_src, json.dumps(mode_to_write))
+
+
+def _rail_pref_driver_js():
+    html = _read_page()
+    bundle = _extract_script_content(html)
+    read_rail_pref_src = _extract_function(bundle, "readRailPref")
+    write_rail_pref_src = _extract_function(bundle, "writeRailPref")
+
+    parts = ["var OUT = {};"]
+
+    # (1) a first-ever page load: 'tracker.rail' was never written.
+    parts.append(_read_rail_pref_case_js("read_default_is_auto", read_rail_pref_src, None))
+
+    # (2) round-trips each of the three real modes.
+    for mode in ("auto", "open", "collapsed"):
+        parts.append(_read_rail_pref_case_js("read_roundtrip_%s" % mode, read_rail_pref_src, mode))
+
+    # (3) an unrecognised/garbage stored value falls back to 'auto'.
+    parts.append(_read_rail_pref_case_js(
+        "read_garbage_falls_back_to_auto", read_rail_pref_src, "not-a-real-mode"))
+
+    # (4) writeRailPref persists all three real modes, and coerces garbage to 'auto'.
+    for mode in ("auto", "open", "collapsed"):
+        parts.append(_write_rail_pref_case_js("write_persists_%s" % mode, write_rail_pref_src, mode))
+    parts.append(_write_rail_pref_case_js(
+        "write_garbage_coerces_to_auto", write_rail_pref_src, "not-a-real-mode"))
+
+    parts.append(r"""
+console.log("===RAIL_TOGGLE_JSON_START===");
+console.log(JSON.stringify(OUT));
+""")
+    return "\n".join(parts)
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestRailPrefTriState(unittest.TestCase):
+    """Pins readRailPref()/writeRailPref() (ext_cr_dialogs.js, the Config
+    dialog's "Session rail" row) against the REAL shipped source.
+
+    THE BUG these pin: ext_cr_dialogs.js used to be two-state
+    ('open' | 'collapsed', default 'open'), which (a) made the Config dialog
+    MISREPORT the state for a user who had never touched the rail -- it read
+    back 'open' when the board's own real default is 'auto' -- and (b) meant
+    that once anyone touched the Config row, writeRailPref() coerced anything
+    unrecognised to 'open', SILENTLY AND PERMANENTLY destroying the board's
+    'auto' default: after one write through the row, 'auto' could never be
+    reached again, because the row's own vocabulary had no way to write it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        js = _rail_pref_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Rail-pref harness failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_json(stdout)
+
+    def test_read_rail_pref_default_is_auto_not_open(self):
+        """A first-ever page load (localStorage has never seen 'tracker.rail')
+        must report 'auto' -- the board's real default -- not 'open', the
+        pre-fix two-state default that misreported this exact case in Config."""
+        self.assertEqual(self.OUT["read_default_is_auto"], "auto")
+
+    def test_read_rail_pref_round_trips_all_three_modes(self):
+        for mode in ("auto", "open", "collapsed"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.OUT["read_roundtrip_%s" % mode], mode)
+
+    def test_read_rail_pref_falls_back_to_auto_for_garbage(self):
+        """An unrecognised stored value must fall back to 'auto', matching the
+        board's own default -- never silently to 'open'."""
+        self.assertEqual(self.OUT["read_garbage_falls_back_to_auto"], "auto")
+
+    def test_write_rail_pref_persists_all_three_modes(self):
+        for mode in ("auto", "open", "collapsed"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.OUT["write_persists_%s" % mode], mode)
+
+    def test_write_rail_pref_coerces_garbage_to_auto_not_open(self):
+        """THE BUG, precisely: writeRailPref() must coerce an unrecognised mode
+        to 'auto', not 'open'. The pre-fix two-state coercion
+        (`mode = (mode === 'collapsed') ? 'collapsed' : 'open'`) meant ANY
+        write through the Config row destroyed 'auto' permanently -- there was
+        no longer any value the row could write that got the user back to it."""
+        self.assertEqual(self.OUT["write_garbage_coerces_to_auto"], "auto")
+
+
+class TestRailPrefConfigRowAndVocabulary(unittest.TestCase):
+    """Static structural pins on the Config dialog's "Session rail" row and on
+    the rail-mode vocabulary shared between ext_cr_dialogs.js and
+    ext_cr_board.js. No JS execution needed -- same brace/paren-matched
+    real-source extraction as the rest of this file, asserted on directly.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        html = _read_page()
+        bundle = _extract_script_content(html)
+        cls.session_rail_row_src = _extract_call(bundle, "cfgRow('Session rail'")
+        cls.read_rail_pref_src = _extract_function(bundle, "readRailPref")
+        cls.write_rail_pref_src = _extract_function(bundle, "writeRailPref")
+        cls.apply_rail_mode_src = _extract_function(bundle, "applyRailMode")
+        cls.toggle_rail_src = _extract_function(bundle, "toggleRail")
+        cls.default_railmode_stmt = _extract_statement(bundle, "railMode")
+
+    def test_config_session_rail_row_offers_all_three_options(self):
+        """THE BUG's other half: the Config dialog's "Session rail" row used to
+        be wired to a two-state toggleCtl (Open/Collapsed only, via a boolean),
+        with no way to pick 'auto' at all -- so a user could never get back to
+        the board's real default once they'd looked at Config. Pins that the
+        shipped row is wired to the tri-state `segmented` control carrying
+        auto/open/collapsed, not toggleCtl."""
+        row = self.session_rail_row_src
+        self.assertIn(
+            "segmented(", row,
+            "the 'Session rail' Config row is no longer wired to segmented() -- "
+            "if it's back on toggleCtl(), 'auto' has no UI path again")
+        self.assertNotIn(
+            "toggleCtl(", row,
+            "the 'Session rail' row reverted to the two-state toggleCtl() control")
+        for label in ("'auto'", "'open'", "'collapsed'"):
+            self.assertIn(
+                label, row,
+                "the 'Session rail' row's segmented control is missing the %s option" % label)
+
+    def test_rail_mode_vocabulary_agrees_across_both_files(self):
+        """DRIFT GUARD: ext_cr_dialogs.js (readRailPref/writeRailPref) and
+        ext_cr_board.js (applyRailMode/toggleRail/the module-level default)
+        must recognise EXACTLY the same set of rail-mode strings.
+
+        THE BUG was precisely this disagreement: ext_cr_dialogs.js's
+        vocabulary used to be {'open', 'collapsed'} while ext_cr_board.js's was
+        {'auto', 'open', 'collapsed'} -- 'auto' had no representation on the
+        Config side at all. If a future change adds a fourth mode to only one
+        file, or reverts either side back to two-state, the two extracted sets
+        stop matching and this fails with both sets printed, naming exactly
+        which file is missing what.
+        """
+        dialogs_modes = (
+            _mode_literals_on_lines_mentioning(self.read_rail_pref_src, "v")
+            | _mode_literals_on_lines_mentioning(self.write_rail_pref_src, "mode")
+        )
+        board_modes = _mode_literals_on_lines_mentioning(
+            self.apply_rail_mode_src + "\n" + self.toggle_rail_src + "\n" + self.default_railmode_stmt,
+            "railMode",
+        )
+        self.assertTrue(
+            dialogs_modes,
+            "extraction found no rail-mode literals in readRailPref()/writeRailPref() "
+            "at all -- the extraction technique likely needs updating for a source shape change")
+        self.assertTrue(
+            board_modes,
+            "extraction found no rail-mode literals in applyRailMode()/toggleRail()/the "
+            "default statement at all -- the extraction technique likely needs updating "
+            "for a source shape change")
+        self.assertEqual(
+            dialogs_modes, board_modes,
+            "ext_cr_dialogs.js (readRailPref/writeRailPref) and ext_cr_board.js "
+            "(applyRailMode/toggleRail/the default) disagree on the rail-mode "
+            "vocabulary:\n"
+            "  ext_cr_dialogs.js accepts:    %r\n"
+            "  ext_cr_board.js understands:  %r\n"
+            "This is the exact shape of the original bug (dialogs.js two-state, "
+            "board.js tri-state) -- both files must always recognise the "
+            "identical set of modes."
+            % (sorted(dialogs_modes), sorted(board_modes))
+        )
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestRailToggleNotADeadControl(unittest.TestCase):
+    """Pins applyRailMode()/toggleRail() behaviour against the REAL, currently
+    shipped source (brace-matched out of the assembled page's bundle), not a
+    hand-retyped paraphrase of it."""
+
+    @classmethod
+    def setUpClass(cls):
+        js = _full_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Rail-toggle harness failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_json(stdout)
+
+    # -- (a) explicit railMode beats the old unconditional OR of isDetail / tier --
+
+    def test_explicit_open_beats_detail_view_force(self):
+        """The bug, precisely: in the detail view, an explicit 'open' choice
+        must render EXPANDED. Under the old `collapsed = isDetail || ...`
+        formula this was unconditionally True regardless of railMode -- the
+        exact reason the toggle did nothing in the detail view."""
+        r = self.OUT["explicit_open_beats_detail_force"]
+        self.assertFalse(r["collapsed"])
+
+    def test_explicit_open_beats_1025_1279_tier_force(self):
+        """Same bug, the other forced zone: an explicit 'open' choice must
+        win at 1100px (inside the 1025-1279 auto-collapse tier) too."""
+        r = self.OUT["explicit_open_beats_tier_force"]
+        self.assertFalse(r["collapsed"])
+
+    def test_explicit_collapsed_still_collapses_outside_forced_zone(self):
+        """Sanity check on the other side: an explicit 'collapsed' choice
+        must still collapse the rail even at a width/view neither force ever
+        applied to (1600px, board view) -- the fix must not have simply
+        disabled collapsing altogether."""
+        r = self.OUT["explicit_collapsed_applies_outside_forced_zone"]
+        self.assertTrue(r["collapsed"])
+
+    # -- (b) tri-state default is 'auto', not 'open' -----------------------
+
+    def test_default_railmode_is_auto_not_open(self):
+        """Executes railMode's own default-value initializer for real, against
+        a localStorage that has never seen 'tracker.rail' (a first-ever page
+        load). Must resolve to 'auto', not the pre-fix default 'open'."""
+        self.assertEqual(self.OUT["default_railmode_is_auto"], "auto")
+
+    def test_auto_mode_still_defers_to_detail_force(self):
+        """Unlike explicit 'open' (which now wins, per test above), the
+        'auto' mode must still collapse in the detail view -- otherwise the
+        fix would have just turned the forced conditions off entirely instead
+        of making them overridable."""
+        r = self.OUT["auto_mode_still_follows_detail_force"]
+        self.assertTrue(r["collapsed"])
+
+    def test_auto_mode_still_defers_to_1025_1279_tier_force(self):
+        r = self.OUT["auto_mode_still_follows_tier_force"]
+        self.assertTrue(r["collapsed"])
+
+    # -- (c) toggleRail derives from the RENDERED class, not the stored value --
+
+    def test_toggle_rail_reads_rendered_class_not_stored_value(self):
+        """`railMode` is deliberately seeded with a value that is neither
+        'open' nor 'collapsed' (garbage left over from -- in spirit -- the
+        old two-state world) so that a same-as-before result can't disguise a
+        wrong wiring: the outcome must be determined ENTIRELY by what's
+        rendered right now (`cr-rail--collapsed`), which is exactly the fix
+        for 'auto' mode's stored/rendered mismatch producing a dead click."""
+        collapsed_to_open = self.OUT["toggle_from_rendered_collapsed_to_open"]
+        self.assertEqual(collapsed_to_open["railModeAfter"], "open")
+        self.assertEqual(collapsed_to_open["storedAfter"], "open")
+        self.assertFalse(collapsed_to_open["collapsedAfter"])
+
+        open_to_collapsed = self.OUT["toggle_from_rendered_open_to_collapsed"]
+        self.assertEqual(open_to_collapsed["railModeAfter"], "collapsed")
+        self.assertEqual(open_to_collapsed["storedAfter"], "collapsed")
+        self.assertTrue(open_to_collapsed["collapsedAfter"])
+
+    # -- (d) cr-rail--detail (56px orb) gated on `collapsed` -----------------
+
+    def test_detail_orb_class_present_only_when_actually_collapsed(self):
+        collapsed_case = self.OUT["detail_class_present_when_detail_collapsed"]
+        self.assertTrue(collapsed_case["collapsed"])
+        self.assertTrue(collapsed_case["detail"])
+
+    def test_detail_orb_class_absent_when_detail_explicitly_expanded(self):
+        """The other half of the same gate: an explicitly EXPANDED detail
+        rail must NOT carry the 56px orb styling -- it should get the full
+        232px row rail instead. Before this fix, `cr-rail--detail` was
+        applied whenever isDetail alone, with no dependency on `collapsed`."""
+        expanded_case = self.OUT["detail_class_absent_when_detail_explicitly_expanded"]
+        self.assertFalse(expanded_case["collapsed"])
+        self.assertFalse(expanded_case["detail"])
+
+
+if __name__ == "__main__":
+    unittest.main()

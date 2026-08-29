@@ -789,15 +789,22 @@
   }
 
   // Fix 2a — the session rail (ext_cr_board.js) reads/writes the RAW STRING key
-  // 'tracker.rail' with values 'open' | 'collapsed' (never JSON, never a boolean) —
-  // see ext_cr_board.js:187 (`localStorage.getItem('tracker.rail') || 'open'`) and
-  // :322 (`localStorage.setItem('tracker.rail', railMode)`). Config must write that
-  // SAME key/vocabulary, not a parallel 'cr.railOpen' boolean nothing reads.
+  // 'tracker.rail' (never JSON, never a boolean). Config must write that SAME
+  // key/vocabulary, not a parallel 'cr.railOpen' boolean nothing reads.
+  // The vocabulary is TRI-state — 'auto' | 'open' | 'collapsed', default 'auto'
+  // — and must stay in lockstep with applyRailMode() in ext_cr_board.js. 'auto'
+  // defers to the view/breakpoint rules (collapsed in the detail view and on the
+  // board at 1025-1279px, open otherwise); 'open'/'collapsed' are an explicit
+  // user choice that overrides them. Two-stating it here would silently destroy
+  // 'auto' the first time anyone touched this row.
   function readRailPref() {
-    try { return localStorage.getItem('tracker.rail') || 'open'; } catch (e) { return 'open'; }
+    try {
+      var v = localStorage.getItem('tracker.rail');
+      return (v === 'open' || v === 'collapsed') ? v : 'auto';
+    } catch (e) { return 'auto'; }
   }
   function writeRailPref(mode) {
-    mode = (mode === 'collapsed') ? 'collapsed' : 'open';
+    if (mode !== 'open' && mode !== 'collapsed') mode = 'auto';
     try { localStorage.setItem('tracker.rail', mode); } catch (e) {}
     if (_ctx && typeof _ctx.emit === 'function') _ctx.emit('cr:pref', { key: 'tracker.rail', value: mode });
   }
@@ -1025,8 +1032,11 @@
           segmented([['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']], themeVal, function (v) {
             if (_ctx && _ctx.theme && _ctx.theme.set) _ctx.theme.set(v);
           })));
-        body.appendChild(cfgRow('Session rail', null, 'Open by default; collapses to 48px orbs.',
-          toggleCtl(readRailPref() === 'open', function (v) { writeRailPref(v ? 'open' : 'collapsed'); })));
+        // Tri-state, drawn with the same `segmented` control as Theme above: a
+        // two-state switch cannot express 'auto' and would collapse it away on
+        // first touch, leaving no way back to the default.
+        body.appendChild(cfgRow('Session rail', null, 'Auto collapses it inside a session and on narrow screens; Open and Collapsed override that.',
+          segmented([['auto', 'Auto'], ['open', 'Open'], ['collapsed', 'Collapsed']], readRailPref(), function (v) { writeRailPref(v); })));
         body.appendChild(cfgRow('Cards start folded', null, 'Every detail-view panel starts collapsed except Conversation.',
           toggleCtl(readPref(CFG_PREF_KEYS.cardsFolded, true), function (v) { writePref(CFG_PREF_KEYS.cardsFolded, v); })));
         // Fix (drift 4): 5c draws this as ONE row — "Desktop notifications + sound" —
