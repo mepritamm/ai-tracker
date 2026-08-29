@@ -1192,6 +1192,10 @@ const KICON={commit:"⎇",test:"✓",install:"⬇",build:"🔨",git:"⎇",cmd:"$
 // line with a link back. The server ships ids only (not titles, see registry.parse_any's
 // comment); the label falls back to the id's short form when the target isn't in the
 // already-polled `sessions` list yet.
+// Resolve a session id to its display title from the top-level `sessions` list,
+// falling back to the id's short form when the target isn't in it yet. Shared with
+// Control Room, which used to keep its own copy of this lookup.
+function sessionLabel(id){const hit=sessions.find(s=>s.id===id);return hit?(hit.title||hit.project||id.slice(0,8)):id.slice(0,8);}
 function renderForkLinks(d){
   let as=$("forkas"), from=$("forkfrom");
   if(!as){
@@ -1204,7 +1208,7 @@ function renderForkLinks(d){
     from.id="forkfrom"; from.className="forkbanner quiet"; from.style.display="none";
     as.insertAdjacentElement("afterend",from);
   }
-  const label=id=>{const hit=sessions.find(s=>s.id===id);return hit?(hit.title||hit.project||id.slice(0,8)):id.slice(0,8);};
+  const label=sessionLabel;
   if(d.continued_as){
     const cid=d.continued_as;
     as.style.display="flex";

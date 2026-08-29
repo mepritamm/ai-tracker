@@ -206,7 +206,14 @@ window.CR = window.CR || {};
   // No reload: both roots stay in the DOM, `hidden` toggles which is shown —
   // a reload would drop the terminal's open PTY streams.
   // ----------------------------------------------------------------------
-  var CLASSIC_SIBLINGS = ['.app', 'footer.foot', '#toasts', '#diffmodal', '#msgmodal'];
+  // #diffmodal/#msgmodal are NOT listed here: they're shared overlays (already
+  // invisible by default via `.overlay { display: none }`, made visible only
+  // by their own openers setting an inline display), not classic-only chrome.
+  // Force-hiding them by `[hidden]` (CSS below has `!important`) would beat
+  // that inline display and permanently break their reuse from Control Room —
+  // see the report. The CSS rule for them is left in place (harmless once the
+  // attribute is no longer set here) in case anything else ever sets it.
+  var CLASSIC_SIBLINGS = ['.app', 'footer.foot', '#toasts'];
   function getUiMode() {
     try { return localStorage.getItem('tracker.ui') || 'classic'; } catch (e) { return 'classic'; }
   }
@@ -221,6 +228,12 @@ window.CR = window.CR || {};
       if (el) el.hidden = isNext;
     });
     if (isNext) {
+      // Edge case the removal above introduces: a modal left open in classic
+      // when the user switches to Control Room would now stay on screen (it's
+      // no longer force-hidden by attribute). Close it via the classic UI's
+      // own closers rather than inventing new hide logic here.
+      if (typeof closeMsg === 'function') closeMsg();
+      if (typeof closeDiff === 'function') closeDiff();
       ensureMounted();
       applyTheme();
       // "immediately triggers a data refresh rather than waiting for the next

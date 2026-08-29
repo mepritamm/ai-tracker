@@ -297,17 +297,20 @@
     _toastHost.appendChild(el);
     if (!document.hidden) arm(); // "never auto-dismiss while [the tab is] focused" — see NOTE below
 
-    // FIX 2: gated on `soundOn` the same way app.js's own notifyDone() gates its OS
-    // Notification (app.js ~1152) — this used to fire unconditionally whenever the tab
-    // was hidden, so muting notifications (the bell toggle) still popped an OS
-    // notification for routine Control Room confirmations (renames, flag-resolves, …).
-    // `soundOn` is app.js's own top-level `let` (app.js:1112) — reachable by bare name
-    // here, same as any other app.js top-level declaration — so this reads the SAME
-    // preference rather than introducing a second one.
-    if (document.hidden && (typeof soundOn === 'undefined' || soundOn) &&
-        'Notification' in window && Notification.permission === 'granted') {
-      try { new Notification(title, { body: opts.meta || '' }); } catch (e) {}
-    }
+    // FIX 3 (real bug, reported twice): this used to also raise `new Notification(...)`
+    // here whenever the tab was hidden (soundOn-gated as of FIX 2 above) — but this
+    // function is the SAME toast() called for every routine confirmation on the bus
+    // (rename/note/flag/run-command/etc., ~20 call sites in ext_cr_boot.js), not just
+    // real completions. A desktop Notification carries the OS's own notification sound
+    // by default, so backgrounding the tab and, say, renaming a session or resolving a
+    // flag popped an audible alert — exactly the "sound every time" complaint, and
+    // exactly the classic dashboard's app.js toast() (~app.js:1139) never does this: it
+    // is purely a visual banner, full stop. The ONE place a real completion is allowed
+    // to raise a desktop Notification is app.js's own notifyDone() (app.js ~1152,
+    // soundOn-gated, called unchanged via ext_cr_boot.js's wrapper for every genuine
+    // running->done transition) — already independent of this function entirely, so
+    // deleting this block loses no real-completion alert, only the spurious ones this
+    // function was never supposed to raise.
     return dismiss;
   }
   // NOTE: doc 04 reads "Auto-dismiss 8s; pause on hover; never auto-dismiss while

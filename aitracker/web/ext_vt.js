@@ -3461,6 +3461,14 @@
   // extending the object inline would break a passing assertion over a cosmetic difference. Same
   // object, same two original entries, one more property.
   window.ExtVT.mountInto = mountInto;
+  // Same reasoning again: the model/effort ladders and their two helper functions (defined above,
+  // ~line 2071-2127) were previously reachable only from inside this IIFE, so ext_cr_term.js held
+  // byte-identical copies that could silently desync from these. Widen the export, don't move or
+  // rewrite the originals -- every internal caller above still refers to the same bindings.
+  window.ExtVT.MODEL_LADDER = MODEL_LADDER;
+  window.ExtVT.EFFORT_LADDER = EFFORT_LADDER;
+  window.ExtVT._matchLadderModel = _matchLadderModel;
+  window.ExtVT.readContextUsage = readContextUsage;
 
   // ===== render hook: participates in the normal 2s poll like every other ext module, and is
   // what genuinely puts #ext_vt to use (the modal is built as its child, not appended to

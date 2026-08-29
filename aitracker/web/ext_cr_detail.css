@@ -161,7 +161,7 @@
 
 .cr .crd-goal {
   font-family: var(--font-serif);
-  font-size: 29px;
+  font-size: 27px;
   line-height: 1.15;
   font-weight: 400;
   letter-spacing: -.02em;
@@ -976,11 +976,7 @@
 
 .cr .crd-timeline-panel { display: flex; flex-direction: column; min-height: 0; }
 .cr .crd-timeline-panel .crd-panel-head { flex-wrap: wrap; row-gap: 6px; }
-.cr .crd-timeline-legend {
-  font-size: 10px;
-  color: var(--text-muted);
-}
-.cr .crd-timeline-filters { margin-left: auto; display: flex; gap: 4px; }
+.cr .crd-timeline-filters { margin-left: auto; display: flex; align-items: center; gap: 4px; }
 .cr .crd-timeline-filters button {
   border: 1px solid var(--line-subtle);
   background: var(--surface-raised);
@@ -994,6 +990,20 @@
   background: var(--fill-action);
   color: var(--text-on-action);
   border-color: transparent;
+}
+/* the four individually-selectable kind chips, and the all/talk-only presets +
+   pop-out — two groups inside the one auto-margin flex row, separated by a hairline */
+.cr .crd-timeline-kinds,
+.cr .crd-timeline-presets { display: flex; gap: 4px; }
+.cr .crd-timeline-presets {
+  padding-left: 10px;
+  margin-left: 2px;
+  border-left: 1px solid var(--line-subtle);
+}
+.cr .crd-timeline-popout {
+  padding: 3px 8px !important;
+  font-size: 12px !important;
+  line-height: 1;
 }
 
 .cr .crd-timeline-panel .crd-panel-body {
@@ -1018,7 +1028,7 @@
   text-align: center;
 }
 
-.cr .crd-entry { display: flex; gap: 11px; }
+.cr .crd-entry { display: flex; gap: 11px; cursor: pointer; }
 .cr .crd-entry-ts {
   flex: 0 0 34px;
   text-align: right;
@@ -1270,6 +1280,29 @@
   .cr .crd-columns { padding: 10px 12px 90px; gap: 12px; }
   .cr .crd-phonebar { display: flex; }
   .cr .crd-card { margin: 10px 12px 0; }
+
+  /* Timeline chip row overflow: `.crd-timeline-filters` (TIMELINE label's
+     4 kind chips + all/talk-only + pop-out, 7 controls) is `display:flex`
+     with no `flex-wrap` — a single non-wrapping line ~437px wide (prompts
+     64 + narration 76 + tools 52 + results 64 + 3x4px gaps=12 -> kinds 268,
+     + 4px gap, + presets prefix 13 + all 40 + talk-only 76 + popout 28 +
+     2x4px gaps=8 -> presets 165; 268+4+165=437px) inside a phone column
+     whose content width is ~336px (390 viewport - 2x12px .crd-columns
+     padding - 2x15px .crd-panel-head padding). 437 > 336, so even though
+     the parent `.crd-timeline-panel .crd-panel-head` already wraps the
+     TIMELINE label off this row (unconditional rule above), the filters
+     group itself still overflows on its own line. Same technique as the
+     top-bar fix (`ext_cr_board.css` Blocker 1): `flex-basis: 100%` forces
+     it onto its own full-width line so its OWN `flex-wrap` has a stable
+     336px to wrap against, instead of shrink-wrapping to its 437px
+     max-content width. Chosen over a horizontal-scroll container to match
+     the wrap idiom already used for this exact row and the top bar. */
+  .cr .crd-timeline-filters {
+    flex-basis: 100%;
+    flex-wrap: wrap;
+    row-gap: 6px;
+    margin-left: 0;
+  }
 }
 
 /* ============================================================
@@ -1323,4 +1356,12 @@
   .cr .crd-agent-row-item,
   .cr .crd-note-row,
   .cr .crd-decision { min-height: 44px; }
+
+  /* Timeline chip row buttons (prompts/narration/tools/results, all/talk
+     only, and the ⤢ pop-out — `.cr .crd-timeline-filters button` matches
+     all 7, popout included, since it's a descendant button too): padding
+     3px10 around a 10.5px line — audited at ~20px. Same `min-height`-only
+     technique as `.cr-pill`/`.crd-decision` above: width stays
+     content-driven, desktop chip density is untouched. ~20px -> 44px. */
+  .cr .crd-timeline-filters button { min-height: 44px; }
 }

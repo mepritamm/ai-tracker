@@ -649,15 +649,20 @@ class TestCRLogic(unittest.TestCase):
         (still working) shows no PR metadata — it's a Landed-tile-only affordance."""
         self.assertIsNone(self.OUT["pr_not_landed"])
 
-    # -- mergeTimeline: one chronological list --------------------------------
+    # -- mergeTimeline: one chronological list, NEWEST FIRST ------------------
 
     def test_merge_timeline_is_one_chronological_list(self):
+        # Newest-first, so index 0 is the newest entry. That is the whole app's
+        # convention -- the server already emits narration newest-first, and
+        # app.js's navFirst() documents "index 0 = newest". The timeline used to
+        # sort ascending, which silently inverted the panel against every other
+        # surface; the owner reported it.
         merged = self.OUT["merged"]
         kinds = [e["kind"] for e in merged]
-        self.assertEqual(kinds, ["command", "narration", "prompt", "ask"])
+        self.assertEqual(kinds, ["ask", "prompt", "narration", "command"])
         times = [e["t"] for e in merged]
-        self.assertEqual(times, sorted(times))
-        self.assertLess(times[0], times[-1])
+        self.assertEqual(times, sorted(times, reverse=True))
+        self.assertGreater(times[0], times[-1])
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +905,247 @@ class TestCRThemeScope(unittest.TestCase):
         `#cr-shell` used to carry a redundant bare `tracker-next` class)."""
         offenders = [s for s in self.OUT["scopes"] if "is-dark" not in s["classes"]]
         self.assertEqual(offenders, [], "these elements carry tracker-next without is-dark: %r" % offenders)
+
+
+# ---------------------------------------------------------------------------
+# Sound-notification regression: "notifies with sound every time" (reported
+# twice against Control Room).
+#
+# Round 1 (fixed by commit 8fe15ca, still correct, re-pinned by the first three
+# assertions below): a parallel completion detector scanned `ended` across
+# every /api/list session with a baseline that only ran once, so a machine
+# with hundreds of already-finished sessions kept re-announcing them, with
+# sound, on every later poll. The fix reuses app.js's own checkCompletions(d) —
+# it watches only the CURRENTLY VIEWED session's `agents_bg`/`shells`, keyed
+# by id, and silently re-baselines (no notify) on the first poll and on a
+# session switch, notifying only a real running -> not-running transition.
+#
+# Round 2 (fixed here): ext_cr_dialogs.js's toast() — the function every
+# routine Control Room confirmation reaches (rename/flag/note/run-command/etc.,
+# ~20 call sites in ext_cr_boot.js, ALL bare visual confirmations in the
+# classic dashboard) — ALSO raised its own `new Notification(...)` whenever the
+# tab was hidden, soundOn-gated but otherwise unconditional. A desktop
+# Notification carries the OS's own alert sound by default, so backgrounding
+# the tab and doing something as routine as renaming a session played an
+# audible alert though nothing had "finished" — exactly the reported "sound
+# every time" behaviour, and something the classic dashboard's own toast()
+# (app.js ~1139) never does at all: it is a pure visual banner. Deleted the
+# block; a real completion still gets its (unchanged) desktop alert from
+# app.js's own notifyDone(), which toast() was never the only path for.
+#
+# Exercises the REAL exported functions (app.js's checkCompletions/notifyDone/
+# beep, reached bare because this driver runs INSIDE the bundle's own try{}
+# block scope -- not window.CR.* -- and ext_cr_dialogs.js's real
+# window.CR.dialogs.toast(), after a real mount()) rather than re-deriving the
+# logic in Python.
+# ---------------------------------------------------------------------------
+
+_SOUND_JS_PREAMBLE = r"""
+globalThis.window = globalThis;
+
+function makeEl() {
+  var self = {
+    classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    style: {}, dataset: {}, setAttribute() {}, getAttribute() { return null; },
+    appendChild() {}, append() {}, remove() {}, insertBefore() {},
+    addEventListener() {}, removeEventListener() {},
+    querySelector: function() { return self; }, querySelectorAll: () => [self],
+    closest: function() { return self; }, firstElementChild: self, children: [self],
+    innerHTML: "", textContent: "", hidden: false, focus() {}, click() {}
+  };
+  return self;
+}
+
+var stubEl = makeEl();
+window.document = {
+  createElement: () => makeEl(), createTextNode: () => makeEl(),
+  getElementById: () => stubEl, querySelector: () => stubEl, querySelectorAll: () => [stubEl],
+  addEventListener() {}, dispatchEvent() {},
+  documentElement: stubEl, body: stubEl, head: stubEl, readyState: "complete",
+  hidden: false
+};
+
+const _localStorage = {};
+window.localStorage = {
+  getItem: (k) => (k in _localStorage) ? _localStorage[k] : null,
+  setItem: (k, v) => { _localStorage[k] = v; },
+  removeItem: (k) => { delete _localStorage[k]; }
+};
+
+window.matchMedia = () => ({ matches: false, addEventListener() {}, addListener() {}, removeEventListener() {} });
+window.fetch = () => Promise.resolve({ ok: true, json: () => Promise.resolve({}), text: () => Promise.resolve(""), headers: { get: () => null } });
+window.setInterval = () => 0; window.setTimeout = () => 0; window.clearInterval = () => {}; window.clearTimeout = () => {};
+window.location = { href: "", search: "", pathname: "/" };
+window.navigator = { userAgent: "node", clipboard: { writeText: () => Promise.resolve() } };
+window.CustomEvent = class { constructor(type, opts) { this.type = type; this.detail = opts && opts.detail; } };
+window.Event = window.CustomEvent;
+window.requestAnimationFrame = () => 0;
+window.getComputedStyle = () => ({ getPropertyValue: () => "" });
+window.getSelection = () => ({ toString: () => "" });
+window.addEventListener = () => {}; window.removeEventListener = () => {}; window.dispatchEvent = () => {};
+// beep() (app.js) needs a WebAudio stub; notifyDone()'s desktop-alert branch
+// (app.js + ext_cr_dialogs.js's toast(), pre-fix) needs a Notification stub.
+window.AudioContext = function () {
+  return { state: "running", resume() {}, currentTime: 0,
+    createOscillator() { return { type: "", frequency: { value: 0 }, connect() {}, start() {}, stop() {} }; },
+    createGain() { return { gain: { setValueAtTime() {}, linearRampToValueAtTime() {}, exponentialRampToValueAtTime() {} }, connect() {} }; },
+    destination: {} };
+};
+window.Notification = function (title, opts) { this.title = title; this.body = opts && opts.body; this.onclick = null; };
+window.Notification.permission = "granted";
+window.Notification.requestPermission = () => Promise.resolve("granted");
+process.on("unhandledRejection", () => {});
+
+try {
+"""
+
+_SOUND_JS_DRIVER = r"""
+// Still inside the bundle's own try{} block: `cur`/`soundOn`/`notifSession`/
+// `notifRunning` are app.js's real top-level `let` bindings (block-scoped —
+// NOT reachable once the enclosing try{} closes), and `beep`/`checkCompletions`/
+// `notifyDone` are its real top-level functions, reached bare by design (same
+// note ext_cr_boot.js's own header carries about this shared script scope).
+var beepCount = 0;
+var origBeep = beep;
+beep = function () { beepCount++; return origBeep.apply(this, arguments); };
+
+function mkAgent(id, running) { return { id: id, task: "task-" + id, running: running }; }
+function mkShell(id, running) { return { id: id, desc: "shell-" + id, cmd: "echo", running: running }; }
+
+var results = {};
+
+// 1) First poll ever, session already has several FINISHED agents/shells ->
+//    baseline only, ZERO sound (the exact "hundreds of already-finished
+//    sessions" shape round 1's bug mishandled).
+cur = "sessA";
+notifSession = null; notifRunning = null;
+beepCount = 0;
+checkCompletions({ agents_bg: [mkAgent("a1", false), mkAgent("a2", false)], shells: [mkShell("s1", false)] });
+results.firstPoll = beepCount;
+checkCompletions({ agents_bg: [mkAgent("a1", false), mkAgent("a2", false)], shells: [mkShell("s1", false)] });
+results.firstPollSecondTick = beepCount;   // nothing changed on a later tick either
+
+// 2) Session switch -> silent re-baseline, ZERO sound, even though the new
+//    session's items are already running=false.
+cur = "sessB";
+beepCount = 0;
+checkCompletions({ agents_bg: [mkAgent("b1", false)], shells: [] });
+results.sessionSwitch = beepCount;
+
+// 3) A genuine running -> finished transition on the session actually being
+//    viewed, sound ON -> EXACTLY one beep.
+soundOn = true;
+cur = "sessC";
+notifSession = null; notifRunning = null;
+checkCompletions({ agents_bg: [mkAgent("c1", true)], shells: [] });   // baseline: c1 running
+beepCount = 0;
+checkCompletions({ agents_bg: [mkAgent("c1", false)], shells: [] }); // c1 finished
+results.realTransitionSoundOn = beepCount;
+
+// 4) Same genuine transition, sound OFF -> zero.
+soundOn = false;
+cur = "sessD";
+notifSession = null; notifRunning = null;
+checkCompletions({ agents_bg: [mkAgent("d1", true)], shells: [] });
+beepCount = 0;
+checkCompletions({ agents_bg: [mkAgent("d1", false)], shells: [] });
+results.realTransitionSoundOff = beepCount;
+soundOn = true;
+
+// 5) Round 2's actual bug: a MUNDANE confirmation (rename/flag/note/etc.) must
+//    NOT raise a desktop Notification while the tab is hidden — only a real
+//    notifyDone() completion may. Exercise the REAL exported toast() the same
+//    way every ext_cr_boot.js confirmation reaches it (ctx.on('notify', ...)
+//    -> toast(payload)), after mount()ing it for real.
+var notifyCtorCalls = 0;
+var RealNotification = window.Notification;
+window.Notification = function (title, opts) { notifyCtorCalls++; return new RealNotification(title, opts); };
+window.Notification.permission = "granted";
+window.CR.dialogs.mount(makeEl(), {});
+document.hidden = true;
+window.CR.dialogs.toast({ text: "Renamed." });          // a mundane confirmation, NOT a completion
+results.mundaneConfirmationRaisedNotification = notifyCtorCalls;
+
+// Sanity check in the SAME harness: a real completion still gets its
+// (unchanged, soundOn-gated) desktop alert straight from app.js's own
+// notifyDone() -- proving the fix removed only the spurious path.
+notifyCtorCalls = 0;
+soundOn = true;
+notifyDone("Background agent finished", "some task");
+results.realCompletionStillRaisesNotification = notifyCtorCalls;
+document.hidden = false;
+window.Notification = RealNotification;
+
+console.log("===CR_SOUND_JSON_START===");
+console.log(JSON.stringify(results));
+"""
+
+_SOUND_JS_CLOSER = r"""
+} catch (e) {
+  console.error("BUNDLE-THREW: " + (e && e.stack || e));
+  process.exit(1);
+}
+"""
+
+
+def _sound_driver_js():
+    bundle_html = _read_page()
+    bundle_js = _extract_script_content(bundle_html)
+    return "\n".join([_SOUND_JS_PREAMBLE, bundle_js, _SOUND_JS_DRIVER, _SOUND_JS_CLOSER])
+
+
+def _extract_sound_json(stdout):
+    marker = "===CR_SOUND_JSON_START==="
+    idx = stdout.find(marker)
+    if idx < 0:
+        raise ValueError("marker not found in node output:\n" + stdout)
+    return json.loads(stdout[idx + len(marker):].strip())
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestCRSoundNotifications(unittest.TestCase):
+    """Pins the sound/desktop-notification behaviour to the classic dashboard's own
+    (same trigger, same soundOn gate, same code path) -- regression for both rounds
+    of the "notifies with sound every time" complaint."""
+
+    @classmethod
+    def setUpClass(cls):
+        js = _sound_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Sound driver failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_sound_json(stdout)
+
+    def test_first_poll_with_already_finished_items_is_silent(self):
+        """Round 1's exact bug shape: a first look at a session whose background
+        agents/shells are already done must never beep -- only baseline."""
+        self.assertEqual(self.OUT["firstPoll"], 0)
+        self.assertEqual(self.OUT["firstPollSecondTick"], 0)
+
+    def test_session_switch_is_silent(self):
+        self.assertEqual(self.OUT["sessionSwitch"], 0)
+
+    def test_real_completion_beeps_exactly_once_when_sound_on(self):
+        self.assertEqual(self.OUT["realTransitionSoundOn"], 1)
+
+    def test_real_completion_is_silent_when_sound_off(self):
+        self.assertEqual(self.OUT["realTransitionSoundOff"], 0)
+
+    def test_mundane_confirmation_never_raises_a_desktop_notification(self):
+        """Round 2's actual bug: ext_cr_dialogs.js's toast() -- reached by every
+        routine confirmation (rename/flag/note/run-command/...) -- used to also pop
+        a desktop Notification (with the OS's own alert sound) whenever the tab was
+        hidden. The classic dashboard's own toast() never does this for anything;
+        only a real completion (notifyDone(), pinned above) is allowed to."""
+        self.assertEqual(self.OUT["mundaneConfirmationRaisedNotification"], 0)
+
+    def test_real_completion_still_raises_a_desktop_notification(self):
+        """Sanity check alongside the assertion above: the fix must not have also
+        silenced the legitimate desktop alert for a genuine completion."""
+        self.assertEqual(self.OUT["realCompletionStillRaisesNotification"], 1)
 
 
 if __name__ == "__main__":

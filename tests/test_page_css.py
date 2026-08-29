@@ -125,6 +125,32 @@ def _extract_selector_from_file(filepath):
     return None
 
 
+def _extract_media_blocks(css, query_substr):
+    """Return the body text of every top-level `@media (...)` block whose
+    condition contains `query_substr` (e.g. "max-width: 480px").
+
+    Not a full CSS parser: only matches simple single-condition media
+    queries (`@media (COND) {`), which is what this codebase uses for every
+    breakpoint. Brace-depth is tracked manually so a block's own nested
+    rules don't truncate the match early.
+    """
+    blocks = []
+    for m in re.finditer(r'@media\s*\(([^)]*)\)\s*\{', css):
+        if query_substr not in m.group(1):
+            continue
+        start = m.end()
+        depth = 1
+        i = start
+        while i < len(css) and depth > 0:
+            if css[i] == '{':
+                depth += 1
+            elif css[i] == '}':
+                depth -= 1
+            i += 1
+        blocks.append(css[start:i - 1])
+    return blocks
+
+
 class TestPageCSS(unittest.TestCase):
     """Test that the assembled page's CSS is syntactically valid and complete."""
 
@@ -273,6 +299,45 @@ class TestPageCSS(unittest.TestCase):
             f"This indicates an upstream CSS syntax error broke the file parsing. "
             f"Missing:\n" +
             "\n".join(f"  {m}" for m in missing)
+        )
+
+    def test_timeline_chip_row_has_phone_escape(self):
+        """The detail view's TIMELINE chip row must not clip at phone width.
+
+        `.crd-timeline-filters` (prompts/narration/tools/results + all/talk
+        only + the pop-out button, 7 controls) is a `display:flex` group
+        with no `flex-wrap` of its own. Unwrapped, it runs ~437px wide --
+        wider than the ~336px of usable width a 390px phone column leaves
+        after `.crd-columns` and `.crd-panel-head` padding -- so without an
+        escape hatch the rightmost chips become unreachable: the exact
+        top-bar defect this project already shipped once, recurring here.
+
+        Pins the fix to the phone tier specifically (inside a
+        `max-width: 480px` block, not merely present somewhere in the file)
+        so a future edit that drops `flex-wrap` or moves the rule out of
+        that breakpoint regresses this test instead of shipping silently.
+        """
+        html = _read_page()
+        assembled_css = _extract_style_content(html)
+
+        phone_blocks = _extract_media_blocks(assembled_css, "max-width: 480px")
+        self.assertTrue(
+            phone_blocks,
+            "No `@media (max-width: 480px)` block found in assembled CSS"
+        )
+
+        escaped = False
+        for block in phone_blocks:
+            rule_match = re.search(r'\.cr\s+\.crd-timeline-filters\s*\{([^}]*)\}', block)
+            if rule_match and re.search(r'flex-wrap\s*:\s*wrap', rule_match.group(1)):
+                escaped = True
+                break
+
+        self.assertTrue(
+            escaped,
+            "`.cr .crd-timeline-filters` has no `flex-wrap: wrap` inside a "
+            "`max-width: 480px` block -- the timeline chip row can overflow "
+            "unreachably on phone."
         )
 
 

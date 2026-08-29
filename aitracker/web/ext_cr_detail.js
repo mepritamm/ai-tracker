@@ -64,7 +64,16 @@
 (function () {
   window.CR = window.CR || {};
 
-  var LIVE_WINDOW = 300; // seconds — aitracker/config.py:60, mirrored in aitracker/web/app.js:699
+  // Mirrors config.LIVE_WINDOW (server) / LIVE (app.js) — same constant, same
+  // meaning, per CLAUDE.md's "Liveness is one constant" rule. app.js's `LIVE`
+  // IS reachable here: page.py concatenates every web/*.js file into ONE
+  // <script> tag, app.js first (page.py: read("app.js") + read_ext(".js")),
+  // so its top-level `const LIVE = 300` sits in the same script-level scope
+  // this IIFE closes over — verified by reading page.py, not assumed (an
+  // earlier version of this comment claimed app.js wasn't reachable; that was
+  // false). Derived from it with a safe literal fallback only for the
+  // (currently never-exercised) case this file is ever loaded standalone.
+  var LIVE_WINDOW = (typeof LIVE !== 'undefined') ? LIVE : 300;
 
   // ============================== small pure helpers ==============================
 
@@ -393,7 +402,8 @@
   }
 
   // Merges narration + prompts (+ decisions + commands + tool activity) into one
-  // chronological list. Pure: (session) -> [{kind, t, ...}] oldest-first.
+  // chronological list. Pure: (session) -> [{kind, t, ...}] newest-first (defect 1 —
+  // matches curNarr/narrState/navFirst's "index 0 = newest" convention elsewhere).
   //
   // FIX (design-audit drift 8 — "the biggest gap"): 5b's timeline shows generic
   // tool-call rows — "Edit · aitracker/web/ext_vt.js · 0.4s · +118 −31" — for every
@@ -451,7 +461,10 @@
       out.push({ kind: "tool", t: t == null ? 0 : t, verb: "Task",
         target: (a.desc || a.type || "background agent"), count: "", agent: true, key: "ag" + i });
     });
-    out.sort(function (a, b) { return a.t - b.t; });
+    // FIX (defect 1): newest-first, matching the rest of the app — the server's own
+    // narrative[::-1] (claude.py:1269), classic's curNarr/narrState prepend-on-arrival
+    // (app.js:1391), and navFirst's own "index 0 = newest" comment (app.js:1591).
+    out.sort(function (a, b) { return b.t - a.t; });
     return out;
   }
 
@@ -823,8 +836,15 @@
       sid: null,
       panels: {}, // key -> wrap element
       timelineSeen: 0,
-      timelineStuckBottom: true,
+      // FIX (defect 1): the timeline is now newest-first (mergeTimeline sorts
+      // descending), matching curNarr/app.js's "index 0 = newest" convention
+      // (navFirst's own comment) and the server's own narrative[::-1]. "Stuck to
+      // latest" therefore means pinned at the TOP of the scroll now, not the bottom.
+      timelineStuckLatest: true,
       timelineFilter: "all",
+      // FIX (defect 2): each of the four legend words is now its own toggle,
+      // additive on top of the all/talk preset — see timelineEntryVisible() below.
+      timelineKindsOn: {},
       agentsShowFinished: false,
       searchOpen: false,
       flagOpen: false,
@@ -867,10 +887,24 @@
         '<header class="crd-panel-head" data-act="toggle-panel" data-panel="timeline" data-col="convo">' +
           '<span class="crd-chevron">▾</span>' +
           '<span class="crd-panel-label">TIMELINE</span>' +
-          '<span class="crd-timeline-legend mono">prompts · narration · tools · results</span>' +
+          // FIX (defect 2): the four words are real, individually-selectable filter
+          // chips now (data-act="timeline-filter" data-mode="kind", same delegation
+          // + .is-active convention the all/talk preset buttons already use) instead
+          // of static legend text. See timelineEntryVisible()/TIMELINE_KIND_MAP.
           '<span class="crd-timeline-filters">' +
-            '<button class="is-active" data-act="timeline-filter" data-mode="all">all</button>' +
-            '<button data-act="timeline-filter" data-mode="talk">talk only</button>' +
+            '<span class="crd-timeline-kinds">' +
+              '<button data-act="timeline-filter" data-mode="kind" data-kind="prompts">prompts</button>' +
+              '<button data-act="timeline-filter" data-mode="kind" data-kind="narration">narration</button>' +
+              '<button data-act="timeline-filter" data-mode="kind" data-kind="tools">tools</button>' +
+              '<button data-act="timeline-filter" data-mode="kind" data-kind="results">results</button>' +
+            "</span>" +
+            '<span class="crd-timeline-presets">' +
+              '<button class="is-active" data-act="timeline-filter" data-mode="all">all</button>' +
+              '<button data-act="timeline-filter" data-mode="talk">talk only</button>' +
+              // FIX (defect 3): panel-level pop-out — opens the newest entry of
+              // whatever's currently visible, same as the "⤒ latest" convo-nav button.
+              '<button class="crd-timeline-popout" data-act="timeline-popout" title="Pop out the newest entry" aria-label="Pop out the newest entry">⤢</button>' +
+            "</span>" +
           "</span>" +
         "</header>" +
         '<div class="crd-panel-body">' +
@@ -885,11 +919,16 @@
 
     var scrollEl = qs(timelineWrap, ".crd-timeline-scroll");
     scrollEl.addEventListener("scroll", function () {
-      var atBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 40;
-      ui.timelineStuckBottom = atBottom;
-      // FIX 4a: real paging — scrolling near the top of the loaded window fetches
-      // older narration from the existing /api/narration route (see loadOlderNarration).
-      if (scrollEl.scrollTop < 60) loadOlderNarration(ctx, ui, node);
+      // FIX (defect 1): newest-first now means the newest entry sits at the TOP of
+      // the scroll box, so "stuck to the latest entry" is pinned at scrollTop≈0 —
+      // the inverse of the old oldest-first "stuck to the bottom" check.
+      var atTop = scrollEl.scrollTop < 40;
+      ui.timelineStuckLatest = atTop;
+      // FIX 4a (order flipped by defect 1): older history is now at the BOTTOM of
+      // the loaded window (oldest = smallest t = sorted last), so paging it in
+      // fires near the bottom of the scroll box, not the top.
+      var nearBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 60;
+      if (nearBottom) loadOlderNarration(ctx, ui, node);
     });
 
     // ---- single delegated click handler ----
@@ -987,11 +1026,32 @@
           break;
         }
         case "timeline-filter": {
-          ui.timelineFilter = t.getAttribute("data-mode");
-          qsa(timelineWrap, ".crd-timeline-filters button").forEach(function (b) {
-            b.classList.toggle("is-active", b === t);
-          });
-          renderTimelineEntries(scrollEl, ui, ui.lastSession, true, ctx);
+          // FIX (defect 2): "kind" chips (prompts/narration/tools/results) are
+          // independent, additive toggles; the "all"/"talk" buttons are the two
+          // shipped presets and reset any custom chip selection back to a clean
+          // slate (same shape as before — see updateTimelineFilterButtons/
+          // timelineEntryVisible for how the two combine).
+          var mode = t.getAttribute("data-mode");
+          if (mode === "kind") {
+            var kind = t.getAttribute("data-kind");
+            ui.timelineKindsOn = ui.timelineKindsOn || {};
+            ui.timelineKindsOn[kind] = !ui.timelineKindsOn[kind];
+          } else {
+            ui.timelineFilter = mode;
+            ui.timelineKindsOn = {};
+          }
+          updateTimelineFilterButtons(timelineWrap, ui);
+          // A filter swap replaces the whole visible set (not an incremental
+          // arrival at one end), so no top-growth scroll compensation applies.
+          renderTimelineEntries(scrollEl, ui, ui.lastSession, true, ctx, { noTopGrowth: true });
+          break;
+        }
+        case "timeline-popout":
+          openLatestTimelineEntry(ui);
+          break;
+        case "timeline-entry-open": {
+          var ekey = t.getAttribute("data-key");
+          openTimelineEntryByKey(ui, ekey);
           break;
         }
         case "narration-diagram": {
@@ -1002,8 +1062,9 @@
           break;
         }
         case "convo-latest":
-          ui.timelineStuckBottom = true;
-          scrollEl.scrollTop = scrollEl.scrollHeight;
+          // FIX (defect 1): newest is at the TOP now (newest-first), not the bottom.
+          ui.timelineStuckLatest = true;
+          scrollEl.scrollTop = 0;
           break;
         case "convo-prev":
           jumpPrompt(scrollEl, -1);
@@ -1751,9 +1812,19 @@
     renderTimelineEntries(scrollEl, ui, session, false, ctx);
   }
 
+  // FIX (defect 3): every entry is clickable to pop out — the SAME data-act
+  // delegation the rest of this file uses, just naming this entry's merge key so
+  // the click handler can find it in ui.timelineEntries (the current filtered,
+  // newest-first list) and hand it to openTimelineEntry(). Nested data-act
+  // elements (e.g. the diagram "expand" button) still win on their own click
+  // since Element.closest() returns the nearest match, not this outer one.
+  function entryOpenAttrs(e) {
+    return ' data-act="timeline-entry-open" data-key="' + esc(e.key) + '"';
+  }
+
   function entryHtml(e, ctx, diagram) {
     if (e.kind === "prompt") {
-      return '<div class="crd-entry crd-entry-prompt"><span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
+      return '<div class="crd-entry crd-entry-prompt"' + entryOpenAttrs(e) + '><span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
         '<div class="crd-bubble crd-bubble-prompt">' + mdHtml(ctx, e.text) + "</div></div>";
     }
     if (e.kind === "narration") {
@@ -1775,7 +1846,7 @@
           return '<span class="cr-diagram-pill' + (n.active ? " is-active" : "") + '">' + esc(n.label) + "</span>";
         }).join("");
         var b64 = _mmdEncodeSrc(diagram.src || "");
-        return '<div class="crd-entry crd-entry-narration crd-entry-diagram" data-todo-text="">' +
+        return '<div class="crd-entry crd-entry-narration crd-entry-diagram" data-todo-text=""' + entryOpenAttrs(e) + '>' +
           '<span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
           '<div class="crd-narration-body">' + pre +
           '<div class="cr-diagram-card crd-diagram-inline">' +
@@ -1786,7 +1857,7 @@
               '<button class="crd-open-link crd-diagram-expand" data-act="narration-diagram" data-key="' + esc(e.key) + '">expand ›</button>' +
             "</div></div>" + suf + "</div></div>";
       }
-      return '<div class="crd-entry crd-entry-narration" data-todo-text="">' +
+      return '<div class="crd-entry crd-entry-narration" data-todo-text=""' + entryOpenAttrs(e) + '>' +
         '<span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
         '<div class="crd-narration-text">' + mdHtml(ctx, e.text) + "</div></div>";
     }
@@ -1800,14 +1871,14 @@
       // view-only copy also drops "itself" and adds the "never writes" clause.
       var miniHead = d.open ? '<div class="crd-ask-minihead"><span class="tn-emo-a" aria-hidden="true">⏳</span>' +
         '<span class="crd-ask-minihead-label">It asked you · still open</span></div>' : "";
-      return '<div class="crd-entry crd-entry-ask"><span class="crd-entry-ts mono crd-ts-ask">' + fmtClock(e.t) + "</span>" +
+      return '<div class="crd-entry crd-entry-ask"' + entryOpenAttrs(e) + '><span class="crd-entry-ts mono crd-ts-ask">' + fmtClock(e.t) + "</span>" +
         '<div class="crd-bubble crd-bubble-ask">' + miniHead + '<div class="crd-ask-q">' + esc(q0.q) + "</div>" +
         '<div class="crd-ask-opts">' + opts + "</div>" +
         '<div class="crd-ask-note">View-only — answer in the session. The tracker never writes to it.</div></div></div>';
     }
     if (e.kind === "command" || e.kind === "command-fail") {
       var c = e.cmd;
-      return '<div class="crd-entry crd-entry-tool' + (e.kind === "command-fail" ? " is-fail" : "") + '">' +
+      return '<div class="crd-entry crd-entry-tool' + (e.kind === "command-fail" ? " is-fail" : "") + '"' + entryOpenAttrs(e) + '>' +
         '<span class="crd-entry-ts mono ' + (e.kind === "command-fail" ? "crd-ts-fail" : "") + '">' + fmtClock(e.t) + "</span>" +
         '<div class="crd-toolrow">' + (e.kind === "command-fail" ? '<span class="crd-tool-fail">fail</span>' : "") +
         '<span class="crd-tool-name mono">' + esc(c.cmd) + "</span></div></div>";
@@ -1821,7 +1892,7 @@
     // "0.4s · +118 −31" duration/diff pair would need the parser to start recording
     // per-op timestamps and line counts, which it does not today.
     if (e.kind === "tool") {
-      return '<div class="crd-entry crd-entry-tool">' +
+      return '<div class="crd-entry crd-entry-tool"' + entryOpenAttrs(e) + '>' +
         '<span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
         '<div class="crd-toolrow"><span class="crd-tool-verb mono">' + esc(e.verb) + "</span>" +
         '<span class="crd-tool-name mono">' + esc(e.target) + "</span>" +
@@ -1867,7 +1938,6 @@
     if (!acc || acc.loading || acc.exhausted) return;
     var sid = ui.sid;
     var scrollEl = qs(node, ".crd-timeline-scroll");
-    var heightBefore = scrollEl.scrollHeight;
     acc.loading = true;
     acc.error = null;
     renderOlderStatus(node, acc);
@@ -1881,8 +1951,14 @@
         if (j.total != null) acc.total = j.total;
         acc.exhausted = acc.items.length >= acc.total || !(j.items && j.items.length);
         renderOlderStatus(node, acc);
-        renderTimelineEntries(scrollEl, ui, ui.lastSession, true, ctx);
-        scrollEl.scrollTop += (scrollEl.scrollHeight - heightBefore); // keep the reader's place (FIX 4 layout-stability rule)
+        // FIX (defect 1): older entries now sort to the BOTTOM of the newest-first
+        // list (smaller t = further down), i.e. strictly AFTER whatever the reader
+        // was already looking at — nothing above the viewport moves, so (unlike the
+        // old oldest-first order, where older pages used to be prepended above the
+        // reader and needed the scrollTop compensation that used to live here)
+        // no adjustment is needed; { noTopGrowth: true } tells the render path not
+        // to apply its usual "new content landed above" compensation either.
+        renderTimelineEntries(scrollEl, ui, ui.lastSession, true, ctx, { noTopGrowth: true });
       })
       .catch(function () {
         if (ui.sid !== sid || ui.narrAcc !== acc) return;
@@ -1909,21 +1985,91 @@
       el2 = document.createElement("div");
       el2.className = "crd-timeline-older";
       el2.hidden = true;
-      scrollEl.insertBefore(el2, scrollEl.firstChild);
+      // FIX (defect 1): older history now lives at the BOTTOM of the newest-first
+      // list (was the top, back when the list was oldest-first) — append, don't
+      // insertBefore(firstChild).
+      scrollEl.appendChild(el2);
     }
     return el2;
   }
 
-  function renderTimelineEntries(scrollEl, ui, session, force, ctx) {
+  // ---- FIX (defect 2): the four legend words are individually-selectable, additive
+  // filter chips now, layered on top of the existing all/talk preset. ----
+  var TIMELINE_KIND_KEYS = ["prompts", "narration", "tools", "results"];
+  var TIMELINE_KIND_MAP = {
+    prompts: ["prompt"],
+    narration: ["narration"],
+    tools: ["tool"],
+    // "results" = the outcome of something the session ran — both a passing and a
+    // failing command are "a result".
+    results: ["command", "command-fail"]
+  };
+  // NOTE (defect 2, ask's home): `ask` (a decision/open question) deliberately maps
+  // to NONE of the four chips. It's arguably conversational, but "talk only" is
+  // shipped, tested behaviour that excludes ask today (:kind==="prompt"||"narration"
+  // only) — folding it into the narration or prompts bucket would make toggling
+  // that chip silently start showing decisions under "talk only", changing behaviour
+  // the owner explicitly said not to touch. So ask stays exactly where it already
+  // was: visible only under the "all" preset (no chips active), same as before this
+  // fix. A fifth "questions" chip would be the clean way to make it independently
+  // selectable, if that's ever wanted — not invented here since it wasn't asked for.
+
+  function timelineActiveKinds(ui) {
+    return TIMELINE_KIND_KEYS.filter(function (k) { return ui.timelineKindsOn && ui.timelineKindsOn[k]; });
+  }
+
+  // Pure predicate: (entry, ui) -> visible? Exposed via _internal for testing.
+  function timelineEntryVisible(e, ui) {
+    var active = timelineActiveKinds(ui);
+    if (active.length) {
+      for (var i = 0; i < active.length; i++) {
+        if (TIMELINE_KIND_MAP[active[i]].indexOf(e.kind) >= 0) return true;
+      }
+      return false;
+    }
+    // No chip active — defer to the existing, unchanged all/talk preset.
+    return ui.timelineFilter === "talk" ? (e.kind === "prompt" || e.kind === "narration") : true;
+  }
+
+  function updateTimelineFilterButtons(wrap, ui) {
+    var active = timelineActiveKinds(ui);
+    qsa(wrap, ".crd-timeline-filters button[data-mode]").forEach(function (b) {
+      var mode = b.getAttribute("data-mode");
+      if (mode === "kind") {
+        b.classList.toggle("is-active", active.indexOf(b.getAttribute("data-kind")) >= 0);
+      } else {
+        b.classList.toggle("is-active", !active.length && ui.timelineFilter === mode);
+      }
+    });
+  }
+
+  // Parity (Auggie / augment-*): names what's actually missing instead of a bare
+  // "nothing recorded yet" — the owner's own complaint about the old degraded-state
+  // handling elsewhere in this file (renderAgentsPanel's providerNote branch).
+  var TIMELINE_KIND_NOUN = { prompts: "prompts", narration: "narration", tools: "tool activity", results: "command results" };
+  function timelineEmptyMessage(ui) {
+    var active = timelineActiveKinds(ui);
+    if (active.length) {
+      var nouns = active.map(function (k) { return TIMELINE_KIND_NOUN[k] || k; });
+      return emptyHtml("No " + nouns.join(" or ") + " recorded",
+        "This session hasn't produced any yet — some providers (Auggie, Augment) never will, since they carry no commands/tools data.");
+    }
+    if (ui.timelineFilter === "talk") return emptyHtml("No prompts or narration recorded yet", "Talk-only shows just what was said.");
+    return emptyHtml("Nothing recorded yet", "The first prompt starts the conversation.");
+  }
+
+  function renderTimelineEntries(scrollEl, ui, session, force, ctx, opts) {
     if (!session) return;
     ensureNarrAccumulator(ui, session);
     var sessionForTimeline = Object.assign({}, session, { narrative: ui.narrAcc.items });
-    var all = mergeTimeline(sessionForTimeline);
+    var all = mergeTimeline(sessionForTimeline); // newest-first (defect 1)
 
-    // FIX 2: index every diagram-bearing narration entry, in chronological order, so
-    // the narration-diagram dialog's prev/next/latest (below) can step between them —
-    // independent of the current talk/all filter, since a diagram entry always passes
-    // both.
+    // FIX 2: index every diagram-bearing narration entry. Sorted ASCENDING here,
+    // independent of `all`'s own (now newest-first, defect 1) order — this list's
+    // consumer, openNarrationDiagram()/ext_cr_dialogs.js's narration-diagram
+    // pop-out, assumes onLatest = the LAST index and onNext steps toward newer;
+    // re-sorting keeps that contract true regardless of which order the timeline
+    // itself renders in.
     var diagramEntries = [], diagramByKey = {};
     all.forEach(function (e) {
       if (e.kind !== "narration") return;
@@ -1936,19 +2082,26 @@
       // openNarrationDiagram()'s own comment).
       diagramEntries.push({ key: e.key, t: e.t, family: d.family, nodes: d.nodes, src: d.src });
     });
+    diagramEntries.sort(function (a, b) { return a.t - b.t; });
     ui.diagramEntries = diagramEntries;
 
-    var filtered = ui.timelineFilter === "talk" ?
-      all.filter(function (e) { return e.kind === "prompt" || e.kind === "narration"; }) : all;
+    // FIX (defect 2): the four chips (additive) win over the all/talk preset when
+    // any is active; otherwise the preset behaves exactly as it did before.
+    var filtered = all.filter(function (e) { return timelineEntryVisible(e, ui); });
+    // FIX (defect 3): the pop-out/nav path reads this — always the current
+    // filtered, newest-first list, so index 0 is "the newest visible entry".
+    ui.timelineEntries = filtered;
 
     if (force || filtered.length !== ui.timelineSeen || !scrollEl.childNodes.length) {
-      var wasStuck = ui.timelineStuckBottom;
+      var wasStuck = ui.timelineStuckLatest;
       var prevScrollTop = scrollEl.scrollTop;
+      var heightBefore = scrollEl.scrollHeight;
       var olderEl = scrollEl.querySelector(".crd-timeline-older"); // preserved across the repaint below
       scrollEl.innerHTML = filtered.length ?
         filtered.map(function (e) { return entryHtml(e, ctx, diagramByKey[e.key]); }).join("") :
-        emptyHtml("Nothing recorded yet", "The first prompt starts the conversation.");
-      if (olderEl) scrollEl.insertBefore(olderEl, scrollEl.firstChild);
+        "";
+      if (!filtered.length) scrollEl.innerHTML = timelineEmptyMessage(ui);
+      if (olderEl) scrollEl.appendChild(olderEl); // FIX (defect 1): older status lives at the bottom now
       // Upgrade every diagram card just painted from its instant node-pill fallback to
       // the real mermaid.js render -- app.js's shared upgradeMermaidIn()/renderMermaid(),
       // the SAME function the classic UI's markdown modals call (app.js is concatenated
@@ -1956,9 +2109,74 @@
       // reachable global here, not a re-implementation).
       if (typeof upgradeMermaidIn === "function") upgradeMermaidIn(scrollEl);
       ui.timelineSeen = filtered.length;
-      if (wasStuck) scrollEl.scrollTop = scrollEl.scrollHeight;
-      else scrollEl.scrollTop = prevScrollTop;
+      // FIX (defect 1): newest-first means fresh entries are prepended at the TOP
+      // now, not appended at the bottom — so a reader who isn't stuck-to-latest
+      // needs the opposite compensation the old oldest-first code never needed.
+      // Callers that instead grew the BOTTOM (paging older history in) pass
+      // {noTopGrowth:true} so this doesn't double-compensate — see loadOlderNarration.
+      if (wasStuck) scrollEl.scrollTop = 0;
+      else if (opts && opts.noTopGrowth) scrollEl.scrollTop = prevScrollTop;
+      else scrollEl.scrollTop = prevScrollTop + (scrollEl.scrollHeight - heightBefore);
     }
+  }
+
+  // FIX (defect 3): "the timeline doesn't pop out like it is used to pop out for
+  // the narration." Builds the {title, when, text} the classic modal expects from
+  // whatever kind of merged-timeline entry was clicked; no new markdown renderer —
+  // openText() below still does mdBlock() itself, same as openMsg()/openReq().
+  function timelineEntryModalPayload(e) {
+    var when = (typeof ago === "function" && e.t) ? ago(Math.max(0, (Date.now() - e.t) / 1000)) : fmtClock(e.t);
+    if (e.kind === "prompt") return { title: "Prompt", when: when, text: e.text || "" };
+    if (e.kind === "narration") return { title: "Narration", when: when, text: e.text || "" };
+    if (e.kind === "ask") {
+      var d = e.decision || {};
+      var q0 = (d.questions && d.questions[0]) || { q: "", options: [] };
+      var lines = [];
+      if (q0.q) lines.push("**" + q0.q + "**");
+      (q0.options || []).forEach(function (o) { lines.push("- " + o); });
+      if (!d.open && d.answer) lines.push("\n**Decided:** " + d.answer);
+      else if (d.open) lines.push("\n_View-only — answer in the session itself; the tracker never writes to it._");
+      return { title: "Decision", when: when, text: lines.join("\n") };
+    }
+    if (e.kind === "command" || e.kind === "command-fail") {
+      var c = e.cmd || {};
+      return { title: "Command", when: when, text: "```\n" + (c.cmd || "") + "\n```\n\n" + (c.ok ? "✓ ok" : "✗ failed") };
+    }
+    // "tool": file edit/write/read or a Task-tool dispatch (mergeTimeline's own
+    // comment names exactly which fields are real for these — no duration/diff
+    // exists to show, same honesty rule as entryHtml's own tool row).
+    var parts = ["**" + esc(e.verb || "Tool") + "** " + esc(e.target || "")];
+    if (e.count) parts.push(e.count);
+    if (e.agent) parts.push("via agent");
+    return { title: e.verb || "Tool", when: when, text: parts.join(" · ") };
+  }
+
+  // Copies openMsg()'s own shape exactly (app.js:1618) — _setNav registers the
+  // SAME prev/next/latest nav the classic modal already drives, over
+  // ui.timelineEntries (the CURRENT filtered, newest-first list), not a second
+  // navigation mechanism; openText is the SAME generic modal opener narration/
+  // prompts/todos already use, not a Control-Room-native dialog.
+  function openTimelineEntry(ui, idx) {
+    if (typeof openText !== "function" || typeof _setNav !== "function") return;
+    var list = ui.timelineEntries || [];
+    var e = list[idx];
+    if (!e) return;
+    _setNav(function (i) { openTimelineEntry(ui, i); }, idx, list.length,
+      { len: function () { return (ui.timelineEntries || []).length; }, live: true });
+    var payload = timelineEntryModalPayload(e);
+    openText(payload.title, payload.when, payload.text);
+  }
+
+  function openTimelineEntryByKey(ui, key) {
+    var list = ui.timelineEntries || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].key === key) { openTimelineEntry(ui, i); return; }
+    }
+  }
+
+  function openLatestTimelineEntry(ui) {
+    var list = ui.timelineEntries || [];
+    if (list.length) openTimelineEntry(ui, 0); // index 0 = newest (defect 1)
   }
 
   // FIX 2: opens ext_cr_dialogs.js's existing narration-diagram pop-out (read, not
@@ -2064,6 +2282,11 @@
     stateOf: stateOf,
     firstEventTime: firstEventTime,
     extractDiagram: extractDiagram,
-    groupAgentReruns: groupAgentReruns
+    groupAgentReruns: groupAgentReruns,
+    // defect 2 / defect 3 additions, exposed the same way as everything above:
+    timelineEntryVisible: timelineEntryVisible,
+    TIMELINE_KIND_MAP: TIMELINE_KIND_MAP,
+    timelineEntryModalPayload: timelineEntryModalPayload,
+    openTimelineEntry: openTimelineEntry
   };
 })();

@@ -848,7 +848,20 @@
   .tracker-next .cr-tile--agentgroup { grid-column: span 1; }
 }
 
+/* Plain 'working' state: shadow-raised only, default (--line-subtle) border —
+   5a itself shows a plain "Working" tile with no gold border/glow at all
+   (grep-verified: `border:1px solid var(--ads-line-subtle);box-shadow:var(--ads-shadow-raised)`).
+   The gold agent glow is a SEPARATE modifier, `.cr-tile--agent-glow` below,
+   added by ext_cr_board.js only when the session also has a live background
+   agent (see that file's sessionTile() for the rule + evidence). */
 .tracker-next .cr-tile--working {
+  box-shadow: var(--shadow-raised);
+}
+/* Item 3: 5a's OTHER simultaneously-"Working" tile carries this gold border +
+   glow, and its head shows a "🤖 2" live-background-agent badge where the
+   plain tile above shows only elapsed time — the glow marks background
+   agents, not the working state itself. */
+.tracker-next .cr-tile--agent-glow {
   border-color: var(--line-agent);
   box-shadow: var(--glow-agent-soft), var(--shadow-raised);
 }
@@ -866,15 +879,31 @@
   padding: 2px;
   background: linear-gradient(135deg, var(--state-awaiting), var(--line-awaiting));
 }
+/* Item 1: 5a's hero splits HORIZONTALLY — a main column beside a fixed-width
+   side rail (see `.cr-tile-main` / `.cr-tile-sidebar` below), never a vertical
+   stack. `flex-direction: row` (the default here, but stated explicitly since
+   this rule USED TO be `column` — that was the bug) + the exact gap/padding
+   measured off 5a's own inline style
+   (`padding:15px 17px;display:flex;gap:20px`, item 5). */
 .tracker-next .cr-tile--hero .cr-tile-inner {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: row;
+  gap: 20px;
+  padding: 15px 17px;
+  border-radius: 9px;
+  background: var(--surface-raised);
+}
+/* The hero's main column — head/title/sub/line/ticks/pr — carries the SAME
+   column stacking `.cr-tile-inner` used to do itself before item 1's fix
+   turned that rule into a row; unchanged visually for every element inside. */
+.tracker-next .cr-tile-main {
   flex: 1;
   min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 12px 14px;
-  border-radius: 9px;
-  background: var(--surface-raised);
 }
 .tracker-next .cr-tile--hero { display: flex; }
 
@@ -930,12 +959,20 @@
   white-space: nowrap;
 }
 
+/* Item 2: 5a measures the hero title at 600 16px/1.3 (--fs-tile-title-max, the
+   token's own value — unchanged) but all FIVE non-hero tiles at 600 14px/1.3 —
+   grep-verified, not guessed. --fs-tile-title-max isn't ours to redefine
+   (ext_cr.css), so the base rule takes the non-hero (more common) size as a
+   literal and the hero override below restores the token's own 16px value. */
 .tracker-next .cr-tile-title {
-  font: var(--fw-tile-title) var(--fs-tile-title-max)/var(--lh-tile-title) var(--font-sans);
+  font: var(--fw-tile-title) 14px/var(--lh-tile-title) var(--font-sans);
   color: var(--text-primary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.tracker-next .cr-tile--hero .cr-tile-title {
+  font-size: var(--fs-tile-title-max);
 }
 .tracker-next .cr-tile-sub {
   font: var(--fw-trace) 10.5px/var(--lh-trace) var(--font-mono);
@@ -944,10 +981,14 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Item 4: 5a measures its plain tile-body text at 12.5px/1.45 — grep-verified.
+   --fs-body-min/--lh-body-max (ext_cr.css, not ours to edit) resolve to
+   13px/1.6, so the leading fix is a literal override here, minimal (only the
+   two properties that differ; --fw-body stays a token). */
 .tracker-next .cr-tile-line {
   flex: 1;
   min-width: 0;
-  font: var(--fw-body) var(--fs-body-min)/var(--lh-body-max) var(--font-sans);
+  font: var(--fw-body) 12.5px/1.45 var(--font-sans);
   color: var(--text-secondary);
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -994,12 +1035,19 @@
   color: var(--text-muted);
 }
 
+/* Item 1: 5a's side rail is a fixed-width COLUMN beside the main content,
+   divided by a vertical border-left — not a horizontal strip stacked below
+   it. Exact measurements off 5a's own inline style
+   (`flex:0 0 124px;border-left:1px solid var(--ads-line-subtle);
+   padding-left:17px;display:flex;flex-direction:column;gap:10px`). */
 .tracker-next .cr-tile-sidebar {
+  flex: 0 0 124px;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding-top: 6px;
-  border-top: 1px solid var(--line-subtle);
+  gap: 10px;
+  padding-left: 17px;
+  border-left: 1px solid var(--line-subtle);
 }
 .tracker-next .cr-tile-counts {
   display: flex;
@@ -1211,6 +1259,23 @@
      so no stray divider remains at the strip's right edge. */
   .tracker-next .cr-triage-hist { display: none; }
   .tracker-next .cr-triage-cell--flagged { border-right: none; }
+
+  /* Item 1's two-column hero (measured off 5a's 1240px-wide desktop artboard)
+     has no phone-tier guidance in that artboard — 5a is never shown at a
+     390px board width. At phone width the hero has already collapsed to a
+     single grid column (line ~841 above), leaving too little room for a
+     124px fixed side rail beside real content; restore the pre-fix vertical
+     stack here so nothing regresses on the phone tier this file must not
+     break, while the desktop/tablet two-column fix stands everywhere above
+     this breakpoint. */
+  .tracker-next .cr-tile--hero .cr-tile-inner { flex-direction: column; gap: 8px; }
+  .tracker-next .cr-tile-sidebar {
+    flex: 0 0 auto;
+    padding-left: 0;
+    padding-top: 6px;
+    border-left: none;
+    border-top: 1px solid var(--line-subtle);
+  }
 }
 
 /* ============================================================

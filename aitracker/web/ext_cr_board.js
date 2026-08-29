@@ -11,12 +11,16 @@ window.CR = window.CR || {};
 (function () {
   'use strict';
 
-  // Mirrors config.LIVE_WINDOW (server) / LIVE (app.js) — same constant,
-  // same meaning, per CLAUDE.md's "Liveness is one constant" rule. This file
-  // cannot import aitracker/config.py or app.js, so the literal is repeated
-  // here; if that constant ever changes, this is one of the two client
-  // places (app.js's `LIVE`) that must change with it.
-  var LIVE_WINDOW = 300;
+  // Mirrors config.LIVE_WINDOW (server) / LIVE (app.js) — same constant, same
+  // meaning, per CLAUDE.md's "Liveness is one constant" rule. app.js's `LIVE`
+  // IS reachable here: page.py concatenates every web/*.js file into ONE
+  // <script> tag, app.js first (page.py: read("app.js") + read_ext(".js")),
+  // so its top-level `const LIVE = 300` sits in the same script-level scope
+  // this IIFE closes over — verified by reading page.py, not assumed (an
+  // earlier version of this comment claimed app.js wasn't reachable; that was
+  // false). Derived from it with a safe literal fallback only for the
+  // (currently never-exercised) case this file is ever loaded standalone.
+  var LIVE_WINDOW = (typeof LIVE !== 'undefined') ? LIVE : 300;
 
   // Sort rank for the board — reproduced verbatim from doc 02 "Sort order".
   var RANK = { awaiting: 0, flagged: 1, working: 2, landed: 3, idle: 4 };
@@ -277,25 +281,41 @@ window.CR = window.CR || {};
     return Math.floor(h / 24) + 'd';
   }
 
-  // NOTE: "tool" (as in "age · tool" / "project · tool") isn't a field the
-  // list dict carries; the nearest available signal is `source`
-  // ('' -> Claude Code, 'auggie', 'augment-vscode', 'augment-cursor'). Mapped
-  // to a short display label here rather than left as the raw provider id.
+  // "tool" (as in "age · tool" / "project · tool") isn't a field the list
+  // dict carries; the nearest available signal is `source`. This used to
+  // maintain its own 4-entry SOURCE_LABEL map — a second, incomplete copy of
+  // app.js's real one (SRC/srcLabel, app.js:818-819, all 7 known source ids:
+  // '', 'cli', 'claude-desktop', 'sdk-cli', 'claude-vscode', 'auggie',
+  // 'augment-vscode', 'augment-cursor') — so claude-desktop/sdk-cli/
+  // claude-vscode sessions rendered their raw internal id on their tile.
+  // `srcLabel` IS reachable here: page.py concatenates every web/*.js file
+  // into ONE <script> tag, app.js first (page.py: read("app.js") +
+  // read_ext(".js")), so its top-level `const srcLabel` sits in the same
+  // script-level scope this IIFE closes over — verified by reading page.py.
   //
-  // Round-5 drift (decision 4b): 5a's own board tiles render this label as a
-  // lowercase literal ("2m · claude cli"), not the Title-Case product name
-  // this used to show -- grep-verified against the prototype HTML itself
-  // (30 hits for "claude cli", 4 for "auggie cli", 6 for "augment cursor",
-  // all lowercase, all inline text, never CSS text-transform). augment-vscode
-  // has no confirmed prototype label of its own (the one 4-hit "claude vs
-  // code" string in the source doesn't correspond to any of this app's real
-  // provider sources — it names a different product/surface combination than
-  // 'augment-vscode' ever is here — so it's not adopted); 'augment vs code'
-  // is this map's own extrapolation of the SAME lowercase "<vendor> <surface>"
-  // pattern the other three entries actually use.
-  var SOURCE_LABEL = { '': 'claude cli', 'auggie': 'auggie cli',
-                        'augment-vscode': 'augment vs code', 'augment-cursor': 'augment cursor' };
-  function toolLabel(source) { return SOURCE_LABEL[source || ''] || (source || 'unknown'); }
+  // Round-5 drift (decision 4b): 5a's own board tiles render this label as an
+  // all-lowercase, no-parens literal ("2m · claude cli"), never the Title-
+  // Case + icon-glyph form app.js's SRC map uses for the classic dashboard —
+  // grep-verified against the prototype HTML itself (30 hits for "claude
+  // cli", 4 for "auggie cli", 6 for "augment vs code", 6 for "augment
+  // cursor", all lowercase, all inline text, never CSS text-transform). Kept
+  // as a TRANSFORM applied over the real map's output, not a second
+  // hand-written table: strip SRC's leading icon glyph, drop parens,
+  // lowercase, then two small CONTENT-driven (never source-id-keyed)
+  // fixups — a bare vendor-less word gets a "claude " prefix (every
+  // Claude-family SRC label omits the vendor, since SRC is this app's own
+  // map and Claude is its default/implied vendor; Auggie/Augment already
+  // spell theirs), and the one vendor word with no surface of its own
+  // ("auggie") gets " cli" appended. '' falls back to the 'cli' entry
+  // (srcLabel('') itself resolves to '' — SRC has no '' key, only 'cli').
+  function toolLabel(source) {
+    if (typeof srcLabel !== 'function') return source || 'unknown';
+    var label = srcLabel(source || 'cli').replace(/^\S+\s*/, '').toLowerCase().replace(/[()]/g, '');
+    if (!label) return source || 'unknown';
+    if (label.indexOf('aug') !== 0) label = 'claude ' + label;
+    else if (label === 'auggie') label += ' cli';
+    return label;
+  }
 
   // The ONE shortening rule for a raw model id (e.g. "claude-opus-4-8" ->
   // "opus 4.8", "claude-opus-5" -> "opus 5", "claude-sonnet-4-5-20250929" ->
@@ -1638,6 +1658,17 @@ window.CR = window.CR || {};
       var s = t.session, state = t.state;
       var cls = 'cr-tile cr-tile--' + state;
       if (t.hero) cls += ' cr-tile--hero cr-tile--span2';
+      // Item 3: the gold "agent" glow (border-line-agent + glow-agent-soft) marks
+      // a tile with LIVE BACKGROUND AGENTS, not merely the plain 'working' state —
+      // confirmed against 5a itself: two simultaneously-"Working" tiles, one
+      // glowing (head shows "🤖 2", a live background-agent count) and one plain
+      // (head shows only elapsed time, no bg-agent badge). `s.bg` is that exact
+      // count (providers/claude.py:448, "in-transcript background agents live
+      // now"); Auggie/augment_ext always emit `bg: 0` (no background-agent concept
+      // for those tools — providers/auggie.py:267/281, providers/augment_ext.py:194),
+      // so those sessions degrade cleanly to the plain 'working' treatment below,
+      // never to a broken or empty one.
+      if (state === 'working' && (s.bg || 0) > 0) cls += ' cr-tile--agent-glow';
       var attrs = tileBaseAttrs(t);
       attrs.class = cls;
       attrs.title = (s.prompt || s.title || '(no prompt)') + '\n' + (s.cwd || '') +
@@ -1664,18 +1695,25 @@ window.CR = window.CR || {};
       if (pr) body.push(pr);
 
       if (t.hero) {
+        // Item 1: 5a's hero splits HORIZONTALLY — the main column (head/title/
+        // sub/line/ticks/pr, `body` above) at `flex:1` beside a `flex:0 0 124px`
+        // side rail, separated by a vertical border-left — not a vertical stack.
+        // `body` is wrapped in its own `.cr-tile-main` column so `.cr-tile-inner`
+        // itself can switch to a row flex (ext_cr_board.css) with the sidebar as
+        // a true sibling column, matching 5a's own two-column markup exactly.
+        var main = h('div', { class: 'cr-tile-main' }, body);
         // NOTE: files/failing counts the doc's hero side-rail calls for
         // aren't in the list dict either; only `note_count` is available.
         // Rendered honestly with what exists rather than fabricating the
         // other two counters — REQUIRED ADDITION in the report.
-        body.push(h('div', { class: 'cr-tile-sidebar' }, [
+        var sidebar = h('div', { class: 'cr-tile-sidebar' }, [
           h('div', { class: 'cr-tile-counts' }, [emoji('📝', 'tn-emo-n'), (s.note_count || 0) + ' notes']),
           h('button', {
             class: 'cr-tile-action', type: 'button',
             onclick: function (e) { e.stopPropagation(); ctx && ctx.emit && ctx.emit('terminal:open', { id: s.id }); }
           }, ['Open terminal to answer']),
-        ]));
-        var inner = h('div', { class: 'cr-tile-inner' }, body);
+        ]);
+        var inner = h('div', { class: 'cr-tile-inner' }, [main, sidebar]);
         return h('div', attrs, [inner]);
       }
       return h('div', attrs, body);
