@@ -248,6 +248,59 @@ class TestPageBundle(unittest.TestCase):
             "\n".join(f"  {f}" for f in failed_files)
         )
 
+    def test_script_block_count(self):
+        """Assert the assembled page has exactly 2 <script> blocks.
+
+        The page consists of:
+          1. index.html's theme init script (line 6)
+          2. The main app bundle (placeholder __JS__ on line 186 gets filled)
+
+        A higher count signals that the closing script tag bug broke the inlined
+        <script> tag, causing the browser to prematurely close it and spawn new ones.
+        """
+        html = _read_page()
+        script_pattern = re.compile(r'<script[^>]*>(.*?)</script>', re.DOTALL)
+        script_blocks = list(script_pattern.finditer(html))
+
+        self.assertEqual(
+            len(script_blocks), 2,
+            f"Expected 2 <script> blocks, found {len(script_blocks)}. "
+            f"A count > 2 indicates the closing script tag bug: a literal </script> "
+            f"inside a comment or string in a .js file terminated the inlined <script> "
+            f"early, causing multiple <script> blocks instead of one bundle. "
+            f"Check aitracker/web/*.js for </script> in comments/strings."
+        )
+
+    def test_no_closing_script_in_js_files(self):
+        """Scan all aitracker/web/*.js files for the literal </script> tag.
+
+        If any .js file contains </script> (even in a comment or string), it will
+        terminate the inlined <script> tag in the assembled HTML, causing a
+        SyntaxError and breaking the dashboard silently. This test catches the bug
+        at its source by checking the source files.
+        """
+        failed_files = []
+        for name in sorted(os.listdir(_WEB)):
+            if not name.endswith(".js"):
+                continue
+            path = os.path.join(_WEB, name)
+            with open(path, encoding="utf-8") as fh:
+                content = fh.read()
+
+            # Find all occurrences of the literal closing script tag.
+            for i, line in enumerate(content.split("\n"), start=1):
+                if "</script>" in line:
+                    # Extract the offending text for clarity.
+                    snippet = line.strip()[:60]
+                    failed_files.append(f"{name}:{i}: {snippet}")
+
+        self.assertEqual(
+            failed_files, [],
+            f"Found closing </script> tag in .js file(s) — this terminates the inlined "
+            f"<script> and breaks every module after it:\n" +
+            "\n".join(f"  {f}" for f in failed_files)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

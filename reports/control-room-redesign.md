@@ -177,14 +177,85 @@ no control. **This is a product call and may want reversing.**
   name matches above project/prompt matches.
 - No selfcheck assertions for `spineSegments` / `boardTiles` / `sessionState`.
 
+## PRECEDENCE DECISION (owner, 2026-08-29) — the prototype wins
+
+The `.dc.html` is a FIVE-ROUND design history (artboards `1a`..`5d`), not one design.
+Round 5 is final: `5a` board, `5b` detail view, `5c` Help/Config, `5d` terminal.
+**The five `.md` docs were written from ROUND 4** and never caught up, but the handoff
+README told implementers to ignore the prototype and follow the docs. That instruction
+is the direct cause of the drift the owner observed.
+
+**Owner's ruling: go by the HTML. Round 5 is the latest and wins.** Where a `.md` doc
+conflicts with a round-5 artboard, the artboard is authoritative and the doc is
+historical. Do not "fix" the implementation back toward a doc that round 5 superseded.
+
+### Owner's additional product decisions, same date
+
+1. **Cap footer**: current copy is fine, leave it.
+2. **Session rail** must show the FOLDER each session runs from, and gain a
+   **group-by** control: directory / activeness / last 24h / last 7 days /
+   last 30 days / none.
+3. **Tile title**: the "waiting on you" hero is fine as-is. For every other state the
+   title must be the SESSION NAME plus the directory it was spawned from — **not the
+   last prompt**, which is what ships today.
+4. **Board tile count**: a real 3-8 slider (matches the prototype's own Config, which
+   already draws 3-8).
+5. **Stop-a-session**: do not drop anything — mirror the old UI's behaviour.
+6. **config.json**: settings editable from the app itself.
+7. Standing policy: **never invent a new pattern without confirmation; follow the
+   existing one; if something better exists, ask.**
+
+## The browser pass — what 1190 passing tests could not see
+
+The UI was finally rendered in a real browser (Playwright, not the Chrome extension).
+It found five bugs in minutes, none of which any existing check could catch:
+
+1. **A CSS comment deleted four stylesheets.** `ext_cr_boot.css`'s header comment
+   contained `--surface-*/--text-*/--line-*`. Each `*/` TERMINATES a CSS comment, so
+   parsing broke and **659 rules were silently dropped** — the entire detail view,
+   dialogs, terminal and bootstrap CSS rendered unstyled. Rule count 539 -> 1198 once
+   fixed. `make check`, `node --check` and the JS bundle test all passed throughout.
+2. **The board rendered zero tiles.** `boardTiles()` excluded every `agent` session,
+   while `agentGroups()` skipped agents with no `group`. A session with
+   `agent:true, group:""` fell through both and vanished. Live: 950 sessions, 1
+   working, 0 tiles. Now filters only agents a group tile will actually represent.
+3. **The classic dashboard stayed rendered underneath.** `.app` read `hidden=true`
+   while computing to `display:flex`, 1440x757 — still painted, still clickable,
+   still polling. The UA's `[hidden]` rule (0,1,0) loses to any class rule that sets
+   `display`.
+4. **The fork banner drew an empty 38px strip** — same root cause as (3).
+5. **Toast and permission nudge covered the header**, blocking the detail view's
+   Open terminal / Resume here / External buttons.
+
+(3) and (4) were the same bug class, so the fix is one blanket rule in the foundations
+file — `.tracker-next [hidden] { display: none !important; }` — rather than chasing
+selectors. Verified afterwards: zero elements in the whole page are hidden-but-visible.
+
+Two permanent guards were added so none of this can regress silently:
+`tests/test_page_bundle.py` (executes the assembled JS under a stub DOM, asserts the
+modules register) and `tests/test_page_css.py` (premature `*/` terminators, comment
+and brace balance, and that a representative selector from EVERY `ext_cr*.css`
+survives into the served page).
+
+**Lesson worth keeping: this project's gate cannot see the assembled page.** Anything
+touching `aitracker/web/` needs the page executed and parsed, ideally rendered, not
+just linted.
+
 ## Not verified — be aware before trusting this
 
-- **No real browser load.** The Chrome extension was not connected, so the UI was
-  never rendered in an actual browser. Substituted: a stub-DOM execution of the real
-  served bundle, `node --check` on the concatenated bundle, and structural HTML checks.
-  **Visual fidelity against the design was never checked by eye.**
-- **No contrast/accessibility audit** against the doc's stated 4.5:1 / 3:1 floor.
-- The "colour never carries meaning alone" clause rests on module self-reports.
+- **Rendered, but only the light theme and only two screens.** A real browser pass
+  (Playwright) confirmed the board and the detail view render correctly in LIGHT
+  theme at ~1440px: the rail, triage strip and histogram, the 8-tile cap, the
+  progress spine with its event gutter and FAIL/NOW markers, the three columns with
+  every card collapsed except the timeline, the merged prompts+narration timeline,
+  the Links panel, the failing-commands tint, the PINNED pill, and the entry/mode
+  switch. **Not yet rendered: dark theme, the phone and tablet layouts, the terminal
+  pane, and every dialog (Help, Config, the drill pop-outs).**
+- **No contrast audit** against the doc's stated 4.5:1 / 3:1 floor, in either theme.
+- The "colour never carries meaning alone" clause still rests on module self-reports,
+  though the screens that were rendered do pair every state with a word.
+- Known cosmetic issue seen in the render: a board tile's cwd line clips rather than
+  ellipsing.
 
 ## Verification actually performed
 

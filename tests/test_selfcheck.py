@@ -598,6 +598,62 @@ def _run():
     # SAME two keys, honestly null, never a guess. (`pa` == parse_auggie("sess1") from above.)
     assert all(t["started_at"] is None and t["ended_at"] is None for t in pa["todos"]), pa["todos"]
 
+    # task store PRUNED (Claude Code deletes ~/.claude/tasks/<sid>/*.json after ~2 days): the
+    # transcript's own TaskCreate/TaskUpdate history must be replayed instead of coming back
+    # empty. sess-recon gets no directory at all under config.TASKS_DIR (load_tasks -> []),
+    # so parse_session has nothing but the transcript to work with.
+    d6 = os.path.join(pdir, "-x-sess-recon"); os.makedirs(d6)
+    _mk(d6, "sess-recon.jsonl", "/x", "cli", "2026-06-01T09:00:00Z", "do three things")
+    with open(os.path.join(d6, "sess-recon.jsonl"), "a") as fh:
+        for r in [
+            {"type": "assistant", "timestamp": "2026-06-01T09:01:00.000Z", "message": {"content": [
+                {"type": "tool_use", "id": "tc1", "name": "TaskCreate",
+                 "input": {"subject": "First reconstructed", "description": "do it"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tc1",
+                 "content": "Task #1 created successfully: First reconstructed"}]}},
+            {"type": "assistant", "timestamp": "2026-06-01T09:02:00.000Z", "message": {"content": [
+                {"type": "tool_use", "id": "tc2", "name": "TaskCreate",
+                 "input": {"subject": "Second reconstructed"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tc2",
+                 "content": "Task #2 created successfully: Second reconstructed"}]}},
+            {"type": "assistant", "timestamp": "2026-06-01T09:03:00.000Z", "message": {"content": [
+                {"type": "tool_use", "id": "tc3", "name": "TaskCreate",
+                 "input": {"subject": "Third reconstructed"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tc3",
+                 "content": "Task #3 created successfully: Third reconstructed"}]}},
+            {"type": "assistant", "timestamp": "2026-06-01T09:10:00.000Z", "message": {"content": [
+                {"type": "tool_use", "name": "TaskUpdate", "input": {"taskId": "1", "status": "in_progress"}}]}},
+            {"type": "assistant", "timestamp": "2026-06-01T09:20:00.000Z", "message": {"content": [
+                {"type": "tool_use", "name": "TaskUpdate", "input": {"taskId": "1", "status": "completed"}}]}},
+            # task 2 goes in_progress and stays there (never completed) -- lands at index 1, not 0
+            {"type": "assistant", "timestamp": "2026-06-01T09:25:00.000Z", "message": {"content": [
+                {"type": "tool_use", "name": "TaskUpdate", "input": {"taskId": "2", "status": "in_progress"}}]}},
+            # task 3 never updated at all -- stays "pending"
+        ]:
+            fh.write(json.dumps(r) + "\n")
+    assert load_tasks("sess-recon") == [], "no task-store dir at all -- the pruned-history case"
+    drec = parse_session(os.path.join(d6, "sess-recon.jsonl"))
+    assert [t["content"] for t in drec["todos"]] == \
+        ["First reconstructed", "Second reconstructed", "Third reconstructed"], drec["todos"]
+    assert [t["status"] for t in drec["todos"]] == ["completed", "in_progress", "pending"], drec["todos"]
+    assert drec["counts"]["todos"] == 3 and drec["counts"]["done"] == 1, drec["counts"]
+    by_rid = {t["id"]: t for t in drec["todos"]}
+    assert by_rid["1"]["desc"] == "do it", by_rid["1"]
+    assert by_rid["1"]["started_at"] == _ts_epoch("2026-06-01T09:10:00.000Z"), by_rid["1"]
+    assert by_rid["1"]["ended_at"] == _ts_epoch("2026-06-01T09:20:00.000Z"), by_rid["1"]
+    assert by_rid["2"]["started_at"] == _ts_epoch("2026-06-01T09:25:00.000Z"), by_rid["2"]
+    assert by_rid["2"]["ended_at"] is None, "still in_progress -> no fabricated ended_at"
+    assert by_rid["3"]["started_at"] is None and by_rid["3"]["ended_at"] is None, "never touched"
+    # ...but the session-LIST surface (/api/list) does NOT recover this: it reads load_tasks()
+    # only, never a transcript, on purpose (950 sessions polled every ~5s -- a per-session
+    # transcript read there would be the slow-dashboard regression, not a fix).
+    lst6 = {s["id"]: s for s in list_sessions()}
+    assert (lst6["sess-recon"]["todo_total"], lst6["sess-recon"]["todo_done"]) == (0, 0), \
+        lst6["sess-recon"]  # deliberately NOT reconstructed -- see the comment above
+
     # Augment-ext (VSCode/Cursor extension) rides the SAME todo_total/todo_done/todo_current
     # session-list capability as Claude/Auggie above, off its own task-storage subTasks tree --
     # and, like Auggie, has no reliable join key for started_at/ended_at, so both come back
@@ -677,4 +733,161 @@ def _run():
     assert push_when(True, 0, LIVE_WINDOW) == "wake", "idle claude session -> lands on wake"
     assert push_when(True, 1, LIVE_WINDOW) == "turn", "just inside the live window -> this turn"
     assert push_when(False, LIVE_WINDOW, LIVE_WINDOW) == "none", "no drain beats liveness"
+
+    # Auggie: approximate per-todo timings recovered by NAME, not id -- add_tasks/update_tasks
+    # key a task by a short per-call id that does NOT match the task-storage file's uuid (see
+    # _auggie_resolve's docstring), so a todo's timing is recovered by matching its NAME back to
+    # that chat-side id space via every add_tasks/update_tasks tool_result_node's echoed
+    # "UUID:<id> NAME:<name> DESCRIPTION:…" text. A name pinning down exactly one chat-side id
+    # gets real timings from that id's update_tasks transitions; a name that collides across TWO
+    # different chat-side ids ("Dup Task" below, from two unrelated tasks that happen to share a
+    # title) is ambiguous and MUST come back null rather than guessing either one's timing.
+    _wtask("root2", name="Current Task List", description="Root task for conversation Y",
+           subTasks=["tu1", "tdup"])
+    _wtask("tu1", name="Unique Task", state="COMPLETE", subTasks=[])
+    _wtask("tdup", name="Dup Task", state="COMPLETE", subTasks=[])
+
+    def _utcall(cid, task_id, state):
+        return {"tool_use": {"tool_name": "update_tasks", "tool_use_id": cid,
+                             "input_json": json.dumps({"tasks": [{"task_id": task_id, "state": state}]})}}
+
+    def _utresult(cid, task_id, name, marker):
+        return {"tool_result_node": {"tool_use_id": cid,
+                "content": ("Task list updated successfully. Created: 0, Updated: 1, Deleted: 0.\n\n"
+                            "# Task Changes\n\n## Updated Tasks\n\n%s UUID:%s NAME:%s DESCRIPTION:desc"
+                            % (marker, task_id, name))}}
+    T1, T2, T3, T4 = ("2026-07-01T10:00:00.000Z", "2026-07-01T10:05:00.000Z",
+                      "2026-07-01T10:10:00.000Z", "2026-07-01T10:15:00.000Z")
+    chat2 = [
+        {"finishedAt": T1, "exchange": {"response_nodes": [_utcall("ut1", "u1chat", "IN_PROGRESS")]}},
+        {"finishedAt": T1, "exchange": {"request_nodes": [_utresult("ut1", "u1chat", "Unique Task", "[/]")]}},
+        {"finishedAt": T2, "exchange": {"response_nodes": [_utcall("ut2", "u1chat", "COMPLETE")]}},
+        {"finishedAt": T2, "exchange": {"request_nodes": [_utresult("ut2", "u1chat", "Unique Task", "[x]")]}},
+        {"finishedAt": T3, "exchange": {"response_nodes": [_utcall("ut3", "dupA", "COMPLETE")]}},
+        {"finishedAt": T3, "exchange": {"request_nodes": [_utresult("ut3", "dupA", "Dup Task", "[x]")]}},
+        {"finishedAt": T4, "exchange": {"response_nodes": [_utcall("ut4", "dupB", "COMPLETE")]}},
+        {"finishedAt": T4, "exchange": {"request_nodes": [_utresult("ut4", "dupB", "Dup Task", "[x]")]}},
+    ]
+    with open(os.path.join(config.AUGGIE_SESSIONS, "sess2.json"), "w") as fh:
+        json.dump({"sessionId": "sess2", "modified": "2026-07-01T10:20:00Z",
+                   "customTitle": "Timings test", "rootTaskUuid": "root2",
+                   "chatHistory": chat2}, fh)
+    pa2 = parse_auggie("sess2")
+    assert pa2["todo_times_approximate"] is True, "Auggie's name-matched timings must be flagged approximate"
+    by_content = {t["content"]: t for t in pa2["todos"]}
+    assert by_content["Unique Task"]["started_at"] == _ts_epoch(T1), by_content["Unique Task"]
+    assert by_content["Unique Task"]["ended_at"] == _ts_epoch(T2), by_content["Unique Task"]
+    assert by_content["Dup Task"]["started_at"] is None and by_content["Dup Task"]["ended_at"] is None, \
+        "a name colliding across two different chat-side ids must stay null, never a guess: %r" % by_content["Dup Task"]
+
+    # PR data on the session-LIST dict (control-room board tile "PR number if any"): only a
+    # `gh pr create` the session itself ran counts -- a PR merely mentioned in narration must
+    # not light up a tile. Cached in _META_CACHE alongside the rest of the session's meta and
+    # resolved via claude.py's _fill_pr (both fixtures below are ended AND freshly-written, so
+    # their mtime is "now" -- inside LIVE_WINDOW, the only sessions a Landed tile could ever be).
+    dpr = os.path.join(pdir, "-repo-x-pr"); os.makedirs(dpr)
+    def _mkpr(fn, rows):
+        p = os.path.join(dpr, fn + ".jsonl")
+        with open(p, "w") as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+        return p
+    def _prhead(cwd):
+        return {"cwd": cwd, "entrypoint": "cli", "timestamp": "2026-08-01T09:00:00Z",
+                "type": "user", "message": {"role": "user", "content": "ship it"}}
+    PR_CREATE_CALL = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "c1", "name": "Bash", "input": {"command": "gh pr create --fill"}}]}}
+    PR_CREATE_RESULT = {"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "c1",
+         "content": "https://github.com/acme/widget/pull/101 created"}]}}
+    PR_DONE = {"type": "assistant", "message": {"content": [{"type": "text", "text": "Opened the PR, all done."}]}}
+    _mkpr("sess_pr_created", [_prhead("/repo/x/pr"), PR_CREATE_CALL, PR_CREATE_RESULT, PR_DONE])
+    # a PR only NARRATED about (never created) must not surface -- the list-path scan never
+    # calls collect_prs on plain assistant text at all, matching parse_session's own
+    # created=False default for narration (see collect_prs's narr-only calls at claude.py:900).
+    PR_MENTION = {"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "see https://github.com/acme/other/pull/55 for context"}]}}
+    _mkpr("sess_pr_mentioned", [_prhead("/repo/x/pr2"), PR_MENTION, PR_DONE])
+    ls3 = {s["id"]: s for s in list_sessions()}
+    assert ls3["sess_pr_created"]["pr_num"] == "101", ls3["sess_pr_created"]
+    assert ls3["sess_pr_created"]["pr_url"] == "https://github.com/acme/widget/pull/101", ls3["sess_pr_created"]
+    assert not ls3["sess_pr_mentioned"]["pr_num"] and not ls3["sess_pr_mentioned"]["pr_url"], \
+        "a PR only narrated about, never created, must not surface on the list dict: %r" % ls3["sess_pr_mentioned"]
+
+    # config.json override precedence for the browser-editable runtime settings (Config
+    # dialog -> POST /api/config -> server.py, which writes config.json; config.py itself
+    # never touches the file, see its module comment -- these resolve functions are pure,
+    # taking the already-loaded overrides dict as an argument). MAX_TERMS has all three
+    # layers (an env var AND a built-in default), so one key pins down the whole chain:
+    # config.json > env var > built-in default.
+    os.environ["TRACKER_MAX_TERMS"] = "20"
+    try:
+        assert config.resolve_max_terms({}) == 20, "env var must beat the built-in default"
+        assert config.resolve_max_terms({"MAX_TERMS": 30}) == 30, "config.json override must beat the env var"
+    finally:
+        del os.environ["TRACKER_MAX_TERMS"]
+    assert config.resolve_max_terms({}) == 12, "built-in default once neither override nor env is set"
+    # The allowlist: POST /api/config's real gate is `key not in config.EDITABLE`
+    # (server.py) -- a bogus key must never validate, and TRACKER_AUTH must never be a
+    # member on purpose (writing a password from a browser into a plaintext file is a
+    # security regression, not a convenience -- see config.py's AUTH comment).
+    assert "MAX_TERMS" in config.EDITABLE
+    assert "TRACKER_AUTH" not in config.EDITABLE, "TRACKER_AUTH must never be browser-writable"
+    assert "NOT_A_REAL_KEY" not in config.EDITABLE, "a non-allowlisted key must never validate"
+
+    # session-LIST `now_line` (a short "what's it doing right now" board-tile phrase) and
+    # `model` (its current model id) -- both ride the SAME bounded tail read _tail_scan
+    # already does for waiting/ended (providers/claude.py), cached in the same mtime-keyed
+    # _META_CACHE entry as pr_num/pr_url/etc, no second read or cache. `now_line` is
+    # LIVE-gated (idle/ended sessions get "" for free); `model` is NOT -- a session still
+    # reports its last known model whether live or idle.
+    NOW_TXT = {"type": "assistant", "message": {"model": "claude-opus-9-test", "content": [
+        {"type": "text", "text": "Working through the retry-backoff edge cases in the client now"}]}}
+    NOW_TOOL = {"type": "assistant", "message": {"model": "claude-opus-9-test", "content": [
+        {"type": "tool_use", "id": "nt1", "name": "Bash", "input": {"command": "pytest -q"}}]}}
+    p_now_live = _mklines("s_now_live", [UMSG, NOW_TXT, NOW_TOOL])
+    p_now_idle = _mklines("s_now_idle", [UMSG, NOW_TXT, NOW_TOOL])
+    os.utime(p_now_live, (time.time(), time.time()))
+    os.utime(p_now_idle, (time.time() - LIVE_WINDOW - 100, time.time() - LIVE_WINDOW - 100))
+    ls_now = {s["id"]: s for s in list_sessions()}
+    assert ls_now["s_now_live"]["now_line"].startswith("Working through the retry-backoff"), \
+        "live session, last block a tool_use (not ended) -> narration fallback surfaces: %r" % ls_now["s_now_live"]
+    assert ls_now["s_now_live"]["model"] == "claude-opus-9-test", ls_now["s_now_live"]
+    assert ls_now["s_now_idle"]["now_line"] == "", \
+        "idle session must get \"\" even with the exact same narration sitting in its tail"
+    assert ls_now["s_now_idle"]["model"] == "claude-opus-9-test", \
+        "model is NOT liveness-gated -- an idle session still reports its last known model: %r" % ls_now["s_now_idle"]
+
+    # same two fields on Auggie's session-LIST dict -- one shared shape, not a second mechanism.
+    with open(os.path.join(config.AUGGIE_SESSIONS, "sess_now.json"), "w") as fh:
+        json.dump({"sessionId": "sess_now", "modified": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                   "chatHistory": [
+                       {"finishedAt": "2026-06-27T05:47:50Z",
+                        "exchange": {"request_message": "start", "response_text": "Refactoring the retry queue now",
+                                     "model_id": "claude-sonnet-9-test"}},
+                       # a later, still-pending exchange with no model_id yet -- must not blank out
+                       # the last KNOWN model (see _auggie_current_model's backward scan)
+                       {"finishedAt": "2026-06-27T05:48:00Z", "exchange": {"request_message": "continue"}},
+                   ]}, fh)
+    _AUGGIE_LIST_CACHE.clear()
+    al_now = {s["id"]: s for s in list_auggie()}
+    assert al_now["auggie:sess_now"]["now_line"] == "Refactoring the retry queue now", al_now["auggie:sess_now"]
+    assert al_now["auggie:sess_now"]["model"] == "claude-sonnet-9-test", al_now["auggie:sess_now"]
+
+    # Augment-ext (VSCode/Cursor extension): no chat transcript at all -> `model` is honestly
+    # "" always; `now_line` still works off the todo tree alone (see augment_ext.py's _list).
+    ext_ws2 = os.path.join(config.VSCODE_WS_ROOT, "wshash-now")
+    ext_tasks2 = os.path.join(ext_ws2, "Augment.vscode-augment", "augment-user-assets", "task-storage", "tasks")
+    os.makedirs(ext_tasks2)
+    with open(os.path.join(ext_ws2, "workspace.json"), "w") as fh:
+        json.dump({"folder": "file:///x/now-proj"}, fh)
+    with open(os.path.join(ext_tasks2, "root.json"), "w") as fh:
+        json.dump({"uuid": "root", "name": "Current Task List", "subTasks": ["t1"]}, fh)
+    with open(os.path.join(ext_tasks2, "t1.json"), "w") as fh:
+        json.dump({"uuid": "t1", "name": "wire up retries", "state": "IN_PROGRESS"}, fh)
+    now_ep = AugmentVscodeProvider()
+    now_erow = next(r for r in now_ep.list() if r["id"] == "augment-vscode:wshash-now:root")
+    assert now_erow["now_line"] == "▶ wire up retries", now_erow
+    assert now_erow["model"] == "", "augment-ext has no chat transcript -- model must be \"\", never a guess"
+
     print("selfcheck ok")

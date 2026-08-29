@@ -255,6 +255,15 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid var(--line)}
    light/dark both read; a classDef fill/stroke/color in the diagram overrides them */
 .mmd{background:var(--side);border:1px solid var(--line);border-radius:8px;padding:12px;margin:0 0 11px;overflow-x:auto}
 .mmd .mmdsvg{display:block;max-width:100%;height:auto;margin:0 auto;font-family:'Source Sans 3',system-ui,sans-serif}
+/* real mermaid.js output (renderMermaid() in app.js) lands in the SAME .mmd card as the
+   hand-rolled .mmdsvg above -- just needs its own svg constrained the same way, since
+   mermaid sets its own width/height/viewBox attributes rather than a %-based size. */
+.mmd svg{display:block;max-width:100%;height:auto;margin:0 auto}
+/* the wrapper mdBlock()/entryHtml() emit around every mermaid fence purely to carry
+   data-mmd-src for renderMermaid()'s later upgrade -- contributes no box of its own so
+   it never double-pads either the hand-rolled .mmd/.cblock.mmdfall fallback or the
+   .cr-diagram-card pill row it wraps in ext_cr_detail.js. */
+.mmd-slot{display:contents}
 .mmdsvg .mmdn{fill:var(--card);stroke:var(--line3);stroke-width:1.4}
 .mmdsvg .mmdt{fill:var(--head);text-anchor:middle;dominant-baseline:auto}
 .mmdsvg .mmde{fill:none;stroke:var(--muted);stroke-width:1.4}

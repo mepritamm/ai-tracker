@@ -3019,13 +3019,14 @@ def _raw_stream_body(handler, pt, q):
                 return
 
 
-# ---- vendored xterm.js static assets --------------------------------------------------------
+# ---- vendored static assets (xterm.js, mermaid.js) --------------------------------------------
 # Served as plain files, NOT inlined into the baked page (unlike ext_vt.js/css -- see page.py's
-# read_ext()): xterm.js alone is ~480KB minified. Even though the default renderer is "xterm"
-# (config.TERM_RENDERER), lazy-loading these assets ensures users who do not open a terminal
-# session never pay for them. ext_vt.js's `_loadXtermAssets()` fetches these lazily, exactly
-# once, only the first time an xterm-rendered terminal is actually opened (see conventions rule 2
-# for lazy loading as the binding invariant for vendored front-end assets).
+# read_ext()): xterm.js alone is ~480KB minified, mermaid.min.js ~3.4MB. Even though the default
+# terminal renderer is "xterm" (config.TERM_RENDERER), lazy-loading these assets ensures users who
+# never open a terminal / never view a diagram don't pay for them. ext_vt.js's
+# `_loadXtermAssets()` and app.js's `_loadMermaidAssets()` each fetch their own asset lazily,
+# exactly once, only the first time the feature that needs it actually activates (see conventions
+# rule 2 for lazy loading as the binding invariant for vendored front-end assets).
 # Gated by the SAME `_authok()` every other non-`/api` path already goes through in
 # `Handler.do_GET` (see server.py) -- no separate check needed here.
 _VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "vendor")
@@ -3033,6 +3034,11 @@ _VENDOR_FILES = {
     "/vendor/xterm.js": ("xterm.js", "application/javascript; charset=utf-8"),
     "/vendor/xterm.css": ("xterm.css", "text/css; charset=utf-8"),
     "/vendor/addon-fit.js": ("addon-fit.js", "application/javascript; charset=utf-8"),
+    # mermaid.js (~3.4MB minified) -- same lazy-load-only story as xterm.js above, but
+    # for diagram rendering (app.js's renderMermaid()/_loadMermaidAssets(), called from
+    # both the classic SPA and ext_cr_detail.js's Control Room narration timeline). Never
+    # fetched unless a diagram actually renders.
+    "/vendor/mermaid.min.js": ("mermaid.min.js", "application/javascript; charset=utf-8"),
 }
 
 

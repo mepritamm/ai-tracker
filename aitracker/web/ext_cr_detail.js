@@ -18,8 +18,14 @@
 //                   aitracker/providers/auggie.py:382 {cwd,title,source,entrypoint,gitBranch,model}
 //   todos[]         {content,status,activeForm} — aitracker/store.py:67-70 (load_tasks) and
 //                   aitracker/providers/claude.py:892-893 (in-transcript TodoWrite fallback).
-//                   NO startedAt/endedAt exist on a todo anywhere in the codebase — see the
-//                   REQUIRED ADDITION note by spineSegments() below.
+//                   started_at/ended_at (snake_case, epoch SECONDS or null) are stamped by
+//                   claude.py:1209-1210 via util._ts_epoch — read via parseEpochSec() below,
+//                   not parseT()/Date.parse (which expects the ISO `.t` strings used elsewhere
+//                   in this file). Confirmed on a live /api/session payload: ended_at is
+//                   populated whenever a todo completed, but started_at is only set when the
+//                   transcript recorded an explicit TaskUpdate to "in_progress" — many real
+//                   sessions never do, so started_at is None there and the honest equal-width
+//                   fallback below is what actually renders for them (correct, not a bug).
 //   files[]         {path,ops,last,created,agent?} — aitracker/providers/claude.py:978,964-970
 //   reads[]         {path,t} — aitracker/providers/claude.py:979-980
 //   commands[]      {id,t,cmd,kind,ok} — aitracker/providers/claude.py:911,931,981 (capped to last 60)
@@ -49,7 +55,6 @@
 // REQUIRED ADDITIONs in the final report, not silently invented here:
 //   session.pinned, session.open_flags, session.note_count  (only on the LIST dict —
 //     registry.py:70-72 all_sessions() — never merged into parse_any()'s per-session detail)
-//   todos[].startedAt / todos[].endedAt                     (spineSegments below)
 //   a generic "links" array for the Links panel                (deriveLinks below)
 //   PR title text                                              (prs[] carries url/repo/num only)
 //   terminal pty-attached signal for the Terminal controls panel (GET /api/term/attached,
@@ -80,6 +85,13 @@
     return isNaN(ms) ? null : ms;
   }
 
+  // todos[i].started_at / ended_at are epoch SECONDS (a number), the same convention as
+  // session.mtime/now (aitracker/util.py:_ts_epoch) -- NOT an ISO string like the `.t`
+  // fields elsewhere in this file, so they are never run through parseT()/Date.parse.
+  function parseEpochSec(v) {
+    return (typeof v === "number" && !isNaN(v)) ? v * 1000 : null;
+  }
+
   function fmtClock(ms) {
     if (ms == null || isNaN(ms)) return "--:--";
     var d = new Date(ms);
@@ -105,8 +117,18 @@
   }
 
   // NOTE: Claude's raw model string ("claude-sonnet-4-5-20250929") isn't the short
-  // display name the doc's "model · sonnet" chip wants; this trims to the family name.
+  // display name the doc's "model · sonnet" chip wants. The ONE shortening rule
+  // lives in ext_cr_board.js's modelShort (loaded before this file — page.py's
+  // read_ext() sorts ext_ files alphabetically, "ext_cr_board" < "ext_cr_detail")
+  // and is reused here rather than forked a second time, per the owner's
+  // standing policy. Same try/catch-delegate-to-another-module pattern as
+  // providerNote() below; the inline fallback (family name only, no version) is
+  // only ever exercised if board.js somehow isn't mounted yet.
   function shortModel(m) {
+    try {
+      var fn = window.CR && window.CR.board && window.CR.board.modelShort;
+      if (typeof fn === "function") return fn(m) || "";
+    } catch (e) {}
     if (!m) return "";
     var hit = /sonnet|opus|haiku/i.exec(m);
     return hit ? hit[0].toLowerCase() : m;
@@ -227,13 +249,10 @@
 
   // The progress spine's derived layout. Pure: (session, nowMs) -> plan object.
   //
-  // REQUIRED ADDITION: the doc's own pseudocode (spineWidths) assumes
-  // todos[i].startedAt / todos[i].endedAt. Neither field is ever written anywhere in
-  // this codebase (aitracker/store.py:load_tasks and aitracker/providers/claude.py's
-  // in-transcript TodoWrite path both emit only {content,status,activeForm,desc}).
-  // This function still honours the doc's algorithm exactly WHEN that data someday
-  // shows up (the `hasTimes` branch), and falls back to an honest equal-width split
-  // among active/pending todos otherwise — never fabricating a per-todo duration.
+  // todos[i].started_at / todos[i].ended_at (snake_case, epoch seconds — see parseEpochSec
+  // above and claude.py:1209-1210) drive the `hasTimes` branch below when every active todo
+  // carries a started_at; this function falls back to an honest equal-width split among
+  // active/pending todos otherwise — never fabricating a per-todo duration.
   function spineSegments(session, nowMs) {
     var todos = (session.todos || []).filter(function (t) { return t && typeof t === "object"; });
     var total = todos.length;
@@ -263,7 +282,7 @@
     var FLOOR = 3, MAX_USED = 88, GROUP_THRESHOLD = 16;
     var activeIdx = doneIdx.concat(runIdx >= 0 ? [runIdx] : []);
     var hasTimes = elapsedMs != null && activeIdx.length > 0 &&
-      activeIdx.every(function (i) { return !!todos[i].startedAt; });
+      activeIdx.every(function (i) { return parseEpochSec(todos[i].started_at) != null; });
 
     var segs = [];
     if (hasTimes) {
@@ -271,8 +290,8 @@
       var spentTotal = 0, spentByIdx = {};
       activeIdx.forEach(function (i) {
         var t = todos[i];
-        var started = parseT(t.startedAt);
-        var ended = t.endedAt ? parseT(t.endedAt) : nowMs;
+        var started = parseEpochSec(t.started_at);
+        var ended = t.ended_at != null ? parseEpochSec(t.ended_at) : nowMs;
         var ms = (started != null && ended != null) ? Math.max(0, ended - started) : 0;
         spentByIdx[i] = ms; spentTotal += ms;
       });
@@ -336,7 +355,8 @@
     (session.requests || []).forEach(function (r) {
       var t = parseT(r.t);
       if (t != null) markers.push({ t: t, kind: "prompt", glyph: "💬", label: "",
-        title: "Your prompt · " + fmtClock(t) });
+        // FIX (design-audit drift 7): 5b's prompt marker tooltip reads "You asked · <clock>".
+        title: "You asked · " + fmtClock(t) });
     });
     (session.commands || []).forEach(function (c) {
       if (!c.ok) {
@@ -372,8 +392,32 @@
     return markers;
   }
 
-  // Merges narration + prompts (+ decisions + commands) into one chronological list.
-  // Pure: (session) -> [{kind, t, ...}] oldest-first.
+  // Merges narration + prompts (+ decisions + commands + tool activity) into one
+  // chronological list. Pure: (session) -> [{kind, t, ...}] oldest-first.
+  //
+  // FIX (design-audit drift 8 — "the biggest gap"): 5b's timeline shows generic
+  // tool-call rows — "Edit · aitracker/web/ext_vt.js · 0.4s · +118 −31" — for every
+  // file the session touched, not just its shell commands. Before this fix,
+  // mergeTimeline only ever folded in requests/narrative/decisions/commands[], so
+  // file edits/writes/reads and Task-tool dispatches never appeared here at all —
+  // most of what an agent actually DOES was invisible in the one view built to show
+  // exactly that.
+  //
+  // What's populated from real fields (verified against parse_session, claude.py
+  // 978-985) and what genuinely is not available:
+  //   files[]  {path, ops, last, created, agent?} — "last" is the aggregate row's
+  //            OWN timestamp (one row per path, not one per edit), so this emits
+  //            ONE tool-call row per touched file at its last-touched time, tool
+  //            name Write/Edit from `created`, target = the full path, and `ops`
+  //            (the op COUNT, not a line diff) as the only real count available.
+  //   reads[]  {path, t} — no op count at all; renders name+target only.
+  //   agents[] {t, type, desc} — Task-tool dispatches; renders Task + its desc/type.
+  //   NOT available anywhere on the detail dict, for any of the three: a duration
+  //   (no per-op start/end pair — only one aggregate "last" timestamp per file, and
+  //   none at all for a Task dispatch) or a diff line-count ("+118 −31" — `ops` is
+  //   an edit-call tally, not lines added/removed; no such field exists). Rendered
+  //   as name + target + whatever count IS real (ops, when present) — see the
+  //   `// NOTE:` on entryHtml's "tool" case below for exactly what's omitted.
   function mergeTimeline(session) {
     var out = [];
     (session.requests || []).forEach(function (r, i) {
@@ -391,6 +435,21 @@
     (session.commands || []).forEach(function (c, i) {
       var t = parseT(c.t);
       out.push({ kind: c.ok ? "command" : "command-fail", t: t == null ? 0 : t, cmd: c, key: "c" + i });
+    });
+    (session.files || []).forEach(function (f, i) {
+      var t = parseT(f.last);
+      out.push({ kind: "tool", t: t == null ? 0 : t, verb: f.created ? "Write" : "Edit",
+        target: f.path, count: f.ops ? (f.ops + (f.ops === 1 ? " op" : " ops")) : "",
+        agent: !!f.agent, key: "f" + i });
+    });
+    (session.reads || []).forEach(function (r, i) {
+      var t = parseT(r.t);
+      out.push({ kind: "tool", t: t == null ? 0 : t, verb: "Read", target: r.path, count: "", agent: false, key: "rd" + i });
+    });
+    (session.agents || []).forEach(function (a, i) {
+      var t = parseT(a.t);
+      out.push({ kind: "tool", t: t == null ? 0 : t, verb: "Task",
+        target: (a.desc || a.type || "background agent"), count: "", agent: true, key: "ag" + i });
     });
     out.sort(function (a, b) { return a.t - b.t; });
     return out;
@@ -533,7 +592,13 @@
       family: family,
       nodes: order.map(function (label, i) { return { label: label, active: i === order.length - 1 }; }),
       prefix: text.slice(0, fm.index),
-      suffix: text.slice(fm.index + fm[0].length)
+      suffix: text.slice(fm.index + fm[0].length),
+      // Raw mermaid source (no fences) -- NOT used by the label/pill extraction above,
+      // but needed by renderMermaid() (app.js, shared with the classic UI's mdBlock())
+      // to draw the REAL diagram rather than the flat pill-list approximation. Kept
+      // alongside the derived `nodes` rather than replacing them: nodes stay the
+      // fallback rendered instantly and reused by ext_cr_dialogs.js's pop-out today.
+      src: fm[1]
     };
   }
 
@@ -556,29 +621,19 @@
     return { word: "Idle", cls: "idle", age: fmtAge(idle) };
   }
 
-  function statChips(session) {
-    var c = session.counts || {};
+  // FIX (design-audit drift 1): 5b has NO files/commands/reads/commits/tests/branch/
+  // tokens stat-chip row under the goal — the token count is folded into the
+  // metadata line instead (renderHeader below builds it: project · branch · elapsed ·
+  // tokens, matching 5b's "ai-tracker · term-tiers · 41m · 128,412 tokens"). The old
+  // 7-chip statChips() row is gone outright, per the ruling ("the row must go"); the
+  // per-panel counts already visible in each STATE/EVIDENCE panel header (Files'
+  // "18", Commands' "42 · 1 failing", PRs' "2 · 1 merged", …) still carry files/
+  // commands/tests/commits visibility — only the bare "reads" count and the branch
+  // NAME as a standalone chip lose their old header-level home; branch itself still
+  // reappears in the metaline below.
+  function fmtTokens(session) {
     var tokTotal = ((session.tokens && session.tokens.in) || 0) + ((session.tokens && session.tokens.out) || 0);
-    // FIX 9b: "branch" is the one chip with a REAL "cannot exist" case, not merely
-    // "missing but could exist" — claude.py:827-830 only ever assigns meta.gitBranch
-    // when the raw session record's own field is truthy (never ""), and auggie.py's
-    // `_git_branch(cwd)` returns "" outside a git repo (auggie.py:403,425). Either way,
-    // a falsy gitBranch here means this session's cwd genuinely isn't a git repo —
-    // there IS no branch, not "we don't know it" — so it gets N/A + a tooltip instead
-    // of the generic "--" every other missing-but-possible chip uses.
-    var branch = session.meta && session.meta.gitBranch;
-    return [
-      { label: "files", value: (session.files || []).length },
-      // NOTE: `commands` is capped to the last 60 by the parser (claude.py:981,
-      // auggie.py:391) — there is no separate "total commands ever run" counter, so
-      // this chip reads the same cap the panel does rather than a fabricated total.
-      { label: "commands", value: (session.commands || []).length },
-      { label: "reads", value: (session.reads || []).length },
-      { label: "commits", value: c.commits || 0 },
-      { label: "tests", value: c.tests ? (c.tests + (c.tests_failed ? " failing" : "")) : "--", failing: !!c.tests_failed },
-      { label: "tokens", value: tokTotal ? fmtNum(tokTotal) : "--" },
-      { label: "branch", value: branch || "N/A", na: !branch }
-    ];
+    return tokTotal ? fmtNum(tokTotal) + " tokens" : "";
   }
 
   // FIX 5: the old ad-hoc `isDegradedTranscript` (meta.source/entrypoint sniffed for
@@ -647,25 +702,27 @@
             '<span class="crd-metaline mono"></span>' +
             '<span class="crd-pill crd-pill-state"></span>' +
             '<span class="crd-pill crd-pill-agents" hidden></span>' +
+            // FIX (design-audit drift 2): 5b collapses actions to ONE inline row —
+            // Open terminal (solid) · Resume (outline) · Queue a note, right-aligned
+            // at the end of THIS row (margin-left:auto), not a second action block
+            // below the header. Search/Flag/External aren't in 5b's row at all (the
+            // whole round 5 detail view drops them — verified across 5a/5b/5c/5d, not
+            // just this artboard); per the owner's "don't drop a capability" rule
+            // they're kept reachable here as small icon buttons rather than removed,
+            // see the module report for exactly where they landed.
+            '<span class="crd-row1-actions">' +
+              '<button class="crd-iconbtn" data-act="toggle-search" title="Search this session" aria-label="Search this session"><span class="crd-ico"></span></button>' +
+              '<button class="crd-iconbtn crd-flagbtn" data-act="toggle-flag" title="Flag an issue" aria-label="Flag an issue"><span class="crd-ico"></span><span class="crd-flag-badge" hidden></span></button>' +
+              '<button class="crd-btn crd-btn-solid" data-act="open-terminal">Open terminal</button>' +
+              '<button class="crd-btn crd-btn-outline" data-act="resume">Resume</button>' +
+              '<button class="crd-btn crd-btn-ai" data-act="toggle-note">Queue a note</button>' +
+              '<button class="crd-btn crd-btn-bare" data-act="external" hidden>External</button>' +
+            "</span>" +
           "</div>" +
           '<div class="crd-id-row2">' +
             '<h1 class="crd-goal"></h1>' +
             '<button class="crd-rename" data-act="rename" title="Rename" aria-label="Rename session"></button>' +
-            '<span class="crd-pill crd-pill-pinned" hidden>📌 Pinned</span>' +
-          "</div>" +
-          '<div class="crd-chips"></div>' +
-        "</div>" +
-        '<div class="crd-actions">' +
-          '<div class="crd-actions-row1">' +
-            '<button class="crd-btn crd-pillbtn" data-act="toggle-search">' +
-              '<span class="crd-ico"></span>Search this session</button>' +
-            '<button class="crd-btn crd-pillbtn crd-flagbtn" data-act="toggle-flag">' +
-              '<span class="crd-ico"></span><span class="crd-flag-label">Flag an issue</span></button>' +
-          "</div>" +
-          '<div class="crd-actions-row2">' +
-            '<button class="crd-btn crd-btn-solid" data-act="open-terminal">Open terminal</button>' +
-            '<button class="crd-btn crd-btn-outline" data-act="resume">Resume here</button>' +
-            '<button class="crd-btn crd-btn-bare" data-act="external" hidden>External</button>' +
+            '<span class="crd-pill crd-pill-pinned" hidden><span class="tn-emo" aria-hidden="true">📌</span> Pinned</span>' +
           "</div>" +
         "</div>" +
       "</div>" +
@@ -681,10 +738,13 @@
           '<button class="crd-btn crd-btn-solid" data-act="submit-flag">Flag it</button>' +
         "</div>" +
       "</div>" +
-      '<div class="crd-forkbanner" hidden>' +
-        '<span class="crd-ico crd-fork-ico"></span>' +
-        '<span class="crd-fork-text"></span>' +
-        '<button class="crd-fork-link" data-act="fork-open"></button>' +
+      // "Queue a note" (design-audit drift 2, new in 5b): opens this small card
+      // instead of a dialog (dialogs aren't ours to add to). Submitting calls the
+      // SAME 'cr:note-push' emit the Plan panel (renderPlan) and the phone bottom
+      // bar already use — a third entry point onto one push path, not a second one.
+      '<div class="crd-card crd-notecard" hidden>' +
+        '<input class="crd-note-queue-input" type="text" placeholder="Queue a note for this session…">' +
+        '<button class="crd-btn crd-btn-solid" data-act="note-queue-send">Queue</button>' +
       "</div>" +
       '<div class="crd-spine" role="img">' +
         '<div class="crd-spine-head">' +
@@ -767,7 +827,8 @@
       timelineFilter: "all",
       agentsShowFinished: false,
       searchOpen: false,
-      flagOpen: false
+      flagOpen: false,
+      noteOpen: false
     };
 
     var stateBody = qs(node, ".crd-col-state .crd-col-body");
@@ -786,6 +847,19 @@
       evidenceBody.appendChild(wrap);
       ui.panels[p[0]] = wrap;
     });
+    // FIX (design-audit drift 3): 5b renders fork lineage as a small card at the
+    // BOTTOM of the Evidence column (after Terminal controls), not a full-width
+    // banner between the header and the spine — see renderForkBanner().
+    var forkCard = el(
+      '<div class="crd-forkcard" hidden>' +
+        '<div class="crd-fork-head"><span class="crd-ico crd-fork-ico"></span>' +
+          '<span class="crd-fork-label"></span></div>' +
+        '<div class="crd-fork-body"></div>' +
+        '<button class="crd-fork-link" data-act="fork-open"></button>' +
+      "</div>"
+    );
+    evidenceBody.appendChild(forkCard);
+    ui.forkCard = forkCard;
 
     // Conversation timeline: single panel, starts expanded (doc: the only exception).
     var timelineWrap = el(
@@ -865,6 +939,25 @@
           qs(node, ".crd-flag-input").value = "";
           ui.flagOpen = false;
           qs(node, ".crd-flagcard").hidden = true;
+          break;
+        }
+        // FIX (design-audit drift 2): "Queue a note" (new in 5b) opens this small
+        // card; submitting calls the SAME 'cr:note-push' emit renderPlan()'s own
+        // push button and the phone bottom bar's send button already use — a third
+        // entry point onto one existing path, not a second note-adding mechanism.
+        case "toggle-note":
+          ui.noteOpen = !ui.noteOpen;
+          qs(node, ".crd-notecard").hidden = !ui.noteOpen;
+          if (ui.noteOpen) qs(node, ".crd-note-queue-input").focus();
+          break;
+        case "note-queue-send": {
+          var qInput = qs(node, ".crd-note-queue-input");
+          var qText = qInput && qInput.value.trim();
+          if (!qText) return;
+          ctx.emit("cr:note-push", { sessionId: sid, text: qText });
+          qInput.value = "";
+          ui.noteOpen = false;
+          qs(node, ".crd-notecard").hidden = true;
           break;
         }
         case "open-terminal":
@@ -1143,19 +1236,31 @@
     qs(node, ".crd-src").textContent = src;
 
     var proj = basename(meta.cwd || "");
-    var idleSec = nowSec - (session.mtime || 0);
-    var span = fmtAge(idleSec);
-    // FIX 9a: doc specifies "project · cwd · branch · elapsed" — this built
-    // [project, cwd, TITLE, elapsed] instead. meta.gitBranch already exists (the
-    // branch stat chip below uses it); swapped in here too.
-    var metaBits = [proj || "--", meta.cwd || "--", meta.gitBranch || "N/A", span + " ago"].filter(Boolean);
-    qs(node, ".crd-metaline").textContent = metaBits.join(" · ");
+    // FIX (design-audit drift 1): 5b's metaline is "project · branch · elapsed ·
+    // tokens" (its own mock: "ai-tracker · term-tiers · 41m · 128,412 tokens") — no
+    // full cwd path, and the elapsed figure matches the SAME "since first prompt"
+    // value the spine shows (firstEventTime), not "idle since last activity"; the
+    // token total that used to live in the stat-chip row is folded in here instead.
+    var firstMs = firstEventTime(session);
+    var elapsedStr = firstMs != null ? fmtAge(Math.max(0, nowSec - firstMs / 1000)) : null;
+    // Model tacks onto the SAME metadata line, subordinate to project/branch/
+    // elapsed/tokens — never its own visual element. Empty means render
+    // nothing (no "unknown"), handled by the existing .filter(Boolean).
+    var modelBit = shortModel(meta.model) || null;
+    var metaBits = [proj || null, meta.gitBranch || null, elapsedStr, fmtTokens(session) || null, modelBit].filter(Boolean);
+    var metaEl = qs(node, ".crd-metaline");
+    metaEl.textContent = metaBits.join(" · ");
+    metaEl.title = meta.model || "";
 
     var st = stateOf(session, nowSec);
     var pill = qs(node, ".crd-pill-state");
     pill.className = "crd-pill crd-pill-state crd-state-" + st.cls;
-    var glyph = st.cls === "awaiting" ? "⏳ " : (st.cls === "failed" ? "" : (st.cls === "done" ? "✅ " : ""));
-    pill.textContent = glyph + st.word + (st.age ? " · " + st.age : "");
+    // Glyph needs its own tinted span (doc 01 table: ⏳ awaiting -> tn-emo-a,
+    // ✅ done -> tn-emo-d) so plain textContent won't do — it can't parse the
+    // wrapper markup. st.word/st.age are still escaped since they land in HTML now.
+    var glyph = st.cls === "awaiting" ? '<span class="tn-emo-a" aria-hidden="true">⏳</span> ' :
+      (st.cls === "failed" ? "" : (st.cls === "done" ? '<span class="tn-emo-d" aria-hidden="true">✅</span> ' : ""));
+    pill.innerHTML = glyph + esc(st.word) + (st.age ? " · " + esc(st.age) : "");
 
     var agentsRunning = (session.agents_bg || []).filter(function (a) { return a.running; }).length;
     var agentsPill = qs(node, ".crd-pill-agents");
@@ -1175,24 +1280,23 @@
     // bootstrap starts forwarding it.
     qs(node, ".crd-pill-pinned").hidden = !session.pinned;
 
-    var chips = statChips(session);
-    qs(node, ".crd-chips").innerHTML = chips.map(function (c) {
-      var failCls = c.failing ? " crd-chip-failing" : "";
-      // FIX 9b: N/A (genuinely can't exist for this session) gets a "Not Applicable"
-      // tooltip, distinct from "--" (could exist, just missing) elsewhere.
-      var naAttr = c.na ? ' title="Not Applicable"' : "";
-      return '<span class="crd-chip' + failCls + '"' + naAttr + '><span class="crd-chip-label">' + esc(c.label) +
-        "</span> " + esc(c.value) + "</span>";
-    }).join("");
-
-    var icoEls = qsa(node, ".crd-pillbtn .crd-ico");
+    // FIX (design-audit drift 2): search/flag are demoted to small icon buttons in
+    // the row1 actions cluster (see the SKELETON comment) rather than the old
+    // full-label pill buttons — icoEls indices still map search first, flag second.
+    var icoEls = qsa(node, ".crd-row1-actions .crd-iconbtn .crd-ico");
     if (icoEls[0]) icoEls[0].innerHTML = svgIcon(ctx, "search", "⌕");
     if (icoEls[1]) icoEls[1].innerHTML = svgIcon(ctx, "alert", "⚠");
 
     // REQUIRED ADDITION: session.open_flags (unresolved-flag count) is not on the
     // detail dict (see stateOf's note above) — shows "—" rather than a fabricated 0.
     var flagCount = session.open_flags;
-    qs(node, ".crd-flag-label").textContent = "Flag an issue" + (flagCount ? " · " + flagCount : "");
+    var flagBtn = qs(node, '[data-act="toggle-flag"]');
+    var flagTitle = "Flag an issue" + (flagCount ? " · " + flagCount + " open" : "");
+    flagBtn.title = flagTitle;
+    flagBtn.setAttribute("aria-label", flagTitle);
+    var flagBadge = qs(flagBtn, ".crd-flag-badge");
+    flagBadge.hidden = !flagCount;
+    flagBadge.textContent = flagCount || "";
     qs(node, ".crd-flagcard .crd-flag-count").textContent = flagCount ?
       flagCount + " open flag" + (flagCount === 1 ? "" : "s") + " on this session" :
       "Open-flag count needs the board's flag store wired into this view (not yet on /api/session).";
@@ -1201,25 +1305,34 @@
     qs(node, '[data-act="external"]').hidden = !isLocalhost;
   }
 
+  // FIX (design-audit drift 3): 5b renders fork lineage as a small card at the
+  // BOTTOM of the Evidence column ("Forked" / "You're on the copy; the original is
+  // still running." / "Open the original"), not a full-width banner between the
+  // header and the spine. Copy for the continued_from direction is 5b's, verbatim;
+  // continued_as (this session forked ONWARD, no equivalent in the mock) gets the
+  // same card shape with a symmetric, equally short line rather than the old
+  // doc-derived paragraph.
   function renderForkBanner(node, ctx, session, ui) {
-    var banner = qs(node, ".crd-forkbanner");
+    var card = ui.forkCard || qs(node, ".crd-forkcard");
+    if (!card) return;
     if (session.continued_as) {
-      banner.hidden = false;
-      qs(banner, ".crd-fork-ico").innerHTML = svgIcon(ctx, "branch", "⑂");
-      qs(banner, ".crd-fork-text").textContent =
-        "This session continued as a fresh copy — the original kept running as a background agent.";
-      qs(banner, ".crd-fork-link").textContent = "Open the copy";
+      card.hidden = false;
+      qs(card, ".crd-fork-ico").innerHTML = svgIcon(ctx, "branch", "⑂");
+      qs(card, ".crd-fork-label").textContent = "Forked";
+      qs(card, ".crd-fork-body").textContent =
+        "You're on the original; a fresh copy continued the work.";
+      qs(card, ".crd-fork-link").textContent = "Open the copy";
       ui.forkTarget = session.continued_as;
     } else if (session.continued_from) {
-      banner.hidden = false;
-      qs(banner, ".crd-fork-ico").innerHTML = svgIcon(ctx, "branch", "⑂");
-      qs(banner, ".crd-fork-text").textContent =
-        "Resume was refused — this session was running as a background agent, so it was forked. " +
-        "You're looking at the copy; the original is still running.";
-      qs(banner, ".crd-fork-link").textContent = "Open the original";
+      card.hidden = false;
+      qs(card, ".crd-fork-ico").innerHTML = svgIcon(ctx, "branch", "⑂");
+      qs(card, ".crd-fork-label").textContent = "Forked";
+      qs(card, ".crd-fork-body").textContent =
+        "You're on the copy; the original is still running.";
+      qs(card, ".crd-fork-link").textContent = "Open the original";
       ui.forkTarget = session.continued_from;
     } else {
-      banner.hidden = true;
+      card.hidden = true;
       ui.forkTarget = null;
     }
   }
@@ -1241,8 +1354,12 @@
       if (s.kind === "done" && s.widthPct >= 7 && s.elapsedMs != null) {
         inner = '<span class="crd-seg-elapsed mono">' + esc(fmtDurMs(s.elapsedMs)) + "</span>";
       } else if (s.kind === "running") {
-        inner = '<span class="crd-seg-dot"></span><span class="crd-seg-running mono">RUNNING' +
-          (s.elapsedMs != null ? " " + esc(fmtDurMs(s.elapsedMs)) : "") + "</span>" +
+        // FIX (design-audit drift 7): 5b lays the running segment out
+        // space-between — dot+"running" on the LEFT, elapsed time on the RIGHT —
+        // not one centred, concatenated string.
+        inner = '<span class="crd-seg-running-label"><span class="crd-seg-dot"></span>' +
+          '<span class="crd-seg-running-word mono">running</span></span>' +
+          (s.elapsedMs != null ? '<span class="crd-seg-running-elapsed mono">' + esc(fmtDurMs(s.elapsedMs)) + "</span>" : "") +
           '<span class="crd-seg-edge"></span>';
       } else if (s.kind === "grouped") {
         inner = '<span class="crd-seg-grouped mono">' + esc(s.label) + "</span>";
@@ -1254,9 +1371,11 @@
     var gutter = qs(node, ".crd-spine-gutter");
     gutter.innerHTML = plan.markers.map(function (m) {
       var cls = "crd-mark crd-mark-" + m.kind;
+      // Doc 01 emoji table: ⏳ (ask) -> tn-emo-a, 🤖/💬 (agent/prompt) -> base tn-emo.
+      var glyphCls = m.kind === "ask" ? "tn-emo-a" : "tn-emo";
       var content = m.kind === "fail" ? '<span class="crd-mark-word mono">FAIL</span>' :
         (m.kind === "now" ? '<span class="crd-mark-word mono">NOW</span>' :
-        (m.glyph ? '<span class="crd-mark-emoji" aria-hidden="true">' + m.glyph + "</span>" : ""));
+        (m.glyph ? '<span class="crd-mark-emoji ' + glyphCls + '" aria-hidden="true">' + m.glyph + "</span>" : ""));
       return '<span class="' + cls + '" style="left:' + m.pct.toFixed(3) + '%" title="' + esc(m.title) + '">' +
         '<span class="crd-mark-tick"></span>' + content + "</span>";
     }).join("");
@@ -1264,9 +1383,31 @@
     qs(node, ".crd-spine-first").textContent = plan.firstMs != null ? fmtClock(plan.firstMs) + " first prompt" : "—";
     qs(node, ".crd-spine-mid").textContent = plan.doneCount + " done · " + plan.runningCount +
       " running · " + plan.pendingCount + " to go";
-    qs(node, ".crd-spine-now").textContent = fmtClock(nowMs) + " now";
+    // FIX (design-audit drift 7): 5b's footer right cell is the literal word "now",
+    // no clock time (the clock already appears on the NOW spine marker above it).
+    qs(node, ".crd-spine-now").textContent = "now";
 
-    qs(node, ".crd-spine").setAttribute("aria-label", plan.ariaLabel);
+    // Check if spine is showing time-proportional segments (not equal-width fallback)
+    var hasTimedSegments = plan.segments.some(function (s) { return s.elapsedMs !== null; });
+    // Check if timings are approximate (from name matching, not exact id join)
+    var isApproximate = session.todo_times_approximate === true;
+
+    // Update hint text if showing approximate timings
+    var hintEl = qs(node, ".crd-spine-hint");
+    if (hintEl) {
+      if (isApproximate && hasTimedSegments) {
+        hintEl.textContent = "segment width = inferred time · click to jump the chat there";
+      } else {
+        hintEl.textContent = "segment width = time actually spent · click to jump the chat there";
+      }
+    }
+
+    // Update aria-label to include approximate indicator
+    var finalAriaLabel = plan.ariaLabel;
+    if (isApproximate && hasTimedSegments) {
+      finalAriaLabel += " Timings are inferred.";
+    }
+    qs(node, ".crd-spine").setAttribute("aria-label", finalAriaLabel);
   }
 
   // ---- State column panels ----
@@ -1375,7 +1516,7 @@
           '<button data-act="note-remove" data-idx="' + i + '">remove</button>' +
         "</span></div>";
     }).join("");
-    var body = '<div class="crd-plan-head">📝 PLAN ON THE GO · ' + notes.length + " notes</div>" +
+    var body = '<div class="crd-plan-head"><span class="tn-emo-n" aria-hidden="true">📝</span> PLAN ON THE GO · ' + notes.length + " notes</div>" +
       (rows || emptyHtml("No notes queued", "Jot one below — it'll queue for delivery.")) +
       '<div class="crd-plan-footer">' +
         '<input class="crd-plan-input" type="text" placeholder="Jot the next thing…">' +
@@ -1408,7 +1549,10 @@
     var cmds = session.commands || [];
     var failing = cmds.filter(function (c) { return !c.ok; }).length;
     setPanelCount(wrap, cmds.length ? cmds.length + (failing ? " · " + failing + " failing" : "") : "—");
-    wrap.classList.toggle("crd-tint-failed", failing > 0);
+    // FIX (design-audit drift 5): 5b keeps the Commands panel on its normal neutral
+    // background and colours only the count text ("1 failing") — no full-panel red
+    // tint. Toggle the tint on the count element alone, not the whole panel.
+    qs(wrap, ".crd-panel-count").classList.toggle("crd-count-failing", failing > 0);
     if (!cmds.length) { setPanelBody(wrap, emptyHtml("No commands yet", "This session hasn't run any. It will fill in as it works.")); return; }
     setPanelBody(wrap, cmds.map(function (c) {
       return '<div class="crd-cmd-row" data-act="command-row" data-id="' + esc(c.id) + '">' +
@@ -1454,9 +1598,15 @@
       // doc: "worktree (wt/wc-audit) or ×N" — one slot, mutually exclusive.
       var tag = g.count > 1 ? '<span class="crd-agent-wf mono">×' + g.count + "</span>" :
         (a.wf ? '<span class="crd-agent-wf mono">' + esc(a.wf) + "</span>" : "");
+      // This background agent's OWN model (its own separate transcript —
+      // parse_agents() in providers/claude.py — genuinely can and does differ
+      // from the parent session's meta.model, which is exactly why the owner
+      // called this surface out specifically). Empty -> no chip at all.
+      var modelTag = a.model ? '<span class="crd-agent-model mono" title="' + esc(a.model) + '">' +
+        esc(shortModel(a.model)) + "</span>" : "";
       return '<div class="crd-agent-row-item"><span class="crd-state-dot ' + (g.running ? "is-working" : "is-done") +
         '"></span><span class="crd-agent-title">' + esc(a.task || a.aid || "background agent") + "</span>" +
-        tag + '<button class="crd-open-link" data-act="agent-open" data-id="' + esc(a.aid) + '">open ›</button></div>'; // "opening the latest"
+        tag + modelTag + '<button class="crd-open-link" data-act="agent-open" data-id="' + esc(a.aid) + '">open ›</button></div>'; // "opening the latest"
     }
     function shellRow(s) {
       var label = (s && (s.cmd || s.id)) || "shell";
@@ -1575,20 +1725,31 @@
     }
     if (e.kind === "narration") {
       if (diagram) {
-        // FIX 2: prose around the fence still renders as markdown; the fence itself
-        // becomes the doc's node-pill diagram card, with an "expand" affordance that
-        // opens the SAME dialog ext_cr_dialogs.js already ships (narration-diagram).
+        // FIX 2 + mermaid vendoring: prose around the fence still renders as markdown;
+        // the fence itself becomes the doc's diagram card. The card's own render slot
+        // (`.mmd-slot`) shows the node-pill row INSTANTLY (same as before), then
+        // app.js's shared renderMermaid() — called from renderTimelineEntries() below,
+        // right after this HTML lands in the DOM — upgrades it in place to the real
+        // mermaid.js SVG. If that upgrade never happens (asset still loading, load
+        // failed, or mermaid throws on this source) the pill row is exactly what stays:
+        // it is the FALLBACK now, not a second permanent renderer. The "expand" button
+        // still opens the SAME dialog ext_cr_dialogs.js already ships
+        // (narration-diagram) — see openNarrationDiagram()'s own comment for what that
+        // pop-out would need to draw the real diagram too.
         var pre = diagram.prefix && diagram.prefix.trim() ? '<div class="crd-narration-text">' + mdHtml(ctx, diagram.prefix) + "</div>" : "";
         var suf = diagram.suffix && diagram.suffix.trim() ? '<div class="crd-narration-text">' + mdHtml(ctx, diagram.suffix) + "</div>" : "";
         var pills = diagram.nodes.map(function (n) {
           return '<span class="cr-diagram-pill' + (n.active ? " is-active" : "") + '">' + esc(n.label) + "</span>";
         }).join("");
+        var b64 = _mmdEncodeSrc(diagram.src || "");
         return '<div class="crd-entry crd-entry-narration crd-entry-diagram" data-todo-text="">' +
           '<span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
           '<div class="crd-narration-body">' + pre +
           '<div class="cr-diagram-card crd-diagram-inline">' +
-            '<div class="cr-diagram-row">' + pills + "</div>" +
-            '<div class="cr-diagram-caption">' + esc(diagram.family) + " · drawn locally in plain SVG, no mermaid.js" +
+            '<div class="cr-diagram-render mmd-slot" data-mmd-src="' + b64 + '">' +
+              '<div class="cr-diagram-row">' + pills + "</div>" +
+            "</div>" +
+            '<div class="cr-diagram-caption">' + esc(diagram.family) +
               '<button class="crd-open-link crd-diagram-expand" data-act="narration-diagram" data-key="' + esc(e.key) + '">expand ›</button>' +
             "</div></div>" + suf + "</div></div>";
       }
@@ -1600,10 +1761,16 @@
       var d = e.decision;
       var q0 = (d.questions && d.questions[0]) || { q: "", options: [] };
       var opts = (q0.options || []).map(function (o) { return '<span class="crd-ask-pill">' + esc(o) + "</span>"; }).join("");
+      // FIX (design-audit drift 6): 5b's ask bubble carries a mini-header
+      // ("⏳ It asked you · still open") above the question — only while it's
+      // still open; a closed decision doesn't claim to still be open. 5b's
+      // view-only copy also drops "itself" and adds the "never writes" clause.
+      var miniHead = d.open ? '<div class="crd-ask-minihead"><span class="tn-emo-a" aria-hidden="true">⏳</span>' +
+        '<span class="crd-ask-minihead-label">It asked you · still open</span></div>' : "";
       return '<div class="crd-entry crd-entry-ask"><span class="crd-entry-ts mono crd-ts-ask">' + fmtClock(e.t) + "</span>" +
-        '<div class="crd-bubble crd-bubble-ask"><div class="crd-ask-q">' + esc(q0.q) + "</div>" +
+        '<div class="crd-bubble crd-bubble-ask">' + miniHead + '<div class="crd-ask-q">' + esc(q0.q) + "</div>" +
         '<div class="crd-ask-opts">' + opts + "</div>" +
-        '<div class="crd-ask-note">View-only — answer in the session itself.</div></div></div>';
+        '<div class="crd-ask-note">View-only — answer in the session. The tracker never writes to it.</div></div></div>';
     }
     if (e.kind === "command" || e.kind === "command-fail") {
       var c = e.cmd;
@@ -1611,6 +1778,23 @@
         '<span class="crd-entry-ts mono ' + (e.kind === "command-fail" ? "crd-ts-fail" : "") + '">' + fmtClock(e.t) + "</span>" +
         '<div class="crd-toolrow">' + (e.kind === "command-fail" ? '<span class="crd-tool-fail">fail</span>' : "") +
         '<span class="crd-tool-name mono">' + esc(c.cmd) + "</span></div></div>";
+    }
+    // FIX (design-audit drift 8): a generic tool-call row — file edit/write/read or a
+    // Task-tool dispatch (see mergeTimeline's own comment for exactly which fields
+    // are real vs. unavailable). NOTE: no duration and no diff line-count (+/-) exist
+    // anywhere on the detail dict for these — only `verb` (Write/Edit/Read/Task),
+    // `target` (the full path or task desc) and, for a file row, `count` (an edit-op
+    // TALLY, not a line diff) are ever rendered; a session with the design's exact
+    // "0.4s · +118 −31" duration/diff pair would need the parser to start recording
+    // per-op timestamps and line counts, which it does not today.
+    if (e.kind === "tool") {
+      return '<div class="crd-entry crd-entry-tool">' +
+        '<span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
+        '<div class="crd-toolrow"><span class="crd-tool-verb mono">' + esc(e.verb) + "</span>" +
+        '<span class="crd-tool-name mono">' + esc(e.target) + "</span>" +
+        (e.agent ? '<span class="crd-tag-agent">agent</span>' : "") +
+        (e.count ? '<span class="crd-tool-count mono">' + esc(e.count) + "</span>" : "") +
+        "</div></div>";
     }
     return "";
   }
@@ -1713,7 +1897,11 @@
       var d = extractDiagram(e.text);
       if (!d) return;
       diagramByKey[e.key] = d;
-      diagramEntries.push({ key: e.key, t: e.t, family: d.family, nodes: d.nodes });
+      // `src` (the raw mermaid source) rides along here too, unused by THIS module's own
+      // pill dialog today, but harmless -- it's what ext_cr_dialogs.js's narration-diagram
+      // pop-out owner needs to draw the real diagram there as well (see
+      // openNarrationDiagram()'s own comment).
+      diagramEntries.push({ key: e.key, t: e.t, family: d.family, nodes: d.nodes, src: d.src });
     });
     ui.diagramEntries = diagramEntries;
 
@@ -1728,6 +1916,12 @@
         filtered.map(function (e) { return entryHtml(e, ctx, diagramByKey[e.key]); }).join("") :
         emptyHtml("Nothing recorded yet", "The first prompt starts the conversation.");
       if (olderEl) scrollEl.insertBefore(olderEl, scrollEl.firstChild);
+      // Upgrade every diagram card just painted from its instant node-pill fallback to
+      // the real mermaid.js render -- app.js's shared upgradeMermaidIn()/renderMermaid(),
+      // the SAME function the classic UI's markdown modals call (app.js is concatenated
+      // ahead of this file into one <script> tag by page.py's build_page(), so it's a
+      // reachable global here, not a re-implementation).
+      if (typeof upgradeMermaidIn === "function") upgradeMermaidIn(scrollEl);
       ui.timelineSeen = filtered.length;
       if (wasStuck) scrollEl.scrollTop = scrollEl.scrollHeight;
       else scrollEl.scrollTop = prevScrollTop;
@@ -1735,10 +1929,16 @@
   }
 
   // FIX 2: opens ext_cr_dialogs.js's existing narration-diagram pop-out (read, not
-  // edited) with the EXACT payload shape its renderNarrationDiagram expects —
-  // {time, nodes:[{label,active}], edges, family, onPrev, onNext, onLatest}. `edges`
-  // is omitted: renderNarrationDiagram never reads it (only `nodes` gets painted as
-  // pills), so passing an unused shape would just be noise, not conformance.
+  // edited -- it is owned by another agent right now) with the payload shape its
+  // renderNarrationDiagram expects — {time, nodes:[{label,active}], edges, family,
+  // onPrev, onNext, onLatest} — PLUS one extra field, `src` (the raw mermaid source),
+  // which that function does not read today. It's included anyway, harmlessly, for
+  // whoever next wires the pop-out to the real mermaid.js render: as things stand the
+  // pop-out only ever draws the node-pill approximation (renderNarrationDiagram builds
+  // its `.cr-diagram-card` straight from `nodes`, never calls app.js's shared
+  // renderMermaid()/upgradeMermaidIn()) — see this module's own report for exactly
+  // what that owner would need to change. `edges` stays omitted: renderNarrationDiagram
+  // never reads it either.
   function openNarrationDiagram(ctx, ui, idx) {
     var list = ui.diagramEntries || [];
     var entry = list[idx];
@@ -1747,6 +1947,7 @@
       time: fmtClock(entry.t),
       nodes: entry.nodes,
       family: entry.family,
+      src: entry.src,
       onPrev: idx > 0 ? function () { openNarrationDiagram(ctx, ui, idx - 1); } : null,
       onNext: idx < list.length - 1 ? function () { openNarrationDiagram(ctx, ui, idx + 1); } : null,
       onLatest: list.length ? function () { openNarrationDiagram(ctx, ui, list.length - 1); } : null
@@ -1770,14 +1971,30 @@
     var live = idle < LIVE_WINDOW && !!ov.now;
     wrap.hidden = !live;
     if (!live) { wrap.innerHTML = ""; return; }
+    // FIX (design-audit drift 4): 5b's live entry reads "Now · <clock>" (the real,
+    // ticking wall-clock time) instead of the literal word "LIVE", plus a small
+    // active-file tag top-right. REQUIRED ADDITION: there's no "file it's touching
+    // right now" field on the detail dict — session.files[] (already sorted
+    // newest-`last`-first by the parser) is the closest honest proxy, shown only
+    // while that top file's OWN `last` is itself inside LIVE_WINDOW, never a stale one.
+    var topFile = (session.files || [])[0];
+    var fileTag = "";
+    if (topFile) {
+      var fileMs = parseT(topFile.last);
+      if (fileMs != null && (nowSec - fileMs / 1000) < LIVE_WINDOW) fileTag = basename(topFile.path);
+    }
     // NOTE: ov.now isn't in FIX 1's markdown list (that names "narration", the
     // narrative[].text field in the timeline — ov.now is a synthesized status string
     // that sometimes embeds a glyph prefix "⚙"/"▶" ahead of a narration snippet), so
     // it stays on plain esc() here, matching the same call already made for the
     // Session summary panel's "Now" field below.
-    wrap.innerHTML = '<span class="crd-seg-dot" aria-hidden="true"></span>' + // reuses the spine's own pulsing-dot style (incl. its reduced-motion variant)
-      '<span class="crd-live-badge mono">LIVE</span>' +
-      '<span class="crd-live-text">' + esc(ov.now) + "</span>";
+    wrap.innerHTML =
+      '<div class="crd-live-head">' +
+        '<span class="crd-seg-dot" aria-hidden="true"></span>' + // reuses the spine's own pulsing-dot style (incl. its reduced-motion variant)
+        '<span class="crd-live-badge mono">' + esc("Now · " + fmtClock(nowSec * 1000)) + "</span>" +
+        (fileTag ? '<span class="crd-live-file mono">' + esc(fileTag) + "</span>" : "") +
+      "</div>" +
+      '<div class="crd-live-text">' + esc(ov.now) + "</div>";
   }
   function ui_findLiveEl(node) { return qs(node, ".crd-timeline-live"); }
 

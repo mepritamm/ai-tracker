@@ -5,6 +5,7 @@ pins.json
 notes.json
 forks.json
 forks.json.lock
+config.json
 port
 token
 drain.log

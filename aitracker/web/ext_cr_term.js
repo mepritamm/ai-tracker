@@ -117,9 +117,9 @@
       '</div>' +
       '<div class="cr-term-head-actions">' +
         '<button type="button" class="cr-term-headpill" data-action="config">' +
-          '<span class="cr-emo" aria-hidden="true">⚙️</span>Config</button>' +
+          '<span class="cr-emo tn-emo" aria-hidden="true">⚙️</span>Config</button>' +
         '<button type="button" class="cr-term-headpill" data-action="help">' +
-          '<span class="cr-emo" aria-hidden="true">❓</span>Help</button>' +
+          '<span class="cr-emo tn-emo" aria-hidden="true">❓</span>Help</button>' +
         '<button type="button" class="cr-term-close" data-action="close" title="Close — detaches, does not kill" aria-label="Close terminal — detaches, does not kill">✕</button>' +
       '</div>';
     shell.appendChild(head);
@@ -158,7 +158,7 @@
           '<button type="button" data-renderer="grid" aria-pressed="false">grid</button>' +
         '</div>' +
         '<button type="button" class="cr-term-themebtn" data-action="theme">' +
-          '<span class="cr-emo" aria-hidden="true">☀️</span>Theme</button>' +
+          '<span class="cr-emo tn-emo" aria-hidden="true">☀️</span>Theme</button>' +
       '</div>';
     shell.appendChild(bar);
 
@@ -225,6 +225,7 @@
       overlay: overlay, shell: shell,
       cwd: head.querySelector('[data-el="cwd"]'),
       resumecmd: head.querySelector('[data-el="resumecmd"]'),
+      primaryGroup: bar.querySelector('[data-group="primary"]'),
       openHere: bar.querySelector('[data-action="open-here"]'),
       resumeHere: bar.querySelector('[data-action="resume-here"]'),
       extTerminal: bar.querySelector('[data-action="ext-terminal"]'),
@@ -334,9 +335,9 @@
   // switch (see _setRenderer below). The values are the SAME frozen dark literals ext_cr_term.css
   // already uses for this pane/status bar — not a second, invented palette:
   //   background #12100E — cr_term.css's own frozen --surface-inverse (.cr-term-pane's background)
-  //   foreground #FBFAF7 — cr_term.css's own frozen --text-primary (.cr-term-pane's color)
+  //   foreground #E4D8CA — cr_term.css's own frozen --text-primary (.cr-term-pane's color)
   //   cursor     #E5CB79 — the one frozen accent literal in that file (.cr-term-ctxbarfill)
-  var DARK_PANE_THEME = { background: "#12100E", foreground: "#FBFAF7", cursor: "#E5CB79" };
+  var DARK_PANE_THEME = { background: "#12100E", foreground: "#E4D8CA", cursor: "#E5CB79" };
   function _applyDarkTheme(handle) {
     if (handle && typeof handle.setTheme === "function") handle.setTheme(DARK_PANE_THEME);
   }
@@ -862,6 +863,8 @@
     // (doc 05: "A slash command must never land on a bash prompt.") — never derived from `mode`.
     el.modelPill.hidden = !st.attached;
     el.effortPill.hidden = !st.attached;
+    // Hide "Open terminal here" / "Resume terminal here" once a terminal is actually attached
+    if (el.primaryGroup) el.primaryGroup.hidden = st.attached;
     if (st.attached) {
       el.modelPill.textContent = "model · " + (st.model || "—");
       el.effortPill.textContent = "effort · " + (st.effort || "—");

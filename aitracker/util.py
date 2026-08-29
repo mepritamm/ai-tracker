@@ -220,6 +220,22 @@ def prs_sorted(acc, states=None):
     return sorted(acc.values(), key=lambda p: (p["created"], p["t"] or ""), reverse=True)
 
 
+def pr_summary(prs, states=None):
+    """(num, url, repo, state) for the session-LIST dict's one representative CREATED pull
+    request — reuses prs_sorted's created-first/most-recent ordering and state overlay (the
+    same primitives the detail path's `prs` panel is built from) rather than re-deriving
+    either. Only entries with created=True count: a PR the session merely referenced or
+    narrated about (pr_worked's broader detail-only semantics) must not light up a board
+    tile. Returns (None, None, None, "") when the session created no PR, so the list dict's
+    fields come back falsy rather than a stale or spurious entry. The one place this gets
+    computed — same precedent as todo_summary below (total/done/current derived once, shared
+    by every provider's list function)."""
+    top = next((p for p in prs_sorted(prs, states) if p["created"]), None)
+    if not top:
+        return None, None, None, ""
+    return top.get("num") or None, top.get("url") or None, top.get("repo") or None, top.get("state") or ""
+
+
 def context_window(current, limit):
     """The shared `context` shape every provider emits: `current` is the context the
     model is CARRYING RIGHT NOW — input + cache-read + cache-creation tokens off the
@@ -282,6 +298,31 @@ def todo_summary(todos):
     cur = todos[current_index] if current_index is not None else None
     current = (cur.get("activeForm") or cur.get("content") or None) if cur else None
     return total, done, current, current_index
+
+
+def now_phrase(s, maxc=60):
+    """A short board-tile "now" phrase: one line, truncated with an ellipsis rather than
+    wrapped. Shared by every provider's session-list `now_line` field (providers/claude.py,
+    auggie.py, augment_ext.py) so the truncation rule lives in exactly one place, not
+    forked per provider. `s` is already a short, pre-selected signal (an in-progress todo's
+    label, or a tail-read narration snippet) -- this only bounds its on-screen length."""
+    s = _first_line(s or "", 400)
+    if len(s) > maxc:
+        cut = s[:maxc].rsplit(" ", 1)[0].rstrip(" ,.;:-")
+        s = (cut or s[:maxc]) + "…"
+    return s
+
+
+def todo_times_approximate(provider_type):
+    """Whether this provider's todo start/end times are approximate (name-matched or unavailable)
+    rather than exact. Always a bool on the detail dict, even with no todos at all, so the UI
+    never has to special-case a provider.
+    - "claude": False (exact ID join from task-store file stem == TaskUpdate's taskId)
+    - "auggie": True (name-matched against chatHistory task ids from add_tasks/update_tasks echoes)
+    - "augment": True (no timing source available; chat transcript in LevelDB unreadable stdlib-only)
+    This is the ONE definition point shared by all providers; it lives here so the semantics
+    stay consistent if the rule ever changes."""
+    return provider_type != "claude"
 
 
 def unified(old, new, cap=20000):

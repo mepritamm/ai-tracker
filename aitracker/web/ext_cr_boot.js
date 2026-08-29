@@ -35,6 +35,7 @@ window.CR = window.CR || {};
   // Tiny event bus — ctx.on / ctx.emit
   // ----------------------------------------------------------------------
   var bus = {};
+  var currentJob = null;  // Track running command job id for cr:stop
   function on(name, fn) {
     if (typeof fn !== 'function') return;
     (bus[name] = bus[name] || []).push(fn);
@@ -104,21 +105,40 @@ window.CR = window.CR || {};
     var pref = getThemePref();
     return (pref === 'dark' || (pref === 'auto' && systemPrefersDark())) ? 'dark' : 'light';
   }
+
+  // Re-entrancy guard for the two-way classic<->Control Room theme sync below.
+  var _syncingClassicTheme = false;
+
+  // Pushes the resolved light/dark theme into the CLASSIC dashboard via its
+  // OWN setTheme() (app.js:3) — never reimplemented here (conventions.md rule
+  // 4: land a capability once, at the real function, not a second fork of it).
+  // setTheme() already dispatches the 'themechange' CustomEvent ext_vt.js's
+  // live xterm re-theme listener depends on, so this call replaces (not
+  // duplicates) what used to be a manual `document.dispatchEvent(...)` here.
+  // Guarded so the 'themechange' listener a few lines down — which exists so
+  // a change made in CLASSIC also updates Control Room's own preference —
+  // never re-enters this same call.
+  function syncClassicTheme(resolved) {
+    if (typeof setTheme !== 'function') return false;
+    _syncingClassicTheme = true;
+    try { setTheme(resolved); } finally { _syncingClassicTheme = false; }
+    return true;
+  }
+
   function applyTheme() {
     var root = document.getElementById('nextRoot');
     var resolved = resolveTheme();
     if (root) root.classList.toggle('is-dark', resolved === 'dark');
-    // Re-dispatch the SAME CustomEvent app.js's own setTheme() fires (app.js:3), so
-    // ext_vt.js's live xterm re-theme listener picks it up too — WITHOUT touching
-    // classic's own <html>.light class or its `localStorage.theme` key (that would
-    // change the classic dashboard's independent theme choice, which this module
-    // must leave completely alone per its brief).
-    document.dispatchEvent(new CustomEvent('themechange', { detail: { theme: resolved } }));
+    if (!syncClassicTheme(resolved)) {
+      // Defensive fallback only — should be unreachable, since app.js (and
+      // its setTheme) is always concatenated before this file (page.py's
+      // build_page(): app.js first, then every ext_*.js sorted by filename).
+      document.dispatchEvent(new CustomEvent('themechange', { detail: { theme: resolved } }));
+    }
     // Internal ctx bus uses ONE name, 'theme:changed' (cr_board.js's original
     // name — cr_term.js's listener was updated to match, see ext_cr_term.js's
-    // _wireThemeReactivity). The document-level 'themechange' CustomEvent above
-    // is a SEPARATE, classic-facing signal that ext_vt.js depends on and is
-    // left untouched.
+    // _wireThemeReactivity). The document-level 'themechange' CustomEvent
+    // dispatched by setTheme() above is a SEPARATE, classic-facing signal.
     emit('theme:changed', { theme: resolved });
   }
   if (window.matchMedia) {
@@ -127,6 +147,39 @@ window.CR = window.CR || {};
     if (mql.addEventListener) mql.addEventListener('change', onSystemChange);
     else if (mql.addListener) mql.addListener(onSystemChange); // Safari <14 fallback
   }
+
+  // Classic's OWN toggle button (toggleTheme(), app.js) can change the theme
+  // independently of Control Room's control. React to its 'themechange' the
+  // same way an OS scheme flip is reacted to above, so a change made in
+  // EITHER UI leaves the other consistent: an explicit classic choice becomes
+  // Control Room's explicit override too. `_syncingClassicTheme` stops this
+  // from re-entering syncClassicTheme()'s own call to setTheme() above —
+  // without it, applyTheme() -> syncClassicTheme() -> setTheme() ->
+  // 'themechange' -> this listener -> applyTheme() -> ... would loop forever.
+  document.addEventListener('themechange', function (e) {
+    if (_syncingClassicTheme) return;
+    var t = e && e.detail && e.detail.theme;
+    if (t !== 'light' && t !== 'dark') return;
+    if (getThemePref() === t) return;   // already in sync (e.g. a redundant re-dispatch)
+    setThemePref(t);   // persists + calls applyTheme(), which re-syncs classic
+                        // (a guarded no-op since it's already `t`) and repaints
+                        // the theme control + #nextRoot.
+  });
+
+  // First-paint sync, run SYNCHRONOUSLY at script-eval time (not deferred via
+  // setTimeout like init() below). index.html's own pre-paint inline script
+  // (its own file, not this one — see the report) only knows classic's binary
+  // `localStorage.theme` key: it can't resolve `tracker.theme`'s 'auto' value
+  // or consult matchMedia, so classic can start a page in the wrong theme
+  // whenever the stored `tracker.theme` preference disagrees with whatever
+  // classic last painted. index.html's one big concatenated script tag is the
+  // very last thing before the closing body/html tags (page.py's build_page()), so every
+  // element this touches already exists and nothing has painted yet —
+  // correcting classic here means the brief window where classic is the only
+  // thing visible (before this file's own deferred init() unhides #nextRoot)
+  // already shows the resolved theme, eliminating the flash without touching
+  // index.html.
+  syncClassicTheme(resolveTheme());
 
   // ----------------------------------------------------------------------
   // UI-mode switch (02-shell-and-board.md "Mode switching")
@@ -167,30 +220,40 @@ window.CR = window.CR || {};
   var state = { view: 'board', sid: '' };
   var els = {};
 
+  // STRUCTURAL FIX (app shell disappearing in detail): `els.shell` is the ONE
+  // element handed to CR.board.mount() — board now builds the rail + top bar
+  // (persistent, never hidden) plus all three content slots inside it. This
+  // file no longer builds #cr-view-board/#cr-view-detail itself; it fetches
+  // the real slot nodes back from CR.board.viewSlots() in ensureMounted()
+  // below, once board has actually mounted. `els.shell` carries the `cr-view`
+  // class so it gets the SAME flex:1 sizing (ext_cr_boot.css) the old
+  // top-level view slots relied on — board.mount() only adds its OWN
+  // `tracker-next cr-app` classes on top, it never clears existing ones.
   function buildRoots() {
     var root = document.getElementById('nextRoot');
-    if (!root || els.viewBoard) return;
-    els.viewBoard = document.createElement('div');
-    els.viewBoard.id = 'cr-view-board';
-    els.viewBoard.className = 'cr-view';
-    els.viewDetail = document.createElement('div');
-    els.viewDetail.id = 'cr-view-detail';
-    els.viewDetail.className = 'cr-view';
-    els.viewDetail.hidden = true;
+    if (!root || els.shell) return;
+    els.shell = document.createElement('div');
+    els.shell.id = 'cr-shell';
+    els.shell.className = 'cr-view';
     els.dialogsRoot = document.createElement('div');
     els.dialogsRoot.id = 'cr-dialogs-root';
     els.termRoot = document.createElement('div');
     els.termRoot.id = 'cr-term-root';
-    root.appendChild(els.viewBoard);
-    root.appendChild(els.viewDetail);
+    root.appendChild(els.shell);
     root.appendChild(els.dialogsRoot);
     root.appendChild(els.termRoot);
   }
 
+  // Unchanged logic — still just toggles `hidden` on the two/three view slots
+  // for the current view. What changed is WHICH elements els.viewBoard /
+  // els.viewSessions / els.viewDetail refer to: they're now the inner content
+  // slots CR.board built inside the persistent shell (see ensureMounted),
+  // never the shell itself — so the rail + top bar are never touched here.
   function showView(view) {
-    view = (view === 'detail') ? 'detail' : 'board';
+    view = (view === 'detail') ? 'detail' : (view === 'sessions') ? 'sessions' : 'board';
     state.view = view;
     if (els.viewBoard) els.viewBoard.hidden = (view !== 'board');
+    if (els.viewSessions) els.viewSessions.hidden = (view !== 'sessions');
     if (els.viewDetail) els.viewDetail.hidden = (view !== 'detail');
   }
 
@@ -204,7 +267,7 @@ window.CR = window.CR || {};
       emit('session:selected', { id: sessionId });
     }
     showView(view);
-    if (view === 'board') {
+    if (view === 'board' || view === 'sessions') {
       if (typeof loadSide === 'function') loadSide();
     } else if (state.sid && typeof poll === 'function') {
       poll();
@@ -323,7 +386,10 @@ window.CR = window.CR || {};
     on: on,
     emit: emit,
     go: go,
-    theme: { get: getThemePref, set: setThemePref },
+    // `resolved` reuses boot.js's OWN resolveTheme() (live matchMedia read,
+    // never a stale snapshot) — cr_board.js's theme control calls this rather
+    // than forking a second resolution formula (see the report).
+    theme: { get: getThemePref, set: setThemePref, resolved: resolveTheme },
     icon: icon,
     dialog: dialog,
     markdown: markdown,
@@ -576,16 +642,18 @@ window.CR = window.CR || {};
         return;
       }
       emit('notify', { text: 'Running: ' + argv });
+      currentJob = res.j.job;
       if (typeof EventSource !== 'function') return;
       var es = new EventSource('/api/term/stream?job=' + encodeURIComponent(res.j.job));
       es.addEventListener('end', function (ev) {
         var d = {};
         try { d = JSON.parse(ev.data); } catch (e) {}
         es.close();
+        currentJob = null;
         emit('notify', { text: argv + (d.rc === 0 ? ' — done' : ' — exit ' + d.rc) });
         if (typeof cur !== 'undefined' && sid === cur && typeof poll === 'function') poll();
       });
-      es.onerror = function () { es.close(); };
+      es.onerror = function () { es.close(); currentJob = null; };
     }).catch(function () {
       emit('notify', { text: 'Couldn’t reach the server to run that command.' });
     });
@@ -662,17 +730,15 @@ window.CR = window.CR || {};
     emit('notify', { text: 'Switching effort needs an already-open terminal for this session — there’s no way to find one from here yet.' });
   });
 
-  // Stop — REQUIRED ADDITION, not wired: there is no server route that stops
-  // "whatever this session is doing" as a general action. The only kill-style
-  // routes that exist are POST /api/term/kill (needs a `job` id from a run
-  // this file itself just started — see cr:run-command above, not a bare
-  // sessionId) and POST /api/term/close (needs a `tty` id). Neither can be
-  // reached from just {sessionId}. Left disabled at the source in
-  // ext_cr_detail.js (the phone-bar Stop button carries `disabled` + a title
-  // explaining why) rather than wired to an endpoint that doesn't answer the
-  // actual question asked.
-  on('cr:stop', function () {
-    emit('notify', { text: 'Stopping a session isn’t supported yet — there’s no server route for it.' });
+  // Stop — stops the currently-running command (via the same /api/term/kill
+  // endpoint ext_run.js's stop() already uses). Mirrors ext_run.js's behaviour:
+  // only executes if a job is actually running; silently returns otherwise.
+  on('cr:stop', function (payload) {
+    if (!currentJob) return;
+    fetch('/api/term/kill', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job: currentJob })
+    }).catch(function () { });
   });
 
   // ----------------------------------------------------------------------
@@ -742,7 +808,27 @@ window.CR = window.CR || {};
     buildRoots();
     safeMount('dialogs', els.dialogsRoot);
     safeMount('term', els.termRoot);
-    safeMount('board', els.viewBoard);
+    // board.mount() builds the persistent rail/top bar AND all three content
+    // slots inside els.shell (see ext_cr_board.js's buildShell()). Fetch the
+    // real slot nodes back out via viewSlots() — same "expose internals for
+    // the bootstrap" pattern boardTiles()/sessionState() already use, not a
+    // new mount contract.
+    safeMount('board', els.shell);
+    var slots = (window.CR.board && typeof window.CR.board.viewSlots === 'function') ? window.CR.board.viewSlots() : null;
+    els.viewBoard = slots && slots.board;
+    els.viewSessions = slots && slots.sessions;
+    els.viewDetail = slots && slots.detail;
+    if (!els.viewDetail) {
+      // CR.board is missing or its own mount() threw before building the view
+      // slots — fall back to a bare slot inside the shell so CR.detail still
+      // has somewhere honest to mount, instead of silently losing the detail
+      // view entirely.
+      els.viewDetail = document.createElement('div');
+      els.viewDetail.id = 'cr-view-detail';
+      els.viewDetail.className = 'cr-view';
+      els.viewDetail.hidden = (state.view !== 'detail');
+      if (els.shell) els.shell.appendChild(els.viewDetail);
+    }
     safeMount('detail', els.viewDetail);
     fetchTermsMax();
     applyPollPref(); // pick up a previously-chosen cadence for a `timer` that predates this mount

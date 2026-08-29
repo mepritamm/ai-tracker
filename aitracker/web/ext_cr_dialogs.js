@@ -5,8 +5,13 @@
  * sibling modules (board, detail, terminal) reuse instead of forking their own.
  *
  * Doc: design_handoff_control_room/04-coverage-and-help.md (source of truth for every
- * string, colour and layout below). NO FETCHING — every dialog is fed by the payload its
- * opener passes to CR.dialogs.open(name, payload); this module never calls fetch().
+ * string, colour and layout below). NO FETCHING, with ONE narrow exception: every dialog
+ * is fed by the payload its opener passes to CR.dialogs.open(name, payload) and none of
+ * them call fetch() — except the Config dialog's Board/Terminal/Server rows, which are now
+ * real, writable server settings (POST /api/config) and so read their own live state via
+ * GET /api/config the moment they open, entirely inside renderConfig()/its own helpers
+ * (fetchServerConfig/postConfigValue below). Every other dialog in this file is still fed
+ * purely by its opener's payload.
  *
  * NOTE: foundations doc 01 writes tokens as `--surface-raised` etc. The shared contract
  * for this build renames that layer `--ads-*` (confirmed against the prototype's own
@@ -237,7 +242,8 @@
 
   // CR.dialogs.showNudgeIfNeeded() — Fix 1c: notificationNudge() was fully built to
   // spec but had ZERO call sites, so it never appeared. This mounts it (floating,
-  // top-left, above the toast stack) the first time this module is asked to — the
+  // bottom-left, clear of the toast stack at bottom-right) the first time this module
+  // is asked to — the
   // caller (ext_cr_boot.js) calls it right when it has a real notify-worthy event
   // (a session landing), satisfying "never on first paint". Idempotent per page life:
   // notificationNudge() itself already returns null once dismissed/granted/denied, and
@@ -353,7 +359,7 @@
     }
   }
 
-  function buildChrome(name, title, emo, contextStr, wide) {
+  function buildChrome(name, title, emo, contextStr, wide, emoCls) {
     var titleId = 'cr-dlg-title-' + (++_idSeq);
     var backdrop = h('div', { class: 'cr-backdrop' });
     var panel = h('div', {
@@ -363,7 +369,9 @@
     });
     var head = h('div', { class: 'cr-dialog-head' }, [
       h('div', { class: 'cr-dialog-heading' }, [
-        emo ? emoji(emo, null) : null,
+        // emoCls: role variant per doc 01's emoji table (e.g. 'tn-emo-f' for
+        // the flags 🚩 dialog) — defaults to the base tint when omitted.
+        emo ? emoji(emo, emoCls || null) : null,
         h('h2', { id: titleId, class: 'cr-dialog-title' }, [title]),
       ]),
       h('div', { class: 'cr-dialog-context' }, [contextStr || '']),
@@ -481,6 +489,32 @@
     ['Idle', 'grey', 'counted, not listed', 'none'],
   ];
 
+  // Coverage tab's colour legend — round 5's final artboard (`5c`, the authoritative
+  // one per the owner's ruling; the docs were written from round 4 and never caught
+  // up). 5c draws exactly five rows: Waiting on you/orange, Working now/wheat, Your
+  // flags/rust, Evidence/dusk, Failures/brick. This is a COLOUR legend, not a literal
+  // board-state reference — "Evidence" is the detail view's own Evidence column
+  // (ext_cr_detail.js's "Evidence" eyebrow), tinted with --text-dusk, not a session
+  // status word — which is why it's a separate list from STATE_ROWS above (that one
+  // stays a real per-state reference for the States tab: When/Word shown/Motion,
+  // none of which "Evidence" has an honest answer for).
+  //
+  // Judgement call: Landed and Idle are genuine states the board renders (see
+  // ext_cr_board.css's .cr-rail-dot.is-landed / default idle grey, and STATE_ROWS
+  // above) but 5c's five rows don't mention them. Dropping them here would make this
+  // legend incomplete versus what the UI actually shows a viewer, so they're kept as
+  // two extra rows AFTER 5c's five, rather than silently carrying over the previous
+  // (wrong) wording for them.
+  var LEGEND_ROWS = [
+    ['Waiting on you', 'orange', 'Waiting on you · <age>'],
+    ['Working now', 'wheat', 'Working'],
+    ['Your flags', 'rust', 'N flags open'],
+    ['Evidence', 'dusk', 'Evidence'],
+    ['Failures', 'brick', 'fail + command name'],
+    ['Landed', 'forest', 'Landed'],
+    ['Idle', 'grey', 'counted, not listed'],
+  ];
+
   // Providers actually registered in aitracker/registry.py (4, matching "4 tools" in
   // the stat block) and where each is known — from the project README — to degrade.
   //
@@ -554,7 +588,7 @@
     var table = h('table', { class: 'cr-state-table' });
     table.appendChild(h('thead', {}, [h('tr', {}, [h('th', {}, ['State']), h('th', {}, ['Colour']), h('th', {}, ['Word shown'])])]));
     var tbody = h('tbody');
-    STATE_ROWS.forEach(function (r) {
+    LEGEND_ROWS.forEach(function (r) {
       tbody.appendChild(h('tr', {}, [
         h('td', {}, [r[0]]),
         h('td', {}, [h('span', { class: 'cr-swatch cr-swatch-' + r[1] }), ' ' + r[1]]),
@@ -566,7 +600,7 @@
 
     wrap.appendChild(h('div', { class: 'cr-seccards' }, [
       h('div', { class: 'cr-seccard cr-seccard-brick' }, [
-        h('div', { class: 'cr-seccard-title' }, [emoji('⚠️', 'tn-emo-f'), ' If you expose this beyond localhost']),
+        h('div', { class: 'cr-seccard-title' }, [emoji('⚠️', 'tn-emo-f'), ' Read this before you expose the server']),
         h('ul', {}, [
           h('li', {}, ['The in-browser terminal is an unrestricted shell, reachable wherever the server is — no allowlist applies to it.']),
           h('li', {}, ['Treat TRACKER_AUTH with the seriousness you’d give a root password, and rotate it if you expose it publicly.']),
@@ -582,10 +616,18 @@
         ]),
       ]),
     ]));
-    // NOTE: doc 04 asks for "verbatim copy from the 'Read this before you expose the
-    // server' list" but no section by that exact heading exists in README.md or doc 04
-    // itself — the closest verbatim source is README's "What these features do and
-    // don't guarantee" bullets (README.md:104-108), quoted near-verbatim above.
+    // NOTE (fixes a prior wrong claim here): that prior note said no section titled
+    // "Read this before you expose the server" exists anywhere in the source material —
+    // true of the docs (README/doc 04), but FALSE of the actual prototype: the sentence
+    // is verbatim in the design file's `4e` artboard (the discarded full-page-Help
+    // exploration) as the eyebrow over this exact pair of cards, and the owner's
+    // ruling makes the artboards authoritative over the docs. `5c` (the final, in-scope
+    // Help/Config-as-dialogs artboard) doesn't redraw this heading itself, so `4e` fills
+    // in the detail per the ruling's own allowance for that. Adopted verbatim above as
+    // the brick card's title, replacing the old "If you expose this beyond localhost"
+    // wording. The list content itself still has no verbatim doc/prototype source, so
+    // it stays the README-derived copy ("What these features do and don't guarantee",
+    // README.md:104-108) it always was.
 
     wrap.appendChild(h('div', { class: 'cr-help-footer' }, [
       emoji('🧩', 'tn-emo'),
@@ -665,7 +707,10 @@
   ];
 
   function renderHelp(payload) {
-    var chrome = buildChrome('help', 'Help', '❓', 'ai-tracker', false);
+    // Header subtitle: 5c gives Help a bare "?" (not "ai-tracker" — that was never
+    // this dialog's real subtitle, just a placeholder left over before the artboard
+    // was consulted).
+    var chrome = buildChrome('help', 'Help', '❓', '?', false);
     chrome.panel.classList.add('cr-dialog-help');
     var tabs = h('div', { class: 'cr-tabpills', role: 'tablist' });
     var pane = h('div', { class: 'cr-tabpane' });
@@ -703,12 +748,32 @@
     // "Reset to defaults" still clears a stray value written by an earlier build.
     railOpen: 'cr.railOpen',
     cardsFolded: 'cr.cardsFolded',
-    // Fix 2d: 'cr.boardTileCount' is no longer written (the row is read-only — see
-    // below); kept here only for the same stale-key cleanup as railOpen above.
+    // The owner's call (see the board-tile-count decision in the PR that wired this row up):
+    // a 3–8 slider, NOT 04's original 3–12 spec — 3–8 never exceeds the handoff README's
+    // "board never renders more than 8 tiles" cap, so both docs are satisfied at once.
+    // Client-side preference ONLY (never a server config.json key) — ext_cr_board.js reads
+    // this SAME key and clamps to 3..8 on its own side; the two must agree on both the key
+    // name and the value shape: a bare JSON-encoded integer (`JSON.stringify(n)`, i.e. the
+    // string "3".."8"), read back with `JSON.parse(localStorage.getItem(key))`. Unset ->
+    // the board's own default (8, matching the previous fixed behaviour) applies.
     boardTiles: 'cr.boardTileCount',
     pollMs: 'cr.pollIntervalMs',
     desktopNotif: 'cr.notif.enabled',
     sound: 'cr.notif.sound',
+  };
+
+  // Env-var chip text for each server config.json key (config.py's EDITABLE/VALIDATORS
+  // universe, plus AUTH which is displayed but never posted) — purely cosmetic labelling,
+  // matches the exact env var name each key falls back to per config.py's own _ENV_NAME.
+  var _ENVCHIP = {
+    LIVE_WINDOW: null,   // never had an env var of its own — config.json > built-in default
+    TERM_RENDERER: 'TRACKER_TERM_RENDERER',
+    MAX_TERMS: 'TRACKER_MAX_TERMS',
+    TERMINAL: 'TRACKER_TERMINAL',
+    TERM_APP: 'TRACKER_TERM_APP',
+    TERM_ALLOW: 'TRACKER_TERM_ALLOW',
+    PORT: 'PORT',
+    HOST: 'HOST',
   };
 
   function readPref(key, dflt) {
@@ -738,15 +803,18 @@
   }
 
   function cfgRow(label, envVar, sub, control, restart) {
+    // `control` may be a single element or an array (e.g. [control, statusBadge()]) --
+    // [].concat() flattens either shape into a flat child list without treating a bare
+    // DOM node as iterable.
     return h('div', { class: 'cr-cfg-row' }, [
       h('div', { class: 'cr-cfg-row-label' }, [
         h('div', { class: 'cr-cfg-row-name' }, [label, envVar ? h('code', { class: 'cr-envchip' }, [envVar]) : null]),
         h('div', { class: 'cr-cfg-row-sub' }, [
           sub,
-          restart ? h('span', { class: 'cr-restart-note' }, [' — needs a restart']) : null,
+          restart ? h('span', { class: 'cr-restart-note' }, [' — takes effect on restart']) : null,
         ]),
       ]),
-      h('div', { class: 'cr-cfg-row-control' }, [control]),
+      h('div', { class: 'cr-cfg-row-control' }, [].concat(control)),
     ]);
   }
 
@@ -792,24 +860,161 @@
     return h('span', { class: 'cr-readonly cr-mono' }, [text]);
   }
 
-  // Config's payload contract (documented in the handoff report): the caller
-  // (bootstrap) supplies `payload.server` with the values it already fetched from
-  // existing routes (GET /api/term/list) or embedded at page-build time — this module
-  // never fetches. ext_cr_boot.js's fetchTermsMax() is today the only populated source:
-  // it learns `maxTerms` AND (Fix 2e) `terminalEnabled` from that SAME one-shot
-  // /api/term/list probe (its guard() 403 is distinguishable from an auth-required 403 —
-  // see that function's own comment). Every other field stays undefined and renders via
-  // each row's own honest fallback ("unknown" for terminalEnabled specifically, per Fix
-  // 2e — never a confidently wrong default).
+  // ---------------------------------------------------------------------------
+  // Config dialog: server-backed controls (POST /api/config). This is the ONE
+  // exception to this module's own "no fetch()" rule stated at the top of the file —
+  // that rule predates a write route existing at all (Fix 2f's own comment below
+  // verified there was NO /api/config route when it was written). A dialog that can
+  // now WRITE a server setting has to read the value it's editing live too, both to
+  // show the real current state on open and to reflect what the server actually
+  // accepted after a save (never just echo back what the user typed) -- kept
+  // entirely local to renderConfig()/its helpers, every other dialog in this file
+  // is still fed purely by its opener's payload.
+  // ---------------------------------------------------------------------------
+
+  function fetchServerConfig(cb) {
+    fetch('/api/config').then(function (r) { return r.json(); })
+      .then(function (d) { cb(d || {}); })
+      .catch(function () { cb(null); });
+  }
+
+  function postConfigValue(key, value, cb) {
+    fetch('/api/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: key, value: value }),
+    }).then(function (r) { return r.json().then(function (d) { cb(r.ok, d); }); })
+      .catch(function (e) { cb(false, { error: String((e && e.message) || e) }); });
+  }
+
+  // Tunnel section (aitracker/config.py's "Tunnel management" -- see its module comment for
+  // the full design). Three routes, deliberately separate from the config.json ones above:
+  // GET /api/tunnel never carries the raw user/pass, only whether each is set -- so a plain
+  // dialog-open fetch (same "read live the moment it opens" pattern as fetchServerConfig)
+  // can't leak a credential just by happening. The raw value only ever comes back from GET
+  // /api/tunnel/reveal, called exactly once per explicit "Show" click (see renderConfig's
+  // Tunnel section below) -- never on open, never cached past that click.
+  function fetchTunnelPublic(cb) {
+    fetch('/api/tunnel').then(function (r) { return r.json(); })
+      .then(function (d) { cb(d || null); })
+      .catch(function () { cb(null); });
+  }
+
+  function fetchTunnelReveal(cb) {
+    fetch('/api/tunnel/reveal').then(function (r) { return r.json(); })
+      .then(function (d) { cb(d || null); })
+      .catch(function () { cb(null); });
+  }
+
+  function postTunnelValue(key, value, cb) {
+    fetch('/api/tunnel', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: key, value: value }),
+    }).then(function (r) { return r.json().then(function (d) { cb(r.ok, d); }); })
+      .catch(function (e) { cb(false, { error: String((e && e.message) || e) }); });
+  }
+
+  // A visible, honest saved/failed state next to the control it belongs to -- mirrors
+  // this file's existing Copy/Copied transient-state pattern (see copyBtn above).
+  function statusBadge() {
+    return h('span', { class: 'cr-cfg-status', 'aria-live': 'polite' });
+  }
+  function showStatus(el, ok, msg) {
+    clearTimeout(el._crStatusT);
+    el.textContent = ok ? 'Saved' : ('Failed' + (msg ? ' — ' + msg : ''));
+    el.classList.toggle('is-saved', ok);
+    el.classList.toggle('is-failed', !ok);
+    el._crStatusT = setTimeout(function () {
+      el.textContent = '';
+      el.classList.remove('is-saved', 'is-failed');
+    }, ok ? 1800 : 5000);
+  }
+
+  // A slider whose LABEL updates continuously while dragging (so the number tracks the
+  // thumb) but whose onCommit only fires once the drag/keystroke is committed ('change') --
+  // unlike sliderCtl (used for pure client-side prefs), this one is meant to sit in front
+  // of a POST /api/config call and must not fire one per drag tick.
+  function sliderCtlCommit(min, max, value, onCommit, suffix) {
+    var out = h('span', { class: 'cr-slider-val cr-mono' }, [String(value) + (suffix || '')]);
+    var input = h('input', { class: 'cr-slider', type: 'range', min: min, max: max, value: value });
+    input.addEventListener('input', function () { out.textContent = input.value + (suffix || ''); });
+    input.addEventListener('change', function () { onCommit(Number(input.value)); });
+    return h('div', { class: 'cr-slider-wrap' }, [input, out]);
+  }
+
+  function textFieldCtl(value, onCommit, opts) {
+    opts = opts || {};
+    var inp = h('input', {
+      class: 'cr-textfield cr-cfg-textfield', type: opts.type || 'text',
+      min: opts.min != null ? opts.min : null, max: opts.max != null ? opts.max : null,
+    });
+    inp.value = value == null ? '' : String(value);
+    inp.addEventListener('change', function () {
+      onCommit(opts.type === 'number' ? Number(inp.value) : inp.value);
+    });
+    return inp;
+  }
+
+  function textareaCtl(value, onCommit, placeholder) {
+    var ta = h('textarea', { class: 'cr-textfield cr-cfg-textarea cr-mono', rows: 4, placeholder: placeholder || '' });
+    ta.value = value || '';
+    ta.addEventListener('change', function () { onCommit(ta.value); });
+    return ta;
+  }
+
+  // Config's payload contract (documented in the handoff report): the caller (bootstrap)
+  // supplies `payload.server` with values it already had lying around (GET /api/term/list's
+  // maxTerms/terminalEnabled) — used here ONLY as an instant, no-flash first paint. The
+  // real, current, WRITABLE state for every config.json-backed row comes from GET
+  // /api/config, fetched the moment this dialog opens (see the "one exception to no
+  // fetch()" note above fetchServerConfig) and merged over the payload defaults the instant
+  // it lands — `srv` below is reassigned in place, never a fresh object, so closures that
+  // already captured it keep seeing the latest merge.
   function renderConfig(payload) {
     var srv = (payload && payload.server) || {};
-    var chrome = buildChrome('config', 'Config', '⚙️', 'ai-tracker', true);
+    // Header subtitle: 5c gives Config the real server address (its mock shows
+    // "localhost:8790") — not "ai-tracker". The honest source for that on THIS page
+    // is the page's own location, not a guessed/invented config field or a request:
+    // this dialog is always served BY the tracker it's showing settings for, so
+    // location.host already IS that address.
+    var subtitle = (window.location && window.location.host) || '';
+    var chrome = buildChrome('config', 'Config', '⚙️', subtitle, true);
     chrome.panel.classList.add('cr-dialog-config');
 
-    var sections = ['Interface', 'Board', 'Terminal', 'Notifications', 'Server', 'Data files'];
+    var sections = ['Interface', 'Board', 'Terminal', 'Notifications', 'Server', 'Tunnel', 'Data files'];
     var nav = h('div', { class: 'cr-cfg-nav' });
     var body = h('div', { class: 'cr-cfg-body' });
     var active = 'Interface';
+    // Tunnel section's own state -- local to THIS renderConfig() call, so it starts fresh
+    // every time the dialog opens. `tunnel` is the masked snapshot (GET /api/tunnel);
+    // `tunnelRevealed` is null until "Show" is clicked and is never written back to
+    // anything that outlives this dialog instance -- closing/reopening always starts
+    // masked again, satisfying "the revealed value must not persist across dialog
+    // close/reopen" (the security requirement this feature was built under).
+    var tunnel = {};
+    var tunnelRevealed = null;
+
+    // A generic editable row for a server config.json key: renders whatever `ctlFn(value,
+    // onCommit)` builds, POSTs on commit, shows an honest Saved/Failed badge, and rolls the
+    // control back to the server's last-known-good value on failure (never leaves the UI
+    // showing a value the server rejected as if it had been accepted).
+    function serverRow(label, key, sub, ctlFn) {
+      var meta = srv.cfg && srv.cfg[key];
+      var value = meta ? meta.value : undefined;
+      var status = statusBadge();
+      var restart = (meta && meta.restart) || false;
+      var ctl = ctlFn(value, function (newVal) {
+        postConfigValue(key, newVal, function (ok, resp) {
+          if (ok) {
+            if (srv.cfg && srv.cfg[key]) srv.cfg[key].value = resp.value;
+            showStatus(status, true);
+          } else {
+            showStatus(status, false, (resp && resp.error) || 'request failed');
+            renderSection();   // snap every control in this section back to last-known-good
+          }
+        });
+      });
+      return cfgRow(label, _ENVCHIP[key] || null, sub, [ctl, status], restart);
+    }
 
     function renderSection() {
       body.innerHTML = '';
@@ -824,49 +1029,172 @@
           toggleCtl(readRailPref() === 'open', function (v) { writeRailPref(v ? 'open' : 'collapsed'); })));
         body.appendChild(cfgRow('Cards start folded', null, 'Every detail-view panel starts collapsed except Conversation.',
           toggleCtl(readPref(CFG_PREF_KEYS.cardsFolded, true), function (v) { writePref(CFG_PREF_KEYS.cardsFolded, v); })));
-        body.appendChild(cfgRow('Desktop notifications', null, 'Ask once; shows the permission nudge if not yet granted.',
-          toggleCtl(readPref(CFG_PREF_KEYS.desktopNotif, true), function (v) { writePref(CFG_PREF_KEYS.desktopNotif, v); })));
-        body.appendChild(cfgRow('Sound', null, 'Plays alongside the toast and desktop notification.',
-          toggleCtl(readPref(CFG_PREF_KEYS.sound, true), function (v) { writePref(CFG_PREF_KEYS.sound, v); })));
+        // Fix (drift 4): 5c draws this as ONE row — "Desktop notifications + sound" —
+        // not two separate toggles. Combined here, but both underlying preferences
+        // still get set on every flip: `desktopNotif` (this dialog's own pref, read by
+        // the permission-nudge logic) AND the REAL sound switch. That real switch is
+        // `soundOn`/`toggleSound()` (app.js globals, same `soundOff` localStorage key
+        // the classic bell and ext_cr_boot.js's `toggle:notifications` handler already
+        // share) -- NOT the disconnected `cr.notif.sound` pref this row used to write
+        // only to itself, which nothing else ever read. That was a real gap, not a
+        // deliberate second source of truth: fixed by routing through the same global
+        // toggleSound() so this control now drives the one real sound switch the rest
+        // of the app already has, instead of a shadow copy of it.
+        body.appendChild(cfgRow('Desktop notifications + sound', null, 'Only while the tab is in the background.',
+          toggleCtl(
+            (typeof soundOn !== 'undefined') ? soundOn : readPref(CFG_PREF_KEYS.sound, true),
+            function (v) {
+              writePref(CFG_PREF_KEYS.desktopNotif, v);
+              writePref(CFG_PREF_KEYS.sound, v);
+              if (typeof soundOn !== 'undefined' && soundOn !== v && typeof toggleSound === 'function') toggleSound();
+            }
+          )));
       } else if (active === 'Board') {
-        // Fix 2d — DOC CONFLICT: 04's config table specifies a 3–12 slider here, but the
-        // handoff README's decision #2 is "the board never renders more than 8 tiles" as
-        // a fixed product decision, and ext_cr_board.js hardcodes that cap (never reads
-        // any pref). A slider that "works" but is silently capped is worse than no
-        // control at all, so this row is read-only, states the real number, and says why
-        // — it does not write cr.boardTileCount any more.
-        body.appendChild(cfgRow('Board tiles', null, 'Fixed at 8 — a product decision (handoff README decision 2), not a live setting despite 04’s slider spec.',
-          readonlyField('8')));
+        // The owner's decision: a 3–8 slider (not 04's original 3–12 spec) — 3–8 never
+        // exceeds the handoff README's "board never renders more than 8 tiles" cap, so
+        // both docs are satisfied. Client-side preference ONLY (localStorage, NOT
+        // config.json) — ext_cr_board.js reads this same key and clamps to 3..8 itself.
+        body.appendChild(cfgRow('Board tiles', null, 'How many session tiles the board shows before "+N more" — never more than 8 (handoff README decision 2).',
+          sliderCtl(3, 8, readPref(CFG_PREF_KEYS.boardTiles, 8), function (v) { writePref(CFG_PREF_KEYS.boardTiles, v); })));
         // Fix 2b — this is the SAME poll() /api/session timer app.js's track() already
         // runs (2s by default, and the project's hard rule keeps that the default) —
         // ext_cr_boot.js re-arms that one timer at the chosen cadence instead of adding a
         // second loop. It does not touch the separate 5s /api/list (board/rail) poll.
         body.appendChild(cfgRow('Poll interval', null, 'How often the open session’s detail view re-polls the server. (The board/rail list poll stays fixed at 5s.)',
           segmented([[1000, '1s'], [2000, '2s'], [5000, '5s']], readPref(CFG_PREF_KEYS.pollMs, 2000), function (v) { writePref(CFG_PREF_KEYS.pollMs, v); })));
-        body.appendChild(cfgRow('Live window', null,
-          'Fixed at ' + (srv.liveWindowSec != null ? Math.round(srv.liveWindowSec / 60) : 5) + ' min server-side (config.py LIVE_WINDOW) — not yet configurable; see Help.',
-          readonlyField((srv.liveWindowSec != null ? Math.round(srv.liveWindowSec / 60) : 5) + ' min')));
+        body.appendChild(serverRow('Live window', 'LIVE_WINDOW',
+          'How long a session with no new activity still counts as "live" before it shows as done.',
+          function (value, onCommit) {
+            return sliderCtlCommit(30, 1800, value != null ? value : 300, onCommit, 's');
+          }));
       } else if (active === 'Terminal') {
-        body.appendChild(cfgRow('Terminal renderer', 'TRACKER_TERM_RENDERER', 'Startup default only — already switchable live per-terminal from its own toolbar.',
-          readonlyField(srv.termRenderer || 'xterm')));
-        body.appendChild(cfgRow('Max terminals', 'TRACKER_MAX_TERMS', 'Clamped to 1–64.',
-          readonlyField(String(srv.maxTerms != null ? srv.maxTerms : 12))));
-        body.appendChild(cfgRow('Terminal enabled', 'TRACKER_TERMINAL', 'Turns the tracker from a read-only viewer into something that can start processes.', restartFlag(srv.terminalEnabled),
-          true));
-        body.appendChild(cfgRow('External terminal app', 'TRACKER_TERM_APP', 'Terminal or iTerm, for the ↗ external-terminal buttons.',
-          readonlyField(srv.termApp || 'Terminal')));
-        body.appendChild(cfgRow('Command allowlist', 'TRACKER_TERM_ALLOW', 'One argv prefix per line; replaces the default set outright.',
-          readonlyField((srv.termAllow || []).length ? (srv.termAllow.length + ' entries') : 'default set')));
+        body.appendChild(serverRow('Terminal renderer', 'TERM_RENDERER',
+          'Default for newly-opened terminals — already switchable live per-terminal from its own toolbar.',
+          function (value, onCommit) {
+            return segmented([['xterm', 'xterm'], ['grid', 'grid']], value || 'xterm', onCommit);
+          }));
+        body.appendChild(serverRow('Max terminals', 'MAX_TERMS', 'Clamped to 1–64.',
+          function (value, onCommit) {
+            return sliderCtlCommit(1, 64, value != null ? value : 12, onCommit, '');
+          }));
+        body.appendChild(serverRow('Terminal enabled', 'TERMINAL',
+          'The kill-switch. ON means the tracker can start real shell processes on this machine, not just read logs — turn it OFF if you only want the read-only dashboard.',
+          function (value, onCommit) {
+            return toggleCtl(value !== false, onCommit);
+          }));
+        body.appendChild(serverRow('External terminal app', 'TERM_APP', 'Terminal or iTerm, for the ↗ external-terminal buttons.',
+          function (value, onCommit) {
+            return segmented([['Terminal', 'Terminal'], ['iTerm', 'iTerm']], value || 'Terminal', onCommit);
+          }));
+        body.appendChild(serverRow('Command allowlist', 'TERM_ALLOW',
+          'One argv prefix per line; replaces the default set outright. Leave empty to use the built-in default set.',
+          function (value, onCommit) {
+            return textareaCtl(value || '', function (text) { onCommit(text); }, 'default set (leave empty)');
+          }));
       } else if (active === 'Notifications') {
-        body.appendChild(cfgRow('Desktop notifications', null, 'Mirrors the Interface tab toggle.',
-          toggleCtl(readPref(CFG_PREF_KEYS.desktopNotif, true), function (v) { writePref(CFG_PREF_KEYS.desktopNotif, v); })));
-        body.appendChild(cfgRow('Sound', null, 'Mirrors the Interface tab toggle.',
-          toggleCtl(readPref(CFG_PREF_KEYS.sound, true), function (v) { writePref(CFG_PREF_KEYS.sound, v); })));
+        // Fix (drift 4): this tab used to carry its own second copy of the two toggles
+        // now combined into the Interface tab's single "Desktop notifications + sound"
+        // row -- a real, functioning duplicate control, not just repeated copy. Removed
+        // rather than mirrored; the tab itself stays (5c's own Config nav still lists
+        // it) since nothing here calls for deleting the nav entry, only the duplication.
+        body.appendChild(h('p', { class: 'cr-help-note' }, [
+          'Desktop notifications + sound now lives on the Interface tab — one row, one setting.',
+        ]));
       } else if (active === 'Server') {
-        body.appendChild(cfgRow('Auth', 'TRACKER_AUTH', 'Never displayed — only whether it is set. Treat it like a root password.',
+        body.appendChild(cfgRow('Auth', 'TRACKER_AUTH',
+          'Never displayed — only whether it is set. Env-only, deliberately not editable here: writing a password typed into a browser into a plaintext file on a server that may be tunneled is a real security regression, not a convenience. Set TRACKER_AUTH and restart to change it.',
           readonlyField(srv.authSet ? 'set' : 'not set'), true));
-        body.appendChild(cfgRow('Port', 'PORT', 'Read-only display.', readonlyField(String(srv.port != null ? srv.port : 8790)), true));
-        body.appendChild(cfgRow('Host', 'HOST', 'Read-only display.', readonlyField(srv.host || '127.0.0.1'), true));
+        body.appendChild(serverRow('Port', 'PORT', 'Rebinding a live listening socket isn’t attempted — this only takes effect the next time the server starts.',
+          function (value, onCommit) {
+            return textFieldCtl(value != null ? value : 8790, onCommit, { type: 'number', min: 1, max: 65535 });
+          }));
+        body.appendChild(serverRow('Host', 'HOST', 'Same as Port — recorded now, applied on the next start.',
+          function (value, onCommit) {
+            return textFieldCtl(value || '127.0.0.1', onCommit, { type: 'text' });
+          }));
+      } else if (active === 'Tunnel') {
+        // The one-line, always-visible disclosure the security review this feature was
+        // built under calls for: never hidden behind the reveal action, never a lecture.
+        body.appendChild(h('p', { class: 'cr-help-note cr-tunnel-disclosure' }, [
+          'Stored in plain text on this machine (', h('code', {}, ['config.json']),
+          ', permissions locked to you only) — the share URL below carries it too. Treat both like a password.',
+        ]));
+
+        body.appendChild(cfgRow('Tunnel URL', null,
+          'Not discoverable from here — a Cloudflare quick tunnel (`make tunnel`) mints a new address every run. Paste the one it printed.',
+          (function () {
+            var status = statusBadge();
+            var ctl = textFieldCtl(tunnel.url || '', function (v) {
+              postTunnelValue('TUNNEL_URL', v, function (ok, resp) {
+                if (ok) { tunnel.url = resp.value; if (tunnelRevealed) tunnelRevealed = null; showStatus(status, true); renderSection(); }
+                else { showStatus(status, false, (resp && resp.error) || 'request failed'); renderSection(); }
+              });
+            }, { type: 'text' });
+            ctl.classList.add('cr-cfg-textfield-wide');
+            return [ctl, status];
+          })()));
+
+        var shown = !!tunnelRevealed;
+        function maskedRow(label, key, sub) {
+          var setFlag = key === 'user' ? tunnel.user_set : tunnel.pass_set;
+          if (!shown) {
+            return cfgRow(label, null, sub, readonlyField(setFlag ? '••••••••' : 'not set'), true);
+          }
+          var status = statusBadge();
+          var ctl = textFieldCtl(tunnelRevealed[key] || '', function (v) {
+            postTunnelValue(key === 'user' ? 'TUNNEL_USER' : 'TUNNEL_PASS', v, function (ok, resp) {
+              if (ok) {
+                tunnelRevealed[key] = v;
+                if (key === 'user') tunnel.user_set = !!v; else tunnel.pass_set = !!v;
+                // the restart command / share URL below embed this value -- keep them
+                // in sync with what was just saved, not the pre-edit reveal snapshot.
+                tunnelRevealed.restart_cmd = (resp && resp.restart_cmd) || tunnelRevealed.restart_cmd;
+                showStatus(status, true, 'restart required to apply');
+                renderSection();
+              } else {
+                showStatus(status, false, (resp && resp.error) || 'request failed');
+              }
+            });
+          }, { type: 'text' });
+          return cfgRow(label, null, sub, [ctl, status], true);
+        }
+        body.appendChild(maskedRow('Username', 'user', 'Same credential as TRACKER_AUTH — masked until you click Show.'));
+        body.appendChild(maskedRow('Password', 'pass', 'Editing here only stages the value — it takes effect once you restart with the command below.'));
+
+        var showBtn = h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: shown ? 'Hide' : 'Show' });
+        showBtn.addEventListener('click', function () {
+          if (tunnelRevealed) { tunnelRevealed = null; renderSection(); return; }
+          fetchTunnelReveal(function (rev) {
+            if (!rev) return;
+            tunnelRevealed = rev;
+            renderSection();
+          });
+        });
+        body.appendChild(h('div', { class: 'cr-tunnel-showrow' }, [showBtn]));
+
+        // Both blocks below embed the raw credential (the restart command needs it to be
+        // useful; the share URL IS it, in userinfo form) -- gated behind the SAME reveal
+        // action as the fields above, never computed or shown before "Show" is clicked.
+        if (tunnelRevealed) {
+          body.appendChild(h('div', { class: 'cr-tunnel-block' }, [
+            h('div', { class: 'cr-tunnel-block-label' }, ['Restart command — required for a new username/password to take effect']),
+            h('div', { class: 'cr-tunnel-cmdrow' }, [
+              h('code', { class: 'cr-mono cr-tunnel-cmd' }, [tunnelRevealed.restart_cmd || '']),
+              copyBtn(function () { return tunnelRevealed.restart_cmd || ''; }),
+            ]),
+            h('div', { class: 'cr-tunnel-block-note' }, [
+              'Started the server directly instead of via ', h('code', {}, ['make tunnel']), '? The equivalent is ',
+              h('code', {}, ['TRACKER_AUTH="user:pass" python3 -m aitracker']), '.',
+            ]),
+          ]));
+          body.appendChild(h('div', { class: 'cr-tunnel-block' }, [
+            h('div', { class: 'cr-tunnel-block-label' }, ['Share URL — for your own notes; the credential rides in the URL’s user:pass@host form, never a query string']),
+            h('div', { class: 'cr-tunnel-cmdrow' }, [
+              h('code', { class: 'cr-mono cr-tunnel-cmd' }, [tunnelRevealed.share_url || '(set a Tunnel URL above first)']),
+              copyBtn(function () { return tunnelRevealed.share_url || ''; }),
+            ]),
+          ]));
+        }
       } else if (active === 'Data files') {
         var df = srv.dataFiles || {};
         ['flags', 'titles', 'pins', 'notes'].forEach(function (k) {
@@ -875,14 +1203,6 @@
         });
       }
     }
-    // Fix 2e: `on` is a real tri-state (true/false/undefined-or-anything-else), never a
-    // hardcoded literal — a caller with no data for this (payload.server.terminalEnabled
-    // unset) must render "unknown" rather than a confident, possibly-wrong "on"/"off".
-    function restartFlag(on) {
-      if (on === true) return h('span', { class: 'cr-restart-badge' }, ['on']);
-      if (on === false) return h('span', { class: 'cr-restart-badge cr-restart-badge-off' }, ['off']);
-      return h('span', { class: 'cr-restart-badge cr-restart-badge-unknown' }, ['unknown']);
-    }
     sections.forEach(function (s) {
       var btn = h('button', { class: 'cr-cfg-nav-btn' + (s === active ? ' is-active' : ''), type: 'button', text: s });
       btn.addEventListener('click', function () { active = s; renderSection(); });
@@ -890,26 +1210,50 @@
     });
     renderSection();
 
+    // The live read: merges GET /api/config's per-key {value, overridden, restart} onto
+    // `srv.cfg` and re-renders whichever section is showing once it lands. A failed fetch
+    // (offline, a 401 race) leaves `srv.cfg` unset -- serverRow's controls then render with
+    // `value` undefined, which every ctlFn above already treats as "use the built-in
+    // default", same honest degrade this dialog already used before this feature existed.
+    fetchServerConfig(function (cfg) {
+      if (!cfg) return;
+      srv.cfg = cfg;
+      srv.authSet = !!cfg.AUTH_SET;
+      renderSection();
+    });
+    // Tunnel section's own live read -- see fetchTunnelPublic's comment for why this is
+    // the masked snapshot only, never the raw credential.
+    fetchTunnelPublic(function (t) {
+      if (!t) return;
+      tunnel = t;
+      if (active === 'Tunnel') renderSection();
+    });
+
     var main = h('div', { class: 'cr-cfg-main' }, [nav, body]);
     chrome.body.appendChild(main);
     chrome.body.appendChild(h('div', { class: 'cr-cfg-footer' }, [
-      // Fix 2f: the old copy claimed "editing one writes an override the server picks
-      // up" — false for every env-backed row (there is no /api/config write route at
-      // all — verified). The truth: rows WITHOUT an env-var chip are plain browser
-      // preferences, saved to this browser the moment you change them, nothing to
-      // "apply". Rows WITH an env-var chip are read from the server process at
-      // startup and have no live write path from here, so they're shown read-only —
-      // change the env var and restart (the rows marked *needs a restart* really do
-      // need one; the rest of the env-backed rows just have no control to change).
+      // Rows without an env-var chip are plain browser preferences — saved to this browser
+      // the moment you change them. Rows WITH an env-var chip are now REAL server settings
+      // (config.json > env var > built-in default — see config.py): a change here saves
+      // immediately and, for everything except Port/Host, applies live, no restart. Auth
+      // stays the one exception — env-only, never writable from here (see its own row).
       h('p', { class: 'cr-cfg-footer-note' }, [
-        'Rows without an env-var chip are plain browser preferences — saved to this browser the moment you change them. Rows with an env-var chip are read from the server process at startup; there’s no live write path from here, so they’re shown read-only — set the env var and restart (',
-        h('code', {}, ['make serve']), ') to change them.',
+        'Rows without an env-var chip are plain browser preferences — saved to this browser the moment you change them. Rows with an env-var chip are real server settings: saving writes ',
+        h('code', {}, ['config.json']),
+        ' and applies immediately — except Port and Host, which only take effect on the next ',
+        h('code', {}, ['make serve']),
+        '. The Server tab’s Auth row stays env-only and is never writable from here — the Tunnel tab is the one deliberate exception, since it edits that same credential and always requires a restart to take effect (see its own disclosure line).',
       ]),
       h('div', { class: 'cr-cfg-actions' }, [
-        h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Reset to defaults', onclick: function () {
-          Object.keys(CFG_PREF_KEYS).forEach(function (k) { var key = CFG_PREF_KEYS[k]; if (key) { try { localStorage.removeItem(key); } catch (e) {} } });
-          renderSection();
-        } }),
+        h('button', {
+          // "Reset to defaults" clears only the browser preferences it always has (there is
+          // no bulk-clear route for server keys — each is reset individually via its own
+          // control if you dial it back to the built-in value shown when unoverridden).
+          class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Reset to defaults', onclick: function () {
+            Object.keys(CFG_PREF_KEYS).forEach(function (k) { var key = CFG_PREF_KEYS[k]; if (key) { try { localStorage.removeItem(key); } catch (e) {} } });
+            renderSection();
+          },
+        }),
         h('button', { class: 'cr-btn cr-btn-solid', type: 'button', text: 'Apply', onclick: close }),
       ]),
     ]));
@@ -1045,7 +1389,7 @@
   // payload: {flags:[{id, session, sessionTitle, text, resolved}], onOpen, onResolve, onReopen, onDelete}
   function renderFlagsList(payload) {
     payload = payload || {};
-    var chrome = buildChrome('flags', 'Flags', '🚩', (payload.flags || []).length + ' total', false);
+    var chrome = buildChrome('flags', 'Flags', '🚩', (payload.flags || []).length + ' total', false, 'tn-emo-f');
     var list = h('div', { class: 'cr-flag-list' });
     function paint() {
       list.innerHTML = '';

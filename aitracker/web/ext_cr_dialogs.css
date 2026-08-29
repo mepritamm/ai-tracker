@@ -105,18 +105,26 @@
 
 .cr .cr-glyph { display: block; }
 
-/* ---- emoji tinting (doc 01) ---- */
+/* ---- emoji tinting (owner override, supersedes doc 01 decision 4) ----
+ * Kept in lockstep with the same-named rules in ext_cr.css
+ * (`.tracker-next .tn-emo*`) — see that file's comment for the full
+ * palette-anchor reasoning: grayscale(1) -> sepia(1) -> hue-rotate per
+ * role, with saturate/brightness/contrast held IDENTICAL across all 5
+ * roles within a theme so only the hue angle differs (that uniformity
+ * is what keeps the role differentiation faint, per the owner's
+ * instruction that theme harmony now wins over glyph identity). Both
+ * copies must be edited together; a mismatch here is a bug. */
 .cr .cr-emo { font-style: normal; }
-.cr .tn-emo   { filter: saturate(.7) contrast(1.05); }
-.cr .tn-emo-a { filter: saturate(1.05) hue-rotate(-6deg); }
-.cr .tn-emo-f { filter: saturate(.85) hue-rotate(-12deg) brightness(.95); }
-.cr .tn-emo-d { filter: saturate(.62) hue-rotate(-18deg) brightness(.82); }
-.cr .tn-emo-n { filter: saturate(.8) hue-rotate(-8deg) brightness(.95); }
-.cr.is-dark .tn-emo   { filter: saturate(.8) contrast(1.05) brightness(1.15); }
-.cr.is-dark .tn-emo-a { filter: saturate(1.1) hue-rotate(-6deg) brightness(1.15); }
-.cr.is-dark .tn-emo-f { filter: saturate(.95) hue-rotate(-12deg) brightness(1.18); }
-.cr.is-dark .tn-emo-d { filter: saturate(.75) hue-rotate(-18deg) brightness(1.2); }
-.cr.is-dark .tn-emo-n { filter: saturate(.9) hue-rotate(-8deg) brightness(1.2); }
+.cr .tn-emo   { filter: grayscale(1) sepia(1) hue-rotate(0deg)   saturate(1.4) brightness(.55) contrast(1.1); }
+.cr .tn-emo-a { filter: grayscale(1) sepia(1) hue-rotate(-13deg) saturate(1.4) brightness(.55) contrast(1.1); }
+.cr .tn-emo-f { filter: grayscale(1) sepia(1) hue-rotate(-25deg) saturate(1.4) brightness(.55) contrast(1.1); }
+.cr .tn-emo-d { filter: grayscale(1) sepia(1) hue-rotate(108deg) saturate(1.4) brightness(.55) contrast(1.1); }
+.cr .tn-emo-n { filter: grayscale(1) sepia(1) hue-rotate(7deg)   saturate(1.4) brightness(.55) contrast(1.1); }
+.cr.is-dark .tn-emo   { filter: grayscale(1) sepia(1) hue-rotate(-6deg)  saturate(1.5) brightness(1.35) contrast(1.05); }
+.cr.is-dark .tn-emo-a { filter: grayscale(1) sepia(1) hue-rotate(-4deg)  saturate(1.5) brightness(1.35) contrast(1.05); }
+.cr.is-dark .tn-emo-f { filter: grayscale(1) sepia(1) hue-rotate(-24deg) saturate(1.5) brightness(1.35) contrast(1.05); }
+.cr.is-dark .tn-emo-d { filter: grayscale(1) sepia(1) hue-rotate(71deg)  saturate(1.5) brightness(1.35) contrast(1.05); }
+.cr.is-dark .tn-emo-n { filter: grayscale(1) sepia(1) hue-rotate(8deg)   saturate(1.5) brightness(1.35) contrast(1.05); }
 
 .cr .cr-rot-180 { transform: rotate(180deg); }
 
@@ -208,10 +216,14 @@
   font-size: 16px; line-height: 1; cursor: pointer; padding: 2px 4px;
 }
 /* Fix 1c: showNudgeIfNeeded() floats the (otherwise inline) nudge row itself, since it
-   is mounted directly on the `.cr` root rather than placed by a page layout. */
+   is mounted directly on the `.cr` root rather than placed by a page layout.
+   Bottom-left (doc 04 pins no corner for this): the detail header's breadcrumb/back
+   line and its action buttons live at the top of the page, so a top corner lands the
+   nudge on top of them. Bottom-left keeps it clear of both the header and the
+   bottom-right toast stack. */
 .cr .cr-nudge-float {
   position: fixed;
-  top: 16px;
+  bottom: 16px;
   left: 16px;
   z-index: 940;
   max-width: 360px;
@@ -220,9 +232,12 @@
 }
 
 /* ---- toasts ---- */
+/* Bottom-right (doc 04's Notifications section pins no corner): the detail header's
+   primary actions (Open terminal / Resume here / External) sit at the top-right, so a
+   top-right toast host would land directly on top of them. */
 .cr .cr-toast-host {
   position: fixed;
-  top: 16px;
+  bottom: 16px;
   right: 16px;
   z-index: 950;
   display: flex;
@@ -279,11 +294,13 @@
 
 .cr .cr-stat-row { display: flex; gap: 16px; margin-bottom: 18px; }
 .cr .cr-stat { flex: 1; text-align: center; padding: 10px 4px; border-radius: var(--radius-md-min, 8px); background: var(--surface-sunken, #F4F1E8); }
-.cr .cr-stat-num { font: 400 34px/1 var(--font-serif, ui-serif, Georgia, serif); letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+/* 5c renders the Coverage stat row at 20px serif, not 34px -- 34px made the stat row
+   dominate the whole dialog. */
+.cr .cr-stat-num { font: 400 20px/1 var(--font-serif, ui-serif, Georgia, serif); letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
 .cr .cr-stat-label { font: 600 10px var(--font-sans, sans-serif); letter-spacing: .08em; text-transform: uppercase; color: var(--text-muted, #877866); margin-top: 2px; }
 .cr .cr-stat-forest .cr-stat-num { color: var(--state-done, #3B5747); }
 .cr .cr-stat-neutral .cr-stat-num { color: var(--text-primary, #1E1B17); }
-.cr .cr-stat-dusk .cr-stat-num { color: var(--text-link, #3B5747); }
+.cr .cr-stat-dusk .cr-stat-num { color: var(--text-dusk, #A8C0C9); }
 
 .cr .cr-state-table, .cr .cr-kbd-table { width: 100%; border-collapse: collapse; font: 400 12px/1.4 var(--font-sans, sans-serif); margin-bottom: 16px; }
 .cr .cr-state-table th, .cr .cr-state-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line-subtle, #E7E2D5); }
@@ -298,6 +315,9 @@
 .cr .cr-swatch-brick { background: var(--state-failed, #C0553A); }
 .cr .cr-swatch-forest { background: var(--state-done, #3B5747); }
 .cr .cr-swatch-grey { background: var(--state-idle, #A89C8B); }
+/* Evidence row (5c's legend) -- the same dusk accent .cr-stat-dusk and the fork-lineage
+   banner already use, not a raw hex. */
+.cr .cr-swatch-dusk { background: var(--text-dusk, #395D6A); }
 
 .cr .cr-seccards { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
 .cr .cr-seccard { flex: 1; min-width: 220px; border-radius: var(--radius-md-min, 8px); padding: 12px; font: 400 12px/1.5 var(--font-sans, sans-serif); }
@@ -372,6 +392,54 @@
 .cr .cr-slider-wrap { display: flex; align-items: center; gap: 8px; }
 .cr .cr-slider { width: 110px; accent-color: var(--state-done, #3B5747); }
 .cr .cr-slider-val { min-width: 34px; text-align: right; color: var(--text-secondary, #4A4237); }
+
+/* Config dialog: server-backed controls (POST /api/config) — a text/number input and a
+   textarea sized for a row's control column (narrower than the full-width .cr-textfield
+   used by the directory-picker/rename dialogs), plus the Saved/Failed status badge that
+   sits beside them. */
+.cr .cr-cfg-textfield { width: 130px; flex: none; }
+.cr .cr-cfg-textarea { width: 220px; flex: none; resize: vertical; }
+.cr .cr-cfg-status {
+  font: 600 10.5px var(--font-mono, monospace); margin-left: 8px;
+  color: var(--text-muted, #877866); opacity: 0; transition: opacity .15s ease;
+}
+.cr .cr-cfg-status.is-saved { opacity: 1; color: var(--text-link, #3B5747); }
+.cr .cr-cfg-status.is-failed { opacity: 1; color: var(--text-failed, #8A2F1B); }
+
+/* ---- Tunnel section (Config dialog) — a wider text field for the URL row, the always-
+   visible plaintext-storage disclosure, the Show/Hide row, and the restart-command /
+   share-URL blocks that only exist once a value has been explicitly revealed. */
+.cr .cr-cfg-textfield-wide { width: 220px; flex: none; }
+.cr .cr-tunnel-disclosure {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm, 4px);
+  background: var(--surface-awaiting, #FDF0E4);
+  color: var(--text-awaiting, #9A4F19);
+  border: 1px solid var(--line-awaiting, #E8B98A);
+}
+.cr .cr-tunnel-showrow { display: flex; justify-content: flex-end; padding: 6px 0; }
+.cr .cr-tunnel-block {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md-min, 8px);
+  background: var(--surface-sunken, #F4F1E8);
+  border: 1px solid var(--line-subtle, #E7E2D5);
+}
+.cr .cr-tunnel-block-label { font: 600 11px var(--font-sans, sans-serif); color: var(--text-secondary, #4A4237); margin-bottom: 6px; }
+.cr .cr-tunnel-cmdrow { display: flex; align-items: center; gap: 8px; }
+.cr .cr-tunnel-cmd {
+  flex: 1; min-width: 0;
+  font-size: 11.5px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm, 4px);
+  background: var(--surface-raised, #fff);
+  border: 1px solid var(--line-default, #CFC7B7);
+  color: var(--text-primary, #1E1B17);
+  overflow-x: auto;
+  white-space: pre;
+}
+.cr .cr-tunnel-block-note { font: 400 10.5px var(--font-mono, monospace); color: var(--text-muted, #877866); margin-top: 6px; }
 
 .cr .cr-cfg-footer { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line-subtle, #E7E2D5); }
 .cr .cr-cfg-footer-note { font: 400 11px/1.5 var(--font-sans, sans-serif); color: var(--text-muted, #877866); margin: 0 0 10px; }
@@ -458,6 +526,37 @@
 /* ---- motion ---- */
 @media (prefers-reduced-motion: reduce) {
   .cr .cr-toggle-knob { transition: none; }
+}
+
+/* ---- phone tier (max-width: 480px) ---- */
+@media (max-width: 480px) {
+  /* FIX 1: Dialog close button touch target. Grows hit area to min 44x44px on phone,
+     keeping the glyph centered at original 28px size. Checked for overlap with adjacent
+     .cr-dialog-context (margin-right: 8px away), so 44px button + 8px gap = 52px minimum
+     width for the pair — well within dialog width. */
+  .cr .cr-dialog-close {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  /* FIX 2: Toast and nudge no longer overlap at phone width. Both expand to fill
+     available width (left: 12px, right: 12px) and stack vertically with toast at the
+     bottom. Nudge positioned at bottom: 96px to clear a typical toast-host stack height
+     (approx. 80px) plus 16px gap. Note: .crd-phonebar already has z-index: 960, so
+     neither toast (950) nor nudge (940) need z-index changes. */
+  .cr .cr-toast-host {
+    left: 12px;
+    right: 12px;
+    width: auto;
+  }
+
+  .cr .cr-nudge-float {
+    left: 12px;
+    right: 12px;
+    width: auto;
+    max-width: none;
+    bottom: 96px;
+  }
 }
 
 /* ---- responsive: nearest breakpoint down (1280) collapses the Config two-pane nav to a top row ---- */

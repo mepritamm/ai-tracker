@@ -1,10 +1,17 @@
 import glob, json, os, re, time
 from ..config import EDIT_TOOLS, LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window, todo_summary
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, pr_summary, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase
 from ..overview import build_overview
-from ..store import load_titles, load_tasks, load_notes
+from ..store import load_titles, load_tasks, load_notes, _TSTATUS
 from .base import Provider
+
+# TaskCreate's tool_result is a plain confirmation string, e.g. "Task #7 created
+# successfully: <subject>" -- confirmed against real transcripts. The number is the
+# SAME ordinal load_tasks() reads off the task-store file's own stem (store.py's
+# load_tasks docstring: taskId "20" <-> "20.json"), so it's the exact join key for
+# reconstructing todos when ~/.claude/tasks/<sid>/*.json has been pruned.
+_TASK_CREATE_ID_RE = re.compile(r"Task #(\d+) created successfully")
 
 
 def find_session(sid):
@@ -23,15 +30,38 @@ def find_session(sid):
 
 _META_CACHE = {}
 
+# Wall-clock budget for _fill_pr() calls in one list_sessions() poll — see the call site.
+# Time-boxed rather than count-boxed so a run of small transcripts drains more of the
+# backlog in one poll while a few p95-sized (~6.6MB, ~28ms) ones still bail out in time.
+_PR_SCAN_BUDGET_SECS = 0.05
 
-def _tail_fields(path, nbytes=96000):
+
+def _tail_scan(path, nbytes=96000):
     """aiTitle/customTitle/entrypoint live on metadata lines written as the
     session evolves — read the tail to get the current values cheaply. The same
     pass yields the session's end-state for the sidebar: `waiting` (an
     AskUserQuestion is still unanswered) and `ended` (the last real turn was the
     assistant finishing — 'completed last run'). A waiting question always sits at
-    the tail, so the 96 KB window sees it; a giant single turn is the only miss."""
+    the tail, so the 96 KB window sees it; a giant single turn is the only miss.
+
+    Also harvests `last_text` — the most recent assistant narration snippet seen in
+    this SAME bounded tail (capped short) — so the session-list `now_line` field
+    (list_sessions, below) can derive a "what is it doing" phrase for a LIVE session
+    with zero extra file access: this tail read already happens for every session to
+    get waiting/ended, so folding the extra bookkeeping in here costs nothing beyond
+    a few string ops per line. Returns a dict (not a tuple) so future fields can be
+    added here without breaking `_tail_fields`'s existing positional callers below.
+
+    Also harvests `model` — the LATEST `message.model` seen in this same bounded tail
+    (last value wins, so a mid-session /model switch shows the CURRENT model, matching
+    `last_text`/`now_line`'s "what's true right now" framing, not the session's first
+    model). "<synthetic>" is a real value seen in the wild on synthetic/compaction
+    messages, not a genuine model id — skipped so it never overwrites a real one and
+    never surfaces alone. Honestly "" when no real model appears in the tail at all
+    (e.g. a session with no assistant turn yet)."""
     ai = custom = entry = None
+    last_text = ""
+    model = ""
     open_asks, last = set(), ""
     try:
         sz = os.path.getsize(path)
@@ -54,13 +84,23 @@ def _tail_fields(path, nbytes=96000):
                 continue
             c = m.get("content")
             if o.get("type") == "assistant":
+                mv = m.get("model")
+                if isinstance(mv, str) and mv and mv != "<synthetic>":
+                    model = mv
                 blocks = c if isinstance(c, list) else []
                 has_tool = False
                 for b in blocks:
-                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                    if not isinstance(b, dict):
+                        continue
+                    bt = b.get("type")
+                    if bt == "tool_use":
                         has_tool = True
                         if b.get("name") == "AskUserQuestion" and b.get("id"):
                             open_asks.add(b["id"])          # opened; a matching tool_result answers it
+                    elif bt == "text":
+                        t = (b.get("text") or "").strip()
+                        if t and not t.startswith("<"):     # skip command/system echoes
+                            last_text = t[:200]             # most recent assistant narration in this tail
                 last = "assistant_tool" if has_tool else "assistant_text"
             elif m.get("role") == "user":
                 if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
@@ -79,7 +119,16 @@ def _tail_fields(path, nbytes=96000):
         pass
     waiting = bool(open_asks)
     ended = (not waiting) and last == "assistant_text"
-    return ai, custom, entry, waiting, ended
+    return {"ai": ai, "custom": custom, "entry": entry, "waiting": waiting, "ended": ended,
+            "last_text": last_text, "model": model}
+
+
+def _tail_fields(path, nbytes=96000):
+    """Back-compat positional shape over _tail_scan (ai, custom, entry, waiting, ended) —
+    kept because both _session_meta (below, now calls _tail_scan directly for last_text
+    too) and the existing test suite unpack/slice this exact 5-tuple."""
+    s = _tail_scan(path, nbytes)
+    return s["ai"], s["custom"], s["entry"], s["waiting"], s["ended"]
 
 
 def _session_meta(path):
@@ -87,7 +136,8 @@ def _session_meta(path):
     try:
         mt = os.path.getmtime(path)
     except OSError:
-        return {"cwd": "", "title": "", "source": "", "prompt": "", "first": 0, "waiting": False, "ended": False, "sessionKind": None}
+        return {"cwd": "", "title": "", "source": "", "prompt": "", "first": 0, "waiting": False, "ended": False, "sessionKind": None,
+                "pr_num": None, "pr_url": None, "pr_repo": None, "pr_state": "", "last_text": "", "model": ""}
     hit = _META_CACHE.get(path)
     if hit and hit[0] == mt:
         return hit[1]
@@ -118,19 +168,101 @@ def _session_meta(path):
                             prompt = s[:140]
     except OSError:
         pass
-    ai, custom, entry, waiting, ended = _tail_fields(path)
+    ts = _tail_scan(path)
     meta = {
         "cwd": cwd,
-        "title": custom or ai or _short_title(prompt),
+        "title": ts["custom"] or ts["ai"] or _short_title(prompt),
         "prompt": prompt,
-        "source": entry or entry_head or "",
+        "source": ts["entry"] or entry_head or "",
         "first": _ts_epoch(first_ts),   # sub-second so same-second orchestrator/agent starts still order
-        "waiting": waiting,             # an AskUserQuestion is unanswered -> sidebar ⏳
-        "ended": ended,                 # last real turn was the assistant finishing -> sidebar ✅ (completed)
+        "waiting": ts["waiting"],       # an AskUserQuestion is unanswered -> sidebar ⏳
+        "ended": ts["ended"],           # last real turn was the assistant finishing -> sidebar ✅ (completed)
         "sessionKind": session_kind,    # "bg" for real background agents (claude --bg)
+        # Most recent assistant narration text seen in the SAME bounded tail read above (no
+        # extra file access) -- the session-list `now_line` field's narration fallback when
+        # this session is LIVE (see list_sessions). Never shown for an idle/ended session.
+        "last_text": ts["last_text"],
+        # Current model (latest wins, "<synthetic>" skipped) from the SAME bounded tail --
+        # the session-list `model` field, unconditional (unlike now_line, shown for idle and
+        # ended sessions too -- see list_sessions).
+        "model": ts["model"],
+        # PR data is the expensive half — a full-file scan (collect_prs et al, ~1ms median but
+        # ~28ms at the p95 file size) that this cheap 40-line/tail-only pass must not eat. Only
+        # an ENDED session can ever render as a Landed tile (ext_cr_board.js's sessionState()),
+        # so a session still mid-conversation gets these nailed to "none" for good — no scan,
+        # no pending, no reconsideration until it changes again. An ended session gets this
+        # placeholder plus `_pr_pending`; list_sessions() resolves it (budgeted, and only for
+        # sessions still inside LIVE_WINDOW — the only ones a Landed tile could ever be) by
+        # mutating this SAME cached dict in place, so the answer sticks at this mtime with no
+        # second cache write.
+        "pr_num": None, "pr_url": None, "pr_repo": None, "pr_state": "",
     }
+    if ts["ended"]:
+        meta["_pr_pending"] = True
     _META_CACHE[path] = (mt, meta)
     return meta
+
+
+def _scan_created_prs(path):
+    """Full-file scan for PRs THIS session created (`gh pr create` / GitHub MCP
+    create_pull_request) — the same tracking parse_session's detail path does (matching a
+    `gh pr create` Bash call or an MCP create_pull_request tool_use to ITS OWN tool_result,
+    the only way to know a URL came from a creation rather than merely being mentioned), via
+    the same primitives (collect_prs/note_pr_states/PR_CREATE_RE) — just narrower: skips
+    narration/files/todos/agents, everything parse_session's detail dict needs beyond PRs.
+    Malformed/unreadable input yields no PR, same as a session that genuinely created none."""
+    prs, pr_states, pr_create_ids = {}, {}, set()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                m = o.get("message")
+                if not isinstance(m, dict):
+                    continue
+                content = m.get("content")
+                if not isinstance(content, list):
+                    continue
+                ts = o.get("timestamp", "")
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    bt = b.get("type")
+                    if bt == "tool_use":
+                        name, inp, bid = b.get("name"), b.get("input") or {}, b.get("id")
+                        if name == "Bash":
+                            c = inp.get("command", "")
+                            if PR_CREATE_RE.search(c):       # its result URL is a created PR
+                                pr_create_ids.add(bid)
+                            note_pr_states(pr_states, c)     # `gh pr merge/close N`
+                        elif name and "create_pull_request" in name:   # GitHub MCP
+                            pr_create_ids.add(bid)
+                        elif name and "merge_pull_request" in name:
+                            pn = inp.get("pullNumber") or inp.get("pull_number")
+                            if pn:
+                                pr_states[str(pn)] = "merged"
+                    elif bt == "tool_result":
+                        rid = b.get("tool_use_id")
+                        cc = b.get("content")               # command output: gh prints the PR URL here
+                        rtext = cc if isinstance(cc, str) else (json.dumps(cc) if cc else "")
+                        collect_prs(prs, rtext, ts, rid in pr_create_ids)
+                        note_pr_states(pr_states, rtext)     # git-log "Merge pull request #N" etc.
+    except OSError:
+        pass
+    return prs, pr_states
+
+
+def _fill_pr(meta, path):
+    """The expensive half of an ended session's PR data — deferred out of _session_meta (see
+    its `_pr_pending` placeholder) so list_sessions() can budget how many of these run per
+    poll, instead of a burst of sessions finishing together stalling the whole poll behind
+    their full-file scans. Mutates `meta` in place; _META_CACHE stores this exact dict object,
+    so the resolution persists at this mtime without a second cache write."""
+    prs, pr_states = _scan_created_prs(path)
+    meta["pr_num"], meta["pr_url"], meta["pr_repo"], meta["pr_state"] = pr_summary(prs, pr_states)
+    meta["_pr_pending"] = False
 
 
 def _is_bg_agent(sm):
@@ -256,6 +388,10 @@ def list_sessions(limit=200):
         if sm["source"] != "sdk-cli":
             humans_by_dir.setdefault(os.path.dirname(f), []).append((os.path.basename(f)[:-6], sm["first"]))
     out = []
+    # Budget for _fill_pr() below: wall-clock, not a file count, so a run of small transcripts
+    # drains more of the pending backlog in one poll while a few p95-sized (~28ms) ones still
+    # bail out in time — any left over just retry next poll (see _pr_pending in _session_meta).
+    pr_deadline = time.time() + _PR_SCAN_BUDGET_SECS
     for f in fs[:limit]:
         sm = metas[f]
         sid = os.path.basename(f)[:-6]
@@ -266,6 +402,12 @@ def list_sessions(limit=200):
             if cands:
                 parent = _pick_parent(sm["first"], cands)
         mt, bg = _mtime_and_bg(f)
+        # Only a session both ENDED and still inside LIVE_WINDOW can ever render as a Landed
+        # tile (ext_cr_board.js's sessionState()) — an idle session's PR data would never be
+        # shown, so it's left pending indefinitely rather than spending a scan on it. Bounded
+        # by pr_deadline so a batch of sessions finishing together can't stall this poll.
+        if sm.get("_pr_pending") and (time.time() - mt) < LIVE_WINDOW and time.time() < pr_deadline:
+            _fill_pr(sm, f)
         # load_tasks() is a listdir + a handful of small JSON reads under ~/.claude/tasks/<sid>/
         # (0 cost via a single failed listdir for the many sessions with no task store at all;
         # measured ~5 files/session, ~170 total across this machine's whole history) — cheap
@@ -273,6 +415,26 @@ def list_sessions(limit=200):
         # Sessions that predate the task store (still in-transcript TodoWrite-only) get 0/0/None
         # here: that would need a full transcript parse to recover, which the list path must not do.
         todo_total, todo_done, todo_current, todo_current_index = todo_summary(load_tasks(sid))
+        # now_line: a short "what is it doing right now" phrase for the board tile — LIVE
+        # sessions only (inside LIVE_WINDOW and not ended); everything else gets "" for free,
+        # no extra file access. Priority mirrors overview.py's build_overview (running agents >
+        # in-progress todo > latest narration), computed entirely off data this poll already
+        # loaded: `bg` (the same _mtime_and_bg call above), `todo_current` (the same
+        # load_tasks() call above), and sm["waiting"]/sm["last_text"] (the same bounded tail
+        # read _session_meta already did for waiting/ended — see _tail_scan). Unlike
+        # build_overview, a running background agent here can't afford its `lead` detail (that
+        # needs a full parse_agents() scan of the agent transcripts — the expensive read this
+        # field must not trigger), so it's just a count.
+        now_line = ""
+        if (time.time() - mt) < LIVE_WINDOW and not sm["ended"]:
+            if sm["waiting"]:
+                now_line = "⏳ waiting for your answer"
+            elif bg:
+                now_line = "⚙ %d background agent%s" % (bg, "" if bg == 1 else "s")
+            elif todo_current:
+                now_line = "▶ " + now_phrase(todo_current)
+            elif sm.get("last_text"):
+                now_line = now_phrase(sm["last_text"])
         out.append({
             "id": sid,
             "project": os.path.basename(sm["cwd"]) if sm["cwd"] else os.path.basename(os.path.dirname(f)),
@@ -289,6 +451,17 @@ def list_sessions(limit=200):
             "mtime": mt,  # counts background-agent activity too
             "todo_total": todo_total, "todo_done": todo_done, "todo_current": todo_current,
             "todo_current_index": todo_current_index,
+            # the ONE representative PR this session created (util.pr_summary) — None/""
+            # while unresolved (_pr_pending) or genuinely absent; a board tile only ever
+            # wants "PR number if any", never the broader referenced-or-narrated set the
+            # detail dict's `prs` field carries (see pr_worked).
+            "pr_num": sm.get("pr_num"), "pr_url": sm.get("pr_url"),
+            "pr_repo": sm.get("pr_repo"), "pr_state": sm.get("pr_state") or "",
+            # short "what's happening now" phrase for the board tile — "" unless LIVE (see above)
+            "now_line": now_line,
+            # current model id (e.g. "claude-opus-5") off the same bounded tail read —
+            # unconditional, not gated on liveness: "" only when the tail truly has no signal.
+            "model": sm.get("model") or "",
         })
     return out
 
@@ -481,6 +654,7 @@ def parse_agents(path):
             continue
         newest = max(newest, mt)
         task = last_text = ""
+        model = ""    # this agent's own current model -- may differ from its parent's (own separate transcript)
         last_ts = None
         tools = 0
         pr_ids = set()    # tool_use_ids of `gh pr create`/MCP-create in THIS agent → its result URL = created
@@ -496,6 +670,9 @@ def parse_agents(path):
                     m = o.get("message")
                     if not isinstance(m, dict):
                         continue
+                    mv = m.get("model")   # same "latest wins, skip the synthetic sentinel" rule as _tail_scan
+                    if isinstance(mv, str) and mv and mv != "<synthetic>":
+                        model = mv
                     c = m.get("content")
                     if not task and m.get("role") == "user" and isinstance(c, str):
                         s = " ".join(c.split())
@@ -552,6 +729,10 @@ def parse_agents(path):
             "ts": last_ts,
             "tools": tools,
             "running": (now - mt) < LIVE_WINDOW,
+            # this agent's OWN current model -- its own separate transcript, so it can (and
+            # does, in the wild) differ from its parent session's model. "" if this agent's
+            # transcript has no assistant turn with a real model id yet.
+            "model": model,
         })
     for e in agent_prs.values():
         e["agent"] = True     # generated by a background agent — badge it in the panel
@@ -793,6 +974,12 @@ def parse_session(path):
                             # each todo's "id" (both trace back to the task-store file's stem, e.g.
                             # taskId "20" <-> 20.json). "started" = first time it went in_progress,
                             # "ended" = last time it went completed.
+    task_creates = {}       # tool_use_id -> {"content","activeForm","desc"} awaiting its assigned id
+                            # (only known once its tool_result names "Task #N")
+    task_order = []         # ids in creation order — transcript-reconstructed todo list, used only
+                            # when the task store (~/.claude/tasks/<sid>/*.json) has been pruned
+    task_defs = {}          # id -> {"content","activeForm","desc"}, resolved from task_creates
+    task_status = {}        # id -> latest normalized status, from TaskUpdate ("last update wins")
     files = {}            # path -> {ops, last, created}
     reads = {}            # path -> last ts
     cmds = []             # bash commands, each {id, t, cmd, kind}
@@ -894,6 +1081,12 @@ def parse_session(path):
                     if rid in asks:                                # the user's answer to an AskUserQuestion
                         asks[rid]["answer"] = re.sub(r"^Your questions have been answered:\s*", "", rtext).strip()[:2000]
                         asks[rid]["open"] = False
+                    if rid in task_creates:                    # resolve the id TaskCreate's own input never carries
+                        d = task_creates.pop(rid, None)
+                        m = _TASK_CREATE_ID_RE.search(rtext)
+                        if m and d and m.group(1) not in task_defs:
+                            task_defs[m.group(1)] = d
+                            task_order.append(m.group(1))
                     collect_prs(prs, rtext, ts, rid in pr_create_ids)
                     note_pr_states(pr_states, rtext)          # git-log "Merge pull request #N" etc.
                 elif bt == "tool_use":
@@ -908,8 +1101,24 @@ def parse_session(path):
                             pr_states[str(pn)] = "merged"
                     if name == "TodoWrite":
                         todos = inp.get("todos", todos)
+                    elif name == "TaskCreate":
+                        # the assigned id isn't in this input at all — only in the tool_result
+                        # ("Task #N created successfully"), resolved in the tool_result branch above
+                        subj = inp.get("subject") or inp.get("content")
+                        af = inp.get("activeForm")
+                        desc = inp.get("description")
+                        subj = subj[:2000] if isinstance(subj, str) else ""
+                        if subj:  # a create with no usable subject can't be replayed as a todo
+                            task_creates[bid] = {
+                                "content": subj,
+                                "activeForm": af[:2000] if isinstance(af, str) else "",
+                                "desc": desc[:4000] if isinstance(desc, str) else "",
+                            }
                     elif name == "TaskUpdate":
                         tid, st = str(inp.get("taskId") or ""), (inp.get("status") or "").lower()
+                        norm = _TSTATUS.get(st)
+                        if tid and norm:
+                            task_status[tid] = norm            # last TaskUpdate wins — reconstructed-todo status
                         if tid and st in ("in_progress", "completed"):
                             tt = task_times.setdefault(tid, {"started": None, "ended": None})
                             if st == "in_progress" and tt["started"] is None:
@@ -945,7 +1154,14 @@ def parse_session(path):
                         n_search += 1
                     elif name == "Task":
                         agents.append({"t": ts, "type": inp.get("subagent_type") or "agent",
-                                       "desc": (inp.get("description") or "")[:80]})
+                                       "desc": (inp.get("description") or "")[:80],
+                                       # this is a DISPATCH record (the Task tool_use itself),
+                                       # with no linkage to whichever transcript file the
+                                       # spawned subagent actually wrote (unlike agents_bg,
+                                       # which parses that file directly) and no model key in
+                                       # its own tool input (confirmed against real transcripts)
+                                       # -- honestly "", never a guess.
+                                       "model": ""})
                     elif name == "AskUserQuestion":                # a decision the session asked the user for
                         qs = [{"q": (q.get("question") or "")[:500], "header": (q.get("header") or "")[:40],
                                "options": [(o.get("label") or "")[:120] for o in (q.get("options") or [])
@@ -958,7 +1174,22 @@ def parse_session(path):
     tests = [c for c in cmds if c["kind"] == "test"]
     sid = meta.get("sessionId") or os.path.basename(path)[:-6]
     tasks = load_tasks(sid)  # newer sessions use the task store, not in-transcript TodoWrite
-    if tasks:
+    # Reconstructed from the TaskCreate/TaskUpdate calls just walked above — the fallback for
+    # when the task store has been pruned (Claude Code deletes ~/.claude/tasks/<sid>/*.json
+    # after ~2 days) or is only partially populated. `id` matches the store's own file-stem
+    # convention exactly (TaskUpdate's own taskId == the ordinal in "Task #N created
+    # successfully", which is the same ordinal the store stamps as <n>.json), so the
+    # started_at/ended_at join a few lines down (keyed on todo["id"]) works unchanged
+    # whichever source `todos` ends up from.
+    recon = [{"content": task_defs[tid]["content"],
+              "status": task_status.get(tid, "pending"),
+              "activeForm": task_defs[tid]["activeForm"] or task_defs[tid]["content"],
+              "desc": task_defs[tid]["desc"],
+              "id": tid}
+             for tid in task_order if tid in task_defs]
+    if len(recon) > len(tasks):
+        todos = recon
+    elif tasks:
         todos = tasks
     # A malformed TodoWrite can set `todos` to a non-list (seen: the string "[]") or a
     # list with stray non-dict entries; keep only dict todos so one bad session can't
@@ -1013,6 +1244,11 @@ def parse_session(path):
     result = {
         "meta": meta,
         "todos": todos,
+        # Claude's started_at/ended_at above come from an exact taskId join (task-store
+        # file stem == TaskUpdate's own taskId) -- authoritative, unlike Auggie/Augment's
+        # name-matched approximation. Always a bool, even with no todos at all, so the UI
+        # never has to special-case a provider to know whether to show an "approximate" label.
+        "todo_times_approximate": todo_times_approximate("claude"),
         "files": sorted(files.values(), key=lambda x: x.get("last") or "", reverse=True),
         "reads": [{"path": p, "t": t} for p, t in
                   sorted(reads.items(), key=lambda kv: kv[1] or "", reverse=True)],

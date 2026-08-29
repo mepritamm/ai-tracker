@@ -197,7 +197,12 @@ class TestBuildPage(unittest.TestCase):
         self.assertIn("function toggleCard", p)                     # the shared toggle
         self.assertIn('.card>h2")', p)                              # delegated to every card header, not one panel
         # Mermaid fences render as diagrams, everywhere mdBlock renders markdown.
-        # Hand-rolled SVG — no mermaid.js, no CDN (zero-dep + `make bundle` inlines web/ verbatim).
+        # Hand-rolled SVG renders FIRST, synchronously — no mermaid.js needed for that
+        # part, still zero-dep at parse time. mermaid.js itself IS now vendored (product
+        # owner approved, conventions rule 2) but ONLY as a lazily-fetched /vendor/ asset
+        # that upgrades the hand-rolled fallback in place — never a CDN, never loaded
+        # eagerly (see TestMermaidVendorLoader in tests/test_mermaid.py for the lazy-load
+        # assertion, and this file's own laziness proof would show no eager request).
         self.assertIn("function mermaidSvg", p)                     # the renderer is baked into the page
         self.assertIn("mermaidSvg(src)", p)                         # …and mdBlock's fence branch calls it
         self.assertIn(".mmd .mmdsvg{", p)                           # its styling came along
@@ -205,6 +210,12 @@ class TestBuildPage(unittest.TestCase):
         # Sequence diagrams share the dispatcher — same seam, second diagram type
         self.assertIn("function _mermaidSeqSvg", p)                 # the sequence renderer is baked in too
         self.assertIn(".mmdsvg .mmsp{fill:var(--card)", p)          # its participant boxes are tokenised
+        # The REAL mermaid.js renderer — one shared function both UIs call, lazy-loaded
+        # from the vendored (not CDN) path only when a diagram is about to render.
+        self.assertIn("function renderMermaid(code, el)", p)
+        self.assertIn('"/vendor/mermaid.min.js"', p)
+        self.assertIn("function upgradeMermaidIn(root)", p)
+        self.assertIn(".mmd-slot{display:contents}", p)
 
 
 class TestSearchAllRanking(unittest.TestCase):

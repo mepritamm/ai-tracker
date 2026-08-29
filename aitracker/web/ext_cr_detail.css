@@ -87,7 +87,7 @@
   letter-spacing: .1em;
   font-size: 10px;
   font-weight: 600;
-  color: var(--text-muted);
+  color: var(--text-eyebrow);
 }
 
 .cr .crd-div {
@@ -190,43 +190,20 @@
   color: var(--text-secondary);
 }
 
-.cr .crd-chips {
+/* FIX (design-audit drift 1): 5b has no stat-chip row under the goal at all — the
+   token count folds into `.crd-metaline` instead (see ext_cr_detail.js renderHeader).
+   The old .crd-chips/.crd-chip* rules are gone with the markup that used them. */
+
+/* FIX (design-audit drift 2): 5b collapses actions to ONE inline row, appended to
+   `.crd-id-row1` itself (margin-left:auto) rather than a separate `.crd-actions`
+   column beside the header — that column and its two stacked rows are gone. */
+.cr .crd-row1-actions {
+  margin-left: auto;
   display: flex;
+  align-items: center;
+  gap: 7px;
   flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 10px;
 }
-
-.cr .crd-chip {
-  padding: 5px 11px;
-  border-radius: 999px;
-  background: var(--surface-raised);
-  border: 1px solid var(--line-subtle);
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
-  font-size: 11.5px;
-  color: var(--text-primary);
-}
-.cr .crd-chip-label { color: var(--text-muted); margin-right: 4px; }
-.cr .crd-chip-failing {
-  background: var(--surface-failed);
-  border-color: var(--line-failed);
-  color: var(--text-failed);
-}
-.cr .crd-chip-failing .crd-chip-label { color: var(--text-failed); }
-/* FIX 9b: N/A chips (genuinely can't exist for this session) carry a native tooltip
-   via title="Not Applicable"; cursor:help signals there's more to read on hover. */
-.cr .crd-chip[title="Not Applicable"] { cursor: help; }
-
-.cr .crd-actions {
-  flex: 0 0 auto;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 8px;
-}
-.cr .crd-actions-row1,
-.cr .crd-actions-row2 { display: flex; gap: 8px; }
 
 .cr .crd-btn {
   font-family: var(--font-sans);
@@ -241,16 +218,51 @@
   border: 1px solid transparent;
   min-height: 32px;
 }
-.cr .crd-pillbtn {
+/* Search/Flag are demoted to small icon-only buttons in the row (not dropped —
+   see the module report for why 5b's own row has no room for their old full-label
+   pill buttons). */
+.cr .crd-iconbtn {
+  position: relative;
   background: var(--surface-raised);
-  border-color: var(--line-subtle);
+  border: 1px solid var(--line-subtle);
   color: var(--text-secondary);
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex: 0 0 auto;
 }
 .cr .crd-flagbtn.is-active,
-.cr .crd-pillbtn.is-active {
+.cr .crd-iconbtn.is-active {
   background: var(--surface-flagged);
   border-color: var(--line-flagged);
   color: var(--text-flagged);
+}
+.cr .crd-flag-badge {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 999px;
+  background: var(--state-flagged);
+  color: var(--text-on-action);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 14px;
+  text-align: center;
+}
+/* "Queue a note" — the mock's AIButton; same solid-pill footprint as the other row
+   actions, tinted toward the thinking/agent accent to read as the AI-flavored one. */
+.cr .crd-btn-ai {
+  background: var(--surface-agent-quiet);
+  border-color: var(--line-agent);
+  color: var(--text-thinking);
 }
 .cr .crd-ico { width: 14px; height: 14px; display: inline-flex; }
 .cr .crd-ico svg { width: 14px; height: 14px; }
@@ -325,29 +337,62 @@
 }
 .cr .crd-flag-note { font-size: 11px; color: var(--text-muted); }
 
-/* ============================== fork lineage banner ============================== */
+/* FIX (design-audit drift 2): "Queue a note" card — same input-and-button footprint
+   as search/flag, but inline (single row) since it's just one field. Submitting it
+   reuses the SAME 'cr:note-push' emit as the Plan panel and phone bar (see JS). */
+.cr .crd-notecard { display: flex; gap: 8px; align-items: center; }
+.cr .crd-note-queue-input {
+  flex: 1 1 auto;
+  box-sizing: border-box;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--line-default);
+  background: var(--surface-page);
+  color: var(--text-primary);
+}
 
-.cr .crd-forkbanner {
-  margin: 14px 26px 0;
-  padding: 11px 15px;
+/* ============================== fork lineage card ============================== */
+/* FIX (design-audit drift 3): 5b renders fork lineage as a small card at the BOTTOM
+   of the Evidence column, not a full-width banner between the header and the spine
+   — `.crd-forkcard` sits alongside the other Evidence panels (ext_cr_detail.js
+   appends it to `.crd-col-evidence .crd-col-body`), not the page-width strip the old
+   `.crd-forkbanner` was. */
+.cr .crd-forkcard {
+  margin-top: 4px;
+  padding: 11px 14px;
   background: var(--surface-provenance);
   border: 1px solid var(--line-default);
-  border-left: 2px solid var(--text-link);
-  border-radius: 4px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
+  border-left: 2px solid var(--line-dusk);
+  border-radius: 10px;
   font-size: 12.5px;
 }
-.cr .crd-fork-ico svg { width: 16px; height: 16px; }
-.cr .crd-fork-text { flex: 1 1 auto; color: var(--text-secondary); }
+/* Bug fix (carried over from the old banner): a class selector alone can lose to the
+   UA `[hidden]` rule at equal specificity in some engines — restate `display:none`
+   explicitly so JS's `hidden` always wins regardless of the block display above. */
+.cr .crd-forkcard[hidden] { display: none; }
+.cr .crd-fork-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.cr .crd-fork-ico { color: var(--text-dusk); }
+.cr .crd-fork-ico svg { width: 13px; height: 13px; }
+.cr .crd-fork-label {
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-dusk);
+}
+.cr .crd-fork-body { color: var(--text-secondary); line-height: 1.5; }
 .cr .crd-fork-link {
+  display: block;
+  margin-top: 6px;
   background: none;
   border: none;
   color: var(--text-link);
   font-weight: 600;
+  font-size: 11px;
   cursor: pointer;
-  flex: 0 0 auto;
+  padding: 0;
 }
 
 /* ============================== progress spine ============================== */
@@ -374,7 +419,7 @@
   letter-spacing: .08em;
   font-size: 10.5px;
   font-weight: 600;
-  color: var(--text-muted);
+  color: var(--text-eyebrow);
 }
 .cr .crd-spine-count {
   font-variant-numeric: tabular-nums;
@@ -424,8 +469,20 @@
   border-top: 1px solid var(--line-agent);
   border-bottom: 1px solid var(--line-agent);
   box-shadow: var(--glow-agent);
+  /* FIX (design-audit drift 7): 5b lays the running segment out space-between —
+     dot+"running" on the LEFT, elapsed time on the RIGHT — not one centred string. */
+  justify-content: space-between;
+  padding: 0 8px;
   gap: 5px;
+  font-size: 9px;
 }
+.cr .crd-seg-running-label { display: flex; align-items: center; gap: 6px; }
+.cr .crd-seg-running-word {
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--text-thinking);
+}
+.cr .crd-seg-running-elapsed { color: var(--text-thinking); }
 .cr .crd-seg-dot {
   width: 7px;
   height: 7px;
@@ -437,8 +494,6 @@
 @media (prefers-reduced-motion: reduce) {
   .cr .crd-seg-dot { animation: none; outline: 2px solid var(--state-thinking); outline-offset: 2px; }
 }
-.cr .crd-seg-running-text,
-.cr .crd-seg-running { font-size: 9px; }
 .cr .crd-seg-edge {
   position: absolute;
   right: -1px;
@@ -491,7 +546,7 @@
   height: 7px;
   background: var(--line-default);
 }
-.cr .crd-mark-prompt .crd-mark-tick { background: var(--text-link); }
+.cr .crd-mark-prompt .crd-mark-tick { background: var(--line-dusk); }
 .cr .crd-mark-fail .crd-mark-tick { background: var(--state-failed); }
 .cr .crd-mark-ask .crd-mark-tick { background: var(--state-awaiting); }
 .cr .crd-mark-agent .crd-mark-tick { background: var(--text-link); }
@@ -503,8 +558,12 @@
 }
 .cr .crd-mark-fail .crd-mark-word { color: var(--text-failed); }
 .cr .crd-mark-now .crd-mark-word { color: var(--text-thinking); }
-.cr .crd-mark-emoji { filter: saturate(.7) contrast(1.05); }
-.cr.is-dark .crd-mark-emoji { filter: saturate(.8) contrast(1.05) brightness(1.15); }
+/* Tinting now lives on the element itself via a `tn-emo`/`tn-emo-a` class
+   (cr_detail.js's buildMarkers/render), not here — a third duplicate of the
+   base recipe scoped to `.crd-mark-emoji` would win-or-lose the cascade
+   against the role variant by source order alone and silently strip the
+   per-kind tint (⏳ ask -> orange) back down to the neutral one. See
+   ext_cr.css's "EMOJI TINTING" block for the actual filter values. */
 
 .cr .crd-spine-foot {
   display: flex;
@@ -538,7 +597,7 @@
   letter-spacing: .08em;
   font-size: 10.5px;
   font-weight: 600;
-  color: var(--text-muted);
+  color: var(--text-eyebrow);
 }
 .cr .crd-col-convo .crd-col-eyebrow { flex-wrap: wrap; }
 .cr .crd-marker {
@@ -594,7 +653,7 @@
   letter-spacing: .07em;
   font-size: 10.5px;
   font-weight: 600;
-  color: var(--text-secondary);
+  color: var(--text-eyebrow);
 }
 .cr .crd-panel-count {
   margin-left: auto;
@@ -658,7 +717,7 @@
   text-transform: uppercase;
   font-size: 9.5px;
   letter-spacing: .06em;
-  color: var(--text-muted);
+  color: var(--text-eyebrow);
   margin: 10px 0 4px;
 }
 
@@ -707,7 +766,7 @@
 }
 .cr .crd-link-group:first-child { border-top: none; padding-top: 0; }
 .cr .crd-link-generated { color: var(--text-link); }
-.cr .crd-link-worked { color: var(--text-awaiting); }
+.cr .crd-link-worked { color: var(--text-dusk); }
 .cr .crd-link-url {
   flex: 1 1 auto;
   min-width: 0;
@@ -738,7 +797,7 @@
   font-size: 9.5px;
   text-transform: uppercase;
   letter-spacing: .06em;
-  color: var(--text-muted);
+  color: var(--text-eyebrow);
   margin-bottom: 3px;
 }
 .cr .crd-summary-body { font-size: 13px; color: var(--text-secondary); }
@@ -747,7 +806,7 @@
 /* -- Plan on the go -- */
 .cr .crd-tint-note {
   background: var(--surface-note);
-  border-left: 2px solid var(--state-thinking);
+  border-left: 2px solid var(--line-note);
 }
 .cr .crd-plan-head {
   font-size: 11px;
@@ -844,8 +903,10 @@
   white-space: nowrap;
   font-size: 11.5px;
 }
-.cr .crd-tint-failed { background: var(--surface-failed); border-color: var(--line-failed); }
-.cr .crd-tint-failed .crd-panel-count { color: var(--text-failed); }
+/* FIX (design-audit drift 5): 5b keeps the Commands panel on its normal neutral
+   background and colours ONLY the count text ("1 failing") — no full-panel red
+   tint (the old `.crd-tint-failed` background rule is gone with its JS toggle). */
+.cr .crd-panel-count.crd-count-failing { color: var(--text-failed); }
 
 /* -- Agents & shells -- */
 .cr .crd-agent-row-item {
@@ -868,6 +929,9 @@
   font-size: 12.5px;
 }
 .cr .crd-agent-wf { font-size: 10px; color: var(--text-muted); }
+/* This agent's OWN model (may genuinely differ from the parent session's) —
+   same subordinate treatment as .crd-agent-wf, never its own visual element. */
+.cr .crd-agent-model { flex: 0 0 auto; font-size: 10px; color: var(--text-muted); }
 .cr .crd-open-link {
   background: none;
   border: none;
@@ -962,7 +1026,7 @@
   color: var(--text-muted);
   padding-top: 2px;
 }
-.cr .crd-entry-prompt .crd-entry-ts { color: var(--text-link); }
+.cr .crd-entry-prompt .crd-entry-ts { color: var(--text-dusk); }
 .cr .crd-ts-fail { color: var(--text-failed) !important; }
 .cr .crd-ts-ask { color: var(--text-awaiting) !important; }
 
@@ -1001,8 +1065,8 @@
    it), so repainting its text every poll can't reflow anything above it. */
 .cr .crd-timeline-live {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  gap: 7px;
   margin: 0 15px 10px;
   padding: 9px 12px;
   border: 2px solid var(--line-agent);
@@ -1011,12 +1075,25 @@
   box-shadow: var(--glow-agent);
   font-size: 12.5px;
 }
+/* FIX (design-audit drift 4): 5b's live entry reads "Now · <clock>" — a dynamic,
+   ticking wall-clock badge — instead of the literal word "LIVE", plus a small
+   active-file tag pinned top-right of the same header row. */
+.cr .crd-live-head { display: flex; align-items: center; gap: 8px; }
 .cr .crd-live-badge {
   flex: 0 0 auto;
   font-size: 9.5px;
   font-weight: 600;
   letter-spacing: .08em;
   color: var(--text-thinking);
+}
+.cr .crd-live-file {
+  margin-left: auto;
+  padding: 3px 8px;
+  border-radius: 3px;
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  font-size: 10px;
+  flex: 0 0 auto;
 }
 .cr .crd-live-text {
   min-width: 0;
@@ -1032,6 +1109,16 @@
   border-radius: 12px 12px 12px 4px;
   padding: 10px 13px;
   max-width: 82%;
+}
+/* FIX (design-audit drift 6): 5b's ask bubble carries an "⏳ It asked you · still
+   open" mini-header above the question, only while it's still open. */
+.cr .crd-ask-minihead { display: flex; align-items: center; gap: 7px; margin-bottom: 7px; }
+.cr .crd-ask-minihead-label {
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-awaiting);
 }
 .cr .crd-ask-q { font-weight: 600; font-size: 14px; margin-bottom: 8px; }
 .cr .crd-ask-opts { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
@@ -1064,10 +1151,27 @@
   color: var(--text-failed);
 }
 .cr .crd-tool-name {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 11.5px;
+}
+/* FIX (design-audit drift 8): the generic tool-call row — Edit/Write/Read/Task —
+   reuses the same `.crd-toolrow` chrome as a command row; `crd-tool-verb` names the
+   action, `crd-tool-count` carries whatever real count exists (an edit-op tally for
+   a file row — never a fabricated duration or diff line-count, see the JS NOTE). */
+.cr .crd-tool-verb {
+  flex: 0 0 auto;
+  font-weight: 600;
+  font-size: 10.5px;
+  color: var(--text-link);
+}
+.cr .crd-tool-count {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--text-muted);
 }
 
 .cr .crd-degraded {
@@ -1089,6 +1193,16 @@
   padding: 10px 14px;
   background: var(--surface-top);
   border-top: 1px solid var(--line-subtle);
+  /* BLOCKER 3 (partial mitigation from an owned file — see report for what
+     ext_cr_dialogs.css itself still needs): `.cr-toast-host`/`.cr-nudge-float`
+     (ext_cr_dialogs.css) are `position: fixed` at z-index 950/940 with no
+     stacking context here to lose to, so without this the phone bar's own
+     send/stop input could silently sit BEHIND a toast or nudge that pops up
+     over it. z-index 960 keeps this bar (and its send/stop controls) always
+     on top of both, so a toast/nudge can still cover the *screen* but never
+     the primary input action. This does not fix the toast/nudge overlapping
+     EACH OTHER — that needs a change on their own side (not owned here). */
+  z-index: 960;
 }
 .cr .crd-phone-input {
   flex: 1 1 auto;
@@ -1139,21 +1253,74 @@
   .cr .crd-col-state { order: 2; }
   .cr .crd-col-evidence { order: 3; }
   .cr .crd-header { flex-direction: column; }
-  .cr .crd-actions { align-items: flex-start; width: 100%; }
+  .cr .crd-row1-actions { width: 100%; margin-left: 0; }
 }
 
 /* phone layout — ~390pt */
 @media (max-width: 480px) {
-  .cr .crd-backline,
-  .cr .crd-actions-row2 { display: none; }
+  .cr .crd-backline { display: none; }
+  .cr .crd-btn-bare,
+  .cr .crd-btn-ai { display: none; }
   .cr .crd-header { padding: 10px 14px 12px; }
   .cr .crd-goal { font-size: 21px; font-family: var(--font-serif); }
   .cr .crd-spine { margin: 10px 12px 0; padding: 10px 12px 10px; }
   .cr .crd-spine-hint,
   .cr .crd-seg-elapsed,
-  .cr .crd-seg-running-text { display: none; }
+  .cr .crd-seg-running-elapsed { display: none; }
   .cr .crd-columns { padding: 10px 12px 90px; gap: 12px; }
   .cr .crd-phonebar { display: flex; }
   .cr .crd-card { margin: 10px 12px 0; }
-  .cr .crd-forkbanner { margin: 10px 12px 0; }
+}
+
+/* ============================================================
+   BLOCKER 2 — phone touch targets (detail view). Phone tier only; desktop/
+   tablet density is untouched. Two techniques, per the brief: grow the box
+   outright where there's room, or expand the invisible HIT area via a
+   `::before` overlay where the visual glyph must stay small.
+   ============================================================ */
+@media (max-width: 480px) {
+  /* Search/Flag icon buttons (`.crd-iconbtn`, incl. `.crd-flagbtn`): explicit
+     28x28 box, `position: relative` already set. A `::before` overlay
+     expands the invisible hit area without enlarging the visible circle or
+     disturbing `.crd-flag-badge` (a real DOM child, unaffected by a sibling
+     pseudo-element).
+     BUG FIX (adversarial review): a uniform `inset: -8px` reached 44x44, but
+     these two buttons sit only 7px apart (`.crd-row1-actions { gap: 7px }`)
+     — two 8px reaches face to face is 16px into a 7px gap, so each
+     invisible overlay actually crossed 1px INTO the neighbour's own visible
+     circle and stole its outer-edge clicks. Fixed with an asymmetric inset:
+     top/bottom stay -8px (28 + 8 + 8 = 44px, no vertical neighbour to
+     collide with), left/right are only -3px (28 + 3 + 3 = 34px — short of
+     the 44px ideal, but 3+3 = 6px of combined reach across the real 7px gap
+     never overlaps, and never crosses into "Open terminal" on the right
+     either). A full 44px WIDTH for both adjacent circles is not physically
+     achievable here without widening the row itself (out of scope) — this
+     is the widest hit box the real 7px gap allows with zero ambiguity. */
+  .cr .crd-iconbtn::before {
+    content: '';
+    position: absolute;
+    top: -8px;
+    bottom: -8px;
+    left: -3px;
+    right: -3px;
+  }
+
+  /* Panel headers (`.crd-panel-head`, toggles collapse, `cursor: pointer`):
+     padding 12px15 around content-driven line height — audited at ~37px.
+     `min-height` brings the row to 44px without touching the label/chevron
+     type scale. 37px -> 44px. */
+  .cr .crd-panel-head { min-height: 44px; }
+
+  /* Every dense list row (files, commands, agents, PRs, links, notes,
+     decisions): padding 5-8px top/bottom around unset (content-driven) line
+     heights — audited at ~24-32px across the group. `min-height` brings each
+     to 44px; none of these change their internal padding/font, so desktop
+     density is untouched. ~24-32px -> 44px. */
+  .cr .crd-file-row,
+  .cr .crd-cmd-row,
+  .cr .crd-pr-row,
+  .cr .crd-link-row,
+  .cr .crd-agent-row-item,
+  .cr .crd-note-row,
+  .cr .crd-decision { min-height: 44px; }
 }

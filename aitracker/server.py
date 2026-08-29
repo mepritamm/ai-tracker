@@ -6,7 +6,14 @@ from .config import LIVE_WINDOW, NARR_PAGE
 from .page import build_page
 from .registry import all_sessions, parse_any, search_all, search_session, drill
 from .store import load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, _load_json, _save_json
-from .config import TITLES_FILE, FLAGS_FILE, PINS_FILE, NOTES_FILE
+# TITLES_FILE/PINS_FILE (below) are referenced live as config.TITLES_FILE/config.PINS_FILE at
+# their write sites, never imported by name -- a copied name freezes the value at import
+# time, so a caller that repoints config.TITLES_FILE (e.g. a test's temp-dir override) would
+# be silently ignored. store.py and the providers already follow this "config.NAME, not a
+# copied import" rule (see CLAUDE.md); this file used to be the one exception for exactly
+# these two paths -- FLAGS_FILE/NOTES_FILE were never actually at risk here since their real
+# write path (store.save_flags()/save_notes()) already reads config.FLAGS_FILE/config.NOTES_FILE
+# live on its own, but TITLES_FILE/PINS_FILE had no such protection.
 
 # ponytail: route seam for optional feature modules (the terminal tiers). A module registers its
 # own routes here on import instead of server.py forking a per-feature elif chain. See the loader
@@ -242,6 +249,37 @@ class Handler(BaseHTTPRequestHandler):
             self._json(all_sessions(), headers=headers)
         elif p.path == "/api/flags":
             self._json(load_flags())
+        elif p.path == "/api/config":
+            # The Config dialog's live read: every config.json-overridable setting's current
+            # effective value (config.json > env > default -- see config.py's big module
+            # comment), whether config.json currently overrides it, and whether it needs a
+            # restart to apply. Read live, no caching -- this is a small dict, not a hot
+            # path. config.py holds no filesystem access of its own (see its module
+            # comment); this route loads config.json via the SAME store._load_json already
+            # imported for flags/titles/pins/notes, then applies it (so the plain
+            # LIVE_WINDOW/TERM_RENDERER/MAX_TERMS/TERMINAL globals reflect a hand-edited
+            # config.json too, not just a browser-made change) before reporting it.
+            overrides = _load_json(config.CONFIG_FILE, {})
+            config.apply_overrides(overrides)
+            snap = config.snapshot(overrides)
+            # AUTH_SET: the Server tab's "Auth" row (readonlyField in ext_cr_dialogs.js)
+            # reads this to show honestly whether TRACKER_AUTH is currently configured --
+            # never the value itself, same "set"/"not set" contract that row has always had.
+            snap["AUTH_SET"] = bool(config.AUTH)
+            self._json(snap)
+        elif p.path == "/api/tunnel":
+            # Config dialog's Tunnel section, default read: URL (not sensitive) plus only
+            # WHETHER a user/password are staged -- never the raw values. See config.py's
+            # "Tunnel management" section for the full design rationale.
+            overrides = _load_json(config.CONFIG_FILE, {})
+            self._json(config.tunnel_public(overrides))
+        elif p.path == "/api/tunnel/reveal":
+            # The ONE route allowed to return the raw tunnel credential -- reached only by
+            # the dialog's explicit "Show" action, already gated by the same _authok() check
+            # every other route in do_GET goes through (see the top of this method) -- an
+            # unauthenticated caller never reaches this line at all.
+            overrides = _load_json(config.CONFIG_FILE, {})
+            self._json(config.tunnel_reveal(overrides))
         elif p.path == "/api/search":
             self._json(search_all(parse_qs(p.query).get("q", [""])[0]))
         elif p.path == "/api/diff":
@@ -363,8 +401,81 @@ class Handler(BaseHTTPRequestHandler):
                 titles[sid] = t[:120]
             else:
                 titles.pop(sid, None)  # empty = clear override, fall back to auto
-            _save_json(TITLES_FILE, titles)
+            _save_json(config.TITLES_FILE, titles)
             self._json({"ok": True})
+            return
+        if p.path == "/api/config":
+            # Writes a runtime setting into config.json (see config.py's big module comment
+            # for the precedence/liveness contract). ALLOWLIST-ONLY: `key` must be a member of
+            # config.EDITABLE (TRACKER_AUTH is deliberately never in it -- writing a password
+            # typed into a web form into a plaintext file on a server that may be tunneled is a
+            # real security regression, not a convenience; that row stays "set"/"not set" only,
+            # same as before this feature). Every accepted key is additionally type/range
+            # checked by config.VALIDATORS before anything touches disk -- a bad value is
+            # rejected with 400 and never reaches config.json.
+            key = body.get("key")
+            if not isinstance(key, str) or key not in config.EDITABLE:
+                self._json({"error": "unknown config key", "key": key}, 400)
+                return
+            if "value" not in body:
+                self._json({"error": "value required"}, 400)
+                return
+            validator = config.VALIDATORS[key]
+            ok, coerced = validator(body.get("value"))
+            if not ok:
+                self._json({"error": "invalid value for %s" % key}, 400)
+                return
+            # config.py holds no filesystem access of its own (see its module comment) --
+            # read-modify-write config.json right here, the SAME shape as every other
+            # app-owned write in this handler (load, mutate, _save_json), then apply the
+            # new value immediately so it's live in this process before the response goes
+            # out (config.apply_overrides repoints the plain LIVE_WINDOW/TERM_RENDERER/
+            # MAX_TERMS/TERMINAL globals and refreshes the TERM_APP/TERM_ALLOW os.environ
+            # mirror -- see that function's docstring).
+            overrides = _load_json(config.CONFIG_FILE, {})
+            overrides[key] = coerced
+            _save_json(config.CONFIG_FILE, overrides)
+            config.apply_overrides(overrides)
+            self._json({"ok": True, "key": key, "value": config.get(key, overrides),
+                        "restart": key in config.RESTART_REQUIRED})
+            return
+        if p.path == "/api/tunnel":
+            # Writes one Tunnel-section field into config.json. ALLOWLIST-ONLY, same shape
+            # as POST /api/config above but a SEPARATE allowlist (config.TUNNEL_EDITABLE,
+            # never config.EDITABLE) -- TUNNEL_USER/TUNNEL_PASS can hold a live credential,
+            # so they get their own gate rather than folding into the general config route.
+            key = body.get("key")
+            if not isinstance(key, str) or key not in config.TUNNEL_EDITABLE:
+                self._json({"error": "unknown tunnel key", "key": key}, 400)
+                return
+            if "value" not in body:
+                self._json({"error": "value required"}, 400)
+                return
+            validator = config.TUNNEL_VALIDATORS[key]
+            ok, coerced = validator(body.get("value"))
+            if not ok:
+                self._json({"error": "invalid value for %s" % key}, 400)
+                return
+            overrides = _load_json(config.CONFIG_FILE, {})
+            overrides[key] = coerced
+            _save_json(config.CONFIG_FILE, overrides)
+            # config.json can now hold a credential (TUNNEL_USER/TUNNEL_PASS) -- lock it to
+            # owner-only read/write the moment that becomes true. Applied unconditionally on
+            # every write through this route, not just USER/PASS ones, so a URL-only edit
+            # re-asserts the same tight mode instead of silently leaving it at whatever a
+            # PREVIOUS credential write set (a mode can only be tightened here, never loosened
+            # by this route). Best-effort: a chmod failure must not lose the write itself.
+            try:
+                os.chmod(config.CONFIG_FILE, 0o600)
+            except OSError:
+                pass
+            # Never echo the credential back in the response -- only TUNNEL_URL (not
+            # sensitive) is safe to confirm this way; USER/PASS get "ok": true and nothing
+            # else (the client already knows what it just sent).
+            resp = {"ok": True, "key": key, "restart": key in ("TUNNEL_USER", "TUNNEL_PASS")}
+            if key == "TUNNEL_URL":
+                resp["value"] = coerced
+            self._json(resp)
             return
         if p.path == "/api/pin":
             sid = body.get("session", "")
@@ -373,7 +484,7 @@ class Handler(BaseHTTPRequestHandler):
                 pins.append(sid)
             elif not body.get("pinned") and sid in pins:
                 pins.remove(sid)
-            _save_json(PINS_FILE, pins)
+            _save_json(config.PINS_FILE, pins)
             self._json({"ok": True})
             return
         flags = load_flags()
@@ -522,6 +633,12 @@ def publish_endpoint(actual):
 
 def run(host="127.0.0.1", port=8790, open_browser=True):
     config.BIND_HOST = host    # term_gate reads this to know whether we're loopback-only
+    # Fold in any config.json overrides left over from a previous run (LIVE_WINDOW/
+    # TERM_RENDERER/MAX_TERMS/TERMINAL are plain module globals seeded from env/default at
+    # config.py's own import time -- see its module comment -- so a pre-existing config.json
+    # override needs this explicit apply at real startup to take effect immediately rather
+    # than waiting for someone to open the Config dialog first).
+    config.apply_overrides(_load_json(config.CONFIG_FILE, {}))
     srv = bind(host, port)
     actual = srv.server_address[1]
     publish_endpoint(actual)

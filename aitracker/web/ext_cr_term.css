@@ -220,17 +220,16 @@
 }
 .cr .cr-term-themebtn:hover { background: var(--fill-row-hover); }
 
-/* emoji tinting recipe (01-foundations.md "Emoji tinting"), renamed cr-emo* for this namespace */
-.cr .cr-emo   { filter: saturate(.7) contrast(1.05); font-style: normal; }
-.cr .cr-emo-a { filter: saturate(1.05) hue-rotate(-6deg); font-style: normal; }
-.cr .cr-emo-f { filter: saturate(.85) hue-rotate(-12deg) brightness(.95); font-style: normal; }
-.cr .cr-emo-d { filter: saturate(.62) hue-rotate(-18deg) brightness(.82); font-style: normal; }
-.cr .cr-emo-n { filter: saturate(.8) hue-rotate(-8deg) brightness(.95); font-style: normal; }
-.cr.is-dark .cr-emo   { filter: saturate(.8) contrast(1.05) brightness(1.15); }
-.cr.is-dark .cr-emo-a { filter: saturate(1.1) hue-rotate(-6deg) brightness(1.15); }
-.cr.is-dark .cr-emo-f { filter: saturate(.95) hue-rotate(-12deg) brightness(1.18); }
-.cr.is-dark .cr-emo-d { filter: saturate(.75) hue-rotate(-18deg) brightness(1.2); }
-.cr.is-dark .cr-emo-n { filter: saturate(.9) hue-rotate(-8deg) brightness(1.2); }
+/* `.cr-emo` is layout-only now (font-style reset for the emoji glyph inside a
+ * button). The actual tint is the shared `.tn-emo`/`.tn-emo-a`/… seam
+ * (ext_cr.css / ext_cr_dialogs.css) — cr_term.js's icon spans carry both
+ * classes. The four `.cr-emo-a/-f/-d/-n` rules that used to live here were a
+ * SEPARATE, never-referenced fork of that same recipe under a renamed-for-
+ * this-namespace scheme (no JS anywhere ever applied cr-emo-a/-f/-d/-n —
+ * confirmed dead) with the doc's original too-weak values; removed rather
+ * than fixed in place, since two copies of one capability under two class
+ * names is the thing that causes the next bug (conventions.md #4). */
+.cr .cr-emo { font-style: normal; }
 
 /* ===== fork / notice banner (conditional) — themed chrome, NOT forced-dark: it sits above the
    pane, not inside it (doc 05, "Layout" + "The fork notice"). Wheat = --surface-agent-quiet. */
@@ -271,7 +270,7 @@
   min-height: 0;
   position: relative;
   background: #12100E;
-  color: #FBFAF7; /* dark theme's own --text-primary, frozen */
+  color: #E4D8CA; /* dark theme's own --text-primary, frozen */
   font: 12.5px/1.4 var(--font-mono);
   overflow: hidden;
 }
@@ -367,6 +366,7 @@
 .cr .cr-term-iconbtn.cr-term-kill {
   color: #E0A491; /* dark theme's --text-failed, frozen: "brick-tinted" per doc */
   border-color: #7F2B1A; /* dark theme's --line-failed, frozen */
+  background: rgba(210,115,90,.22);
 }
 .cr .cr-term-iconbtn.cr-term-kill:hover { background: rgba(210,115,90,.12); }
 .cr .cr-term-iconbtn:disabled { opacity: .4; cursor: default; }
@@ -403,4 +403,34 @@
   .cr .cr-term-overlay { padding: 0; }
   .cr .cr-term-shell { width: 100%; height: 100%; border-radius: 0; }
   .cr .cr-term-cwd, .cr .cr-term-resumecmd { max-width: 44vw; }
+}
+
+/* BLOCKER 2 — phone touch targets (terminal surface). Phone tier only;
+   the 760px tablet-shell tier above (and desktop) keep their density. */
+@media (max-width: 480px) {
+  /* Close (X): explicit 26x26 box, room to grow (head uses
+     justify-content: space-between on a full-width mobile shell). 26px -> 44px. */
+  .cr .cr-term-close { width: 44px; height: 44px; }
+
+  /* Head pill (Config/Help): padding 5px10 + font 11.5px/1.2 (13.8px line) +
+     2px border = 5+5+13.8+2 = 25.8px. `min-height` -> 44px. */
+  .cr .cr-term-headpill { min-height: 44px; }
+
+  /* Segmented buttons (view/layout toggles): padding 5px10 + font 11px/1.2
+     (13.2px line) = 5+5+13.2 = 23.2px (matches the audit's "22-26px"
+     group). `min-height` -> 44px. */
+  .cr .cr-term-seg button { min-height: 44px; }
+
+  /* Theme button: padding 5px10 + font 11px/1.2 (13.2px line) + 2px border =
+     5+5+13.2+2 = 25.2px. `min-height` -> 44px. */
+  .cr .cr-term-themebtn { min-height: 44px; }
+
+  /* Status-bar icon buttons (context/effort controls) and the effort pill
+     (`cursor: pointer`, so it is interactive, not just a readout): padding
+     3px8-9 + font 10.5px/1.3 (13.65px line) + 0-2px border = ~19.65-21.65px
+     (matches the audit's "22-26px" group). `min-height` -> 44px; width stays
+     content-driven since these sit in a tight `justify-content: space-between`
+     status bar. */
+  .cr .cr-term-iconbtn,
+  .cr .cr-term-pill { min-height: 44px; }
 }

@@ -26,11 +26,20 @@ function mdBlock(s){
     if(fm){ i++; const b=[]; while(i<L.length&&!/^\s*```/.test(L[i])){b.push(L[i]);i++;} i++;
       const src=b.join("\n");
       if(/^mermaid$/i.test(fm[1])){ const g=mermaidSvg(src);
-        if(g){ out.push(`<div class=mmd>${g}</div>`); continue; }
-        // unsupported diagram type — still readable, but LABEL it so the reader can see
-        // it was an intended diagram (not a plain code fence) whose renderer isn't baked in yet
-        const t=(src.match(/^\s*(?:%%.*\n)*\s*([A-Za-z][A-Za-z0-9_-]*)/)||[,""])[1]||"unknown";
-        out.push(`<div class="cblock mmdfall"><div class=mmdftag>🧜 mermaid: ${esc(t)}</div><button class=codecopy onclick="copyCode(this)" title="Copy this block">⧉ Copy</button><pre class=mdpre><code>${esc(src)}</code></pre></div>`); continue; }
+        // Render the hand-rolled fallback SYNCHRONOUSLY first (so the page is correct
+        // immediately, even offline, before the vendored asset loads) — g is the SVG when
+        // this diagram's family is one of the 8 covered above, or null for a family only
+        // real mermaid.js knows (gantt/mindmap/timeline/gitGraph/...). Either way it's
+        // wrapped in a `.mmd-slot` carrying the raw source, so renderMermaid() (below)
+        // can upgrade it in place once mermaid.js is available — see that function's own
+        // comment for why the fallback stays rather than getting deleted.
+        const b64=_mmdEncodeSrc(src);
+        const fallback=g ? `<div class=mmd>${g}</div>`
+          // unsupported diagram type — still readable, but LABEL it so the reader can see
+          // it was an intended diagram (not a plain code fence) whose renderer isn't baked in yet
+          : (()=>{ const t=(src.match(/^\s*(?:%%.*\n)*\s*([A-Za-z][A-Za-z0-9_-]*)/)||[,""])[1]||"unknown";
+              return `<div class="cblock mmdfall"><div class=mmdftag>🧜 mermaid: ${esc(t)}</div><button class=codecopy onclick="copyCode(this)" title="Copy this block">⧉ Copy</button><pre class=mdpre><code>${esc(src)}</code></pre></div>`; })();
+        out.push(`<div class="mmd-slot" data-mmd-src="${b64}">${fallback}</div>`); continue; }
       out.push(`<div class=cblock><button class=codecopy onclick="copyCode(this)" title="Copy this block">⧉ Copy</button><pre class=mdpre><code>${esc(src)}</code></pre></div>`); continue; }
     const hm=l.match(/^(#{1,6})\s+(.*)$/);
     if(hm){ const lv=Math.min(hm[1].length,4)+1; out.push(`<h${lv} class=mdh>${md(hm[2])}</h${lv}>`); i++; continue; }
@@ -682,6 +691,126 @@ function _mermaidQuadrantSvg(src){
     parts.join("") + `</svg>`;
 }
 
+// ---- Mermaid → REAL rendering, lazily vendored (product owner approved this one
+// dependency; conventions rule 2: committed vendor file, loaded lazily, never at page
+// load). The hand-rolled SVG renderers above (mermaidSvg() and its _mermaid*Svg()
+// helpers) are NOT dead code — mdBlock() still renders every mermaid fence with them
+// FIRST, synchronously, so the page is correct immediately: offline, before the
+// ~3.4MB vendored asset loads, or if mermaid.js throws on syntax it doesn't recognise.
+// renderMermaid() below then upgrades that fallback IN PLACE once the real library is
+// available — mermaid wins whenever it loads and succeeds; the hand-rolled SVG (or, in
+// the Control Room's inline diagram card, the node-pill row) wins otherwise, forever,
+// on that one render. ONE renderer for BOTH UIs: app.js and every web/ext_*.js file
+// are concatenated into a single <script> tag by page.py's build_page() (verified —
+// index.html:186 is exactly one script tag holding the page's JS placeholder, which
+// build_page() fills with read("app.js") + read_ext(".js"), sorted), so a plain
+// top-level function declared here is a global
+// both this file's mdBlock()/renderMdView()/openText() AND ext_cr_detail.js's
+// entryHtml()/renderTimelineEntries() can call directly by name — no second
+// implementation, per conventions rule 4.
+let _mermaidAssetPromise=null;
+function _loadMermaidAssets(){
+  if(_mermaidAssetPromise) return _mermaidAssetPromise;
+  _mermaidAssetPromise=new Promise((resolve,reject)=>{
+    if(window.mermaid){ resolve(); return; }   // already loaded (2nd diagram)
+    const s=document.createElement("script");
+    s.src="/vendor/mermaid.min.js";
+    s.onload=()=>resolve();
+    s.onerror=()=>reject(new Error("failed to load /vendor/mermaid.min.js"));
+    document.head.appendChild(s);
+  });
+  return _mermaidAssetPromise;
+}
+// UTF-8-safe base64 — used to smuggle a diagram's raw source through a data-* attribute
+// (mdBlock/entryHtml build plain HTML strings, not DOM nodes with closures, so the
+// source can't just be held in memory). Plain btoa()/atob() are Latin1-only, hence the
+// encodeURIComponent/decodeURIComponent round-trip.
+function _mmdEncodeSrc(s){ try{ return btoa(unescape(encodeURIComponent(s||""))); }catch(e){ return ""; } }
+function _mmdDecodeSrc(b){ try{ return decodeURIComponent(escape(atob(b||""))); }catch(e){ return ""; } }
+// Theme derived from the app's OWN CSS custom properties — never a hardcoded palette
+// (conventions rule 5, "server owns policy, client renders it", applied to theme: read
+// the ONE existing source of truth for whichever scope `el` sits in, don't invent a
+// second palette). Two token vocabularies exist side by side in this app: the classic
+// UI's --app/--text/--card/--line3/--muted/... (app.css :root / html.light, this
+// file's own mermaidSvg() CSS already keys off these) and the Control Room's
+// --surface-*/--text-*/--line-* (ext_cr.css .tracker-next / .tracker-next.is-dark).
+// getComputedStyle(el) already resolves through whichever ancestor set those
+// variables for the CURRENT theme (light/dark, or Control Room's own toggle on
+// #nextRoot) — this only needs to pick the right variable NAMES for the scope `el`
+// sits in, mirroring ext_vt.js's _xtermTheme(el).
+function _mermaidThemeVars(el){
+  const node=el||document.documentElement;
+  const isNext=!!(node.closest && node.closest(".tracker-next"));
+  const cs=getComputedStyle(node);
+  const v=(name,fallback)=>{ const val=cs.getPropertyValue(name); return val?val.trim():fallback; };
+  if(isNext){
+    return {
+      background: v("--surface-raised","#FFFFFF"),
+      primaryColor: v("--surface-top","#FBFAF7"),
+      primaryTextColor: v("--text-primary","#1E1B17"),
+      primaryBorderColor: v("--line-default","#CFC7B7"),
+      lineColor: v("--line-strong","#A89C8B"),
+      secondaryColor: v("--surface-sunken","#F4F1E8"),
+      tertiaryColor: v("--surface-note","#F7F4EA"),
+      textColor: v("--text-primary","#1E1B17"),
+    };
+  }
+  return {
+    background: v("--app","#0c0f15"),
+    primaryColor: v("--card","#0e121a"),
+    primaryTextColor: v("--text","#e6edf3"),
+    primaryBorderColor: v("--line3","#2c333f"),
+    lineColor: v("--muted","#8b98a8"),
+    secondaryColor: v("--side","#0a0d12"),
+    tertiaryColor: v("--raised","#131a24"),
+    textColor: v("--text","#e6edf3"),
+  };
+}
+let _mermaidRenderSeq=0;
+let _mermaidQueue=Promise.resolve();  // serialises mermaid.initialize()+render() pairs:
+                                       // mermaid's config is process-global, so two
+                                       // renders in flight at once (e.g. classic +
+                                       // Control Room diagrams upgrading together) could
+                                       // otherwise theme-clobber each other mid-render.
+// THE shared renderer both UIs call: async function renderMermaid(code, el). Lazy-loads
+// the vendored bundle on first use (memoized above, exactly like ext_vt.js's own
+// _loadXtermAssets()), (re-)initialises mermaid with the CURRENT caller's theme, renders
+// `code`, and injects the resulting SVG into `el` wrapped in the SAME `.mmd` card class
+// the hand-rolled renderer already uses (app.css's `.mmd{background:var(--side);...}` —
+// reused, not duplicated). Resolves `false` — touching `el` NOT AT ALL — if the asset
+// fails to load or mermaid.js throws on this source, so whatever fallback markup was
+// already sitting in `el` (hand-rolled SVG, unsupported-fence code block, or the
+// Control Room's node-pill row) is exactly what stays visible.
+async function renderMermaid(code, el){
+  if(!el || !code) return false;
+  const run=()=>_loadMermaidAssets().then(()=>{
+    if(!window.mermaid) return false;
+    window.mermaid.initialize({startOnLoad:false, securityLevel:"strict", theme:"base", themeVariables:_mermaidThemeVars(el)});
+    const id="mmd-live-"+(_mermaidRenderSeq++);
+    return window.mermaid.render(id, code).then(res=>{
+      el.innerHTML=`<div class=mmd>${res.svg}</div>`;
+      el.classList.add("mmd-live");
+      return true;
+    });
+  }).catch(()=>false);
+  const p=_mermaidQueue.then(run, run);
+  _mermaidQueue=p.catch(()=>{});
+  return p;
+}
+// Scans `root` (defaults to the whole document) for every diagram slot mdBlock()/
+// ext_cr_detail.js's entryHtml() emitted — `.mmd-slot[data-mmd-src]`, holding the
+// base64'd raw mermaid source — and upgrades each to the real render. Called once right
+// after the HTML carrying them is injected (renderMdView/openText below, and
+// ext_cr_detail.js's renderTimelineEntries), and again on every `themechange` so an
+// already-live diagram repaints in the new palette instead of staying stuck in the old
+// one (renderMermaid() is idempotent to call again — it just re-renders and replaces).
+function upgradeMermaidIn(root){
+  (root||document).querySelectorAll(".mmd-slot[data-mmd-src]").forEach(slot=>{
+    const src=_mmdDecodeSrc(slot.getAttribute("data-mmd-src"));
+    if(src) renderMermaid(src, slot);
+  });
+}
+document.addEventListener("themechange", ()=>upgradeMermaidIn(document));
 
 function ago(sec){sec=Math.max(0,sec|0);if(sec<60)return sec+"s ago";if(sec<3600)return(sec/60|0)+"m ago";if(sec<86400)return(sec/3600|0)+"h ago";return(sec/86400|0)+"d ago"}
 function base(p){return (p||"").split("/").pop()}
@@ -1429,6 +1558,7 @@ async function renderMdView(){
   $("diffbody").innerHTML=content
     ? `<div class="msgbody mdmode" style=overflow:visible>${mdBlock(content)}</div>`
     : "<div class=empty>could not read the file to render</div>";
+  upgradeMermaidIn($("diffbody"));
 }
 function reconstructAfter(ops){ return ops.length?_afterLines(ops[0]).join("\n"):""; }
 function renderDiff(t){
@@ -1478,6 +1608,7 @@ function openText(title,when,text){
   $("msgwhen").textContent=when||"";
   $("msgbody").className="msgbody mdmode";
   $("msgbody").innerHTML=mdBlock(text)||"<span class=muted>(empty)</span>";
+  upgradeMermaidIn($("msgbody"));
   $("msgmodal").style.display="flex";
 }
 function openMsg(i){const n=curNarr[i]; if(!n)return; _setNav(openMsg,i,curNarr.length,{len:()=>curNarr.length,live:true}); openText("Narration",tago(n.t),n.text);}

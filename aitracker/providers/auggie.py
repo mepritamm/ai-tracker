@@ -1,7 +1,7 @@
 import glob, json, os, re, time
 from ..config import LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified, safe_path_component, context_window, todo_summary
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase
 from ..overview import build_overview
 from ..store import load_titles, load_tasks, load_notes
 from .base import Provider
@@ -87,14 +87,18 @@ def _auggie_resolve(root, get, seen=None):
         out.append({"content": name,
                     "status": _ASTATE.get((st.get("state") or "").upper(), "pending"),
                     "activeForm": name,
-                    # No honest started_at/ended_at here (unlike Claude): the task-storage
+                    # No EXACT started_at/ended_at here (unlike Claude): the task-storage
                     # file's own "lastUpdated" is a single last-write instant, not a start/end
                     # pair, and the update_tasks/add_tasks tool calls in the session's own
                     # chatHistory key each task by a short per-call id that does NOT match this
                     # file's uuid (confirmed against a real session: update_tasks used ids like
                     # "63a4cp3bxdwD2oqwQ1pWLZ" while task-storage files are named by uuid) — so
-                    # there is no reliable join back to THIS todo. Emit null, same shape as
-                    # Claude's todos, rather than fabricate or guess from a weak proxy.
+                    # there is no reliable ID join back to THIS todo. Default to null, same shape
+                    # as Claude's todos; parse_auggie (the detail path, via _auggie_todos_for)
+                    # backfills these APPROXIMATELY by NAME afterward, off its own single
+                    # chatHistory pass — see _TASK_LINE_RE above and the join loop right after
+                    # `todos = _auggie_todos_for(...)` in parse_auggie. The list path
+                    # (_auggie_todos_for_list) does not, so these two stay null there.
                     "started_at": None, "ended_at": None})
         out.extend(_auggie_resolve(st, get, seen))
     return out
@@ -121,6 +125,38 @@ def _auggie_first_request(chat):
         r = (m.get("exchange") or {}).get("request_message")
         if isinstance(r, str) and r.strip() and not r.lstrip().startswith("<"):
             return " ".join(r.split())[:200]
+    return ""
+
+
+def _auggie_last_narration(chat):
+    """Most recent assistant reply text in the transcript — cheap because list_auggie()'s
+    cache-miss path already loads the FULL session JSON (unlike Claude, which only tails),
+    so this reads no extra bytes; it just picks the last non-empty response_text out of what
+    is already in memory. Feeds the session-list `now_line` field's narration fallback —
+    parity with Claude's tail-derived last_text (see providers/claude.py's _tail_scan)."""
+    for m in reversed(chat or []):
+        if not isinstance(m, dict):
+            continue
+        ex = m.get("exchange")
+        resp = ex.get("response_text") if isinstance(ex, dict) else None
+        if isinstance(resp, str) and resp.strip():
+            return resp.strip()[:200]
+    return ""
+
+
+def _auggie_current_model(chat):
+    """Latest model_id off this session's chatHistory -- scans backward for the last exchange
+    that actually carries one (a later exchange can be a bare pending request with no
+    model_id yet), same "what's true right now" framing as now_line/last_text (a session can
+    switch models mid-run, same as Claude). Shared by list_auggie's session-LIST `model` field
+    and parse_auggie's detail `meta.model` so there is exactly one derivation, not two."""
+    for m in reversed(chat or []):
+        if not isinstance(m, dict):
+            continue
+        ex = m.get("exchange")
+        mid = ex.get("model_id") if isinstance(ex, dict) else None
+        if isinstance(mid, str) and mid:
+            return mid
     return ""
 
 
@@ -152,6 +188,27 @@ def _auggie_todos_for(root_uuid):
     allmap = _auggie_all()
     root = allmap.get(root_uuid)
     return _auggie_resolve(root, allmap.get) if root else []
+
+
+# Fallback for the gap _auggie_resolve documents above: add_tasks/update_tasks key each
+# task by a short per-call id (e.g. "63a4cp3bxdwD2oqwQ1pWLZ") that does NOT match the
+# task-storage file's uuid, so there is no reliable ID join for started_at/ended_at. But
+# every add_tasks/update_tasks tool_result_node echoes that id alongside the task's own
+# NAME text ("[x] UUID:<id> NAME:<name> DESCRIPTION:…" — confirmed against real sessions),
+# and update_tasks' own tool_use input carries (id, state) transitions in that SAME id
+# space — both collected in parse_auggie's own single chatHistory pass below, right beside
+# everything else it already reads off request_nodes/response_nodes (no second traversal).
+# A todo (built from task-storage, which carries the real "name" text too — confirmed
+# identical, character for character, on this machine) is matched back by NORMALISED NAME,
+# not id, same conservative rule as _auggie_resolve's: refuse to guess whenever a name
+# doesn't pin down exactly one chat-side id.
+_TASK_LINE_RE = re.compile(r"^\[.\]\s*UUID:(\S+)\s+NAME:(.*?)\s+DESCRIPTION:", re.M)
+
+
+def _norm_task_name(s):
+    """trim + collapse whitespace + casefold — the normalisation the name join uses on
+    both sides (a todo's content and a chatHistory task's NAME)."""
+    return " ".join((s or "").split()).casefold()
 
 
 def _auggie_todos_for_list(root_uuid):
@@ -191,6 +248,9 @@ def list_auggie():
                  "cwd": _auggie_ide_cwd(d),   # real per-session working dir (like Claude)
                  "waiting": waiting, "ended": ended,
                  "root": d.get("rootTaskUuid"),
+                 # narration fallback for now_line -- free here, see _auggie_last_narration
+                 "last_text": _auggie_last_narration(d.get("chatHistory")),
+                 "model": _auggie_current_model(d.get("chatHistory")),
                  "mtime": _iso_epoch(d.get("modified")) or mt}
             _AUGGIE_LIST_CACHE[f] = (mt, e)
         gid = "auggie:" + e["sid"]
@@ -199,6 +259,21 @@ def list_auggie():
         # touching this session's own file, so gating it on the session file's mtime would go stale.
         # _auggie_todos_for_list only reads this session's own task-tree files, so it's still cheap.
         todo_total, todo_done, todo_current, todo_current_index = todo_summary(_auggie_todos_for_list(e.get("root")))
+        # now_line: parity with Claude's (providers/claude.py, list_sessions) -- LIVE only
+        # (inside LIVE_WINDOW, not ended), same priority (waiting > in-progress todo >
+        # narration), off data already in hand: `todo_current` just computed above, and
+        # e["waiting"]/e["last_text"] cached alongside everything else in _AUGGIE_LIST_CACHE
+        # (no extra file access -- the whole session JSON was already loaded to build `e`).
+        # No background-agent concept for Auggie (see the "bg": 0 field below), so that
+        # branch is skipped entirely rather than faked.
+        now_line = ""
+        if (time.time() - e["mtime"]) < LIVE_WINDOW and not e.get("ended"):
+            if e.get("waiting"):
+                now_line = "⏳ waiting for your answer"
+            elif todo_current:
+                now_line = "▶ " + now_phrase(todo_current)
+            elif e.get("last_text"):
+                now_line = now_phrase(e["last_text"])
         out.append({
             "id": gid, "project": os.path.basename(cwd) if cwd else "Augment", "cwd": cwd,
             "title": titles.get(gid) or e["title"],
@@ -207,6 +282,9 @@ def list_auggie():
             "waiting": e.get("waiting", False), "ended": e.get("ended", False),
             "todo_total": todo_total, "todo_done": todo_done, "todo_current": todo_current,
             "todo_current_index": todo_current_index,
+            "pr_num": None, "pr_url": None, "pr_repo": None, "pr_state": "",  # Auggie has no PR extraction
+            "now_line": now_line,
+            "model": e.get("model") or "",
         })
     return out
 
@@ -306,6 +384,10 @@ def parse_auggie(session_id):
     pr_states = {}    # num -> "merged"/"closed" : state signals seen in logs (overlaid at the end)
     pr_creates = []   # exchange indices where a PR-create ran — Auggie logs no output URL, so we
     pr_first_ex = {}  # url -> exchange it first appeared in → attribute "created" by order, below
+    name_to_ids = {}  # normalised task NAME -> set of chat-side task ids seen with that name —
+                       # from add_tasks/update_tasks tool_result_node text (see _TASK_LINE_RE above)
+    task_times = {}   # chat-side task id -> {"started","ended"} (ISO), from update_tasks' own
+                       # tool_use input — the name-matched fallback for started_at/ended_at (~ Claude's task_times)
     tok_in = tok_out = 0
     ctx_current = ctx_limit = None  # LATEST turn's occupancy + the session's own context-window size
     def _cprs(text, narr=False):  # collect PRs + note which exchange each URL first showed up in
@@ -328,6 +410,12 @@ def parse_auggie(session_id):
                 c = trn.get("content") or ""
                 asks[trn["tool_use_id"]]["answer"] = re.sub(r"^User responded:\s*", "", c).strip()[:2000]
                 asks[trn["tool_use_id"]]["open"] = False
+            content = trn.get("content")                      # add_tasks/update_tasks echo id<->NAME here
+            if isinstance(content, str) and "UUID:" in content:
+                for tid, tname in _TASK_LINE_RE.findall(content):
+                    n = _norm_task_name(tname)
+                    if n:
+                        name_to_ids.setdefault(n, set()).add(tid)
         for rn in ex.get("response_nodes") or []:
             tu = rn.get("token_usage")
             if isinstance(tu, dict):                # tokens: mirror Claude (input + cache)
@@ -373,7 +461,11 @@ def parse_auggie(session_id):
                             _touch(files, _abs(p, ide_cwd), ts)
                 elif name and name.startswith("sub-agent-"):   # ~ Claude's Task
                     agents.append({"t": ts, "type": (name[len("sub-agent-"):] or "agent"),
-                                   "desc": (inp.get("name") or inp.get("instruction") or "")[:80]})
+                                   "desc": (inp.get("name") or inp.get("instruction") or "")[:80],
+                                   # a dispatch record only -- no separate transcript to read a
+                                   # model off, and its own input carries no model key either
+                                   # (confirmed against real sessions) -- honestly "".
+                                   "model": ""})
                 elif name == "view" and inp.get("path") and inp.get("type") != "directory":
                     reads[_abs(inp["path"], ide_cwd)] = ts   # ~ Claude's Read, anchored like `files`
                 elif name == "ask-user":              # Auggie's user-question tool (~ Claude's AskUserQuestion)
@@ -381,6 +473,19 @@ def parse_auggie(session_id):
                     asks[call.get("tool_use_id")] = {"t": ts, "open": True, "answer": "",
                                                      "questions": [{"q": (inp.get("question") or "")[:500],
                                                                     "header": "", "options": opts}]}
+                elif name == "update_tasks":           # ~ Claude's TaskUpdate -- state transitions, by chat-side id
+                    for tsk in (inp.get("tasks") or []):
+                        if not isinstance(tsk, dict):
+                            continue
+                        tid = tsk.get("task_id")
+                        stnorm = _ASTATE.get((tsk.get("state") or "").upper())
+                        if not tid or not stnorm:
+                            continue
+                        tt = task_times.setdefault(tid, {"started": None, "ended": None})
+                        if stnorm == "in_progress" and tt["started"] is None:
+                            tt["started"] = ts             # first activation only
+                        elif stnorm == "completed":
+                            tt["ended"] = ts                # latest completion wins
         r = ex.get("request_message")
         if isinstance(r, str) and r.strip() and not r.lstrip().startswith("<"):
             requests.append({"t": ts, "text": " ".join(r.split())[:300]})
@@ -403,6 +508,25 @@ def parse_auggie(session_id):
     branch = _git_branch(cwd)
     tests = [c for c in cmds if c["kind"] == "test"]
     todos = _auggie_todos_for(d.get("rootTaskUuid"))
+    # Approximate per-todo timings, joined by NAME (not id — see the comment above
+    # _TASK_LINE_RE) against name_to_ids/task_times, both collected in the single
+    # chatHistory pass above — mirrors parse_session()'s own todos/task_times join exactly,
+    # except a name matching zero or MORE THAN ONE chat-side id is ambiguous and is left
+    # None,None (the default _auggie_resolve already set), same as data that would put
+    # ended_at before started_at (never trusted — distrust both rather than show a
+    # contradictory timeline).
+    for t in todos:
+        ids = name_to_ids.get(_norm_task_name(t.get("content")))
+        if not ids or len(ids) != 1:
+            continue
+        tt = task_times.get(next(iter(ids)))
+        if not tt:
+            continue
+        started = _ts_epoch(tt["started"]) if tt["started"] and t.get("status") in ("in_progress", "completed") else None
+        ended = _ts_epoch(tt["ended"]) if tt["ended"] and t.get("status") == "completed" else None
+        if started is not None and ended is not None and ended < started:
+            continue          # contradictory transitions -> distrust both, stay None
+        t["started_at"], t["ended_at"] = started, ended
     done = sum(1 for x in todos if x["status"] == "completed")
     ip = next((x for x in todos if x["status"] == "in_progress"), None)
     gid = "auggie:" + session_id
@@ -423,10 +547,13 @@ def parse_auggie(session_id):
     return {
         "meta": {"cwd": cwd, "title": title, "source": "auggie", "entrypoint": "auggie",
                  "gitBranch": branch,
-                 "model": ((d.get("chatHistory") or [{}])[-1].get("exchange") or {}).get("model_id") or ""},
+                 "model": _auggie_current_model(d.get("chatHistory"))},
                  # no "effort" key here: Auggie logs have no reasoning-effort concept
                  # (unlike model, which Auggie has but may be empty) — omit rather than fake
         "todos": todos,
+        # todo timings above (when not None) came from a NAME match, not an exact id join
+        # like Claude's — the UI uses this to mark the progress spine approximate.
+        "todo_times_approximate": todo_times_approximate("auggie"),
         "files": sorted(files.values(), key=lambda x: x.get("last") or "", reverse=True),
         "reads": [{"path": p, "t": t} for p, t in
                   sorted(reads.items(), key=lambda kv: kv[1] or "", reverse=True)],

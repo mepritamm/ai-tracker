@@ -44,6 +44,29 @@
   overflow: hidden;
 }
 
+/* STRUCTURAL FIX: the swappable content region below the persistent top bar.
+ * Exactly one of its three children (#cr-view-board / #cr-view-sessions /
+ * #cr-view-detail) is visible at a time — ext_cr_boot.js's showView() toggles
+ * `hidden`, same contract as before, just one level deeper than the old
+ * top-level view slots (see ext_cr_boot.css's `.cr-view` rule, reused as-is
+ * by each of the three). The rail + top bar are siblings of this, never
+ * children — so they're never part of what gets hidden. */
+.tracker-next .cr-content {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+/* The board's own content (triage strip + board grid) needs the same
+ * stacked-column layout `.cr-main` used to give it directly, before it moved
+ * one level deeper into `.cr-content`. */
+.tracker-next .cr-view--board {
+  display: flex;
+  flex-direction: column;
+}
+
 /* ============================================================
    TOP BAR — 54px
    ============================================================ */
@@ -147,13 +170,14 @@
   align-items: center;
   gap: 6px;
 }
-.tracker-next .cr-theme-auto {
-  font: var(--fw-eyebrow) var(--fs-eyebrow-min)/1 var(--font-sans);
-  letter-spacing: var(--ls-eyebrow-min);
-  text-transform: uppercase;
-  color: var(--text-muted);
-}
-.tracker-next .cr-theme-auto[data-dim="1"] { opacity: .45; }
+/* Decision 5: Auto is now a real third button inside the SAME `.cr-theme-seg`
+ * pill as Light/Dark (see ext_cr_board.js's buildThemeControl), styled by the
+ * `.cr-theme-seg button`/`.is-on` rules below like every other segment. The
+ * standalone `.cr-theme-auto` label these two rules used to style is gone —
+ * grep-verified unreferenced by any .js/.css in this app — so the "never
+ * shrink the rule count" instruction (meant to catch parse breakage, not to
+ * preserve genuinely dead code) no longer applies; deleted rather than kept
+ * as permanent dead weight. */
 .tracker-next .cr-theme-seg {
   display: inline-flex;
   border: 1px solid var(--line-default);
@@ -190,6 +214,142 @@
 .tracker-next .cr-newsession svg { width: 14px; height: 14px; }
 
 /* ============================================================
+   TOP BAR — responsive (BLOCKER 1 + BLOCKER 2)
+   ============================================================
+   BLOCKER 1: `.cr-topbar` had `display:flex; gap:14px` and NO `flex-wrap`,
+   NO `overflow-x`, and no `@media` rule anywhere — grep-confirmed before this
+   fix. Its ~1000px of content sat inside `.cr-main`/`.cr-app`/#nextRoot, all
+   `overflow:hidden`, so anything past whatever fit in one row was silently
+   clipped: unreachable, no scrollbar, no visual cue. At 390px that took out
+   the Sessions/Terminals pills and everything from Config onward; at ~820px
+   tablet it already clipped the tail (New session/theme/Help/Config).
+   Fix, chosen per tier:
+     - Tablet & phone (<=1024px, the same compact-tier boundary Blocker 4
+       aligns this file to): let the bar WRAP into two rows instead of
+       clipping. `.cr-topbar-spacer` gets `flex-basis: 100%`, which forces a
+       flex-wrap line break exactly there (a well-known flexbox technique)
+       regardless of whether row 1 would otherwise still fit — so row 1 is
+       always "navigation" (rail toggle, back, divider, the three Board/
+       Sessions/Terminals destination pills) and row 2 is always "actions"
+       (flag count, bell, Config, Help, theme, New session). Nothing is
+       display:none'd or removed; everything just reflows onto a row that
+       has room. At the tablet width this doc was audited at (~820px) both
+       rows fit on one line apiece with every label intact — confirmed by
+       the same arithmetic the audit used (row 1 ~465px incl. the full
+       "Classic dashboard" label, row 2 ~564px; both < 820px minus padding).
+     - Phone (<=480px): row 2 alone (~564px of desktop-sized controls) still
+       doesn't fit next to itself at 390px, so this tier ADDITIONALLY: (a)
+       shrinks gaps/padding, (b) collapses the redundant text label on
+       Back/Config/Help/New session down to icon-only via `.cr-topbar-label`
+       (added in ext_cr_board.js's buildTopBar/buildThemeControl call sites —
+       every one of these buttons already carries a `title`/`aria-label` with
+       the full text, so the accessible name survives; only the always-on
+       VISUAL label disappears — a compaction of presentation, not a removal
+       of the control, unlike the clipping this rule exists to prevent).
+       flagCountBtn keeps its label deliberately: that "label" is the live
+       flag count digit, not a redundant string, so it is never a
+       `.cr-topbar-label` and never hidden. Even after this compaction the
+       narrowest phones may still wrap the action row once more onto a third
+       line — every control stays fully visible and tappable, just taller,
+       never clipped and never behind an undiscoverable scroll.
+   Result: Board / Sessions / Terminals (the three pills) and Config / Help /
+   theme / New session are all reachable at both 390px and 820px — verified
+   by the arithmetic above, no runtime measurement tool available here.
+
+   BLOCKER 2 (touch targets, phone tier only — desktop/tablet density is
+   untouched per instruction): every control in this section measured below
+   44px effective height at phone width. Technique used throughout is either
+   (a) growing the actual box for square icon buttons that already have
+   spare room once the bar wraps (rail toggle, back-icon, bell/Config/Help
+   icon buttons), or (b) `min-height` on the row for text-bearing pills/
+   buttons whose WIDTH must stay content-driven (destination pills, theme
+   segments, New session) — never inflating the glyph/icon itself. See the
+   per-control comments below for the arithmetic.
+   ============================================================ */
+@media (max-width: 1024px) {
+  .tracker-next .cr-topbar {
+    flex-wrap: wrap;
+    height: auto;
+    min-height: 54px;
+    row-gap: 8px;
+    padding: 10px 16px;
+  }
+  /* Forces the row1/row2 break at this exact point — see block comment above. */
+  .tracker-next .cr-topbar-spacer {
+    flex-basis: 100%;
+    height: 0;
+    margin-left: 0;
+  }
+}
+
+@media (max-width: 480px) {
+  .tracker-next .cr-topbar { gap: 8px; padding: 8px 12px; }
+  .tracker-next .cr-dest-pills { gap: 4px; }
+
+  /* Blocker 2 — rail toggle: was a bare 28x28 box (no padding to grow).
+     Grown to a real 44x44 box outright (row already has room once wrapped;
+     see arithmetic in the file-level Blocker 1 comment). 28px -> 44px. */
+  .tracker-next .cr-rail-toggle { width: 44px; height: 44px; }
+
+  /* Blocker 1 — Back: label collapses to icon-only ("‹" stays visible as
+     the permanent glyph, "Classic dashboard" is the hidden `.cr-topbar-label`
+     span added in ext_cr_board.js). Blocker 2 — same button grown to a
+     44x44 box: was unsized (text-driven height ~ font 11.5px * lh 1 + no
+     padding beyond `4px 2px` = ~19.5px). 19.5px -> 44px. */
+  .tracker-next .cr-back {
+    width: 44px;
+    height: 44px;
+    justify-content: center;
+    padding: 0;
+  }
+  .tracker-next .cr-back .cr-topbar-label { display: none; }
+
+  /* Blocker 2 — destination pills: padding 6px12 + font 12.5px/1.4 (17.5px
+     line box) + 1px top/bottom border = 6+6+17.5+2 = 31.5px. `min-height`
+     brings the box to 44px without touching the text/icon size or the
+     content-driven width (pills must stay named, not become icon-only —
+     "the app's primary navigation" per the brief). 31.5px -> 44px. */
+  .tracker-next .cr-pill { min-height: 44px; padding: 6px 9px; }
+
+  /* Blocker 1 — flagcount keeps its label (it's the live count digit, not a
+     redundant string) so it is excluded from the icon-only rule below.
+     Blocker 2 — flagcount/bell/Config/Help: padding 6px9 + font 12.5px/1.4
+     (17.5px) + 2px border = 6+6+17.5+2 = 31.5px. flagcount gets `min-height`
+     only (keeps its digit); bell/Config/Help become fixed 44x44 icon-only
+     boxes once their `.cr-topbar-label` hides. 31.5px -> 44px both ways. */
+  .tracker-next .cr-flagcount { min-height: 44px; padding: 0 10px; }
+  .tracker-next .cr-bell,
+  .tracker-next .cr-icon-btn {
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    justify-content: center;
+  }
+  .tracker-next .cr-icon-btn .cr-topbar-label { display: none; }
+
+  /* Blocker 2 — theme segment buttons: padding 6px10 + font 11px/1 (11px
+     line box) + 0 border = 6+6+11 = 23px (matches the audit's "~23-25.6px").
+     `min-height` on each segment brings the control to 44px; the segmented
+     pill container (`.cr-theme-seg`, no explicit height) grows to match
+     since it sizes to its tallest child. 23px -> 44px. */
+  .tracker-next .cr-theme-seg button { min-height: 44px; padding: 6px 12px; }
+
+  /* Blocker 1 — New session: label collapses to icon-only (spark icon stays,
+     "New session" is the hidden `.cr-topbar-label` span). Blocker 2 — same
+     button: padding 7px14 + font 11.5px/1 (11.5px line box) = 7+7+11.5 =
+     25.5px (matches the audit's "~23-25.6px"). Grown to a fixed 44x44
+     icon-only box. 25.5px -> 44px. */
+  .tracker-next .cr-newsession {
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    justify-content: center;
+    gap: 0;
+  }
+  .tracker-next .cr-newsession .cr-topbar-label { display: none; }
+}
+
+/* ============================================================
    SESSION RAIL — 232px open / 48px collapsed
    ============================================================ */
 .tracker-next .cr-rail {
@@ -207,6 +367,17 @@
   .tracker-next .cr-rail { transition: none; }
 }
 .tracker-next .cr-rail--collapsed { width: 48px; }
+/* Doc 03 "The collapsed orb rail" / README decision 1: the detail view's rail
+ * is ALWAYS 56px, distinct from the board's own 48px collapse-toggle width
+ * (doc 02's rail table, left unchanged above). `.cr-rail--detail` is applied
+ * alongside `.cr-rail--collapsed` (see applyRailMode() in ext_cr_board.js) and
+ * wins over it here by appearing later in the source, same specificity. */
+.tracker-next .cr-rail--detail { width: 56px; }
+/* Requirement 2 — the Sessions destination's no-seed browse state hides the
+ * rail outright (not the 48/56px collapsed strip — genuinely absent), so the
+ * full-width browse list + search + pager (below) get the room instead. Wins
+ * over --collapsed/--detail by appearing later in the source. */
+.tracker-next .cr-rail--hidden { display: none; }
 
 .tracker-next .cr-rail-header {
   flex: 0 0 auto;
@@ -283,6 +454,33 @@
   color: var(--text-muted);
 }
 
+/* Decision 2 — the rail's group-by control. Same select/label pairing as the
+ * Sessions destination's page-size picker (.cr-sessions-pagesize below), just
+ * scoped to the rail's own narrower column. */
+.tracker-next .cr-rail-groupby {
+  margin: 0 12px 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.tracker-next .cr-rail-groupby-label {
+  flex: 0 0 auto;
+  font: var(--fw-eyebrow) var(--fs-eyebrow-min)/1 var(--font-sans);
+  letter-spacing: var(--ls-eyebrow-min);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.tracker-next .cr-rail-groupby-select {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--line-default);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-primary);
+  font: var(--fw-row-min) var(--fs-row-min)/var(--lh-row-min) var(--font-sans);
+  padding: 4px 6px;
+}
+
 .tracker-next .cr-rail-list {
   flex: 1;
   min-height: 0;
@@ -325,11 +523,32 @@
 }
 .tracker-next .cr-rail-dot.is-live { background: var(--state-thinking); }
 .tracker-next .cr-rail-dot.is-waiting { background: var(--state-awaiting); }
-.tracker-next .cr-rail-title {
+/* BUG FIX: rail rows had no flagged/landed colour at all — only is-live/
+ * is-waiting existed, so most non-idle sessions showed no state colour. */
+.tracker-next .cr-rail-dot.is-flagged { background: var(--state-flagged); }
+.tracker-next .cr-rail-dot.is-landed { background: var(--state-done); }
+/* Decision 1 — the rail row's title + directory now stack in their own
+ * column so the row can carry both without growing the dot/meta layout;
+ * `.cr-rail-title` no longer needs its own flex-item sizing, its wrap does. */
+.tracker-next .cr-rail-titlewrap {
   flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.tracker-next .cr-rail-title {
   min-width: 0;
   font: var(--fw-row-min) 12px/var(--lh-row-min) var(--font-sans);
   color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tracker-next .cr-rail-dir {
+  min-width: 0;
+  font: var(--fw-trace) var(--fs-trace-min)/var(--lh-trace) var(--font-mono);
+  color: var(--text-muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -376,6 +595,7 @@
 .tracker-next .cr-rail--collapsed .cr-rail-group-header,
 .tracker-next .cr-rail--collapsed .cr-rail-label,
 .tracker-next .cr-rail--collapsed .cr-rail-search,
+.tracker-next .cr-rail--collapsed .cr-rail-groupby,
 .tracker-next .cr-rail--collapsed .cr-rail-count { display: none; }
 .tracker-next .cr-rail--collapsed .cr-rail-header { justify-content: center; }
 
@@ -386,10 +606,15 @@
   margin: 2px 0;
 }
 .tracker-next .cr-orb {
+  /* BUG FIX: doc 02's rail table specifies 28px collapsed orbs; this rendered
+   * at 32px. Sizing here doesn't depend on either collapsed rail width (48px
+   * board / 56px detail, .cr-rail--detail) — both center orbs via the parent
+   * `.cr-rail--collapsed .cr-rail-list`'s flex `align-items: center` — so the
+   * orb still centres correctly in both. */
   position: relative;
   flex: 0 0 auto;
-  width: 32px;
-  height: 32px;
+  width: 28px;
+  height: 28px;
   border-radius: 50%;
   display: inline-flex;
   align-items: center;
@@ -414,9 +639,19 @@
 .tracker-next .cr-orb-pip.is-live { background: var(--state-thinking); }
 .tracker-next .cr-orb-pip.is-waiting { background: var(--state-awaiting); }
 .tracker-next .cr-orb-pip.is-flagged { background: var(--state-flagged); }
+/* BUG FIX: no landed colour existed on the orb pip at all. */
+.tracker-next .cr-orb-pip.is-landed { background: var(--state-done); }
 
-/* < 1024px: rail becomes a hidden overlay, opened by the rail toggle */
-@media (max-width: 1023px) {
+/* BLOCKER 4 (tier boundary): this used to be `max-width: 1023px`, one pixel
+ * off from ext_cr_detail.css's own compact-tier boundary (`max-width: 1024px`
+ * / `min-width: 1025px`) — at exactly 1024px (classic iPad landscape) the
+ * rail stayed docked (desktop behaviour) while the detail view had already
+ * dropped to its single-column phone-adjacent stack. Realigned to the same
+ * <=1024px boundary detail.css already uses, so 1024px gets ONE consistent
+ * tier across both files. ext_cr_board.js's own `window.innerWidth < 1024`
+ * checks (openRailOverlay/closeRailOverlay/applyRailMode/bindResize) are
+ * updated alongside this to `<= 1024` so JS agrees with CSS at the boundary. */
+@media (max-width: 1024px) {
   .tracker-next .cr-rail {
     position: fixed;
     top: 54px;
@@ -430,6 +665,10 @@
   }
   .tracker-next .cr-rail.cr-rail--overlay-open { transform: translateX(0); }
   .tracker-next .cr-rail--collapsed { width: 232px; } /* an opened overlay is always the full row rail */
+  /* ...except in the detail view, which keeps its 56px orb rail even as a
+   * mobile overlay (decision 1 has no mobile exception) — wins over the rule
+   * above by appearing later, same specificity. */
+  .tracker-next .cr-rail--detail { width: 56px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .tracker-next .cr-rail { transition: none; }
@@ -438,12 +677,13 @@
 /* Mobile rail scrim — sits behind the overlay-open rail, in front of the
  * board. No scrim/backdrop token exists in 01-foundations.md, so the fill is
  * a literal rgba (same precedent as the working-tile pulse keyframes, which
- * also use a literal rgba where no token covers the need). Only present
- * below 1024px, i.e. exactly the width band where the rail is an overlay. */
+ * also use a literal rgba where no token covers the need). Only present at
+ * or below 1024px, i.e. exactly the width band where the rail is an overlay
+ * (see the Blocker 4 note above the rail-overlay media query). */
 .tracker-next .cr-rail-scrim {
   display: none;
 }
-@media (max-width: 1023px) {
+@media (max-width: 1024px) {
   .tracker-next .cr-rail-scrim {
     display: block;
     position: fixed;
@@ -501,6 +741,12 @@
   font: var(--fw-triage-count) var(--fs-triage-count-max)/var(--lh-triage-count) var(--font-serif);
   letter-spacing: var(--ls-triage-count);
   font-variant-numeric: tabular-nums;
+  /* BUG FIX: 01-foundations.md gives triage counts a 33-40px range, but the
+   * original prototype actually renders them at 31px — doc and prototype
+   * disagree here, and the prototype's rendered value wins per instruction.
+   * The token (--fs-triage-count-max, owned elsewhere) is left untouched;
+   * overridden at this use site only. */
+  font-size: 31px;
 }
 @media (max-width: 1439px) {
   .tracker-next .cr-triage-count { font-size: var(--fs-triage-count-min); }
@@ -566,7 +812,7 @@
 @media (max-width: 1279px) {
   .tracker-next .cr-board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
-@media (max-width: 1023px) {
+@media (max-width: 1024px) {
   .tracker-next .cr-board { grid-template-columns: minmax(0, 1fr); }
 }
 
@@ -582,7 +828,7 @@
 }
 .tracker-next .cr-tile--span2,
 .tracker-next .cr-tile--agentgroup { grid-column: span 2; }
-@media (max-width: 1023px) {
+@media (max-width: 1024px) {
   .tracker-next .cr-tile--span2,
   .tracker-next .cr-tile--agentgroup { grid-column: span 1; }
 }
@@ -656,7 +902,13 @@
 .tracker-next .cr-tile-pin { flex: 0 0 auto; font-size: 11px; }
 .tracker-next .cr-tile-meta {
   margin-left: auto;
-  flex: 0 0 auto;
+  /* was `flex: 0 0 auto` (never shrinks) — now that a model short-form can be
+     appended here too (e.g. "3m · CLI · opus 4.8"), this can shrink and
+     ellipsize rather than overflow the tile at narrow (390px) widths. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font: var(--fw-trace) 10.5px/var(--lh-trace) var(--font-mono);
   font-variant-numeric: tabular-nums;
   color: var(--text-muted);
@@ -692,6 +944,22 @@
   border-radius: var(--radius-sm);
   padding: 6px 8px;
   color: var(--text-flagged);
+}
+/* Decision 3 (revised) — the `s.now_line` second line: small, secondary,
+ * single-line-truncated (never wraps to a second line the way the awaiting
+ * tile's prompt line still does above). Overrides the base rule's 2-line
+ * clamp; flagged's own background/padding/colour rule just above still wins
+ * on the properties it sets (higher specificity), so a flagged tile keeps its
+ * amber panel with this line just truncated to one line inside it. */
+.tracker-next .cr-tile-line--now {
+  display: block;
+  -webkit-line-clamp: unset;
+  -webkit-box-orient: unset;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font: var(--fw-trace) var(--fs-trace-max)/var(--lh-trace) var(--font-sans);
+  color: var(--text-muted);
 }
 
 .tracker-next .cr-tile-todos { display: flex; flex-direction: column; gap: 4px; }
@@ -738,6 +1006,12 @@
 .tracker-next .cr-tile-pr {
   font: var(--fw-trace) 10.5px/var(--lh-trace) var(--font-mono);
   color: var(--text-secondary);
+  /* BUG FIX: this rule existed with no render call site (Bug 2). Now used on both
+   * a <span> (no pr_url) and an <a> (pr_url present) -- text-decoration:none keeps
+   * the link as quiet/subordinate as the plain-text case, matching the same
+   * convention as .crd-pr-row/.crd-link-row in ext_cr_detail.css. */
+  text-decoration: none;
+  align-self: flex-start;
 }
 
 .tracker-next .cr-tile-agentexpand {
@@ -747,7 +1021,16 @@
   color: var(--text-agent);
   font: var(--fw-row-max) var(--fs-row-min)/var(--lh-row-min) var(--font-sans);
 }
-.tracker-next .cr-tile-agentexpand svg { width: 12px; height: 12px; }
+/* BUG FIX: doc 02's tile-anatomy table puts the `▸` chevron FIRST, beside the
+ * 🤖, in the tile head — not trailing next to "expand". Sizing rule moved
+ * along with the chevron's new position. */
+.tracker-next .cr-tile--agentgroup .cr-tile-head svg { width: 12px; height: 12px; color: var(--text-muted); flex: 0 0 auto; }
+/* Doc: a plain, secondary-coloured title ("Agents · ai-tracker") — not the
+ * bold primary-ink title every other tile state uses. */
+.tracker-next .cr-tile--agentgroup .cr-tile-title--agent {
+  color: var(--text-secondary);
+  font-weight: var(--fw-body);
+}
 
 .tracker-next .cr-board-empty {
   grid-column: 1 / -1;
@@ -786,6 +1069,132 @@
   font-weight: 600;
   cursor: pointer;
   padding: 0;
+}
+
+/* ============================================================
+   SESSIONS DESTINATION — the minimal honest version (requirement 3): doc
+   02-shell-and-board.md never defines what this screen shows (its only uses
+   of "Sessions" are the rail's own group-header label and generic prose), so
+   this reuses the rail's OWN row/group markup (.cr-rail-row, .cr-rail-group-
+   header, .cr-rail-agentrow — all already styled above) via renderSessionRows
+   in ext_cr_board.js. Only the two wrapper elements are new.
+   ============================================================ */
+.tracker-next .cr-sessions-view {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.tracker-next .cr-sessions-header {
+  flex: 0 0 auto;
+  padding: 16px 22px 8px;
+  font: var(--fw-eyebrow) var(--fs-eyebrow-min)/1 var(--font-sans);
+  letter-spacing: var(--ls-eyebrow-min);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.tracker-next .cr-sessions-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 18px 18px;
+}
+.tracker-next .cr-sessions-empty {
+  padding: 30px 16px;
+  text-align: center;
+  color: var(--text-muted);
+  font: var(--fw-body) var(--fs-body-min)/var(--lh-body-max) var(--font-sans);
+}
+
+/* Requirement 5 — the Sessions destination's own search box. Reuses the
+ * rail's own `.cr-rail-search` pill styling (same look, different data
+ * source: this one hits GET /api/search, covering the whole session stack,
+ * not just what's already loaded) — only the outer margin differs since it
+ * sits in a wider, non-rail column. */
+.tracker-next .cr-sessions-search {
+  margin: 0 22px 12px;
+}
+
+/* Requirement 4 — pagination, shared by the browse list and search results. */
+.tracker-next .cr-sessions-pager {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 22px 16px;
+  border-top: 1px solid var(--line-subtle);
+}
+.tracker-next .cr-sessions-pager-label {
+  flex: 1;
+  min-width: 0;
+  font: var(--fw-trace) var(--fs-trace-max)/var(--lh-trace) var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+.tracker-next .cr-sessions-pagesize {
+  border: 1px solid var(--line-default);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-primary);
+  font: var(--fw-row-min) var(--fs-row-min)/var(--lh-row-min) var(--font-sans);
+  padding: 5px 6px;
+}
+.tracker-next .cr-sessions-pager-btn {
+  border: 1px solid var(--line-default);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-primary);
+  font: var(--fw-row-max) var(--fs-row-min)/var(--lh-row-min) var(--font-sans);
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.tracker-next .cr-sessions-pager-btn:hover:not(:disabled) { background: var(--fill-row-hover); }
+.tracker-next .cr-sessions-pager-btn:disabled {
+  cursor: default;
+  opacity: .45;
+}
+
+/* ============================================================
+   BLOCKER 2 — phone touch targets: rail, sessions, board (phone tier only;
+   tablet/desktop density untouched, per instruction). Same rationale as the
+   top-bar block above: grow the box for square icon controls, `min-height`
+   for text-driven rows/inputs whose width must stay content-sized.
+   ============================================================ */
+@media (max-width: 480px) {
+  /* Rail chevron (collapse/expand): was a bare 22x22 box. 22px -> 44px. */
+  .tracker-next .cr-rail-chevron { width: 44px; height: 44px; }
+
+  /* Rail search + reused Sessions search (`.cr-rail-search.cr-sessions-search`,
+     see ext_cr_board.js): explicit `height: 29px`. 29px -> 44px. */
+  .tracker-next .cr-rail-search { height: 44px; }
+
+  /* Rail row: padding 8px/9px around unset (content-driven) line height —
+     audited at ~34px. `min-height` brings it to 44px without touching the
+     row's internal type scale. 34px -> 44px. */
+  .tracker-next .cr-rail-row { min-height: 44px; }
+
+  /* Collapsed orb rail (always in effect for the detail view's 56px rail,
+     `.cr-rail--detail`, regardless of breakpoint — decision 1 has no mobile
+     exception): explicit 28x28. Grown to 44x44; the 56px-wide detail rail
+     column has room (56 - 44 = 12px, 6px each side). 28px -> 44px. */
+  .tracker-next .cr-orb { width: 44px; height: 44px; }
+
+  /* Sessions page-size select: padding 5px6 + font 12px/1.25 (15px line) +
+     2px border = 5+5+15+2 = 27px. `min-height` -> 44px. */
+  .tracker-next .cr-sessions-pagesize { min-height: 44px; }
+
+  /* Sessions pager buttons (prev/next): padding 5px10 + font 12px/1.25
+     (15px line) + 2px border = 5+5+15+2 = 27px. `min-height` -> 44px. */
+  .tracker-next .cr-sessions-pager-btn { min-height: 44px; }
+
+  /* Triage strip: hide histogram at phone width. The histogram is decorative
+     context (activity, last hour); the three counts (WAITING ON YOU / WORKING /
+     FLAGGED) are the actionable filters. At 390px the histogram label clips
+     mid-word (ACT… · LA… HOU) against the right edge. Hiding the whole cell
+     lets the three counts expand and remain fully legible and tappable. Also
+     remove the trailing border-right from Flagged (now visually the last cell)
+     so no stray divider remains at the strip's right edge. */
+  .tracker-next .cr-triage-hist { display: none; }
+  .tracker-next .cr-triage-cell--flagged { border-right: none; }
 }
 
 /* ============================================================

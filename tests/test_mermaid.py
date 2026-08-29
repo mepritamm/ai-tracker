@@ -5,8 +5,10 @@ The renderer is client-side JS, so these run the *real* app.js under node with a
 stub DOM and assert on what mermaidSvg()/mdBlock() actually produce. node isn't a
 project dependency — if it's absent the module skips (the page-level assertions in
 test_integration.py still pin that the renderer is served)."""
+import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import unittest
@@ -147,6 +149,46 @@ class TestMdBlockFences(unittest.TestCase):
         self.assertNotIn("mdpre", h)                    # replaced the code block, not added to it
         self.assertIn("<p class=mdp>intro</p>", h)      # surrounding markdown still renders
         self.assertIn("after", h)
+
+    def test_mermaid_fence_gets_a_data_mmd_src_slot_for_the_async_upgrade(self):
+        # mdBlock() still renders the hand-rolled SVG SYNCHRONOUSLY (asserted above), but
+        # now wraps it in a `.mmd-slot[data-mmd-src=...]` holding the raw source, base64'd
+        # UTF-8-safe -- app.js's own renderMermaid()/upgradeMermaidIn() (the ONE renderer
+        # both the classic UI and the Control Room call, see their own comments) read this
+        # attribute back off the DOM to upgrade the fallback in place to a real mermaid.js
+        # render, without a second markdown pass over the original text.
+        src = "flowchart TD\n  A[one] --> B[two]"
+        h = _js("```mermaid\n%s\n```" % src, fn="mdBlock")
+        self.assertIn('class="mmd-slot"', h)
+        m = re.search(r'data-mmd-src="([^"]+)"', h)
+        self.assertIsNotNone(m, h)
+        self.assertEqual(base64.b64decode(m.group(1)).decode("utf-8"), src)
+
+    def test_unsupported_diagram_still_gets_a_slot_so_mermaid_js_can_try(self):
+        # A `gantt` fence has no hand-rolled renderer (falls back to a labelled code
+        # block — see test_unsupported_mermaid_falls_back_to_the_source_with_a_tag), but
+        # mermaid.js itself DOES understand gantt — so this fence still gets a
+        # `data-mmd-src` slot, not just the families the hand-rolled renderer covers.
+        src = "gantt\n  title x\n  section A\n    a : a1, 2014-01-01, 30d"
+        h = _js("```mermaid\n%s\n```" % src, fn="mdBlock")
+        self.assertIn('class="mmd-slot"', h)
+        m = re.search(r'data-mmd-src="([^"]+)"', h)
+        self.assertIsNotNone(m, h)
+        self.assertEqual(base64.b64decode(m.group(1)).decode("utf-8"), src)
+
+
+class TestMermaidVendorLoader(unittest.TestCase):
+    """The lazy-load target must be the committed vendor file, never a CDN URL at runtime
+    (conventions rule 2/6 — no outbound network calls; mirrors
+    test_term_vt_client.py's test_lazy_asset_loader_targets_the_vendored_paths_not_a_cdn
+    for xterm.js's own vendor loader)."""
+
+    def test_loader_targets_the_vendored_path_not_a_cdn(self):
+        with open(APP_JS) as f:
+            js = f.read()
+        self.assertIn('"/vendor/mermaid.min.js"', js)
+        for host in ("cdn.jsdelivr.net", "cdnjs.cloudflare.com", "unpkg.com", "esm.sh"):
+            self.assertNotIn(host, js)
 
     def test_other_fences_are_untouched_code_blocks(self):
         h = _js("```python\nprint('hi')\n```", fn="mdBlock")

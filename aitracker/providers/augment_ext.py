@@ -15,7 +15,7 @@ the source badge distinguishes the IDE — mirrors Claude's per-surface
 import glob, json, os, time, urllib.parse
 from .. import config
 from ..store import load_titles, load_notes, _load_json
-from ..util import _first_line, push_when, _window, _git_branch, safe_path_component, context_window, todo_summary
+from ..util import _first_line, push_when, _window, _git_branch, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase
 from .base import Provider
 
 
@@ -177,15 +177,27 @@ def _list(kind, prefix, src_label):
             mt = _mtime_of(task, aug_dir) or mt_file
             title = _title_for(task, folder)
             todo_total, todo_done, todo_current, todo_current_index = todo_summary(_todos_from(task, allmap))
+            ended = (task.get("state") or "").upper() in ("COMPLETE", "COMPLETED", "DONE")
+            # now_line: parity with Claude/Auggie, LIVE only (inside LIVE_WINDOW, not ended).
+            # This provider has NO narration source at all (chat transcript lives in the
+            # extension's LevelDB kv-store, unreadable stdlib-only -- see the module
+            # docstring), so the in-progress todo is the only signal it can honestly offer;
+            # with none, this stays "" rather than fabricating something from files-touched.
+            now_line = ""
+            if not ended and (time.time() - mt) < config.LIVE_WINDOW and todo_current:
+                now_line = "▶ " + now_phrase(todo_current)
             out.append({
                 "id": gid, "project": os.path.basename(folder) if folder else "Augment", "cwd": folder,
                 "title": titles.get(gid) or title,
                 "prompt": (task.get("description") or "")[:200],
                 "source": src_label, "mtime": mt,
                 "agent": False, "group": "", "groupLabel": "", "parentId": "", "bg": 0, "first": 0,
-                "waiting": False, "ended": (task.get("state") or "").upper() in ("COMPLETE", "COMPLETED", "DONE"),
+                "waiting": False, "ended": ended,
                 "todo_total": todo_total, "todo_done": todo_done, "todo_current": todo_current,
                 "todo_current_index": todo_current_index,
+                "pr_num": None, "pr_url": None, "pr_repo": None, "pr_state": "",  # Augment Ext has no PR extraction
+                "now_line": now_line,
+                "model": "",  # no chat transcript at all (LevelDB, unreadable stdlib-only) -- honestly unknown
             })
     return out
 
@@ -243,6 +255,14 @@ def _parse(kind, prefix, src_label, sid):
         "meta": {"cwd": folder, "title": title, "source": src_label, "entrypoint": src_label,
                  "gitBranch": _git_branch(folder), "model": ""},
         "todos": todos,
+        # Same shared-shape field Auggie CLI reports (see auggie.py's parse_auggie): this
+        # family never does Claude's exact id join. Unlike Auggie CLI, this provider has no
+        # chatHistory-equivalent AT ALL to name-match against either (the chat transcript
+        # lives in the extension's augment-kv-store LevelDB — unreadable stdlib-only, per
+        # the module docstring above), so started_at/ended_at above stay null, not just
+        # approximate. True here still means "don't trust this as an exact join" — the
+        # honest, conservative value given the provider has no timing source of any kind.
+        "todo_times_approximate": todo_times_approximate("augment"),
         "files": files, "reads": [], "commands": [], "commits": [], "tests": [],
         "requests": [], "agents": [], "agents_bg": [], "agent_sessions": [], "shells": [],
         "decisions": [], "waiting": False,

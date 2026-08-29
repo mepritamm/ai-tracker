@@ -1,6 +1,6 @@
 /* ext_cr_boot.css — Control Room bootstrap: the opt-in entry button (classic
- * palette) and the minimal shell plumbing ext_cr_boot.js needs (view-container
- * show/hide, an honest placeholder, and the first-run panel).
+ * palette) and the minimal shell plumbing ext_cr_boot.js needs (the shell
+ * container's sizing, an honest placeholder, and the first-run panel).
  *
  * IMPORTANT (found while wiring the real integration, not assumed up front):
  * cr_board.js's own CR.board.mount(rootEl, ctx) builds a COMPLETE, self-
@@ -9,12 +9,21 @@
  * styled by cr_board.css (soon ext_cr_board.css) under `.tracker-next .cr-*`
  * selectors. This file therefore does NOT build or style a second top bar;
  * doing so would fork a parallel implementation of the same capability
- * (conventions.md rule 4). #cr-view-board below is just the empty slot
- * CR.board.mount() is handed.
+ * (conventions.md rule 4).
+ *
+ * STRUCTURAL FIX (persistent shell): the rail and top bar used to live inside
+ * the SAME element ext_cr_boot.js's showView() hid/showed per view, so
+ * navigating into a session hid them too. Now `#cr-shell` below is the ONE
+ * element handed to CR.board.mount() — board builds the rail + top bar
+ * (never hidden) plus all three content slots (#cr-view-board / #cr-view-
+ * sessions / #cr-view-detail, still just `.cr-view` — see below) inside it,
+ * and only those inner slots toggle `hidden` on navigation.
  *
  * Token source: `.tracker-next` / `.tracker-next.is-dark` (cr.css, soon
- * ext_cr.css) defines every --surface-*/--text-*/--line-*/--state-*/--fill-*/
- * --shadow-*/--font-* custom property from 01-foundations.md. No `--ads-*`
+ * ext_cr.css) defines every --surface-, --text-, --line-, --state-, --fill-,
+ * --shadow- and --font- custom property from 01-foundations.md. (Written without
+ * a trailing star-slash on each prefix on purpose: that sequence ENDS a CSS
+ * comment, which silently killed every stylesheet after this one.) No `--ads-*`
  * prefix exists anywhere in the doc or the sibling token file, so this file
  * uses the doc's real token names (matches ext_cr.css's own note on the
  * point). #nextRoot carries both `tracker-next` (token scope) and `cr`
@@ -73,9 +82,15 @@ header.hd {
    rule and break the toggle). */
 #nextRoot[hidden] { display: none; }
 
-/* The two view slots ext_cr_boot.js's ctx.go('board' | 'detail', id) toggles.
-   Each owning module (CR.board / CR.detail) fills its own slot completely,
-   including that view's own internal layout — this file only sizes the slot. */
+/* The (now three) view slots ext_cr_boot.js's ctx.go('board' | 'sessions' |
+   'detail', id) toggles — #cr-view-board and #cr-view-sessions are built by
+   CR.board (ext_cr_board.js), #cr-view-detail is CR.detail's own slot. Each
+   owning module fills its own slot completely, including that view's own
+   internal layout — this file only sizes the slot. Also applied to `#cr-
+   shell` itself (the ONE persistent container CR.board.mount() actually
+   receives — see the file header note above): it needs the exact same
+   flex:1 sizing these slots always had, now that it's what's handed to
+   board.mount() instead of a single per-view slot. */
 .cr-view {
   flex: 1;
   min-width: 0;
@@ -101,6 +116,18 @@ header.hd {
    point — classic mode hasn't switched yet), so it carries its own
    `.tracker-next[.is-dark]` scope for token resolution.
    ============================================================ */
+/* The mode switch sets `el.hidden = true` on the classic roots, but app.css gives
+   several of them an explicit `display` via a CLASS rule, which outranks the UA
+   stylesheet's `[hidden] { display: none }`. Without this the classic dashboard
+   stays fully rendered and clickable UNDERNEATH Control Room — verified in a real
+   browser: .app read `hidden=true` while computing to `display:flex`, 1440x757.
+   Scoped to the exact roots ext_cr_boot.js's CLASSIC_SIBLINGS hides. */
+.app[hidden],
+footer.foot[hidden],
+#toasts[hidden],
+#diffmodal[hidden],
+#msgmodal[hidden] { display: none !important; }
+
 .cr-scrim {
   position: fixed;
   inset: 0;
