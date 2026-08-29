@@ -15,7 +15,7 @@ the source badge distinguishes the IDE — mirrors Claude's per-surface
 import glob, json, os, time, urllib.parse
 from .. import config
 from ..store import load_titles, load_notes, _load_json
-from ..util import _first_line, push_when, _window, _git_branch, safe_path_component, context_window
+from ..util import _first_line, push_when, _window, _git_branch, safe_path_component, context_window, todo_summary
 from .base import Provider
 
 
@@ -121,7 +121,12 @@ def _resolve_subtasks(root, allmap, seen=None):
         t = allmap[uu]
         out.append({"content": t.get("name") or t.get("description") or "",
                     "status": _STATE_TO_TODO.get((t.get("state") or "").upper(), "pending"),
-                    "t": ""})
+                    "t": "",
+                    # Same shape as Claude's todos, but honestly null: see auggie.py's
+                    # _auggie_resolve for why this task-storage family can't join a real
+                    # start/end pair onto a todo (task-storage's own lastUpdated is one
+                    # instant, not a range, and the extension has no separate event log).
+                    "started_at": None, "ended_at": None})
         out += _resolve_subtasks(t, allmap, seen)
     return out
 
@@ -159,15 +164,19 @@ def _list(kind, prefix, src_label):
     titles = load_titles()
     out = []
     for ws, aug_dir, folder in _scan_workspaces(kind):
-        # ONE pass over the task files. There used to be an `allmap` built from a first
-        # _iter_tasks() pass here, but nothing in this loop ever read it (only _parse()
-        # needs the map, to flatten subTasks) — it just opened and json-parsed every task
-        # file a second time on every /api/list. Measured on real data: 665 Augment tasks
-        # read as 1330 opens, ~0.12s of a 0.40s warm /api/list (~30%).
-        for uu, task, mt_file in _iter_tasks(aug_dir):
+        # ONE pass over the task files, materialized so the todo-tree lookup below can
+        # share it. There used to be a SEPARATE `allmap` built from a second _iter_tasks()
+        # pass here — it just opened and json-parsed every task file a second time on
+        # every /api/list. Measured on real data: 665 Augment tasks read as 1330 opens,
+        # ~0.12s of a 0.40s warm /api/list (~30%). Building allmap from THIS SAME pass
+        # (already fully in memory) costs nothing extra — no second read, same list.
+        tasks = list(_iter_tasks(aug_dir))
+        allmap = {u: t for u, t, _ in tasks}
+        for uu, task, mt_file in tasks:
             gid = "%s%s:%s" % (prefix, ws, uu)
             mt = _mtime_of(task, aug_dir) or mt_file
             title = _title_for(task, folder)
+            todo_total, todo_done, todo_current = todo_summary(_todos_from(task, allmap))
             out.append({
                 "id": gid, "project": os.path.basename(folder) if folder else "Augment", "cwd": folder,
                 "title": titles.get(gid) or title,
@@ -175,6 +184,7 @@ def _list(kind, prefix, src_label):
                 "source": src_label, "mtime": mt,
                 "agent": False, "group": "", "groupLabel": "", "parentId": "", "bg": 0, "first": 0,
                 "waiting": False, "ended": (task.get("state") or "").upper() in ("COMPLETE", "COMPLETED", "DONE"),
+                "todo_total": todo_total, "todo_done": todo_done, "todo_current": todo_current,
             })
     return out
 

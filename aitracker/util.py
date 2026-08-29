@@ -266,6 +266,19 @@ def cmd_kind(c):
     return "cmd"
 
 
+def todo_summary(todos):
+    """(total, done, current-label-or-None) from a list of normalized todo dicts
+    ({"content"/"activeForm"/"status"} — the shape both providers already emit:
+    Claude's store.load_tasks() and Auggie's task-tree resolver). The one place
+    this gets computed, so the session-list dict's todo_total/todo_done/todo_current
+    (registry.py's shared seam) aren't derived twice, once per provider."""
+    total = len(todos)
+    done = sum(1 for t in todos if t.get("status") == "completed")
+    cur = next((t for t in todos if t.get("status") == "in_progress"), None)
+    current = (cur.get("activeForm") or cur.get("content") or None) if cur else None
+    return total, done, current
+
+
 def unified(old, new, cap=20000):
     """Unified diff between two strings, each capped to keep payloads sane.
     Shared by every provider that reconstructs an edit from the tool input it

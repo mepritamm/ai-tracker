@@ -105,6 +105,14 @@ def parse_any(sid):
     # with no extra round trip.
     d["continued_as"] = resolve_fork_child(sid)
     d["continued_from"] = fork_parent_of(sid)
+    # pinned/open_flags/note_count: same shared seam as all_sessions() above, same store.py
+    # helpers, one implementation for every provider. Without this the detail header (pinned
+    # pill, 🚩 count) has nothing to read and hides — these three small JSON files are already
+    # read live on every /api/list poll at this same ~2s cadence, so reading them again here for
+    # ONE session's detail view is not a measurable added cost.
+    d["pinned"] = sid in set(load_pins())
+    d["note_count"] = len(load_notes().get(sid, []))
+    d["open_flags"] = sum(1 for f in load_flags() if f.get("session") == sid and not f.get("resolved"))
     return d
 
 

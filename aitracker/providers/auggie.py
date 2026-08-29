@@ -1,7 +1,7 @@
 import glob, json, os, re, time
 from ..config import LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified, safe_path_component, context_window
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified, safe_path_component, context_window, todo_summary
 from ..overview import build_overview
 from ..store import load_titles, load_tasks, load_notes
 from .base import Provider
@@ -68,24 +68,49 @@ def _auggie_all():
     return m
 
 
-def _auggie_resolve(root, allmap, seen=None):
+def _auggie_resolve(root, get, seen=None):
     """A root's subTasks are UUID references to other task files — flatten them
-    (depth-first, cycle-safe) into todo dicts."""
+    (depth-first, cycle-safe) into todo dicts. `get(uuid)` fetches one task dict
+    (or None); the two callers below differ only in how they fetch — a preloaded
+    map for the full detail parse vs. a direct per-uuid file read for the list
+    view — so this tree-walk/normalize logic exists exactly once."""
     seen = seen if seen is not None else set()
     out = []
     for ref in root.get("subTasks") or []:
         if not isinstance(ref, str) or ref in seen:
             continue
         seen.add(ref)
-        st = allmap.get(ref)
+        st = get(ref)
         if not st:
             continue
         name = st.get("name") or st.get("description") or ""
         out.append({"content": name,
                     "status": _ASTATE.get((st.get("state") or "").upper(), "pending"),
-                    "activeForm": name})
-        out.extend(_auggie_resolve(st, allmap, seen))
+                    "activeForm": name,
+                    # No honest started_at/ended_at here (unlike Claude): the task-storage
+                    # file's own "lastUpdated" is a single last-write instant, not a start/end
+                    # pair, and the update_tasks/add_tasks tool calls in the session's own
+                    # chatHistory key each task by a short per-call id that does NOT match this
+                    # file's uuid (confirmed against a real session: update_tasks used ids like
+                    # "63a4cp3bxdwD2oqwQ1pWLZ" while task-storage files are named by uuid) — so
+                    # there is no reliable join back to THIS todo. Emit null, same shape as
+                    # Claude's todos, rather than fabricate or guess from a weak proxy.
+                    "started_at": None, "ended_at": None})
+        out.extend(_auggie_resolve(st, get, seen))
     return out
+
+
+def _load_task_file(uuid):
+    """One task-storage file by its uuid (== its filename, confirmed against real
+    files on disk). Used for the list-time cheap path below — NOT _auggie_all()'s
+    glob-everything, which is fine once per detail parse but far too much (223
+    files on this machine) to redo per session on every /api/list poll."""
+    if not uuid:
+        return None
+    try:
+        return json.load(open(os.path.join(config.AUGMENT_DIR, "task-storage", "tasks", uuid), encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
 
 
 _AUGGIE_LIST_CACHE = {}
@@ -126,7 +151,17 @@ def _auggie_todos_for(root_uuid):
         return []
     allmap = _auggie_all()
     root = allmap.get(root_uuid)
-    return _auggie_resolve(root, allmap) if root else []
+    return _auggie_resolve(root, allmap.get) if root else []
+
+
+def _auggie_todos_for_list(root_uuid):
+    """List-time equivalent of _auggie_todos_for: reads only the task files this
+    session's own tree references (root + descendants, by direct uuid path) —
+    bounded by that session's todo count, not by every task file on disk."""
+    if not root_uuid:
+        return []
+    root = _load_task_file(root_uuid)
+    return _auggie_resolve(root, _load_task_file) if root else []
 
 
 def list_auggie():
@@ -155,16 +190,22 @@ def list_auggie():
                  "prompt": req,
                  "cwd": _auggie_ide_cwd(d),   # real per-session working dir (like Claude)
                  "waiting": waiting, "ended": ended,
+                 "root": d.get("rootTaskUuid"),
                  "mtime": _iso_epoch(d.get("modified")) or mt}
             _AUGGIE_LIST_CACHE[f] = (mt, e)
         gid = "auggie:" + e["sid"]
         cwd = e.get("cwd") or default_cwd
+        # Recomputed every call (not cached alongside `e`): a task's status can change without
+        # touching this session's own file, so gating it on the session file's mtime would go stale.
+        # _auggie_todos_for_list only reads this session's own task-tree files, so it's still cheap.
+        todo_total, todo_done, todo_current = todo_summary(_auggie_todos_for_list(e.get("root")))
         out.append({
             "id": gid, "project": os.path.basename(cwd) if cwd else "Augment", "cwd": cwd,
             "title": titles.get(gid) or e["title"],
             "prompt": e["prompt"], "source": "auggie", "mtime": e["mtime"],
             "agent": False, "group": "", "groupLabel": "", "parentId": "", "bg": 0, "first": 0,   # Auggie has no background-agent/SDK model
             "waiting": e.get("waiting", False), "ended": e.get("ended", False),
+            "todo_total": todo_total, "todo_done": todo_done, "todo_current": todo_current,
         })
     return out
 

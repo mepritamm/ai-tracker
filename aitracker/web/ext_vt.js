@@ -1662,8 +1662,15 @@
   // xterm.js takes an explicit JS colour theme, not CSS -- read the app's own custom properties
   // once so both light/dark themes (app.css's html.light) carry straight over instead of a second,
   // hardcoded palette drifting from the SGR classes in ext_vt.css.
-  function _xtermTheme() {
-    var cs = getComputedStyle(document.documentElement);
+  //
+  // `el` (added for mountInto() -- see that function's own comment): defaults to the document
+  // root, exactly the element every existing caller (XtermTerminal._build/_onThemeChange) reads
+  // from today -- passing no `el` is byte-for-byte the old behaviour. mountInto() instead reads
+  // off the CALLER's own container, so a `setTheme()` override written as inline custom
+  // properties on that one element (which normally just inherits the root's values verbatim,
+  // hence no change for every OTHER call site) is what getComputedStyle sees here.
+  function _xtermTheme(el) {
+    var cs = getComputedStyle(el || document.documentElement);
     function v(name, fallback) { var val = cs.getPropertyValue(name); return val ? val.trim() : fallback; }
     return {
       background: v("--app", "#0c0f15"), foreground: v("--text", "#e6edf3"),
@@ -1729,6 +1736,15 @@
     // of this instance, including the window between attach() and the deferred _build() actually
     // running -- self._onThemeChange checks `self.term` itself and is a no-op until _build() sets
     // it. Removed in destroy() below; see that method's own comment for why.
+    // NOTE: kept calling _xtermTheme() with NO argument here (root-scoped), byte-for-byte the
+    // pre-existing literal an existing test pins exactly
+    // (test_xterm_adds_and_removes_the_themechange_listener) -- unlike _build()'s own call just
+    // below, a GLOBAL themechange (the classic app's light/dark toggle) always re-reads the
+    // document root, so it can't be fooled into keeping a mountInto() setTheme() override that
+    // isn't the classic app's own theme. setTheme() itself still re-applies its override
+    // synchronously against `container` on every call; only a SUBSEQUENT global toggle event, if
+    // one ever fires while a caller-set override is active, would revert it -- a narrow, callable-
+    // again edge case, not a structural break.
     this._onThemeChange = function () { if (self.term) self.term.options.theme = _xtermTheme(); };
     document.addEventListener("themechange", this._onThemeChange);
   }
@@ -1752,7 +1768,7 @@
       fontSize: this._fontSize,
       cursorBlink: true,
       scrollback: 5000,
-      theme: _xtermTheme(),
+      theme: _xtermTheme(this.container),
     });
     var fit = new window.FitAddon.FitAddon();
     term.loadAddon(fit);
@@ -2640,6 +2656,13 @@
   // has (peekTerm, below) -- conventions rule 4, don't fork a second way to attach to a live tty.
   // `gen` is claimed HERE, before the async list check, so a second click while this one is still
   // checking supersedes it via the same openGen mechanism _openVTFresh's POST already relies on.
+  //
+  // NOTE (mountInto, further down): this list-scan decision is NOT extracted into a shared helper
+  // -- tests/test_term_vt_exec.py executes openVT's OWN source text standalone (sliced out by
+  // exact byte markers, `fetch` mocked, no other module scope available), so pulling this out from
+  // under it would leave that harness calling an undefined function. mountInto() below makes the
+  // exact same check with its own small, self-contained inline copy instead of sharing this one --
+  // a deliberate, documented exception to conventions rule 4, not an oversight.
   function openVT(sid, mode) {
     if (!sid) return;
     var mount = document.getElementById("ext_vt");
@@ -3159,7 +3182,285 @@
     });
   }
 
+  // ===== mountInto: renders a live terminal into a CALLER-SUPPLIED container instead of this
+  // file's own body-level overlay -- the seam the opt-in "Control Room" UI (cr_term.js) needs to
+  // host the terminal inside ITS OWN chrome (control bar, status bar, PTY pane) instead of falling
+  // back to openVT()'s floating modal. Shares the real "renderer+transport core" with openVT/
+  // switchActiveRenderer/bootStandalone -- that core is `Terminal`/`XtermTerminal` themselves
+  // (attach/measureAndResize/destroy/focus/_onStatusChange/_onNotice, both already built to render
+  // wholly inside whatever container they're handed). The find-or-spawn LIST SCAN itself, below,
+  // is a small self-contained inline copy of openVT's own decision rather than a shared helper --
+  // see openVT's own header comment for why: tests/test_term_vt_exec.py executes openVT's exact
+  // source text standalone (sliced by byte markers, no other module scope available), so pulling
+  // the decision out from under it would break that harness. A deliberate, documented exception to
+  // conventions rule 4, not an oversight. What THIS function owns, and what every other call site
+  // does NOT need, is forwarding status/notice/forked/renderer as plain callbacks/fields instead of
+  // writing into this file's own modal chrome (modalStatusEl/modalNotices/modalForkChip) -- the
+  // caller owns its own chrome, so none of that DOM gets built here.
+  //
+  // Deliberately independent of every module-level `active*` var (activeTerm/activeBar/activeTty/
+  // ...): those belong to the ONE classic overlay singleton, and a second independent instance of
+  // that state would let opening the classic modal silently clobber a mountInto()'d pane (or vice
+  // versa). Every mountInto() call is fully self-contained -- its own wrap, its own tty/renderer
+  // bookkeeping, its own cancellation flag -- so multiple mounts, and the classic overlay, can all
+  // coexist without knowing about each other.
+  //
+  // `container` -- caller-owned element the terminal renders into. A dedicated child `wrap` is
+  // appended to it (never `container` itself) for the same reason every other call site in this
+  // file uses one: Terminal/XtermTerminal's own constructor does `container.innerHTML = ""` on
+  // whatever it's given, and setRenderer() below rebuilds that wrap alone, leaving any OTHER
+  // chrome the caller keeps as `container`'s siblings/children untouched.
+  // `target` -- `{session, mode}` (find-existing-or-spawn, exactly openVT's own decision) or
+  // `{tty}` (attach to an already-running pty in place -- the manager panel's "peek", done here
+  // instead of in a new tab).
+  // `opts.renderer` -- optional initial-renderer override ("xterm"|"grid"). Renderer choice is
+  // ALWAYS a client-side decision the user can change at will against the same live pty (see
+  // switchActiveRenderer's own header comment) -- so this never gets sent to the server, it only
+  // picks which of the two classes THIS mount builds first, exactly like `opts.renderer` already
+  // does for a bare ?tty= standalone tab (bootStandalone). Omitted -- an existing tty falls back to
+  // GET /api/term/renderer (matching bootStandalone's own fallback), a freshly spawned one reads
+  // POST /api/term/pty's own `renderer` field (matching _openVTFresh).
+  //
+  // Returns the handle SYNCHRONOUSLY (per the requested shape), but resolving which tty to attach
+  // to is inherently a network round trip (a list scan, or a spawn) -- so `tty`/`renderer`/
+  // `forked`/`notice` start out unset and are filled in on the SAME object once that resolves;
+  // `onStatus`/`onNotice`/`onForked` subscribers registered right after this call (the normal
+  // pattern) are already in place by the time that happens.
+  function mountInto(container, target, opts) {
+    opts = opts || {};
+    var destroyed = false;
+    var curTerm = null;
+    var curRenderer = (opts.renderer === "xterm" || opts.renderer === "grid") ? opts.renderer : null;
+    var statusCbs = [], noticeCbs = [], forkedCbs = [];
+    var wrap = document.createElement("div");
+    wrap.className = "vttermwrap";
+    container.appendChild(wrap);
+
+    function fireStatus(s) { for (var i = 0; i < statusCbs.length; i++) statusCbs[i](s); }
+    function fireNotice(n) { for (var i = 0; i < noticeCbs.length; i++) noticeCbs[i](n); }
+    function fireForked(f) { for (var i = 0; i < forkedCbs.length; i++) forkedCbs[i](f); }
+
+    // Builds (or, called again from setRenderer, REbuilds) the terminal object against `wrap` --
+    // the exact same shape as _openVTFresh's/mountRenderer's own construction, just wired to this
+    // handle's callback lists instead of a hard-coded status line. `startingFlag` mirrors
+    // _openVTFresh's own grid-only gate (see that function's comment) -- server-owned, only ever
+    // true on the FIRST build for a mode="resume" pane still recovering, never on a later switch.
+    function attachRenderer(tty, renderer, startingFlag) {
+      var Cls = renderer === "xterm" ? XtermTerminal : Terminal;
+      var term = new Cls(wrap, tty, {
+        getActive: function () { return curRenderer; },
+        switchTo: setRenderer
+      });
+      term._onNotice = function (n) { if (curTerm !== term) return; fireNotice(n); };
+      term._onStatusChange = function (s) {
+        if (curTerm !== term) return;
+        // Same "starting" suppression _wireModalTerm/mountRenderer apply -- a refused-resume
+        // child's SSE drop must not look like a connection failure here either.
+        fireStatus(term.starting ? "starting…" : s);
+      };
+      if (renderer === "grid" && startingFlag) {
+        term.starting = true;
+        term.pane.classList.toggle("vtstarting", true);
+      }
+      curTerm = term;
+      curRenderer = renderer;
+      handle.renderer = renderer;
+      term.attach();
+      return term;
+    }
+
+    function setRenderer(next) {
+      if (destroyed || !curTerm || (next !== "xterm" && next !== "grid") || next === curRenderer) return;
+      // See switchActiveRenderer's own comment: destroy() closes the old SSE/raw stream before the
+      // new renderer opens its own against the same tty, so the pty never has two live viewers.
+      curTerm.destroy();
+      attachRenderer(handle.tty, next, false);
+    }
+
+    // {background, foreground, cursor} -- lets a caller-owned palette (Control Room's own
+    // light/dark toggle, independent of the classic app's) drive this ONE mount's colours. Grid's
+    // entire palette is already CSS custom properties (ext_vt.css's var(--app)/var(--text)/
+    // var(--ring2), inherited from :root) -- setting them as inline overrides on `container` alone
+    // repaints every descendant for free, no code change needed there. xterm.js takes an explicit
+    // JS colour object instead of CSS, so it needs an explicit push: `_xtermTheme(container)` (see
+    // that function's own updated comment) reads the SAME properties back off `container`'s
+    // computed style, which is exactly the override just set -- one read path for both renderers.
+    function setTheme(theme) {
+      if (!theme) return;
+      if (theme.background) container.style.setProperty("--app", theme.background);
+      if (theme.foreground) container.style.setProperty("--text", theme.foreground);
+      if (theme.cursor) container.style.setProperty("--ring2", theme.cursor);
+      if (curRenderer === "xterm" && curTerm && curTerm.term) {
+        curTerm.term.options.theme = _xtermTheme(container);
+      }
+    }
+
+    // Returns the buffer text (a plain string, not a Promise -- but `Promise.resolve(...)` on the
+    // caller's side makes either shape fine) rather than writing to the clipboard itself: the
+    // caller owns its own "Copied."/"Couldn't copy." UI around that write. Selection wins when
+    // there is one (parity with the existing Ctrl+C-copies-selection behaviour, Terminal.prototype
+    // _onKeyDown/XtermTerminal's own copyCombo handler); otherwise falls back to the renderer's
+    // full on-screen buffer -- `this.grid`'s right-trimmed rows for the grid renderer, xterm.js's
+    // own buffer API for the other.
+    function copyBuffer() {
+      if (!curTerm) return "";
+      var sel = window.getSelection ? window.getSelection().toString() : "";
+      if (sel) return sel;
+      if (curRenderer === "grid" && curTerm.grid) {
+        var lines = [];
+        for (var i = 0; i < curTerm.grid.length; i++) lines.push(curTerm.grid[i].text || "");
+        return lines.join("\n");
+      }
+      if (curTerm.term && curTerm.term.buffer && curTerm.term.buffer.active) {
+        var buf = curTerm.term.buffer.active, out = [];
+        for (var j = 0; j < buf.length; j++) {
+          var line = buf.getLine(j);
+          out.push(line ? line.translateToString(true) : "");
+        }
+        return out.join("\n");
+      }
+      return "";
+    }
+
+    function focus() { if (curTerm) curTerm.focus(); }
+
+    function destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      if (curTerm) { curTerm.destroy(); curTerm = null; }
+      if (wrap.parentNode) wrap.parentNode.removeChild(wrap);
+      statusCbs.length = 0; noticeCbs.length = 0; forkedCbs.length = 0;
+    }
+
+    var handle = {
+      tty: null,
+      renderer: curRenderer,
+      forked: false,
+      notice: null,
+      setRenderer: setRenderer,
+      setTheme: setTheme,
+      copyBuffer: copyBuffer,
+      focus: focus,
+      destroy: destroy,
+      onStatus: function (cb) { if (typeof cb === "function") statusCbs.push(cb); },
+      onNotice: function (cb) { if (typeof cb === "function") noticeCbs.push(cb); },
+      onForked: function (cb) { if (typeof cb === "function") forkedCbs.push(cb); }
+    };
+
+    // Resolves the server-picked renderer for a tty this call did NOT just spawn (a peeked
+    // {tty} target, or an existing {session,mode} match) -- same fallback bootStandalone's own
+    // GET /api/term/renderer path uses for a bare ?tty= link with no renderer param: grid, the
+    // safer renderer (repaint on reconnect, server-backed scrollback), not xterm, if even that
+    // route is unreachable. Skipped entirely when opts.renderer already forced a choice.
+    function resolveRenderer() {
+      if (curRenderer) return Promise.resolve(curRenderer);
+      return fetch("/api/term/renderer").then(function (r) { return r.json(); })
+        .then(function (j) { return (j && j.renderer === "xterm") ? "xterm" : "grid"; })
+        .catch(function () { return "grid"; });
+    }
+
+    function finish(tty, renderer, forked, notice, starting, spawned) {
+      if (destroyed) {
+        // Superseded/torn down while the network round trip was in flight -- see openVT's own
+        // comment on this exact race for why a freshly SPAWNED pty must be handed straight back
+        // rather than left running, viewer-less, until IDLE_TIMEOUT. `spawned` gates this: a
+        // peeked/found tty (the other two call sites below) was ALREADY running before this call
+        // and may still be viewed elsewhere (the classic overlay, another mount, the manage
+        // panel) -- closing it here would SIGKILL someone else's live terminal, not free a leak.
+        if (spawned) {
+          fetch("/api/term/close", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ tty: tty })
+          }).catch(function () { });
+        }
+        return;
+      }
+      handle.tty = tty;
+      handle.forked = !!forked;
+      handle.notice = (typeof notice === "string") ? notice : null;
+      attachRenderer(tty, renderer, starting);
+      fireForked(handle.forked);
+      if (handle.notice) fireNotice({ text: handle.notice });
+    }
+
+    function fail(msg) {
+      if (destroyed) return;
+      fireStatus(msg);
+    }
+
+    if (target && target.tty) {
+      // "Peek": attach to an already-running pty in place, no spawn -- this call never owns the
+      // pty, so a destroy() mid-resolution above just drops the response (nothing to hand back).
+      resolveRenderer().then(function (renderer) {
+        finish(target.tty, renderer, false, null, false, false);
+      });
+    } else if (target && target.session) {
+      var sid = target.session, mode = target.mode || "";
+      // Self-contained find-existing check -- see this function's own header comment for why it's
+      // not shared with openVT's identical decision. Same fetch/catch/scan shape as that one.
+      fetch("/api/term/list")
+        .then(function (r) { return r.ok ? r.json().catch(function () { return {}; }) : {}; })
+        .catch(function () { return {}; })
+        .then(function (j) {
+          var terms = (j && j.terminals) || [];
+          for (var i = 0; i < terms.length; i++) {
+            if (terms[i].session === sid && terms[i].mode === mode) return terms[i];
+          }
+          return null;
+        })
+        .then(function (existing) {
+          if (destroyed) return;
+          if (existing) {
+            resolveRenderer().then(function (renderer) {
+              finish(existing.tty, renderer, existing.forked, null, false, false);
+            });
+            return;
+          }
+          // Nothing running yet -- spawn one sized to the CONTAINER's actual rendered box, same
+          // reasoning as _openVTFresh's own probePane: ask the server for the right size instead
+          // of guessing a default and resizing after.
+          var probe = document.createElement("div");
+          probe.className = "vtpane";
+          wrap.appendChild(probe);
+          requestAnimationFrame(function () {
+            if (destroyed) { if (probe.parentNode) probe.parentNode.removeChild(probe); return; }
+            var m = computeColsRows(probe);
+            wrap.innerHTML = "";
+            fetch("/api/term/pty", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ session: sid, cols: m.cols, rows: m.rows, mode: mode })
+            }).then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; }); })
+              .then(function (res) {
+                if (!res.ok || !res.j || !res.j.tty) {
+                  if (destroyed) return;
+                  fail((res.j && res.j.error) ||
+                    (res.status === 403
+                      ? "in-browser terminal is disabled — set TRACKER_TERMINAL=1 and TRACKER_AUTH"
+                      : res.status === 429
+                        ? "terminal capacity reached"
+                        : "failed to start terminal"));
+                  return;
+                }
+                var renderer = (curRenderer) ? curRenderer : ((res.j.renderer === "xterm") ? "xterm" : "grid");
+                finish(res.j.tty, renderer, res.j.forked,
+                  (typeof res.j.notice === "string") ? res.j.notice : null, !!res.j.starting, true);
+              })
+              .catch(function (e) { fail("failed to reach the server: " + String(e)); });
+          });
+        });
+    } else {
+      fail("mountInto: target must be {session, mode} or {tty}");
+    }
+
+    return handle;
+  }
+
   window.ExtVT = { open: openVT, manage: openManager };
+  // mountInto is assigned separately, immediately after, rather than folded into the object
+  // literal above: an existing test (test_term_vt_client.py) pins that literal's exact text, so
+  // extending the object inline would break a passing assertion over a cosmetic difference. Same
+  // object, same two original entries, one more property.
+  window.ExtVT.mountInto = mountInto;
 
   // ===== render hook: participates in the normal 2s poll like every other ext module, and is
   // what genuinely puts #ext_vt to use (the modal is built as its child, not appended to

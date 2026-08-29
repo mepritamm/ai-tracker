@@ -138,6 +138,19 @@ Worth reading, especially if you expose the server over a tunnel.
 
 ---
 
+## Control Room — an alternate UI (opt-in)
+
+A second UI sits alongside the dashboard above (which is unchanged apart from one entry point). Open it from the **✦ Try the new experience** button in the classic header, or by adding `?ui=next` to the URL (`?ui=classic` switches back); either way there's one click back to classic, any time, no reload. The choice persists in `localStorage` (`tracker.ui` = `classic` | `next`). It reads the same server data over the same shared seam — no server change, no build step, no new dependency.
+
+- **Board** — the home view: a collapsible session rail down the side, a triage strip, and a board of tiles that's never more than 8 at once (pinned sessions first, then by state and recency — everything past the cap lives in the rail, not on the board).
+- **Session detail** — full-width, three columns of panels, every one collapsed by default except the conversation timeline, which merges narration and prompts into a single chat-style thread instead of two separate panels. Adds a **Links** panel and a **progress spine** — a bar across a session's todos sized by time actually spent on each (see the parity table below for where that's genuinely time-proportional).
+- **Theme** follows `prefers-color-scheme` (Light or Dark) with a persisted manual override (`tracker.theme` = `auto` | `light` | `dark`) — independent of the classic dashboard's own theme toggle.
+- **Terminal** — the same PTY plumbing as the classic dashboard in new chrome (`ExtVT.mountInto()` hosts it inline rather than a second terminal implementation). xterm.js still loads lazily, only once a terminal is actually opened.
+- **Help and Config are dialogs, not routes.** Config surfaces the real running parameters (LIVE_WINDOW, TRACKER_TERM_RENDERER, TRACKER_MAX_TERMS, TRACKER_TERMINAL, TRACKER_AUTH — shown only as set/not-set, TRACKER_TERM_APP, TRACKER_TERM_ALLOW, PORT, HOST) but they're **read-only** — there's no route to change them from the browser; env vars stay the actual source of truth.
+- **Known gaps** — stopping a running session, and switching a terminal's model/effort, are disabled here with copy explaining why: no server route exists for either yet (the classic dashboard's own switchers still work — see [Terminal](#terminal--on-by-default) above).
+
+---
+
 ## How it works
 
 Every supported tool writes an append-only session log to disk. The tracker only ever **reads** those files — there's no integration, no API key, and no network traffic.
@@ -159,6 +172,7 @@ All providers emit the **same result shape**, so the browser renders them identi
 | Pull requests — created **or** worked on | ✅ (created via `gh pr create` / MCP; worked-on = narrated about **and** in the session's own repo) | ✅ (Auggie logs no command output, so a created PR is tied to the first URL after `gh pr create`; worked-on = narrated about **and** in its own repo) | ➖ n/a |
 | Decisions & open questions | ✅ (`AskUserQuestion`) | ✅ (`ask-user` — answer from the next turn's tool result) | ➖ n/a |
 | Background agents & shells | ✅ | ➖ Auggie has no such model | ➖ n/a |
+| Progress spine (Control Room's time-proportional todo bar) | ✅ — todo `started_at`/`ended_at` join transcript `TaskUpdate` entries to the task store by id | ➖ `null` — Auggie has no equivalent join key, so segments render equal-width instead | ➖ same as Auggie |
 | Markdown rendering, incl. ` ```mermaid ` fences drawn as diagrams | ✅ | ✅ (shared renderer — one seam, both sources) | ✅ (same shared renderer) |
 | 📝 Notes — write, ⧉ copy, 📝 N badge | ✅ | ✅ | ✅ |
 | ▶ push a note into the session | ✅ live → next turn-end; idle → next prompt/resume (`Stop` + `UserPromptSubmit` + `SessionStart` hooks) | ➖ queues fine, but Auggie has no hooks to deliver it — use ⧉ copy | ➖ same — no hook, use ⧉ copy |
@@ -236,7 +250,12 @@ The repo ships Claude Code skills under [`.claude/skills/`](.claude/skills/). In
 aitracker/                     the app package (Python stdlib only): providers/, web/, server, cli
 aitracker/web/vendor/          vendored assets: xterm.js + xterm.css (MIT; default renderer, lazy-loaded)
 web assets in aitracker/web/    index.html · app.css · app.js (inlined at serve time)
+aitracker/web/ext_cr_*          Control Room (opt-in alternate UI): boot/board/detail/dialogs/term
+                               modules + ext_cr.css (design tokens) — auto-inlined like the rest
 tests/                unit tests + evals — the mandatory gate
+tests/test_page_bundle.py     runs the assembled page's bundled JS under a stub DOM in Node,
+                               catching a load-time throw in any web/*.js that would blank the
+                               whole dashboard (skips cleanly if node isn't installed)
 hooks/pre-commit               runs the gate before every commit (make hooks)
 hooks/drain-notes.py           optional Claude Code hook: delivers ▶ pushed notes (3 events)
 Makefile                       make serve / stop / check / test / hooks

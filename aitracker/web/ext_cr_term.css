@@ -1,0 +1,406 @@
+/* cr_term.css — Control Room skin for the terminal surface (doc 05-terminal-and-dialogs.md).
+ *
+ * Every selector here is scoped under `.cr` (contract rule 6) and reads colour/font tokens by
+ * their plain 01-foundations.md names (`--surface-*`, `--text-*`, `--line-*`, `--state-*`,
+ * `--fill-*`, `--shadow-*`, `--glow-*`, `--font-*`, `--radius-*`) from the sibling `cr.css` token
+ * layer — NOT an `--ads-` prefix: cr.css's own header note explains that 01-foundations.md never
+ * uses that prefix, so this file matches its real names instead of inventing one. Never a raw hex
+ * — with ONE deliberate, doc-mandated exception: the PTY pane and its docked status bar are "dark
+ * in both themes" (doc 05, "Layout"). Foundations' own Contrast-floor section confirms this is
+ * expected ("[the focus ring] must stay visible on every surface... including the dark PTY"), so
+ * that region intentionally does NOT read the live theme tokens (which flip with the Light/Dark
+ * toggle) — it reads a small frozen set of literal constants lifted verbatim from
+ * the DARK theme table in 01-foundations.md, so it stays visually "the dark theme" no matter what
+ * the rest of the app is doing. Nothing else in this file hardcodes a colour.
+ *
+ * NOTE: 01-foundations.md never defines a named "stone 7" token (05's own status-bar line says
+ * "Mono 11px on stone 7" without pointing at a var) — approximated below as the dark theme's own
+ * --surface-top (#26221C), one step lighter than --surface-inverse (#12100E), which the same doc
+ * assigns to the pane itself ("stone 8"). Both are frozen dark-theme literals, not live tokens.
+ */
+
+.cr .cr-term-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 22px;
+  background: rgba(18, 16, 14, .55);
+}
+.cr .cr-term-overlay.is-open { display: flex; }
+
+.cr .cr-term-shell {
+  display: flex;
+  flex-direction: column;
+  width: min(1240px, 100%);
+  height: min(860px, 100%);
+  background: var(--surface-raised);
+  border: 1px solid var(--line-subtle);
+  border-radius: var(--radius-md-min);
+  box-shadow: var(--shadow-overlay);
+  overflow: hidden;
+  font-family: var(--font-sans);
+  color: var(--text-primary);
+}
+
+/* ===== head: eyebrow + cwd + resume cmd  |  Config  Help  close ===== */
+.cr .cr-term-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--line-subtle);
+  background: var(--surface-top);
+}
+.cr .cr-term-head-info { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.cr .cr-term-eyebrow {
+  font: 600 10px/1 var(--font-sans);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.cr .cr-term-cwd {
+  font: 13px/1.3 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 62vw;
+}
+.cr .cr-term-resumecmd {
+  font: 11px/1.3 var(--font-mono);
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 62vw;
+}
+.cr .cr-term-resumecmd[hidden] { display: none; }
+
+.cr .cr-term-head-actions { display: flex; align-items: center; gap: 6px; flex: none; }
+.cr .cr-term-headpill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line-default);
+  background: transparent;
+  color: var(--text-secondary);
+  font: 600 11.5px/1.2 var(--font-sans);
+  cursor: pointer;
+}
+.cr .cr-term-headpill:hover { background: var(--fill-row-hover); }
+.cr .cr-term-headpill:focus-visible,
+.cr .cr-term-btn:focus-visible,
+.cr .cr-term-iconbtn:focus-visible,
+.cr .cr-term-pill:focus-visible,
+.cr .cr-term-seg button:focus-visible,
+.cr .cr-term-close:focus-visible {
+  outline: 2px solid var(--line-focus);
+  outline-offset: 2px;
+}
+.cr .cr-term-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 14px;
+  cursor: pointer;
+}
+.cr .cr-term-close:hover { background: var(--fill-row-hover); color: var(--text-primary); }
+
+/* ===== control bar — every button, nothing dropped (doc 05, "The control bar") ===== */
+.cr .cr-term-controlbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--line-subtle);
+  background: var(--surface-raised);
+}
+.cr .cr-term-group { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.cr .cr-term-divider {
+  width: 1px;
+  height: 20px;
+  background: var(--line-subtle);
+  flex: none;
+  margin: 0 2px;
+}
+.cr .cr-term-right { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+
+.cr .cr-term-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  font: 600 12px/1.3 var(--font-sans);
+  cursor: pointer;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.cr .cr-term-btn[hidden] { display: none; }
+.cr .cr-term-btn-solid {
+  background: var(--fill-action);
+  color: var(--text-on-action);
+  box-shadow: var(--shadow-raised);
+}
+.cr .cr-term-btn-solid:hover { filter: brightness(1.05); }
+.cr .cr-term-btn-outline {
+  background: transparent;
+  border-color: var(--line-default);
+  color: var(--text-primary);
+}
+.cr .cr-term-btn-outline:hover { background: var(--fill-row-hover); }
+.cr .cr-term-btn-ghost {
+  background: transparent;
+  color: var(--text-secondary);
+  padding: 6px 10px;
+}
+.cr .cr-term-btn-ghost:hover { background: var(--fill-row-hover); color: var(--text-primary); }
+.cr .cr-term-btn:disabled { opacity: .45; cursor: default; pointer-events: none; }
+
+.cr .cr-term-btn-manage { position: relative; }
+.cr .cr-term-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--state-thinking);
+  color: var(--text-on-signal);
+  font: 700 10px/1 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.cr .cr-term-badge[hidden] { display: none; }
+
+.cr .cr-term-seg {
+  display: inline-flex;
+  border: 1px solid var(--line-default);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.cr .cr-term-seg button {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font: 600 11px/1.2 var(--font-sans);
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.cr .cr-term-seg button + button { border-left: 1px solid var(--line-default); }
+.cr .cr-term-seg button[aria-pressed="true"] {
+  background: var(--fill-action);
+  color: var(--text-on-action);
+}
+.cr .cr-term-themebtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line-default);
+  background: transparent;
+  color: var(--text-secondary);
+  font: 600 11px/1.2 var(--font-sans);
+  cursor: pointer;
+}
+.cr .cr-term-themebtn:hover { background: var(--fill-row-hover); }
+
+/* emoji tinting recipe (01-foundations.md "Emoji tinting"), renamed cr-emo* for this namespace */
+.cr .cr-emo   { filter: saturate(.7) contrast(1.05); font-style: normal; }
+.cr .cr-emo-a { filter: saturate(1.05) hue-rotate(-6deg); font-style: normal; }
+.cr .cr-emo-f { filter: saturate(.85) hue-rotate(-12deg) brightness(.95); font-style: normal; }
+.cr .cr-emo-d { filter: saturate(.62) hue-rotate(-18deg) brightness(.82); font-style: normal; }
+.cr .cr-emo-n { filter: saturate(.8) hue-rotate(-8deg) brightness(.95); font-style: normal; }
+.cr.is-dark .cr-emo   { filter: saturate(.8) contrast(1.05) brightness(1.15); }
+.cr.is-dark .cr-emo-a { filter: saturate(1.1) hue-rotate(-6deg) brightness(1.15); }
+.cr.is-dark .cr-emo-f { filter: saturate(.95) hue-rotate(-12deg) brightness(1.18); }
+.cr.is-dark .cr-emo-d { filter: saturate(.75) hue-rotate(-18deg) brightness(1.2); }
+.cr.is-dark .cr-emo-n { filter: saturate(.9) hue-rotate(-8deg) brightness(1.2); }
+
+/* ===== fork / notice banner (conditional) — themed chrome, NOT forced-dark: it sits above the
+   pane, not inside it (doc 05, "Layout" + "The fork notice"). Wheat = --surface-agent-quiet. */
+.cr .cr-term-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 20px;
+  background: var(--surface-agent-quiet);
+  border-bottom: 1px solid var(--line-agent);
+  color: var(--text-thinking);
+  font: 500 12.5px/1.4 var(--font-sans);
+}
+.cr .cr-term-notice[hidden] { display: none; }
+.cr .cr-term-notice-text { flex: 1; min-width: 0; }
+.cr .cr-term-notice-link {
+  flex: none;
+  border: none;
+  background: transparent;
+  color: var(--text-link);
+  font: 600 12px/1 var(--font-sans);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* ===== PTY pane — DARK IN BOTH THEMES (doc 05: "stone 8"/"stone 7"). Frozen literals, see file
+   header note; deliberately not the live theme tokens. ===== */
+.cr .cr-term-paneframe {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: #12100E; /* dark theme's own --surface-inverse, frozen */
+}
+.cr .cr-term-pane {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  background: #12100E;
+  color: #FBFAF7; /* dark theme's own --text-primary, frozen */
+  font: 12.5px/1.4 var(--font-mono);
+  overflow: hidden;
+}
+.cr .cr-term-pane-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  text-align: center;
+  color: #A89C8B; /* dark theme's own --text-muted, frozen */
+  font: 12.5px/1.5 var(--font-mono);
+}
+.cr .cr-term-pane-blank {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px 20px;
+  text-align: center;
+  color: #A89C8B;
+  font: 11.5px/1.5 var(--font-sans);
+  background: rgba(18, 16, 14, .82);
+  pointer-events: none;
+}
+.cr .cr-term-pane-blank[hidden] { display: none; }
+/* the mounted engine (once the mountInto seam lands) is expected to size to this box */
+.cr .cr-term-pane > :not(.cr-term-pane-placeholder):not(.cr-term-pane-blank) {
+  position: absolute;
+  inset: 0;
+}
+
+/* ===== status bar — mono 11px, frozen dark, docked to the bottom of the pane ===== */
+.cr .cr-term-statusbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 14px;
+  background: #26221C; /* dark theme's --surface-top, frozen — this file's "stone 7" */
+  border-top: 1px solid #4A4237; /* dark theme's --line-subtle, frozen */
+  font: 11px/1.3 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: #D8CFC2; /* dark theme's --text-secondary, frozen */
+  flex: none;
+}
+.cr .cr-term-statusbar[hidden] { display: none; }
+.cr .cr-term-ctxreadout { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cr .cr-term-ctxused { color: #FBFAF7; }
+.cr .cr-term-ctxcum { color: #A89C8B; margin-left: 8px; }
+.cr .cr-term-ctxbarwrap {
+  display: inline-block;
+  width: 48px;
+  height: 5px;
+  border-radius: 999px;
+  background: #4A4237;
+  overflow: hidden;
+  margin: 0 6px;
+  vertical-align: middle;
+}
+.cr .cr-term-ctxbarfill { display: block; height: 100%; background: #E5CB79; }
+.cr .cr-term-status-right { display: flex; align-items: center; gap: 6px; flex: none; }
+
+.cr .cr-term-pill {
+  border: none;
+  border-radius: 999px;
+  padding: 3px 9px;
+  font: 700 10.5px/1.3 var(--font-mono);
+  cursor: pointer;
+}
+.cr .cr-term-pill[hidden] { display: none; }
+.cr .cr-term-pill-model { background: #FBFAF7; color: #1E1B17; } /* doc: "white pill", frozen */
+.cr .cr-term-pill-effort {
+  background: transparent;
+  border: 1px solid #6F6455;
+  color: #D8CFC2;
+} /* doc: "ghost" */
+.cr .cr-term-iconbtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid #6F6455;
+  background: transparent;
+  color: #D8CFC2;
+  border-radius: var(--radius-sm);
+  padding: 3px 8px;
+  font: 600 10.5px/1.3 var(--font-mono);
+  cursor: pointer;
+}
+.cr .cr-term-iconbtn:hover { background: rgba(255,255,255,.06); }
+.cr .cr-term-iconbtn.cr-term-kill {
+  color: #E0A491; /* dark theme's --text-failed, frozen: "brick-tinted" per doc */
+  border-color: #7F2B1A; /* dark theme's --line-failed, frozen */
+}
+.cr .cr-term-iconbtn.cr-term-kill:hover { background: rgba(210,115,90,.12); }
+.cr .cr-term-iconbtn:disabled { opacity: .4; cursor: default; }
+
+/* ===== footnote + dialog triggers ===== */
+.cr .cr-term-foot {
+  padding: 6px 20px;
+  border-top: 1px solid var(--line-subtle);
+  background: var(--surface-top);
+  font: 11px/1.4 var(--font-sans);
+  color: var(--text-muted);
+}
+.cr .cr-term-footnote { min-width: 0; }
+
+/* ===== toast — non-blocking status line for actions that used to use alert() ===== */
+.cr .cr-term-toast {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  max-width: 80%;
+  padding: 8px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-failed);
+  color: var(--text-failed);
+  border: 1px solid var(--line-failed);
+  font: 600 12px/1.4 var(--font-sans);
+  box-shadow: var(--shadow-raised);
+  z-index: 5;
+}
+.cr .cr-term-toast[hidden] { display: none; }
+
+@media (max-width: 760px) {
+  .cr .cr-term-overlay { padding: 0; }
+  .cr .cr-term-shell { width: 100%; height: 100%; border-radius: 0; }
+  .cr .cr-term-cwd, .cr .cr-term-resumecmd { max-width: 44vw; }
+}

@@ -1,7 +1,7 @@
 import glob, json, os, re, time
 from ..config import EDIT_TOOLS, LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window, todo_summary
 from ..overview import build_overview
 from ..store import load_titles, load_tasks, load_notes
 from .base import Provider
@@ -266,6 +266,13 @@ def list_sessions(limit=200):
             if cands:
                 parent = _pick_parent(sm["first"], cands)
         mt, bg = _mtime_and_bg(f)
+        # load_tasks() is a listdir + a handful of small JSON reads under ~/.claude/tasks/<sid>/
+        # (0 cost via a single failed listdir for the many sessions with no task store at all;
+        # measured ~5 files/session, ~170 total across this machine's whole history) — cheap
+        # enough for every /api/list poll, unlike a full parse_session() re-read of the jsonl.
+        # Sessions that predate the task store (still in-transcript TodoWrite-only) get 0/0/None
+        # here: that would need a full transcript parse to recover, which the list path must not do.
+        todo_total, todo_done, todo_current = todo_summary(load_tasks(sid))
         out.append({
             "id": sid,
             "project": os.path.basename(sm["cwd"]) if sm["cwd"] else os.path.basename(os.path.dirname(f)),
@@ -280,6 +287,7 @@ def list_sessions(limit=200):
             "waiting": sm["waiting"],                # unanswered AskUserQuestion -> ⏳ sidebar highlight
             "ended": sm["ended"],                    # last turn was the assistant finishing -> ✅ completed
             "mtime": mt,  # counts background-agent activity too
+            "todo_total": todo_total, "todo_done": todo_done, "todo_current": todo_current,
         })
     return out
 
@@ -776,6 +784,14 @@ def parse_session(path):
     # ponytail: full re-parse per poll. Fine to a few MB; switch to
     # offset-tailing if session files ever get huge.
     todos = []
+    task_times = {}        # taskId (str, == the task-store file's stem) -> {"started": ts, "ended": ts}
+                            # filled from TaskUpdate tool calls below — the transcript is already
+                            # being walked line-by-line for everything else, so this costs nothing
+                            # extra to collect. Confirmed against a real transcript: TaskUpdate's
+                            # own `input.taskId` is the exact string load_tasks() now stamps as
+                            # each todo's "id" (both trace back to the task-store file's stem, e.g.
+                            # taskId "20" <-> 20.json). "started" = first time it went in_progress,
+                            # "ended" = last time it went completed.
     files = {}            # path -> {ops, last, created}
     reads = {}            # path -> last ts
     cmds = []             # bash commands, each {id, t, cmd, kind}
@@ -891,6 +907,14 @@ def parse_session(path):
                             pr_states[str(pn)] = "merged"
                     if name == "TodoWrite":
                         todos = inp.get("todos", todos)
+                    elif name == "TaskUpdate":
+                        tid, st = str(inp.get("taskId") or ""), (inp.get("status") or "").lower()
+                        if tid and st in ("in_progress", "completed"):
+                            tt = task_times.setdefault(tid, {"started": None, "ended": None})
+                            if st == "in_progress" and tt["started"] is None:
+                                tt["started"] = ts             # first activation only
+                            elif st == "completed":
+                                tt["ended"] = ts               # latest completion wins
                     elif name == "Write":
                         fp = inp.get("file_path")
                         if fp:
@@ -939,6 +963,19 @@ def parse_session(path):
     # list with stray non-dict entries; keep only dict todos so one bad session can't
     # crash the parse (which closed the socket -> a 502 through a tunnel on every poll).
     todos = [t for t in todos if isinstance(t, dict)] if isinstance(todos, list) else []
+    # Time-proportional progress-spine segments (per todo): started_at/ended_at, epoch seconds,
+    # from the TaskUpdate transitions collected above -- joined by the task-store id load_tasks()
+    # now stamps on each todo. Claude Code prunes ~/.claude/tasks/<sid>/*.json after roughly two
+    # days, so load_tasks() returns nothing for most older sessions -- both the todo list and its
+    # timings go empty then, even though the transcript still has the full TaskCreate/TaskUpdate
+    # history; this code path keys off the task store, not the transcript. ended_at is only
+    # trusted while the todo's OWN current status still says completed, so a task that was
+    # reopened after an earlier completion can't show a stale "ended" time for work that isn't
+    # actually done.
+    for t in todos:
+        tt = task_times.get(t.get("id") or "")
+        t["started_at"] = _ts_epoch(tt["started"]) if tt and tt["started"] and t.get("status") in ("in_progress", "completed") else None
+        t["ended_at"] = _ts_epoch(tt["ended"]) if tt and tt["ended"] and t.get("status") == "completed" else None
     done_todos = [t for t in todos if t.get("status") == "completed"]
     agents_bg, newest_agent, agent_files, agent_prs, agent_pr_states = parse_agents(path)
     # merge PRs a background agent generated into the session's prs (created stickies, agent-flagged),

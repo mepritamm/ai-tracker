@@ -420,6 +420,10 @@ def _run():
     assert len(al) == 1 and al[0]["id"] == "auggie:sess1", al
     # real IDE cwd wins over the indexed-root/changed-file fallback (matches Claude's per-session cwd)
     assert al[0]["source"] == "auggie" and al[0]["project"] == "dw-stack" and al[0]["cwd"] == "/work/dw-stack", al
+    # the todo summary rides the session-LIST shape too (todo_total/todo_done/todo_current) — a
+    # compact progress tick for the sidebar, off root1/s1(completed)/s2(in_progress) above, without
+    # a full detail parse. (Claude's half of this is asserted below, once the task store is set up.)
+    assert (al[0]["todo_total"], al[0]["todo_done"], al[0]["todo_current"]) == (2, 1, "step two"), al[0]
     assert al[0]["title"] == "List Home Dir", al                       # customTitle wins
     pa = parse_auggie("sess1")
     assert pa and pa["counts"]["done"] == 1 and pa["counts"]["todos"] == 2, pa   # todos via rootTaskUuid
@@ -493,6 +497,26 @@ def _run():
     assert all_sessions()[0].get("open_flags") == 0, "no flags file -> every session still reports 0"
     _AUGGIE_LIST_CACHE.clear()
 
+    # pinned/open_flags/note_count must ALSO reach the DETAIL dict (registry.parse_any), not just
+    # the list (all_sessions above) -- same store.py helpers, same shared seam, one implementation
+    # covering every provider (the detail header's pinned pill / 🚩 count silently hid without this).
+    _pins_snap, _notes_snap, _flags_snap2 = config.PINS_FILE, config.NOTES_FILE, config.FLAGS_FILE
+    config.PINS_FILE = tempfile.mktemp(suffix=".json")
+    config.NOTES_FILE = tempfile.mktemp(suffix=".json")
+    config.FLAGS_FILE = tempfile.mktemp(suffix=".json")
+    _save_json(config.PINS_FILE, ["s_wait", "auggie:sess1"])
+    save_notes({"s_wait": [{"text": "a note", "pushed": False}]})
+    save_flags([{"id": 1, "session": "s_wait", "note": "open one", "resolved": False},
+                {"id": 2, "session": "auggie:sess1", "note": "auggie gap", "resolved": False},
+                {"id": 3, "session": "auggie:sess1", "note": "old", "resolved": True}])
+    dw = parse_any("s_wait")
+    assert (dw["pinned"], dw["open_flags"], dw["note_count"]) == (True, 1, 1), dw
+    da = parse_any("auggie:sess1")
+    assert (da["pinned"], da["open_flags"], da["note_count"]) == (True, 1, 0), da
+    os.unlink(config.PINS_FILE); os.unlink(config.NOTES_FILE); os.unlink(config.FLAGS_FILE)
+    config.PINS_FILE, config.NOTES_FILE, config.FLAGS_FILE = _pins_snap, _notes_snap, _flags_snap2
+    _AUGGIE_LIST_CACHE.clear()
+
     # _git_branch reads a normal repo and a worktree (Auggie's git branch source)
     gdir = tempfile.mkdtemp()
     os.makedirs(os.path.join(gdir, ".git"))
@@ -536,6 +560,65 @@ def _run():
     assert tl[0]["status"] == "completed" and tl[1]["status"] == "in_progress", tl
     assert tl[1]["desc"] == "do it", tl
     assert load_tasks("missing") == []
+    # ...and it rides the session-LIST shape too (todo_total/todo_done/todo_current), read via the
+    # SAME cheap load_tasks() call above — not a full transcript re-parse — for a sidebar progress
+    # tick. (Auggie's half of this capability is asserted above, off root1/s1/s2.)
+    d5 = os.path.join(pdir, "-x-sess-x"); os.makedirs(d5)
+    _mk(d5, "sess-x.jsonl", "/x", "cli", "2026-06-01T09:00:00Z", "do the thing")
+    lst = {s["id"]: s for s in list_sessions()}
+    assert (lst["sess-x"]["todo_total"], lst["sess-x"]["todo_done"], lst["sess-x"]["todo_current"]) == (2, 1, "Second"), lst["sess-x"]
+
+    # time-proportional progress-spine segments: started_at/ended_at per todo (epoch seconds),
+    # reconstructed from TaskUpdate tool calls already being walked in parse_session's one
+    # transcript pass — no extra file I/O. Joined onto load_tasks()'s todos above (sess-x's
+    # "1.json"/"2.json") by taskId <-> the task-store file's own stem, confirmed against a real
+    # ~/.claude/tasks/<sid>/<n>.json + its owning transcript on this machine.
+    with open(os.path.join(d5, "sess-x.jsonl"), "a") as fh:
+        for r in [
+            {"type": "assistant", "timestamp": "2026-06-01T09:10:00.000Z", "message": {"content": [
+                {"type": "tool_use", "name": "TaskUpdate", "input": {"taskId": "1", "status": "in_progress"}}]}},
+            {"type": "assistant", "timestamp": "2026-06-01T09:20:00.000Z", "message": {"content": [
+                {"type": "tool_use", "name": "TaskUpdate", "input": {"taskId": "1", "status": "completed"}}]}},
+            {"type": "assistant", "timestamp": "2026-06-01T09:25:00.000Z", "message": {"content": [
+                {"type": "tool_use", "name": "TaskUpdate", "input": {"taskId": "2", "status": "in_progress"}}]}},
+        ]:
+            fh.write(json.dumps(r) + "\n")
+    dtb = parse_session(os.path.join(d5, "sess-x.jsonl"))
+    by_id = {t["id"]: t for t in dtb["todos"]}
+    assert by_id["1"]["status"] == "completed", by_id["1"]
+    assert by_id["1"]["started_at"] == _ts_epoch("2026-06-01T09:10:00.000Z"), by_id["1"]
+    assert by_id["1"]["ended_at"] == _ts_epoch("2026-06-01T09:20:00.000Z"), by_id["1"]
+    assert by_id["2"]["status"] == "in_progress", by_id["2"]
+    assert by_id["2"]["started_at"] == _ts_epoch("2026-06-01T09:25:00.000Z"), by_id["2"]
+    assert by_id["2"]["ended_at"] is None, "still in_progress -> no fabricated ended_at"
+    # Auggie/Augment-ext have no reliable join key for this (their in-session task ids don't
+    # match the task-storage file's uuid — see auggie.py's _auggie_resolve) -- they emit the
+    # SAME two keys, honestly null, never a guess. (`pa` == parse_auggie("sess1") from above.)
+    assert all(t["started_at"] is None and t["ended_at"] is None for t in pa["todos"]), pa["todos"]
+
+    # Augment-ext (VSCode/Cursor extension) rides the SAME todo_total/todo_done/todo_current
+    # session-list capability as Claude/Auggie above, off its own task-storage subTasks tree --
+    # and, like Auggie, has no reliable join key for started_at/ended_at, so both come back
+    # honestly None rather than a guess (see augment_ext.py's _resolve_subtasks).
+    from aitracker.providers.augment_ext import AugmentVscodeProvider
+    config.VSCODE_WS_ROOT = tempfile.mkdtemp()
+    ext_ws = os.path.join(config.VSCODE_WS_ROOT, "wshash-ext")
+    ext_tasks = os.path.join(ext_ws, "Augment.vscode-augment", "augment-user-assets", "task-storage", "tasks")
+    os.makedirs(ext_tasks)
+    with open(os.path.join(ext_ws, "workspace.json"), "w") as fh:
+        json.dump({"folder": "file:///x/ext-proj"}, fh)
+    def _etask(u, **kw):
+        with open(os.path.join(ext_tasks, u + ".json"), "w") as fh:
+            json.dump({"uuid": u, **kw}, fh)
+    _etask("root", name="Current Task List", subTasks=["a", "b"])
+    _etask("a", name="add helper", state="COMPLETE")
+    _etask("b", name="wire tests", state="IN_PROGRESS")
+    ep = AugmentVscodeProvider()
+    erows = {r["id"]: r for r in ep.list()}
+    eroot = erows["augment-vscode:wshash-ext:root"]
+    assert (eroot["todo_total"], eroot["todo_done"], eroot["todo_current"]) == (2, 1, "wire tests"), eroot
+    ed = ep.parse("augment-vscode:wshash-ext:root")
+    assert ed["todos"] and all(t["started_at"] is None and t["ended_at"] is None for t in ed["todos"]), ed["todos"]
 
     # flags persistence round-trip
     config.FLAGS_FILE = tempfile.mktemp(suffix=".json")

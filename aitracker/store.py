@@ -67,7 +67,13 @@ def load_tasks(sid):
         out.append({"content": subj,
                     "status": _TSTATUS.get((t.get("status") or "").lower(), "pending"),
                     "activeForm": t.get("activeForm") or subj,
-                    "desc": t.get("description") or ""})
+                    "desc": t.get("description") or "",
+                    # the file's own stem == the taskId a TaskUpdate tool call names (confirmed
+                    # against real ~/.claude/tasks/<sid>/<n>.json files: {"id": "20", ...} lives
+                    # in "20.json"), so parse_session can join transcript-derived started_at/
+                    # ended_at onto the matching todo by this id. Auggie has no equivalent join
+                    # key (see providers/claude.py's timing comment), so this key is Claude-only.
+                    "id": f[:-5]})
     return out
 
 

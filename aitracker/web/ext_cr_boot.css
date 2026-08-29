@@ -1,0 +1,173 @@
+/* ext_cr_boot.css — Control Room bootstrap: the opt-in entry button (classic
+ * palette) and the minimal shell plumbing ext_cr_boot.js needs (view-container
+ * show/hide, an honest placeholder, and the first-run panel).
+ *
+ * IMPORTANT (found while wiring the real integration, not assumed up front):
+ * cr_board.js's own CR.board.mount(rootEl, ctx) builds a COMPLETE, self-
+ * sufficient shell — rail + top bar (back button, destination pills, flag
+ * count, bell, config/help pills, theme control, new-session button) — fully
+ * styled by cr_board.css (soon ext_cr_board.css) under `.tracker-next .cr-*`
+ * selectors. This file therefore does NOT build or style a second top bar;
+ * doing so would fork a parallel implementation of the same capability
+ * (conventions.md rule 4). #cr-view-board below is just the empty slot
+ * CR.board.mount() is handed.
+ *
+ * Token source: `.tracker-next` / `.tracker-next.is-dark` (cr.css, soon
+ * ext_cr.css) defines every --surface-*/--text-*/--line-*/--state-*/--fill-*/
+ * --shadow-*/--font-* custom property from 01-foundations.md. No `--ads-*`
+ * prefix exists anywhere in the doc or the sibling token file, so this file
+ * uses the doc's real token names (matches ext_cr.css's own note on the
+ * point). #nextRoot carries both `tracker-next` (token scope) and `cr`
+ * (the sibling stylesheets' structural hook).
+ */
+
+/* ============================================================
+   ONE rule touching the classic dashboard: the entry button.
+   Scoped tightly to #tryNext so it cannot affect any existing selector.
+   Styled in the CLASSIC palette per doc (literal colours, not the new
+   tokens) — it lives in the old UI, not the new one.
+   ============================================================ */
+header.hd {
+  /* Additive only: the classic header has no existing `position` declaration
+     (verified in app.css) and no descendant relies on it being static, so this
+     only gives #tryNext something to anchor to. Does not modify app.css. */
+  position: relative;
+}
+#tryNext.tn-entry {
+  position: absolute;
+  top: 22px;
+  right: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 13px;
+  border-radius: 20px;
+  background: linear-gradient(135deg, #3a2a0f, #1a1206);
+  border: 1px solid #d9a441;
+  font: 600 11.5px/1 'Source Sans 3', sans-serif;
+  color: #f5b443;
+  cursor: pointer;
+  z-index: 5;
+}
+#tryNext.tn-entry:hover { filter: brightness(1.12); }
+#tryNext.tn-entry:focus-visible { outline: 2px solid #f5b443; outline-offset: 2px; }
+@media (max-width: 720px) {
+  #tryNext.tn-entry { position: static; margin: 10px 0 0; }
+}
+
+/* ============================================================
+   Shell root — #nextRoot (.tracker-next.cr)
+   ============================================================ */
+#nextRoot {
+  display: flex;
+  overflow: hidden;
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: var(--surface-page);
+  color: var(--text-primary);
+  font-family: var(--font-sans, system-ui, -apple-system, sans-serif);
+}
+/* Higher-specificity override so the `hidden` attribute always wins regardless
+   of stylesheet order (an ID selector alone would out-rank the UA [hidden]
+   rule and break the toggle). */
+#nextRoot[hidden] { display: none; }
+
+/* The two view slots ext_cr_boot.js's ctx.go('board' | 'detail', id) toggles.
+   Each owning module (CR.board / CR.detail) fills its own slot completely,
+   including that view's own internal layout — this file only sizes the slot. */
+.cr-view {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.cr-view[hidden] { display: none; }
+
+/* Shown only when a CR.* module is missing or its mount() throws — an honest
+   placeholder, never a blank screen or a thrown error. */
+.cr-placeholder {
+  margin: 24px;
+  padding: 14px 16px;
+  border: 1px dashed var(--line-default);
+  border-radius: 8px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+/* ============================================================
+   First-run panel (decision 5 — "The opt-in entry")
+   Appended to <body> (not inside #nextRoot, which is still hidden at this
+   point — classic mode hasn't switched yet), so it carries its own
+   `.tracker-next[.is-dark]` scope for token resolution.
+   ============================================================ */
+.cr-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(20, 16, 10, .45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  font-family: var(--font-sans, system-ui, -apple-system, sans-serif);
+}
+.cr-scrim[hidden] { display: none; }
+.cr-firstrun {
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  border-radius: 10px;
+  box-shadow: var(--shadow-overlay);
+  max-width: 720px;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  overflow: hidden;
+}
+.cr-firstrun-preview {
+  background: var(--surface-page);
+  padding: 26px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  justify-content: center;
+}
+.cr-firstrun-tile {
+  height: 34px;
+  border-radius: 8px;
+  background: var(--surface-raised);
+  border: 1px solid var(--line-agent);
+  box-shadow: var(--shadow-raised);
+}
+.cr-firstrun-tile.is-wide { grid-column: span 2; }
+.cr-firstrun-tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.cr-firstrun-copy { padding: 26px 28px; display: flex; flex-direction: column; gap: 12px; }
+.cr-firstrun-copy h2 {
+  font: 400 22px/1.2 var(--font-serif, ui-serif, Georgia, serif);
+  letter-spacing: -.02em;
+  margin: 0;
+}
+.cr-firstrun-copy p { margin: 0; font-size: 13px; line-height: 1.55; color: var(--text-secondary); }
+.cr-firstrun-checks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.cr-firstrun-checks li { font-size: 12.5px; color: var(--text-secondary); display: flex; gap: 8px; align-items: flex-start; }
+.cr-firstrun-checks li svg { flex: none; width: 15px; height: 15px; color: var(--state-done); margin-top: 1px; }
+.cr-firstrun-actions { display: flex; gap: 10px; margin-top: 6px; }
+.cr-firstrun-actions button {
+  border-radius: 8px;
+  font: 600 12.5px/1 var(--font-sans, sans-serif);
+  padding: 10px 16px;
+  cursor: pointer;
+}
+.cr-firstrun-open { border: none; background: var(--fill-action); color: var(--text-on-action); }
+.cr-firstrun-skip { border: 1px solid var(--line-default); background: transparent; color: var(--text-secondary); }
+.cr-firstrun-foot { font-size: 11px; color: var(--text-muted); margin: 0; }
+.cr-firstrun-open:focus-visible,
+.cr-firstrun-skip:focus-visible {
+  outline: 2px solid var(--line-focus);
+  outline-offset: 2px;
+}
+@media (max-width: 640px) {
+  .cr-firstrun { grid-template-columns: 1fr; }
+  .cr-firstrun-preview { display: none; }
+}

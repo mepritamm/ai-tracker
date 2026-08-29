@@ -1,0 +1,311 @@
+/* Control Room — foundations. Design tokens from 01-foundations.md. */
+
+/*
+ * Scope root: .tracker-next (named explicitly by the doc's "Scoping" section —
+ * NOT the generic `.cr` fallback). The classic dashboard's bare `:root` is left
+ * untouched; nothing in this file styles bare `body`, a bare element selector,
+ * or unscoped `:root`.
+ *
+ * Theme mechanism: the doc prescribes a JS-driven CLASS TOGGLE, not a
+ * `prefers-color-scheme` media query or a `[data-theme]` attribute:
+ *   - `.tracker-next`            → light tokens (also the default/fallback)
+ *   - `.tracker-next.is-dark`    → dark token overrides
+ * `resolveTheme()`/`applyTheme()` (doc "Theme resolution (decision 3)") read
+ * `localStorage['tracker.theme']` ('auto' | 'light' | 'dark') and
+ * `matchMedia('(prefers-color-scheme: dark)')`, then toggle `.is-dark` on the
+ * `.tracker-next` root — including live, on a `change` listener, with no
+ * reload. That JS is out of scope for this foundations file (component/app
+ * wiring); this file only needs to define what each class sets.
+ * NOTE: no `@media (prefers-color-scheme: dark)` block and no `[data-theme]`
+ * selector are used here — the doc's own mechanism supersedes the generic
+ * fallback shape, per "if it prescribes a specific mechanism, follow the doc."
+ *
+ * NOTE: the brief asked for an `--ads-*` custom-property layer. 01-foundations.md
+ * does not use an `--ads-` prefix anywhere — every token is named plainly
+ * (`--surface-*`, `--text-*`, `--line-*`, `--state-*`, `--fill-*`, `--shadow-*`,
+ * `--glow-*`, `--font-*`). Reproducing the doc exactly (per this task's own
+ * "reproduce exact values, don't invent" rule) means keeping the doc's real
+ * names rather than inventing an `--ads-` prefix that appears nowhere in the
+ * source of truth. New tokens added below for the type/spacing/radii/motion
+ * scales (which the doc gives as prose/tables, not as a fenced `--token` list)
+ * follow the doc's own naming style (`--fs-*`, `--lh-*`, `--fw-*`, `--ls-*`,
+ * `--space-*`, `--gap-*`, `--radius-*`, `--motion-*`) for consistency.
+ */
+
+/* ============================================================
+   LIGHT THEME — color / material tokens (default on .tracker-next)
+   ============================================================ */
+.tracker-next {
+  /* surfaces (15) */
+  --surface-page: linear-gradient(180deg, #F1EEE0, #DFEAEC);
+  --surface-raised: #FFFFFF;
+  --surface-top: #FBFAF7;
+  --surface-sunken: #F4F1E8;
+  --surface-trace: #F4F1E8;
+  --surface-note: #F7F4EA;
+  --surface-provenance: #EDF2F3;
+  --surface-inverse: #1E1B17;
+  --surface-agent-quiet: #FBF3DC;
+  --surface-agent-active: linear-gradient(160deg, #FBF3DC, #FFFFFF 55%, #EDF2F3);
+  --surface-awaiting: #FDF0E4;
+  --surface-failed: #FBEAE5;
+  --surface-done: #EDF3EE;
+  --surface-flagged: #FBEEE7;
+  --surface-signal-fill: #F5DE9B;
+
+  /* ink (11) */
+  --text-primary: #1E1B17;
+  --text-secondary: #4A4237;
+  --text-muted: #877866;
+  --text-link: #3B5747;
+  --text-thinking: #8A6D14;
+  --text-awaiting: #9A4F19;
+  --text-failed: #8A2F1B;
+  --text-flagged: #7D3A28;
+  --text-agent: #6F6455;
+  --text-on-action: #FBFAF7;
+  --text-on-signal: #1E1B17;
+
+  /* lines (9) */
+  --line-subtle: #E7E2D5;
+  --line-default: #CFC7B7;
+  --line-strong: #A89C8B;
+  --line-agent: #D9B855;
+  --line-awaiting: #E8B98A;
+  --line-failed: #E0A491;
+  --line-done: #B9CBBF;
+  --line-flagged: #E0B49F;
+  --line-focus: #3B5747;
+
+  /* state dots (6) */
+  --state-thinking: #D9B855;
+  --state-awaiting: #E58F3C;
+  --state-done: #3B5747;
+  --state-failed: #C0553A;
+  --state-flagged: #C27950;
+  --state-idle: #A89C8B;
+
+  /* fills (2) */
+  --fill-action: linear-gradient(180deg, #3B5747, #2E4438);
+  --fill-row-hover: rgba(0,0,0,.04);
+
+  /* material: shadow + glow (4) */
+  --shadow-raised: 1px 2px 5px rgba(30,27,23,.10);
+  --shadow-overlay: 2px 10px 30px rgba(30,27,23,.18);
+  --glow-agent: 0 0 0 1px rgba(217,184,85,.35), 0 2px 14px rgba(217,184,85,.28);
+  --glow-agent-soft: 0 0 10px rgba(217,184,85,.20);
+
+  /* ---- typography stacks (3) ---- */
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-serif: 'Newsreader', ui-serif, Georgia, serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, Menlo, monospace;
+
+  /*
+   * ---- type scale ----
+   * The doc gives each role as a RANGE ("Scale as used" table), not a single
+   * fixed value. Per "don't invent values," both range endpoints are exposed
+   * verbatim as -min/-max tokens rather than fabricating a midpoint; a
+   * component can clamp() between them or just pick one end.
+   */
+
+  /* page title (detail): 29–32px / 1.15 / 400 serif, letter-spacing -.02em */
+  --fs-page-title-min: 29px;
+  --fs-page-title-max: 32px;
+  --lh-page-title: 1.15;
+  --fw-page-title: 400;
+  --ls-page-title: -.02em;
+
+  /* triage count: 33–40px / 1 / 400 serif, tabular nums, letter-spacing -.03em */
+  --fs-triage-count-min: 33px;
+  --fs-triage-count-max: 40px;
+  --lh-triage-count: 1;
+  --fw-triage-count: 400;
+  --ls-triage-count: -.03em;
+
+  /* section head (h2): 25–28px / 1.2 / 400 serif */
+  --fs-h2-min: 25px;
+  --fs-h2-max: 28px;
+  --lh-h2: 1.2;
+  --fw-h2: 400;
+
+  /* tile title: 14–16px / 1.3 / 600 sans */
+  --fs-tile-title-min: 14px;
+  --fs-tile-title-max: 16px;
+  --lh-tile-title: 1.3;
+  --fw-tile-title: 600;
+
+  /* body: 13–14px / 1.5–1.6 / 400 sans */
+  --fs-body-min: 13px;
+  --fs-body-max: 14px;
+  --lh-body-min: 1.5;
+  --lh-body-max: 1.6;
+  --fw-body: 400;
+
+  /* row / control: 12–12.5px / 1.25–1.4 / 400–600 sans */
+  --fs-row-min: 12px;
+  --fs-row-max: 12.5px;
+  --lh-row-min: 1.25;
+  --lh-row-max: 1.4;
+  --fw-row-min: 400;
+  --fw-row-max: 600;
+
+  /* eyebrow / label: 9.5–11px / 1 / 600 sans, letter-spacing .06–.14em, uppercase */
+  --fs-eyebrow-min: 9.5px;
+  --fs-eyebrow-max: 11px;
+  --lh-eyebrow: 1;
+  --fw-eyebrow: 600;
+  --ls-eyebrow-min: .06em;
+  --ls-eyebrow-max: .14em;
+
+  /* machine trace: 10–12px / 1.5 / 400 mono, tabular nums */
+  --fs-trace-min: 10px;
+  --fs-trace-max: 12px;
+  --lh-trace: 1.5;
+  --fw-trace: 400;
+
+  /* absolute floor — 10px, mono metadata only */
+  --fs-floor: 10px;
+
+  /* ---- spacing scale (component-scoped, not a utility scale) ---- */
+  --space-page-x-min: 22px;
+  --space-page-x-max: 34px;
+  --space-page-y-min: 16px;
+  --space-page-y-max: 30px;
+  --space-panel-min: 12px;
+  --space-panel-max: 16px;
+  --gap-rail: 3px;              /* rail rows */
+  --gap-row-min: 6px;           /* inside a row */
+  --gap-row-max: 8px;
+  --gap-panel-min: 11px;        /* between panels */
+  --gap-panel-max: 16px;
+  --gap-section-min: 20px;      /* between columns/sections */
+  --gap-section-max: 26px;
+
+  /* ---- radii ---- */
+  --radius-sm: 4px;             /* small chips and rows */
+  --radius-md-min: 8px;         /* panels and tiles */
+  --radius-md-max: 10px;
+  --radius-pill: 999px;
+  --radius-none: 0;             /* never used here — kept for completeness per doc */
+
+  /* ---- motion ---- */
+  /* The only motion value the doc specifies: the working-dot pulse duration.
+     No named easing curve is given beyond the keyframe's own 0%/70%/100%
+     stops (default timing-function applies); the actual @keyframes/.tn-dot
+     rule is component CSS, not a foundations token, and is left for later. */
+  --motion-pulse-duration: 2.4s;
+}
+
+/* ============================================================
+   DARK THEME — color / material token overrides
+   Applied via JS-toggled class per "Theme resolution (decision 3)".
+   Same token names, re-pointed at the dark end of the same ramps.
+   This is not an inversion and not a filter.
+   ============================================================ */
+.tracker-next.is-dark {
+  /* surfaces (15) */
+  --surface-page: linear-gradient(180deg, #1E1B17, #243235);
+  --surface-raised: #302A23;
+  --surface-top: #26221C;
+  --surface-sunken: #1E1B17;
+  --surface-trace: #1E1B17;
+  --surface-note: #2A1E15;
+  --surface-provenance: #243235;
+  --surface-inverse: #12100E;
+  --surface-agent-quiet: #52400F;
+  --surface-agent-active: linear-gradient(160deg, #52400F, #302A23 55%, #24352F);
+  --surface-awaiting: #6E3711;
+  --surface-failed: #642113;
+  --surface-done: #1F3227;
+  --surface-flagged: #5C2A1C;
+  --surface-signal-fill: #E5CB79;
+
+  /* ink (11) */
+  --text-primary: #FBFAF7;
+  --text-secondary: #D8CFC2;
+  --text-muted: #A89C8B;
+  --text-link: #8FB187;
+  --text-thinking: #E5CB79;
+  --text-awaiting: #F5C98E;
+  --text-failed: #E0A491;
+  --text-flagged: #E5BFA5;
+  --text-agent: #C6B29B;
+  --text-on-action: #1E1B17;
+  --text-on-signal: #1E1B17;
+
+  /* lines (9) */
+  --line-subtle: #4A4237;
+  --line-default: #6F6455;
+  --line-strong: #A89C8B;
+  --line-agent: #A9862C;
+  --line-awaiting: #9A4F19;
+  --line-failed: #7F2B1A;
+  --line-done: #3B5747;
+  --line-flagged: #7D3A28;
+  --line-focus: #8FB187;
+
+  /* state dots (6) */
+  --state-thinking: #D9B855;
+  --state-awaiting: #E58F3C;
+  --state-done: #8FB187;
+  --state-failed: #D2735A;
+  --state-flagged: #C27950;
+  --state-idle: #877866;
+
+  /* fills (2) */
+  --fill-action: linear-gradient(180deg, #8FB187, #6E8A75);
+  --fill-row-hover: rgba(255,255,255,.06);
+
+  /* material (2 of 4 — doc redefines shadow only; --glow-agent and
+     --glow-agent-soft are NOT redefined for dark, so they carry over
+     unchanged from .tracker-next above. This is exact to the doc, not an
+     omission: the wheat glow is deliberately theme-invariant. */
+  --shadow-raised: 1px 2px 5px rgba(0,0,0,.45);
+  --shadow-overlay: 2px 10px 30px rgba(0,0,0,.60);
+}
+
+/* ============================================================
+   BASE / RESET — minimal, scoped only under .tracker-next
+   Grounded directly in the doc: surfaces/ink tokens and the three type
+   stacks need somewhere to actually apply for the root to render correctly;
+   nothing here is invented beyond that minimum.
+   ============================================================ */
+.tracker-next {
+  background: var(--surface-page);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  box-sizing: border-box;
+}
+.tracker-next *,
+.tracker-next *::before,
+.tracker-next *::after {
+  box-sizing: inherit;
+}
+
+/* Contrast floor / keyboard focus (doc "Contrast floor"): a 2px solid
+   --line-focus outline, 2px offset, visible on every surface — this is a
+   universal a11y default, not any one component's concern. */
+.tracker-next :focus-visible {
+  outline: 2px solid var(--line-focus);
+  outline-offset: 2px;
+}
+
+/* ============================================================
+   EMOJI TINTING (decision 4, revised) — reusable utility classes
+   Gentle desaturate + small hue nudge toward the nearest palette hue, per
+   meaning. Emoji keep their own identity — not grayscale-and-resepia.
+   One `filter` declaration per rule: a second one overrides, never composes.
+   ============================================================ */
+.tracker-next .tn-emo   { filter: saturate(.7) contrast(1.05); font-style: normal; }          /* neutral / agent */
+.tracker-next .tn-emo-a { filter: saturate(1.05) hue-rotate(-6deg); font-style: normal; }      /* awaiting -> orange */
+.tracker-next .tn-emo-f { filter: saturate(.85) hue-rotate(-12deg) brightness(.95); font-style: normal; } /* flag -> rust */
+.tracker-next .tn-emo-d { filter: saturate(.62) hue-rotate(-18deg) brightness(.82); font-style: normal; } /* done -> forest */
+.tracker-next .tn-emo-n { filter: saturate(.8) hue-rotate(-8deg) brightness(.95); font-style: normal; }   /* note -> wheat */
+
+/* Dark theme lifts brightness — emoji are authored for light backgrounds and
+   go muddy on --surface-page otherwise. */
+.tracker-next.is-dark .tn-emo   { filter: saturate(.8) contrast(1.05) brightness(1.15); }
+.tracker-next.is-dark .tn-emo-a { filter: saturate(1.1) hue-rotate(-6deg) brightness(1.15); }
+.tracker-next.is-dark .tn-emo-f { filter: saturate(.95) hue-rotate(-12deg) brightness(1.18); }
+.tracker-next.is-dark .tn-emo-d { filter: saturate(.75) hue-rotate(-18deg) brightness(1.2); }
+.tracker-next.is-dark .tn-emo-n { filter: saturate(.9) hue-rotate(-8deg) brightness(1.2); }
