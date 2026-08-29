@@ -177,7 +177,7 @@ Every new eval was proven RED before GREEN:
 | C3 | Use `claude attach <short>` rather than a fork copy | **discharged** — fork demoted to fallback |
 | C4 | Add evals/tests so this cannot regress silently | **discharged** — 6 RED-proven evals; markers now pinned against verbatim captures |
 | C5 | `make check` green | **discharged** — 1297 tests, selfcheck ok |
-| C6 | `/tracker-push` — `personal` only | pending |
+| C6 | `/tracker-push` — `personal` only | **discharged** — `b89a779` on `personal/main`, LICENSE ok |
 
 ### Still open
 
