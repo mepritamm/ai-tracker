@@ -126,27 +126,35 @@ class TestBuildScriptResumeFallback(unittest.TestCase):
     """Option C, Tier-1 shape (docs/refusal-fix-direction.md): term_launch hands off to
     `osascript` and never observes the spawned tab again, so there is no way to retry
     AFTER the fact like term_vt's PTY backstop does. The fallback is built into the shell
-    command itself instead -- `claude --resume <id> || claude --resume <id> --fork-session`
-    -- so a refused resume falls back with no ai-tracker process involved at all."""
+    command itself instead -- now a THREE-leg chain,
+    `claude --resume <id> || claude attach <id[:8]> || claude --resume <id> --fork-session`
+    -- so a refused resume tries to reattach to the REAL session before ever falling back
+    to a forked copy, with no ai-tracker process involved at all.
+
+    `claude attach` was inserted in the middle of the existing two-leg chain because a
+    bare `--fork-session` fallback only ever gave the user a COPY of the conversation --
+    it never really "resumed" anything, which was the whole complaint this fix answers."""
 
     def _unescape(self, script):
         m = re.search(r'do script "((?:[^"\\]|\\.)*)"', script)
         self.assertIsNotNone(m, "no valid do-script string literal found in:\n%s" % script)
         return _applescript_unescape(m.group(1))
 
-    def test_plain_resume_gets_the_or_fallback_with_fork_session(self):
+    def test_plain_resume_gets_the_attach_then_fork_fallback_chain(self):
         argv = ["claude", "--resume", "abc-123"]
         inner = self._unescape(
             term_launch.build_script("/tmp/proj", "abc-123", "resume", "Terminal", argv))
         self.assertEqual(
             inner,
             "cd " + shlex.quote("/tmp/proj") +
-            " && (claude --resume abc-123 || claude --resume abc-123 --fork-session)")
+            " && (claude --resume abc-123 || claude attach abc-123"
+            " || claude --resume abc-123 --fork-session)")
 
     def test_already_forked_argv_is_not_wrapped_in_a_redundant_or(self):
         """When the fast path already appended --fork-session (a background-agent
         session), there is nothing left to fall back to -- the command must stay a
-        single, unwrapped command, not `(cmd || cmd)` with itself."""
+        single, unwrapped command, not `(cmd || cmd)` with itself, and no attach leg
+        is added either."""
         argv = ["claude", "--resume", "bg-sid", "--fork-session"]
         inner = self._unescape(
             term_launch.build_script("/tmp/proj", "bg-sid", "resume", "Terminal", argv))
@@ -154,18 +162,125 @@ class TestBuildScriptResumeFallback(unittest.TestCase):
             inner, "cd " + shlex.quote("/tmp/proj") +
             " && claude --resume bg-sid --fork-session")
         self.assertNotIn("||", inner)
+        self.assertNotIn("attach", inner)
 
-    def test_default_argv_when_resume_argv_omitted_also_gets_the_fallback(self):
+    def test_default_argv_when_resume_argv_omitted_also_gets_the_fallback_chain(self):
         """Existing direct callers that don't pass resume_argv (e.g. the plain
         TestBuildScriptResume tests above) fall back to ["claude", "--resume", sid] --
-        which has no --fork-session, so it must ALSO gain the || fallback."""
+        which has no --fork-session, so it must ALSO gain the attach-then-fork chain."""
         script = term_launch.build_script("/tmp/proj", "abc-123", "resume", "Terminal")
-        self.assertIn("claude --resume abc-123 || claude --resume abc-123 --fork-session",
-                       script.replace("\\\\", "\\"))
+        self.assertIn(
+            "claude --resume abc-123 || claude attach abc-123"
+            " || claude --resume abc-123 --fork-session",
+            script.replace("\\\\", "\\"))
 
     def test_cwd_mode_never_gets_an_or_fallback(self):
         script = term_launch.build_script("/tmp/proj", "abc-123", "cwd", "Terminal")
         self.assertNotIn("||", script)
+        self.assertNotIn("attach", script)
+
+    def test_attach_leg_uses_the_short_eight_char_sid_not_the_full_uuid(self):
+        """Regression: `claude attach` takes the short id (first 8 chars), not the full
+        uuid the way `--resume` does -- a long, realistic uuid-shaped sid must be
+        truncated in the attach leg while the --resume legs keep the id in full."""
+        sid = "abcd1234-5678-90ab-cdef-1234567890ab"
+        argv = ["claude", "--resume", sid]
+        inner = self._unescape(
+            term_launch.build_script("/tmp/x", sid, "resume", "Terminal", argv))
+        self.assertEqual(
+            inner,
+            "cd " + shlex.quote("/tmp/x") +
+            " && (claude --resume %s || claude attach abcd1234"
+            " || claude --resume %s --fork-session)" % (sid, sid))
+        # sanity: the attach leg itself never carries more than 8 characters of the id
+        self.assertIn("claude attach abcd1234", inner)
+        self.assertNotIn("claude attach " + sid, inner)
+
+    def test_attach_leg_ordered_between_resume_and_fork_not_just_present(self):
+        """ORDER MATTERS: the whole point of the fix is that attach is tried before the
+        chain gives up and forks a copy. Assert relative position, not just membership --
+        a chain with the legs shuffled would pass a plain assertIn check but still be the
+        old, broken behaviour (fork tried before/without ever trying attach in place)."""
+        sid = "abcd1234-5678-90ab-cdef-1234567890ab"
+        inner = self._unescape(
+            term_launch.build_script("/tmp/x", sid, "resume", "Terminal",
+                                      ["claude", "--resume", sid]))
+        i_resume = inner.index("claude --resume %s ||" % sid)
+        i_attach = inner.index("claude attach abcd1234")
+        i_fork = inner.index("--fork-session")
+        self.assertLess(i_resume, i_attach,
+                         "plain resume must be tried before attach")
+        self.assertLess(i_attach, i_fork,
+                         "attach must be tried before the fork-session fallback")
+
+    def test_custom_resume_argv_still_gets_the_attach_leg_inserted(self):
+        """A non-default resume_argv (e.g. one carrying extra flags a caller supplied)
+        must still gain the attach leg in the middle, keyed off the extra flags surviving
+        into the first and last legs unchanged."""
+        sid = "abcd1234-5678-90ab-cdef-1234567890ab"
+        argv = ["claude", "--resume", sid, "--extra-flag"]
+        inner = self._unescape(
+            term_launch.build_script("/tmp/x", sid, "resume", "Terminal", argv))
+        self.assertEqual(
+            inner,
+            "cd " + shlex.quote("/tmp/x") +
+            " && (claude --resume %s --extra-flag || claude attach abcd1234"
+            " || claude --resume %s --extra-flag --fork-session)" % (sid, sid))
+
+    def test_every_leg_is_shlex_quoted_and_cannot_break_out_of_the_do_script_string(self):
+        """cwd is untrusted input (comes from a session log) -- a cwd containing both a
+        space and a shell metacharacter must not let anything escape the quoted `cd`
+        argument, and the whole inner command must still round-trip cleanly through the
+        AppleScript do-script string (i.e. build_script's own escaping still holds with
+        the new, longer fallback chain in play)."""
+        cwd = "/tmp/a b;c"
+        sid = "abcd1234-5678-90ab-cdef-1234567890ab"
+        argv = ["claude", "--resume", sid]
+        script = term_launch.build_script(cwd, sid, "resume", "Terminal", argv)
+        inner = self._unescape(script)
+        self.assertEqual(
+            inner,
+            "cd " + shlex.quote(cwd) +
+            " && (claude --resume %s || claude attach abcd1234"
+            " || claude --resume %s --fork-session)" % (sid, sid))
+        # the metacharacter never appears un-quoted / bare in the inner command
+        self.assertNotIn("cd /tmp/a b;c ", inner)
+        self.assertIn(shlex.quote(cwd), inner)
+        # and the do-script string literal itself still parses as exactly one string --
+        # i.e. there is exactly one properly-terminated do-script argument in the script.
+        self.assertEqual(len(re.findall(r'do script "(?:[^"\\]|\\.)*"', script)), 1)
+
+    def test_empty_sid_in_resume_mode_emits_no_broken_attach_leg(self):
+        """Edge case: an empty sid in resume mode (shouldn't normally reach build_script,
+        but this function takes sid as a bare argument with no validation of its own) must
+        not emit a broken `claude attach ` leg with an empty/missing argument -- pinning
+        the real behaviour of the `if sid:` guard in build_script, which skips the attach
+        leg entirely when sid is falsy rather than emitting `claude attach` with a blank
+        or missing argv."""
+        argv = ["claude", "--resume", ""]
+        inner = self._unescape(
+            term_launch.build_script("/tmp/proj", "", "resume", "Terminal", argv))
+        self.assertNotIn("attach", inner)
+        self.assertEqual(
+            inner,
+            "cd " + shlex.quote("/tmp/proj") +
+            " && (claude --resume '' || claude --resume '' --fork-session)")
+
+    def test_none_sid_in_resume_mode_also_emits_no_broken_attach_leg(self):
+        """Same edge case as above but with sid=None rather than "" -- `if sid:` treats
+        both as falsy, so this must behave identically (no attach leg). Uses an explicit
+        resume_argv, since the *default* argv (resume_argv omitted) interpolates sid
+        directly into ["claude", "--resume", sid] and shlex.quote(None) would raise --
+        that is a separate, pre-existing contract of the function unrelated to this fix,
+        not something this test is pinning."""
+        inner = self._unescape(
+            term_launch.build_script("/tmp/proj", None, "resume", "Terminal",
+                                      ["claude", "--resume", ""]))
+        self.assertNotIn("attach", inner)
+        self.assertEqual(
+            inner,
+            "cd " + shlex.quote("/tmp/proj") +
+            " && (claude --resume '' || claude --resume '' --fork-session)")
 
 
 class TestIsClaude(unittest.TestCase):

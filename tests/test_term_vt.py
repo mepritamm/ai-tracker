@@ -3695,11 +3695,23 @@ class TestResumeBackstopFiresOnRefusal(unittest.TestCase):
         for q in qs:
             q.put(data)
 
-    def test_refusal_plus_nonzero_exit_triggers_exactly_one_retry(self):
+    def test_refusal_plus_nonzero_exit_triggers_exactly_one_fork_retry_when_attach_is_unavailable(self):
+        """Original intent of this test, made EXPLICIT about which retry path it drives: "a
+        refusal plus a non-zero exit triggers exactly ONE retry." `sid` here ("refused-sid") is
+        non-empty, so `term_gate.attach_target()` resolves a fallback short id from `sid[:8]` even
+        against this LEGACY refusal text (which carries no `claude attach <id>` hint of its own) --
+        meaning `_resume_backstop` DOES attempt `_retry_with_attach` first. That attempt is faked
+        here to return False (attach unavailable/refused -- the same signal a stale short id or a
+        failed execvp produces on the real path), so the backstop must fall back to
+        `_retry_with_fork` exactly once. Both retry functions are faked -- neither `_fork_child` nor
+        a real subprocess is ever reached, so this can never exec a real `claude` process (see the
+        sibling test below for the attach-succeeds half, and TestResumeBackstopAttachRecovery for
+        the attach argv itself)."""
         pt = _bare_pty()
-        calls = []
-        with mock.patch.object(term_vt, "_retry_with_fork",
-                                side_effect=lambda p, sid, c, r: calls.append(sid)):
+        fork_calls = []
+        with mock.patch.object(term_vt, "_retry_with_attach", return_value=False) as attach, \
+             mock.patch.object(term_vt, "_retry_with_fork",
+                                side_effect=lambda p, sid, c, r: fork_calls.append(sid)):
             t = threading.Thread(target=term_vt._resume_backstop,
                                   args=(pt, "refused-sid", False, 80, 24))
             t.start()
@@ -3708,7 +3720,38 @@ class TestResumeBackstopFiresOnRefusal(unittest.TestCase):
             pt.done, pt.rc = True, 1
             t.join(timeout=term_vt.BACKSTOP_WINDOW + 2)
         self.assertFalse(t.is_alive())
-        self.assertEqual(calls, ["refused-sid"])
+        attach.assert_called_once()
+        self.assertEqual(fork_calls, ["refused-sid"])
+
+    def test_refusal_plus_nonzero_exit_triggers_exactly_one_attach_retry_when_attach_succeeds(self):
+        """Companion to the fork-path test above, covering the other branch of the same "attach
+        first, fork only as fallback" choice: when `_retry_with_attach` succeeds (a resolvable
+        short id and a live replacement child -- the normal case), exactly one retry happens
+        overall, and it is the attach, never the fork. Faked exactly like the fork-path twin, so
+        neither real retry function nor `_fork_child` is ever reached -- no real `claude`
+        subprocess."""
+        pt = _bare_pty()
+        attach_calls = []
+
+        def _fake_attach(p, sid, target, cols, rows):
+            attach_calls.append(sid)
+            p.done, p.rc = False, None    # what a successful real swap leaves behind
+            return True
+
+        with mock.patch.object(term_vt, "_retry_with_attach", side_effect=_fake_attach), \
+             mock.patch.object(term_vt, "_retry_with_fork") as fork:
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, "refused-sid", False, 80, 24))
+            t.start()
+            self._feed(pt, b"Session refused-sid is currently running as a "
+                           b"background agent (bg). Use `claude agents`...")
+            pt.done, pt.rc = True, 1
+            self.assertTrue(_wait_for(lambda: len(attach_calls) == 1))
+            pt.done, pt.rc = True, 0      # the attach child itself then exits cleanly -- no fallback
+            t.join(timeout=term_vt.BACKSTOP_WINDOW + 2)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(attach_calls, ["refused-sid"])
+        fork.assert_not_called()
 
     def test_a_deliberate_sigkill_is_not_mistaken_for_the_refusal(self):
         """Regression: close_pty (the ✕ that frees a capacity slot) and _reader's idle reap both
@@ -3934,6 +3977,722 @@ class TestResumeBackstopFiresOnRefusal(unittest.TestCase):
              mock.patch.object(term_vt, "BACKSTOP_DONE_GRACE", 0.05):
             term_vt._resume_backstop(pt, "sid-cleanup", False, 80, 24)
         self.assertEqual(pt.raw_queues, [])
+
+
+class TestResumeBackstopAttachRecovery(unittest.TestCase):
+    """Regression coverage for the bug where term_gate pinned the CLI's OLD refusal wording,
+    `looks_like_bg_refusal()` stopped matching the CURRENT one, and `_resume_backstop()` never
+    fired at all -- a `mode="resume"` terminal just hung forever on a background-session
+    refusal. The fix (see `_retry_with_attach`/`_resume_backstop` in aitracker/term_vt.py)
+    prefers `claude attach <short-id>` -- which re-enters the REAL live session -- over the old
+    `--fork-session` consolation-prize retry, falling back to fork only when attach cannot be
+    attempted or its own child also dies. These tests drive `_resume_backstop` directly with a
+    bare (processless) `Pty`, exactly like `TestResumeBackstopFiresOnRefusal` above, and
+    intercept at `_fork_child` (the actual spawn primitive) rather than asserting on log
+    strings, so a test only passes if the real argv the code would exec is the one asserted."""
+
+    FULL_SID = "e30d3b6a-046e-483b-b0f5-e0a1d692abfa"
+    SHORT_SID = "e30d3b6a"
+
+    # Verbatim from a real capture (see term_gate.BG_REFUSAL_MARKERS's docstring) -- the
+    # CURRENT CLI wording that the pinned-old-string bug stopped matching.
+    CURRENT_REFUSAL = (
+        b"Session e30d3b6a-046e-483b-b0f5-e0a1d692abfa is running as a background session "
+        b"(e30d3b6a). Run `claude attach e30d3b6a` to open it, or `claude stop e30d3b6a` "
+        b"first to resume it here. Add --fork-session to branch off a copy instead."
+    )
+
+    # The LEGACY wording (term_gate.REFUSAL_MARKER): no `claude attach <id>` hint at all --
+    # only `claude agents` (an interactive picker with no scriptable argv).
+    LEGACY_REFUSAL = (
+        b"Session legacy-sid is currently running as a background agent (bg). Use "
+        b"`claude agents` to find and attach to it, or add --fork-session to branch off "
+        b"a copy."
+    )
+
+    def _feed(self, pt, data):
+        self.assertTrue(_wait_for(lambda: bool(pt.raw_queues)))
+        with pt.lock:
+            qs = list(pt.raw_queues)
+        for q in qs:
+            q.put(data)
+
+    def test_current_wording_refusal_retries_with_claude_attach(self):
+        """THE test for the user's actual bug: a mode="resume" pty whose child prints the
+        CURRENT verbatim refusal and exits non-zero must end up running
+        `claude attach e30d3b6a` -- asserted on the real argv `_fork_child` would exec, not on
+        a log line. Also proves no fork bookkeeping happens on this path (task 3): no
+        store.record_fork, no store.capture_fork_snapshot, no pt.forked."""
+        pt = _bare_pty()
+        argvs = []
+
+        def _fake_fork(cwd, argv, cols, rows):
+            argvs.append(argv)
+            return (4242, 99)
+
+        with mock.patch.object(term_vt, "_fork_child", side_effect=_fake_fork), \
+             mock.patch.object(term_vt, "_reader"), \
+             mock.patch.object(term_vt.store, "record_fork") as record_fork, \
+             mock.patch.object(term_vt.store, "capture_fork_snapshot") as capture_snap, \
+             mock.patch.object(term_vt, "_retry_with_fork") as fork_fallback:
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, self.FULL_SID, False, 80, 24))
+            t.start()
+            self._feed(pt, self.CURRENT_REFUSAL)
+            pt.done, pt.rc = True, 1
+            t.join(timeout=term_vt.BACKSTOP_WINDOW + 2)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(argvs, [["claude", "attach", self.SHORT_SID]])
+        fork_fallback.assert_not_called()
+        record_fork.assert_not_called()
+        capture_snap.assert_not_called()
+        self.assertFalse(pt.forked, "an attach re-enters the REAL session -- no `⑂ fork` chip")
+
+    def test_legacy_wording_still_triggers_attach_via_sid_fallback(self):
+        """The LEGACY refusal carries no `claude attach <id>` hint to parse (only `claude
+        agents`), but `attach_target()` falls back to `sid[:8]` when `sid` is known -- so an
+        older `claude` binary elsewhere must still recover via attach, not silently degrade to
+        the fork-only consolation prize."""
+        pt = _bare_pty()
+        sid = "legacylegacy1234567890"
+        argvs = []
+
+        def _fake_fork(cwd, argv, cols, rows):
+            argvs.append(argv)
+            return (1, 2)
+
+        with mock.patch.object(term_vt, "_fork_child", side_effect=_fake_fork), \
+             mock.patch.object(term_vt, "_reader"), \
+             mock.patch.object(term_vt.store, "record_fork") as record_fork, \
+             mock.patch.object(term_vt.store, "capture_fork_snapshot") as capture_snap, \
+             mock.patch.object(term_vt, "_retry_with_fork") as fork_fallback:
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, sid, False, 80, 24))
+            t.start()
+            self._feed(pt, self.LEGACY_REFUSAL)
+            pt.done, pt.rc = True, 1
+            t.join(timeout=term_vt.BACKSTOP_WINDOW + 2)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(argvs, [["claude", "attach", sid[:8]]])
+        fork_fallback.assert_not_called()
+        record_fork.assert_not_called()
+        capture_snap.assert_not_called()
+        self.assertFalse(pt.forked)
+
+    def test_attach_feeds_a_visible_notice_into_the_pane(self):
+        """The notice is set and fed to the pane (task 4): both the structured `pt.notices`
+        queue (the SSE `notices` frame / raw-stream replay channel) and the visible screen
+        text a `screen_stream()` viewer already attached would see."""
+        pt = _bare_pty()
+        with mock.patch.object(term_vt, "_fork_child", return_value=(1, 2)), \
+             mock.patch.object(term_vt, "_reader"), \
+             mock.patch.object(term_vt.store, "record_fork"), \
+             mock.patch.object(term_vt.store, "capture_fork_snapshot"):
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, self.FULL_SID, False, 80, 24))
+            t.start()
+            self._feed(pt, self.CURRENT_REFUSAL)
+            pt.done, pt.rc = True, 1
+            t.join(timeout=term_vt.BACKSTOP_WINDOW + 2)
+        self.assertTrue(any("attached to the live session" in n["text"] for n in pt.notices))
+        # The screen side wraps at a fixed column with no word-wrap, so a phrase spanning two
+        # rows can pick up an extra space MID-WORD (same artifact test_missing_transcript_...
+        # above works around) -- asserted on a substring short enough not to straddle that
+        # wrap boundary, not the whole sentence.
+        snap = pt.screen.snapshot(-1)
+        joined = " ".join(" ".join(text for _, text, _ in snap["rows"]).split())
+        self.assertIn("already running in the background", joined)
+        self.assertIn("claude attach e30d3b6a", joined)
+
+    def test_attach_failure_falls_back_to_fork_and_terminal_is_not_left_dead(self):
+        """The "never leave a dead pane" guarantee (task 5): the attach child spawns (a real
+        `_retry_with_attach` runs, only `_fork_child`/`_reader` are faked) but then itself
+        exits non-zero -- `_retry_with_fork` must run, so the terminal recovers instead of
+        sitting dead."""
+        pt = _bare_pty()
+        attach_argvs = []
+
+        def _fake_fork(cwd, argv, cols, rows):
+            attach_argvs.append(argv)
+            return (999, 88)
+
+        fork_calls = []
+
+        def _fake_retry_with_fork(p, sid, cols, rows):
+            fork_calls.append(sid)
+
+        with mock.patch.object(term_vt, "_fork_child", side_effect=_fake_fork), \
+             mock.patch.object(term_vt, "_reader"), \
+             mock.patch.object(term_vt.store, "record_fork"), \
+             mock.patch.object(term_vt.store, "capture_fork_snapshot"), \
+             mock.patch.object(term_vt, "_retry_with_fork", side_effect=_fake_retry_with_fork):
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, self.FULL_SID, False, 80, 24))
+            t.start()
+            self._feed(pt, self.CURRENT_REFUSAL)
+            pt.done, pt.rc = True, 1                      # the ORIGINAL child refuses
+            self.assertTrue(_wait_for(lambda: len(attach_argvs) == 1))
+            self.assertFalse(pt.done, "the real attach swap must have cleared done for the "
+                                       "replacement child")
+            pt.done, pt.rc = True, 1                      # ...and the ATTACH child itself dies
+            t.join(timeout=term_vt.BACKSTOP_WINDOW + 2)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(attach_argvs, [["claude", "attach", self.SHORT_SID]])
+        self.assertEqual(fork_calls, [self.FULL_SID])
+
+    def test_at_most_one_attach_and_at_most_one_fork_across_many_iterations(self):
+        """AT MOST ONCE each (task 6): `attach_tried` latches after the first attempt so the
+        refusal branch can never re-enter even while the buffer still holds the refusal text
+        and `pt.done`/`pt.rc` still look like a match on every later poll tick -- driven here
+        across several real BACKSTOP_POLL ticks, not asserted after a single one."""
+        pt = _bare_pty()
+        attach_calls = []
+        fork_calls = []
+
+        def _fake_attach(p, sid, target, cols, rows):
+            attach_calls.append(target)
+            p.done, p.rc = False, None      # what a successful real swap would leave behind
+            return True
+
+        def _fake_fork(p, sid, cols, rows):
+            fork_calls.append(sid)
+
+        with mock.patch.object(term_vt, "_retry_with_attach", side_effect=_fake_attach), \
+             mock.patch.object(term_vt, "_retry_with_fork", side_effect=_fake_fork):
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, self.FULL_SID, False, 80, 24))
+            t.start()
+            self._feed(pt, self.CURRENT_REFUSAL)
+            pt.done, pt.rc = True, 1
+            self.assertTrue(_wait_for(lambda: len(attach_calls) == 1))
+            # Hold steady for several backstop ticks -- the one-shot latch must not re-enter
+            # just because the tee'd buffer still holds the refusal text.
+            time.sleep(term_vt.BACKSTOP_POLL * 5)
+            self.assertEqual(len(attach_calls), 1)
+            self.assertEqual(fork_calls, [])
+            pt.done, pt.rc = True, 1        # the (fake) attach child itself now dies
+            t.join(timeout=term_vt.BACKSTOP_WINDOW + 2)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(attach_calls, [self.SHORT_SID])
+        self.assertEqual(fork_calls, [self.FULL_SID])
+
+    def test_closing_suppresses_attach_and_fork_and_does_not_resurrect(self):
+        """Intent guard (task 7): the user clicked ✕ (pt.closing) before the refusal-looking
+        output arrived -- neither retry may fire, and the pty must stay dead so the capacity
+        slot frees instead of leaking (the close_pty regression this guard exists for)."""
+        pt = _bare_pty()
+        pt.closing = True
+        with mock.patch.object(term_vt, "BACKSTOP_WINDOW", 0.3), \
+             mock.patch.object(term_vt, "_retry_with_attach") as attach, \
+             mock.patch.object(term_vt, "_retry_with_fork") as fork:
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, self.FULL_SID, False, 80, 24))
+            t.start()
+            self._feed(pt, self.CURRENT_REFUSAL)
+            pt.done, pt.rc = True, 1
+            t.join(timeout=2)
+        self.assertFalse(t.is_alive())
+        attach.assert_not_called()
+        fork.assert_not_called()
+        self.assertTrue(pt.done, "a pty closed by the user must stay dead, not be resurrected")
+
+    def test_sigkill_is_not_mistaken_for_the_refusal_on_the_attach_path(self):
+        """Intent guard (task 7): WE killed it (rc == -SIGKILL, e.g. the idle reaper) and
+        nobody set `closing` -- still not a refusal, on the attach path exactly like the
+        pre-existing fork-path test above."""
+        pt = _bare_pty()
+        with mock.patch.object(term_vt, "BACKSTOP_WINDOW", 0.3), \
+             mock.patch.object(term_vt, "_retry_with_attach") as attach, \
+             mock.patch.object(term_vt, "_retry_with_fork") as fork:
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, self.FULL_SID, False, 80, 24))
+            t.start()
+            self._feed(pt, self.CURRENT_REFUSAL)
+            pt.done, pt.rc = True, -signal.SIGKILL
+            t.join(timeout=2)
+        self.assertFalse(t.is_alive())
+        attach.assert_not_called()
+        fork.assert_not_called()
+
+    def test_already_forked_suppresses_attach_too(self):
+        """Intent guard (task 7): a session the fast path already forked can't ALSO hit this
+        refusal, so `already_forked=True` must suppress the attach retry exactly like it
+        already suppresses the fork retry (see the pre-existing fork-path test)."""
+        pt = _bare_pty()
+        with mock.patch.object(term_vt, "BACKSTOP_WINDOW", 0.3), \
+             mock.patch.object(term_vt, "_retry_with_attach") as attach, \
+             mock.patch.object(term_vt, "_retry_with_fork") as fork:
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, self.FULL_SID, True, 80, 24))
+            t.start()
+            self._feed(pt, self.CURRENT_REFUSAL)
+            pt.done, pt.rc = True, 1
+            t.join(timeout=2)
+        self.assertFalse(t.is_alive())
+        attach.assert_not_called()
+        fork.assert_not_called()
+
+    def test_no_attach_target_falls_back_to_fork_never_a_bare_attach(self):
+        """NO TARGET (task 8): the LEGACY wording carries no `claude attach <id>` hint, and an
+        empty `sid` leaves attach_target() with no fallback either -- `_retry_with_attach` must
+        never even be attempted (never a bare `claude attach` with an empty argument), and the
+        fork fallback must still run so the pty recovers."""
+        pt = _bare_pty()
+        with mock.patch.object(term_vt, "BACKSTOP_WINDOW", 0.3), \
+             mock.patch.object(term_vt, "_retry_with_attach") as attach, \
+             mock.patch.object(term_vt, "_retry_with_fork") as fork:
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, "", False, 80, 24))
+            t.start()
+            self._feed(pt, self.LEGACY_REFUSAL)
+            pt.done, pt.rc = True, 1
+            t.join(timeout=2)
+        self.assertFalse(t.is_alive())
+        attach.assert_not_called()
+        fork.assert_called_once_with(pt, "", 80, 24)
+
+    def test_clean_exit_does_not_trigger_either_retry(self):
+        """NEGATIVE (task 9): the child exits 0 -- `pt.rc not in (0, None)` fails, so neither
+        retry may fire even though the refusal text is sitting right there in the buffer."""
+        pt = _bare_pty()
+        with mock.patch.object(term_vt, "BACKSTOP_WINDOW", 0.3), \
+             mock.patch.object(term_vt, "_retry_with_attach") as attach, \
+             mock.patch.object(term_vt, "_retry_with_fork") as fork:
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, self.FULL_SID, False, 80, 24))
+            t.start()
+            self._feed(pt, self.CURRENT_REFUSAL)
+            pt.done, pt.rc = True, 0
+            t.join(timeout=2)
+        self.assertFalse(t.is_alive())
+        attach.assert_not_called()
+        fork.assert_not_called()
+
+    def test_no_refusal_marker_does_not_trigger_either_retry(self):
+        """NEGATIVE (task 9): a resume that fails for some OTHER reason -- output that never
+        matches BG_REFUSAL_MARKERS -- must not be mistaken for the specific bg-agent refusal on
+        either retry path."""
+        pt = _bare_pty()
+        with mock.patch.object(term_vt, "BACKSTOP_WINDOW", 0.3), \
+             mock.patch.object(term_vt, "_retry_with_attach") as attach, \
+             mock.patch.object(term_vt, "_retry_with_fork") as fork:
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, self.FULL_SID, False, 80, 24))
+            t.start()
+            self._feed(pt, b"claude: permission denied\n")
+            pt.done, pt.rc = True, 1
+            t.join(timeout=2)
+        self.assertFalse(t.is_alive())
+        attach.assert_not_called()
+        fork.assert_not_called()
+
+
+class TestResumeBackstopStreamRecoversAfterAttach(unittest.TestCase):
+    """Closes the UNPROVEN half of the attach-recovery story. `TestResumeBackstopAttachRecovery`
+    above only proves `_retry_with_attach` spawns the right argv (`claude attach <short-id>`) --
+    it never proves the SSE stream a reconnecting client re-opens actually resumes into a LIVE
+    pane afterward. The user's reported symptom was a terminal stuck forever on the refusal text
+    under a "reconnecting..." header: `GET /api/term/raw` (`_raw_stream_body`, ~term_vt.py:3160)
+    closes its SSE connection the instant `pt.done` becomes True -- true for the ORIGINAL refused
+    child -- and the browser's `EventSource` then reconnects with the SAME `?tty=<id>`. The claim
+    under test is that by the time it reconnects, the swapped-in attach child has left this SAME
+    `Pty` looking alive, present in `PTYS`, and streamable -- not that the swap merely picked the
+    right argv.
+
+    Drives the REAL `_retry_with_attach` (only `_fork_child`/`_reader` faked, exactly like
+    `TestResumeBackstopAttachRecovery`'s tests do for the same reason: no real process, no real
+    reader thread, but every other line of the swap runs for real) and asserts on the state a
+    reconnecting `/api/term/raw` viewer would actually observe -- registry lookup, `pt.done`,
+    `pt.notices`, and a real `raw_stream()` connection fed through the exact `_tee_raw` mechanism
+    `_reader()` uses."""
+
+    FULL_SID = "e30d3b6a-046e-483b-b0f5-e0a1d692abfa"
+    SHORT_SID = "e30d3b6a"
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        term_vt._STREAMS = 0
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        for pt in list(term_vt.PTYS.values()):
+            pt.kill()
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+        term_vt._STREAMS = 0
+
+    def _feed(self, pt, data):
+        self.assertTrue(_wait_for(lambda: bool(pt.raw_queues)))
+        with pt.lock:
+            qs = list(pt.raw_queues)
+        for q in qs:
+            q.put(data)
+
+    def _refused_pty(self, tid="streamrec"):
+        """A pty in exactly the state `_resume_backstop` sees when it calls `_retry_with_attach`:
+        the ORIGINAL child already exited non-zero (the refusal), `starting` still True (the
+        readiness question `open_pty()` left open), registered in `PTYS` under its tty id exactly
+        like `open_pty()` would leave it -- so a reconnecting `/api/term/raw?tty=<id>` finds it
+        the same way a real client's `EventSource` would."""
+        pt = _bare_pty(tid=tid)
+        pt.done, pt.rc = True, 1
+        pt.starting = True
+        term_vt.PTYS[pt.id] = pt
+        return pt
+
+    def test_1_pty_is_not_done_after_the_swap(self):
+        """THE single fact the whole "stream resumes" story rests on: if the swap left `pt.done`
+        True, a reconnecting client's `_raw_stream_body` loop would see `not data and pt.done` on
+        its very first tick and return immediately -- an immediately-closed stream forever, which
+        IS the reported bug. See the RED/GREEN proof in the report for confirmation this actually
+        bites: a one-line scratch edit that skips the `pt.done = False` reset makes this fail."""
+        pt = self._refused_pty(tid="streamrec1")
+        with mock.patch.object(term_vt, "_fork_child", return_value=(4242, 99)), \
+             mock.patch.object(term_vt, "_reader"):
+            ok = term_vt._retry_with_attach(pt, self.FULL_SID, self.SHORT_SID, 80, 24)
+        self.assertTrue(ok)
+        self.assertFalse(pt.done, "a reconnecting client's SSE stream closes forever the instant "
+                                   "_raw_stream_body sees pt.done True -- the swap must clear it")
+        self.assertIsNone(pt.rc)
+
+    def test_2_pty_keeps_its_identity_and_stays_in_the_registry(self):
+        """A client reconnecting after the SSE stream closes re-opens `/api/term/raw?tty=<id>`
+        with the SAME id it already held -- so the swap must keep the SAME tty id, and the pty
+        must still be the one `PTYS` hands back for that id (the actual registry `raw_stream()`
+        looks a pty up in), not a new object under a new key."""
+        pt = self._refused_pty(tid="streamrec2")
+        with mock.patch.object(term_vt, "_fork_child", return_value=(4242, 99)), \
+             mock.patch.object(term_vt, "_reader"):
+            term_vt._retry_with_attach(pt, self.FULL_SID, self.SHORT_SID, 80, 24)
+        self.assertEqual(pt.id, "streamrec2")
+        self.assertIs(term_vt.PTYS.get("streamrec2"), pt,
+                      "a client reconnecting with the same ?tty=<id> must still find this pty")
+
+    def test_3a_pid_and_fd_actually_change_to_the_new_child(self):
+        """Proves the swap is REAL, not nominal: `pt.pid`/`pt.fd` must become the replacement
+        child's values, not stay the (already-dead) refused child's. The refused child's own fd
+        is already closed and its pid already reaped by `Pty.finish()` -- the reader thread that
+        observed its exit -- BEFORE `_resume_backstop` ever sees `pt.done` and calls this, so
+        `pt.fd == -1` here models that real precondition rather than inventing a leak that cannot
+        occur on this path (see test_3b below for the ONE path that spawns a child and must clean
+        up after itself: the abandoned swap)."""
+        pt = self._refused_pty(tid="streamrec3a")
+        self.assertEqual(pt.fd, -1, "the refused child's fd is already closed by Pty.finish() "
+                                     "by the time this runs in the real flow")
+        with mock.patch.object(term_vt, "_fork_child", return_value=(4242, 99)), \
+             mock.patch.object(term_vt, "_reader"):
+            term_vt._retry_with_attach(pt, self.FULL_SID, self.SHORT_SID, 80, 24)
+        self.assertEqual((pt.pid, pt.fd), (4242, 99))
+
+    def test_3b_abandoned_swap_does_not_leak_the_replacement_child(self):
+        """The other half of task 3: if the user closes the pane WHILE the attach is being
+        spawned (`pt.closing` flips True mid-swap), `_retry_with_attach` still spawned a REAL
+        replacement child before it noticed -- and must not leave THAT one as an open fd / zombie
+        pid either. Uses a real `_fork_child` (mirrors the existing
+        `test_retry_abandons_the_fork_if_the_close_lands_mid_fork` pattern for `_retry_with_fork`)
+        with `term_gate.attach_argv` swapped for a real, harmless long-lived child so the reap can
+        be observed with `os.kill(pid, 0)` instead of mocking `os` itself."""
+        pt = self._refused_pty(tid="streamrec3b")
+        pt.closing = True
+        spawned = []
+        real_fork = term_vt._fork_child
+
+        def _spawn_sleep(cwd, argv, cols, rows):
+            pid, fd = real_fork(cwd, ["/bin/sh", "-c", "sleep 30"], cols, rows)
+            spawned.append(pid)
+            return pid, fd
+
+        with mock.patch.object(term_vt, "_fork_child", _spawn_sleep):
+            ok = term_vt._retry_with_attach(pt, self.FULL_SID, self.SHORT_SID, 80, 24)
+        self.assertTrue(ok, "the abandoned path still returns True -- see its docstring")
+        self.assertTrue(pt.closing)
+        self.assertEqual(len(spawned), 1)
+        for _ in range(150):
+            try:
+                os.kill(spawned[0], 0)
+            except OSError:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("the abandoned attach child is still running -- leaked, not reaped")
+
+    def test_4_output_from_the_replacement_child_reaches_a_late_subscriber(self):
+        """The end-to-end "the pane comes back to life" assertion: a raw-stream consumer that
+        subscribes to `/api/term/raw?tty=<id>` AFTER the swap has already happened -- exactly a
+        reconnecting `EventSource` -- must receive bytes written by the REPLACEMENT (attach)
+        child. `_reader` is faked (no real fd behind this bare pty), so the bytes are fed through
+        the exact same `_tee_raw`/`screen.feed` pair the real reader thread calls under
+        `pt.lock`, standing in for the replacement child's own output the way
+        `TestResumeBackstopFiresOnRefusal`'s `_feed` helper already does for the watcher's own
+        queue."""
+        pt = self._refused_pty(tid="streamrec4")
+        with mock.patch.object(term_vt, "_fork_child", return_value=(4242, 99)), \
+             mock.patch.object(term_vt, "_reader"):
+            term_vt._retry_with_attach(pt, self.FULL_SID, self.SHORT_SID, 80, 24)
+
+        h = _StreamHandler()
+        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("tty=" + pt.id)))
+        t.daemon = True
+        t.start()
+        try:
+            self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
+            data = b"replacement child is alive\n"
+            with pt.lock:
+                pt.screen.feed(data)
+                term_vt._tee_raw(pt, data)
+
+            h.peer.settimeout(10)
+            seen = b""
+            deadline = time.time() + 10
+            while b"replacement child is alive" not in seen and time.time() < deadline:
+                try:
+                    chunk = h.peer.recv(65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                seen += chunk
+            frames = [ln[len(b"data: "):] for ln in seen.split(b"\n\n") if ln.startswith(b"data: ")]
+            decoded = b""
+            for f in frames:
+                try:
+                    decoded += base64.b64decode(f, validate=True)
+                except Exception:
+                    pass
+            self.assertIn(b"replacement child is alive", decoded,
+                          "a viewer subscribing AFTER the swap never saw the replacement "
+                          "child's own output -- the pane did not really come back to life")
+        finally:
+            h.close_peer()
+            t.join(5)
+            h.close()
+
+    def test_5_retry_with_attach_leaves_starting_set(self):
+        """INVERTED from the original test_5, which pinned the exact bug an adversarial review
+        proved out: `_retry_with_attach` clearing `pt.starting` itself, right when the replacement
+        child was installed. That closes a grid-renderer client's EventSource mid-recovery, because
+        `_screen_stream_body()`'s terminating condition is `done and not starting` -- clearing here
+        makes it true in the gap between the attach child's own eventual death and the fork retry
+        reviving the pty, and a viewer copying that condition at its real ~0.05s cadence measured
+        12 of 12 attach->fail->fork trials closing early. The fix moves ownership of the flag
+        entirely to `_resume_backstop`: that function keeps watching the swapped-in child and can
+        still fall back to `_retry_with_fork` for the whole of the continued watch, so the pane
+        must keep advertising "still settling" for all of it. See `_retry_with_attach`'s own
+        closing comment for the full account, and test_6/test_9/test_10 below for the paths that
+        now own clearing it instead."""
+        pt = self._refused_pty(tid="streamrec5")
+        self.assertTrue(pt.starting)
+        with mock.patch.object(term_vt, "_fork_child", return_value=(4242, 99)), \
+             mock.patch.object(term_vt, "_reader"):
+            ok = term_vt._retry_with_attach(pt, self.FULL_SID, self.SHORT_SID, 80, 24)
+        self.assertTrue(ok)
+        self.assertTrue(pt.starting, "_retry_with_attach must LEAVE `starting` SET -- clearing "
+                                      "it here is the exact regression this test pins")
+
+    def test_6_resume_backstop_clears_starting_once_attach_settles_not_at_backstop_window(self):
+        """The other half of the story test_5 above sets up: if `_retry_with_attach` no longer
+        clears `starting`, something still must -- and it must not simply be "wait out the full
+        BACKSTOP_WINDOW", which is precisely the stuck-looking-pane symptom this whole mechanism
+        exists to avoid. Drives the REAL refusal -> `_retry_with_attach` -> settle sequence with a
+        SURVIVING attach child -- its `done`/`rc` are never touched again after the swap lands --
+        so the only way this loop can end is `_resume_backstop`'s ATTACH_SETTLE settle-return, not
+        the BACKSTOP_WINDOW deadline and not a child exit. `ATTACH_SETTLE`/`BACKSTOP_WINDOW`/
+        `BACKSTOP_POLL` are shrunk for this test only (restored in `finally`), and the assertion is
+        on the RELATIONSHIP between them (elapsed well under BACKSTOP_WINDOW), not a hardcoded
+        wall-clock number, so this stays honest if the production constants change."""
+        orig = (term_vt.BACKSTOP_WINDOW, term_vt.ATTACH_SETTLE, term_vt.BACKSTOP_POLL)
+        term_vt.BACKSTOP_WINDOW = 2.0
+        term_vt.ATTACH_SETTLE = 0.3
+        term_vt.BACKSTOP_POLL = 0.02
+        try:
+            pt = _bare_pty(tid="streamrec6")
+            pt.starting = True
+            with mock.patch.object(term_vt, "_fork_child", return_value=(4242, 99)), \
+                 mock.patch.object(term_vt, "_reader"), \
+                 mock.patch.object(term_vt, "_retry_with_fork") as fork_fallback:
+                t = threading.Thread(target=term_vt._resume_backstop,
+                                      args=(pt, self.FULL_SID, False, 80, 24))
+                start = time.time()
+                t.start()
+                self._feed(pt, TestResumeBackstopAttachRecovery.CURRENT_REFUSAL)
+                pt.done, pt.rc = True, 1                  # the ORIGINAL child refuses
+                self.assertTrue(_wait_for(lambda: not pt.done, timeout=1),
+                                "the attach swap never landed within the shrunk window")
+                # The ATTACH child SURVIVES from here on -- pt.done/pt.rc are never touched
+                # again, so neither the attach-died branch nor a window expiry can end this;
+                # only the settle-return (ATTACH_SETTLE after the swap) can.
+                t.join(timeout=term_vt.BACKSTOP_WINDOW + 2)
+            elapsed = time.time() - start
+            self.assertFalse(t.is_alive(), "the backstop thread never returned")
+            self.assertFalse(pt.starting, "starting must clear once the attach child settles")
+            fork_fallback.assert_not_called()
+            self.assertLess(elapsed, term_vt.BACKSTOP_WINDOW,
+                            "resolved by idling out the full BACKSTOP_WINDOW instead of the "
+                            "much shorter ATTACH_SETTLE settle-return")
+        finally:
+            term_vt.BACKSTOP_WINDOW, term_vt.ATTACH_SETTLE, term_vt.BACKSTOP_POLL = orig
+
+    def test_7_late_subscriber_still_receives_the_pending_attach_notice(self):
+        """A late-joining client (a fresh reconnect, `since_notice=0`) must be TOLD why its
+        session changed, not silently land in a different-looking pane. `_raw_stream_body`
+        replays `pt.notices` with `seq > since_notice` on every loop tick -- including entries
+        queued before this viewer ever attached (see `TestNoticeReachesRawViewer`'s own pin for
+        that policy) -- so the attach notice `_retry_with_attach` queues must still be there,
+        with a `seq` a fresh consumer would replay, for a viewer that only subscribes AFTER the
+        swap already happened."""
+        pt = self._refused_pty(tid="streamrec6")
+        with mock.patch.object(term_vt, "_fork_child", return_value=(4242, 99)), \
+             mock.patch.object(term_vt, "_reader"):
+            term_vt._retry_with_attach(pt, self.FULL_SID, self.SHORT_SID, 80, 24)
+        self.assertTrue(any("attached to the live session" in n["text"] for n in pt.notices))
+
+        h = _StreamHandler()
+        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("tty=" + pt.id)))
+        t.daemon = True
+        t.start()
+        try:
+            self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
+            h.peer.settimeout(10)
+            seen = b""
+            deadline = time.time() + 10
+            while b"event: notice" not in seen and time.time() < deadline:
+                try:
+                    chunk = h.peer.recv(65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                seen += chunk
+            frames = seen.split(b"\n\n")
+            notice_frames = [f for f in frames if f.startswith(b"event: notice")]
+            self.assertTrue(notice_frames,
+                            "a late raw viewer never received the pending attach notice -- "
+                            "the user would land in a different-looking session with no "
+                            "explanation")
+            data_line = next(ln for ln in notice_frames[0].split(b"\n") if ln.startswith(b"data: "))
+            payload = json.loads(data_line[len(b"data: "):])
+            self.assertIn("attached to the live session", payload["text"])
+            self.assertIn("seq", payload)
+        finally:
+            h.close_peer()
+            t.join(5)
+            h.close()
+
+    def test_8_full_recovery_completes_within_bounded_backstop_ticks(self):
+        """BOUNDED, task 7: the whole refusal -> attach -> live sequence must resolve within a
+        small, fixed number of `BACKSTOP_POLL` ticks -- not by sleeping out the (real, 8s)
+        `BACKSTOP_WINDOW`. `BACKSTOP_WINDOW`/`BACKSTOP_POLL`/`BACKSTOP_DONE_GRACE` are shrunk for
+        the duration of this test only and restored in the `finally` below, so this stays fast and
+        deterministic regardless of the production constants: drives the REAL `_resume_backstop`
+        loop end to end (refusal -> real `_retry_with_attach` -> replacement child exits cleanly)
+        and asserts wall-clock elapsed stays well under even the shrunk `BACKSTOP_WINDOW`, proving
+        the loop resolved on the `BACKSTOP_DONE_GRACE` tick rather than idling out the deadline."""
+        orig = (term_vt.BACKSTOP_WINDOW, term_vt.BACKSTOP_POLL, term_vt.BACKSTOP_DONE_GRACE)
+        term_vt.BACKSTOP_WINDOW = 1.0
+        term_vt.BACKSTOP_POLL = 0.02
+        term_vt.BACKSTOP_DONE_GRACE = 0.05
+        try:
+            pt = self._refused_pty(tid="streamrec7")
+            pt.done, pt.rc = False, None      # _resume_backstop watches a FRESH spawn, not a
+                                                # pre-refused one -- undo _refused_pty's refusal
+                                                # state so this models the real caller (open_pty)
+            with mock.patch.object(term_vt, "_fork_child", return_value=(4242, 99)), \
+                 mock.patch.object(term_vt, "_reader"), \
+                 mock.patch.object(term_vt, "_retry_with_fork") as fork_fallback:
+                t = threading.Thread(target=term_vt._resume_backstop,
+                                      args=(pt, self.FULL_SID, False, 80, 24))
+                start = time.time()
+                t.start()
+                self._feed(pt, TestResumeBackstopAttachRecovery.CURRENT_REFUSAL)
+                pt.done, pt.rc = True, 1                       # the original child refuses
+                self.assertTrue(_wait_for(lambda: not pt.done, timeout=1),
+                                "the attach swap never landed within the shrunk window")
+                pt.done, pt.rc = True, 0                       # the replacement exits cleanly
+                t.join(timeout=2)
+            elapsed = time.time() - start
+            self.assertFalse(t.is_alive(), "the backstop thread never returned")
+            fork_fallback.assert_not_called()
+            self.assertLess(elapsed, term_vt.BACKSTOP_WINDOW + 0.5,
+                            "resolved by idling out a full window instead of a bounded number "
+                            "of BACKSTOP_POLL ticks")
+        finally:
+            term_vt.BACKSTOP_WINDOW, term_vt.BACKSTOP_POLL, term_vt.BACKSTOP_DONE_GRACE = orig
+
+    def test_9_attach_child_dies_non_zero_falls_back_to_fork_and_still_clears_starting(self):
+        """The fork-fallback exit from `_resume_backstop`'s attach branch, closing the gap test_6
+        above does not cover: here the ATTACH child itself dies non-zero (a stale short id, a bg
+        session that ended in the meantime, a failed execvp) instead of settling. `_retry_with_fork`
+        is faked out here to a bare call-recorder, so the ONLY thing that can clear `starting` on
+        this path is `_resume_backstop`'s own `finally` -- proving that ownership holds on the
+        fork-fallback exit too, not only on the settle-return test_6 already proved."""
+        pt = _bare_pty(tid="streamrec9")
+        pt.starting = True
+        fork_calls = []
+        with mock.patch.object(term_vt, "_fork_child", return_value=(4242, 99)), \
+             mock.patch.object(term_vt, "_reader"), \
+             mock.patch.object(term_vt, "_retry_with_fork",
+                                side_effect=lambda p, sid, c, r: fork_calls.append(sid)):
+            t = threading.Thread(target=term_vt._resume_backstop,
+                                  args=(pt, self.FULL_SID, False, 80, 24))
+            t.start()
+            self._feed(pt, TestResumeBackstopAttachRecovery.CURRENT_REFUSAL)
+            pt.done, pt.rc = True, 1                      # the ORIGINAL child refuses
+            self.assertTrue(_wait_for(lambda: not pt.done, timeout=1),
+                            "the attach swap never landed")
+            self.assertTrue(pt.starting, "must still be SET mid-recovery -- see test_5")
+            pt.done, pt.rc = True, 1                      # ...and the ATTACH child itself dies
+            t.join(timeout=term_vt.BACKSTOP_WINDOW + 2)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(fork_calls, [self.FULL_SID])
+        self.assertFalse(pt.starting, "the fork-fallback exit must still clear starting")
+
+    def test_10_abandoned_swap_mid_attach_still_clears_starting_and_never_forks(self):
+        """The ABANDONED half of `_retry_with_attach` (`pt.closing` flips mid-swap, see that
+        function's docstring and test_3b above), driven through the FULL `_resume_backstop` loop
+        rather than in isolation. `pt.closing` is flipped from inside the faked `_fork_child` --
+        exactly where the real race lands: after the replacement child is spawned, before
+        `_retry_with_attach`'s `_LOCK`-guarded check-then-act ever reads it -- so the REAL
+        `_retry_with_attach` takes its abandoned branch and returns True without touching
+        `pt.done`/`pt.rc` (they stay at the ORIGINAL refusal's True/1). Back in `_resume_backstop`,
+        `not pt.closing` then blocks the attach-child-died branch from ever firing even though
+        `pt.done`/`pt.rc` look exactly like a dead attach child -- so this loop can only end via
+        BACKSTOP_DONE_GRACE expiry, and its `finally` must still be the one to clear `starting`,
+        with NO fork ever attempted for a pane the user already asked to destroy."""
+        orig = (term_vt.BACKSTOP_WINDOW, term_vt.BACKSTOP_DONE_GRACE, term_vt.BACKSTOP_POLL)
+        term_vt.BACKSTOP_WINDOW = 2.0
+        term_vt.BACKSTOP_DONE_GRACE = 0.05
+        term_vt.BACKSTOP_POLL = 0.02
+        try:
+            pt = _bare_pty(tid="streamrec10")
+            pt.starting = True
+
+            def _fake_fork_then_close(cwd, argv, cols, rows):
+                pt.closing = True     # the (checked int) equivalent of the user clicking X while
+                                       # the attach child is still being spawned
+                return (999999999, -1)   # a pid past any real PID range and an already-invalid
+                                          # fd -- the abandoned branch's cleanup (os.close/
+                                          # os.killpg/os.waitpid) tolerates both not existing,
+                                          # every one of those calls is guarded by its own
+                                          # except clause in _retry_with_attach
+
+            with mock.patch.object(term_vt, "_fork_child", _fake_fork_then_close), \
+                 mock.patch.object(term_vt, "_retry_with_fork") as fork_fallback:
+                t = threading.Thread(target=term_vt._resume_backstop,
+                                      args=(pt, self.FULL_SID, False, 80, 24))
+                t.start()
+                self._feed(pt, TestResumeBackstopAttachRecovery.CURRENT_REFUSAL)
+                pt.done, pt.rc = True, 1                  # the ORIGINAL child refuses
+                t.join(timeout=term_vt.BACKSTOP_WINDOW + 2)
+            self.assertFalse(t.is_alive(), "the backstop thread never returned")
+            self.assertTrue(pt.closing)
+            self.assertFalse(pt.starting, "an abandoned mid-attach swap must still clear "
+                                           "starting -- the finally is the only owner left")
+            fork_fallback.assert_not_called()
+        finally:
+            term_vt.BACKSTOP_WINDOW, term_vt.BACKSTOP_DONE_GRACE, term_vt.BACKSTOP_POLL = orig
 
 
 class TestRetryWithFork(unittest.TestCase):

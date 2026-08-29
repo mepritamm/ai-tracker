@@ -73,3 +73,24 @@ confusion of editing a fork while expecting the original to move.
 **Non-existent ids currently start a brand-new session** rather than failing. If someone opens a
 terminal on a session whose log was deleted, they silently get a fresh conversation instead of an
 error. Probably worth refusing explicitly. Low priority, but it is the same class of surprise.
+
+---
+
+## UPDATE (2026-08-30): Fix direction changed — `attach` is now available
+
+The recommendation above assumed fork was the only programmatic route. That is no longer true.
+
+**New finding:** `claude attach <id>` now exists and **opens the live background agent without forking**.
+Unlike `--fork-session` (which creates a new session id), `attach` opens the *original running session*.
+
+**Revised recommendation:**
+
+1. **Detect background agents correctly** (via `sessionKind: "bg"` in the log, not `source == "sdk-cli"`).
+2. **Use `claude attach <id>` as the primary path** when the terminal detects a background agent.
+3. **Use `--fork-session` only as a fallback** (e.g. if `attach` is not available on older CLI versions, or if the user explicitly chooses to fork in a UI option).
+4. **Keep the refusal-string safety net** from Option C — if a `--resume` exits non-zero and matches the known refusal, try `attach` first, then `--fork-session` as a final fallback.
+
+This changes the mental model from "fork is the fix" to "fork is a last resort." The user now gets the 
+real session by default, not a copy.
+
+Original text preserved above for audit trail.

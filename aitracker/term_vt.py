@@ -1721,6 +1721,33 @@ refusal is still completely silent -- `text` stays empty, `first_output_at` stay
 clear never fires for it. An ordinary resume, by contrast, starts painting well inside 0.5s, so
 its `starting` placeholder clears promptly instead of sitting through the full BACKSTOP_WINDOW."""
 
+ATTACH_SETTLE = 4.0
+"""How long `_resume_backstop` watches a swapped-in `claude attach` child (see
+`_retry_with_attach`) before concluding the recovery worked -- at which point it RETURNS, and its
+`finally` clears `Pty.starting` on the way out. The sibling of BACKSTOP_SETTLE for the one child
+that constant cannot judge.
+
+**ANCHORED ON THE SWAP, NOT ON OUTPUT -- and that is the whole point of it being a separate
+constant.** The obvious implementation is to re-arm BACKSTOP_SETTLE's own machinery for the
+replacement child (reset `first_output_at`, drop `buf`) and let "first printable output + 0.5s"
+decide again. That was tried and it DOES NOT WORK, for a reason nothing about the constants
+suggests: `_retry_with_attach` calls `_feed_note`, and `_feed_note` pushes its line through
+`_tee_raw` onto every `pt.raw_queues` entry -- INCLUDING this watcher's own queue. So the
+re-armed clock anchors on OUR OWN injected note, roughly at the swap, and fires ~0.5s later no
+matter what the attach child is doing; measured, the churn came straight back at attach
+lifetimes past 0.5s. Any future output-anchored scheme hits the same wall. Don't re-try it.
+
+**WHY 4.0.** What must NOT happen is the settle firing while a failing attach is still on its way
+to dying -- that hands the user a dead pane instead of the fork fallback, which is the original
+bug. The measured death of the analogous child (a refused `claude --resume`, same binary, same
+cold start dominating) is 2.61s: prints at 2.05s, exits at 2.61s (see BACKSTOP_WINDOW). Add
+BACKSTOP_POLL of observation lag and the number to beat is ~2.7s. 4.0 leaves ~1.3s of margin,
+about 50% over measured, and is deliberately biased LONG: the two failure directions are not
+symmetric -- too short costs the user a dead terminal, too long costs them a slightly longer
+"starting…". It is also exactly half of BACKSTOP_WINDOW, which is the placeholder the pane would
+otherwise sit through, and it stays well clear of that outer bound so the deadline never
+pre-empts this."""
+
 
 def _feed_note(pt, text):
     """Record a LATE-firing Option-C event (see the section docstring above) on EVERY channel a
@@ -1874,6 +1901,129 @@ def _retry_with_fork(pt, sid, cols, rows):
         pt.starting = False
 
 
+def _retry_with_attach(pt, sid, target, cols, rows):
+    """The PREFERRED one-shot retry for a bg-agent refusal: re-exec `claude attach <target>`
+    and swap THAT child into this same `Pty` -- same tty id the client already holds, fresh
+    `Screen`, a new `_reader` thread. Deliberately modelled line-for-line on `_retry_with_fork`
+    above and reusing its swap machinery (the `_LOCK` mutual exclusion against `close_pty`, the
+    abandoned-swap cleanup, the replacement reader thread) -- see that function's long comments
+    for WHY each of those pieces is shaped the way it is. A second, subtly-different swap
+    mechanism next to it would be the next bug. The ONE piece deliberately NOT copied is that
+    function's `pt.starting = False`: the fork retry is terminal and this one is not, so clearing
+    it here would advertise "settled" mid-recovery -- see the comment at the end of this function,
+    and do not "restore the symmetry" without reading it.
+
+    **WHY THIS RUNS BEFORE THE FORK.** Both retries answer the same refusal, but they hand the
+    user two very different things. `--fork-session` branches a COPY off the transcript under a
+    brand-new session id: the live agent keeps running in the background, untouched, and the
+    pane the user is looking at is a duplicate that will diverge from it -- which is why the
+    fork retry, though it always "worked", never actually resumed anything from the user's point
+    of view. `claude attach <short-id>` re-enters the REAL, still-running session: same id, same
+    agent, the thing the user asked for when they clicked resume. So attach is the answer and
+    the fork is the consolation prize -- tried only if attach cannot be attempted or its own
+    child dies (see `_resume_backstop`'s fallback branch), because a copy still beats a dead
+    terminal.
+
+    THREE things this deliberately does NOT do, all for one reason -- **an attach re-enters an
+    EXISTING session, it does not create one**:
+      * no `store.capture_fork_snapshot` / no `store.record_fork` -- there is no parent/child
+        lineage to record. The id the user is now talking to IS `sid`; inventing a fork edge
+        for it would poison store.py's fork lineage with a child that never existed.
+      * no `pt.forked = True` -- the `⑂ fork` chip means "this pane is a copy". On an attach it
+        would be a lie in the one direction that matters to the user.
+      * no `--fork-session` anywhere in `argv`.
+
+    Returns True when a replacement child was installed -- and also on the `abandoned` path,
+    where one was spawned and then deliberately reaped because the user closed the pty
+    underneath us (there is nothing to fall back TO once the pane is gone). Returns False only
+    when no attach could be ATTEMPTED at all: an empty `target`, or a fork that raised. False is
+    the caller's signal to fall back to `_retry_with_fork`.
+    """
+    argv = term_gate.attach_argv(target)
+    if not argv:
+        # term_gate.attach_target() yielded "" -- no `claude attach <id>` hint in the refusal
+        # (the LEGACY wording carries none) and no `sid` to shorten. Nothing to attach TO.
+        print("[ai-tracker] terminal %s: no attach target for session %s -- "
+              "falling back to --fork-session" % (pt.id, sid))
+        return False
+    print("[ai-tracker] terminal %s: resume refusal backstop fired for session %s -- "
+          "retrying with `claude attach %s`" % (pt.id, sid, target))
+    try:
+        pid, fd = _fork_child(pt.cwd, argv, cols, rows)
+    except Exception as exc:
+        # Only the PARENT-side failures land here (pty.fork() out of ptys/fds, the winsize
+        # ioctl). A failed execvp does NOT: _fork_child's child exits 127 instead, which the
+        # caller's continued watch sees as "the attach child died non-zero" and falls back on
+        # exactly like a stale bg session would.
+        print("[ai-tracker] terminal %s: attach retry could not spawn for session %s: %r"
+              % (pt.id, sid, exc))
+        return False
+    screen = Screen(cols=cols, rows=rows)     # allocate before the lock; it touches nothing shared
+    # The SAME mutual exclusion as _retry_with_fork's swap, for the same reason and in the same
+    # lock order (`pt.lock` nests inside `_LOCK`; nothing in this module takes them the other way
+    # round) -- read that function's comment, this is the identical check-then-act race against
+    # `close_pty`, not a second design of it.
+    with _LOCK:
+        abandoned = pt.closing
+        if not abandoned:
+            with pt.lock:
+                pt.screen = screen
+            pt.pid, pt.fd = pid, fd
+            pt.cmd = " ".join(argv)
+            pt.done, pt.rc, pt.ended = False, None, 0.0
+            # NO `pt.forked = True` -- see the docstring. This pane is the real session.
+    if abandoned:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except (ChildProcessError, OSError):
+            pass
+        print("[ai-tracker] terminal %s: attach retry abandoned -- closed while attaching" % pt.id)
+        # True, NOT False. The pty is gone because the user clicked ✕. Reporting failure here
+        # would send the caller into `_retry_with_fork`, which would resurrect the very pane
+        # they just told us to destroy -- the exact bug the `closing` guards exist to prevent.
+        return True
+    _feed_note(pt, "[ai-tracker] note: this session was already running in the background -- "
+                   "attached to the live session with `claude attach %s`" % target)
+    threading.Thread(target=_reader, args=(pt,), daemon=True).start()
+    # **NO `pt.starting = False` HERE, and that asymmetry with `_retry_with_fork` is deliberate.**
+    # `_retry_with_fork` is TERMINAL -- every path that reaches it returns immediately after, so
+    # nothing can retry past it and "a replacement child is installed" really is the final answer
+    # to the readiness question. This function is NOT: `_resume_backstop` keeps watching the child
+    # installed above and still falls back to `_retry_with_fork` if it dies non-zero. Clearing
+    # here advertises "settled" while recovery is still in flight, and `_screen_stream_body`'s
+    # terminating condition -- `done and not starting` (see its comment, which explains that the
+    # flag exists precisely to hold the SSE stream open across a child's death) -- then fires in
+    # the gap between the attach child's exit and the fork retry reviving the pty, closing the
+    # EventSource mid-recovery. That is the reconnect churn `starting` was introduced to
+    # eliminate; a viewer copying that condition verbatim at its real 0.05s cadence closed early
+    # in 12 of 12 attach->fail->fork trials before this clear was removed.
+    #
+    # Nothing is left stuck, and there is no second clearing site to keep in sync: from here the
+    # flag is owned SOLELY by `_resume_backstop` -- this function's only caller -- whose `finally`
+    # clears it unconditionally on every exit path, including the abandoned one below and
+    # including plain window expiry. Its settle-clear stands itself down for the rest of the watch
+    # (`not attach_tried`, see there), so "recovery concluded" and "`starting` cleared" become the
+    # same instant instead of two instants with a fork retry in between.
+    #
+    # THE PRICE, stated plainly so nobody re-derives it as a bug: a SUCCESSFUL attach shows the
+    # client's "starting…" placeholder for ATTACH_SETTLE past the swap instead of painting rows
+    # immediately. That is not an oversight to optimise away in isolation -- it is the same
+    # interval during which `_resume_backstop` can still yank this child out and fork, and a pane
+    # cannot honestly claim to be settled while that is true. The earlier code made the opposite
+    # trade (clear now, accept the churn) and the churn is the symptom users actually reported.
+    # ATTACH_SETTLE exists to keep that honest interval as short as the measurements allow rather
+    # than letting it run to BACKSTOP_WINDOW; read its docstring before shortening it further.
+    return True
+
+
 def _resume_backstop(pt, sid, already_forked, cols, rows):
     """Watches a just-spawned `mode="resume"` child's raw output for up to BACKSTOP_WINDOW
     seconds, via the SAME tee `raw_stream()` uses (`pt.raw_queues`) -- not a second read of the
@@ -1883,7 +2033,13 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
        False -- a session the fast path already forked can't ALSO hit this refusal (that's
        exactly what --fork-session avoids), so there is nothing to retry. On a match (and the
        child having actually exited non-zero -- the refusal exits immediately, per the matrix),
-       retries EXACTLY ONCE via `_retry_with_fork` and returns; this function never loops.
+       it retries ONCE with `_retry_with_attach` (`claude attach <short-id>`, which gives the
+       user back the REAL live session -- see that function for why it goes first) and keeps
+       watching the replacement child in this same loop. If the attach could not be attempted,
+       or its own child then dies non-zero (a bg session that ended in the meantime, a stale
+       short id, a failed execvp), it falls back ONCE to `_retry_with_fork` and returns. Each
+       retry is one-shot: `attach_tried` gates the first and returning gates the second, so this
+       function still never loops.
     2. **The missing-transcript message** (term_gate.looks_like_missing_transcript) -- not a
        retry trigger (the CLI already recovered on its own), just records `pt.notice` and feeds
        a note so the terminal doesn't silently pretend the resumed transcript is the one shown.
@@ -1895,6 +2051,20 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
     `finally`, REGARDLESS of which way this function exits -- window expiry, an unrelated child
     exit, anything -- so a pty can never be left stuck in `starting` because this watcher gave up
     without either of the two conditions above ever resolving. Fail-open, not fail-stuck.
+
+    That settle-clear covers the ATTACH child too, and has to: `_retry_with_attach` deliberately
+    does not clear `starting` itself, because the pane must keep advertising "still settling"
+    across the WHOLE attach->(maybe fork) recovery -- fork is still fork-able right up until this
+    function returns, and a viewer told "settled" in between closes its stream mid-recovery (see
+    that function's closing comment). So once the attach branch below fires, the settle-clear
+    stands itself down (`not attach_tried`) and this `finally` becomes the SOLE owner of the flag
+    -- which also covers `_retry_with_attach`'s ABANDONED return, where a child is spawned, reaped
+    and nothing else changes. The cost of that is a successful attach sitting in the client's
+    "starting…" placeholder until this watch ends; see `_retry_with_attach` for why that is the
+    right side of the trade, and ATTACH_SETTLE for the settle-RETURN that ends the watch as soon
+    as the attach child has proved itself, so "as long as the watch runs" is ~4s and not the full
+    BACKSTOP_WINDOW. Every exit from that watch -- settled, forked, expired, abandoned -- leaves
+    through this one `finally`; there is no second clearing site to keep in sync.
     """
     q = queue.Queue(maxsize=256)
     with pt.lock:
@@ -1904,6 +2074,13 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
     first_output_at = None   # time.time() of the first non-empty `text` seen -- see BACKSTOP_SETTLE
     deadline = time.time() + BACKSTOP_WINDOW
     grace_until = None      # set once pt.done is first observed -- see BACKSTOP_DONE_GRACE
+    attach_settle_at = None  # set once, at the attach swap -- see ATTACH_SETTLE
+    attach_tried = False    # one-shot latch: at most ONE `claude attach` retry per run, and once
+                            # it is set the refusal branch below can never re-enter (`buf` still
+                            # holds the refusal text, so looks_like_bg_refusal() keeps matching --
+                            # this flag, not the matcher, is what makes the retry one-shot). The
+                            # fork retry is one-shot by construction: every path that reaches it
+                            # returns immediately after.
     try:
         while True:
             now = time.time()
@@ -1931,7 +2108,19 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
             # here is fail-open.
             if first_output_at is None and term_gate._normalize_output(text):
                 first_output_at = now
-            if (pt.starting and first_output_at is not None
+            # `not attach_tried` STANDS THIS CLAUSE DOWN once an attach is in flight, and it is
+            # load-bearing rather than belt-and-braces. This clause answers "is the ORIGINAL
+            # resume ordinary?"; after a refusal that question is settled (it wasn't) and the only
+            # open question is the attach child's fate, which this clause is not equipped to
+            # judge -- an attach failure prints no marker at all (see the fallback branch below),
+            # so `not looks_like_bg_refusal(text)` says nothing about it. Left un-gated it would
+            # also fire ACCIDENTALLY: `buf` keeps only the last BACKSTOP_SCAN_BYTES, so a chatty
+            # attach child (a long transcript replaying into the pane -- the good case!) pushes
+            # the refusal text out of the scanned tail, the refusal clause goes true, and
+            # `starting` clears while a fork fallback is still possible. That is exactly the
+            # premature clear removed from `_retry_with_attach` -- read its closing comment --
+            # arriving by a second route. From here the `finally` owns the flag.
+            if (pt.starting and not attach_tried and first_output_at is not None
                     and now - first_output_at >= BACKSTOP_SETTLE
                     and not pt.done and not term_gate.looks_like_bg_refusal(text)):
                 with pt.lock:
@@ -1943,7 +2132,7 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
                 _feed_note(pt, "[ai-tracker] note: " + pt.notice)
                 print("[ai-tracker] terminal %s: missing-transcript notice fired for session %s"
                       % (pt.id, sid))
-            if (not already_forked and pt.done and pt.rc not in (0, None)
+            if (not already_forked and not attach_tried and pt.done and pt.rc not in (0, None)
                     and not pt.closing and pt.rc != -signal.SIGKILL
                     and term_gate.looks_like_bg_refusal(text)):
                 # Two guards, because they catch different actors, and the intent one is the
@@ -1959,7 +2148,84 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
                 # RESURRECTS the pty it was just told to destroy: _retry_with_fork resets `done`
                 # back to False and forks a --fork-session child nobody asked for, so close
                 # returns 200 while the slot never frees.
+                #
+                # ATTACH FIRST, FORK ONLY IF ATTACH ISN'T POSSIBLE. The refusal itself tells us
+                # the command that works -- "Run `claude attach e30d3b6a` to open it" -- and that
+                # command hands the user back the LIVE session they clicked resume on.
+                # `--fork-session` only ever hands them a COPY that diverges from the agent still
+                # running in the background, which is why this recovery "worked" for a year while
+                # the user's actual complaint ("it never really resumed") stayed true. So the fork
+                # is demoted to the fallback: it is still strictly better than a dead pane, and
+                # nothing else here changes. See `_retry_with_attach`'s docstring.
+                target = term_gate.attach_target(text, sid)
+                if target and _retry_with_attach(pt, sid, target, cols, rows):
+                    attach_tried = True
+                    # Keep watching the REPLACEMENT child in THIS loop rather than starting a
+                    # second watcher thread -- the attach can itself fail (the bg session ended
+                    # between the refusal printing and us attaching, or the short id is stale),
+                    # and a terminal left dead is exactly what this backstop exists to prevent.
+                    # Three resets are what make that continued watch real rather than nominal:
+                    #   `grace_until` -- already armed by the REFUSED child's own exit on an
+                    #     earlier tick, it would end this loop within BACKSTOP_DONE_GRACE and the
+                    #     attach child's fate would never be observed. It belonged to a process
+                    #     that no longer exists.
+                    #   `deadline` -- the original is measured from the ORIGINAL spawn and a
+                    #     refusal burns ~2.6s of it (see BACKSTOP_WINDOW), leaving too little for
+                    #     an attach's own ~2s cold start to fail inside. A just-spawned child gets
+                    #     a full BACKSTOP_WINDOW; that is what the constant means, and this is the
+                    #     same kind of watch over the same kind of child.
+                    #   `attach_settle_at` -- ARMS the settle-return below, the one thing that
+                    #     ends this continued watch on success rather than on expiry. See
+                    #     ATTACH_SETTLE, and note it is anchored HERE, on the swap, not on any
+                    #     output.
+                    # `pt.starting` is deliberately NOT among them: it stays SET for the whole of
+                    # this continued watch, because a fork fallback is still possible for the
+                    # whole of this continued watch. Neither `_retry_with_attach` nor the
+                    # settle-clear above will touch it now (see both) -- the `finally` clears it
+                    # when this watch genuinely ends, and that is the point.
+                    grace_until = None
+                    deadline = time.time() + BACKSTOP_WINDOW
+                    attach_settle_at = time.time() + ATTACH_SETTLE
+                    continue
                 _retry_with_fork(pt, sid, cols, rows)
+                return
+            if (attach_tried and pt.done and pt.rc not in (0, None)
+                    and not pt.closing and pt.rc != -signal.SIGKILL):
+                # The attach child ITSELF died non-zero: a stale short id, a bg session that
+                # ended in the seconds since the refusal printed, or _fork_child's own exit 127
+                # from a failed execvp. No marker match is required -- an attach that exits
+                # non-zero has already said everything there is to say -- but the same two
+                # "did WE kill it" guards as the branch above still apply verbatim, and for the
+                # identical reasons: without them a ✕ landing during the attach watch would be
+                # read as an attach failure and fork a child nobody asked for.
+                # Reachable at most once: `attach_tried` can only be set by the branch above
+                # (itself one-shot), and this branch returns.
+                print("[ai-tracker] terminal %s: `claude attach` retry exited rc=%r for session "
+                      "%s -- falling back to --fork-session" % (pt.id, pt.rc, sid))
+                _retry_with_fork(pt, sid, cols, rows)
+                return
+            if (attach_settle_at is not None and now >= attach_settle_at and not pt.done):
+                # THE ATTACH WORKED. The replacement child has been alive for ATTACH_SETTLE --
+                # comfortably past the point a failing one would have died and been caught by the
+                # branch directly above, which is checked FIRST on every tick precisely so a dead
+                # child is never mistaken for a settled one.
+                #
+                # This RETURNS rather than clearing `pt.starting` in place, and that distinction
+                # is the entire reason this is safe. Clearing here and watching on would recreate
+                # the very hole removed from `_retry_with_attach`, just narrower: a window in
+                # which the pane says "settled" while a fork fallback is still armed. Returning
+                # instead retires the fallback and clears the flag in the SAME breath -- the
+                # `finally` below does the clearing -- so "recovery concluded" and "`starting`
+                # cleared" remain one instant with nothing in between, exactly as they are on the
+                # expiry path. The invariant is preserved; only the wait gets shorter.
+                #
+                # What it costs: an attach that dies LATER than ATTACH_SETTLE no longer gets the
+                # fork fallback. That is a deliberate, bounded trade -- see ATTACH_SETTLE for the
+                # measured margin behind the number -- and it degrades to ordinary end-of-life
+                # (the child died, the stream closes, which is correct once recovery is over),
+                # not to the stuck pane this backstop exists to prevent.
+                print("[ai-tracker] terminal %s: `claude attach` retry settled for session %s"
+                      % (pt.id, sid))
                 return
             if pt.done and grace_until is None:
                 grace_until = time.time() + BACKSTOP_DONE_GRACE
@@ -1967,7 +2233,8 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
         # Fail-open, unconditional: however this function is exiting (window expiry, an
         # already_forked resume with nothing to detect, an unrelated done -- anything), a pty
         # must never be left stuck in `starting` just because neither the settle-clear above nor
-        # `_retry_with_fork` happened to run. See this function's own docstring.
+        # `_retry_with_attach`/`_retry_with_fork` happened to run. See this function's own
+        # docstring.
         with pt.lock:
             pt.starting = False
             if q in pt.raw_queues:

@@ -5,6 +5,13 @@ machine (`~/.claude/projects/**/*.jsonl`) under a PTY harness, capturing the fir
 seconds of output, and killing the process group. No session was left running. See
 "Method" and "Cleanup" at the end.
 
+## LOAD-BEARING WORDING ALERT
+
+**The refusal messages below are matched by `aitracker/term_gate.py:BG_REFUSAL_MARKERS`.** 
+A silent CLI wording change breaks the terminal's resume backstop. When you next capture output, 
+re-run the `claude --resume <id>` test against a real background-agent session and update the 
+verbatim blocks below. Do not guess the wording from the help text — capture it live under PTY.
+
 ## TL;DR — the matrix
 
 | Session state | Command | Result | Recommended command |
@@ -16,18 +23,17 @@ seconds of output, and killing the process group. No session was left running. S
 | Non-existent session id | `claude --resume <id>` | Prints `No conversation found with session ID: <id>` **then falls through and starts a brand-new interactive session** in the current directory — it does not just exit. | n/a — treat as "start fresh," but tell the user the id was wrong. |
 | (n/a) | `claude agents` (bare) | **Interactive-only** full-screen picker/dashboard (columns: "Needs input" / "Ready for review" / "Completed"). Takes no id argument. Not scriptable. | Use for a human to browse, not for a script. |
 | (n/a) | `claude agents --json` | **Non-interactive**, exits immediately, no TTY required. Prints every session (`kind: "interactive"` or `"background"`) with `sessionId`, `state`, `status`, `pid`, `cwd`, `name`. **Does not attach to anything** — read-only listing. | Use this to *look up* the id, then `claude --resume <id> --fork-session` to actually open it. |
+| Background agent (any status) | `claude attach <id>` | **Opens the live background agent in this terminal.** Does not fork; attaches to the real running session. | **Preferred way to open a live background agent** — opens the original session, not a copy. |
+| Background agent (any status) | `claude stop <id>` or `claude kill <id>` | **Stops the background agent.** The session's conversation is kept and can be resumed later. After stopping, `claude --resume <id>` works, or re-open via `claude attach <id>`. | Use to halt a running agent; the transcript is preserved. |
 
 ## Ground truth per question the user asked
 
 **Is there a non-interactive way to attach to a live background agent?**
-No. `claude agents --json` is the only non-interactive command touching background
-agents, and it only *lists* them (id, state, status, pid, cwd, name) — it has no
-attach/id argument. `claude agents` (bare) is a full-screen interactive picker with no
-id argument either (confirmed by observing it live: a dashboard with a
-"describe a task for a new session" prompt box, navigated by arrow keys). The only way
-to actually open a background agent's transcript is `claude --resume <id>` (which
-refuses) or `claude --resume <id> --fork-session` (which works). There is no
-`claude agents attach <id>` or equivalent.
+Yes, as of 2026-08-30: **`claude attach <id>`** opens the live background agent in this 
+terminal. Unlike `--fork-session` (which creates a new session id branched from the transcript), 
+`attach` opens the *real* running session without forking. `claude agents --json` lists all 
+sessions and their ids, and can be piped directly to `attach` for programmatic use. 
+(Earlier testing found no such command; this is new.)
 
 **Does `--fork-session` work on a non-agent session too, or does it error?**
 It works, no error, on every session state tested: plain sessions (fresh or weeks
@@ -127,25 +133,27 @@ equivalently, showing up with `"kind":"background"` in `claude agents --json`).
 
 ## Verbatim captured output
 
-### `claude --resume <id>` on a background agent (blocked state) — refuses, exits immediately
+### `claude --resume <id>` on a background agent — refuses, exits immediately
+
+**Current wording (CLI v2.1.241+, as of 2026-08-30):**
+
+```
+Session e30d3b6a-046e-483b-b0f5-e0a1d692abfa is running as a background 
+session (e30d3b6a). Run `claude attach e30d3b6a` to open it, or `claude stop 
+e30d3b6a` first to resume it here. Add --fork-session to branch off a copy instead.
+```
+Process exit status: `EXITED code=1` (self-terminated — did not need to be killed).
+
+**Previous wording (CLI v2.1.241 and earlier, for comparison):**
 
 ```
 Session e4e6bdd6-937b-4b4a-ac2f-9a8c7789e5b7 is currently running as a
 background agent (bg). Use `claude agents` to find and attach to it, or add
 --fork-session to branch off a copy.
 ```
-Process exit status: `EXITED code=1` (self-terminated — did not need to be killed).
 
-### `claude --resume <id>` on a background agent (done state) — identical refusal
-
-```
-Session eb5db9b4-4c93-41ab-9b2d-1b7c08518dc8 is currently running as a
-background agent (bg). Use `claude agents` to find and attach to it, or add
---fork-session to branch off a copy.
-```
-Same message verbatim, confirming the refusal fires regardless of whether
-`claude agents --json` reports the agent's `state` as `"blocked"` or `"done"` — only
-`sessionKind:"bg"` seems to matter, not whether the agent is still actively working.
+Both phrasings produce the same exit code. `aitracker/term_gate.py:BG_REFUSAL_MARKERS` 
+matches both; update it here if a new wording is captured.
 
 ### `claude --resume <id> --fork-session` on the same background agent — succeeds
 
@@ -155,6 +163,31 @@ status line, and an active input prompt). Reached a fully interactive, idle prom
 had to be `SIGKILL`ed (`SIGTERM` alone was not enough; the fullscreen TUI appears to
 trap/ignore it while in raw terminal mode). No refusal text appeared anywhere in the
 captured output.
+
+### `claude attach <id>` on a background agent — opens the live session (new as of 2026-08-30)
+
+```
+Usage: claude attach [options] <id>
+
+Open a background session in this terminal
+```
+
+This is the **preferred method** for opening a live background agent. Unlike 
+`--fork-session`, this does not fork; it opens the original running session. The id 
+argument is required and accepts short (8-char) or full (36-char UUID) format.
+
+### `claude stop <id>` and `claude kill <id>` — stop a background agent (new as of 2026-08-30)
+
+```
+Usage: claude stop|kill [options] <id>
+
+Stop a background session. Its conversation is kept: `claude attach <id>` opens 
+it again, `claude --resume` works once it is stopped.
+```
+
+These commands halt a running background agent without losing its conversation. 
+After stopping, the session can be resumed with `claude --resume <id>` or 
+re-opened with `claude attach <id>`. Both names (`stop` and `kill`) are aliases.
 
 ### `claude --resume <id>` on a non-existent id
 
@@ -257,9 +290,23 @@ Options:
                                         background) as a JSON array and exit
                                         (for scripting; does not require a TTY)
 ```
-No `agents` subcommand or flag accepts a session id to attach; `agents` has no `attach`
-verb. (`--all` with `--json` was not separately tested — noted below as not
-determined.)
+
+**New as of 2026-08-30:** `claude attach --help` (verbatim):
+
+```
+Usage: claude attach <id>
+
+Open a background session in this terminal
+```
+
+**New as of 2026-08-30:** `claude stop --help` and `claude kill --help` (verbatim):
+
+```
+Usage: claude stop|kill <id>
+
+Stop a background session. Its conversation is kept: `claude attach <id>` opens 
+it again, `claude --resume` works once it is stopped.
+```
 
 ## What I could not determine
 
