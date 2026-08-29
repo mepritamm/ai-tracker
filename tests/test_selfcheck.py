@@ -890,4 +890,43 @@ def _run():
     assert now_erow["now_line"] == "▶ wire up retries", now_erow
     assert now_erow["model"] == "", "augment-ext has no chat transcript -- model must be \"\", never a guess"
 
+    # ---- brand mark ---------------------------------------------------------------
+    # The logo is ONE shared #brandMark symbol (index.html) that both dashboards
+    # <use>; its colours come from --brand-plate/--brand-dot + currentColor, set per
+    # theme by each shell. Before this, the control-room rail drew a generic outlined
+    # sparkle and the classic mark hardcoded the dark-theme palette (broken in light).
+    import aitracker as _ait
+    _WEB = os.path.join(os.path.dirname(_ait.__file__), "web")
+    def _read(n):
+        with open(os.path.join(_WEB, n), encoding="utf-8") as _fh:
+            return _fh.read()
+    _idx, _appcss = _read("index.html"), _read("app.css")
+    _brdjs, _brdcss = _read("ext_cr_board.js"), _read("ext_cr_board.css")
+
+    assert _idx.count("id=brandMark") == 1, "brand symbol must be defined exactly once -- shared seam, not forked"
+    # fallbacks matter: a consumer that forgets the tokens must degrade to the
+    # outline form, not an opaque black plate.
+    for _tok in ("var(--brand-plate, transparent)", "var(--brand-dot, currentColor)", "currentColor"):
+        assert _tok in _idx, "the brand symbol must take %s from the theme, not a literal" % _tok
+
+    # ...scoped to the MARK itself: unrelated chrome (the agent/shell count badges) is
+    # free to use a literal hex, but the logo must take every colour from a token.
+    import re as _re
+    _sprite = _idx.split("<svg class=brandsprite", 1)[1].split("</svg>", 1)[0]
+    _logospan = _re.search(r"<span class=logo\b.*?</span>", _idx, _re.S).group(0)
+    for _where, _frag in (("brand symbol", _sprite), ("classic logo span", _logospan)):
+        for _hex in ("#f5b443", "#29d398", "#11161f"):
+            assert _hex not in _frag, "%s must not hardcode the dark-theme hex %s" % (_where, _hex)
+
+    # both shells render the same symbol ...
+    assert 'use href="#brandMark"' in _idx, "classic sidebar logo must <use> the shared symbol"
+    assert 'use href="#brandMark"' in _brdjs, "control-room rail must <use> the shared symbol"
+    _railline = next(l for l in _brdjs.splitlines() if "class: 'cr-rail-brand'" in l)
+    assert "icon('spark'" not in _railline, "the rail brand must be the product mark, not the generic spark glyph"
+
+    # ... and each defines the tint tokens for its own theme scope
+    for _name, _css in (("app.css", _appcss), ("ext_cr_board.css", _brdcss)):
+        for _v in ("--brand-plate", "--brand-dot"):
+            assert _v in _css, "%s must define %s so the mark tints in both themes" % (_name, _v)
+
     print("selfcheck ok")

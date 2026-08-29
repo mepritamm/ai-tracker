@@ -20,8 +20,11 @@ html,body{margin:0;height:100%;background:var(--app);color:var(--text);font-fami
    fighting the live badge + 3 icon buttons for a shared 94-112px sliver (was truncated to
    "Sessi…" at tablet width). row 2: live badge (left) + theme/bell/flags icons (right). */
 .sidetop{display:flex;align-items:center;gap:8px;margin-bottom:6px}
-.sidetop .logo{width:22px;height:22px;flex:0 0 auto;display:block}
+/* The mark is one shared #brandMark symbol; its colours come from tokens that
+   already flip per theme, so it no longer hardcodes the dark-theme palette. */
+.sidetop .logo{width:22px;height:22px;flex:0 0 auto;display:block;color:var(--amber);--brand-plate:var(--chipbg);--brand-dot:var(--green)}
 .sidetop .logo svg{width:100%;height:100%;display:block}
+.brandsprite{position:absolute;width:0;height:0;overflow:hidden}
 .sidetop .ttl{font-weight:700;font-size:14px;letter-spacing:.01em;min-width:0;flex:1 1 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sidetop2{display:flex;align-items:center;gap:8px;margin-bottom:12px}
 .sidetop2 #livecount{margin-right:auto}

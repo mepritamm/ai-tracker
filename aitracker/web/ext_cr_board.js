@@ -433,6 +433,17 @@ window.CR = window.CR || {};
       return svgEl;
     }
 
+    // The rail's brand mark is the PRODUCT logo -- the #brandMark symbol defined
+    // once in index.html and shared with the classic dashboard. It used to be
+    // icon('spark'), which drew a generic outlined sparkle: a stand-in, not the
+    // logo. Colours come from tokens on .cr-rail-brand, so it tints per theme.
+    function brandMark() {
+      var wrap = document.createElement('span');
+      wrap.innerHTML = '<svg viewBox="0 0 32 32" aria-hidden="true" focusable="false">'
+        + '<use href="#brandMark"/></svg>';
+      return wrap.firstElementChild;
+    }
+
     function emoji(char, cls, label) {
       return h('span', { class: 'tn-emo' + (cls ? ' ' + cls : ''), 'aria-hidden': 'true', title: label || null },
         [char]);
@@ -560,7 +571,7 @@ window.CR = window.CR || {};
       els.rail.innerHTML = '';
 
       var header = h('div', { class: 'cr-rail-header' }, [
-        h('span', { class: 'cr-rail-brand' }, [icon('spark', '<path d="M12 2l2 7h7l-5.5 4.5L17 21l-5-4-5 4 1.5-7.5L3 9h7z"/>')]),
+        h('span', { class: 'cr-rail-brand', title: 'AI Session Tracker' }, [brandMark()]),
         h('div', { class: 'cr-rail-title-group' }, [
           h('span', { class: 'cr-rail-label' }, ['All sessions']),
         ]),

@@ -387,13 +387,16 @@
   padding: 14px 12px 10px;
   border-bottom: 1px solid var(--line-subtle);
 }
+/* Tinted from the SAME theme anchors the tn-emo-* emoji tints are derived from
+   (--text-thinking = the gold anchor, --text-link = the green anchor), so the
+   logo sits in the same colour family as the tinted emoji in both themes. */
 .tracker-next .cr-rail-brand {
-  flex: 0 0 auto;
-  width: 20px;
-  height: 20px;
-  color: var(--text-link);
+  flex: 0 0 auto; width: 20px; height: 20px;
+  color: var(--text-thinking);
+  --brand-plate: var(--surface-sunken);
+  --brand-dot: var(--text-link);
 }
-.tracker-next .cr-rail-brand svg { width: 20px; height: 20px; }
+.tracker-next .cr-rail-brand svg { width: 20px; height: 20px; display: block; }
 .tracker-next .cr-rail-title-group { min-width: 0; flex: 1; }
 .tracker-next .cr-rail-label {
   font: var(--fw-eyebrow) var(--fs-eyebrow-min)/1 var(--font-sans);
