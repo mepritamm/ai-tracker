@@ -57,11 +57,15 @@
     return el;
   }
 
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-    });
-  }
+  // FIX 4: this used to redeclare its own esc() here — an exact second copy of
+  // ext_cr_detail.js's, itself a copy of app.js's global `esc()` (app.js:7) plus quote
+  // escaping. Neither call site below (mdLite()'s markdown-lite body, a plain digit count)
+  // interpolates into an HTML attribute, so nothing here actually needs the quote
+  // handling — this file now falls through to app.js's own top-level `esc()`, reachable
+  // by bare name like every other app.js top-level declaration (no local shadow left to
+  // block it). ext_cr_detail.js keeps the one quote-escaping esc() Control Room still
+  // needs (its attribute-interpolation call sites genuinely require it); REQUIRED
+  // ADDITION: app.js's `esc()` should absorb `"`/`'` escaping so even that copy can go.
 
   // Minimal, deliberately dumb markdown-lite for copy that lives INSIDE this module's
   // own dialogs (Help lede, degraded-state copy). This is NOT capability #31 (full
@@ -93,26 +97,19 @@
     return fallbackGlyph(name, cls);
   }
 
-  // 24px grid, currentColor, ~1.75px stroke — used only when ctx.icon(name) has nothing
-  // for that name. Covers the glyph set doc 01 lists as "not emoji".
+  // FIX 5: this table used to carry all 13 of ext_cr_boot.js's GLYPHS entries (pixel-
+  // identical, verified by reading that file) just to add one extra key, 'close', that
+  // boot's table lacks. icon() above already tries ctx.icon(name) — backed by boot's
+  // table — FIRST for every name, so the duplicated entries were only ever reached as a
+  // fallback for 'close' itself, or in the (untested-in-practice) case ctx is missing
+  // entirely, in which case nothing beyond 'close' had a real local path to fall to
+  // anyway. Trimmed to the one key this file actually owns. REQUIRED ADDITION: boot's
+  // GLYPHS/icon() should absorb 'close' so this fallback table can go away completely.
   var GLYPH_PATHS = {
-    search: 'M10.5 3a7.5 7.5 0 1 0 4.66 13.4l4.72 4.72 1.42-1.42-4.72-4.72A7.5 7.5 0 0 0 10.5 3zm0 2a5.5 5.5 0 1 1 0 11 5.5 5.5 0 0 1 0-11z',
-    chevron: 'M8 5l7 7-7 7',
-    check: 'M4 12.5l5 5L20 7',
-    alert: 'M12 3l10 18H2L12 3zm0 6v5m0 3.2h.01',
-    bell: 'M12 3a5 5 0 0 0-5 5v3.4L5 15v1.5h14V15l-2-3.6V8a5 5 0 0 0-5-5zM9.5 19a2.5 2.5 0 0 0 5 0',
-    branch: 'M6 3v9a4 4 0 0 0 4 4h4M6 3a2 2 0 1 1 0 4 2 2 0 0 1 0-4zm12 4a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm-6 13a2 2 0 1 1 0-4 2 2 0 0 1 0 4z',
-    panel: 'M4 5h16v14H4zM9 5v14',
-    redo: 'M8 8h9v-4l5 5-5 5v-4H8a4 4 0 1 0 0 8h5v2H8a6 6 0 1 1 0-12z',
-    edit: 'M4 20l1-5L16 4l4 4L9 19l-5 1z',
-    clock: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zm0 4v5l4 2',
-    stop: 'M6 6h12v12H6z',
-    send: 'M3 11l18-8-8 18-2-8-8-2z',
-    close: 'M6 6l12 12M18 6L6 18',
-    spark: 'M12 2l1.8 6.2L20 10l-6.2 1.8L12 18l-1.8-6.2L4 10l6.2-1.8z',
+    close: 'M6 6l12 12M18 6L6 18'
   };
   function fallbackGlyph(name, cls) {
-    var d = GLYPH_PATHS[name] || GLYPH_PATHS.spark;
+    var d = GLYPH_PATHS[name] || GLYPH_PATHS.close;
     var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.setAttribute('viewBox', '0 0 24 24');
     svg.setAttribute('width', '16');
@@ -300,7 +297,15 @@
     _toastHost.appendChild(el);
     if (!document.hidden) arm(); // "never auto-dismiss while [the tab is] focused" — see NOTE below
 
-    if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
+    // FIX 2: gated on `soundOn` the same way app.js's own notifyDone() gates its OS
+    // Notification (app.js ~1152) — this used to fire unconditionally whenever the tab
+    // was hidden, so muting notifications (the bell toggle) still popped an OS
+    // notification for routine Control Room confirmations (renames, flag-resolves, …).
+    // `soundOn` is app.js's own top-level `let` (app.js:1112) — reachable by bare name
+    // here, same as any other app.js top-level declaration — so this reads the SAME
+    // preference rather than introducing a second one.
+    if (document.hidden && (typeof soundOn === 'undefined' || soundOn) &&
+        'Notification' in window && Notification.permission === 'granted') {
       try { new Notification(title, { body: opts.meta || '' }); } catch (e) {}
     }
     return dismiss;

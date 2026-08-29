@@ -1014,7 +1014,20 @@
         case "note-copy": {
           var idx2 = parseInt(t.getAttribute("data-idx"), 10);
           var n = (ui.lastSession && ui.lastSession.notes || [])[idx2];
-          if (n && navigator.clipboard) navigator.clipboard.writeText(n.text || "").catch(function () {});
+          // FIX 1: route through app.js's own copyNote(idx) (app.js ~1804) instead of a
+          // bare navigator.clipboard.writeText().catch(()=>{}) — that silently did nothing
+          // on a denied/unavailable Clipboard API. copyNote() reads the SAME note (by the
+          // SAME index) off app.js's `lastData`, which ctx.go()->pick() keeps pointed at
+          // whatever session this view has open, so it's the same note `n` above resolves.
+          // It already has its own navigator.clipboard + execCommand-textarea fallback.
+          // Its own toast() call writes into the classic #toasts div, which CR mode hides
+          // (ext_cr_boot.js's notifyDone wrapper documents the same gotcha) — so also emit
+          // the 'notify' bus event this module's other confirmations use, for a toast that
+          // is actually visible in Control Room.
+          if (n && typeof copyNote === "function") {
+            copyNote(idx2);
+            ctx.emit("notify", { text: "Note copied" });
+          }
           break;
         }
         case "note-remove":
@@ -1312,6 +1325,24 @@
   // continued_as (this session forked ONWARD, no equivalent in the mock) gets the
   // same card shape with a symmetric, equally short line rather than the old
   // doc-derived paragraph.
+  // FIX 3: names the target session, the same way app.js's renderForkLinks() does
+  // (app.js ~1195, its inner `label(id)`). That `label` is a `const` closed over inside
+  // renderForkLinks() itself — a function-local binding, not a top-level app.js
+  // declaration — so it is NOT reachable from here the way a top-level app.js function
+  // would be (per this module's own contract comment above). Reimplemented as
+  // forkSessionLabel() below, reading the SAME top-level `sessions` array app.js's
+  // label() reads (app.js:821, a bare top-level `let`, which — like a top-level function —
+  // is directly reachable from every Control Room module). REQUIRED ADDITION for app.js:
+  // hoist `label` out of renderForkLinks() into a top-level function (e.g.
+  // `function forkSessionLabel(id)`) so both call sites share one implementation instead
+  // of two copies of the same one-liner.
+  function forkSessionLabel(id) {
+    var list = (typeof sessions !== "undefined" && sessions) || [];
+    var hit = null;
+    for (var i = 0; i < list.length; i++) { if (list[i].id === id) { hit = list[i]; break; } }
+    return hit ? (hit.title || hit.project || id.slice(0, 8)) : id.slice(0, 8);
+  }
+
   function renderForkBanner(node, ctx, session, ui) {
     var card = ui.forkCard || qs(node, ".crd-forkcard");
     if (!card) return;
@@ -1320,7 +1351,8 @@
       qs(card, ".crd-fork-ico").innerHTML = svgIcon(ctx, "branch", "⑂");
       qs(card, ".crd-fork-label").textContent = "Forked";
       qs(card, ".crd-fork-body").textContent =
-        "You're on the original; a fresh copy continued the work.";
+        "You're on the original; a fresh copy continued the work — " +
+        forkSessionLabel(session.continued_as) + ".";
       qs(card, ".crd-fork-link").textContent = "Open the copy";
       ui.forkTarget = session.continued_as;
     } else if (session.continued_from) {
@@ -1328,7 +1360,8 @@
       qs(card, ".crd-fork-ico").innerHTML = svgIcon(ctx, "branch", "⑂");
       qs(card, ".crd-fork-label").textContent = "Forked";
       qs(card, ".crd-fork-body").textContent =
-        "You're on the copy; the original is still running.";
+        "You're on the copy; the original — " + forkSessionLabel(session.continued_from) +
+        " — is still running.";
       qs(card, ".crd-fork-link").textContent = "Open the original";
       ui.forkTarget = session.continued_from;
     } else {
