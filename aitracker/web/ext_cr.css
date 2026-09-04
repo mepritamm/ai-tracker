@@ -285,21 +285,21 @@
    ============================================================ */
 .tracker-next.is-dark {
   /* surfaces (15) */
-  --surface-page: linear-gradient(180deg, #1E1B17, #243235);
-  --surface-raised: #302A23;
-  --surface-top: #26221C;
-  --surface-sunken: #1E1B17;
-  --surface-trace: #1E1B17;
-  --surface-note: #2A1E15;
-  --surface-provenance: #243235;
-  --surface-inverse: #12100E;
-  --surface-agent-quiet: #52400F;
-  --surface-agent-active: linear-gradient(160deg, #52400F, #302A23 55%, #24352F);
-  --surface-awaiting: #6E3711;
-  --surface-failed: #642113;
-  --surface-done: #1F3227;
-  --surface-flagged: #5C2A1C;
-  --surface-signal-fill: #E5CB79;
+  --surface-page: linear-gradient(180deg, #1E1B17, #24211C);
+  --surface-raised: #2A251F;
+  --surface-top: #231F1A;
+  --surface-sunken: #1A1714;
+  --surface-trace: #1A1714;
+  --surface-note: #262B22;
+  --surface-provenance: #222E31;
+  --surface-inverse: #100E0C;
+  --surface-agent-quiet: #322A16;
+  --surface-agent-active: linear-gradient(160deg, #3D3218, #2A251F 58%, #24302B);
+  --surface-awaiting: #3A2A18;
+  --surface-failed: #3A211A;
+  --surface-done: #22322A;
+  --surface-flagged: #38241B;
+  --surface-signal-fill: #C9A33C;
 
   /* ink (13) */
   --text-primary: #FBFAF7;
@@ -321,14 +321,14 @@
   --text-eyebrow: #8FB187;
 
   /* lines (11) */
-  --line-subtle: #4A4237;
-  --line-default: #6F6455;
-  --line-strong: #A89C8B;
+  --line-subtle: #403A31;
+  --line-default: #6E6354;
+  --line-strong: #7A6E5D;
   --line-agent: #A9862C;
-  --line-awaiting: #9A4F19;
-  --line-failed: #7F2B1A;
-  --line-done: #3B5747;
-  --line-flagged: #7D3A28;
+  --line-awaiting: #B4712C;
+  --line-failed: #B85A3F;
+  --line-done: #6E9478;
+  --line-flagged: #A9714E;
   --line-focus: #8FB187;
   --line-dusk: #7E9AA6;
   --line-note: #6E8A75;

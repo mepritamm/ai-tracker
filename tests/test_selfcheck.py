@@ -7,8 +7,9 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 
-from aitracker import config
+from aitracker import config, term_vt
 from aitracker.config import LIVE_WINDOW
 from aitracker.util import _short_title, _window, _git_branch, push_when
 from aitracker.store import load_flags, save_flags, load_titles, load_tasks, load_notes, save_notes, _save_json
@@ -17,9 +18,10 @@ from aitracker.providers.claude import (
     parse_session, parse_agents, parse_shells, _match_content, _active_mtime,
     file_diffs, command_output, shell_output, agent_detail, _redirect_log,
     list_sessions, child_agent_sessions, _agent_group, _pick_parent, _mtime_and_bg, _tail_fields,
-    _is_bg_agent)
+    _is_bg_agent, _tail_scan)
 from aitracker.providers.auggie import (
-    list_auggie, parse_auggie, search_auggie, _AUGGIE_LIST_CACHE, _auggie_state)
+    list_auggie, parse_auggie, search_auggie, _AUGGIE_LIST_CACHE, _auggie_state, _auggie_fail_cmd)
+from aitracker.providers.augment_ext import AugmentVscodeProvider
 
 
 def _run():
@@ -889,6 +891,185 @@ def _run():
     now_erow = next(r for r in now_ep.list() if r["id"] == "augment-vscode:wshash-now:root")
     assert now_erow["now_line"] == "▶ wire up retries", now_erow
     assert now_erow["model"] == "", "augment-ext has no chat transcript -- model must be \"\", never a guess"
+
+    # ---- fail_cmd: board "failing" tile signal -- session-LIST dict only, every provider ----
+    # Claude: providers/claude.py's _tail_scan tracks a Bash tool_use's id -> command text, then
+    # a later tool_result's is_error flag decides pass/fail; "latest wins", like model/last_text.
+    FAIL_BASH = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "fb1", "name": "Bash", "input": {"command": "pytest -q --maxfail=1"}}]}}
+    def _fail_result(is_error):
+        return {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "fb1", "is_error": is_error, "content": "x"}]}}
+    fc_dir = tempfile.mkdtemp()
+    def _fc_write(fn, rows):
+        p = os.path.join(fc_dir, fn)
+        with open(p, "w") as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+        return p
+    p_failed = _fc_write("failed.jsonl", [FAIL_BASH, _fail_result(True)])
+    p_passed = _fc_write("passed.jsonl", [FAIL_BASH, _fail_result(False)])
+    p_norun = _fc_write("norun.jsonl", [{"type": "user", "message": {"role": "user", "content": "hi"}}])
+    assert _tail_scan(p_failed)["fail_cmd"] == "pytest -q --maxfail=1", _tail_scan(p_failed)
+    assert _tail_scan(p_passed)["fail_cmd"] is None, "a later PASS clears an earlier FAIL"
+    assert _tail_scan(p_norun)["fail_cmd"] is None, "no Bash tool_use at all -> honestly None, not a crash"
+    # EDGE CASE: a truncated/malformed trailing line must not blow up the tail scan, and a
+    # valid Bash failure seen before the garbage still counts.
+    p_trunc = _fc_write("trunc.jsonl", [])
+    with open(p_trunc, "w") as fh:
+        fh.write(json.dumps(FAIL_BASH) + "\n")
+        fh.write(json.dumps(_fail_result(True)) + "\n")
+        fh.write('{"type": "user", "message": {"content": [{"type": "tool_resu\n')   # cut mid-line
+    assert _tail_scan(p_trunc)["fail_cmd"] == "pytest -q --maxfail=1", _tail_scan(p_trunc)
+
+    # wired onto the real session-LIST dict (list_sessions()), not just _tail_scan in isolation
+    dfc = os.path.join(pdir, "-x-failcmd"); os.makedirs(dfc)
+    _mk(dfc, "s_fail.jsonl", "/x", "cli", "2026-06-02T09:00:00Z", "run the suite")
+    with open(os.path.join(dfc, "s_fail.jsonl"), "a") as fh:
+        fh.write(json.dumps(FAIL_BASH) + "\n")
+        fh.write(json.dumps(_fail_result(True)) + "\n")
+    _mk(dfc, "s_pass.jsonl", "/x", "cli", "2026-06-02T09:00:00Z", "run the suite")
+    with open(os.path.join(dfc, "s_pass.jsonl"), "a") as fh:
+        fh.write(json.dumps(FAIL_BASH) + "\n")
+        fh.write(json.dumps(_fail_result(False)) + "\n")
+    # EDGE CASE: no "cwd" field on any line -- must not crash, must fall back to "".
+    with open(os.path.join(dfc, "s_nocwd.jsonl"), "w") as fh:
+        fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": "go, no cwd anywhere"}}) + "\n")
+    ls_fc = {s["id"]: s for s in list_sessions()}
+    assert ls_fc["s_fail"]["fail_cmd"] == "pytest -q --maxfail=1", ls_fc["s_fail"]
+    assert ls_fc["s_fail"]["todo_total"] == 0, "the new field coexists fine with a session that has no todos"
+    assert "fail_cmd" in ls_fc["s_pass"] and ls_fc["s_pass"]["fail_cmd"] is None, ls_fc["s_pass"]
+    assert ls_fc["s_nocwd"]["cwd"] == "", "missing cwd field -> empty string, not a crash"
+    assert "fail_cmd" in ls_fc["s_nocwd"] and ls_fc["s_nocwd"]["fail_cmd"] is None, ls_fc["s_nocwd"]
+
+    # Auggie: same signal off launch-process tool_use / tool_result_node pairs (zero extra I/O --
+    # the chatHistory is already loaded), same "latest wins" rule.
+    assert _auggie_fail_cmd(None) is None, "no chatHistory at all -> honestly None"
+    assert _auggie_fail_cmd([]) is None
+    err_chat = [
+        {"exchange": {"response_nodes": [{"tool_use": {"tool_name": "launch-process", "tool_use_id": "lp1",
+                                                         "input_json": json.dumps({"command": "npm test"})}}]}},
+        {"exchange": {"request_nodes": [{"tool_result_node": {"tool_use_id": "lp1", "is_error": True}}]}},
+    ]
+    assert _auggie_fail_cmd(err_chat) == "npm test", _auggie_fail_cmd(err_chat)
+    ok_chat = [
+        {"exchange": {"response_nodes": [{"tool_use": {"tool_name": "launch-process", "tool_use_id": "lp2",
+                                                         "input_json": json.dumps({"command": "npm test"})}}]}},
+        {"exchange": {"request_nodes": [{"tool_result_node": {"tool_use_id": "lp2", "is_error": False}}]}},
+    ]
+    assert _auggie_fail_cmd(ok_chat) is None
+    # EDGE CASE: a launch-process call with no matching result at all (still running) -> None.
+    pending_chat = [
+        {"exchange": {"response_nodes": [{"tool_use": {"tool_name": "launch-process", "tool_use_id": "lp3",
+                                                         "input_json": json.dumps({"command": "npm test"})}}]}},
+    ]
+    assert _auggie_fail_cmd(pending_chat) is None
+    # already wired onto sess1's real fixture above (c1 "git commit" ok, c2 "pytest -q" errored,
+    # request_nodes processed in that order) -- the LATEST result (c2, failed) wins.
+    assert al[0]["fail_cmd"] == "pytest -q", al[0]
+    # EDGE CASE: an Auggie session lacking the field entirely (no "chatHistory" key at all in
+    # the on-disk JSON, not merely an empty list) -- must not crash, must come back None.
+    with open(os.path.join(config.AUGGIE_SESSIONS, "sess_nofield.json"), "w") as fh:
+        json.dump({"sessionId": "sess_nofield", "modified": "2026-06-27T05:48:03Z"}, fh)
+    _AUGGIE_LIST_CACHE.clear()
+    al_nf = {s["id"]: s for s in list_auggie()}
+    assert al_nf["auggie:sess_nofield"]["fail_cmd"] is None, al_nf["auggie:sess_nofield"]
+    _AUGGIE_LIST_CACHE.clear()
+
+    # Augment-ext (VSCode/Cursor extension): no command/tool-result stream at all -> honestly
+    # None, always -- never a guess, never omitted (augment_ext.py's _list()).
+    assert now_erow["fail_cmd"] is None and "fail_cmd" in now_erow, now_erow
+
+    # registry.all_sessions() guarantees the key on EVERY session regardless of provider
+    # (registry.py:89's setdefault) -- spot-check across every source populated above.
+    by_all = {s["id"]: s for s in all_sessions()}
+    for _sid in ("s_fail", "s_pass", "auggie:sess1", "augment-vscode:wshash-now:root"):
+        assert "fail_cmd" in by_all[_sid], "%s missing fail_cmd on the list dict" % _sid
+    assert by_all["s_fail"]["fail_cmd"] == "pytest -q --maxfail=1", by_all["s_fail"]
+
+    # a provider that FORGETS to set fail_cmd at all must still get it defaulted to None by the
+    # shared seam's setdefault -- never a KeyError reaching the client.
+    class _NoFailCmdProvider:
+        prefix = "nofc:"
+        def available(self):
+            return True
+        def list(self):
+            return [{"id": "nofc:x", "mtime": time.time()}]   # no "fail_cmd" key at all
+    import aitracker.registry as _registry_mod
+    _orig_providers = _registry_mod.PROVIDERS
+    _registry_mod.PROVIDERS = _orig_providers + [_NoFailCmdProvider()]
+    try:
+        row = next(s for s in all_sessions() if s["id"] == "nofc:x")
+        assert row["fail_cmd"] is None, "setdefault must backfill a missing fail_cmd as None: %r" % row
+    finally:
+        _registry_mod.PROVIDERS = _orig_providers
+
+    # ---- flag_text: the flag badge's text -- list dict AND detail dict, both providers ----
+    config.FLAGS_FILE = tempfile.mktemp(suffix=".json")
+    save_flags([
+        {"id": 1, "session": "s_wait", "note": "first note", "resolved": False},
+        {"id": 2, "session": "s_wait", "note": "latest note wins", "resolved": False},
+        {"id": 3, "session": "auggie:sess1", "note": "auggie flag text", "resolved": False},
+        {"id": 4, "session": "s_done", "note": "resolved, must not count", "resolved": True},
+    ])
+    by_ft = {s["id"]: s for s in all_sessions()}
+    assert by_ft["s_wait"]["flag_text"] == "latest note wins", by_ft["s_wait"]   # append-only -> last unresolved wins
+    assert by_ft["auggie:sess1"]["flag_text"] == "auggie flag text", by_ft["auggie:sess1"]
+    assert by_ft["s_done"]["flag_text"] is None, "no OPEN flag -> None, never omitted or stale"
+    assert "flag_text" in by_ft["augment-vscode:wshash-now:root"], "key always present, even unflagged"
+    assert by_ft["augment-vscode:wshash-now:root"]["flag_text"] is None
+
+    dft_wait = parse_any("s_wait")
+    assert dft_wait["flag_text"] == "latest note wins", dft_wait["flag_text"]
+    dft_auggie = parse_any("auggie:sess1")
+    assert dft_auggie["flag_text"] == "auggie flag text", dft_auggie["flag_text"]
+    dft_done = parse_any("s_done")
+    assert dft_done["flag_text"] is None, "detail dict: no open flag -> honestly None"
+    os.unlink(config.FLAGS_FILE)
+
+    # ---- term_attached (detail dict only) + pinned (detail dict, true AND false) ----
+    _pins_snap3 = config.PINS_FILE
+    config.PINS_FILE = tempfile.mktemp(suffix=".json")
+    _save_json(config.PINS_FILE, [])   # nothing pinned yet
+    assert parse_any("s_done")["term_attached"] is False, "no open terminal at all -> not attached"
+    assert parse_any("auggie:sess1")["term_attached"] is False
+    assert parse_any("s_done")["pinned"] is False, "not in pins.json -> False, never merely absent"
+
+    _ptys_snapshot = dict(term_vt.PTYS)
+    term_vt.PTYS.clear()
+    try:
+        pt = term_vt.Pty(tid="fake-term-1")
+        pt.session = "s_done"
+        pt.done = False
+        term_vt.PTYS[pt.id] = pt
+        with mock.patch("aitracker.term_vt._foreground_is_claude", return_value=True):
+            assert parse_any("s_done")["term_attached"] is True, \
+                "an open pty for this session with claude in the foreground -> attached"
+        with mock.patch("aitracker.term_vt._foreground_is_claude", return_value=False):
+            assert parse_any("s_done")["term_attached"] is False, \
+                "an open pty exists but claude isn't the foreground process -> not attached"
+        # a FINISHED pty (done=True) for this session must not count as attached
+        pt.done = True
+        with mock.patch("aitracker.term_vt._foreground_is_claude", return_value=True):
+            assert parse_any("s_done")["term_attached"] is False, "a done pty must not count as attached"
+        # a live pty against a DIFFERENT session must not leak onto this one (both providers)
+        pt2 = term_vt.Pty(tid="fake-term-2")
+        pt2.session = "auggie:sess1"
+        pt2.done = False
+        term_vt.PTYS[pt2.id] = pt2
+        with mock.patch("aitracker.term_vt._foreground_is_claude", return_value=True):
+            assert parse_any("s_done")["term_attached"] is False, "another session's pty must not attach here"
+            assert parse_any("auggie:sess1")["term_attached"] is True, "...but it does attach to ITS OWN session"
+    finally:
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(_ptys_snapshot)
+
+    _save_json(config.PINS_FILE, ["s_done", "auggie:sess1"])
+    assert parse_any("s_done")["pinned"] is True, "pinned session -> detail dict must say so"
+    assert parse_any("auggie:sess1")["pinned"] is True
+    assert parse_any("s_wait")["pinned"] is False, "un-pinned session -> False, not merely absent"
+    os.unlink(config.PINS_FILE)
+    config.PINS_FILE = _pins_snap3
 
     # ---- brand mark ---------------------------------------------------------------
     # The logo is ONE shared #brandMark symbol (index.html) that both dashboards

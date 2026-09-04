@@ -772,6 +772,14 @@
     pollMs: 'cr.pollIntervalMs',
     desktopNotif: 'cr.notif.enabled',
     sound: 'cr.notif.sound',
+    // Doc 04 capability #21's 7-chip stat row (files, commands, reads, commits, tests,
+    // tokens, branch) in the session-detail header, restored opt-in / default OFF.
+    // Client-side preference ONLY, and the reader (ext_cr_detail.js) is already wired to
+    // this EXACT contract, fixed — do not change key, value shape, or event name here:
+    // key holds the raw string "1" (show); "0" or absent means hide. NOT JSON-encoded
+    // like readPref/writePref's booleans, so it gets its own read/write pair below
+    // (readStatChipsPref/writeStatChipsPref) instead of routing through readPref/writePref.
+    statChips: 'tracker.next.statchips',
   };
 
   // Env-var chip text for each server config.json key (config.py's EDITABLE/VALIDATORS
@@ -819,6 +827,19 @@
     if (mode !== 'open' && mode !== 'collapsed') mode = 'auto';
     try { localStorage.setItem('tracker.rail.mode', mode); } catch (e) {}
     if (_ctx && typeof _ctx.emit === 'function') _ctx.emit('cr:pref', { key: 'tracker.rail.mode', value: mode });
+  }
+
+  // Detail-header stat chips (doc 04 capability #21) — live-applied via a dedicated
+  // 'cr:statchips' CustomEvent on window, which ext_cr_detail.js listens for to re-render
+  // without a reload, the same way writeRailPref emits for the rail's own listener. Both
+  // read and write are wrapped in try/catch: localStorage can throw (private windows,
+  // blocked site data) and that must never break the dialog. Absent or unreadable => OFF.
+  function readStatChipsPref() {
+    try { return localStorage.getItem(CFG_PREF_KEYS.statChips) === '1'; } catch (e) { return false; }
+  }
+  function writeStatChipsPref(on) {
+    try { localStorage.setItem(CFG_PREF_KEYS.statChips, on ? '1' : '0'); } catch (e) {}
+    window.dispatchEvent(new CustomEvent('cr:statchips', { detail: { on: on } }));
   }
 
   function cfgRow(label, envVar, sub, control, restart) {
@@ -1051,6 +1072,10 @@
           segmented([['auto', 'Auto'], ['open', 'Open'], ['collapsed', 'Collapsed']], readRailPref(), function (v) { writeRailPref(v); })));
         body.appendChild(cfgRow('Cards start folded', null, 'Every detail-view panel starts collapsed except Conversation.',
           toggleCtl(readPref(CFG_PREF_KEYS.cardsFolded, true), function (v) { writePref(CFG_PREF_KEYS.cardsFolded, v); })));
+        // Doc 04 capability #21, restored opt-in / default OFF — see the CFG_PREF_KEYS.statChips
+        // comment above for the fixed key/value/event contract this row writes to.
+        body.appendChild(cfgRow('Session stat chips', null, 'Shows a row of quick stats — files, commands, reads, commits, tests, tokens, branch — at the top of the session detail header. Off by default.',
+          toggleCtl(readStatChipsPref(), function (v) { writeStatChipsPref(v); })));
         // Fix (drift 4): 5c draws this as ONE row — "Desktop notifications + sound" —
         // not two separate toggles. Combined here, but both underlying preferences
         // still get set on every flip: `desktopNotif` (this dialog's own pref, read by
@@ -1126,14 +1151,15 @@
         body.appendChild(cfgRow('Auth', 'TRACKER_AUTH',
           'Never displayed — only whether it is set. Env-only, deliberately not editable here: writing a password typed into a browser into a plaintext file on a server that may be tunneled is a real security regression, not a convenience. Set TRACKER_AUTH and restart to change it.',
           readonlyField(srv.authSet ? 'set' : 'not set'), true));
-        body.appendChild(serverRow('Port', 'PORT', 'Rebinding a live listening socket isn’t attempted — this only takes effect the next time the server starts.',
-          function (value, onCommit) {
-            return textFieldCtl(value != null ? value : 8790, onCommit, { type: 'number', min: 1, max: 65535 });
-          }));
-        body.appendChild(serverRow('Host', 'HOST', 'Same as Port — recorded now, applied on the next start.',
-          function (value, onCommit) {
-            return textFieldCtl(value || '127.0.0.1', onCommit, { type: 'text' });
-          }));
+        // Doc 04 (§ Config → Server) specs Port/Host as "mono fields, read-only display" —
+        // no POST /api/config path for either. Rebinding a live listening socket's bind
+        // host/port from a dashboard field is a write surface the spec never sanctioned,
+        // so these render via the same readonlyField() helper the Auth row above uses,
+        // never textFieldCtl()/serverRow() (which would wire them to postConfigValue()).
+        body.appendChild(cfgRow('Port', 'PORT', 'Rebinding a live listening socket isn’t attempted — this reflects what the server is running with now.',
+          readonlyField(String((srv.cfg && srv.cfg.PORT && srv.cfg.PORT.value != null) ? srv.cfg.PORT.value : 8790))));
+        body.appendChild(cfgRow('Host', 'HOST', 'Same as Port — read-only.',
+          readonlyField(String((srv.cfg && srv.cfg.HOST && srv.cfg.HOST.value) || '127.0.0.1'))));
       } else if (active === 'Tunnel') {
         // The one-line, always-visible disclosure the security review this feature was
         // built under calls for: never hidden behind the reveal action, never a lecture.
@@ -1751,6 +1777,12 @@
     showNudgeIfNeeded: showNudgeIfNeeded,
     providerNoteFor: providerNoteFor,
     addHelpShortcuts: addHelpShortcuts,
+    // Exposed so a role="dialog" surface built outside this module's own open()/close()
+    // (currently: ext_cr_term.js's terminal overlay) can wire the SAME Tab-cycling focus
+    // trap every dialog built via open() already gets — instead of forking a second
+    // implementation. Returns the untrap cleanup fn, exactly like the internal call site
+    // above (open()) uses it.
+    trapFocus: trapFocus,
     CAPABILITIES: CAPABILITIES, // exposed read-only — tests/test_capability_table.py asserts against this directly
   };
 })();

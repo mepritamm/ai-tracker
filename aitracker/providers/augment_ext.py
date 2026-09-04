@@ -198,6 +198,10 @@ def _list(kind, prefix, src_label):
                 "pr_num": None, "pr_url": None, "pr_repo": None, "pr_state": "",  # Augment Ext has no PR extraction
                 "now_line": now_line,
                 "model": "",  # no chat transcript at all (LevelDB, unreadable stdlib-only) -- honestly unknown
+                # board "failing" tile signal -- same LevelDB gap as `model` above: no
+                # command/tool-result stream to read a pass/fail off, so honestly None
+                # rather than a guess (see ext_cr_board.js's sessionState()).
+                "fail_cmd": None,
             })
     return out
 

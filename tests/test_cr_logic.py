@@ -145,6 +145,9 @@ def make_session(id, mtime, **overrides):
         # registry.all_sessions() additions
         "pinned": False, "note_count": 0, "open_flags": 0,
         "continued_as": "", "continued_from": "",
+        # board "failing" tile signal (registry.py:89's setdefault guarantees this key on
+        # every provider's row; None means nothing failed).
+        "fail_cmd": None,
     }
     s.update(overrides)
     return s
@@ -185,10 +188,12 @@ NOW = 1_700_000_000  # fixed epoch seconds
 def _board_driver_js():
     # 1) Rank ordering must dominate recency: mtime is DELIBERATELY reversed vs. rank
     #    (the landed session is the most recent, the awaiting one the oldest) so a
-    #    recency-only sort would get this backwards.
+    #    recency-only sort would get this backwards. 'failing' (fail_cmd set) slots
+    #    between flagged and working per ext_cr_board.js's RANK table.
     rank_sessions = [
         make_session("land", NOW - 10, ended=True),
         make_session("work", NOW - 20, ended=False),
+        make_session("fail", NOW - 30, ended=False, fail_cmd="pytest -q"),
         make_session("flag", NOW - 9999, open_flags=1),
         make_session("wait", NOW - 40, waiting=True),
     ]
@@ -226,7 +231,51 @@ def _board_driver_js():
         "idle": make_session("e", NOW - 99999, ended=False),
         "boundary_live": make_session("f", NOW - (LIVE_WINDOW - 1), ended=False),
         "boundary_idle": make_session("g", NOW - LIVE_WINDOW, ended=False),
+        "failing": make_session("h", NOW - 5, ended=False, fail_cmd="pytest -q"),
+        # precedence: waiting > open_flags > fail_cmd -- a session that is BOTH
+        # waiting AND failing must still read as 'awaiting' (claim on attention first).
+        "waiting_beats_failing": make_session("i", NOW - 5, waiting=True, fail_cmd="pytest -q"),
+        "flagged_beats_failing": make_session("j", NOW - 5, open_flags=1, fail_cmd="pytest -q"),
+        # an idle (outside LIVE_WINDOW) session with a stale fail_cmd must NOT read as
+        # 'failing' -- sessionState() checks fail_cmd before the live/idle branch, so
+        # this pins that a genuinely idle session still reports 'idle', not 'failing'.
+        # THE DEFECT THIS PINS (measured on the real 957-session corpus, reports/
+        # drift/): the pre-fix `if (s.fail_cmd) return 'failing'` had no liveness
+        # check at all, so this exact shape -- a long-dead session that merely
+        # HAPPENS to carry a stale fail_cmd from whenever it last ran -- turned the
+        # board from 2 tiles into 118, 116 of them 'failing' with a median age of 7
+        # days (max 48). mtime is placed a week past LIVE_WINDOW, not just 1s past
+        # it, to match that real-world shape rather than only the boundary.
+        "idle_stale_failing": make_session("k", NOW - (LIVE_WINDOW + 7 * 86400),
+                                            ended=False, waiting=False, open_flags=0,
+                                            fail_cmd="pytest -q"),
     }
+    # 6b) 8-tile cap holds with a mix of states, failing included -- and RANK still
+    #     orders failing tiles ahead of plain working ones within the cap.
+    mixed_cap_sessions = (
+        [make_session("cap_wait%d" % i, NOW - i, waiting=True) for i in range(2)] +
+        [make_session("cap_fail%d" % i, NOW - i, ended=False, fail_cmd="pytest -q") for i in range(4)] +
+        [make_session("cap_work%d" % i, NOW - i, ended=False) for i in range(6)]
+    )
+
+    # 6c) THE EVICTION GUARD -- the highest-value regression, closest to the actual
+    # defect (reports/drift/): the real corpus had 957 sessions, 1 genuinely working,
+    # and 116 carrying a week-plus-stale fail_cmd. The pre-fix RANK gave 'failing' a
+    # higher claim on the board than plain 'working', with NO liveness gate, so those
+    # 116 dead sessions outranked (and, under the 8-tile hard cap, EVICTED) the one
+    # session that actually needed attention. Mirrored here at smaller scale: 5
+    # genuinely live 'working' sessions (recent mtime, no fail_cmd) plus 20 long-dead
+    # sessions (mtime well outside LIVE_WINDOW) each carrying a stale fail_cmd --
+    # enough stale sessions to fill (and overflow) the default 8-tile cap on their
+    # own if the bug were still present. The fixed sessionState() reads every one of
+    # the 20 as 'idle' (gated on liveness before fail_cmd), so boardTiles() must
+    # filter all of them out entirely and seat every one of the 5 live sessions.
+    live_working_sessions = [make_session("evict_live%d" % i, NOW - i, ended=False)
+                              for i in range(5)]
+    stale_failing_sessions = [make_session("evict_stale%d" % i, NOW - (LIVE_WINDOW + 86400 + i),
+                                            ended=False, fail_cmd="pytest -q")
+                               for i in range(20)]
+    eviction_sessions = live_working_sessions + stale_failing_sessions
 
     # 7) railOrder: pinned/unpinned partition, each newest-first.
     rail_sessions = [
@@ -305,6 +354,29 @@ def _board_driver_js():
     js.append("OUT.states = {};")
     js.append("Object.keys(stateProbe).forEach(function(k){"
               " OUT.states[k] = window.CR.board.sessionState(stateProbe[k], NOW); });")
+
+    # Board/detail agreement (conventions rule 4: one derivation, never two forked
+    # ones): the SAME session objects fed to both the board's sessionState() and the
+    # detail panel's stateOf() (ext_cr_detail.js's window.CR.detail._internal) must
+    # never disagree about whether a session is failing. stateOf() only reads
+    # mtime/fail_cmd/waiting/open_flags/agents_bg/todos off its argument -- the same
+    # list-dict session shape sessionState() already takes -- so no separate detail
+    # fixture is needed; agents_bg/todos default to [] when absent (see stateOf's
+    # own `(session.agents_bg || [])` / `(session.todos || [])`).
+    js.append("OUT.detail_agreement = {};")
+    js.append("['failing', 'idle_stale_failing', 'working', 'awaiting', 'flagged'].forEach(function(k){"
+              " var s = stateProbe[k];"
+              " var boardState = window.CR.board.sessionState(s, NOW);"
+              " var detailState = window.CR.detail._internal.stateOf(s, NOW);"
+              " OUT.detail_agreement[k] = { board: boardState, detailCls: detailState.cls, detailWord: detailState.word }; });")
+
+    js.append("var mixedCapSessions = %s;" % json.dumps(mixed_cap_sessions))
+    js.append("OUT.mixed_cap_tiles = %s;" % tiles_summary("mixedCapSessions"))
+
+    # 6c) The eviction guard: run the REAL boardTiles() over the mixed live/stale
+    # corpus and report everything the test needs to prove no eviction happened.
+    js.append("var evictionSessions = %s;" % json.dumps(eviction_sessions))
+    js.append("OUT.eviction_tiles = %s;" % tiles_summary("evictionSessions"))
 
     js.append("var railSessions = %s;" % json.dumps(rail_sessions))
     js.append("(function(){ var r = window.CR.board.railOrder(railSessions);"
@@ -497,10 +569,10 @@ class TestCRLogic(unittest.TestCase):
     # -- boardTiles: ranking + cap -----------------------------------------
 
     def test_board_tiles_rank_order(self):
-        """awaiting < flagged < working < landed, REGARDLESS of recency (mtime is
-        deliberately reversed vs. rank in the fixture)."""
+        """awaiting < flagged < failing < working < landed, REGARDLESS of recency
+        (mtime is deliberately reversed vs. rank in the fixture)."""
         got = [t["state"] for t in self.OUT["rank_order"]]
-        self.assertEqual(got, ["awaiting", "flagged", "working", "landed"])
+        self.assertEqual(got, ["awaiting", "flagged", "failing", "working", "landed"])
 
     def test_board_tiles_pinned_beats_recency(self):
         """Within the same rank, a pinned session outranks a strictly newer unpinned one."""
@@ -520,6 +592,49 @@ class TestCRLogic(unittest.TestCase):
         self.assertEqual(self.OUT["cap_five"], 5)
         self.assertEqual(self.OUT["cap_clamp_high"], 8)  # 20 clamps down to 8
         self.assertEqual(self.OUT["cap_clamp_low"], 3)   # 1 clamps up to 3
+
+    def test_board_tile_cap_holds_with_failing_tiles_present(self):
+        """12 sessions (2 awaiting + 4 failing + 6 working) at the default cap must
+        still cut off at 8, and the failing tiles must be ranked ahead of the plain
+        working ones within that cap (RANK: awaiting < failing < working)."""
+        tiles = self.OUT["mixed_cap_tiles"]
+        self.assertEqual(len(tiles), 8)
+        states = [t["state"] for t in tiles]
+        self.assertEqual(states, sorted(states, key=lambda s: {"awaiting": 0, "failing": 1, "working": 2}[s]))
+        self.assertEqual(states.count("awaiting"), 2)   # both awaiting sessions made the cut
+        self.assertEqual(states.count("failing"), 4)    # all 4 failing sessions made the cut
+        self.assertEqual(states.count("working"), 2)    # only 2 of 6 working sessions fit in what's left
+
+    def test_board_tiles_eviction_guard_stale_failing_never_displaces_live_sessions(self):
+        """THE regression test for the shipped-then-caught defect (reports/drift/):
+        pre-fix, `if (s.fail_cmd) return 'failing'` carried no liveness check, so a
+        corpus with a handful of genuinely live sessions and a pile of long-dead ones
+        that merely carry a stale fail_cmd let the dead ones outrank ('failing' > RANK
+        > 'working') and EVICT the live ones under the 8-tile hard cap -- on the real
+        957-session corpus, 2 tiles became 118, 116 of them week-plus-stale 'failing'
+        tiles, and the one live session got bumped off the board entirely.
+
+        Fixture: 5 genuinely live 'working' sessions + 20 long-dead sessions each
+        carrying a stale fail_cmd (fixture builder above). Asserts all three legs of
+        the guard: the cap still holds, every live session got a tile, and no stale
+        session did."""
+        tiles = self.OUT["eviction_tiles"]
+        self.assertLessEqual(len(tiles), 8, "the hard cap must still hold")
+        ids = [t["id"] for t in tiles if t["kind"] == "session"]
+        for i in range(5):
+            self.assertIn("evict_live%d" % i, ids,
+                          "a genuinely live session was evicted from the board")
+        for i in range(20):
+            self.assertNotIn("evict_stale%d" % i, ids,
+                             "a long-dead session with a stale fail_cmd occupied a board slot")
+        # every tile that DID make it onto the board is one of the 5 live sessions --
+        # not merely "the live ones are present among others", but "nothing else is".
+        self.assertEqual(set(ids), set("evict_live%d" % i for i in range(5)))
+        # and every one of those tiles reads as plain 'working', never 'failing' --
+        # sessionState() correctly gates fail_cmd on liveness for this corpus too.
+        states = {t["id"]: t["state"] for t in tiles if t["kind"] == "session"}
+        for i in range(5):
+            self.assertEqual(states["evict_live%d" % i], "working")
 
     def test_board_tiles_agent_no_group_regression(self):
         """Regression for the '950 sessions, 0 tiles' bug: agent:true, group:"" must
@@ -543,6 +658,14 @@ class TestCRLogic(unittest.TestCase):
         self.assertEqual(self.OUT["states"]["working"], "working")
         self.assertEqual(self.OUT["states"]["landed"], "landed")
         self.assertEqual(self.OUT["states"]["idle"], "idle")
+        self.assertEqual(self.OUT["states"]["failing"], "failing")
+
+    def test_session_state_failing_precedence(self):
+        """sessionState()'s check order is waiting > open_flags > fail_cmd > live/ended
+        -- a session that is BOTH waiting/flagged AND carries a fail_cmd must still
+        read as the higher-precedence state, never 'failing'."""
+        self.assertEqual(self.OUT["states"]["waiting_beats_failing"], "awaiting")
+        self.assertEqual(self.OUT["states"]["flagged_beats_failing"], "flagged")
 
     def test_session_state_live_window_boundary_matches_server_constant(self):
         """The 'live' cutoff is exactly aitracker.config.LIVE_WINDOW seconds — read from
@@ -550,6 +673,47 @@ class TestCRLogic(unittest.TestCase):
         server constant that the JS literal doesn't follow would be caught here."""
         self.assertEqual(self.OUT["states"]["boundary_live"], "working")
         self.assertEqual(self.OUT["states"]["boundary_idle"], "idle")
+
+    def test_session_state_stale_fail_cmd_does_not_read_as_failing(self):
+        """THE CORE REGRESSION (the defect that nearly shipped, reports/drift/): a
+        session that is NOT live (mtime well outside LIVE_WINDOW -- 7 days past it
+        here, matching the real corpus's median stale age) but still carries a
+        fail_cmd from whenever it last ran must NOT resolve to 'failing'.
+        sessionState()'s fix gates the fail_cmd check on liveness
+        (`if (live && s.fail_cmd) return 'failing';`, ext_cr_board.js:64) -- pre-fix
+        this read 'failing' unconditionally the instant fail_cmd was truthy,
+        regardless of age, which is exactly what turned a 957-session corpus's 2
+        genuinely-live tiles into 118, 116 of them week-plus-stale 'failing' ones."""
+        self.assertEqual(self.OUT["states"]["idle_stale_failing"], "idle")
+
+    # -- board/detail agreement: one derivation, not two forked ones ---------
+
+    def test_board_and_detail_agree_on_failing(self):
+        """Pins the conventions rule-4 violation that was just fixed: the board tile's
+        sessionState() (ext_cr_board.js) and the detail header's stateOf()
+        (ext_cr_detail.js) used to derive 'failing' independently -- the board off
+        `fail_cmd`, the detail off `counts.errors`/`counts.tests_failed` -- so a
+        session could read 'fail: pytest' on the board and 'Landed' in its own detail
+        header. Both now gate on the SAME `live && fail_cmd` predicate. Checked over
+        the same session objects sessionState()'s own state_probe fixture already
+        uses, across both the failing case and the stale-fail_cmd regression case."""
+        agree = self.OUT["detail_agreement"]
+        # genuinely live + fail_cmd: board says 'failing', detail says 'failed', and
+        # the detail word carries the actual command, matching the board's own word.
+        self.assertEqual(agree["failing"]["board"], "failing")
+        self.assertEqual(agree["failing"]["detailCls"], "failed")
+        self.assertEqual(agree["failing"]["detailWord"], "fail: pytest -q")
+        # the exact regression: a long-dead session with a stale fail_cmd must read
+        # as NOT failing on BOTH sides -- never 'failing'/'fail: ...' on the detail
+        # side while the board correctly says 'idle'.
+        self.assertEqual(agree["idle_stale_failing"]["board"], "idle")
+        self.assertNotEqual(agree["idle_stale_failing"]["detailCls"], "failed")
+        self.assertNotIn("fail:", agree["idle_stale_failing"]["detailWord"])
+        # sanity control: unrelated states still agree they are NOT failing on either
+        # side, so this isn't vacuously true for every session.
+        for k in ("working", "awaiting", "flagged"):
+            self.assertNotEqual(agree[k]["board"], "failing", k)
+            self.assertNotEqual(agree[k]["detailCls"], "failed", k)
 
     # -- railOrder / agentGroups --------------------------------------------
 
@@ -1146,6 +1310,325 @@ class TestCRSoundNotifications(unittest.TestCase):
         """Sanity check alongside the assertion above: the fix must not have also
         silenced the legitimate desktop alert for a genuine completion."""
         self.assertEqual(self.OUT["realCompletionStillRaisesNotification"], 1)
+
+
+# ---------------------------------------------------------------------------
+# Board "failing" tile render: stateWord(state, s) (ext_cr_board.js) is an
+# UNEXPORTED closure function -- window.CR.board only exposes the pure
+# derivations (boardTiles/sessionState/...), not this one, because it is a
+# render-time helper, not a standalone derivation. sessionState() (exported,
+# pinned above) already proves 'failing' is DERIVED correctly and RANKED
+# correctly; this section proves the remaining piece -- that a failing tile's
+# rendered DOM text is actually "fail: <command>" -- by driving the REAL
+# CR.board.mount()/update() render path against a real (tracked) DOM stub,
+# the same technique TestCRThemeScope uses above for the same reason (the
+# thing under test only exists inside a render, not a pure function).
+# ---------------------------------------------------------------------------
+
+_FAILTILE_JS_PREAMBLE = r"""
+globalThis.window = globalThis;
+
+function makeDummy() {
+  var self = {
+    classList: { add: function () {}, remove: function () {}, toggle: function () { return false; }, contains: function () { return false; } },
+    style: {}, dataset: {},
+    setAttribute: function () {}, getAttribute: function () { return null; }, removeAttribute: function () {},
+    appendChild: function (c) { return c; }, append: function () {}, remove: function () {}, insertBefore: function (c) { return c; },
+    addEventListener: function () {}, removeEventListener: function () {},
+    querySelector: function () { return self; }, querySelectorAll: function () { return [self]; },
+    closest: function () { return self; }, firstElementChild: null, children: [],
+    innerHTML: "", textContent: "", value: "", hidden: false,
+    focus: function () {}, click: function () {}, scrollIntoView: function () {}
+  };
+  return self;
+}
+var dummy = makeDummy();
+
+function queryAllReal(root, sel) {
+  var out = [];
+  if (!sel || sel.charAt(0) !== '.') return out;
+  var cls = sel.slice(1);
+  (function walk(node) {
+    (node._children || []).forEach(function (c) {
+      if (c && c._classes && c._classes.has(cls)) out.push(c);
+      walk(c);
+    });
+  })(root);
+  return out;
+}
+
+function makeReal(tag) {
+  var el = {
+    tagName: String(tag || 'div').toUpperCase(),
+    _classes: new Set(),
+    _children: [],
+    _attrs: {},
+    _id: '',
+    style: {}, dataset: {},
+    hidden: false, innerHTML: '', textContent: '', value: '',
+    parentNode: null
+  };
+  el.classList = {
+    add: function () { for (var i = 0; i < arguments.length; i++) if (arguments[i]) el._classes.add(arguments[i]); },
+    remove: function () { for (var i = 0; i < arguments.length; i++) el._classes.delete(arguments[i]); },
+    toggle: function (c, force) {
+      var has = el._classes.has(c);
+      var want = (force === undefined) ? !has : !!force;
+      if (want) el._classes.add(c); else el._classes.delete(c);
+      return want;
+    },
+    contains: function (c) { return el._classes.has(c); }
+  };
+  Object.defineProperty(el, 'className', {
+    get: function () { return Array.from(el._classes).join(' '); },
+    set: function (v) { el._classes = new Set(String(v == null ? '' : v).split(/\s+/).filter(Boolean)); }
+  });
+  Object.defineProperty(el, 'id', {
+    get: function () { return el._id; },
+    set: function (v) { el._id = v; if (v) _idRegistry[v] = el; }
+  });
+  el.setAttribute = function (k, v) { el._attrs[k] = v; if (k === 'class') el.className = v; if (k === 'id') el.id = v; };
+  el.getAttribute = function (k) { return (k in el._attrs) ? el._attrs[k] : null; };
+  el.removeAttribute = function (k) { delete el._attrs[k]; };
+  el.appendChild = function (c) { if (c) { el._children.push(c); c.parentNode = el; } return c; };
+  el.append = function () { for (var i = 0; i < arguments.length; i++) el.appendChild(arguments[i]); };
+  el.insertBefore = function (c) { if (c) { el._children.push(c); c.parentNode = el; } return c; };
+  el.removeChild = function (c) { var idx = el._children.indexOf(c); if (idx >= 0) el._children.splice(idx, 1); return c; };
+  el.remove = function () { if (el.parentNode) el.parentNode.removeChild(el); };
+  el.addEventListener = function () {}; el.removeEventListener = function () {};
+  el.focus = function () {}; el.click = function () {}; el.scrollIntoView = function () {};
+  el.querySelectorAll = function (sel) { return queryAllReal(el, sel); };
+  el.querySelector = function (sel) { return queryAllReal(el, sel)[0] || null; };
+  el.closest = function () { return null; };
+  Object.defineProperty(el, 'firstElementChild', { get: function () { return el._children[0] || null; } });
+  Object.defineProperty(el, 'lastChild', { get: function () { return el._children[el._children.length - 1] || null; } });
+  Object.defineProperty(el, 'children', { get: function () { return el._children.slice(); } });
+  return el;
+}
+
+var _idRegistry = {};
+var docBody = makeReal('body');
+
+window.document = {
+  createElement: function (tag) { return makeReal(tag); },
+  createElementNS: function (ns, tag) { return makeReal(tag); },
+  createTextNode: function (text) { var t = makeReal('#text'); t.textContent = text; return t; },
+  getElementById: function (id) { return _idRegistry[id] || dummy; },
+  querySelector: function (sel) { return queryAllReal(docBody, sel)[0] || null; },
+  querySelectorAll: function (sel) { return queryAllReal(docBody, sel); },
+  addEventListener: function () {}, removeEventListener: function () {}, dispatchEvent: function () {},
+  documentElement: dummy, body: docBody, head: dummy, readyState: "complete"
+};
+
+var _FT_STORAGE = {};
+window.localStorage = {
+  getItem: function (k) { return (k in _FT_STORAGE) ? _FT_STORAGE[k] : null; },
+  setItem: function (k, v) { _FT_STORAGE[k] = String(v); },
+  removeItem: function (k) { delete _FT_STORAGE[k]; }
+};
+window.matchMedia = function () { return { matches: false, addEventListener: function () {}, addListener: function () {}, removeEventListener: function () {} }; };
+window.fetch = function () { return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); }, text: function () { return Promise.resolve(""); }, headers: { get: function () { return null; } } }); };
+// setTimeout is a NO-OP (never invokes its callback) -- ext_cr_boot.js's queued
+// setTimeout(init, 0) must NOT auto-run here: this driver calls
+// CR.board.mount()/update() directly, against its own hand-built root, once per
+// scenario, so nothing else may mount first.
+window.setTimeout = function () { return 0; };
+window.setInterval = function () { return 0; };
+window.clearInterval = function () {}; window.clearTimeout = function () {};
+window.location = { href: "", search: "", pathname: "/", host: "localhost" };
+window.navigator = { userAgent: "node", clipboard: { writeText: function () { return Promise.resolve(); } } };
+window.CustomEvent = function (type, opts) { this.type = type; this.detail = opts && opts.detail; };
+window.Event = window.CustomEvent;
+window.requestAnimationFrame = function () { return 0; };
+window.getComputedStyle = function () { return { getPropertyValue: function () { return ""; } }; };
+window.getSelection = function () { return { toString: function () { return ""; } }; };
+window.addEventListener = function () {}; window.removeEventListener = function () {}; window.dispatchEvent = function () {};
+window.URLSearchParams = function () { return { get: function () { return null; } }; };
+process.on("unhandledRejection", function () {});
+
+try {
+"""
+
+_FAILTILE_JS_MID = r"""
+} catch (e) {
+  console.error("BUNDLE-THREW: " + (e && e.stack || e));
+  process.exit(1);
+}
+"""
+
+_FAILTILE_JS_TAIL = r"""
+// Every scenario gets its OWN fresh root (a real mount() call rebuilds the whole
+// shell from scratch), so tiles from an earlier scenario can never leak into a
+// later one's query, even though old roots stay attached to docBody.
+function renderOneTile(session) {
+  var root = makeReal('div');
+  docBody.appendChild(root);
+  window.CR.board.mount(root, {});
+  window.CR.board.update({ sessions: [session], now: NOW });
+  var stateEls = queryAllReal(root, '.cr-tile-state');
+  if (!stateEls.length) return null;
+  var textNode = stateEls[0]._children[0];
+  return textNode ? textNode.textContent : '';
+}
+
+var NOW = %(now)d;
+var out = {};
+out.failing = renderOneTile(%(failing)s);
+out.awaiting = renderOneTile(%(awaiting)s);
+out.flagged = renderOneTile(%(flagged)s);
+
+console.log("===CR_FAILTILE_JSON_START===");
+console.log(JSON.stringify(out));
+"""
+
+
+def _failtile_driver_js():
+    bundle_html = _read_page()
+    bundle_js = _extract_script_content(bundle_html)
+    now = NOW
+    failing = make_session("ft_fail", now - 5, ended=False, fail_cmd="pytest -q --maxfail=1")
+    awaiting = make_session("ft_wait", now - 5, waiting=True)
+    flagged = make_session("ft_flag", now - 5, open_flags=3)
+    tail = _FAILTILE_JS_TAIL % {
+        "now": now,
+        "failing": json.dumps(failing),
+        "awaiting": json.dumps(awaiting),
+        "flagged": json.dumps(flagged),
+    }
+    return "\n".join([_FAILTILE_JS_PREAMBLE, bundle_js, _FAILTILE_JS_MID, tail])
+
+
+def _extract_failtile_json(stdout):
+    marker = "===CR_FAILTILE_JSON_START==="
+    idx = stdout.find(marker)
+    if idx < 0:
+        raise ValueError("marker not found in node output:\n" + stdout)
+    return json.loads(stdout[idx + len(marker):].strip())
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestCRFailingTileRender(unittest.TestCase):
+    """Drives the REAL CR.board.mount()/update() render path (not just the pure
+    sessionState() derivation, pinned separately above in TestCRLogic) to prove the
+    unexported stateWord(state, s) helper actually renders "fail: <command>" onto
+    the failing tile's .cr-tile-state DOM node -- ext_cr_board.js line ~1559."""
+
+    @classmethod
+    def setUpClass(cls):
+        js = _failtile_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Failing-tile driver failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_failtile_json(stdout)
+
+    def test_failing_tile_renders_fail_colon_command(self):
+        self.assertEqual(self.OUT["failing"], "fail: pytest -q --maxfail=1")
+
+    def test_awaiting_tile_renders_its_own_word_not_failing(self):
+        """Sanity control: the render pipeline actually distinguishes states -- it
+        isn't just always emitting the same static string."""
+        self.assertTrue(self.OUT["awaiting"].startswith("Waiting on you"))
+
+    def test_flagged_tile_renders_its_flag_count_not_failing(self):
+        self.assertEqual(self.OUT["flagged"], "3 flags open")
+
+
+# ---------------------------------------------------------------------------
+# Stat-chip row preference (ext_cr_detail.js's statChipsOn(), localStorage key
+# "tracker.next.statchips"): DEFAULT OFF, "1" -> on, anything else -> off,
+# an unreadable localStorage -> off. Also an UNEXPORTED closure function --
+# window.CR.detail._internal exposes spineSegments/mergeTimeline/etc. but not
+# this one (it's a tiny render-preference getter, not one of the designed
+# testable derivations). Driving the full detail-panel render just to read one
+# preference bit is impractical here (ext_cr_detail.js's mount() builds the
+# entire evidence-panel template), so per this batch's own instructions this
+# pins the PURE PREDICATE instead -- by exposing the REAL function object
+# (never re-implementing its logic): the driver splices one extra line onto
+# window.CR.detail._internal's own literal export object in the IN-MEMORY copy
+# of the bundle text used only for this Node subprocess (aitracker/web/*.js on
+# disk is never touched), naming the same real `statChipsOn` binding its
+# neighbours in that same object already close over.
+# ---------------------------------------------------------------------------
+
+def _expose_statchips_on(bundle_js):
+    anchor = "spineSegments: spineSegments,"
+    assert bundle_js.count(anchor) == 1, "ext_cr_detail.js's _internal export shape changed"
+    return bundle_js.replace(anchor, "spineSegments: spineSegments,\n    statChipsOn: statChipsOn,", 1)
+
+
+_STATCHIPS_JS_TAIL = r"""
+var out = {};
+var K = "tracker.next.statchips";
+var fn = window.CR.detail._internal.statChipsOn;
+
+localStorage.removeItem(K);
+out.absent = fn();
+
+localStorage.setItem(K, "1");
+out.on = fn();
+
+localStorage.setItem(K, "0");
+out.explicit_off = fn();
+
+localStorage.setItem(K, "yes");            // any non-"1" string -> off, never truthy-coerced
+out.garbage_value = fn();
+
+var _realGetItem = localStorage.getItem;
+localStorage.getItem = function () { throw new Error("storage blocked"); };
+out.throwing = fn();
+localStorage.getItem = _realGetItem;
+
+console.log("===CR_STATCHIPS_JSON_START===");
+console.log(JSON.stringify(out));
+"""
+
+
+def _statchips_driver_js():
+    bundle_html = _read_page()
+    bundle_js = _expose_statchips_on(_extract_script_content(bundle_html))
+    return "\n".join([_JS_PREAMBLE, bundle_js, _JS_MID, _STATCHIPS_JS_TAIL])
+
+
+def _extract_statchips_json(stdout):
+    marker = "===CR_STATCHIPS_JSON_START==="
+    idx = stdout.find(marker)
+    if idx < 0:
+        raise ValueError("marker not found in node output:\n" + stdout)
+    return json.loads(stdout[idx + len(marker):].strip())
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestCRStatChipsPreference(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        js = _statchips_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Stat-chips driver failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_statchips_json(stdout)
+
+    def test_default_off_when_key_absent(self):
+        self.assertFalse(self.OUT["absent"])
+
+    def test_on_only_for_the_exact_string_one(self):
+        self.assertTrue(self.OUT["on"])
+
+    def test_explicit_zero_is_off(self):
+        self.assertFalse(self.OUT["explicit_off"])
+
+    def test_any_other_value_is_off_not_truthy_coerced(self):
+        self.assertFalse(self.OUT["garbage_value"])
+
+    def test_unreadable_localstorage_defaults_off(self):
+        """EDGE CASE: localStorage.getItem throwing (private mode / sandboxed
+        iframe) must degrade to OFF, never raise and never read as 'show'."""
+        self.assertFalse(self.OUT["throwing"])
 
 
 if __name__ == "__main__":

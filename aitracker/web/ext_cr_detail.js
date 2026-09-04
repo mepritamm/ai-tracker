@@ -53,13 +53,22 @@
 //
 // Fields the doc assumes but that do NOT exist in the detail dict — flagged as
 // REQUIRED ADDITIONs in the final report, not silently invented here:
-//   session.pinned, session.open_flags, session.note_count  (only on the LIST dict —
-//     registry.py:70-72 all_sessions() — never merged into parse_any()'s per-session detail)
+//   session.open_flags, session.note_count  (only on the LIST dict — registry.py:70-72
+//     all_sessions() — never merged into parse_any()'s per-session detail)
 //   a generic "links" array for the Links panel                (deriveLinks below)
-//   PR title text                                              (prs[] carries url/repo/num only)
-//   terminal pty-attached signal for the Terminal controls panel (GET /api/term/attached,
-//     keyed by a `tty` id the session detail dict never carries)
-//   a triage-queue position ("1 of 4 needing attention") for the back-line hint
+//   PR title text                                              (prs[] carries url/repo/num
+//     only — util.py:collect_prs is a regex-only URL scan; renderPRs below shows the
+//     honest "—" missing-data marker rather than letting repo/num masquerade as a title)
+//
+// session.term_attached and session.pinned WERE on this list (drift findings A4/A10) —
+// the shared seam now populates both on the per-session detail dict, so
+// renderTerminalPanel()/renderHeader() below read them directly, no longer forward-
+// compatible dead code.
+//
+// A triage-queue position ("1 of 4 needing attention") for the back-line hint is NOT
+// on this dict either (and never will be — it's a cross-session ranking, not a
+// per-session fact); ext_cr_boot.js's EXT.push now computes it separately via
+// CR.board.boardTiles() and passes it as `state.triage` to update() (drift finding A9).
 
 (function () {
   window.CR = window.CR || {};
@@ -229,6 +238,17 @@
       if (raw == null) return true; // key absent -> preserve today's behaviour
       return JSON.parse(raw) !== false;
     } catch (e) { return true; }
+  }
+
+  // ============================== stat-chip row preference ==============================
+  // PREFERENCE CONTRACT, fixed with the Config-dialog agent building the toggle
+  // (ext_cr_dialogs.js, not owned here): localStorage key "tracker.next.statchips",
+  // "1" = show, "0" or absent = hide. DEFAULT OFF. Read defensively -- localStorage
+  // can throw in some contexts (private mode, sandboxed iframes) -- any unreadable
+  // or absent value is treated as OFF, never as "show".
+  var STATCHIPS_PREF_KEY = "tracker.next.statchips";
+  function statChipsOn() {
+    try { return localStorage.getItem(STATCHIPS_PREF_KEY) === "1"; } catch (e) { return false; }
   }
 
   // ============================== derived / pure logic ==============================
@@ -619,34 +639,215 @@
   // registry.all_sessions() for the board list (registry.py:70-72) and never merged into
   // parse_any()'s per-session detail dict — so the header's state pill can't see flags
   // without that count. Treated as unknown (falsy) here.
+  //
+  // FIX (drift: two forked definitions of "failing"): this used to derive failing
+  // independently from counts.errors/counts.tests_failed, disagreeing with the board
+  // tile's own sessionState() (ext_cr_board.js), which gates on `live && s.fail_cmd`.
+  // Same predicate here now, so a session can't read "fail: pytest" on the board and
+  // "Landed" in its own detail header. `fail_cmd` is threaded onto the detail dict by
+  // the same server-side addition that put it on the list dict (registry.py) — a
+  // session that's gone stale (fail_cmd set but no longer live) reads Landed/Idle like
+  // the board does, not Failing. counts.errors/tests_failed stay exactly where they
+  // already are as DATA (statChipsHtml() below) — this only changes which source
+  // decides the failing STATE.
   function stateOf(session, nowSec) {
     var idle = nowSec - (session.mtime || 0);
     var live = idle < LIVE_WINDOW;
     var openFlags = session.open_flags || 0;
     var running = (session.agents_bg || []).some(function (a) { return a.running; });
     var inProgress = (session.todos || []).some(function (t) { return t.status === "in_progress"; });
-    var failing = session.counts && (session.counts.errors > 0 || session.counts.tests_failed > 0);
+    var failing = live && !!session.fail_cmd;
     if (session.waiting) return { word: "Waiting on you", cls: "awaiting", age: fmtAge(idle) };
     if (openFlags) return { word: openFlags + " flag" + (openFlags === 1 ? "" : "s") + " open", cls: "flagged" };
-    if (failing) return { word: "Failing", cls: "failed" };
+    if (failing) return { word: "fail: " + session.fail_cmd, cls: "failed" };
     if (live && (running || inProgress)) return { word: "Working", cls: "working" };
     if (live) return { word: "Landed", cls: "done" };
     return { word: "Idle", cls: "idle", age: fmtAge(idle) };
   }
 
-  // FIX (design-audit drift 1): 5b has NO files/commands/reads/commits/tests/branch/
-  // tokens stat-chip row under the goal — the token count is folded into the
-  // metadata line instead (renderHeader below builds it: project · branch · elapsed ·
-  // tokens, matching 5b's "ai-tracker · term-tiers · 41m · 128,412 tokens"). The old
-  // 7-chip statChips() row is gone outright, per the ruling ("the row must go"); the
-  // per-panel counts already visible in each STATE/EVIDENCE panel header (Files'
-  // "18", Commands' "42 · 1 failing", PRs' "2 · 1 merged", …) still carry files/
-  // commands/tests/commits visibility — only the bare "reads" count and the branch
-  // NAME as a standalone chip lose their old header-level home; branch itself still
-  // reappears in the metaline below.
+  // FIX (design-audit drift 1, REVERSED by owner ruling "Restore behind the Config
+  // dialog"): 5b dropped the files/commands/reads/commits/tests/branch/tokens
+  // stat-chip row outright and folded the token count into the metadata line
+  // instead (renderHeader below still builds that: project · branch · elapsed ·
+  // tokens). The row is now back, but OPT-IN and DEFAULT OFF — see statChipsOn()
+  // above and renderStatChips()/statChipsHtml() below. It renders only when the
+  // preference is on; the metaline's own token bit is untouched either way (kept
+  // for the collapsed default), so token count can appear twice when the chip row
+  // is switched on — that duplication is intentional, not a bug, since the two are
+  // read by different design decisions (5b's vs the owner's reversal of it).
   function fmtTokens(session) {
     var tokTotal = ((session.tokens && session.tokens.in) || 0) + ((session.tokens && session.tokens.out) || 0);
     return tokTotal ? fmtNum(tokTotal) + " tokens" : "";
+  }
+
+  // ============================== stat chips (doc 03 Row 3 / doc 04 capability #21) ==============================
+  // Doc's exact set, order and separator: `files 18 · commands 42 · reads 96 ·
+  // commits 3 · tests 1 failing · tokens 128,412 · branch term-tiers`. Every value
+  // is read straight off the EXISTING detail dict — no fetch, no new server field:
+  //   files    session.files.length          (claude.py:1280, auggie.py:595)
+  //   commands session.commands.length       (claude.py:1283, auggie.py:598 -- same
+  //            array the Commands panel's own header count reads, capped to the
+  //            last 60 by the parser itself, not by this file)
+  //   reads    session.counts.read            (claude.py:1307, auggie.py:614)
+  //   commits  session.counts.commits         (claude.py:1307, auggie.py:614)
+  //   tests    session.counts.tests / .tests_failed (claude.py:1308, auggie.py:614)
+  //   tokens   session.tokens.in + .out       (claude.py:1299, auggie.py:609)
+  //   branch   session.meta.gitBranch         (claude.py meta, auggie.py:587)
+  // Verified directly in both providers (not guessed) -- all seven fields exist in
+  // the shared shape for BOTH Claude and Auggie, so the doc's `N/A` ("cannot exist
+  // for this provider") branch never actually fires for either provider today;
+  // only the `--` ("could exist but doesn't", e.g. no git branch) branch is
+  // reachable, and it is the one implemented below. A genuine zero count (e.g. "no
+  // files touched yet") is a real answer, not a missing one, and renders as "0" --
+  // `--` is reserved for a field that is null/undefined, never for a fabricated 0.
+  var STAT_CHIP_MISSING = "--"; // doc's literal marker (two hyphens, not an em dash)
+
+  function statChip(label, value, opts) {
+    opts = opts || {};
+    // "mono" is the shared utility class (app.css) every other mono-set element
+    // in this file already relies on for its font-family (.crd-metaline mono,
+    // .crd-cmd-text mono, …) rather than each .crd-* rule redeclaring it.
+    var cls = "crd-statchip mono" + (opts.tint ? " crd-statchip-" + opts.tint : "");
+    var title = opts.title ? ' title="' + esc(opts.title) + '"' : "";
+    return '<span class="' + cls + '"' + title + '>' +
+      '<span class="crd-statchip-label">' + esc(label) + "</span> " +
+      '<span class="crd-statchip-val">' + esc(value) + "</span></span>";
+  }
+
+  function statChipsHtml(session) {
+    var counts = session.counts || null;
+    var filesN = session.files ? session.files.length : null;
+    var cmdsN = session.commands ? session.commands.length : null;
+    var readsN = (counts && typeof counts.read === "number") ? counts.read :
+      (session.reads ? session.reads.length : null);
+    var commitsN = (counts && typeof counts.commits === "number") ? counts.commits :
+      (session.commits ? session.commits.length : null);
+    var testsTotal = (counts && typeof counts.tests === "number") ? counts.tests : null;
+    var testsFailed = (counts && typeof counts.tests_failed === "number") ? counts.tests_failed : 0;
+    var tokTotal = session.tokens ? ((session.tokens.in || 0) + (session.tokens.out || 0)) : null;
+    var branch = (session.meta && session.meta.gitBranch) || null;
+
+    // doc: "tests is the only chip that changes colour -- brick surface/border/
+    // text when failing. Everything else stays neutral, so a coloured chip
+    // always means something."
+    var testsVal, testsFailing = false;
+    if (testsTotal == null) {
+      testsVal = STAT_CHIP_MISSING;
+    } else if (testsFailed > 0) {
+      testsVal = testsFailed + " failing";
+      testsFailing = true;
+    } else {
+      testsVal = String(testsTotal);
+    }
+
+    return [
+      statChip("files", filesN != null ? String(filesN) : STAT_CHIP_MISSING),
+      statChip("commands", cmdsN != null ? String(cmdsN) : STAT_CHIP_MISSING),
+      statChip("reads", readsN != null ? String(readsN) : STAT_CHIP_MISSING),
+      statChip("commits", commitsN != null ? String(commitsN) : STAT_CHIP_MISSING),
+      statChip("tests", testsVal, testsFailing ? { tint: "failing" } : {}),
+      statChip("tokens", tokTotal != null ? fmtNum(tokTotal) : STAT_CHIP_MISSING),
+      statChip("branch", branch || STAT_CHIP_MISSING)
+    ].join("");
+  }
+
+  // Callable both from renderHeader (every 2s poll) and from the two live-toggle
+  // listeners mount() wires up below (the Config dialog's own 'cr:statchips'
+  // dispatch, and 'storage' for a second tab) -- same function either way, so the
+  // row never drifts between "just toggled" and "next poll tick".
+  function renderStatChips(node, session) {
+    var row = qs(node, ".crd-statchips");
+    if (!row) return;
+    var on = statChipsOn();
+    row.hidden = !on;
+    if (!on) return;
+    row.innerHTML = statChipsHtml(session);
+  }
+
+  // ============================== phone: back-crumb, presence, narration, awaiting card ==============================
+  // The four pieces doc 03's "Phone layout" section names but the current build
+  // never implemented (owner ruling: "Finish it") -- additive only. Nothing here
+  // touches the progress spine, the merged conversation timeline
+  // (renderTimeline/renderLiveEntry below), or panel collapse behaviour; all three
+  // are called out as already-verified-correct and stay exactly as they are.
+
+  // Same honest "current file" derivation renderLiveEntry() already uses --
+  // session.files[0] (parser-sorted newest-`last`-first), shown only while that
+  // file's own `last` is itself inside LIVE_WINDOW. Read again here with the same
+  // rule rather than forked with a looser one.
+  function phonePresence(session, nowSec) {
+    var ov = session.overview || {};
+    var idle = nowSec - (session.mtime || 0);
+    var live = idle < LIVE_WINDOW && !!ov.now;
+    var topFile = (session.files || [])[0];
+    var fileTag = "";
+    if (topFile) {
+      var fileMs = parseT(topFile.last);
+      if (fileMs != null && (nowSec - fileMs / 1000) < LIVE_WINDOW) fileTag = basename(topFile.path);
+    }
+    return { live: live, now: ov.now || "", file: fileTag };
+  }
+
+  // Back chevron + ellipsed breadcrumb + "N/M" (doc: "back chevron + ellipsed
+  // breadcrumb + '7/11'"). The chevron button reuses the SAME data-act="back"
+  // the desktop back-line button already wires to ctx.go("board") (mount()'s
+  // delegated click handler) -- no new click logic. "N/M" is session.counts.done
+  // / .counts.todos, the SAME two numbers the progress spine's own header already
+  // shows as "7 of 11" (claude.py counts: done=len(done_todos), todos=len(todos))
+  // -- read again here rather than recomputing spineSegments() a second time.
+  function renderPhoneHead(node, session) {
+    var crumbEl = qs(node, ".crd-phonehead-crumb");
+    var progEl = qs(node, ".crd-phonehead-progress");
+    if (!crumbEl || !progEl) return;
+    var meta = session.meta || {};
+    var proj = basename(meta.cwd || "");
+    crumbEl.textContent = [proj || null, meta.gitBranch || null].filter(Boolean).join(" · ") ||
+      meta.title || "session";
+    var counts = session.counts || null;
+    progEl.textContent = (counts && typeof counts.done === "number" && typeof counts.todos === "number" && counts.todos > 0) ?
+      (counts.done + "/" + counts.todos) : "";
+  }
+
+  // 34px presence orb (state colour + the SAME state word the desktop pill shows,
+  // so colour never carries the state alone) + current file, then the live
+  // narration itself at 21px serif right below it.
+  function renderPhonePresence(node, session, nowSec) {
+    var orb = qs(node, ".crd-phone-orb");
+    var stateEl = qs(node, ".crd-phone-presence-state");
+    var fileEl = qs(node, ".crd-phone-presence-file");
+    var narrEl = qs(node, ".crd-phone-narration");
+    if (!orb || !stateEl || !fileEl || !narrEl) return;
+    var st = stateOf(session, nowSec);
+    orb.className = "crd-phone-orb crd-state-" + st.cls;
+    stateEl.textContent = st.word;
+    var pres = phonePresence(session, nowSec);
+    fileEl.hidden = !pres.file;
+    fileEl.textContent = pres.file || "";
+    narrEl.hidden = !pres.live;
+    narrEl.textContent = pres.live ? pres.now : "";
+  }
+
+  // The awaiting-question card: same source (session.decisions, open pinned
+  // first) the Decisions panel already renders in full -- this is a compact,
+  // phone-only duplicate of just the top open question, not a second data path.
+  function renderPhoneAwaiting(node, session) {
+    var card = qs(node, ".crd-phone-awaiting");
+    if (!card) return;
+    var open = (session.decisions || []).filter(function (d) { return d.open; });
+    if (!open.length) { card.hidden = true; card.innerHTML = ""; return; }
+    var d = open[0];
+    var q0 = (d.questions && d.questions[0]) || { q: "", options: [] };
+    var opts = (q0.options || []).map(function (o) {
+      return '<div class="crd-phone-awaiting-opt">' + esc(o) + "</div>";
+    }).join("");
+    card.hidden = false;
+    card.innerHTML =
+      '<div class="crd-phone-awaiting-head"><span class="tn-emo-a" aria-hidden="true">⏳</span> Waiting on you' +
+        (open.length > 1 ? '<span class="crd-phone-awaiting-more mono"> +' + (open.length - 1) + " more</span>" : "") +
+      "</div>" +
+      '<div class="crd-phone-awaiting-q">' + esc(q0.q) + "</div>" +
+      opts +
+      '<div class="crd-phone-awaiting-foot">View-only — answer in the session itself.</div>';
   }
 
   // FIX 5: the old ad-hoc `isDegradedTranscript` (meta.source/entrypoint sniffed for
@@ -707,6 +908,16 @@
         '<button class="crd-back" data-act="back">‹ Back to the board</button>' +
         '<span class="crd-back-hint mono"></span>' +
       "</div>" +
+      // Phone-only status bar (doc 03 "Phone layout": "back chevron + ellipsed
+      // breadcrumb + '7/11'"). Hidden above the phone breakpoint; see
+      // ext_cr_detail.css. The chevron reuses data-act="back" — the SAME
+      // delegated click handler `.crd-back` above already wires to
+      // ctx.go("board"), not a second back-navigation path.
+      '<div class="crd-phonehead">' +
+        '<button class="crd-phonehead-back" data-act="back" aria-label="Back to the board" title="Back to the board">‹</button>' +
+        '<span class="crd-phonehead-crumb mono"></span>' +
+        '<span class="crd-phonehead-progress mono"></span>' +
+      "</div>" +
       '<div class="crd-header">' +
         '<div class="crd-id">' +
           '<div class="crd-id-row1">' +
@@ -737,8 +948,24 @@
             '<button class="crd-rename" data-act="rename" title="Rename" aria-label="Rename session"></button>' +
             '<span class="crd-pill crd-pill-pinned" hidden><span class="tn-emo" aria-hidden="true">📌</span> Pinned</span>' +
           "</div>" +
+          // Row 3 — stat chips (doc 03 Row 3 / doc 04 capability #21). OPT-IN,
+          // DEFAULT OFF — see statChipsOn()/renderStatChips() above. `hidden`
+          // is the actual gate (renderStatChips toggles it); the class alone
+          // carries no visibility.
+          '<div class="crd-statchips" hidden></div>' +
         "</div>" +
       "</div>" +
+      // Phone-only presence orb + live narration (doc 03 "Phone layout"): "34px
+      // presence orb with 'Claude is thinking' and the current file" then "the
+      // live narration at 21px serif". Hidden above the phone breakpoint.
+      '<div class="crd-phone-presence">' +
+        '<span class="crd-phone-orb" aria-hidden="true"></span>' +
+        '<div class="crd-phone-presence-text">' +
+          '<span class="crd-phone-presence-state"></span>' +
+          '<span class="crd-phone-presence-file mono" hidden></span>' +
+        "</div>" +
+      "</div>" +
+      '<div class="crd-phone-narration" hidden></div>' +
       '<div class="crd-card crd-searchcard" hidden>' +
         '<input class="crd-search-input" type="text" placeholder="Search this session…">' +
         '<div class="crd-search-results"></div>' +
@@ -793,6 +1020,14 @@
             "</span></div>" +
           '<div class="crd-col-body"></div>' +
         "</div>" +
+        // Phone-only awaiting-question card (doc 03 "Phone layout": "the chat
+        // timeline -> the awaiting question card -> folded State and Evidence
+        // cards"). A direct grid child of .crd-columns (sibling of the three
+        // .crd-col-* blocks) so the phone breakpoint's `order` can place it
+        // between Conversation and State — see renderPhoneAwaiting() above and
+        // ext_cr_detail.css. Hidden above the phone breakpoint and whenever
+        // there is no open decision.
+        '<div class="crd-phone-awaiting" hidden></div>' +
         '<div class="crd-col crd-col-evidence">' +
           '<div class="crd-col-eyebrow">Evidence' +
             '<span class="crd-colbtns">' +
@@ -1171,6 +1406,20 @@
       else if (e.key === "k") { e.preventDefault(); stepSession(ctx, ui, -1); }
     });
 
+    // Live re-render of the stat-chip row on the Config dialog's own toggle
+    // (ext_cr_dialogs.js dispatches 'cr:statchips' on window when the pref
+    // changes — not ours to edit, only to listen for) and on 'storage' so a
+    // second tab flipping the same localStorage key stays in sync. mount()
+    // runs exactly once per page load (ext_cr_boot.js ensureMounted()'s
+    // `mounted` guard), so this never attaches twice.
+    window.addEventListener("cr:statchips", function () {
+      if (ui.lastSession) renderStatChips(node, ui.lastSession);
+    });
+    window.addEventListener("storage", function (ev) {
+      if (ev && ev.key != null && ev.key !== STATCHIPS_PREF_KEY) return;
+      if (ui.lastSession) renderStatChips(node, ui.lastSession);
+    });
+
     root._crDetail = { node: node, ui: ui };
   };
 
@@ -1270,10 +1519,14 @@
 
     renderBackline(node, session, state);
     renderHeader(node, ctx, session, nowSec);
+    renderStatChips(node, session);
+    renderPhoneHead(node, session);
+    renderPhonePresence(node, session, nowSec);
     renderForkBanner(node, ctx, session, ui);
     renderSpine(node, ctx, session, nowMs);
 
     renderDecisions(ui.panels.decisions, session);
+    renderPhoneAwaiting(node, session);
     renderPRs(ui.panels.prs, session);
     renderLinks(ui.panels.links, session);
     renderSummary(ui.panels.summary, session);
@@ -1291,8 +1544,11 @@
 
   function renderBackline(node, session, state) {
     var hint = qs(node, ".crd-back-hint");
-    // REQUIRED ADDITION: no triage-queue position (e.g. "1 of 4 needing attention") is
-    // available on the detail dict or via ctx — hidden rather than fabricated.
+    // FIX (drift A9): ext_cr_boot.js's EXT.push now computes `state.triage` (index/total
+    // within CR.board.boardTiles()'s own triage-ranked order) on every 2s poll tick and
+    // passes it through update() — this read was already here, waiting for a supplier.
+    // Still hidden (not fabricated) whenever CR.board hasn't ranked this session at all
+    // (e.g. it's idle, or board hasn't mounted yet).
     if (state && state.triage && state.triage.total) {
       hint.hidden = false;
       hint.textContent = state.triage.index + " of " + state.triage.total +
@@ -1335,6 +1591,17 @@
     var glyph = st.cls === "awaiting" ? '<span class="tn-emo-a" aria-hidden="true">⏳</span> ' :
       (st.cls === "failed" ? "" : (st.cls === "done" ? '<span class="tn-emo-d" aria-hidden="true">✅</span> ' : ""));
     pill.innerHTML = glyph + esc(st.word) + (st.age ? " · " + esc(st.age) : "");
+    // GAP CLOSE: session.flag_text (registry.py parse_any(), the unresolved flag's own
+    // text) had zero consumers — the pill above only ever showed the COUNT via
+    // stateOf()'s "N flags open". Surfaced via the pill's native `title` tooltip, the
+    // same DOM-property mechanism metaEl.title uses just above (no esc() needed — it's
+    // a property assignment, not innerHTML). null/no open flag -> removeAttribute, so
+    // there is never a stray empty tooltip.
+    if (st.cls === "flagged" && session.flag_text) {
+      pill.title = session.flag_text;
+    } else {
+      pill.removeAttribute("title");
+    }
 
     var agentsRunning = (session.agents_bg || []).filter(function (a) { return a.running; }).length;
     var agentsPill = qs(node, ".crd-pill-agents");
@@ -1349,9 +1616,11 @@
     qs(node, ".crd-goal").textContent = goal;
     qs(node, ".crd-rename").innerHTML = svgIcon(ctx, "edit", "✎");
 
-    // REQUIRED ADDITION: session.pinned is only present on the board-list dict
-    // (registry.py:70), never on parse_any()'s detail dict — hidden unless the
-    // bootstrap starts forwarding it.
+    // FIX (drift A10): session.pinned used to be present only on the board-list dict
+    // (registry.py:70), never on parse_any()'s per-session detail — the shared seam now
+    // merges it into the detail dict too, so this simple truthy read (already correct
+    // for both the pinned and unpinned case — the pill markup carries its own "📌
+    // Pinned" text, this only ever toggles `hidden`) starts actually firing.
     qs(node, ".crd-pill-pinned").hidden = !session.pinned;
 
     // FIX (design-audit drift 2): search/flag are demoted to small icon buttons in
@@ -1547,11 +1816,20 @@
     if (!prs.length) { setPanelBody(wrap, emptyHtml("No pull requests yet", "This session hasn't opened any. It will fill in as it works.")); return; }
     setPanelBody(wrap, prs.map(function (p) {
       var state = p.state === "merged" ? "merged" : (p.state === "closed" ? "closed" : "open");
-      // NOTE: the parser never captures a PR's real title (util.py:collect_prs only
-      // regex-extracts url/repo/num) — repo/num stands in for it. See REQUIRED ADDITION.
-      var label = "#" + esc(p.num || "?") + " · " + esc(p.repo || p.url);
+      // FIX (drift A12/capability #43): doc 03's PR row anatomy is "number + title" —
+      // the parser never captures a real PR title (util.py:collect_prs is a regex-only
+      // URL scan; the `prs[]` shape carries url/repo/num only, confirmed against
+      // util.py:162-220 and providers/claude.py:994/auggie.py). Previously repo/num
+      // silently stood in FOR the title with no signal that it wasn't one — this file's
+      // own missing-data convention (the "—" used by renderSummary/renderTerminalPanel
+      // above for a value that could exist but doesn't) now marks the title honestly,
+      // with repo kept alongside as a real, clearly separate identifier instead of a
+      // masquerading title.
+      var title = p.title ? esc(p.title) : "—";
+      var titleAttr = p.title ? "" : ' title="PR title isn’t captured by the parser yet"';
       return '<a class="crd-pr-row" href="' + esc(p.url) + '" target="_blank" rel="noopener">' +
-        '<span class="crd-pr-title">' + label + "</span>" +
+        '<span class="crd-pr-title"' + titleAttr + '>#' + esc(p.num || "?") + " · " + title + "</span>" +
+        (p.repo ? '<span class="crd-agent-wf mono">' + esc(p.repo) + "</span>" : "") +
         (p.agent ? '<span class="crd-tag-agent">agent</span>' : "") +
         '<span class="crd-pr-state crd-pr-' + state + '">' + state + "</span>" +
         "</a>";
@@ -1641,16 +1919,42 @@
 
   function renderCommands(wrap, session) {
     var cmds = session.commands || [];
-    var failing = cmds.filter(function (c) { return !c.ok; }).length;
-    setPanelCount(wrap, cmds.length ? cmds.length + (failing ? " · " + failing + " failing" : "") : "—");
+    var failing = cmds.filter(function (c) { return c.ok === false; }).length;
+    // FIX (drift A12/capability #41): doc 03's header text for a provider whose
+    // commands carry no real exit status is "N · status not recorded" — never
+    // implemented anywhere (grep confirmed zero hits). NOT hardcoded to a provider
+    // name: the drift report's own finding is that the doc's Auggie premise is stale
+    // — auggie.py:499/680 (same as claude.py:1173) always computes a real ok/fail
+    // boolean, so hardcoding "Auggie" here would be a NEW lie, not a fix. This checks
+    // the actual per-command signal instead: `typeof c.ok !== "boolean"` is the
+    // honest "absent" case for whichever provider/session actually lacks it. Today
+    // that's zero real commands (both providers always set a boolean), so this stays
+    // dormant for real data — same forward-compatible shape as the term_attached gate.
+    var unknown = cmds.filter(function (c) { return typeof c.ok !== "boolean"; }).length;
+    var countText = cmds.length ? String(cmds.length) : "—";
+    if (cmds.length) {
+      if (unknown === cmds.length) countText += " · status not recorded";
+      else if (failing) countText += " · " + failing + " failing";
+    }
+    setPanelCount(wrap, countText);
     // FIX (design-audit drift 5): 5b keeps the Commands panel on its normal neutral
     // background and colours only the count text ("1 failing") — no full-panel red
     // tint. Toggle the tint on the count element alone, not the whole panel.
     qs(wrap, ".crd-panel-count").classList.toggle("crd-count-failing", failing > 0);
     if (!cmds.length) { setPanelBody(wrap, emptyHtml("No commands yet", "This session hasn't run any. It will fill in as it works.")); return; }
     setPanelBody(wrap, cmds.map(function (c) {
+      var known = typeof c.ok === "boolean";
+      // FIX (drift: unrecorded status rendered as a green "ok"): `ok = known ? c.ok
+      // : true` asserted success the data never recorded, with the only disclaimer
+      // buried in a tooltip. Reuses this same panel's existing "unknown" convention
+      // (the header's "status not recorded" text a few lines up, and STAT_CHIP_MISSING's
+      // "--" marker) instead of inventing a third one: an unrecorded row shows "--",
+      // styled neutral (no crd-cmd-ok/crd-cmd-fail), never a success affordance.
+      var statusCls = known ? (c.ok ? "crd-cmd-ok" : "crd-cmd-fail") : "crd-cmd-unknown";
+      var statusText = known ? (c.ok ? "ok" : "fail") : STAT_CHIP_MISSING;
       return '<div class="crd-cmd-row" data-act="command-row" data-id="' + esc(c.id) + '">' +
-        '<span class="crd-cmd-status ' + (c.ok ? "crd-cmd-ok" : "crd-cmd-fail") + '">' + (c.ok ? "ok" : "fail") + "</span>" +
+        '<span class="crd-cmd-status ' + statusCls + '"' +
+          (known ? "" : ' title="Status not recorded for this command"') + '>' + statusText + "</span>" +
         '<span class="crd-cmd-text mono">' + esc(c.cmd) + "</span></div>";
     }).join(""));
   }
@@ -1749,12 +2053,15 @@
   }
 
   function renderTerminalPanel(wrap, session) {
-    // REQUIRED ADDITION: whether a Claude CLI is actually attached to a pty's foreground
-    // is answered by GET /api/term/attached?tty=<id> (aitracker/term_vt.py:2383), keyed by
-    // a terminal id the session detail dict never carries. Absent that signal, the safe
-    // and honest default is to hide the panel — matching the doc's own instruction to
-    // hide it whenever "not attached".
-    var attached = session.term_attached; // not present today; forward-compatible read
+    // FIX (drift A4): session.term_attached used to be set by no provider or route
+    // anywhere in the Python tree, so this gate was permanently false and the panel was
+    // dead code. The shared seam now populates it on the per-session detail dict (it
+    // arrives on the SAME 2s /api/session poll every other field here rides — no new
+    // fetch, no per-panel round-trip to GET /api/term/attached). The gate itself was
+    // already correct and stays unchanged: falsy (missing, false, or any other provider
+    // that never sets it) hides the WHOLE panel, per the doc's own instruction — never a
+    // blank/half-rendered card.
+    var attached = session.term_attached;
     if (!attached) { wrap.style.display = "none"; return; }
     wrap.style.display = "";
     var meta = session.meta || {};

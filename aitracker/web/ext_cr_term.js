@@ -65,6 +65,16 @@
   var pollTimer = null;
   var pollGen = 0;       // supersede guard — same idiom as ext_vt.js's own openGen
 
+  // A6/A7 fix: this overlay's .cr-term-shell carries role="dialog" (see _build below) but,
+  // unlike every dialog CR.dialogs.open() builds, had neither a focus trap nor opener
+  // restore — broken for keyboard/screen-reader users. `_opener` mirrors dialogs.js's own
+  // `entry.opener` (the element focused right before the overlay opens, refocused on
+  // close); `_untrap` is the cleanup fn CR.dialogs.trapFocus() returns, reusing THE SAME
+  // trap implementation every other dialog in this app already gets rather than forking a
+  // second one here.
+  var _opener = null;
+  var _untrap = null;
+
   // ===== module state — everything the chrome renders from ================================
   var st = {
     open: false,
@@ -350,6 +360,12 @@
     st.open = true;
     st.sessionId = sessionId;
     el.overlay.classList.add("is-open");
+    // Opener capture + focus trap — same mechanism CR.dialogs.open() uses (see
+    // ext_cr_dialogs.js's `trapFocus`/`entry.opener`, exported for exactly this reuse).
+    _opener = document.activeElement;
+    if (window.CR && window.CR.dialogs && typeof window.CR.dialogs.trapFocus === "function") {
+      _untrap = window.CR.dialogs.trapFocus(el.shell);
+    }
     _resetPaneChrome();
     _loadHeaderInfo(sessionId);
     _refreshRunningList();
@@ -357,6 +373,17 @@
     var mode = opts.mode || "cwd";
     if (mode === "resume" || mode === "cwd") {
       _openInline(sessionId, mode);
+    }
+    // Move focus into the dialog — first focusable control, else the shell itself (same
+    // fallback dialogs.js's own open() uses; FOCUSABLE selector matches it verbatim).
+    var focusable = el.shell.querySelector(
+      'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])'
+    );
+    if (focusable) {
+      focusable.focus({ preventScroll: true });
+    } else {
+      el.shell.setAttribute("tabindex", "-1");
+      el.shell.focus({ preventScroll: true });
     }
   }
 
@@ -374,6 +401,12 @@
     st.tty = null;
     st.mode = null;
     _resetPaneChrome();
+    if (typeof _untrap === "function") { _untrap(); }
+    _untrap = null;
+    if (_opener && typeof _opener.focus === "function") {
+      try { _opener.focus({ preventScroll: true }); } catch (e) {}
+    }
+    _opener = null;
     if (ctx && typeof ctx.emit === "function") ctx.emit("cr:term-closed", { sessionId: st.sessionId });
   }
 

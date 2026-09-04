@@ -22,8 +22,14 @@ window.CR = window.CR || {};
   // (currently never-exercised) case this file is ever loaded standalone.
   var LIVE_WINDOW = (typeof LIVE !== 'undefined') ? LIVE : 300;
 
-  // Sort rank for the board — reproduced verbatim from doc 02 "Sort order".
-  var RANK = { awaiting: 0, flagged: 1, working: 2, landed: 3, idle: 4 };
+  // Sort rank for the board — doc 02 "Sort order" gives awaiting/flagged/working/
+  // landed/idle verbatim but is silent on 'failing' (01-foundations.md's state
+  // table names six states; doc 02's own RANK object only ever had five). Slotted
+  // between flagged and working: 01's table lists Failing right after Flagged, and
+  // both are "something is actively wrong" states that outrank plain 'working' —
+  // awaiting/flagged keep their original 0/1 values (no reshuffle above 'failing'),
+  // working/landed/idle each shift down by one to make room.
+  var RANK = { awaiting: 0, flagged: 1, failing: 2, working: 3, landed: 4, idle: 5 };
 
   // ----------------------------------------------------------------------
   // Pure derivations — no DOM, no ctx. Easy to unit-test in isolation.
@@ -36,20 +42,26 @@ window.CR = window.CR || {};
   // (providers/claude.py:246-284) emits id/project/cwd/title/prompt/source/
   // agent/group/groupLabel/parentId/bg/waiting/ended/mtime; providers/
   // auggie.py's list() (providers/auggie.py:160-168) emits the same key set.
-  // `state` here is derived from waiting/open_flags/mtime+ended, mirroring
+  // `state` here is derived from waiting/open_flags/fail_cmd/mtime+ended, mirroring
   // the precedence app.js's own sidebar already uses (waiting > done-if-live
   // > live > idle — aitracker/web/app.js:817-820), with open_flags slotted
   // into RANK's 'flagged' step. The doc's state vocabulary (01-foundations.md)
-  // also names a sixth state, "Failing" (a command/test returned non-zero),
-  // but that signal only exists in a session's parsed *detail* dict
-  // (commands[].exit), never in the list-endpoint shape this module is fed —
-  // and RANK itself never includes a 'failing' key either, so no tile in
-  // this implementation can ever carry that state. See REQUIRED ADDITIONS
-  // in the report for what a real "failing" tile would need.
+  // also names a sixth state, "Failing" (a command/test returned non-zero) —
+  // that signal is computed today ONLY inside a session's parsed *detail* dict
+  // (parse_session()'s `counts.errors`/`counts.tests_failed`, providers/claude.py),
+  // never emitted into the list-endpoint shape (list_sessions()) this module is
+  // fed, so this board has no live source for it yet (a REQUIRED ADDITION: thread
+  // a `fail_cmd` string — the failing command's name, ''/absent when nothing is
+  // failing — into the list dict the same way `open_flags`/`pr_num`/`note_count`
+  // already are). Wired defensively ahead of that addition, same pattern this file
+  // already uses for pr_num et al: the check below is a no-op today (no provider
+  // ever sets `fail_cmd`) and lights up the instant one does, with zero risk to
+  // any session that doesn't carry the field.
   function sessionState(s, now) {
     var live = (now - (s.mtime || 0)) < LIVE_WINDOW;
     if (s.waiting) return 'awaiting';
     if (s.open_flags) return 'flagged';
+    if (live && s.fail_cmd) return 'failing';
     if (live && !s.ended) return 'working';
     if (live && s.ended) return 'landed';
     return 'idle';
@@ -216,10 +228,20 @@ window.CR = window.CR || {};
   // recency; idle sessions never get a tile; agent-group tiles sit last.
   function boardTiles(sessions, now) {
     var individual = sessions
-      // Exclude only agents that a group tile will actually represent. An agent
-      // session with no `group` (agent:true, group:"") is otherwise dropped by
-      // BOTH paths — agentGroups() skips it for lack of a key — and vanishes
-      // from the board entirely. Verified live: 950 sessions, 1 working, 0 tiles.
+      // Exclude only agents that a group tile will actually represent (agent:true
+      // WITH a non-empty `group` — a real `claude --bg` agent whose session isn't
+      // sdk-cli-sourced gets group:"" from providers/claude.py's _agent_group(),
+      // since that helper only buckets sdk-cli sessions). The bug this predicate
+      // fixes: a naive `!s.agent` here would drop every agent session from
+      // `individual`, and agentGroups() below independently skips anything with
+      // no `group` key (`if (!s.agent || !s.group) return;`) — so a plain `!s.agent`
+      // filter would strand agent:true/group:"" sessions in neither path, vanishing
+      // from the board entirely (live-verified once: 950 sessions, 1 working, 0
+      // tiles). Chosen fix here is "include individually when non-idle": this
+      // exact `!(s.agent && s.group)` predicate keeps an ungrouped agent session
+      // in `individual` (only agent+group together are excluded), so it gets
+      // ranked and tiled exactly like any other session — smaller diff than
+      // building a second "(no group)" bucket path through agentGroups().
       .filter(function (s) { return !(s.agent && s.group); })
       .map(function (s) { return { kind: 'session', session: s, state: sessionState(s, now) }; })
       .filter(function (t) { return t.state !== 'idle'; })
@@ -1155,10 +1177,14 @@ window.CR = window.CR || {};
       // real list-dict session) — falls back to the prompt/title tooltip
       // exactly as before whenever it's absent, so this is purely additive.
       var todoLabel = railTodoLabel(s);
+      // GAP CLOSE: flag_text rides the row's existing tooltip too — same reasoning as
+      // tileHead() above. '' when null/absent, so an unflagged row's tooltip is
+      // byte-for-byte unchanged.
       var titleAttr = (s.prompt || s.snippet || s.title || '(no prompt)') + '\n' + (s.cwd || '') +
         (s.model ? '\nModel: ' + s.model : '') +
         (todoLabel ? '\n' + (s.todo_done || 0) + ' of ' + s.todo_total + ' todos done' +
-          (s.todo_current ? ' — in progress: ' + s.todo_current : '') : '');
+          (s.todo_current ? ' — in progress: ' + s.todo_current : '') : '') +
+        (s.flag_text ? '\n🚩 ' + s.flag_text : '');
       // Colour never carries meaning alone: the state word (and, for a pinned
       // session, "(pinned)") rides along in aria-label (title keeps the fuller
       // prompt/cwd/snippet tooltip it already had).
@@ -1470,6 +1496,17 @@ window.CR = window.CR || {};
       var allTiles = boardTiles(sessions, now);
       var tiles = allTiles.filter(passesFilter);
 
+      // A8: mirrors renderRail()'s / renderSessionsView()'s own scroll-position
+      // preservation across a poll re-render — same pattern (snapshot scrollTop
+      // of the actual overflow:auto container before clearing its content,
+      // restore it after), not a second one. The board's scrolling element is
+      // els.boardScroll (`.cr-board-scroll`, `overflow-y:auto` in
+      // ext_cr_board.css) — a parent of els.board, the grid whose innerHTML
+      // this function replaces — because els.board itself has no overflow of
+      // its own. Doc 02's keyboard section calls re-render scroll/focus loss
+      // "the single most likely regression."
+      var scrollTop = els.boardScroll.scrollTop;
+
       els.board.innerHTML = '';
       if (!tiles.length) {
         els.board.appendChild(h('div', { class: 'cr-board-empty' },
@@ -1482,6 +1519,8 @@ window.CR = window.CR || {};
         var el = els.board.querySelector('[data-tile-id="' + cssEscape(focusedTileId) + '"]');
         if (el) el.focus();
       }
+
+      els.boardScroll.scrollTop = scrollTop;
 
       renderCapFooter(sessions, allTiles);
     }
@@ -1509,15 +1548,23 @@ window.CR = window.CR || {};
     // count into the word itself — "N flags open", singular "1 flag open" —
     // matching the exact pluralisation already used for the tile body line
     // (tileLine below). The static "Flagged" label carried no count.
+    // 01-foundations.md's state table gives Failing's word as `"fail" + command
+    // name` — rendered here as "fail: <command>" (colon-joined, matching the
+    // "N flags open"/"Waiting on you · <age>" convention of always spelling the
+    // dynamic part out in full, never a bare label). `s.fail_cmd` is the same
+    // (currently unwired server-side, see sessionState()'s note) command-name
+    // field that gates 'failing' in sessionState() in the first place, so this
+    // branch is only ever reached when there's a real command name to show.
     function stateWord(state, s) {
       if (state === 'flagged') {
         var n = (s && s.open_flags) || 0;
         return n + ' flag' + (n === 1 ? '' : 's') + ' open';
       }
+      if (state === 'failing') return 'fail: ' + (s && s.fail_cmd);
       return { awaiting: 'Waiting on you', working: 'Working', landed: 'Landed' }[state] || state;
     }
     function stateEmoji(state) {
-      return { awaiting: ['⏳', 'tn-emo-a'], working: ['🟡', ''], flagged: ['🚩', 'tn-emo-f'], landed: ['✅', 'tn-emo-d'] }[state] || ['', ''];
+      return { awaiting: ['⏳', 'tn-emo-a'], working: ['🟡', ''], flagged: ['🚩', 'tn-emo-f'], failing: ['❌', 'tn-emo-f'], landed: ['✅', 'tn-emo-d'] }[state] || ['', ''];
     }
 
     function todoTicks(s) {
@@ -1585,9 +1632,21 @@ window.CR = window.CR || {};
 
     function tileHead(s, state, now) {
       var ew = stateEmoji(state);
+      // GAP CLOSE: flag_text (registry.py's list dict, s.flag_text) is the unresolved
+      // flag's own text — the badge above already carries the COUNT (stateWord's "N
+      // flags open"); the text rides the same `title` tooltip mechanism every other
+      // tile/row metadatum already uses here (see attrs.title below, railRow's
+      // titleAttr). null (no open flag) means no `title` attribute at all — h()
+      // skips null/undefined attrs, so there's never a stray empty tooltip.
+      // Extended (truncation follow-up) to 'failing': the tile's own text now
+      // ellipsizes at width (ext_cr_board.css .cr-tile-state), so the full
+      // fail_cmd string needs the same title-tooltip escape hatch flag_text
+      // already had, or a long command name would be unrecoverably clipped.
+      var flagTitle = (state === 'flagged' && s.flag_text) ? s.flag_text
+        : (state === 'failing' && s.fail_cmd) ? stateWord(state, s) : null;
       var kids = [
         emoji(ew[0], ew[1]),
-        h('span', { class: 'cr-tile-state' }, [stateWord(state, s) + (state === 'awaiting' ? ' · ' + ago(now - (s.mtime || 0)) : '')]),
+        h('span', { class: 'cr-tile-state', title: flagTitle }, [stateWord(state, s) + (state === 'awaiting' ? ' · ' + ago(now - (s.mtime || 0)) : '')]),
       ];
       if (s.pinned) kids.push(emoji('📌', '', 'Pinned'));
       var head = h('div', { class: 'cr-tile-head', 'data-state': state }, kids);

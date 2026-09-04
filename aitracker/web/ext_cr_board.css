@@ -866,6 +866,11 @@
   box-shadow: var(--glow-agent-soft), var(--shadow-raised);
 }
 .tracker-next .cr-tile--flagged { background: var(--surface-flagged); border-color: var(--line-flagged); }
+/* A5 — Failing (brick, 01-foundations.md's state table): same background+border
+   pairing convention as flagged/landed above, using the --surface-failed/
+   --line-failed tokens the foundations file already defines for exactly this
+   state (both themes) — no new tokens needed. */
+.tracker-next .cr-tile--failing { background: var(--surface-failed); border-color: var(--line-failed); }
 .tracker-next .cr-tile--landed { background: var(--surface-done); border-color: var(--line-done); }
 .tracker-next .cr-tile--agentgroup { border-color: var(--line-subtle); }
 
@@ -917,11 +922,23 @@
   font: var(--fw-eyebrow) var(--fs-eyebrow-min)/1 var(--font-sans);
   letter-spacing: var(--ls-eyebrow-min);
   text-transform: uppercase;
+  /* A5 follow-up: 'failing' renders "fail: <command>" with the fail_cmd string
+     interpolated verbatim (stateWord(), ext_cr_board.js) — an arbitrarily long
+     or unbreakable command name must not blow out the tile. Same shrink+
+     ellipsize pattern as .cr-tile-meta above, the sibling trailing-text field
+     in this same flex row. */
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .tracker-next .cr-tile--awaiting-label,
 .tracker-next .cr-tile-head[data-state="awaiting"] .cr-tile-state { color: var(--text-awaiting); }
 .tracker-next .cr-tile-head[data-state="working"] .cr-tile-state { color: var(--text-thinking); }
 .tracker-next .cr-tile-head[data-state="flagged"] .cr-tile-state { color: var(--text-flagged); }
+/* A5 — Failing state label, --text-failed (brick ink, 01-foundations.md). */
+.tracker-next .cr-tile-head[data-state="failing"] .cr-tile-state { color: var(--text-failed); }
 .tracker-next .cr-tile-head[data-state="landed"] .cr-tile-state { color: var(--text-secondary); }
 .tracker-next .cr-tile-dot {
   flex: 0 0 auto;

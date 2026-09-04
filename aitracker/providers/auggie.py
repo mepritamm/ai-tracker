@@ -160,6 +160,79 @@ def _auggie_current_model(chat):
     return ""
 
 
+# Fixed prefixes Auggie's OWN pre-exec guards write into a launch-process tool_result's
+# `content` when they refuse to run a command at all -- the Auggie equivalent of Claude's
+# `_BASH_REFUSAL_PREFIXES` (providers/claude.py), same reasoning: a command Auggie itself
+# never ran can't be what broke the user's work. Confirmed against every launch-process
+# is_error result on this machine's real corpus (reports/drift/): the one framework-refusal
+# pattern found there is a pre-exec shell-syntax guard; "Tool use rejected with user
+# message:" (an explicit user rejection, seen on other Auggie tool types in this same
+# corpus) is included defensively even though it wasn't observed on launch-process here.
+_AUGGIE_REFUSAL_PREFIXES = (
+    "Error: Backticks are not allowed in shell commands",  # pre-exec shell-syntax guard
+    "Tool use rejected with user message:",                 # explicit user rejection
+)
+
+
+def _auggie_is_real_launch_error(text):
+    """True iff a launch-process tool_result's content (already known `is_error`)
+    reflects the command actually RUNNING and exiting nonzero -- not one of Auggie's
+    own never-ran-at-all refusals (see `_AUGGIE_REFUSAL_PREFIXES` above). Non-string/
+    empty content (Auggie's tool_result_node doesn't always carry `content` at all)
+    can't be classified either way -- treated as real (True) so an is_error result is
+    never silently hidden just because its content couldn't be read.
+
+    # ponytail: textual match on Auggie's own fixed refusal strings, same ceiling as
+    # Claude's _is_real_bash_error -- if a future Auggie version rewords one, this
+    # silently stops catching it. Upgrade path: re-grep a fresh ~/.augment/sessions/
+    # *.json corpus for launch-process is_error content and extend the tuple above.
+    """
+    if not isinstance(text, str) or not text:
+        return True
+    return not text.startswith(_AUGGIE_REFUSAL_PREFIXES)
+
+
+def _auggie_fail_cmd(chat):
+    """Board "failing" tile signal (~ Claude's _tail_scan `fail_cmd`) — zero extra I/O:
+    list_auggie()'s cache-miss path already loads the FULL session JSON (see
+    _auggie_last_narration above), so this just reads what's already in memory. Tracks
+    each `launch-process` (~Bash) tool_use's id -> command text as it's seen, then the
+    matching tool_result_node's `is_error` (Auggie DOES store exit status — same join
+    parse_auggie's `errors_by_id` does over the whole file, per _auggie_todos_for's
+    sibling comment above) decides pass/fail. Auggie files a tool result under the
+    NEXT exchange's request_nodes (see the module note near errors_by_id below), so
+    results are seen strictly after their call in this single forward pass. Latest REAL
+    launch-process result wins — a later PASS clears an earlier FAIL, same "what's
+    true right now" rule as _auggie_current_model — so this is None unless the most
+    recently completed command actually RAN and errored (see _auggie_is_real_launch_error:
+    a command Auggie's own guard refused to run at all is not a real failure)."""
+    bash_cmds = {}   # tool_use_id -> command text[:60]
+    fail_cmd = None
+    for m in chat or []:
+        ex = m.get("exchange") or {}
+        for rn in ex.get("request_nodes") or []:
+            trn = rn.get("tool_result_node") if isinstance(rn, dict) else None
+            if not isinstance(trn, dict):
+                continue
+            tid = trn.get("tool_use_id")
+            if tid in bash_cmds:
+                if trn.get("is_error"):
+                    content = trn.get("content")
+                    text = content if isinstance(content, str) else (json.dumps(content) if content else "")
+                    if _auggie_is_real_launch_error(text):
+                        fail_cmd = bash_cmds[tid]
+                    # else: Auggie's own pre-exec guard blocked it -- not a real failure
+                else:
+                    fail_cmd = None
+        for rn in ex.get("response_nodes") or []:
+            call = rn.get("tool_use")
+            if isinstance(call, dict) and call.get("tool_name") == "launch-process":
+                c = _tool_input(call).get("command")
+                if isinstance(c, str) and c and call.get("tool_use_id"):
+                    bash_cmds[call["tool_use_id"]] = c[:60]
+    return fail_cmd
+
+
 def _auggie_state(chat):
     """(waiting, ended) for the sidebar — parity with Claude's _tail_fields. `waiting`:
     an ask-user is still unanswered. `ended`: the last exchange finished with an assistant
@@ -251,6 +324,8 @@ def list_auggie():
                  # narration fallback for now_line -- free here, see _auggie_last_narration
                  "last_text": _auggie_last_narration(d.get("chatHistory")),
                  "model": _auggie_current_model(d.get("chatHistory")),
+                 # board "failing" tile signal -- free here too, see _auggie_fail_cmd
+                 "fail_cmd": _auggie_fail_cmd(d.get("chatHistory")),
                  "mtime": _iso_epoch(d.get("modified")) or mt}
             _AUGGIE_LIST_CACHE[f] = (mt, e)
         gid = "auggie:" + e["sid"]
@@ -285,6 +360,9 @@ def list_auggie():
             "pr_num": None, "pr_url": None, "pr_repo": None, "pr_state": "",  # Auggie has no PR extraction
             "now_line": now_line,
             "model": e.get("model") or "",
+            # board "failing" tile signal (ext_cr_board.js's sessionState()) — honestly
+            # None when nothing failed, never omitted. See _auggie_fail_cmd.
+            "fail_cmd": e.get("fail_cmd"),
         })
     return out
 
@@ -378,6 +456,12 @@ def parse_auggie(session_id):
     requests, narrative, files, cmds, reads, commits = [], [], {}, [], {}, []
     agents = []       # sub-agent-* dispatches (~ Claude's Task) — {t, type, desc}
     errors_by_id = {} # tool_use_id -> True, from tool_result_node.is_error (~ Claude's map)
+    bash_cmd_text = {} # tool_use_id -> command text[:60], launch-process calls seen so far -- the
+                        # SAME id->text tracking _auggie_fail_cmd keeps, kept here over the whole
+                        # session (this function already walks it in full) so the detail dict's
+                        # `fail_cmd` (below) is the whole-transcript version of the same field
+    fail_cmd = None     # detail dict's `fail_cmd` -- same field, same filter
+                        # (_auggie_is_real_launch_error) as list_auggie()'s _auggie_fail_cmd
     ide_cwd = _auggie_ide_cwd(d)   # needed inside the loop to anchor relative edit paths
     asks = {}         # tool_use_id -> ask-user decision {t, open, answer, questions} (parity with Claude)
     prs = {}          # url -> entry : PR/MR links touched this session (parity with Claude)
@@ -406,6 +490,16 @@ def parse_auggie(session_id):
                 continue
             if trn.get("is_error"):                           # Auggie DOES store exit status
                 errors_by_id[trn.get("tool_use_id")] = True
+            _tid = trn.get("tool_use_id")
+            if _tid in bash_cmd_text:                         # latest REAL launch-process result wins
+                if trn.get("is_error"):
+                    _c = trn.get("content")
+                    _text = _c if isinstance(_c, str) else (json.dumps(_c) if _c else "")
+                    if _auggie_is_real_launch_error(_text):
+                        fail_cmd = bash_cmd_text[_tid]
+                    # else: Auggie's own pre-exec guard blocked it -- not a real failure
+                else:
+                    fail_cmd = None
             if trn.get("tool_use_id") in asks:                # the user's answer to a prior ask-user
                 c = trn.get("content") or ""
                 asks[trn["tool_use_id"]]["answer"] = re.sub(r"^User responded:\s*", "", c).strip()[:2000]
@@ -445,6 +539,8 @@ def parse_auggie(session_id):
                     k = cmd_kind(c)
                     cmds.append({"id": call.get("tool_use_id"), "t": ts, "cmd": c[:200],
                                  "kind": k})    # `ok` joined from tool_result_node.is_error below
+                    if call.get("tool_use_id"):
+                        bash_cmd_text[call["tool_use_id"]] = c[:60]  # for fail_cmd above
                     if PR_CREATE_RE.search(c):
                         pr_creates.append(i)
                     _cprs(c)                              # a command's PR ref alone isn't "worked on"
@@ -564,6 +660,11 @@ def parse_auggie(session_id):
         # open decisions first, then most-recent — parity with Claude's AskUserQuestion panel
         "decisions": sorted(asks.values(), key=lambda a: (a["open"], a["t"] or ""), reverse=True),
         "waiting": any(a["open"] for a in asks.values()),   # unanswered ask-user -> blocked on the user, not idle
+        # board "failing" tile signal, SAME field name as Claude's detail dict and as
+        # list_auggie()'s list dict (see _auggie_fail_cmd) -- off the whole session here
+        # instead of a tail (Auggie has no tail-only fast path; this function always reads
+        # the full session). Honestly None when nothing really failed, never omitted.
+        "fail_cmd": fail_cmd,
 
         "prs": [p for p in prs_sorted(prs, pr_states) if pr_worked(p, cwd)],   # created or worked-on, not prompt-only references
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail

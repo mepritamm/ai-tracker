@@ -14,6 +14,56 @@ from .base import Provider
 _TASK_CREATE_ID_RE = re.compile(r"Task #(\d+) created successfully")
 
 
+# Fixed prefixes/substrings Claude Code's OWN permission system, worktree-isolation guard,
+# blocked-command guard, auto-mode classifier, and reject-this-tool-use flow write into a
+# Bash tool_result's `content` when it refuses to run a command at all -- confirmed against
+# every is_error Bash tool_result on this machine's real corpus (~950 sessions, reports/
+# drift/): measured 116/957 real sessions carrying a fail_cmd before this filter, and EVERY
+# ONE of them was one of these refusals, never a real command failure (the single most
+# common by a wide margin: an unrelated automated bot's Bash calls denied under "don't ask"
+# mode, printf'ing a JSON verdict it never got to write). A command Claude Code itself
+# refused to run can't be what broke the user's work, so it must not set fail_cmd.
+_BASH_REFUSAL_PREFIXES = (
+    "Permission to use Bash",                    # "...has been denied because Claude Code is
+                                                  # running in don't ask mode" / "...with command
+                                                  # X\n...has been denied" -- never ran
+    "This session is isolated in the worktree",  # bg-isolation guard -- never ran
+    "Permission for this action was denied by the Claude Code auto mode classifier",
+    "The user doesn't want to proceed with this tool use.",  # explicit user rejection
+    "<tool_use_error>Blocked:",                  # command-blocking guard (e.g. a bare `sleep`)
+    "<tool_use_error>Cancelled:",                # a parallel sibling call errored; this one
+                                                  # was never actually run
+)
+# Model name varies ("claude-sonnet-5[1m]", "claude-opus-4-8", ...) so this can't be a
+# fixed prefix -- matched as a substring instead: "<model> is temporarily unavailable, so
+# auto mode cannot determine the safety of <Tool> right now" -- the auto-mode classifier
+# itself is down, so the command was never even evaluated, let alone run.
+_BASH_REFUSAL_SUBSTRING = "auto mode cannot determine the safety of"
+
+
+def _is_real_bash_error(text):
+    """True iff a Bash tool_result's content (already known `is_error`) reflects the
+    command actually RUNNING and exiting nonzero -- not one of Claude Code's own
+    never-ran-at-all refusals (see `_BASH_REFUSAL_PREFIXES` above). Non-string/empty
+    content can't be classified either way -- treated as real (True) so an is_error
+    result is never silently hidden just because its content couldn't be read.
+
+    # ponytail: this is a textual match on Claude Code's own fixed refusal strings, not
+    # a session-log field -- if a future Claude Code version rewords one of them, this
+    # silently stops catching it (fail_cmd goes noisy again, never wrong the other way).
+    # No structural field distinguishing "the command ran" from "the framework refused
+    # it" was found on this corpus (checked: tool_use's own `caller` field is always
+    # {"type": "direct"}, no hook/system variant appears in ~30k real tool_use blocks).
+    # Upgrade path: re-grep a fresh corpus's is_error Bash content for new refusal
+    # wording and add it to `_BASH_REFUSAL_PREFIXES`/`_BASH_REFUSAL_SUBSTRING` above.
+    """
+    if not isinstance(text, str) or not text:
+        return True
+    if text.startswith(_BASH_REFUSAL_PREFIXES):
+        return False
+    return _BASH_REFUSAL_SUBSTRING not in text
+
+
 def find_session(sid):
     sid = sid.strip().replace(".jsonl", "")
     # sid is URL-sourced and lands straight in a glob.glob() pattern below — unlike a
@@ -58,10 +108,27 @@ def _tail_scan(path, nbytes=96000):
     model). "<synthetic>" is a real value seen in the wild on synthetic/compaction
     messages, not a genuine model id — skipped so it never overwrites a real one and
     never surfaces alone. Honestly "" when no real model appears in the tail at all
-    (e.g. a session with no assistant turn yet)."""
+    (e.g. a session with no assistant turn yet).
+
+    Also harvests `fail_cmd` — the board's "failing" tile signal, off this SAME bounded
+    tail (zero extra I/O): a Bash `tool_use` seen in the tail records its id -> command
+    text; the matching `tool_result`'s `is_error` flag AND its content (checked below,
+    is_error is the same join parse_session's `errors_by_id` does over the WHOLE file —
+    content is the new part, see `_is_real_bash_error`) decide pass/fail. Latest REAL
+    Bash result in the tail wins — a later PASS clears an earlier FAIL, same "what's
+    true right now" rule as model/last_text — so `fail_cmd` is None unless the most
+    recently completed Bash command in this tail actually ran and errored (a command
+    Claude Code itself refused to run — a permission denial, a worktree guard, a user
+    rejection — is not a real failure and is skipped; see `_is_real_bash_error`). A
+    giant single command's tool_use can in principle fall outside the 96 KB window
+    while its result is inside (same known limitation as the waiting-question miss
+    above); that just means the id is unmatched and this stays honestly None, never
+    a guess."""
     ai = custom = entry = None
     last_text = ""
     model = ""
+    bash_cmds = {}   # tool_use_id -> command text[:60], Bash calls seen in this tail
+    fail_cmd = None
     open_asks, last = set(), ""
     try:
         sz = os.path.getsize(path)
@@ -97,6 +164,10 @@ def _tail_scan(path, nbytes=96000):
                         has_tool = True
                         if b.get("name") == "AskUserQuestion" and b.get("id"):
                             open_asks.add(b["id"])          # opened; a matching tool_result answers it
+                        elif b.get("name") == "Bash" and b.get("id"):
+                            cmdtxt = (b.get("input") or {}).get("command")
+                            if isinstance(cmdtxt, str) and cmdtxt:
+                                bash_cmds[b["id"]] = cmdtxt[:60]
                     elif bt == "text":
                         t = (b.get("text") or "").strip()
                         if t and not t.startswith("<"):     # skip command/system echoes
@@ -106,7 +177,19 @@ def _tail_scan(path, nbytes=96000):
                 if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
                     for b in c:                              # the user's answer closes the question
                         if isinstance(b, dict) and b.get("type") == "tool_result":
-                            open_asks.discard(b.get("tool_use_id"))
+                            tid = b.get("tool_use_id")
+                            open_asks.discard(tid)
+                            if tid in bash_cmds:              # latest REAL Bash result in the tail wins
+                                if b.get("is_error"):
+                                    cc = b.get("content")
+                                    rtext = cc if isinstance(cc, str) else (json.dumps(cc) if cc else "")
+                                    if _is_real_bash_error(rtext):
+                                        fail_cmd = bash_cmds[tid]
+                                    # else: Claude Code's own guard refused the command before it
+                                    # ever ran -- not a real failure, leave fail_cmd as it was (see
+                                    # _is_real_bash_error)
+                                else:
+                                    fail_cmd = None
                     last = "tool_result"
                 elif o.get("isMeta"):
                     pass                                     # injected system text (task-notification, skill reload) — not a turn
@@ -120,7 +203,7 @@ def _tail_scan(path, nbytes=96000):
     waiting = bool(open_asks)
     ended = (not waiting) and last == "assistant_text"
     return {"ai": ai, "custom": custom, "entry": entry, "waiting": waiting, "ended": ended,
-            "last_text": last_text, "model": model}
+            "last_text": last_text, "model": model, "fail_cmd": fail_cmd}
 
 
 def _tail_fields(path, nbytes=96000):
@@ -137,7 +220,7 @@ def _session_meta(path):
         mt = os.path.getmtime(path)
     except OSError:
         return {"cwd": "", "title": "", "source": "", "prompt": "", "first": 0, "waiting": False, "ended": False, "sessionKind": None,
-                "pr_num": None, "pr_url": None, "pr_repo": None, "pr_state": "", "last_text": "", "model": ""}
+                "pr_num": None, "pr_url": None, "pr_repo": None, "pr_state": "", "last_text": "", "model": "", "fail_cmd": None}
     hit = _META_CACHE.get(path)
     if hit and hit[0] == mt:
         return hit[1]
@@ -186,6 +269,10 @@ def _session_meta(path):
         # the session-list `model` field, unconditional (unlike now_line, shown for idle and
         # ended sessions too -- see list_sessions).
         "model": ts["model"],
+        # Board "failing" tile signal -- the most recently completed Bash command's name
+        # in this SAME bounded tail if it errored, else honestly None. See _tail_scan's
+        # docstring for the join and its "latest wins" semantics.
+        "fail_cmd": ts["fail_cmd"],
         # PR data is the expensive half — a full-file scan (collect_prs et al, ~1ms median but
         # ~28ms at the p95 file size) that this cheap 40-line/tail-only pass must not eat. Only
         # an ENDED session can ever render as a Landed tile (ext_cr_board.js's sessionState()),
@@ -462,6 +549,10 @@ def list_sessions(limit=200):
             # current model id (e.g. "claude-opus-5") off the same bounded tail read —
             # unconditional, not gated on liveness: "" only when the tail truly has no signal.
             "model": sm.get("model") or "",
+            # board "failing" tile signal (ext_cr_board.js's sessionState()) — the failing
+            # Bash command's name, off the SAME bounded tail read as waiting/ended/model
+            # above (zero extra I/O); honestly None when nothing failed, never omitted.
+            "fail_cmd": sm.get("fail_cmd"),
         })
     return out
 
@@ -987,6 +1078,12 @@ def parse_session(path):
     requests = []         # user asks {t, text}
     agents = []           # {t, type, desc}
     errors_by_id = {}     # tool_use_id -> True
+    bash_cmd_text = {}    # tool_use_id -> command text[:60], Bash calls seen so far -- the SAME
+                           # id->text tracking _tail_scan keeps over its 96KB tail, kept here over
+                           # the WHOLE file so the detail dict's `fail_cmd` (below) reflects the
+                           # true latest real failure, not just what the cheap list-level tail saw
+    fail_cmd = None        # detail dict's `fail_cmd` -- same field, same filter (_is_real_bash_error)
+                           # as the list's, just over the full transcript instead of a 96KB tail
     prs = {}              # url -> {url, repo, num, created, state, t} : PRs touched this session
     pr_states = {}        # num -> "merged"/"closed" : state signals seen in logs (overlaid at the end)
     pr_create_ids = set() # tool_use_ids of `gh pr create` Bash calls (their result URL = created)
@@ -1078,6 +1175,14 @@ def parse_session(path):
                         errors_by_id[rid] = True
                     cc = b.get("content")                          # command output: gh prints the PR URL here
                     rtext = cc if isinstance(cc, str) else (json.dumps(cc) if cc else "")
+                    if rid in bash_cmd_text:                       # latest REAL Bash result wins, whole-file version
+                        if b.get("is_error"):
+                            if _is_real_bash_error(rtext):
+                                fail_cmd = bash_cmd_text[rid]
+                            # else: Claude Code's own guard refused it -- not a real failure, see
+                            # _is_real_bash_error; leave fail_cmd as it was
+                        else:
+                            fail_cmd = None
                     if rid in asks:                                # the user's answer to an AskUserQuestion
                         asks[rid]["answer"] = re.sub(r"^Your questions have been answered:\s*", "", rtext).strip()[:2000]
                         asks[rid]["open"] = False
@@ -1143,6 +1248,8 @@ def parse_session(path):
                         c = inp.get("command", "")
                         k = cmd_kind(c)
                         cmds.append({"id": bid, "t": ts, "cmd": c[:200], "kind": k})
+                        if c:
+                            bash_cmd_text[bid] = c[:60]  # for fail_cmd above, same [:60] as _tail_scan's
                         if PR_CREATE_RE.search(c):       # its result URL is a created PR
                             pr_create_ids.add(bid)
                         collect_prs(prs, c, ts)                    # a command's PR ref alone isn't "worked on"
@@ -1265,6 +1372,12 @@ def parse_session(path):
         # an unanswered AskUserQuestion: the session isn't idle, it's blocked on the user.
         # Same signal the sidebar's ⏳ uses, off the whole transcript instead of the tail.
         "waiting": any(a["open"] for a in asks.values()),
+        # board "failing" tile signal (ext_cr_board.js's sessionState()), SAME field name as
+        # the list dict (see list_sessions/registry.all_sessions) so board and detail derive
+        # "failing" off one field -- off the WHOLE transcript here instead of just the tail,
+        # same filter (_is_real_bash_error) as the list-level derivation. Honestly None when
+        # nothing really failed, never omitted.
+        "fail_cmd": fail_cmd,
         "prs": [p for p in prs_sorted(prs, pr_states) if pr_worked(p, meta.get("cwd"))],   # created or worked-on, not prompt-only references
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": text_last[:2000],

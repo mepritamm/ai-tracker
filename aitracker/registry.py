@@ -23,9 +23,18 @@ def all_sessions():
     pins = set(load_pins())                       # user-pinned ids, read live
     notes = load_notes()                          # per-session note stacks, read live
     open_flags = {}                               # session id -> unresolved 🚩 count, read live
+    flag_text = {}                                # session id -> most recent unresolved flag's
+                                                    # note text, or absent -> None on the shape below.
+                                                    # flags.json is append-only (server.py's POST
+                                                    # /api/flags always appends), so a forward scan
+                                                    # that overwrites on every hit lands on the LATEST
+                                                    # unresolved flag for that session, same one
+                                                    # `open_flags`'s count is already tallying.
     for f in load_flags():
         if not f.get("resolved"):
-            open_flags[f.get("session", "")] = open_flags.get(f.get("session", ""), 0) + 1
+            sid_f = f.get("session", "")
+            open_flags[sid_f] = open_flags.get(sid_f, 0) + 1
+            flag_text[sid_f] = f.get("note", "")
     # Fork lineage (shared seam — every provider inherits this from one implementation).
     # resolve_fork_child() fast-paths to "" for any sid that isn't a recorded fork parent
     # (a single dict lookup, cheap even across ~200 sessions on every poll); it only does
@@ -70,8 +79,14 @@ def all_sessions():
         s["pinned"] = sid in pins
         s["note_count"] = len(notes.get(sid, []))
         s["open_flags"] = open_flags.get(sid, 0)  # 🚩 badge + the cross-session flag list
+        s["flag_text"] = flag_text.get(sid)       # the badge's text, or None when open_flags is 0
         s["continued_as"] = continued_as.get(sid, "")      # "" unless this session was forked
         s["continued_from"] = continued_from.get(sid, "")  # "" unless this session IS a fork
+        # Board "failing" tile signal (ext_cr_board.js's sessionState()) — every provider
+        # now sets this itself (claude.py/auggie.py off a cheap already-loaded/tail-read
+        # signal, augment_ext.py an honest None), but the seam guarantees the key exists
+        # for EVERY session regardless, same defensive pattern as the fields above.
+        s.setdefault("fail_cmd", None)
     out.sort(key=lambda s: (not s.get("pinned"), -s.get("mtime", 0)))   # pinned first, then newest
     return out
 
@@ -105,6 +120,14 @@ def parse_any(sid):
     # with no extra round trip.
     d["continued_as"] = resolve_fork_child(sid)
     d["continued_from"] = fork_parent_of(sid)
+    # Board "failing" tile signal (ext_cr_board.js's sessionState()) — the SAME field name
+    # as all_sessions()'s list dict, so the client derives "failing" off one field regardless
+    # of which view it's looking at. Claude/Auggie's parse() now sets this themselves (off
+    # their own full-transcript scan, filtered the same way _tail_scan/_auggie_fail_cmd
+    # filter the list-level derivation); this setdefault is the same defensive seam
+    # guarantee as all_sessions()'s (line ~89 above) for any provider that doesn't (Augment
+    # ext honestly has no Bash-equivalent concept, so it never will) — the key always exists.
+    d.setdefault("fail_cmd", None)
     # pinned/open_flags/note_count: same shared seam as all_sessions() above, same store.py
     # helpers, one implementation for every provider. Without this the detail header (pinned
     # pill, 🚩 count) has nothing to read and hides — these three small JSON files are already
@@ -112,8 +135,50 @@ def parse_any(sid):
     # ONE session's detail view is not a measurable added cost.
     d["pinned"] = sid in set(load_pins())
     d["note_count"] = len(load_notes().get(sid, []))
-    d["open_flags"] = sum(1 for f in load_flags() if f.get("session") == sid and not f.get("resolved"))
+    open_flags = [f for f in load_flags() if f.get("session") == sid and not f.get("resolved")]
+    d["open_flags"] = len(open_flags)
+    d["flag_text"] = open_flags[-1].get("note") if open_flags else None  # latest unresolved
+                                    # flag's text (flags.json is append-only, see all_sessions()
+                                    # above), or an honest None when there's nothing open to show.
+    # term_attached: whether a live Claude CLI is the foreground process of any OPEN terminal
+    # this dashboard has running against `sid` right now. Reuses term_vt's existing
+    # `/api/term/attached` answer (_foreground_is_claude) instead of a second implementation —
+    # see that route for the tcgetpgrp/ps mechanics and its fail-closed (False on any doubt)
+    # policy, which this inherits unchanged. Threaded into the SAME detail dict the client
+    # already polls every ~2s, rather than a new per-panel route (a hard non-negotiable here).
+    # Late import: term_vt -> server -> registry at module load time, so a top-level import
+    # would be circular (term_gate.py/term_vt.py already late-import registry for the same
+    # reason). Neither provider can supply this on its own — it's dashboard/terminal state,
+    # not session-log state — so both get it from this one shared computation.
+    d["term_attached"] = _term_attached(sid)
     return d
+
+
+def _term_attached(sid):
+    """True iff a live Claude CLI is the foreground process on any currently-open terminal
+    opened against session `sid`. False for no open terminal, an unattached shell, or if
+    term_vt couldn't be imported at all — never raises (this runs on every ~2s detail poll).
+
+    Imported via __import__("%s.term_vt" % __package__, ...) rather than an ordinary
+    package-relative import statement — same effect inside the real package
+    (__package__ == "aitracker"), but this
+    is an *expression*, not a `from `/`import ` statement, so scripts/bundle.py's
+    strip_module() (which only drops top-level `import `/`from ` lines) leaves it alone and
+    it survives into dist/tracker.py as ordinary code instead of a relative import a
+    flattened single-file script can't resolve. There, __package__ is None (the same
+    guarded-import idiom server.py's terminal-tier loader relies on — see bundle.py), so the
+    lookup fails and the except below returns False: an honest "no terminal tier" instead of
+    a crash, with no bundler-side special case needed."""
+    try:
+        term_vt = __import__("%s.term_vt" % __package__, fromlist=["term_vt"])
+    except Exception:
+        return False
+    try:
+        with term_vt._LOCK:
+            ptys = [p for p in term_vt.PTYS.values() if p.session == sid and not p.done]
+        return any(term_vt._foreground_is_claude(p.fd) for p in ptys)
+    except Exception:
+        return False
 
 
 DRILLS = ("output", "diff", "shell", "agent")
