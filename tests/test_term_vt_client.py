@@ -2515,7 +2515,28 @@ class TestTerminalManagerPanel(unittest.TestCase):
         self.assertIn('"&sid=" + encodeURIComponent(t.session || "")', peek)
         self.assertIn('"&mode=" + encodeURIComponent(t.mode || "")', peek)
         self.assertIn('window.open(url, "_blank")', peek)
-        self.assertIn("Popup blocked", peek)
+        # Blocked-popup handling is pinned on BEHAVIOUR, not on where the message text lives:
+        # peekTerm() must route a null window.open() through the shared, non-blocking notice
+        # helper -- never a blocking native alert() -- and that helper is separately checked (below,
+        # test_no_native_blocking_dialogs_in_ext_vt) to actually say "Popup blocked" somewhere.
+        # A prior version of this test asserted the literal string "Popup blocked" INSIDE
+        # peekTerm()'s own body, which broke when the message moved into the shared
+        # _popupBlockedNotice() helper (used by openNewTab() too) so a native, page-freezing
+        # alert() would not have to be duplicated at every call site.
+        self.assertIn("if (!w) _popupBlockedNotice();", peek)
+
+    def test_no_native_blocking_dialogs_in_ext_vt(self):
+        """alert()/confirm()/prompt() all BLOCK the whole page -- including the 2s poll and any
+        live PTY stream -- for as long as they're up, which is why _popupBlockedNotice() replaced
+        the inline alert() this test file used to pin. Guard the invariant directly, and confirm
+        the helper it was replaced by still actually carries the user-visible message."""
+        for native in ("alert(", "confirm(", "prompt("):
+            self.assertNotIn(native, self.js,
+                              "native blocking dialog %r found in ext_vt.js -- it freezes the "
+                              "2s poll and any live PTY stream; route it through "
+                              "_popupBlockedNotice() (or CR.dialogs/toast) instead" % native)
+        notice = _body_until(self.js, "function _popupBlockedNotice(", ["function openNewTab("])
+        self.assertIn("Popup blocked", notice)
 
     # ----- 6. the overlay lives on <body> -----
 

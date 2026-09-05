@@ -51,7 +51,8 @@ def _scan_workspaces(kind):
         folder = ""
         if os.path.isfile(ws_json):
             try:
-                folder = _decode_folder(json.load(open(ws_json, encoding="utf-8")).get("folder", ""))
+                with open(ws_json, encoding="utf-8") as fh:
+                    folder = _decode_folder(json.load(fh).get("folder", ""))
             except (OSError, ValueError):
                 folder = ""
         yield ws, aug_dir, folder
@@ -74,7 +75,8 @@ def _iter_tasks(aug_dir):
         p = os.path.join(d, fn)
         try:
             mt = os.path.getmtime(p)
-            t = json.load(open(p, encoding="utf-8"))
+            with open(p, encoding="utf-8") as fh:
+                t = json.load(fh)
         except (OSError, ValueError):
             continue
         yield t.get("uuid") or fn, t, mt
@@ -90,7 +92,8 @@ def _files_touched(aug_dir):
     for fn in os.listdir(sd):
         p = os.path.join(sd, fn)
         try:
-            shard = json.load(open(p, encoding="utf-8"))
+            with open(p, encoding="utf-8") as fh:
+                shard = json.load(fh)
         except (OSError, ValueError):
             continue
         mt = ((shard.get("metadata") or {}).get("lastModified") or 0) / 1000.0
@@ -198,6 +201,10 @@ def _list(kind, prefix, src_label):
                 "pr_num": None, "pr_url": None, "pr_repo": None, "pr_state": "",  # Augment Ext has no PR extraction
                 "now_line": now_line,
                 "model": "",  # no chat transcript at all (LevelDB, unreadable stdlib-only) -- honestly unknown
+                # board "failing" tile signal -- same LevelDB gap as `model` above: no
+                # command/tool-result stream to read a pass/fail off, so honestly None
+                # rather than a guess (see ext_cr_board.js's sessionState()).
+                "fail_cmd": None,
             })
     return out
 
@@ -231,7 +238,8 @@ def _parse(kind, prefix, src_label, sid):
     folder = ""
     if os.path.isfile(ws_json):
         try:
-            folder = _decode_folder(json.load(open(ws_json, encoding="utf-8")).get("folder", ""))
+            with open(ws_json, encoding="utf-8") as fh:
+                folder = _decode_folder(json.load(fh).get("folder", ""))
         except (OSError, ValueError):
             folder = ""
 
@@ -266,6 +274,12 @@ def _parse(kind, prefix, src_label, sid):
         "files": files, "reads": [], "commands": [], "commits": [], "tests": [],
         "requests": [], "agents": [], "agents_bg": [], "agent_sessions": [], "shells": [],
         "decisions": [], "waiting": False,
+        # Same field/shape contract as Claude/Auggie's detail dict (see parse_session's
+        # parse_error), honestly None here always: this provider has no chat transcript to
+        # parse at all (per the LevelDB gap in the module docstring above) -- "can't know",
+        # not "nothing failed", but the two read the same to the client, which is correct:
+        # there's no line/record for it to point at either way.
+        "parse_error": None,
         "prs": [],
         "narrative": narrative,
         "message": NOTE[:2000],

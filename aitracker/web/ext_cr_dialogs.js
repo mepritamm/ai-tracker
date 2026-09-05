@@ -82,6 +82,20 @@
     return '<p>' + out + '</p>';
   }
 
+  // Strips terminal escape sequences for the plain-text `renderRunOutput` pane below.
+  // This is NOT ext_run.js's ansiHtml() (SGR -> <span class="aNN">, HTML-escaped) — that
+  // renderer earns real colour by building markup, which this pane deliberately does not
+  // do (textContent only, per this pass's brief). Dropping the codes instead of leaving
+  // them as literal garbage bytes is the cheaper honest middle ground: plain, readable
+  // text, still zero HTML risk since nothing here is ever parsed as markup.
+  function stripAnsi(s) {
+    return (s || '')
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')   // OSC ... BEL/ST
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')               // CSI (incl. SGR colour)
+      .replace(/\x1b[@-Z\\-_]/g, '')                        // two-char escapes
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');        // stray control bytes (keep \r\n)
+  }
+
   function icon(name, cls) {
     if (_ctx && typeof _ctx.icon === 'function') {
       // ctx.icon(name) returns an SVG STRING, not a DOM node (see ext_cr_boot.js's
@@ -764,14 +778,13 @@
     railLegacy: 'tracker.rail',
     railOpen: 'cr.railOpen',
     cardsFolded: 'cr.cardsFolded',
-    // The owner's call (see the board-tile-count decision in the PR that wired this row up):
-    // a 3–8 slider, NOT 04's original 3–12 spec — 3–8 never exceeds the handoff README's
-    // "board never renders more than 8 tiles" cap, so both docs are satisfied at once.
-    // Client-side preference ONLY (never a server config.json key) — ext_cr_board.js reads
-    // this SAME key and clamps to 3..8 on its own side; the two must agree on both the key
-    // name and the value shape: a bare JSON-encoded integer (`JSON.stringify(n)`, i.e. the
-    // string "3".."8"), read back with `JSON.parse(localStorage.getItem(key))`. Unset ->
-    // the board's own default (8, matching the previous fixed behaviour) applies.
+    // Owner ruling: doc 04's board-tiles row is the authoritative spec — a 3–12 slider,
+    // default 8 — superseding doc 02's "never more than 8" cap. ext_cr_board.js's
+    // enforcement ceiling was raised to 12 in lockstep; the two MUST agree on both the
+    // key name and the value shape: a bare JSON-encoded integer (`JSON.stringify(n)`,
+    // i.e. the string "3".."12"), read back with `JSON.parse(localStorage.getItem(key))`.
+    // Client-side preference ONLY (never a server config.json key). Unset -> the board's
+    // own default (8) applies.
     boardTiles: 'cr.boardTileCount',
     pollMs: 'cr.pollIntervalMs',
     desktopNotif: 'cr.notif.enabled',
@@ -824,6 +837,7 @@
     try { localStorage.setItem('tracker.rail.mode', mode); } catch (e) {}
     if (_ctx && typeof _ctx.emit === 'function') _ctx.emit('cr:pref', { key: 'tracker.rail.mode', value: mode });
   }
+
 
   function cfgRow(label, envVar, sub, control, restart) {
     // `control` may be a single element or an array (e.g. [control, statusBadge()]) --
@@ -1076,12 +1090,12 @@
             }
           )));
       } else if (active === 'Board') {
-        // The owner's decision: a 3–8 slider (not 04's original 3–12 spec) — 3–8 never
-        // exceeds the handoff README's "board never renders more than 8 tiles" cap, so
-        // both docs are satisfied. Client-side preference ONLY (localStorage, NOT
-        // config.json) — ext_cr_board.js reads this same key and clamps to 3..8 itself.
-        body.appendChild(cfgRow('Board tiles', null, 'How many session tiles the board shows before "+N more" — never more than 8 (handoff README decision 2).',
-          sliderCtl(3, 8, readPref(CFG_PREF_KEYS.boardTiles, 8), function (v) { writePref(CFG_PREF_KEYS.boardTiles, v); })));
+        // Owner ruling: doc 04's board-tiles row wins — a 3–12 slider, default 8 —
+        // superseding doc 02's "never more than 8" cap. Client-side preference ONLY
+        // (localStorage, NOT config.json) — ext_cr_board.js reads this same key and
+        // clamps to 3..12 itself; the two ceilings must agree.
+        body.appendChild(cfgRow('Board tiles', null, 'How many session tiles the board shows before "+N more".',
+          sliderCtl(3, 12, readPref(CFG_PREF_KEYS.boardTiles, 8), function (v) { writePref(CFG_PREF_KEYS.boardTiles, v); })));
         // Fix 2b — this is the SAME poll() /api/session timer app.js's track() already
         // runs (2s by default, and the project's hard rule keeps that the default) —
         // ext_cr_boot.js re-arms that one timer at the chosen cadence instead of adding a
@@ -1130,14 +1144,15 @@
         body.appendChild(cfgRow('Auth', 'TRACKER_AUTH',
           'Never displayed — only whether it is set. Env-only, deliberately not editable here: writing a password typed into a browser into a plaintext file on a server that may be tunneled is a real security regression, not a convenience. Set TRACKER_AUTH and restart to change it.',
           readonlyField(srv.authSet ? 'set' : 'not set'), true));
-        body.appendChild(serverRow('Port', 'PORT', 'Rebinding a live listening socket isn’t attempted — this only takes effect the next time the server starts.',
-          function (value, onCommit) {
-            return textFieldCtl(value != null ? value : 8790, onCommit, { type: 'number', min: 1, max: 65535 });
-          }));
-        body.appendChild(serverRow('Host', 'HOST', 'Same as Port — recorded now, applied on the next start.',
-          function (value, onCommit) {
-            return textFieldCtl(value || '127.0.0.1', onCommit, { type: 'text' });
-          }));
+        // Doc 04 (§ Config → Server) specs Port/Host as "mono fields, read-only display" —
+        // no POST /api/config path for either. Rebinding a live listening socket's bind
+        // host/port from a dashboard field is a write surface the spec never sanctioned,
+        // so these render via the same readonlyField() helper the Auth row above uses,
+        // never textFieldCtl()/serverRow() (which would wire them to postConfigValue()).
+        body.appendChild(cfgRow('Port', 'PORT', 'Rebinding a live listening socket isn’t attempted — this reflects what the server is running with now.',
+          readonlyField(String((srv.cfg && srv.cfg.PORT && srv.cfg.PORT.value != null) ? srv.cfg.PORT.value : 8790)), true));
+        body.appendChild(cfgRow('Host', 'HOST', 'Same as Port — read-only.',
+          readonlyField(String((srv.cfg && srv.cfg.HOST && srv.cfg.HOST.value) || '127.0.0.1')), true));
       } else if (active === 'Tunnel') {
         // The one-line, always-visible disclosure the security review this feature was
         // built under calls for: never hidden behind the reveal action, never a lecture.
@@ -1369,6 +1384,167 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Live "Run a command" output pop-out (doc 04 capability #54 — "Command runner
+  // + constraint stated", Evidence column). Was toast-only: the panel started a
+  // job over POST /api/term/run and reported "Running: <cmd>" / "<cmd> — done"
+  // via ctx.emit('notify', ...) with no way to see what the command actually
+  // printed. This is the missing output pane, sharing the SAME pop-out chrome
+  // and .cr-popout-body/.cr-outputtext styling as the file-diff/command-output
+  // pop-out above (doc 04: "The same pop-out serves command output and full
+  // narration text; only the toolbar differs") rather than a new modal shape.
+  //
+  // NO NEW ENDPOINT, NO NEW STREAM. This attaches its OWN EventSource straight
+  // to the EXISTING GET /api/term/stream?job=<id> route (aitracker/term_run.py)
+  // that a run already opens — term_run.py's stream() explicitly supports
+  // multiple simultaneous viewers of one job (job.viewers is a refcount; the
+  // child is killed only once the LAST viewer disconnects, so a second reader
+  // here cannot end the job early for anyone else watching, and starts no
+  // second child process). This is a second VIEWER of one stream, not a second
+  // stream, and not a per-panel poll — the SSE connection itself pushes.
+  //
+  // payload: {sessionId, cmd, cwd, jobId} — jobId is the id POST /api/term/run
+  // already returned to whoever started the job.
+  //
+  // REQUIRED ADDITION (outside this file's ownership for this pass — cr_boot.js
+  // is not in this task's file list): cr_boot.js's own `on('cr:run-command', …)`
+  // handler (the sole caller of POST /api/term/run) needs ONE new line, right
+  // after it sets `currentJob = res.j.job;`:
+  //   ctx.dialog('run-output', { sessionId: sid, cmd: argv, jobId: res.j.job });
+  // Nothing else there needs to change — this dialog reads the job's output and
+  // its `end` event (rc/truncated) directly off its own stream connection, so
+  // cr_boot.js's existing toast-only notify()s can stay exactly as they are (a
+  // toast AND a pane are not mutually exclusive). Verified by hand: opening this
+  // dialog directly with a real job id (started via a raw POST /api/term/run)
+  // renders the live output; see the module report for the exact command run.
+  function renderRunOutput(payload) {
+    payload = payload || {};
+    var cmd = payload.cmd || '';
+    var jobId = payload.jobId || null;
+    var chrome = buildChrome('run-output', cmd || 'command', null, payload.cwd || '', true);
+    chrome.panel.classList.add('cr-dialog-popout');
+
+    var stateEl = h('span', { class: 'cr-runstate cr-mono' }, ['starting…']);
+    var killBtn = h('button', { class: 'cr-btn cr-btn-quiet cr-btn-danger', type: 'button' },
+      [icon('stop'), ' Kill']);
+    var toolbar = h('div', { class: 'cr-popout-toolbar' }, [
+      h('span', { class: 'cr-popout-path cr-mono' }, [cmd]),
+      stateEl,
+      killBtn,
+      h('button', {
+        class: 'cr-btn cr-btn-quiet', type: 'button', text: 'New tab',
+        onclick: function () {
+          var w = window.open('', '_blank');
+          if (w) {
+            w.document.title = cmd || 'command output';
+            w.document.body.style.cssText = 'font-family:monospace;white-space:pre-wrap;padding:16px';
+            w.document.body.textContent = buf;
+          }
+        },
+      }),
+    ]);
+
+    // The pane scrolls INSIDE .cr-popout-body (max-height:60vh; overflow:auto,
+    // already defined for the diff/output pop-out above) — never the page body.
+    var pre = h('pre', { class: 'cr-outputtext cr-popout-body' });
+    var empty = h('div', { class: 'cr-runoutput-empty' }, ['No output yet.']);
+
+    var buf = '';
+    var es = null;
+    var ended = false;
+    // "Preserve scroll position sensibly across updates": stick to the bottom
+    // only while the viewer was already at (or near) the bottom; a reader who
+    // has scrolled up to read earlier output is left alone by later writes.
+    var stickBottom = true;
+    pre.addEventListener('scroll', function () {
+      stickBottom = (pre.scrollHeight - pre.scrollTop - pre.clientHeight) < 24;
+    });
+
+    function setState(text, cls) {
+      stateEl.textContent = text;               // textContent only — never HTML
+      stateEl.className = 'cr-runstate cr-mono' + (cls ? ' ' + cls : '');
+    }
+    function paint() {
+      empty.hidden = !!buf;
+      pre.hidden = !buf;
+      if (buf) {
+        pre.textContent = buf;                   // textContent — output is untrusted text
+        if (stickBottom) pre.scrollTop = pre.scrollHeight;
+      }
+    }
+
+    function attach(jid) {
+      if (es) { try { es.close(); } catch (e) {} es = null; }
+      ended = false;
+      killBtn.disabled = !jid;
+      if (!jid) { setState('failed to start', 'is-fail'); return; }
+      setState('running', 'is-run');
+      es = new EventSource('/api/term/stream?job=' + encodeURIComponent(jid));
+      es.onmessage = function (ev) {
+        try {
+          var d = JSON.parse(ev.data);
+          if (d && typeof d.b === 'string') { buf += stripAnsi(d.b); paint(); }
+        } catch (e) {}
+      };
+      es.addEventListener('end', function (ev) {
+        var d = {};
+        try { d = JSON.parse(ev.data); } catch (e) {}
+        ended = true;
+        if (es) { try { es.close(); } catch (e) {} es = null; }
+        if (d.truncated) buf += '\n… output truncated';
+        var rc = d.rc;
+        if (rc === 0) setState('finished — exit 0', 'is-ok');
+        else if (typeof rc === 'number') setState('finished — exit ' + rc, 'is-fail');
+        else setState('failed', 'is-fail');
+        killBtn.disabled = true;
+        paint();
+      });
+      es.onerror = function () {
+        if (ended) return;
+        setState('connection lost', 'is-fail');
+      };
+    }
+    killBtn.addEventListener('click', function () {
+      if (!jobId || killBtn.disabled) return;
+      fetch('/api/term/kill', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job: jobId }),
+      }).catch(function () {});
+    });
+
+    paint();
+    attach(jobId);
+    chrome.body.appendChild(toolbar);
+    chrome.body.appendChild(empty);
+    chrome.body.appendChild(pre);
+
+    // No per-dialog destroy hook exists in this module's own close()/_stack
+    // (see that function above — it only removes the wrap element), so this
+    // watches THIS module's own `_layer` (same closure, not a new mechanism)
+    // for the panel's removal to stop the EventSource instead of leaking it.
+    // Closing the dialog only detaches this VIEWER — same "detach, don't kill"
+    // rule doc 05 states for the terminal — it does not touch the job itself.
+    var mo = new MutationObserver(function () {
+      if (!document.body.contains(chrome.panel)) {
+        if (es) { try { es.close(); } catch (e) {} es = null; }
+        mo.disconnect();
+      }
+    });
+    if (_layer) mo.observe(_layer, { childList: true });
+
+    return {
+      backdrop: chrome.backdrop, panel: chrome.panel,
+      // Re-opening with a fresh jobId (another "run" click while this pop-out
+      // is already the topmost dialog) attaches to the new job instead of
+      // stacking a second copy — same convention open()'s own dedupe uses.
+      update: function (next) {
+        next = next || {};
+        if (next.cmd) { cmd = next.cmd; toolbar.querySelector('.cr-popout-path').textContent = cmd; }
+        if (next.jobId && next.jobId !== jobId) { jobId = next.jobId; buf = ''; paint(); attach(jobId); }
+      },
+    };
+  }
+
+  // ---------------------------------------------------------------------------
   // Narration pop-out with a rendered diagram
   // ---------------------------------------------------------------------------
 
@@ -1470,6 +1646,22 @@
     return parts[parts.length - 1] || String(cwd);
   }
 
+  // FIX 2: resolve a session id to its human title, the SAME pattern ext_vt.js's
+  // buildTermRow (~line 2500) and ext_cr_boot.js's buildFlagsPayload (~line 792) already
+  // use -- `sessions` is app.js's own global array (concatenated into the same top-level
+  // <script>, kept fresh by its 2s poll), looked up by id, falling back to title||project.
+  // The server's terminal rows never carry a `title` (only the raw `session` uuid), so
+  // every caller that wants a human name resolves it client-side against this same list
+  // rather than inventing a second lookup.
+  function sessionTitleFor(sid) {
+    if (!sid) return null;
+    var list = (typeof sessions !== 'undefined' && sessions) || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].id === sid) return list[i].title || list[i].project || null;
+    }
+    return null;
+  }
+
   // payload: {terminals:[{tty,cmd,cwd,started,session,mode}], max, onPeek(t), onKill(t), onCloseAll(), error}
   function renderManageTerminals(payload) {
     payload = payload || {};
@@ -1494,9 +1686,14 @@
       }
       var list = h('div', { class: 'cr-termcap-list' });
       terms.forEach(function (t) {
+        // FIX 2: t.title never arrives from the server (term_vt.py's terminal rows carry
+        // only the raw `session` uuid) -- resolve a human name via sessionTitleFor(), same
+        // as ext_vt.js/ext_cr_boot.js, and fall back to a truncated id rather than the full
+        // 36-char uuid (never "undefined": t.session is "" for a plain shell, never unset).
+        var identity = t.session ? (sessionTitleFor(t.session) || t.session.slice(0, 8)) : null;
         list.appendChild(h('div', { class: 'cr-termcap-row' }, [
           h('div', {}, [
-            h('div', { class: 'cr-termcap-title' }, [t.title || t.session || cwdTail(t.cwd) || t.tty]),
+            h('div', { class: 'cr-termcap-title' }, [identity || cwdTail(t.cwd) || t.tty]),
             h('div', { class: 'cr-termcap-meta cr-mono' }, [cwdTail(t.cwd) + ' · ' + timeAgo(t.started)]),
           ]),
           h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'peek', onclick: function () { if (payload.onPeek) payload.onPeek(t); } }),
@@ -1524,7 +1721,11 @@
   // Directory picker — cr_term.js's "+ New terminal" / "+ New Claude session".
   // Opened first with {loading:true}, then again with {cwds, note} once GET
   // /api/term/cwds resolves — folded via the same-name update path.
-  // payload: {mode, title, loading, cwds:[path,...], note, onPick(path)}
+  // payload: {mode, title, loading, cwds:[{path,label,mtime},...], note, onPick(path)}
+  // FIX 1: GET /api/term/cwds (term_vt.py's term_cwds()) returns OBJECTS shaped
+  // {path, label, mtime} -- `label` is the project/basename to display, `path` is the
+  // absolute directory to actually POST as `cwd`. Confirmed against term_vt.py:2469
+  // (`out = [{"path": p, "label": label_for[p], "mtime": m} ...]`).
   // ---------------------------------------------------------------------------
 
   function renderDirectoryPicker(payload) {
@@ -1539,13 +1740,23 @@
       var cwds = payload.cwds || [];
       if (cwds.length) {
         var list = h('div', { class: 'cr-flag-list' });
-        cwds.forEach(function (p) {
+        cwds.forEach(function (entry) {
+          var path = (entry && entry.path) || '';
+          if (!path) return;
+          var label = (entry && entry.label) || path;
           list.appendChild(h('button', {
-            class: 'cr-btn cr-btn-quiet cr-fullrow', type: 'button', text: p,
-            onclick: function () { if (payload.onPick) payload.onPick(p); close(); },
+            // `text:` assigns via el.textContent (h()'s own DOM-property path, line ~48) --
+            // never innerHTML -- so an untrusted label/path can't break markup here.
+            class: 'cr-btn cr-btn-quiet cr-fullrow', type: 'button', text: label,
+            title: path,
+            onclick: function () { if (payload.onPick) payload.onPick(path); close(); },
           }));
         });
         chrome.body.appendChild(list);
+      } else if (!payload.loading && !payload.note) {
+        // Honest empty state (doc 04's "two different empties" -- "nothing yet" case)
+        // instead of silently showing only the free-text field with no explanation.
+        chrome.body.appendChild(emptyState({ title: 'No recent directories', body: 'Type a path below to start.' }));
       }
       var input = h('input', { class: 'cr-textfield', type: 'text', placeholder: '/path/to/project' });
       var go = h('button', {
@@ -1617,6 +1828,14 @@
     payload = payload || {};
     var chrome = buildChrome('fork-lineage', 'Fork lineage', 'branch', payload.sid || '', false);
     var body = chrome.body;
+    // FIX 5: the header subtitle is only the raw id (buildChrome's 4th arg) -- colour/id
+    // never carries meaning alone (doc 04's own rule), so say in words which session this
+    // is, resolving a human title the same way every other identity lookup in this file
+    // does (sessionTitleFor, added above for FIX 2).
+    if (payload.sid) {
+      var here = sessionTitleFor(payload.sid) || payload.sid.slice(0, 8);
+      body.appendChild(h('p', { class: 'cr-help-note' }, ['You are currently on ', h('strong', {}, [here]), '.']));
+    }
     function linkRow(label, targetSid) {
       body.appendChild(h('p', {}, [
         label + ' ',
@@ -1739,6 +1958,7 @@
     'agent-transcript': renderDrillPopout('agent'),
     'shell-tail': renderDrillPopout('shell'),
     diff: renderDiffPopout,       // generic rich pop-out for a caller that already holds full content
+    'run-output': renderRunOutput, // live "Run a command" pane (doc 04 #54) — see REQUIRED ADDITION above
     'narration-diagram': renderNarrationDiagram,
   };
 
@@ -1755,6 +1975,12 @@
     showNudgeIfNeeded: showNudgeIfNeeded,
     providerNoteFor: providerNoteFor,
     addHelpShortcuts: addHelpShortcuts,
+    // Exposed so a role="dialog" surface built outside this module's own open()/close()
+    // (currently: ext_cr_term.js's terminal overlay) can wire the SAME Tab-cycling focus
+    // trap every dialog built via open() already gets — instead of forking a second
+    // implementation. Returns the untrap cleanup fn, exactly like the internal call site
+    // above (open()) uses it.
+    trapFocus: trapFocus,
     CAPABILITIES: CAPABILITIES, // exposed read-only — tests/test_capability_table.py asserts against this directly
   };
 })();

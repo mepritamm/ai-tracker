@@ -659,6 +659,7 @@ window.CR = window.CR || {};
       }
       emit('notify', { text: 'Running: ' + argv });
       currentJob = res.j.job;
+      dialog('run-output', { sessionId: sid, cmd: argv, jobId: res.j.job });
       if (typeof EventSource !== 'function') return;
       var es = new EventSource('/api/term/stream?job=' + encodeURIComponent(res.j.job));
       es.addEventListener('end', function (ev) {
@@ -879,12 +880,36 @@ window.CR = window.CR || {};
       }
     });
   }
+  // A9 fix (control-room-drift-analysis.md finding A9): the back-line hint "N of M
+  // needing attention · j/k to move between them" (doc 03) is real code in
+  // ext_cr_detail.js's renderBackline() — it already reads `state.triage.index`/
+  // `.total` — but nothing ever supplied `state.triage`, so it stayed permanently
+  // hidden. `sessions`/`listNow` are the SAME top-level globals this file already
+  // reads elsewhere (buildFlagsPayload, the ctx.terminals.count fallback), kept
+  // fresh by app.js's own 5s loadSide() poll — no new round-trip. The ranking is
+  // CR.board's own public `boardTiles(sessions, now)` (the exact list "needing
+  // attention" ranks over, idle sessions already excluded), the SAME public surface
+  // ext_cr_detail.js's own stepSession() (j/k navigation) already calls for the
+  // identical purpose — not a second ranking invented here.
+  function computeTriage(d) {
+    if (!window.CR.board || typeof window.CR.board.boardTiles !== 'function') return null;
+    var list = (typeof sessions !== 'undefined' && Array.isArray(sessions)) ? sessions : [];
+    if (!list.length) return null;
+    var nowSec = (typeof listNow === 'number') ? listNow : Math.floor(Date.now() / 1000);
+    var tiles = window.CR.board.boardTiles(list, nowSec).filter(function (t) { return t.kind === 'session'; });
+    if (!tiles.length) return null;
+    var sid = (d.meta && d.meta.sessionId) || d.id;
+    var idx = -1;
+    tiles.forEach(function (t, i) { if (t.session.id === sid) idx = i; });
+    if (idx < 0) return null; // this session isn't in the triage-ranked set (e.g. idle) — honestly hidden, not fabricated
+    return { index: idx + 1, total: tiles.length };
+  }
   if (typeof EXT !== 'undefined' && EXT && EXT.push) {
     EXT.push(function (d) {
       if (getUiMode() !== 'next' || !mounted) return;
       if (!d || d.error) return;
       if (window.CR.detail && typeof window.CR.detail.update === 'function') {
-        try { window.CR.detail.update({ session: d, now: d.now }); } catch (e) { console.error('[CR] detail.update threw', e); }
+        try { window.CR.detail.update({ session: d, now: d.now, triage: computeTriage(d) }); } catch (e) { console.error('[CR] detail.update threw', e); }
       }
     });
   }

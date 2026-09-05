@@ -187,7 +187,13 @@ EDITABLE = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL",
 
 # Keys that only bind at process startup -- the dialog labels these "takes effect on
 # restart" and never claims a live apply for them.
-RESTART_REQUIRED = frozenset({"PORT", "HOST"})
+# TERMINAL joins PORT/HOST here per doc 04's Config table ("Terminal enabled | toggle |
+# TRACKER_TERMINAL | yes") -- the one row in that table marked Restart=yes besides
+# Auth/Port/Host. Note this is a UI/doc contract, not a claim that the attribute
+# resolution above is non-live (it is: term_gate.py rereads config.TERMINAL on every
+# request, per the comment above) -- the restart note is what the product spec calls for
+# on this row regardless.
+RESTART_REQUIRED = frozenset({"PORT", "HOST", "TERMINAL"})
 
 
 def _v_bool(v):

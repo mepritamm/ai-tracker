@@ -22,8 +22,14 @@ window.CR = window.CR || {};
   // (currently never-exercised) case this file is ever loaded standalone.
   var LIVE_WINDOW = (typeof LIVE !== 'undefined') ? LIVE : 300;
 
-  // Sort rank for the board — reproduced verbatim from doc 02 "Sort order".
-  var RANK = { awaiting: 0, flagged: 1, working: 2, landed: 3, idle: 4 };
+  // Sort rank for the board — doc 02 "Sort order" gives awaiting/flagged/working/
+  // landed/idle verbatim but is silent on 'failing' (01-foundations.md's state
+  // table names six states; doc 02's own RANK object only ever had five). Slotted
+  // between flagged and working: 01's table lists Failing right after Flagged, and
+  // both are "something is actively wrong" states that outrank plain 'working' —
+  // awaiting/flagged keep their original 0/1 values (no reshuffle above 'failing'),
+  // working/landed/idle each shift down by one to make room.
+  var RANK = { awaiting: 0, flagged: 1, failing: 2, working: 3, landed: 4, idle: 5 };
 
   // ----------------------------------------------------------------------
   // Pure derivations — no DOM, no ctx. Easy to unit-test in isolation.
@@ -36,20 +42,26 @@ window.CR = window.CR || {};
   // (providers/claude.py:246-284) emits id/project/cwd/title/prompt/source/
   // agent/group/groupLabel/parentId/bg/waiting/ended/mtime; providers/
   // auggie.py's list() (providers/auggie.py:160-168) emits the same key set.
-  // `state` here is derived from waiting/open_flags/mtime+ended, mirroring
+  // `state` here is derived from waiting/open_flags/fail_cmd/mtime+ended, mirroring
   // the precedence app.js's own sidebar already uses (waiting > done-if-live
   // > live > idle — aitracker/web/app.js:817-820), with open_flags slotted
   // into RANK's 'flagged' step. The doc's state vocabulary (01-foundations.md)
-  // also names a sixth state, "Failing" (a command/test returned non-zero),
-  // but that signal only exists in a session's parsed *detail* dict
-  // (commands[].exit), never in the list-endpoint shape this module is fed —
-  // and RANK itself never includes a 'failing' key either, so no tile in
-  // this implementation can ever carry that state. See REQUIRED ADDITIONS
-  // in the report for what a real "failing" tile would need.
+  // also names a sixth state, "Failing" (a command/test returned non-zero) —
+  // that signal is computed today ONLY inside a session's parsed *detail* dict
+  // (parse_session()'s `counts.errors`/`counts.tests_failed`, providers/claude.py),
+  // never emitted into the list-endpoint shape (list_sessions()) this module is
+  // fed, so this board has no live source for it yet (a REQUIRED ADDITION: thread
+  // a `fail_cmd` string — the failing command's name, ''/absent when nothing is
+  // failing — into the list dict the same way `open_flags`/`pr_num`/`note_count`
+  // already are). Wired defensively ahead of that addition, same pattern this file
+  // already uses for pr_num et al: the check below is a no-op today (no provider
+  // ever sets `fail_cmd`) and lights up the instant one does, with zero risk to
+  // any session that doesn't carry the field.
   function sessionState(s, now) {
     var live = (now - (s.mtime || 0)) < LIVE_WINDOW;
     if (s.waiting) return 'awaiting';
     if (s.open_flags) return 'flagged';
+    if (live && s.fail_cmd) return 'failing';
     if (live && !s.ended) return 'working';
     if (live && s.ended) return 'landed';
     return 'idle';
@@ -150,7 +162,7 @@ window.CR = window.CR || {};
   // with `agent === true` are pulled out of individual ranking and folded
   // into one tile per `group` bucket (repo/sandbox), counted only while at
   // least one session in the bucket is non-idle, then appended after the
-  // individually-ranked tiles, before the 8-tile cap is applied.
+  // individually-ranked tiles, before the board tile cap (boardTileCap()) is applied.
   function agentGroups(sessions, now) {
     var buckets = {};
     var order = [];
@@ -172,18 +184,49 @@ window.CR = window.CR || {};
     return order;
   }
 
+  // GAP CLOSE (rail parity, requirement/task 2): classic's collapseAgents()
+  // (app.js) folds re-runs of the SAME agent task (same prompt, falling back
+  // to title/id) into one row, newest run's fields winning, with `_runs`
+  // counting how many were folded — otherwise a task re-executed a dozen
+  // times floods an expanded "🤖 Agents · <repo>" bucket with a dozen
+  // near-identical rows instead of one. Ported here (rail's agent-bucket
+  // expansion, below, had no equivalent — every run rendered its own row)
+  // rather than shared, since app.js is out of this file's ownership for this
+  // task; same Object.assign-style semantics (a plain-object copy stands in
+  // for the spread/Map original, order preserved via a parallel array since
+  // insertion order on string keys is reliable here).
+  function collapseAgentRuns(arr) {
+    var by = {}, order = [];
+    arr.forEach(function (s) {
+      var key = s.prompt || s.title || s.id;
+      var g = by[key];
+      if (!g) {
+        g = {};
+        Object.keys(s).forEach(function (k) { g[k] = s[k]; });
+        g._runs = 1;
+        by[key] = g;
+        order.push(g);
+      } else {
+        var runs = g._runs + 1;
+        if ((s.mtime || 0) >= (g.mtime || 0)) { Object.keys(s).forEach(function (k) { g[k] = s[k]; }); }
+        g._runs = runs;
+      }
+    });
+    return order;
+  }
+
   // Config now writes a user preference for the board's tile cap —
-  // `cr.boardTileCount`, a JSON-encoded integer 3-8 (localStorage). Read fresh
+  // `cr.boardTileCount`, a JSON-encoded integer 3-12 (localStorage). Read fresh
   // on every call (never cached at mount) so the Config change takes effect on
   // the next 2s poll re-render with no reload. Absent/unparseable/out-of-range
-  // always falls back to the hard ceiling of 8 — README decision 2's "the
-  // board never renders more than 8 tiles" is never something a stored value
-  // can raise, only lower.
+  // always falls back to the default of 8. Ceiling is 12 per doc 04
+  // ("Board tiles | slider 3-12, default 8") — the owner ruled doc 04's 3-12
+  // wins over doc 02's "never more than 8 tiles" line, which is superseded.
   function boardTileCap() {
     var raw = null;
     try { raw = JSON.parse(localStorage.getItem('cr.boardTileCount')); } catch (e) { raw = null; }
     var n = (typeof raw === 'number' && isFinite(raw)) ? Math.round(raw) : 8;
-    return Math.max(3, Math.min(8, n));
+    return Math.max(3, Math.min(12, n));
   }
 
   // Sessions destination, requirement 1: which session (if any) the tab should
@@ -210,16 +253,27 @@ window.CR = window.CR || {};
   }
 
   // THE RULE (doc 02 "Sort order — this is the design"; README decision 2):
-  // never more than 8 tiles (or fewer, per the user's cr.boardTileCount
-  // preference above); pinned group on top, unpinned below, newest first
-  // within each group — waiting-on-you outranks everything, including
-  // recency; idle sessions never get a tile; agent-group tiles sit last.
+  // never more than boardTileCap() tiles — default 8, user-adjustable 3-12 per
+  // doc 04 (owner-ruled to supersede doc 02's flat "never more than 8");
+  // pinned group on top, unpinned below, newest first within each group —
+  // waiting-on-you outranks everything, including recency; idle sessions
+  // never get a tile; agent-group tiles sit last.
   function boardTiles(sessions, now) {
     var individual = sessions
-      // Exclude only agents that a group tile will actually represent. An agent
-      // session with no `group` (agent:true, group:"") is otherwise dropped by
-      // BOTH paths — agentGroups() skips it for lack of a key — and vanishes
-      // from the board entirely. Verified live: 950 sessions, 1 working, 0 tiles.
+      // Exclude only agents that a group tile will actually represent (agent:true
+      // WITH a non-empty `group` — a real `claude --bg` agent whose session isn't
+      // sdk-cli-sourced gets group:"" from providers/claude.py's _agent_group(),
+      // since that helper only buckets sdk-cli sessions). The bug this predicate
+      // fixes: a naive `!s.agent` here would drop every agent session from
+      // `individual`, and agentGroups() below independently skips anything with
+      // no `group` key (`if (!s.agent || !s.group) return;`) — so a plain `!s.agent`
+      // filter would strand agent:true/group:"" sessions in neither path, vanishing
+      // from the board entirely (live-verified once: 950 sessions, 1 working, 0
+      // tiles). Chosen fix here is "include individually when non-idle": this
+      // exact `!(s.agent && s.group)` predicate keeps an ungrouped agent session
+      // in `individual` (only agent+group together are excluded), so it gets
+      // ranked and tiled exactly like any other session — smaller diff than
+      // building a second "(no group)" bucket path through agentGroups().
       .filter(function (s) { return !(s.agent && s.group); })
       .map(function (s) { return { kind: 'session', session: s, state: sessionState(s, now) }; })
       .filter(function (t) { return t.state !== 'idle'; })
@@ -237,19 +291,23 @@ window.CR = window.CR || {};
   }
 
   // Triage-strip counts. NOTE: these read the raw fields directly rather
-  // than the single derived `state` above, because the three counts are not
+  // than the single derived `state` above, because the four counts are not
   // mutually exclusive the way a per-tile state is — a session can be both
   // "working" and "flagged" at once, and the strip's copy ("Flagged") never
-  // says these subtract from each other.
+  // says these subtract from each other. PINNED (owner addition, not in doc
+  // 02's three-cell table) counts every pinned session regardless of
+  // liveness/state, same as the other three counting across ALL sessions —
+  // not just what the 8-tile board happens to show.
   function triageCounts(sessions, now) {
-    var awaiting = 0, working = 0, flagged = 0;
+    var awaiting = 0, working = 0, flagged = 0, pinned = 0;
     sessions.forEach(function (s) {
       var live = (now - (s.mtime || 0)) < LIVE_WINDOW;
       if (s.waiting) awaiting++;
       else if (live && !s.ended) working++;
       if (s.open_flags) flagged++;
+      if (s.pinned) pinned++;
     });
-    return { awaiting: awaiting, working: working, flagged: flagged };
+    return { awaiting: awaiting, working: working, flagged: flagged, pinned: pinned };
   }
 
   // NOTE: the list-endpoint shape carries one mtime per session (its latest
@@ -379,7 +437,7 @@ window.CR = window.CR || {};
     // EXPLICIT user toggle and beat those rules. Before this tri-state the
     // mode was only 'open'|'collapsed' and applyRailMode() OR-ed the forced
     // conditions on top, so a click in the detail view (or on the board at
-    // 1025-1279px) was written to localStorage and then silently discarded --
+    // 1024-1279px) was written to localStorage and then silently discarded --
     // a visible button, correctly labelled, that did nothing.
     // NOTE the key is 'tracker.rail.mode', not the older 'tracker.rail'. The old
     // key's vocabulary was 'open'|'collapsed' with 'open' as the literal default,
@@ -390,8 +448,11 @@ window.CR = window.CR || {};
     // byte-for-byte the old default behaviour. The stale key is left alone.
     var railMode = (localStorage.getItem('tracker.rail.mode') || 'auto');
     var railOverlayOpen = false;      // < 1024px only: the rail as a slide-in overlay drawer
-    var activeFilter = null;          // 'awaiting' | 'working' | 'flagged' | null
+    var activeFilter = null;          // 'awaiting' | 'working' | 'flagged' | 'pinned' | null
     var searchQuery = '';
+    // GAP CLOSE (rail parity): mirrors classic's `liveOnly` (app.js) — the
+    // rail had no equivalent of the sidebar's "N live ✕" click-to-filter.
+    var railLiveOnly = false;
     var focusedTileId = null;         // preserved across update() re-renders
     var selectedSessionId = null;     // for rail row highlight, set by ctx events if any
     var lastState = { sessions: [], now: Math.floor(Date.now() / 1000) };
@@ -623,7 +684,11 @@ window.CR = window.CR || {};
         h('div', { class: 'cr-rail-title-group' }, [
           h('span', { class: 'cr-rail-label' }, ['All sessions']),
         ]),
-        (els.railCount = h('span', { class: 'cr-rail-count' }, ['0'])),
+        // GAP CLOSE (rail parity): a real <button> now (was a bare <span>) so
+        // it can toggle railLiveOnly, mirroring classic's clickable "N live"
+        // pill (app.js `livecount`) — title/aria-label are set live in
+        // renderRail() since the label depends on the current toggle state.
+        (els.railCount = h('button', { class: 'cr-rail-count', type: 'button', onclick: toggleRailLiveOnly }, ['0'])),
         (els.railChevron = h('button', {
           class: 'cr-rail-chevron', type: 'button',
           title: 'Collapse session rail', 'aria-label': 'Collapse session rail',
@@ -671,18 +736,18 @@ window.CR = window.CR || {};
       // Requirement 2: the rail is unconditionally hidden while the Sessions
       // tab is showing its no-seed browse list — there is nothing to toggle.
       if (currentView === 'sessions') return;
-      // At or below 1024px the rail isn't in-flow (open vs collapsed doesn't
+      // Below 1024px the rail isn't in-flow (open vs collapsed doesn't
       // apply — doc 02's breakpoint table has it "hidden; rail becomes an
       // overlay"), so the same toggle drives the overlay drawer instead.
-      // BLOCKER 4: threshold is `<= 1024` (not `< 1024`) to agree with the
-      // CSS's `max-width: 1024px` rail-overlay tier — both files now treat
-      // 1024px itself as compact, matching ext_cr_detail.css's own boundary.
-      if (window.innerWidth <= 1024) {
+      // Threshold is `< 1024` (not `<= 1024`) so it agrees with the CSS's
+      // `max-width: 1023px` rail-overlay tier — 1024px itself belongs to
+      // the wider "2 columns, docked/collapsed rail" tier per the doc.
+      if (window.innerWidth < 1024) {
         if (railOverlayOpen) closeRailOverlay(); else openRailOverlay();
         return;
       }
       // Flip against what is ACTUALLY on screen, not against the stored mode:
-      // under 'auto' the two disagree (detail view and the 1025-1279px tier are
+      // under 'auto' the two disagree (detail view and the 1024-1279px tier are
       // collapsed while railMode still reads 'auto'/'open'), and flipping the
       // stored value there produced a no-op first click.
       railMode = els.rail.classList.contains('cr-rail--collapsed') ? 'open' : 'collapsed';
@@ -708,7 +773,7 @@ window.CR = window.CR || {};
 
     // Closes the mobile overlay drawer. Called on: the toggle (chevron / top-bar
     // button), the scrim click, Escape (bindKeyboard), selecting a session
-    // (openSession), and a resize back above 1024px (bindResize) — safe to call
+    // (openSession), and a resize back to >= 1024px (bindResize) — safe to call
     // when already closed.
     function closeRailOverlay() {
       railOverlayOpen = false;
@@ -732,13 +797,16 @@ window.CR = window.CR || {};
       var hideRail = (currentView === 'sessions');
       els.rail.classList.toggle('cr-rail--hidden', hideRail);
       if (els.railToggleTop) els.railToggleTop.hidden = hideRail;
-      // BLOCKER 4: lower bound is `>= 1025` (not `>= 1024`) so this in-flow
-      // "collapsed icon rail" tier (1025-1279) never overlaps the <=1024
-      // rail-overlay tier above — 1024 itself is now overlay-only, agreeing
-      // with the CSS's `max-width: 1024px` boundary.
-      // The detail view and the 1025-1279px tier collapse the rail BY DEFAULT,
+      // Lower bound is `>= 1024` (not `>= 1025`) so this in-flow "collapsed
+      // icon rail" tier (1024-1279, doc 02's breakpoint table) sits directly
+      // against the `< 1024` rail-overlay tier above with no gap and no
+      // overlap — 1024px itself is docked/collapsed, not overlay, per the
+      // doc's own table (a prior "BLOCKER 4" pass had shifted this to
+      // `>= 1025` to match the CSS's now-superseded `<=1024` overlay
+      // boundary; the owner's docs-win ruling supersedes that).
+      // The detail view and the 1024-1279px tier collapse the rail BY DEFAULT,
       // but an explicit toggle overrides them -- otherwise the control is dead.
-      var autoCollapsed = isDetail || (window.innerWidth < 1280 && window.innerWidth >= 1025);
+      var autoCollapsed = isDetail || (window.innerWidth < 1280 && window.innerWidth >= 1024);
       var collapsed = (railMode === 'auto') ? autoCollapsed : (railMode === 'collapsed');
       els.rail.classList.toggle('cr-rail--collapsed', collapsed);
       // 56px orb styling is the COLLAPSED detail rail; once the user expands it
@@ -756,8 +824,8 @@ window.CR = window.CR || {};
 
     function bindResize() {
       window.addEventListener('resize', function () {
-        var underlay = window.innerWidth <= 1024;
-        if (!underlay) closeRailOverlay();   // resizing back above 1024px cleans up the overlay + scrim
+        var underlay = window.innerWidth < 1024;
+        if (!underlay) closeRailOverlay();   // resizing back to >= 1024px cleans up the overlay + scrim
         applyRailMode();
       });
     }
@@ -875,7 +943,7 @@ window.CR = window.CR || {};
           }, [glyph('agent', '', null), 'Agents · ' + esc(b.label) + (b.live ? ' (' + b.live + ' live)' : ''),
               h('span', { class: 'cr-rail-agentchevron' }, [icon('chevron', '<path d="M9 6l6 6-6 6"/>')])]));
           if (isOpen) {
-            b.sessions.slice().sort(function (a, c) { return (c.mtime || 0) - (a.mtime || 0); })
+            collapseAgentRuns(b.sessions).sort(function (a, c) { return (c.mtime || 0) - (a.mtime || 0); })
               .forEach(function (s) { container.appendChild(railRow(s, now)); });
           }
         });
@@ -887,7 +955,24 @@ window.CR = window.CR || {};
     function renderRail(state) {
       if (!els.railList) return;
       var sessions = state.sessions || [], now = state.now;
-      els.railCount.textContent = String(sessions.length);
+      // GAP CLOSE (rail parity): classic's "N live ✕" pill (app.js's
+      // `livecount`) filters the WHOLE sidebar to live sessions on click; the
+      // rail's count was display-only. Isolated to this file's two rail-only
+      // call sites below (renderSessionRows' OTHER caller, the Sessions
+      // destination at line ~1085ish, is untouched — the owner's instruction
+      // is not to alter that view) — `baseSessions` stands in for `sessions`
+      // in both branches, same as classic's own `shown=liveOnly?...:sessions`.
+      var baseSessions = railLiveOnly
+        ? sessions.filter(function (s) { return (now - (s.mtime || 0)) < LIVE_WINDOW; })
+        : sessions;
+      // innerHTML is safe here: the only interpolated value is a NUMBER (a count),
+      // never a session-derived string. The clear-the-filter affordance is an icon.
+      if (railLiveOnly) els.railCount.innerHTML = baseSessions.length + ' live ' + ico('close');
+      else els.railCount.textContent = String(sessions.length);
+      els.railCount.classList.toggle('cr-rail-count--on', railLiveOnly);
+      var railCountLabel = railLiveOnly ? 'Showing live only — click to show all' : 'Click to show live sessions only';
+      els.railCount.title = railCountLabel;
+      els.railCount.setAttribute('aria-label', railCountLabel);
 
       var scrollTop = els.railList.scrollTop;
       var activeEl = document.activeElement;
@@ -898,19 +983,24 @@ window.CR = window.CR || {};
 
       var shown;
       if (collapsed) {
-        var filtered = railRowsFor(sessions.filter(function (s) { return !s.agent; }));
+        var filtered = railRowsFor(baseSessions.filter(function (s) { return !s.agent; }));
         var order = railOrder(filtered);
         renderCollapsedOrbs(order, now);
         shown = order.pinned.length + order.unpinned.length;
       } else {
-        shown = renderSessionRows(els.railList, sessions, now).total;
+        shown = renderSessionRows(els.railList, baseSessions, now).total;
       }
 
-      var more = sessions.length - shown;
+      var more = baseSessions.length - shown;
       els.railFooter.textContent = 'scroll · ' + Math.max(0, more) + ' more';
 
       els.railList.scrollTop = scrollTop;
       if (activeWasSearch) els.railSearchInput.focus();
+    }
+
+    function toggleRailLiveOnly() {
+      railLiveOnly = !railLiveOnly;
+      renderRail(lastState);
     }
 
     // ------------------------------------------------------------------
@@ -1155,10 +1245,22 @@ window.CR = window.CR || {};
       // real list-dict session) — falls back to the prompt/title tooltip
       // exactly as before whenever it's absent, so this is purely additive.
       var todoLabel = railTodoLabel(s);
+      // GAP CLOSE: flag_text rides the row's existing tooltip too — same reasoning as
+      // tileHead() above. '' when null/absent, so an unflagged row's tooltip is
+      // byte-for-byte unchanged.
+      // GAP CLOSE (rail parity, requirement/task 2): the classic sidebar shows
+      // a visible 📝N note badge on every row (app.js's sessionRow()); doc 02's
+      // own row anatomy caps trailing metadata at ONE slot ("age, or 🚩 count,
+      // or agent count") with no room for a second badge, so the note count
+      // rides the tooltip instead of a new visible element — reachable, same
+      // as flag_text already was, without widening the row or adding a second
+      // always-on badge doc 02 never specified.
       var titleAttr = (s.prompt || s.snippet || s.title || '(no prompt)') + '\n' + (s.cwd || '') +
         (s.model ? '\nModel: ' + s.model : '') +
         (todoLabel ? '\n' + (s.todo_done || 0) + ' of ' + s.todo_total + ' todos done' +
-          (s.todo_current ? ' — in progress: ' + s.todo_current : '') : '');
+          (s.todo_current ? ' — in progress: ' + s.todo_current : '') : '') +
+        (s.flag_text ? '\nFlags: ' + s.flag_text : '') +
+        (s.note_count ? '\nNotes: ' + s.note_count + ' note' + (s.note_count === 1 ? '' : 's') : '');
       // Colour never carries meaning alone: the state word (and, for a pinned
       // session, "(pinned)") rides along in aria-label (title keeps the fuller
       // prompt/cwd/snippet tooltip it already had).
@@ -1169,6 +1271,28 @@ window.CR = window.CR || {};
       // colour and UI elements, not as inline prefixes, to keep the title
       // clean and avoid duplicate visual indicators.
       var displayName = name;
+      // GAP CLOSE (rail parity): the classic sidebar's row carries an inline
+      // pin toggle (pin icon, togglePin()) and rename control (edit icon,
+      // renameSession()) — the rail only ever DISPLAYED pinned state (the dot
+      // colour + aria-label above), with no way to pin/unpin or rename a
+      // session anywhere in this UI. Mirrors classic exactly: same
+      // `stopPropagation` (so clicking either button opens nothing), same
+      // title/on-state semantics.
+      var actions = h('div', { class: 'cr-rail-actions' }, [
+        h('button', {
+          class: 'cr-rail-pin' + (s.pinned ? ' cr-rail-pin--on' : ''), type: 'button',
+          title: s.pinned ? 'Unpin' : 'Pin to top', 'aria-label': s.pinned ? 'Unpin' : 'Pin to top',
+          onclick: function (e) { e.stopPropagation(); toggleSessionPin(s.id); }
+        }, [glyph('pin', '')]),
+        h('button', {
+          class: 'cr-rail-rename', type: 'button',
+          title: 'Rename', 'aria-label': 'Rename this session',
+          onclick: function (e) {
+            e.stopPropagation();
+            if (ctx && typeof ctx.dialog === 'function') ctx.dialog('rename', { sessionId: s.id, currentTitle: s.title || '' });
+          }
+        }, [glyph('edit', '')]),
+      ]);
       return h('div', {
         class: 'cr-rail-row' + (s.id === selectedSessionId ? ' cr-rail-row--selected' : ''),
         tabindex: '0', role: 'button', title: titleAttr, 'aria-label': label, 'data-id': s.id,
@@ -1181,8 +1305,45 @@ window.CR = window.CR || {};
           dirLine ? h('span', { class: 'cr-rail-dir' }, [dirLine]) : null,
         ]),
         h('span', { class: 'cr-rail-meta' },
-          (todoLabel ? [todoLabel + ' · '] : []).concat(railRowMeta(s, now))),
+          // GAP CLOSE (rail parity): `s._runs` only exists on a row folded by
+          // collapseAgentRuns() above (a re-run collapsed into one row) —
+          // classic's own `×N` badge (app.js: `s._runs>1`), absent everywhere
+          // else, same as todoLabel already was. railRowMeta() can return icon
+          // elements (glyph()), not just strings, so this stays an array
+          // `.concat()` rather than a `.join()` — a naive string join would
+          // stringify a DOM node instead of rendering it.
+          (s._runs > 1 ? ['×' + s._runs + ' · '] : [])
+            .concat(todoLabel ? [todoLabel + ' · '] : [])
+            .concat(railRowMeta(s, now))),
+        actions,
       ]);
+    }
+
+    // GAP CLOSE (rail parity): classic's togglePin() (app.js) POSTs the
+    // existing /api/pin route directly from its sidebar module — no bus
+    // event/bridge exists for it (unlike cr:rename, which cr_dialogs.js +
+    // ext_cr_boot.js already wire end-to-end). Adding a NEW 'cr:pin-toggle'
+    // bridge would mean editing ext_cr_boot.js, which is outside this file's
+    // ownership for this task — so this calls the SAME already-shipped
+    // /api/pin route directly, exactly like this file already does for
+    // /api/search (see doSearch below); optimistic local update + re-render
+    // (rail/board/triage all read `pinned` off the same session objects) so
+    // the toggle reflects immediately rather than waiting on the next 2s poll.
+    function toggleSessionPin(id) {
+      var s = null;
+      (lastState.sessions || []).some(function (x) { if (x.id === id) { s = x; return true; } return false; });
+      if (!s || typeof fetch !== 'function') return;
+      var next = !s.pinned;
+      fetch('/api/pin', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session: id, pinned: next }),
+      }).then(function (r) { return r.ok; }).then(function (ok) {
+        if (!ok) return;
+        s.pinned = next;
+        renderRail(lastState);
+        renderBoard(lastState);
+        renderTriage(lastState);
+      });
     }
 
     function openSession(id) {
@@ -1295,9 +1456,11 @@ window.CR = window.CR || {};
       // BLOCKER 1: 'New session' label wrapped in `.cr-topbar-label` so the
       // phone-tier CSS can drop to icon-only. `aria-label` is new — this
       // button previously had none, relying entirely on the (now hideable)
-      // text node for its accessible name.
+      // text node for its accessible name. `title` (doc 02: "icon-only
+      // controls need a `title` and an `aria-label` sourced from the same
+      // string") was missing entirely — added here, same text as aria-label.
       els.topbar.appendChild(h('button', {
-        class: 'cr-newsession', type: 'button', 'aria-label': 'New session',
+        class: 'cr-newsession', type: 'button', title: 'New session', 'aria-label': 'New session',
         onclick: function () { ctx && ctx.emit && ctx.emit('session:new'); }
       }, [icon('spark', '<path d="M12 2l2 7h7l-5.5 4.5L17 21l-5-4-5 4 1.5-7.5L3 9h7z"/>'),
           h('span', { class: 'cr-topbar-label' }, ['New session'])]));
@@ -1387,6 +1550,7 @@ window.CR = window.CR || {};
       cell('awaiting', 'WAITING ON YOU');
       cell('working', 'WORKING');
       cell('flagged', 'FLAGGED');
+      cell('pinned', 'PINNED');
 
       els.histWrap = h('div', { class: 'cr-triage-hist' }, [
         (els.histBars = h('div', {
@@ -1409,7 +1573,7 @@ window.CR = window.CR || {};
     function renderTriage(state) {
       var sessions = state.sessions || [], now = state.now;
       var counts = triageCounts(sessions, now);
-      ['awaiting', 'working', 'flagged'].forEach(function (key) {
+      ['awaiting', 'working', 'flagged', 'pinned'].forEach(function (key) {
         els['triageCount_' + key].textContent = String(counts[key]);
         els['triageCell_' + key].classList.toggle('cr-triage-cell--active', activeFilter === key);
       });
@@ -1460,6 +1624,13 @@ window.CR = window.CR || {};
 
     function passesFilter(t) {
       if (!activeFilter) return true;
+      // PINNED (owner addition): not a per-tile `state` value, so it needs its
+      // own branch, same shape as the 'flagged' special-case below. An
+      // agent-group tile has no `.session` (it aggregates several), but DOES
+      // carry its own `.pinned` (agentGroups() ORs every member's pinned flag
+      // onto the group) — read straight off `t` for a group, off `t.session`
+      // for an individual session tile.
+      if (activeFilter === 'pinned') return t.kind === 'session' ? !!t.session.pinned : !!t.pinned;
       if (t.kind !== 'session') return activeFilter !== 'flagged' ? false : t.session.open_flags > 0;
       if (activeFilter === 'flagged') return !!t.session.open_flags;
       return t.state === activeFilter;
@@ -1469,6 +1640,17 @@ window.CR = window.CR || {};
       var sessions = state.sessions || [], now = state.now;
       var allTiles = boardTiles(sessions, now);
       var tiles = allTiles.filter(passesFilter);
+
+      // A8: mirrors renderRail()'s / renderSessionsView()'s own scroll-position
+      // preservation across a poll re-render — same pattern (snapshot scrollTop
+      // of the actual overflow:auto container before clearing its content,
+      // restore it after), not a second one. The board's scrolling element is
+      // els.boardScroll (`.cr-board-scroll`, `overflow-y:auto` in
+      // ext_cr_board.css) — a parent of els.board, the grid whose innerHTML
+      // this function replaces — because els.board itself has no overflow of
+      // its own. Doc 02's keyboard section calls re-render scroll/focus loss
+      // "the single most likely regression."
+      var scrollTop = els.boardScroll.scrollTop;
 
       els.board.innerHTML = '';
       if (!tiles.length) {
@@ -1482,6 +1664,8 @@ window.CR = window.CR || {};
         var el = els.board.querySelector('[data-tile-id="' + cssEscape(focusedTileId) + '"]');
         if (el) el.focus();
       }
+
+      els.boardScroll.scrollTop = scrollTop;
 
       renderCapFooter(sessions, allTiles);
     }
@@ -1509,15 +1693,23 @@ window.CR = window.CR || {};
     // count into the word itself — "N flags open", singular "1 flag open" —
     // matching the exact pluralisation already used for the tile body line
     // (tileLine below). The static "Flagged" label carried no count.
+    // 01-foundations.md's state table gives Failing's word as `"fail" + command
+    // name` — rendered here as "fail: <command>" (colon-joined, matching the
+    // "N flags open"/"Waiting on you · <age>" convention of always spelling the
+    // dynamic part out in full, never a bare label). `s.fail_cmd` is the same
+    // (currently unwired server-side, see sessionState()'s note) command-name
+    // field that gates 'failing' in sessionState() in the first place, so this
+    // branch is only ever reached when there's a real command name to show.
     function stateWord(state, s) {
       if (state === 'flagged') {
         var n = (s && s.open_flags) || 0;
         return n + ' flag' + (n === 1 ? '' : 's') + ' open';
       }
+      if (state === 'failing') return 'fail: ' + (s && s.fail_cmd);
       return { awaiting: 'Waiting on you', working: 'Working', landed: 'Landed' }[state] || state;
     }
     function stateIcon(state) {
-      return { awaiting: ['hourglass', 'tn-emo-a'], working: ['working', ''], flagged: ['flag', 'tn-emo-f'], landed: ['check', 'tn-emo-d'] }[state] || ['', ''];
+      return { awaiting: ['hourglass', 'tn-emo-a'], working: ['working', ''], flagged: ['flag', 'tn-emo-f'], failing: ['x', 'tn-emo-f'], landed: ['check', 'tn-emo-d'] }[state] || ['', ''];
     }
 
     function todoTicks(s) {
@@ -1585,9 +1777,21 @@ window.CR = window.CR || {};
 
     function tileHead(s, state, now) {
       var ew = stateIcon(state);
+      // GAP CLOSE: flag_text (registry.py's list dict, s.flag_text) is the unresolved
+      // flag's own text — the badge above already carries the COUNT (stateWord's "N
+      // flags open"); the text rides the same `title` tooltip mechanism every other
+      // tile/row metadatum already uses here (see attrs.title below, railRow's
+      // titleAttr). null (no open flag) means no `title` attribute at all — h()
+      // skips null/undefined attrs, so there's never a stray empty tooltip.
+      // Extended (truncation follow-up) to 'failing': the tile's own text now
+      // ellipsizes at width (ext_cr_board.css .cr-tile-state), so the full
+      // fail_cmd string needs the same title-tooltip escape hatch flag_text
+      // already had, or a long command name would be unrecoverably clipped.
+      var flagTitle = (state === 'flagged' && s.flag_text) ? s.flag_text
+        : (state === 'failing' && s.fail_cmd) ? stateWord(state, s) : null;
       var kids = [
         glyph(ew[0], ew[1]),
-        h('span', { class: 'cr-tile-state' }, [stateWord(state, s) + (state === 'awaiting' ? ' · ' + ago(now - (s.mtime || 0)) : '')]),
+        h('span', { class: 'cr-tile-state', title: flagTitle }, [stateWord(state, s) + (state === 'awaiting' ? ' · ' + ago(now - (s.mtime || 0)) : '')]),
       ];
       if (s.pinned) kids.push(glyph('pin', '', 'Pinned'));
       var head = h('div', { class: 'cr-tile-head', 'data-state': state }, kids);
@@ -1658,17 +1862,11 @@ window.CR = window.CR || {};
       var s = t.session, state = t.state;
       var cls = 'cr-tile cr-tile--' + state;
       if (t.hero) cls += ' cr-tile--hero cr-tile--span2';
-      // Item 3: the gold "agent" glow (border-line-agent + glow-agent-soft) marks
-      // a tile with LIVE BACKGROUND AGENTS, not merely the plain 'working' state —
-      // confirmed against 5a itself: two simultaneously-"Working" tiles, one
-      // glowing (head shows "🤖 2", a live background-agent count) and one plain
-      // (head shows only elapsed time, no bg-agent badge). `s.bg` is that exact
-      // count (providers/claude.py:448, "in-transcript background agents live
-      // now"); Auggie/augment_ext always emit `bg: 0` (no background-agent concept
-      // for those tools — providers/auggie.py:267/281, providers/augment_ext.py:194),
-      // so those sessions degrade cleanly to the plain 'working' treatment below,
-      // never to a broken or empty one.
-      if (state === 'working' && (s.bg || 0) > 0) cls += ' cr-tile--agent-glow';
+      // Doc 02 tile-anatomy table / 01-foundations.md ~line 271: EVERY 'Working'
+      // tile gets the --line-agent border plus --glow-agent-soft + --shadow-raised
+      // — unconditional, not gated on live background agents. (`.cr-tile--working`
+      // in ext_cr_board.css now carries border+glow directly; the owner reversed
+      // the prior "only when s.bg > 0" restriction that used to live here.)
       var attrs = tileBaseAttrs(t);
       attrs.class = cls;
       attrs.title = (s.prompt || s.title || '(no prompt)') + '\n' + (s.cwd || '') +
@@ -1678,15 +1876,12 @@ window.CR = window.CR || {};
         tileHead(s, state, now),
         h('div', { class: 'cr-tile-title' }, [tileTitleText(s, state)]),
       ];
-      // Round-5 drift (decision 4a): 5a's own non-hero tile anatomy is
-      // head -> title -> body only — no "project · tool" sub-line (grep-
-      // verified against the artboard's own tile markup: three divs, never
-      // four). The hero (awaiting) tile is left exactly as it rendered
-      // before — decision 3's explicit exception — sub-line included, since
-      // it isn't part of this round-5 density fix.
-      if (t.hero) {
-        body.push(h('div', { class: 'cr-tile-sub' }, [(s.project || '') + ' · ' + toolLabel(s.source)]));
-      }
+      // Doc 02 tile-anatomy table: EVERY tile gets a "project · tool" sub-line
+      // (mono 10.5px, muted) between the title and the live/summary line — not
+      // just the hero. The owner reversed the prior round-5 "hero only" drift
+      // (which had cited the artboard's three-div markup over the doc); the
+      // doc wins now, restored to all states.
+      body.push(h('div', { class: 'cr-tile-sub' }, [(s.project || '') + ' · ' + toolLabel(s.source)]));
       var line = tileLine(s, state);
       if (line) body.push(line);
       var ticks = todoTicks(s);
@@ -1749,8 +1944,8 @@ window.CR = window.CR || {};
       els.capfooter.innerHTML = '';
       // BUG FIX / preference support: the "8" in this sentence used to be a
       // literal, but the cap is now a user preference (cr.boardTileCount,
-      // clamped 3-8) — the copy's shape is doc 02's "Cap footer" verbatim,
-      // only the number is dynamic.
+      // clamped 3-12 per doc 04) — the copy's shape is doc 02's "Cap footer"
+      // verbatim, only the number is dynamic.
       els.capfooter.appendChild(h('span', { class: 'cr-capfooter-count' }, [allTiles.length + ' of ' + sessions.length]));
       els.capfooter.appendChild(document.createTextNode(
         ' — The board never shows more than ' + boardTileCap() + ' tiles. Everything else lives in the rail — pinned on top, newest first in each group. — '));

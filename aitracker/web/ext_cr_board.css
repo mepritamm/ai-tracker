@@ -266,6 +266,25 @@
    theme / New session are all reachable at both 390px and 820px — verified
    by the arithmetic above, no runtime measurement tool available here.
 
+   CR-DRIFT (measured with Playwright, both themes, board + detail): the wrap
+   boundary above was `max-width: 1024px`, which assumed single-row content
+   (~1072px, incl. gaps, excl. the bar's own 44px h-padding) always fits once
+   the session rail's auto-collapse tier (1024-1279px -> 48/56px collapsed,
+   `applyRailMode`/`bindResize` in ext_cr_board.js) frees up room. It doesn't:
+   the rail's OWN threshold is `innerWidth < 1280`, so at exactly 1280px (and
+   up through ~1347px) the rail has already snapped back to its full 232px
+   OPEN width while the topbar is still nowrap — a viewport-width cliff where
+   available content width actually *drops* (~1004px vs. ~1048-1072px just
+   below 1280) as the window grows. Measured: `.cr-newsession` right edge
+   1326px / `.cr-topbar-label` "New session" 1312px at 1280x900 (both past
+   the 1280px viewport, text clipped to "New se..."). 1440px is the first
+   width safely clear of the cliff (content flush at 1418px, 22px of padding
+   to spare) so the boundary below is raised to `max-width: 1439px` — the bar
+   now wraps for the whole rail-cliff range instead of only <=1024px. This is
+   independent of (and does not change) the rail's own 1024/1280 thresholds
+   or the separate `max-width: 1023px` overlay-rail queries elsewhere in this
+   file — only the topbar's own wrap point moved.
+
    BLOCKER 2 (touch targets, phone tier only — desktop/tablet density is
    untouched per instruction): every control in this section measured below
    44px effective height at phone width. Technique used throughout is either
@@ -275,8 +294,31 @@
    buttons whose WIDTH must stay content-driven (destination pills, theme
    segments, New session) — never inflating the glyph/icon itself. See the
    per-control comments below for the arithmetic.
+
+   CR-DRIFT FOLLOW-UP (doc 02 line 93: "Top bar — 54px", ONE row at every
+   width from 1280 up): the fix above raised this wrap boundary to 1439px to
+   stop the "New se…" clipping, but that made 1280-1439 a measured 108.5px
+   TWO-row bar (nav row + actions row) — trading a clipped label for a doc
+   violation. The wrap boundary is now split into two tiers instead:
+     - <=1279px keeps the WRAP fix exactly as before (unchanged block below) —
+       this is the tablet/rail-collapsed tier the doc doesn't require single-
+       row for, and the row1/row2 split still reads fine there per the
+       original audit.
+     - 1280-1439px (the rail-cliff range the block comment above measured) no
+       longer wraps. Instead it reuses the SAME icon-only compaction the
+       phone tier (<=480px, below) already uses for this exact set of
+       controls — `.cr-topbar-label` hidden on cr-back/cr-icon-btn/
+       cr-newsession, icon/glyph stays, `title`+`aria-label` (already present
+       on every one of these buttons, see buildTopBar in ext_cr_board.js)
+       carry the accessible name. No second compaction mechanism invented.
+       Unlike the phone tier, boxes are NOT forced to a fixed 44x44 — there is
+       no touch-target requirement at this width, so buttons just shrink to
+       icon + existing padding, which is what buys back the ~68px deficit the
+       rail-open cliff costs (measured: content 1004px available vs ~1072px
+       needed at 1280 nowrap with full labels). Verified single 54px row at
+       1280/1300/1350/1439/1440, no clipped label, no overflow (see report).
    ============================================================ */
-@media (max-width: 1024px) {
+@media (max-width: 1279px) {
   .tracker-next .cr-topbar {
     flex-wrap: wrap;
     height: auto;
@@ -290,6 +332,13 @@
     height: 0;
     margin-left: 0;
   }
+}
+
+@media (min-width: 1280px) and (max-width: 1439px) {
+  .tracker-next .cr-back .cr-topbar-label,
+  .tracker-next .cr-icon-btn .cr-topbar-label,
+  .tracker-next .cr-newsession .cr-topbar-label { display: none; }
+  .tracker-next .cr-newsession { gap: 0; }
 }
 
 @media (max-width: 480px) {
@@ -422,7 +471,15 @@
   font: var(--fw-trace) var(--fs-trace-max)/var(--lh-trace) var(--font-mono);
   font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
+  /* GAP CLOSE (rail parity): now a <button> (was a <span>) so it can toggle
+   * live-only, same live-count click classic's sidebar has always had — see
+   * the triage-cell fix earlier in this file for why the reset comes first. */
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
 }
+.tracker-next .cr-rail-count--on { color: var(--text-thinking); }
 .tracker-next .cr-rail-chevron {
   flex: 0 0 auto;
   width: 22px;
@@ -574,6 +631,44 @@
   color: var(--text-muted);
 }
 
+/* GAP CLOSE (rail parity): pin/rename controls the classic sidebar always
+ * carries inline (app.js: `.ren{opacity:0}` / `.sitem:hover .ren{opacity:.8}`
+ * / `.pin{opacity:0}` / `.sitem:hover .pin{opacity:.6}` / `.pin.on{opacity:1}`
+ * unconditionally, plus a `@media(hover:none)` floor for touch). Same recipe
+ * here, opacity per-button (not on the `.cr-rail-actions` wrapper — a child's
+ * opacity can't win over a parent's 0, so `--on` has to sit on the button
+ * itself to stay visible outside hover). Buttons, so `border:0` first, same
+ * reset every other icon-only control in this file uses (see the triage-cell
+ * fix above — this file already learned that lesson once this session). */
+.tracker-next .cr-rail-actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 2px;
+}
+.tracker-next .cr-rail-pin,
+.tracker-next .cr-rail-rename {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  padding: 2px 3px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  line-height: 1;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0;
+}
+.tracker-next .cr-rail-row:hover .cr-rail-pin,
+.tracker-next .cr-rail-row:focus-within .cr-rail-pin,
+.tracker-next .cr-rail-row:hover .cr-rail-rename,
+.tracker-next .cr-rail-row:focus-within .cr-rail-rename { opacity: .6; }
+.tracker-next .cr-rail-pin:hover,
+.tracker-next .cr-rail-rename:hover { opacity: 1 !important; background: var(--fill-row-hover); }
+.tracker-next .cr-rail-pin--on { opacity: 1; color: var(--text-agent); }
+@media (hover: none) {
+  .tracker-next .cr-rail-pin, .tracker-next .cr-rail-rename { opacity: .6; }
+}
+
 .tracker-next .cr-rail-agentrow {
   display: flex;
   align-items: center;
@@ -656,16 +751,16 @@
 /* BUG FIX: no landed colour existed on the orb pip at all. */
 .tracker-next .cr-orb-pip.is-landed { background: var(--state-done); }
 
-/* BLOCKER 4 (tier boundary): this used to be `max-width: 1023px`, one pixel
- * off from ext_cr_detail.css's own compact-tier boundary (`max-width: 1024px`
- * / `min-width: 1025px`) — at exactly 1024px (classic iPad landscape) the
- * rail stayed docked (desktop behaviour) while the detail view had already
- * dropped to its single-column phone-adjacent stack. Realigned to the same
- * <=1024px boundary detail.css already uses, so 1024px gets ONE consistent
- * tier across both files. ext_cr_board.js's own `window.innerWidth < 1024`
- * checks (openRailOverlay/closeRailOverlay/applyRailMode/bindResize) are
- * updated alongside this to `<= 1024` so JS agrees with CSS at the boundary. */
-@media (max-width: 1024px) {
+/* Tier boundary (doc 02's breakpoint table): 1024–1279px is the "2 columns,
+ * rail collapsed to orbs, in-flow" tier; < 1024px is the "1 column, rail
+ * hidden/overlay" tier — so 1024px itself belongs to the WIDER tier, docked
+ * rail, not the overlay. A prior "BLOCKER 4" pass moved this to `max-width:
+ * 1024px` (`<=1024`) to match ext_cr_detail.css's own compact-tier boundary;
+ * the owner's docs-win ruling supersedes that reconciliation for the board/
+ * rail here — `max-width: 1023px` (`<1024`) matches the doc's own table.
+ * ext_cr_board.js's `window.innerWidth` checks (openRailOverlay/
+ * closeRailOverlay/applyRailMode/bindResize) use the matching `< 1024`. */
+@media (max-width: 1023px) {
   .tracker-next .cr-rail {
     position: fixed;
     top: 54px;
@@ -692,13 +787,13 @@
 /* Mobile rail scrim — sits behind the overlay-open rail, in front of the
  * board. No scrim/backdrop token exists in 01-foundations.md, so the fill is
  * a literal rgba (same precedent as the working-tile pulse keyframes, which
- * also use a literal rgba where no token covers the need). Only present at
- * or below 1024px, i.e. exactly the width band where the rail is an overlay
- * (see the Blocker 4 note above the rail-overlay media query). */
+ * also use a literal rgba where no token covers the need). Only present
+ * below 1024px, i.e. exactly the width band where the rail is an overlay
+ * (see the tier-boundary note above the rail-overlay media query). */
 .tracker-next .cr-rail-scrim {
   display: none;
 }
-@media (max-width: 1024px) {
+@media (max-width: 1023px) {
   .tracker-next .cr-rail-scrim {
     display: block;
     position: fixed;
@@ -727,7 +822,7 @@
 .tracker-next .cr-triage {
   flex: 0 0 auto;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, auto)) 1fr;
+  grid-template-columns: repeat(4, minmax(0, auto)) 1fr;
   padding: 16px 22px 14px;
   background: var(--surface-top);
   border-bottom: 1px solid var(--line-subtle);
@@ -735,33 +830,55 @@
 .tracker-next .cr-triage-cell {
   min-width: 0;
   padding: 0 26px 0 0;
-  border-right: 1px solid var(--line-subtle);
   margin-right: 26px;
   cursor: pointer;
-  border-bottom: 2px solid transparent;
   background: transparent;
   text-align: left;
   font: inherit;
+  /* BUG FIX ("plain boxy counters"): these cells are real <button> elements,
+   * and nothing here ever reset the UA default button border — Chrome/Safari
+   * draw their own 1px border on all four sides, so every cell rendered as a
+   * literal box around the count+label instead of the doc's borderless cell
+   * with a single divider. `border:0` clears the default on all sides first;
+   * the two sides the design actually wants (the divider, the active-state
+   * underline) are then set explicitly, same order every other reset button
+   * in this file uses (e.g. .cr-rail-chevron, .cr-rail-search input). */
+  border: 0;
+  border-right: 1px solid var(--line-subtle);
+  border-bottom: 2px solid transparent;
 }
 /* NOTE: no `:last-of-type` reset here — the histogram cell (`.cr-triage-hist`)
  * isn't a `.cr-triage-cell` and never had a border-right to begin with, so all
- * three count cells keep their divider (3 of 3) and the strip still ends
+ * four count cells keep their divider (4 of 4) and the strip still ends
  * without a trailing border after the histogram. The removed reset used to
- * strip the divider off the *last* `.cr-triage-cell` (Flagged) instead. */
+ * strip the divider off the *last* `.cr-triage-cell` (Flagged, now Pinned)
+ * instead — see the phone-tier override further down, which now targets
+ * `--pinned` since it is the last counter cell. */
 .tracker-next .cr-triage-cell--awaiting.cr-triage-cell--active { border-bottom-color: var(--text-awaiting); }
 .tracker-next .cr-triage-cell--working.cr-triage-cell--active { border-bottom-color: var(--text-thinking); }
 .tracker-next .cr-triage-cell--flagged.cr-triage-cell--active { border-bottom-color: var(--state-flagged); }
+/* PINNED (owner addition, doc 02 lists only awaiting/working/flagged): not a
+ * state in 01-foundations.md's state vocabulary table, so it gets no hued
+ * state colour of its own — inventing one would contradict "use only existing
+ * tokens, no new meaning." --text-agent is the doc's own "neutral" ink
+ * (01-foundations.md's emoji table classes 📌 pinned and 🤖 agent under the
+ * SAME untinted `tn-emo` treatment), and it is already dark-mode-safe
+ * (ext_cr.css defines both light and dark values) — reused here rather than
+ * --text-muted, which 01-foundations.md's contrast section reserves for
+ * "supporting copy only, never primary content," and a 33px triage count is
+ * primary content. */
+.tracker-next .cr-triage-cell--pinned .cr-triage-count { color: var(--text-agent); }
+.tracker-next .cr-triage-cell--pinned.cr-triage-cell--active { border-bottom-color: var(--text-agent); }
 .tracker-next .cr-triage-count {
   display: block;
   font: var(--fw-triage-count) var(--fs-triage-count-max)/var(--lh-triage-count) var(--font-serif);
   letter-spacing: var(--ls-triage-count);
   font-variant-numeric: tabular-nums;
-  /* BUG FIX: 01-foundations.md gives triage counts a 33-40px range, but the
-   * original prototype actually renders them at 31px — doc and prototype
-   * disagree here, and the prototype's rendered value wins per instruction.
-   * The token (--fs-triage-count-max, owned elsewhere) is left untouched;
-   * overridden at this use site only. */
-  font-size: 31px;
+  /* Doc 02 "Triage strip" table: counts are 33px (within 01-foundations.md's
+   * 33-40px range). The owner reversed the prior "prototype's 31px wins"
+   * exception — the doc's 33px is now implemented directly at this use site.
+   * The token (--fs-triage-count-max, owned elsewhere) is left untouched. */
+  font-size: 33px;
 }
 @media (max-width: 1439px) {
   .tracker-next .cr-triage-count { font-size: var(--fs-triage-count-min); }
@@ -807,6 +924,23 @@
   color: var(--text-muted);
 }
 
+/* Adding PINNED as a 4th counter cell leaves the histogram less room at
+ * narrow widths. It used to only get hidden inside the ≤480px "phone touch
+ * targets" block further down — measured at 481-600px (still inside this
+ * app's own phone tier; the ≤1023px/<1024 rail-collapse boundary is a
+ * separate, unrelated breakpoint) the foot's two labels ("Activity · last
+ * hour" / "events / min") no longer fit `justify-content:space-between` on
+ * one line each and wrap mid-word instead of overflowing, since
+ * `.cr-triage-hist` carries `min-width:0`. Widened to ≤600px and moved to its
+ * own query, split out of the unrelated 480px touch-target block below (whose
+ * OTHER rules — rail chevron/search/row-height, orb size, pager buttons — are
+ * deliberately left at their own 480px threshold, untouched) so the two
+ * declarations here aren't duplicated at two breakpoints. */
+@media (max-width: 600px) {
+  .tracker-next .cr-triage-hist { display: none; }
+  .tracker-next .cr-triage-cell--pinned { border-right: none; }
+}
+
 /* ============================================================
    BOARD — max 8 tiles
    ============================================================ */
@@ -827,7 +961,7 @@
 @media (max-width: 1279px) {
   .tracker-next .cr-board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
-@media (max-width: 1024px) {
+@media (max-width: 1023px) {
   .tracker-next .cr-board { grid-template-columns: minmax(0, 1fr); }
 }
 
@@ -843,29 +977,27 @@
 }
 .tracker-next .cr-tile--span2,
 .tracker-next .cr-tile--agentgroup { grid-column: span 2; }
-@media (max-width: 1024px) {
+@media (max-width: 1023px) {
   .tracker-next .cr-tile--span2,
   .tracker-next .cr-tile--agentgroup { grid-column: span 1; }
 }
 
-/* Plain 'working' state: shadow-raised only, default (--line-subtle) border —
-   5a itself shows a plain "Working" tile with no gold border/glow at all
-   (grep-verified: `border:1px solid var(--ads-line-subtle);box-shadow:var(--ads-shadow-raised)`).
-   The gold agent glow is a SEPARATE modifier, `.cr-tile--agent-glow` below,
-   added by ext_cr_board.js only when the session also has a live background
-   agent (see that file's sessionTile() for the rule + evidence). */
+/* Every 'Working' tile (doc 02 tile-anatomy table + 01-foundations.md ~line 271:
+   "A working tile gets --glow-agent-soft plus --shadow-raised", unconditional —
+   not gated on live background agents). The owner reversed the prior
+   bg-agent-only restriction (formerly a separate `.cr-tile--agent-glow`
+   modifier added only when `s.bg > 0`); that ruling is superseded, so the
+   border+glow now lives directly on the base working state. */
 .tracker-next .cr-tile--working {
-  box-shadow: var(--shadow-raised);
-}
-/* Item 3: 5a's OTHER simultaneously-"Working" tile carries this gold border +
-   glow, and its head shows a "🤖 2" live-background-agent badge where the
-   plain tile above shows only elapsed time — the glow marks background
-   agents, not the working state itself. */
-.tracker-next .cr-tile--agent-glow {
   border-color: var(--line-agent);
   box-shadow: var(--glow-agent-soft), var(--shadow-raised);
 }
 .tracker-next .cr-tile--flagged { background: var(--surface-flagged); border-color: var(--line-flagged); }
+/* A5 — Failing (brick, 01-foundations.md's state table): same background+border
+   pairing convention as flagged/landed above, using the --surface-failed/
+   --line-failed tokens the foundations file already defines for exactly this
+   state (both themes) — no new tokens needed. */
+.tracker-next .cr-tile--failing { background: var(--surface-failed); border-color: var(--line-failed); }
 .tracker-next .cr-tile--landed { background: var(--surface-done); border-color: var(--line-done); }
 .tracker-next .cr-tile--agentgroup { border-color: var(--line-subtle); }
 
@@ -917,11 +1049,23 @@
   font: var(--fw-eyebrow) var(--fs-eyebrow-min)/1 var(--font-sans);
   letter-spacing: var(--ls-eyebrow-min);
   text-transform: uppercase;
+  /* A5 follow-up: 'failing' renders "fail: <command>" with the fail_cmd string
+     interpolated verbatim (stateWord(), ext_cr_board.js) — an arbitrarily long
+     or unbreakable command name must not blow out the tile. Same shrink+
+     ellipsize pattern as .cr-tile-meta above, the sibling trailing-text field
+     in this same flex row. */
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .tracker-next .cr-tile--awaiting-label,
 .tracker-next .cr-tile-head[data-state="awaiting"] .cr-tile-state { color: var(--text-awaiting); }
 .tracker-next .cr-tile-head[data-state="working"] .cr-tile-state { color: var(--text-thinking); }
 .tracker-next .cr-tile-head[data-state="flagged"] .cr-tile-state { color: var(--text-flagged); }
+/* A5 — Failing state label, --text-failed (brick ink, 01-foundations.md). */
+.tracker-next .cr-tile-head[data-state="failing"] .cr-tile-state { color: var(--text-failed); }
 .tracker-next .cr-tile-head[data-state="landed"] .cr-tile-state { color: var(--text-secondary); }
 .tracker-next .cr-tile-dot {
   flex: 0 0 auto;
@@ -1250,15 +1394,11 @@
      (15px line) + 2px border = 5+5+15+2 = 27px. `min-height` -> 44px. */
   .tracker-next .cr-sessions-pager-btn { min-height: 44px; }
 
-  /* Triage strip: hide histogram at phone width. The histogram is decorative
-     context (activity, last hour); the three counts (WAITING ON YOU / WORKING /
-     FLAGGED) are the actionable filters. At 390px the histogram label clips
-     mid-word (ACT… · LA… HOU) against the right edge. Hiding the whole cell
-     lets the three counts expand and remain fully legible and tappable. Also
-     remove the trailing border-right from Flagged (now visually the last cell)
-     so no stray divider remains at the strip's right edge. */
-  .tracker-next .cr-triage-hist { display: none; }
-  .tracker-next .cr-triage-cell--flagged { border-right: none; }
+  /* Triage strip: histogram hide + Pinned's border-right now live in their
+     own `@media (max-width: 600px)` query (above, right after the histogram's
+     base rules) — moved off this 480px touch-target block since 481-600px
+     needed the same treatment (the foot's labels wrap, not just clip) and
+     duplicating the same two declarations at two breakpoints would drift. */
 
   /* Item 1's two-column hero (measured off 5a's 1240px-wide desktop artboard)
      has no phone-tier guidance in that artboard — 5a is never shown at a
