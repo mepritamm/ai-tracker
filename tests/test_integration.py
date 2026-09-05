@@ -8,6 +8,7 @@ import http.client
 import json
 import sys
 import os
+import re
 import runpy
 import shutil
 import socket
@@ -1558,11 +1559,17 @@ class TestPollerInFlightGuard(unittest.TestCase):
         self.assertIn("finally{sideBusy=false;}", body)  # released unconditionally
 
     def test_poll_has_its_own_inflight_flag_independent_of_loadSide(self):
-        self.assertIn("let pollBusy=false;", self.src)
+        # pollBusy's declaration now also introduces pollSeq (the race-fix's sequence number) on
+        # the same statement -- assert the declaration exists without pinning exact spacing/
+        # adjacency (e.g. "let pollBusy=false;" alone broke the moment pollSeq was added next to
+        # it), and assert pollSeq is declared and reset to 0 alongside it.
+        self.assertRegex(self.src, r"\blet\s+pollBusy\s*=\s*false\b")
+        self.assertRegex(self.src, r"\bpollSeq\s*=\s*0\b")
         i = self.src.index("async function poll(){")
         body_end = self.src.index("\nconst KICON=", i)   # poll is the last stmt before KICON
         body = self.src[i:body_end]
         self.assertIn("pollBusy", body)
+        self.assertIn("pollSeq", body)   # sequence number guards stale/out-of-order responses
         self.assertIn("finally{pollBusy=false;}", body)  # released unconditionally
         # the two pollers must not share one flag -- a slow /api/list must not block /api/session
         self.assertNotIn("sideBusy", body)
@@ -1571,8 +1578,18 @@ class TestPollerInFlightGuard(unittest.TestCase):
         # both releases must be reachable on the reject path too, not only after a successful
         # .json() parse -- i.e. the finally must wrap the try that contains the fetch/await, not
         # merely follow it as a sibling statement that a thrown error would skip.
-        for flag, needle in (("sideBusy", "let sideBusy=false;"), ("pollBusy", "let pollBusy=false;")):
-            start = self.src.index(needle)
+        # Declaration pattern is a regex, not a literal substring: pollBusy's declaration line
+        # grew a second variable (pollSeq) next to it for the race fix, and a literal
+        # "let pollBusy=false;" match broke the instant that landed. Matching just the
+        # `let <flag>=false` fragment (with flexible whitespace) is resilient to what else shares
+        # the statement.
+        for flag, decl_pattern in (
+            ("sideBusy", r"\blet\s+sideBusy\s*=\s*false\b"),
+            ("pollBusy", r"\blet\s+pollBusy\s*=\s*false\b"),
+        ):
+            m = re.search(decl_pattern, self.src)
+            self.assertIsNotNone(m, "declaration for %s not found" % flag)
+            start = m.start()
             # the nearest `try{` after the flag's declaration must be closed by a `finally` that
             # clears the same flag, before any other top-level `let `/`function ` declaration.
             try_idx = self.src.index("try{", start)
@@ -1633,7 +1650,12 @@ class TestPollerInFlightGuardExecuted(unittest.TestCase):
         with open(os.path.join(root, "aitracker", "web", "app.js"), encoding="utf-8") as fh:
             src = fh.read()
         cls._loadside_src = _extract_js_block(src, "let sideBusy=false;", "async function loadSide(){")
-        cls._poll_src = _extract_js_block(src, "let pollBusy=false;", "async function poll(){")
+        # marker deliberately omits the trailing ";" -- pollBusy's declaration now shares its
+        # statement with pollSeq ("let pollBusy=false, pollSeq=0;"), so a marker ending in ";"
+        # would no longer match. Slicing starts at "let pollBusy=false" either way; the rest of
+        # the declaration (", pollSeq=0;") is captured by the block extraction that follows since
+        # it sits between this start point and poll()'s closing brace.
+        cls._poll_src = _extract_js_block(src, "let pollBusy=false", "async function poll(){")
 
     _MOCKS = """
 'use strict';
@@ -1764,6 +1786,90 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         result = self._run(script)
         self.assertFalse(result["busyAfterFailure"], "a rejected fetch must clear the guard, not leave it stuck")
         self.assertTrue(result["fetchedAgain"], "after a failure the next poll() must be allowed to fetch")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_poll_current_in_order_response_is_applied(self):
+        # the baseline "happy path" for the seq/id guard: a response that lands while it is both
+        # the latest poll issued (seq===pollSeq) and still for the selected session (id===cur)
+        # must be painted -- lastData set, render()/loadFlags()/checkCompletions() all invoked.
+        script = self._MOCKS + self._poll_src + """
+async function main() {
+  cur = "sess1";
+  var p1 = poll();
+  __fetchCalls[0].resolve({ json: function () { return Promise.resolve({ marker: "sess1-payload" }); } });
+  await p1;
+  console.log(JSON.stringify({
+    renderCalls: __renderCalls, loadFlagsCalls: __loadFlagsCalls, checkCompletionsCalls: __checkCompletionsCalls,
+    lastData: lastData, busyAfter: pollBusy
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = self._run(script)
+        self.assertEqual(result["renderCalls"], 1, "a current, in-order response must be painted")
+        self.assertEqual(result["loadFlagsCalls"], 1)
+        self.assertEqual(result["checkCompletionsCalls"], 1)
+        self.assertEqual(result["lastData"], {"marker": "sess1-payload"}, "lastData must be set to the response that was actually applied")
+        self.assertFalse(result["busyAfter"])
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_poll_response_after_selection_changed_is_discarded(self):
+        # the primary race this fix closes: the user switches to a different session while the
+        # first session's /api/session fetch is still in flight. The stale response must not be
+        # painted under the new session's header (id!==cur when it lands).
+        script = self._MOCKS + self._poll_src + """
+async function main() {
+  cur = "sess1";
+  var p1 = poll();                 // fetch issued for sess1
+  cur = "sess2";                   // user selects a different session before it resolves
+  __fetchCalls[0].resolve({ json: function () { return Promise.resolve({ marker: "stale-sess1-payload" }); } });
+  await p1;
+  console.log(JSON.stringify({
+    renderCalls: __renderCalls, loadFlagsCalls: __loadFlagsCalls, checkCompletionsCalls: __checkCompletionsCalls,
+    lastData: lastData, busyAfter: pollBusy
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = self._run(script)
+        self.assertEqual(result["renderCalls"], 0, "a response for a session the user has navigated away from must never be painted")
+        self.assertEqual(result["loadFlagsCalls"], 0)
+        self.assertEqual(result["checkCompletionsCalls"], 0)
+        self.assertIsNone(result["lastData"], "lastData must not be overwritten by a stale response")
+        self.assertFalse(result["busyAfter"], "the guard must still be released even though the response was discarded")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_poll_stale_out_of_order_seq_for_same_session_is_discarded(self):
+        # Belt-and-suspenders half of the same guard: even when the session id hasn't changed, a
+        # reply must be discarded if it is no longer the latest request issued (seq!==pollSeq).
+        # pollBusy already serializes poll()'s own real dispatches (a second call while one is
+        # pending is a no-op, see test_poll_second_call_is_a_noop_while_first_is_pending), so an
+        # actually-out-of-order pair of in-flight requests can't be produced by calling poll()
+        # twice through the public entry point. To exercise the seq check itself in isolation, we
+        # bump the module-level `pollSeq` counter directly between issuing the fetch and resolving
+        # it -- modelling "a newer request was issued and this reply is now stale" the same way a
+        # genuinely concurrent caller would, without fighting the pollBusy guard to get there.
+        script = self._MOCKS + self._poll_src + """
+async function main() {
+  cur = "sess1";
+  var p1 = poll();          // captures seq=1, id="sess1"
+  pollSeq++;                 // simulate a newer request having been issued in the meantime
+  __fetchCalls[0].resolve({ json: function () { return Promise.resolve({ marker: "stale-seq-payload" }); } });
+  await p1;
+  console.log(JSON.stringify({
+    renderCalls: __renderCalls, loadFlagsCalls: __loadFlagsCalls, checkCompletionsCalls: __checkCompletionsCalls,
+    lastData: lastData, busyAfter: pollBusy, pollSeqAfter: pollSeq
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+"""
+        result = self._run(script)
+        self.assertEqual(result["renderCalls"], 0, "a reply for a superseded seq must never be painted, even for the same session id")
+        self.assertEqual(result["loadFlagsCalls"], 0)
+        self.assertEqual(result["checkCompletionsCalls"], 0)
+        self.assertIsNone(result["lastData"], "lastData must not be overwritten by an out-of-order reply")
+        self.assertFalse(result["busyAfter"], "the guard must still be released even though the response was discarded")
+        self.assertEqual(result["pollSeqAfter"], 2, "sanity: the simulated newer request is still reflected in pollSeq")
 
     @unittest.skipUnless(_HAS_NODE, "node not available")
     def test_loadSide_and_poll_guards_are_independent(self):

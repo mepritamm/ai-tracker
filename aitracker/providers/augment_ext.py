@@ -51,7 +51,8 @@ def _scan_workspaces(kind):
         folder = ""
         if os.path.isfile(ws_json):
             try:
-                folder = _decode_folder(json.load(open(ws_json, encoding="utf-8")).get("folder", ""))
+                with open(ws_json, encoding="utf-8") as fh:
+                    folder = _decode_folder(json.load(fh).get("folder", ""))
             except (OSError, ValueError):
                 folder = ""
         yield ws, aug_dir, folder
@@ -74,7 +75,8 @@ def _iter_tasks(aug_dir):
         p = os.path.join(d, fn)
         try:
             mt = os.path.getmtime(p)
-            t = json.load(open(p, encoding="utf-8"))
+            with open(p, encoding="utf-8") as fh:
+                t = json.load(fh)
         except (OSError, ValueError):
             continue
         yield t.get("uuid") or fn, t, mt
@@ -90,7 +92,8 @@ def _files_touched(aug_dir):
     for fn in os.listdir(sd):
         p = os.path.join(sd, fn)
         try:
-            shard = json.load(open(p, encoding="utf-8"))
+            with open(p, encoding="utf-8") as fh:
+                shard = json.load(fh)
         except (OSError, ValueError):
             continue
         mt = ((shard.get("metadata") or {}).get("lastModified") or 0) / 1000.0
@@ -235,7 +238,8 @@ def _parse(kind, prefix, src_label, sid):
     folder = ""
     if os.path.isfile(ws_json):
         try:
-            folder = _decode_folder(json.load(open(ws_json, encoding="utf-8")).get("folder", ""))
+            with open(ws_json, encoding="utf-8") as fh:
+                folder = _decode_folder(json.load(fh).get("folder", ""))
         except (OSError, ValueError):
             folder = ""
 

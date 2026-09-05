@@ -2843,6 +2843,33 @@
     if (modalNotices) modalNotices.clear();
   }
 
+  // A native `alert` call BLOCKS the whole page -- per this project's own words it "will prevent the
+  // extension from receiving any subsequent commands", freezing the 2s poll and any live PTY
+  // stream for as long as it's up. "Popup blocked" is exactly the transient, dismiss-and-move-on
+  // notice a toast is for, so route it through whichever toast mechanism is actually mounted
+  // here: CR.dialogs.toast when the control room is up (this file also serves the CLASSIC
+  // dashboard, where CR is never mounted -- guarded the same way ext_cr_term.js checks before
+  // depending on CR.dialogs), else app.js's own toast() (the classic dashboard's real global --
+  // see this file's header comment), else -- both somehow missing -- a minimal non-blocking
+  // inline banner so this never throws and never silently drops the message.
+  function _popupBlockedNotice() {
+    var msg = "Popup blocked", sub = "allow popups for this page to open a new tab.";
+    if (window.CR && window.CR.dialogs && typeof window.CR.dialogs.toast === "function") {
+      window.CR.dialogs.toast({ title: msg, meta: sub });
+      return;
+    }
+    if (typeof toast === "function") { toast(msg, sub); return; }
+    try {
+      var el = document.createElement("div");
+      el.setAttribute("role", "status");
+      el.className = "vtfallbacknotice";
+      el.textContent = msg + " — " + sub;
+      el.addEventListener("click", function () { el.remove(); });
+      document.body.appendChild(el);
+      setTimeout(function () { if (el.parentNode) el.remove(); }, 7000);
+    } catch (e) {}
+  }
+
   function openNewTab() {
     if (!activeTty) return;
     // sid/mode/renderer are carried into the new tab's own URL (this app's own scheme, not a
@@ -2858,7 +2885,7 @@
       "&forked=" + (activeForked ? "1" : "0") +
       (activeNotice ? "&notice=" + encodeURIComponent(activeNotice) : "");
     var w = window.open(url, "_blank");
-    if (!w) alert("Popup blocked — allow popups for this page to open a new tab.");
+    if (!w) _popupBlockedNotice();
   }
 
   // ===== "Manage terminals" panel ===========================================================
@@ -3111,7 +3138,7 @@
       "&mode=" + encodeURIComponent(t.mode || "") +
       "&forked=" + (t.forked ? "1" : "0");
     var w = window.open(url, "_blank");
-    if (!w) alert("Popup blocked — allow popups for this page to open a new tab.");
+    if (!w) _popupBlockedNotice();
   }
 
   // The existing route -- no bulk variant was added server-side for "close all"; looping this one

@@ -484,7 +484,19 @@
 .cr .cr-diffline.is-add .cr-diffline-text, .cr .cr-diffline.is-add .cr-diffline-prefix { color: var(--text-link, #3B5747); }
 .cr .cr-diffline.is-del { background: var(--surface-failed, #FBEAE5); }
 .cr .cr-diffline.is-del .cr-diffline-text, .cr .cr-diffline.is-del .cr-diffline-prefix { color: var(--text-failed, #8A2F1B); }
-.cr .cr-outputtext { margin: 0; padding: 12px; white-space: pre-wrap; }
+.cr .cr-outputtext { margin: 0; padding: 12px; white-space: pre-wrap; word-break: break-word; }
+
+/* ---- live "Run a command" output pop-out (capability #54) ---- */
+/* The pane scrolls inside its OWN container (.cr-popout-body's max-height:60vh;
+   overflow:auto above already does this — reused verbatim, never the page body). */
+.cr .cr-runstate {
+  font-weight: 600; padding: 2px 9px; border-radius: var(--radius-pill, 999px);
+  border: 1px solid var(--line-default, #CFC7B7); color: var(--text-secondary, #4A4237);
+}
+.cr .cr-runstate.is-run { color: var(--text-awaiting, #9A4F19); border-color: var(--line-awaiting, #E0B37A); }
+.cr .cr-runstate.is-ok { color: var(--state-done, #3B5747); border-color: var(--line-done, #B9CBBF); }
+.cr .cr-runstate.is-fail { color: var(--text-failed, #8A2F1B); border-color: var(--line-failed, #E0A491); }
+.cr .cr-runoutput-empty { padding: 12px; color: var(--text-muted, #877866); font-style: italic; }
 .cr .cr-rendered-md { padding: 12px; font-family: var(--font-sans, sans-serif); line-height: 1.6; }
 .cr .cr-rendered-md code { font-family: var(--font-mono, monospace); background: var(--surface-sunken, #F4F1E8); padding: 1px 4px; border-radius: 3px; }
 

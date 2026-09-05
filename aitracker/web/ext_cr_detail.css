@@ -161,12 +161,20 @@
 
 .cr .crd-goal {
   font-family: var(--font-serif);
-  font-size: 27px;
+  font-size: 29px;
   line-height: 1.15;
   font-weight: 400;
   letter-spacing: -.02em;
   margin: 0;
   color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.cr .crd-goalline {
+  margin-top: 4px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-secondary);
   overflow-wrap: anywhere;
 }
 
@@ -850,9 +858,10 @@
 .cr .crd-summary-field:last-child { margin-bottom: 0; }
 .cr .crd-summary-label {
   font-size: 9.5px;
+  font-weight: 600;
   text-transform: uppercase;
   letter-spacing: .06em;
-  color: var(--text-eyebrow);
+  color: var(--text-muted);
   margin-bottom: 3px;
 }
 .cr .crd-summary-body { font-size: 13px; color: var(--text-secondary); }
@@ -1134,6 +1143,61 @@
 }
 .cr .crd-narration-text code { font-family: var(--font-mono); background: var(--surface-sunken); padding: 1px 4px; border-radius: 3px; overflow-wrap: anywhere; }
 
+/* TASK 2 (capability #33, "Copy per code block — on every fence"): mdHtml()
+   now hands fence-bearing text to app.js's own mdBlock(), whose markup
+   (`.mdh`/.mdp`/`.mdul`/`.mdt`/`.cblock`/`.mdpre`) is only ever STYLED under
+   app.css's `.msgbody` scope (the classic modal). Control Room's own markdown
+   containers (narration, notes, prompt bubbles, summary) don't carry that
+   class, so without this block the fence would render with the browser's
+   bare default `<pre>` look — the copy button (`.codecopy`, unscoped in
+   app.css) still works, but everything around it wouldn't read as "this
+   view's design." Restyled here with THIS theme's own tokens rather than
+   reusing app.css's classic --card/--line3/--muted set, which isn't defined
+   in Control Room's scope at all. `.codecopy`/`.mmd`/`.mmd-slot` stay
+   functionally shared (app.js's copyCode()/renderMermaid() target them by
+   class name, unscoped) -- only their COLOUR is retargeted per theme here. */
+.cr .crd-narration-text .mdh,
+.cr .crd-note-body .mdh,
+.cr .crd-bubble-prompt .mdh,
+.cr .crd-summary-body .mdh {
+  font-size: 14px; font-weight: 700; margin: 12px 0 6px; color: var(--text-primary);
+}
+.cr .crd-narration-text .mdh:first-child,
+.cr .crd-note-body .mdh:first-child,
+.cr .crd-bubble-prompt .mdh:first-child,
+.cr .crd-summary-body .mdh:first-child { margin-top: 0; }
+.cr .mdp { margin: 0 0 9px; }
+.cr .mdul { margin: 0 0 9px; padding-left: 20px; }
+.cr .mdul li { margin: 2px 0; }
+.cr .mdt {
+  border-collapse: collapse; margin: 4px 0 11px; font-size: 12.5px;
+  display: block; overflow-x: auto;
+}
+.cr .mdt th, .cr .mdt td { border: 1px solid var(--line-default); padding: 5px 9px; text-align: left; vertical-align: top; }
+.cr .mdt th { background: var(--surface-sunken); font-weight: 600; color: var(--text-primary); }
+.cr .cblock { position: relative; margin: 0 0 9px; }
+.cr .cblock .mdpre { margin: 0; }
+.cr .mdpre {
+  background: var(--surface-sunken); border: 1px solid var(--line-default);
+  border-radius: 8px; padding: 10px 12px; overflow: auto; margin: 0 0 9px;
+  white-space: pre; font-family: var(--font-mono); font-size: 12px;
+}
+.cr .mdpre code { background: none; border: 0; padding: 0; margin: 0; color: var(--text-primary); }
+.cr .cblock.mmdfall { position: relative; }
+.cr .cblock .mmdftag {
+  position: absolute; top: 6px; left: 10px; font: 600 10px/1 var(--font-mono);
+  letter-spacing: .4px; color: var(--text-awaiting); background: var(--surface-awaiting);
+  border: 1px solid var(--line-awaiting); border-radius: 5px; padding: 4px 8px; z-index: 2;
+}
+.cr .cblock.mmdfall .mdpre { padding-top: 32px; }
+.cr .codecopy {
+  font-family: var(--font-mono); color: var(--text-muted); background: var(--surface-raised);
+  border-color: var(--line-default);
+}
+.cr .codecopy:hover { border-color: var(--text-link); color: var(--text-primary); }
+.cr .codecopy.ok { color: var(--text-link); border-color: var(--text-link); }
+.cr .mmd { background: var(--surface-sunken); border: 1px solid var(--line-default); }
+
 /* FIX 2: the narration timeline's inline diagram card — a prose entry that also
    contains a fenced mermaid block gets its prefix/suffix text plus the SAME
    cr-diagram-card/-row/-pill classes ext_cr_dialogs.css already styles for the
@@ -1337,6 +1401,12 @@
   background: var(--state-failed);
   color: var(--text-on-action);
   font-weight: 700;
+}
+/* Same honestly-disabled treatment as .crd-btn:disabled above — now toggled per-render
+   (renderPhoneStop, ext_cr_detail.js) on registry.py's term_tty, not just a static attribute. */
+.cr .crd-phone-stop:disabled {
+  opacity: .5;
+  cursor: not-allowed;
 }
 
 /* ============================== breakpoints ============================== */

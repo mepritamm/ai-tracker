@@ -82,6 +82,20 @@
     return '<p>' + out + '</p>';
   }
 
+  // Strips terminal escape sequences for the plain-text `renderRunOutput` pane below.
+  // This is NOT ext_run.js's ansiHtml() (SGR -> <span class="aNN">, HTML-escaped) — that
+  // renderer earns real colour by building markup, which this pane deliberately does not
+  // do (textContent only, per this pass's brief). Dropping the codes instead of leaving
+  // them as literal garbage bytes is the cheaper honest middle ground: plain, readable
+  // text, still zero HTML risk since nothing here is ever parsed as markup.
+  function stripAnsi(s) {
+    return (s || '')
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')   // OSC ... BEL/ST
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')               // CSI (incl. SGR colour)
+      .replace(/\x1b[@-Z\\-_]/g, '')                        // two-char escapes
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');        // stray control bytes (keep \r\n)
+  }
+
   function icon(name, cls) {
     if (_ctx && typeof _ctx.icon === 'function') {
       // ctx.icon(name) returns an SVG STRING, not a DOM node (see ext_cr_boot.js's
@@ -1366,6 +1380,166 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Live "Run a command" output pop-out (doc 04 capability #54 — "Command runner
+  // + constraint stated", Evidence column). Was toast-only: the panel started a
+  // job over POST /api/term/run and reported "Running: <cmd>" / "<cmd> — done"
+  // via ctx.emit('notify', ...) with no way to see what the command actually
+  // printed. This is the missing output pane, sharing the SAME pop-out chrome
+  // and .cr-popout-body/.cr-outputtext styling as the file-diff/command-output
+  // pop-out above (doc 04: "The same pop-out serves command output and full
+  // narration text; only the toolbar differs") rather than a new modal shape.
+  //
+  // NO NEW ENDPOINT, NO NEW STREAM. This attaches its OWN EventSource straight
+  // to the EXISTING GET /api/term/stream?job=<id> route (aitracker/term_run.py)
+  // that a run already opens — term_run.py's stream() explicitly supports
+  // multiple simultaneous viewers of one job (job.viewers is a refcount; the
+  // child is killed only once the LAST viewer disconnects, so a second reader
+  // here cannot end the job early for anyone else watching, and starts no
+  // second child process). This is a second VIEWER of one stream, not a second
+  // stream, and not a per-panel poll — the SSE connection itself pushes.
+  //
+  // payload: {sessionId, cmd, cwd, jobId} — jobId is the id POST /api/term/run
+  // already returned to whoever started the job.
+  //
+  // REQUIRED ADDITION (outside this file's ownership for this pass — cr_boot.js
+  // is not in this task's file list): cr_boot.js's own `on('cr:run-command', …)`
+  // handler (the sole caller of POST /api/term/run) needs ONE new line, right
+  // after it sets `currentJob = res.j.job;`:
+  //   ctx.dialog('run-output', { sessionId: sid, cmd: argv, jobId: res.j.job });
+  // Nothing else there needs to change — this dialog reads the job's output and
+  // its `end` event (rc/truncated) directly off its own stream connection, so
+  // cr_boot.js's existing toast-only notify()s can stay exactly as they are (a
+  // toast AND a pane are not mutually exclusive). Verified by hand: opening this
+  // dialog directly with a real job id (started via a raw POST /api/term/run)
+  // renders the live output; see the module report for the exact command run.
+  function renderRunOutput(payload) {
+    payload = payload || {};
+    var cmd = payload.cmd || '';
+    var jobId = payload.jobId || null;
+    var chrome = buildChrome('run-output', cmd || 'command', null, payload.cwd || '', true);
+    chrome.panel.classList.add('cr-dialog-popout');
+
+    var stateEl = h('span', { class: 'cr-runstate cr-mono' }, ['starting…']);
+    var killBtn = h('button', { class: 'cr-btn cr-btn-quiet cr-btn-danger', type: 'button', text: '■ Kill' });
+    var toolbar = h('div', { class: 'cr-popout-toolbar' }, [
+      h('span', { class: 'cr-popout-path cr-mono' }, [cmd]),
+      stateEl,
+      killBtn,
+      h('button', {
+        class: 'cr-btn cr-btn-quiet', type: 'button', text: 'New tab',
+        onclick: function () {
+          var w = window.open('', '_blank');
+          if (w) {
+            w.document.title = cmd || 'command output';
+            w.document.body.style.cssText = 'font-family:monospace;white-space:pre-wrap;padding:16px';
+            w.document.body.textContent = buf;
+          }
+        },
+      }),
+    ]);
+
+    // The pane scrolls INSIDE .cr-popout-body (max-height:60vh; overflow:auto,
+    // already defined for the diff/output pop-out above) — never the page body.
+    var pre = h('pre', { class: 'cr-outputtext cr-popout-body' });
+    var empty = h('div', { class: 'cr-runoutput-empty' }, ['No output yet.']);
+
+    var buf = '';
+    var es = null;
+    var ended = false;
+    // "Preserve scroll position sensibly across updates": stick to the bottom
+    // only while the viewer was already at (or near) the bottom; a reader who
+    // has scrolled up to read earlier output is left alone by later writes.
+    var stickBottom = true;
+    pre.addEventListener('scroll', function () {
+      stickBottom = (pre.scrollHeight - pre.scrollTop - pre.clientHeight) < 24;
+    });
+
+    function setState(text, cls) {
+      stateEl.textContent = text;               // textContent only — never HTML
+      stateEl.className = 'cr-runstate cr-mono' + (cls ? ' ' + cls : '');
+    }
+    function paint() {
+      empty.hidden = !!buf;
+      pre.hidden = !buf;
+      if (buf) {
+        pre.textContent = buf;                   // textContent — output is untrusted text
+        if (stickBottom) pre.scrollTop = pre.scrollHeight;
+      }
+    }
+
+    function attach(jid) {
+      if (es) { try { es.close(); } catch (e) {} es = null; }
+      ended = false;
+      killBtn.disabled = !jid;
+      if (!jid) { setState('failed to start', 'is-fail'); return; }
+      setState('running', 'is-run');
+      es = new EventSource('/api/term/stream?job=' + encodeURIComponent(jid));
+      es.onmessage = function (ev) {
+        try {
+          var d = JSON.parse(ev.data);
+          if (d && typeof d.b === 'string') { buf += stripAnsi(d.b); paint(); }
+        } catch (e) {}
+      };
+      es.addEventListener('end', function (ev) {
+        var d = {};
+        try { d = JSON.parse(ev.data); } catch (e) {}
+        ended = true;
+        if (es) { try { es.close(); } catch (e) {} es = null; }
+        if (d.truncated) buf += '\n… output truncated';
+        var rc = d.rc;
+        if (rc === 0) setState('finished — exit 0', 'is-ok');
+        else if (typeof rc === 'number') setState('finished — exit ' + rc, 'is-fail');
+        else setState('failed', 'is-fail');
+        killBtn.disabled = true;
+        paint();
+      });
+      es.onerror = function () {
+        if (ended) return;
+        setState('connection lost', 'is-fail');
+      };
+    }
+    killBtn.addEventListener('click', function () {
+      if (!jobId || killBtn.disabled) return;
+      fetch('/api/term/kill', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job: jobId }),
+      }).catch(function () {});
+    });
+
+    paint();
+    attach(jobId);
+    chrome.body.appendChild(toolbar);
+    chrome.body.appendChild(empty);
+    chrome.body.appendChild(pre);
+
+    // No per-dialog destroy hook exists in this module's own close()/_stack
+    // (see that function above — it only removes the wrap element), so this
+    // watches THIS module's own `_layer` (same closure, not a new mechanism)
+    // for the panel's removal to stop the EventSource instead of leaking it.
+    // Closing the dialog only detaches this VIEWER — same "detach, don't kill"
+    // rule doc 05 states for the terminal — it does not touch the job itself.
+    var mo = new MutationObserver(function () {
+      if (!document.body.contains(chrome.panel)) {
+        if (es) { try { es.close(); } catch (e) {} es = null; }
+        mo.disconnect();
+      }
+    });
+    if (_layer) mo.observe(_layer, { childList: true });
+
+    return {
+      backdrop: chrome.backdrop, panel: chrome.panel,
+      // Re-opening with a fresh jobId (another "run" click while this pop-out
+      // is already the topmost dialog) attaches to the new job instead of
+      // stacking a second copy — same convention open()'s own dedupe uses.
+      update: function (next) {
+        next = next || {};
+        if (next.cmd) { cmd = next.cmd; toolbar.querySelector('.cr-popout-path').textContent = cmd; }
+        if (next.jobId && next.jobId !== jobId) { jobId = next.jobId; buf = ''; paint(); attach(jobId); }
+      },
+    };
+  }
+
+  // ---------------------------------------------------------------------------
   // Narration pop-out with a rendered diagram
   // ---------------------------------------------------------------------------
 
@@ -1779,6 +1953,7 @@
     'agent-transcript': renderDrillPopout('agent'),
     'shell-tail': renderDrillPopout('shell'),
     diff: renderDiffPopout,       // generic rich pop-out for a caller that already holds full content
+    'run-output': renderRunOutput, // live "Run a command" pane (doc 04 #54) — see REQUIRED ADDITION above
     'narration-diagram': renderNarrationDiagram,
   };
 

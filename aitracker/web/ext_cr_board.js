@@ -184,6 +184,37 @@ window.CR = window.CR || {};
     return order;
   }
 
+  // GAP CLOSE (rail parity, requirement/task 2): classic's collapseAgents()
+  // (app.js) folds re-runs of the SAME agent task (same prompt, falling back
+  // to title/id) into one row, newest run's fields winning, with `_runs`
+  // counting how many were folded — otherwise a task re-executed a dozen
+  // times floods an expanded "🤖 Agents · <repo>" bucket with a dozen
+  // near-identical rows instead of one. Ported here (rail's agent-bucket
+  // expansion, below, had no equivalent — every run rendered its own row)
+  // rather than shared, since app.js is out of this file's ownership for this
+  // task; same Object.assign-style semantics (a plain-object copy stands in
+  // for the spread/Map original, order preserved via a parallel array since
+  // insertion order on string keys is reliable here).
+  function collapseAgentRuns(arr) {
+    var by = {}, order = [];
+    arr.forEach(function (s) {
+      var key = s.prompt || s.title || s.id;
+      var g = by[key];
+      if (!g) {
+        g = {};
+        Object.keys(s).forEach(function (k) { g[k] = s[k]; });
+        g._runs = 1;
+        by[key] = g;
+        order.push(g);
+      } else {
+        var runs = g._runs + 1;
+        if ((s.mtime || 0) >= (g.mtime || 0)) { Object.keys(s).forEach(function (k) { g[k] = s[k]; }); }
+        g._runs = runs;
+      }
+    });
+    return order;
+  }
+
   // Config now writes a user preference for the board's tile cap —
   // `cr.boardTileCount`, a JSON-encoded integer 3-12 (localStorage). Read fresh
   // on every call (never cached at mount) so the Config change takes effect on
@@ -260,19 +291,23 @@ window.CR = window.CR || {};
   }
 
   // Triage-strip counts. NOTE: these read the raw fields directly rather
-  // than the single derived `state` above, because the three counts are not
+  // than the single derived `state` above, because the four counts are not
   // mutually exclusive the way a per-tile state is — a session can be both
   // "working" and "flagged" at once, and the strip's copy ("Flagged") never
-  // says these subtract from each other.
+  // says these subtract from each other. PINNED (owner addition, not in doc
+  // 02's three-cell table) counts every pinned session regardless of
+  // liveness/state, same as the other three counting across ALL sessions —
+  // not just what the 8-tile board happens to show.
   function triageCounts(sessions, now) {
-    var awaiting = 0, working = 0, flagged = 0;
+    var awaiting = 0, working = 0, flagged = 0, pinned = 0;
     sessions.forEach(function (s) {
       var live = (now - (s.mtime || 0)) < LIVE_WINDOW;
       if (s.waiting) awaiting++;
       else if (live && !s.ended) working++;
       if (s.open_flags) flagged++;
+      if (s.pinned) pinned++;
     });
-    return { awaiting: awaiting, working: working, flagged: flagged };
+    return { awaiting: awaiting, working: working, flagged: flagged, pinned: pinned };
   }
 
   // NOTE: the list-endpoint shape carries one mtime per session (its latest
@@ -413,8 +448,11 @@ window.CR = window.CR || {};
     // byte-for-byte the old default behaviour. The stale key is left alone.
     var railMode = (localStorage.getItem('tracker.rail.mode') || 'auto');
     var railOverlayOpen = false;      // < 1024px only: the rail as a slide-in overlay drawer
-    var activeFilter = null;          // 'awaiting' | 'working' | 'flagged' | null
+    var activeFilter = null;          // 'awaiting' | 'working' | 'flagged' | 'pinned' | null
     var searchQuery = '';
+    // GAP CLOSE (rail parity): mirrors classic's `liveOnly` (app.js) — the
+    // rail had no equivalent of the sidebar's "N live ✕" click-to-filter.
+    var railLiveOnly = false;
     var focusedTileId = null;         // preserved across update() re-renders
     var selectedSessionId = null;     // for rail row highlight, set by ctx events if any
     var lastState = { sessions: [], now: Math.floor(Date.now() / 1000) };
@@ -646,7 +684,11 @@ window.CR = window.CR || {};
         h('div', { class: 'cr-rail-title-group' }, [
           h('span', { class: 'cr-rail-label' }, ['All sessions']),
         ]),
-        (els.railCount = h('span', { class: 'cr-rail-count' }, ['0'])),
+        // GAP CLOSE (rail parity): a real <button> now (was a bare <span>) so
+        // it can toggle railLiveOnly, mirroring classic's clickable "N live"
+        // pill (app.js `livecount`) — title/aria-label are set live in
+        // renderRail() since the label depends on the current toggle state.
+        (els.railCount = h('button', { class: 'cr-rail-count', type: 'button', onclick: toggleRailLiveOnly }, ['0'])),
         (els.railChevron = h('button', {
           class: 'cr-rail-chevron', type: 'button',
           title: 'Collapse session rail', 'aria-label': 'Collapse session rail',
@@ -901,7 +943,7 @@ window.CR = window.CR || {};
           }, [emoji('🤖', '', null), '🤖 Agents · ' + esc(b.label) + (b.live ? ' (' + b.live + ' live)' : ''),
               h('span', { class: 'cr-rail-agentchevron' }, [icon('chevron', '<path d="M9 6l6 6-6 6"/>')])]));
           if (isOpen) {
-            b.sessions.slice().sort(function (a, c) { return (c.mtime || 0) - (a.mtime || 0); })
+            collapseAgentRuns(b.sessions).sort(function (a, c) { return (c.mtime || 0) - (a.mtime || 0); })
               .forEach(function (s) { container.appendChild(railRow(s, now)); });
           }
         });
@@ -913,7 +955,21 @@ window.CR = window.CR || {};
     function renderRail(state) {
       if (!els.railList) return;
       var sessions = state.sessions || [], now = state.now;
-      els.railCount.textContent = String(sessions.length);
+      // GAP CLOSE (rail parity): classic's "N live ✕" pill (app.js's
+      // `livecount`) filters the WHOLE sidebar to live sessions on click; the
+      // rail's count was display-only. Isolated to this file's two rail-only
+      // call sites below (renderSessionRows' OTHER caller, the Sessions
+      // destination at line ~1085ish, is untouched — the owner's instruction
+      // is not to alter that view) — `baseSessions` stands in for `sessions`
+      // in both branches, same as classic's own `shown=liveOnly?...:sessions`.
+      var baseSessions = railLiveOnly
+        ? sessions.filter(function (s) { return (now - (s.mtime || 0)) < LIVE_WINDOW; })
+        : sessions;
+      els.railCount.textContent = railLiveOnly ? (baseSessions.length + ' live ✕') : String(sessions.length);
+      els.railCount.classList.toggle('cr-rail-count--on', railLiveOnly);
+      var railCountLabel = railLiveOnly ? 'Showing live only — click to show all' : 'Click to show live sessions only';
+      els.railCount.title = railCountLabel;
+      els.railCount.setAttribute('aria-label', railCountLabel);
 
       var scrollTop = els.railList.scrollTop;
       var activeEl = document.activeElement;
@@ -924,19 +980,24 @@ window.CR = window.CR || {};
 
       var shown;
       if (collapsed) {
-        var filtered = railRowsFor(sessions.filter(function (s) { return !s.agent; }));
+        var filtered = railRowsFor(baseSessions.filter(function (s) { return !s.agent; }));
         var order = railOrder(filtered);
         renderCollapsedOrbs(order, now);
         shown = order.pinned.length + order.unpinned.length;
       } else {
-        shown = renderSessionRows(els.railList, sessions, now).total;
+        shown = renderSessionRows(els.railList, baseSessions, now).total;
       }
 
-      var more = sessions.length - shown;
+      var more = baseSessions.length - shown;
       els.railFooter.textContent = 'scroll · ' + Math.max(0, more) + ' more';
 
       els.railList.scrollTop = scrollTop;
       if (activeWasSearch) els.railSearchInput.focus();
+    }
+
+    function toggleRailLiveOnly() {
+      railLiveOnly = !railLiveOnly;
+      renderRail(lastState);
     }
 
     // ------------------------------------------------------------------
@@ -1184,11 +1245,19 @@ window.CR = window.CR || {};
       // GAP CLOSE: flag_text rides the row's existing tooltip too — same reasoning as
       // tileHead() above. '' when null/absent, so an unflagged row's tooltip is
       // byte-for-byte unchanged.
+      // GAP CLOSE (rail parity, requirement/task 2): the classic sidebar shows
+      // a visible 📝N note badge on every row (app.js's sessionRow()); doc 02's
+      // own row anatomy caps trailing metadata at ONE slot ("age, or 🚩 count,
+      // or agent count") with no room for a second badge, so the note count
+      // rides the tooltip instead of a new visible element — reachable, same
+      // as flag_text already was, without widening the row or adding a second
+      // always-on badge doc 02 never specified.
       var titleAttr = (s.prompt || s.snippet || s.title || '(no prompt)') + '\n' + (s.cwd || '') +
         (s.model ? '\nModel: ' + s.model : '') +
         (todoLabel ? '\n' + (s.todo_done || 0) + ' of ' + s.todo_total + ' todos done' +
           (s.todo_current ? ' — in progress: ' + s.todo_current : '') : '') +
-        (s.flag_text ? '\n🚩 ' + s.flag_text : '');
+        (s.flag_text ? '\n🚩 ' + s.flag_text : '') +
+        (s.note_count ? '\n📝 ' + s.note_count + ' note' + (s.note_count === 1 ? '' : 's') : '');
       // Colour never carries meaning alone: the state word (and, for a pinned
       // session, "(pinned)") rides along in aria-label (title keeps the fuller
       // prompt/cwd/snippet tooltip it already had).
@@ -1199,6 +1268,27 @@ window.CR = window.CR || {};
       // rather than being pulled into a separate "Pinned" group the way
       // browsing does, which would re-sort exactly what search must not.
       var displayName = (s.pinned ? '📌 ' : '') + (s.agent ? '🤖 ' : '') + name;
+      // GAP CLOSE (rail parity): the classic sidebar's row carries an inline
+      // pin toggle (📌, togglePin()) and rename control (✎, renameSession())
+      // — the rail only ever DISPLAYED pinned state (the 📌 prefix above),
+      // with no way to pin/unpin or rename a session anywhere in this UI.
+      // Mirrors classic exactly: same `stopPropagation` (so clicking either
+      // button opens nothing), same title/on-state semantics.
+      var actions = h('div', { class: 'cr-rail-actions' }, [
+        h('button', {
+          class: 'cr-rail-pin' + (s.pinned ? ' cr-rail-pin--on' : ''), type: 'button',
+          title: s.pinned ? 'Unpin' : 'Pin to top', 'aria-label': s.pinned ? 'Unpin' : 'Pin to top',
+          onclick: function (e) { e.stopPropagation(); toggleSessionPin(s.id); }
+        }, ['📌']),
+        h('button', {
+          class: 'cr-rail-rename', type: 'button',
+          title: 'Rename', 'aria-label': 'Rename this session',
+          onclick: function (e) {
+            e.stopPropagation();
+            if (ctx && typeof ctx.dialog === 'function') ctx.dialog('rename', { sessionId: s.id, currentTitle: s.title || '' });
+          }
+        }, ['✎']),
+      ]);
       return h('div', {
         class: 'cr-rail-row' + (s.id === selectedSessionId ? ' cr-rail-row--selected' : ''),
         tabindex: '0', role: 'button', title: titleAttr, 'aria-label': label, 'data-id': s.id,
@@ -1211,8 +1301,40 @@ window.CR = window.CR || {};
           dirLine ? h('span', { class: 'cr-rail-dir' }, [dirLine]) : null,
         ]),
         h('span', { class: 'cr-rail-meta' },
-          [todoLabel ? (todoLabel + ' · ' + railRowMeta(s, now)) : railRowMeta(s, now)]),
+          // GAP CLOSE (rail parity): `s._runs` only exists on a row folded by
+          // collapseAgentRuns() above (a re-run collapsed into one row) —
+          // classic's own `×N` badge (app.js: `s._runs>1`), absent everywhere
+          // else, same as todoLabel already was.
+          [[s._runs > 1 ? ('×' + s._runs) : '', todoLabel, railRowMeta(s, now)].filter(Boolean).join(' · ')]),
+        actions,
       ]);
+    }
+
+    // GAP CLOSE (rail parity): classic's togglePin() (app.js) POSTs the
+    // existing /api/pin route directly from its sidebar module — no bus
+    // event/bridge exists for it (unlike cr:rename, which cr_dialogs.js +
+    // ext_cr_boot.js already wire end-to-end). Adding a NEW 'cr:pin-toggle'
+    // bridge would mean editing ext_cr_boot.js, which is outside this file's
+    // ownership for this task — so this calls the SAME already-shipped
+    // /api/pin route directly, exactly like this file already does for
+    // /api/search (see doSearch below); optimistic local update + re-render
+    // (rail/board/triage all read `pinned` off the same session objects) so
+    // the toggle reflects immediately rather than waiting on the next 2s poll.
+    function toggleSessionPin(id) {
+      var s = null;
+      (lastState.sessions || []).some(function (x) { if (x.id === id) { s = x; return true; } return false; });
+      if (!s || typeof fetch !== 'function') return;
+      var next = !s.pinned;
+      fetch('/api/pin', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session: id, pinned: next }),
+      }).then(function (r) { return r.ok; }).then(function (ok) {
+        if (!ok) return;
+        s.pinned = next;
+        renderRail(lastState);
+        renderBoard(lastState);
+        renderTriage(lastState);
+      });
     }
 
     function openSession(id) {
@@ -1419,6 +1541,7 @@ window.CR = window.CR || {};
       cell('awaiting', 'WAITING ON YOU');
       cell('working', 'WORKING');
       cell('flagged', 'FLAGGED');
+      cell('pinned', 'PINNED');
 
       els.histWrap = h('div', { class: 'cr-triage-hist' }, [
         (els.histBars = h('div', {
@@ -1441,7 +1564,7 @@ window.CR = window.CR || {};
     function renderTriage(state) {
       var sessions = state.sessions || [], now = state.now;
       var counts = triageCounts(sessions, now);
-      ['awaiting', 'working', 'flagged'].forEach(function (key) {
+      ['awaiting', 'working', 'flagged', 'pinned'].forEach(function (key) {
         els['triageCount_' + key].textContent = String(counts[key]);
         els['triageCell_' + key].classList.toggle('cr-triage-cell--active', activeFilter === key);
       });
@@ -1492,6 +1615,13 @@ window.CR = window.CR || {};
 
     function passesFilter(t) {
       if (!activeFilter) return true;
+      // PINNED (owner addition): not a per-tile `state` value, so it needs its
+      // own branch, same shape as the 'flagged' special-case below. An
+      // agent-group tile has no `.session` (it aggregates several), but DOES
+      // carry its own `.pinned` (agentGroups() ORs every member's pinned flag
+      // onto the group) — read straight off `t` for a group, off `t.session`
+      // for an individual session tile.
+      if (activeFilter === 'pinned') return t.kind === 'session' ? !!t.session.pinned : !!t.pinned;
       if (t.kind !== 'session') return activeFilter !== 'flagged' ? false : t.session.open_flags > 0;
       if (activeFilter === 'flagged') return !!t.session.open_flags;
       return t.state === activeFilter;

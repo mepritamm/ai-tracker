@@ -148,24 +148,34 @@ def parse_any(sid):
     d["flag_text"] = open_flags[-1].get("note") if open_flags else None  # latest unresolved
                                     # flag's text (flags.json is append-only, see all_sessions()
                                     # above), or an honest None when there's nothing open to show.
-    # term_attached: whether a live Claude CLI is the foreground process of any OPEN terminal
-    # this dashboard has running against `sid` right now. Reuses term_vt's existing
-    # `/api/term/attached` answer (_foreground_is_claude) instead of a second implementation —
-    # see that route for the tcgetpgrp/ps mechanics and its fail-closed (False on any doubt)
-    # policy, which this inherits unchanged. Threaded into the SAME detail dict the client
-    # already polls every ~2s, rather than a new per-panel route (a hard non-negotiable here).
-    # Late import: term_vt -> server -> registry at module load time, so a top-level import
-    # would be circular (term_gate.py/term_vt.py already late-import registry for the same
-    # reason). Neither provider can supply this on its own — it's dashboard/terminal state,
-    # not session-log state — so both get it from this one shared computation.
-    d["term_attached"] = _term_attached(sid)
+    # term_attached / term_tty: whether a live Claude CLI is the foreground process of any
+    # OPEN terminal this dashboard has running against `sid` right now, and — if so — the
+    # id of that terminal (term_vt's `Pty.id`, the same `tty` value every /api/term/* route
+    # takes) so the client can actually TARGET it: /api/term/inject to drive model/effort
+    # controls, /api/term/close to stop it, /api/term/attached to poll it directly. Both
+    # come from ONE lookup (`_attached_pty` below) — term_attached is just `pty is not None`
+    # — reusing term_vt's existing `/api/term/attached` answer (_foreground_is_claude)
+    # instead of a second implementation. See that route for the tcgetpgrp/ps mechanics and
+    # its fail-closed (None/False on any doubt) policy, which both inherit unchanged.
+    # Threaded into the SAME detail dict the client already polls every ~2s, rather than a
+    # new per-panel route (a hard non-negotiable here).
+    _pty = _attached_pty(sid)
+    d["term_attached"] = _pty is not None
+    # ALWAYS present, honest None when nothing is attached — never omitted (an omitted key
+    # is what made term_attached itself dead code twice in this codebase before it landed
+    # on the shared detail dict).
+    d["term_tty"] = _pty.id if _pty is not None else None
     return d
 
 
-def _term_attached(sid):
-    """True iff a live Claude CLI is the foreground process on any currently-open terminal
-    opened against session `sid`. False for no open terminal, an unattached shell, or if
-    term_vt couldn't be imported at all — never raises (this runs on every ~2s detail poll).
+def _attached_pty(sid):
+    """The term_vt `Pty` object with a live Claude CLI in its foreground, for any currently-
+    open terminal opened against session `sid` — or None for no open terminal, an
+    unattached shell, or if term_vt couldn't be imported at all. Never raises (this runs on
+    every ~2s detail poll). The single shared lookup behind both `term_attached` (just
+    `pty is not None`) and `term_tty` (`pty.id`) in parse_any() above, so there is exactly
+    one definition of "attached" between the two, not a boolean and an id computed two
+    different ways.
 
     Imported via __import__("%s.term_vt" % __package__, ...) rather than an ordinary
     package-relative import statement — same effect inside the real package
@@ -175,18 +185,21 @@ def _term_attached(sid):
     it survives into dist/tracker.py as ordinary code instead of a relative import a
     flattened single-file script can't resolve. There, __package__ is None (the same
     guarded-import idiom server.py's terminal-tier loader relies on — see bundle.py), so the
-    lookup fails and the except below returns False: an honest "no terminal tier" instead of
+    lookup fails and the except below returns None: an honest "no terminal tier" instead of
     a crash, with no bundler-side special case needed."""
     try:
         term_vt = __import__("%s.term_vt" % __package__, fromlist=["term_vt"])
     except Exception:
-        return False
+        return None
     try:
         with term_vt._LOCK:
             ptys = [p for p in term_vt.PTYS.values() if p.session == sid and not p.done]
-        return any(term_vt._foreground_is_claude(p.fd) for p in ptys)
+        for p in ptys:
+            if term_vt._foreground_is_claude(p.fd):
+                return p
+        return None
     except Exception:
-        return False
+        return None
 
 
 DRILLS = ("output", "diff", "shell", "agent")

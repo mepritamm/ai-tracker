@@ -94,11 +94,13 @@ def _git_branch(cwd):
     try:
         gitpath = os.path.join(cwd, ".git")
         if os.path.isfile(gitpath):                       # worktree: "gitdir: <path>"
-            line = open(gitpath, encoding="utf-8").read().strip()
+            with open(gitpath, encoding="utf-8") as fh:
+                line = fh.read().strip()
             head = os.path.join(line[7:].strip(), "HEAD") if line.startswith("gitdir:") else ""
         else:
             head = os.path.join(gitpath, "HEAD")
-        ref = open(head, encoding="utf-8").read().strip()
+        with open(head, encoding="utf-8") as fh:
+            ref = fh.read().strip()
         if ref.startswith("ref: refs/heads/"):
             return ref[len("ref: refs/heads/"):]
         return ref[:12]                                   # detached HEAD -> short sha

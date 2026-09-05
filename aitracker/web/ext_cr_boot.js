@@ -675,6 +675,7 @@ window.CR = window.CR || {};
       }
       emit('notify', { text: 'Running: ' + argv });
       currentJob = res.j.job;
+      dialog('run-output', { sessionId: sid, cmd: argv, jobId: res.j.job });
       if (typeof EventSource !== 'function') return;
       var es = new EventSource('/api/term/stream?job=' + encodeURIComponent(res.j.job));
       es.addEventListener('end', function (ev) {

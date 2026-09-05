@@ -190,6 +190,33 @@
   // plain esc() in this file — e.g. decision questions/options and the Summary
   // Goal/Now/So-far fields aren't named there, so they're deliberately left alone.
   function mdHtml(ctx, text) {
+    // TASK 2 (capability #33, "Copy per code block — on every fence"):
+    // ctx.markdown (ext_cr_boot.js) wraps app.js's inline-only `md()` (backtick
+    // code/bold/italic/links), which never understood a ``` fence at all — so
+    // a fence just fell through the inline replaces untouched. Rather than
+    // write a second fence parser, text containing a fence is instead handed
+    // whole to app.js's OWN block renderer, `mdBlock` (global — app.js:19,
+    // concatenated ahead of this file into one <script> tag by page.py's
+    // build_page(), the SAME reachable-global pattern this file already uses
+    // for shortModel()/upgradeMermaidIn()). mdBlock() already emits
+    // `.cblock`/`.codecopy` per fence wired to app.js's existing `copyCode()`
+    // — clipboard API with a guarded execCommand fallback that never throws,
+    // "✓ Copied" WORD feedback (not colour alone), never hostname-gated, and
+    // not hover-only (app.css's `.codecopy` sits at opacity:.9 by default, so
+    // it's reachable on touch too) — exactly the button this capability
+    // needs, reused rather than forked. A mermaid fence inside that text
+    // degrades the SAME honest way capability #32 already does for narration
+    // elsewhere in this file: mdBlock's own `.mmd-slot` fallback (hand-rolled
+    // SVG for the 8 known families, an honestly-labelled readable code block
+    // otherwise), upgraded to the real vendored mermaid.js by
+    // upgradeMermaidIn() — see setPanelBody() below and renderTimelineEntries()
+    // above, which already call it. Fence-free text keeps the original
+    // inline-only path, unchanged.
+    if (text && text.indexOf("```") !== -1) {
+      try {
+        if (typeof mdBlock === "function") return mdBlock(text);
+      } catch (e) {}
+    }
     if (ctx && typeof ctx.markdown === "function") {
       try { return ctx.markdown(text).innerHTML; } catch (e) {}
     }
@@ -825,6 +852,21 @@
     narrEl.textContent = pres.live ? pres.now : "";
   }
 
+  // FIX (drift): phone-stop mirrors the Evidence column's terminal-kill affordance for
+  // the phone breakpoint (one back-affordance rule doesn't apply here — this is the
+  // compose bar's stop button, not navigation). Gated the SAME way renderTerminalPanel
+  // gates model/effort: enabled only when registry.py's term_tty (parse_any(), NEW) is a
+  // real non-null string, honestly disabled with copy that says why otherwise — never a
+  // clickable button that cannot work.
+  function renderPhoneStop(node, session) {
+    var btn = qs(node, ".crd-phone-stop");
+    if (!btn) return;
+    var tty = typeof session.term_tty === "string" && session.term_tty ? session.term_tty : null;
+    btn.disabled = !tty;
+    btn.title = tty ? "Stop the attached terminal" :
+      "Not available yet — there’s no terminal attached to stop.";
+  }
+
   // The awaiting-question card: same source (session.decisions, open pinned
   // first) the Decisions panel already renders in full -- this is a compact,
   // phone-only duplicate of just the top open question, not a second data path.
@@ -895,7 +937,13 @@
   }
 
   function setPanelBody(wrap, html) {
-    qs(wrap, ".crd-panel-body").innerHTML = html;
+    var bodyEl = qs(wrap, ".crd-panel-body");
+    bodyEl.innerHTML = html;
+    // mdHtml() (capability #33 fix above) can now hand back a mermaid
+    // `.mmd-slot` fallback for any panel that renders markdown (notes today)
+    // — upgrade it in place the same way renderTimelineEntries() already does
+    // for the conversation timeline, one call site rather than one per panel.
+    try { if (typeof upgradeMermaidIn === "function") upgradeMermaidIn(bodyEl); } catch (e) {}
   }
 
   // ---- skeleton ----
@@ -946,6 +994,10 @@
             '<button class="crd-rename" data-act="rename" title="Rename" aria-label="Rename session"></button>' +
             '<span class="crd-pill crd-pill-pinned" hidden><span class="tn-emo" aria-hidden="true">📌</span> Pinned</span>' +
           "</div>" +
+          // Doc 03 row 2's "goal" text (the session's last request, overview.py's
+          // `goal`) -- demoted to its own line below the name (see TASK 1 FIX in
+          // renderHeader), never occupying the h1. Hidden whenever there's no goal.
+          '<div class="crd-goalline" hidden></div>' +
           // Row 3 — stat chips (doc 03 Row 3 / doc 04 capability #21). PERMANENT
           // — no preference, no `hidden` gate; renderStatChips() fills it on
           // every render pass. Hidden on phone via CSS only (doc's phone layout
@@ -1045,8 +1097,11 @@
       '<div class="crd-phonebar">' +
         '<input class="crd-phone-input" type="text" placeholder="Queue a note…">' +
         '<button class="crd-phone-send" data-act="phone-send" aria-label="Send"></button>' +
+        // Disabled/title updated per-render by renderPhoneStop() below, once real
+        // session.term_tty data arrives — this skeleton default matches the same
+        // honest "nothing to target yet" copy that gate uses.
         '<button class="crd-phone-stop" data-act="phone-stop" aria-label="Stop" disabled ' +
-          'title="Not available yet — there’s no server route to stop a running session.">■</button>' +
+          'title="Not available yet — there’s no terminal attached to stop.">■</button>' +
       "</div>" +
     "</div>";
 
@@ -1372,15 +1427,29 @@
           break;
         }
         case "terminal-model":
-        case "terminal-effort":
-          // FIX 2 (design-audit): dead branch now — renderTerminalPanel() renders both
-          // buttons `disabled`, so a real click never reaches here. Left in place (not
-          // deleted) as the honest no-op it always was, in case something ever
-          // dispatches this data-act programmatically; see renderTerminalPanel()'s own
-          // comment for why this couldn't be wired to a real /api/term/inject call
-          // without editing a file this pass doesn't own.
-          ctx.emit("cr:term-controls-request", { sessionId: sid, control: act === "terminal-model" ? "model" : "effort" });
+        case "terminal-effort": {
+          // FIX 2 (design-audit), now closed: registry.py's term_tty (parse_any(), NEW)
+          // finally gives this file a real id to target, so this drives the SAME
+          // /api/term/inject path the terminal toolbar's own _openModelDialog/
+          // _openEffortDialog/_injectSlash use (ext_cr_term.js:770-794) — same dialog
+          // contract (ctx.dialog("model"|"effort", {current, ladder, onPick})), same
+          // payload shape — instead of the old cr:term-controls-request notice, which
+          // unconditionally claimed no terminal could be found even while this exact
+          // button was visible and enabled.
+          var ttyMe = ui.lastSession && ui.lastSession.term_tty;
+          if (!ttyMe) return; // disabled (renderTerminalPanel); a real click never reaches here
+          var isModel = act === "terminal-model";
+          var meta2 = ui.lastSession.meta || {};
+          ctx.dialog(isModel ? "model" : "effort", {
+            current: isModel ? shortModel(meta2.model) : (meta2.effort || null),
+            ladder: isModel ? MODEL_LADDER : EFFORT_LADDER,
+            onPick: function (val) {
+              _injectToTerminal(ctx, ttyMe, "/" + (isModel ? "model" : "effort") + " " + val,
+                isModel ? "Couldn’t switch model" : "Couldn’t switch effort");
+            }
+          });
           break;
+        }
         case "phone-send": {
           var pInput = qs(node, ".crd-phone-input");
           var pText = pInput && pInput.value.trim();
@@ -1389,9 +1458,18 @@
           pInput.value = "";
           break;
         }
-        case "phone-stop":
-          ctx.emit("cr:stop", { sessionId: sid });
+        case "phone-stop": {
+          // FIX (drift): same term_tty seam — stops the attached terminal via the SAME
+          // /api/term/close route ext_cr_term.js's own ■ Kill (_killCurrent) uses,
+          // instead of the old cr:stop bus event (ext_cr_boot.js's handler only ever
+          // stopped a queued run-command job, an unrelated feature this button's copy
+          // never described). Disabled (see renderPhoneStop) whenever there's no real
+          // tty to target.
+          var ttySt = ui.lastSession && ui.lastSession.term_tty;
+          if (!ttySt) return;
+          _killTerminal(ctx, ttySt);
           break;
+        }
       }
     });
 
@@ -1539,6 +1617,7 @@
     renderStatChips(node, session);
     renderPhoneHead(node, session);
     renderPhonePresence(node, session, nowSec);
+    renderPhoneStop(node, session);
     renderForkBanner(node, ctx, session, ui);
     renderSpine(node, ctx, session, nowMs);
 
@@ -1599,6 +1678,24 @@
     metaEl.textContent = metaBits.join(" · ");
     metaEl.title = meta.model || "";
 
+    // TASK 1 FIX (owner-reported drift): the big header text used to be
+    // session.overview.goal (overview.py:19 `goal = requests[-1]["text"]` --
+    // literally the LAST PROMPT, verbatim), falling back to the session name
+    // only when there was no goal at all. Since a goal is present on almost
+    // every session, the name essentially never showed, breaking parity with
+    // the classic dashboard and the board tile, which both identify a session
+    // by its NAME. Derivation reused verbatim from the classic dashboard's own
+    // detail render over this SAME session.meta shape (aitracker/web/app.js:1249
+    // `const title=m.title||m.customTitle||m.aiTitle||cur.slice(0,8);`) rather
+    // than forking a third chain (conventions.md rule 4). `meta.title` is
+    // already server-resolved (providers/claude.py:1362 folds titles.json/
+    // customTitle/aiTitle/short-prompt into it) -- the extra fallbacks here are
+    // the same defensive belt-and-suspenders app.js keeps, so a still-missing
+    // title degrades honestly to a short id fragment, never "undefined".
+    var sid = meta.sessionId || session.id || "";
+    var sessionName = meta.title || meta.customTitle || meta.aiTitle ||
+      (sid ? sid.slice(0, 8) : "(untitled session)");
+
     var st = stateOf(session, nowSec);
     var pill = qs(node, ".crd-pill-state");
     pill.className = "crd-pill crd-pill-state crd-state-" + st.cls;
@@ -1617,8 +1714,15 @@
     if (st.cls === "flagged" && session.flag_text) {
       pill.title = session.flag_text;
     } else {
-      pill.removeAttribute("title");
+      // GAP CLOSE (drift): the pill used to carry no tooltip at all outside the
+      // flagged case, so it never identified WHICH session it belonged to when
+      // read out of context (a screenshot, a screen reader). Same "<name> —
+      // <state word>" shape the board orb's own accessible label already uses
+      // (ext_cr_board.js:1148 `var label = title + ' — ' + orbStateWord(...)`)
+      // -- one derivation, not a second one invented here.
+      pill.title = sessionName + " — " + st.word;
     }
+    pill.setAttribute("aria-label", sessionName + " — " + st.word);
 
     var agentsRunning = (session.agents_bg || []).filter(function (a) { return a.running; }).length;
     var agentsPill = qs(node, ".crd-pill-agents");
@@ -1629,8 +1733,20 @@
       agentsPill.hidden = true;
     }
 
-    var goal = (session.overview && session.overview.goal) || meta.title || "(untitled session)";
-    qs(node, ".crd-goal").textContent = goal;
+    // The h1 is the session's NAME now (see the TASK 1 FIX note above) — doc
+    // 03's row 2 is "the goal, ... If there is no goal, fall back to the
+    // session title", but the goal here is the raw last prompt, not a title
+    // substitute, so it's demoted to its own line (.crd-goalline) below the
+    // name rather than ever occupying the name's slot. Hidden (not "—") when
+    // there's nothing to show, same honest-degrade convention as the rest of
+    // this header.
+    qs(node, ".crd-goal").textContent = sessionName;
+    var goalText = (session.overview && session.overview.goal) || "";
+    var goalEl = qs(node, ".crd-goalline");
+    if (goalEl) {
+      goalEl.hidden = !goalText;
+      goalEl.textContent = goalText;
+    }
     qs(node, ".crd-rename").innerHTML = svgIcon(ctx, "edit", "✎");
 
     // FIX (drift A10): session.pinned used to be present only on the board-list dict
@@ -2084,6 +2200,50 @@
     );
   }
 
+  // ===== model / effort / stop — the SAME /api/term/inject and /api/term/close routes
+  // ext_cr_term.js's toolbar drives (_openModelDialog/_openEffortDialog/_injectSlash and
+  // _killCurrent, ext_cr_term.js:770-850), reached here via registry.py's NEW term_tty
+  // (parse_any()) rather than a second implementation (conventions.md rule 4). Ladders
+  // mirror ext_cr_term.js's own hard-coded MODEL_LADDER/EFFORT_LADDER exactly (which itself
+  // mirrors ext_vt.js's) — a third copy of the same small constant, not a fork of behaviour.
+  var MODEL_LADDER = ["haiku", "sonnet", "opus", "fable"];
+  var EFFORT_LADDER = ["low", "medium", "high", "xhigh", "max"];
+
+  function _termPost(url, body) {
+    return fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {})
+    });
+  }
+  function _termJson(r) {
+    return r.json().catch(function () { return {}; }).then(function (body) {
+      return { ok: r.ok, status: r.status, j: body };
+    });
+  }
+  // Failure always surfaces a real message via the file's existing notice bus
+  // (ctx.emit("notify", …) — see the "Note copied" callsite above); success gives a
+  // WORD ("Switched."), never colour alone. Never a silent no-op, never a false positive.
+  function _injectToTerminal(ctx, tty, text, failLabel) {
+    if (!tty) { ctx.emit("notify", { text: failLabel + ": no terminal attached" }); return; }
+    _termPost("/api/term/inject", { tty: tty, text: text, submit: true, clear_first: true })
+      .then(_termJson).then(function (res) {
+        if (res.ok && res.j && res.j.ok === true) { ctx.emit("notify", { text: "Switched." }); return; }
+        var reason = (res.j && res.j.error) ||
+          (res.status === 404 ? "that route isn’t available in this build yet" :
+           res.status === 400 ? "the terminal rejected that request" :
+           "the terminal didn’t confirm the switch");
+        ctx.emit("notify", { text: failLabel + " — " + reason });
+      }).catch(function () { ctx.emit("notify", { text: "Couldn’t reach the server — the switch wasn’t sent" }); });
+  }
+  function _killTerminal(ctx, tty) {
+    if (!tty) { ctx.emit("notify", { text: "No terminal attached." }); return; }
+    _termPost("/api/term/close", { tty: tty }).then(function (r) {
+      if (!r.ok) { ctx.emit("notify", { text: "Failed to kill terminal." }); return; }
+      ctx.emit("notify", { text: "Terminal killed." });
+    }).catch(function () { ctx.emit("notify", { text: "Couldn’t reach the server — the terminal wasn’t killed." }); });
+  }
+
   function renderTerminalPanel(wrap, session) {
     // FIX (drift A4): session.term_attached used to be set by no provider or route
     // anywhere in the Python tree, so this gate was permanently false and the panel was
@@ -2099,28 +2259,24 @@
     var meta = session.meta || {};
     var ctxWin = session.context || {};
     setPanelCount(wrap, "");
-    // FIX 2 (design-audit HIGH): these used to render fully clickable whenever
-    // this panel is visible, but the click routed to ext_cr_boot.js's
-    // cr:term-controls-request handler, which unconditionally claims "there's
-    // no way to find [a terminal] from here yet" — provably false at the only
-    // moment these buttons are shown (the panel itself is gated on
-    // term_attached === true, just above). The real fix is wiring this mirror
-    // to the SAME /api/term/inject path the terminal toolbar's own
-    // _openModelDialog/_openEffortDialog use (ext_cr_term.js:770-794,
-    // _injectSlash) — but that call is keyed on `st.tty`, a value private to
-    // that module's own open-overlay state, never threaded onto the session
-    // detail dict this panel reads (registry.py's term_attached is a bare
-    // boolean, no tty id). Reaching the real route from here would mean
-    // either adding a tty-by-session lookup to registry.py (a Python file
-    // this pass doesn't own) or teaching ext_cr_boot.js a new seam (a file
-    // this pass doesn't own either). Per the brief's own fallback, these are
-    // instead rendered honestly DISABLED with copy that says why, rather than
-    // left clickable against a stale lie.
+    // FIX 2 (design-audit HIGH), now closed: registry.py's term_tty (parse_any(), NEW)
+    // threads the attached pty's own id onto this SAME polled detail dict — the id every
+    // /api/term/{inject,close,attached} route expects as `tty`. These buttons are enabled
+    // ONLY when it's a real non-null string (the delegated click handler below does the
+    // actual inject/close); term_attached alone is never trusted for the gate, so a
+    // theoretical race between the two never leaves a clickable button with nothing to
+    // target. Still rendered honestly DISABLED, with the same copy as before, whenever
+    // term_tty is null — never a clickable control that cannot work.
+    var tty = typeof session.term_tty === "string" && session.term_tty ? session.term_tty : null;
     var noRoute = "Not reachable from here yet — there’s no way to find this session’s terminal from the Evidence panel.";
+    var modelAttrs = tty ? 'data-act="terminal-model" title="Switch this session’s model"' :
+      'data-act="terminal-model" disabled aria-disabled="true" title="' + esc(noRoute) + '"';
+    var effortAttrs = tty ? 'data-act="terminal-effort" title="Switch this session’s effort"' :
+      'data-act="terminal-effort" disabled aria-disabled="true" title="' + esc(noRoute) + '"';
     setPanelBody(wrap,
       '<div class="crd-term-row">' +
-        '<button class="crd-btn crd-btn-solid" data-act="terminal-model" disabled aria-disabled="true" title="' + esc(noRoute) + '">model · ' + esc(shortModel(meta.model) || "—") + "</button>" +
-        '<button class="crd-btn crd-btn-outline" data-act="terminal-effort" disabled aria-disabled="true" title="' + esc(noRoute) + '">effort · ' + esc(meta.effort || "—") + "</button>" +
+        '<button class="crd-btn crd-btn-solid" ' + modelAttrs + '>model · ' + esc(shortModel(meta.model) || "—") + "</button>" +
+        '<button class="crd-btn crd-btn-outline" ' + effortAttrs + '>effort · ' + esc(meta.effort || "—") + "</button>" +
         '<span class="crd-term-ctx mono">' + (ctxWin.current != null ? fmtK(ctxWin.current) : "—") + " / " +
           (ctxWin.limit != null ? fmtK(ctxWin.limit) : "—") + "</span>" +
       "</div>" +

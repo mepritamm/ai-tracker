@@ -31,15 +31,40 @@
  */
 
 /* ============================================================
-   ONE rule touching the classic dashboard: the entry button.
-   Scoped tightly to #tryNext so it cannot affect any existing selector.
-   Styled in the CLASSIC palette per doc (literal colours, not the new
-   tokens) — it lives in the old UI, not the new one.
-   Doc 02 places it inline in the sidebar's `.sidetop2` row, right after
-   `#livecount` (index.html) — normal flex-row flow, no absolute
-   positioning; `.sidetop2` (app.css) already supplies `display:flex;
-   gap:8px` and `#livecount{margin-right:auto}`, so #tryNext just needs
-   its own box styling, same as every other .sidetop2 sibling. */
+   ONE rule touching the classic dashboard: the entry button (plus a wrapper
+   span, .tn-pair, added around #tryNext + #flagbtn in index.html so the two
+   stay a visually adjacent pair).
+   Scoped tightly to #tryNext / .tn-pair so it cannot affect any existing
+   selector — #flagbtn's own app.css rule is never touched.
+   Styled in the CLASSIC palette (literal colours, not the new tokens) — it
+   lives in the old UI, not the new one.
+   OWNER RULING (supersedes the sidebar placement doc 02 called for): it sits
+   in the classic MAIN header's `.htop` row (index.html), immediately before
+   the "Flag an issue" button — normal flex-row flow, no absolute positioning.
+
+   CORRECTED (previous version of this comment assumed `.flagbtn{margin-
+   left:auto}` alone would keep #tryNext pinned to it — verified false: that
+   auto margin absorbs ALL free space in `.htop` between #tryNext and
+   #flagbtn, leaving a large gap at wide widths, and `.htop`'s flex-wrap drops
+   #flagbtn onto its own line below ~1280px, separating the two entirely).
+   Fix: .tn-pair wraps both buttons in one inline-flex box with its OWN
+   `gap:10px` (the visible gutter) and `flex-wrap:nowrap` (never splits
+   internally). .tn-pair itself — not #flagbtn — now carries `margin-left:
+   auto`, so IT absorbs `.htop`'s free space and the pair rides together to
+   the row's right edge. #flagbtn's own `margin-left:auto` still applies
+   inside .tn-pair, but since .tn-pair shrink-wraps to its content (no
+   flex-grow, so no free space of its own), that inner auto margin resolves
+   to 0 — it does not reopen the gap. Two independent auto margins on the
+   same axis SPLIT the space between them, which is why simply moving the
+   auto margin onto #tryNext instead would not have worked. */
+.tn-pair {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: nowrap;
+  flex-shrink: 0;
+  margin-left: auto;
+}
 #tryNext.tn-entry {
   display: inline-flex;
   align-items: center;
@@ -51,9 +76,24 @@
   font: 600 11.5px/1 'Source Sans 3', sans-serif;
   color: #f5b443;
   cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 #tryNext.tn-entry:hover { filter: brightness(1.12); }
 #tryNext.tn-entry:focus-visible { outline: 2px solid #f5b443; outline-offset: 2px; }
+
+/* Phones (measured at 390px): the classic header's title column (`.htitle`,
+   narrowed by the ring icon at this width) leaves ~270px for the pair —
+   #tryNext's full-size box pushed the pair's natural width to ~276px,
+   clipping #flagbtn's right edge against the viewport (verified with
+   getBoundingClientRect + a pixel-level screenshot scan, not assumed).
+   Trims only #tryNext's own box (padding/font) and .tn-pair's gutter —
+   never #flagbtn — to bring the pair back under budget; nowrap is kept so
+   the label still never breaks mid-word. */
+@media (max-width: 480px) {
+  .tn-pair { gap: 6px; }
+  #tryNext.tn-entry { padding: 5px 9px; font: 600 10.5px/1 'Source Sans 3', sans-serif; }
+}
 
 /* ============================================================
    Shell root — #nextRoot (.tracker-next.cr)

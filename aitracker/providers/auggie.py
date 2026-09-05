@@ -10,7 +10,8 @@ from .base import Provider
 def _augment_dirs():
     """Auggie's indexed workspace roots, longest (most specific) first."""
     try:
-        s = json.load(open(os.path.join(config.AUGMENT_DIR, "settings.json"), encoding="utf-8"))
+        with open(os.path.join(config.AUGMENT_DIR, "settings.json"), encoding="utf-8") as fh:
+            s = json.load(fh)
         return sorted([d for d in (s.get("indexingAllowDirs") or []) if isinstance(d, str)],
                       key=len, reverse=True)
     except (OSError, ValueError):
@@ -64,7 +65,8 @@ def _auggie_all():
     failed = 0
     for f in glob.glob(os.path.join(config.AUGMENT_DIR, "task-storage", "tasks", "*")):
         try:
-            t = json.load(open(f, encoding="utf-8"))
+            with open(f, encoding="utf-8") as fh:
+                t = json.load(fh)
         except (OSError, ValueError):
             failed += 1
             continue
@@ -118,7 +120,8 @@ def _load_task_file(uuid):
     if not uuid:
         return None
     try:
-        return json.load(open(os.path.join(config.AUGMENT_DIR, "task-storage", "tasks", uuid), encoding="utf-8"))
+        with open(os.path.join(config.AUGMENT_DIR, "task-storage", "tasks", uuid), encoding="utf-8") as fh:
+            return json.load(fh)
     except (OSError, ValueError):
         return None
 
@@ -323,7 +326,8 @@ def list_auggie():
             e = hit[1]
         else:
             try:
-                d = json.load(open(f, encoding="utf-8"))
+                with open(f, encoding="utf-8") as fh:
+                    d = json.load(fh)
             except (OSError, ValueError):
                 continue
             sid = d.get("sessionId") or os.path.basename(f)[:-5]
@@ -437,6 +441,12 @@ def _safe_session_id(session_id):
 
 
 def _load_auggie(session_id):
+    """(session dict, path). (None, None) means no such session file exists at all
+    (bad/unsafe id, or nothing on disk for it) -- parse_auggie's genuinely-missing
+    case. (None, f) with f the real path means the file EXISTS but failed to parse
+    (corrupt/truncated JSON) -- parse_auggie's degraded case (see FIX 2): the two
+    are deliberately distinguishable by whether the second element is None, not
+    just whether the first is."""
     session_id = _safe_session_id(session_id)
     if session_id is None:
         return None, None
@@ -444,9 +454,10 @@ def _load_auggie(session_id):
     if not os.path.isfile(f):
         return None, None
     try:
-        return json.load(open(f, encoding="utf-8")), f
+        with open(f, encoding="utf-8") as fh:
+            return json.load(fh), f
     except (OSError, ValueError):
-        return None, None
+        return None, f
 
 
 def _auggie_results(d):
@@ -463,10 +474,59 @@ def _auggie_results(d):
     return out
 
 
+def _degraded_auggie_detail(session_id, f):
+    """Minimal but VALID detail dict for a session whose file exists on disk but
+    failed to parse (see FIX 2): every key the shared shape requires, honest
+    empty lists/zeros, and `parse_error` populated so the client's existing
+    degraded banner fires -- same {"line", "parsed_before"} contract as every
+    other provider's parse_error (see _auggie_todos_for above). `line` is always
+    None here (a whole-file JSON parse failure has no single line to point at,
+    unlike a truncated JSONL line); `parsed_before` is 0 because nothing at all
+    could be recovered from an unparseable file. Only reached from parse_auggie
+    when `_load_auggie` reports the file EXISTS (f is not None) -- a session id
+    with no file at all still returns None outright, unchanged."""
+    gid = "auggie:" + session_id
+    title = load_titles().get(gid) or "Auggie session (unreadable)"
+    try:
+        mt = os.path.getmtime(f)
+    except OSError:
+        mt = time.time()
+    return {
+        "meta": {"cwd": "", "title": title, "source": "auggie", "entrypoint": "auggie",
+                 "gitBranch": "", "model": ""},
+        "todos": [],
+        "todo_times_approximate": todo_times_approximate("auggie"),
+        "files": [], "reads": [], "commands": [], "commits": [], "tests": [],
+        "requests": [], "agents": [], "agents_bg": [], "agent_sessions": [], "shells": [],
+        "decisions": [], "waiting": False,
+        "fail_cmd": None,
+        "parse_error": {"line": None, "parsed_before": 0},
+        "prs": [],
+        "narrative": [],
+        "message": "This session's file exists but could not be read (corrupt or truncated JSON).",
+        "tokens": {"in": 0, "out": 0},
+        "context": context_window(None, None),
+        "counts": {"done": 0, "todos": 0, "created": 0, "edited": 0,
+                   "read": 0, "commits": 0, "tests": 0,
+                   "tests_failed": 0, "errors": 0, "agents": 0, "searches": 0},
+        "overview": {
+            "where": "Augment", "goal": "", "now": "", "now_kind": "",
+            "sofar": "Session file could not be read.",
+            "commits": [],
+        },
+        "mtime": mt,
+        "now": time.time(),
+        "notes": load_notes().get(gid, []),
+        "push_when": push_when(False, 0, 0),
+    }
+
+
 def parse_auggie(session_id):
     d, f = _load_auggie(session_id)
     if d is None:
-        return None
+        if f is None:
+            return None   # genuinely no such session -- no file at all
+        return _degraded_auggie_detail(os.path.basename(f)[:-5], f)  # exists, unreadable
     requests, narrative, files, cmds, reads, commits = [], [], {}, [], {}, []
     agents = []       # sub-agent-* dispatches (~ Claude's Task) — {t, type, desc}
     errors_by_id = {} # tool_use_id -> True, from tool_result_node.is_error (~ Claude's map)
@@ -752,7 +812,8 @@ def search_auggie(q, limit=500):
     out = []
     for f in glob.glob(os.path.join(config.AUGGIE_SESSIONS, "*.json"))[:limit]:
         try:
-            d = json.load(open(f, encoding="utf-8"))
+            with open(f, encoding="utf-8") as fh:
+                d = json.load(fh)
         except (OSError, ValueError):
             continue
         sid = d.get("sessionId") or os.path.basename(f)[:-5]

@@ -630,7 +630,8 @@ def search_sessions(q, limit=500):
     out = []
     for f in fs[:limit]:
         try:
-            data = open(f, encoding="utf-8", errors="ignore").read()
+            with open(f, encoding="utf-8", errors="ignore") as fh:
+                data = fh.read()
         except OSError:
             continue
         dl = data.lower()
@@ -964,7 +965,8 @@ def parse_shells(path):
         last = ""
         if outpath and os.path.exists(outpath):
             try:
-                lines = [l for l in open(outpath, encoding="utf-8", errors="ignore").read().splitlines() if l.strip()]
+                with open(outpath, encoding="utf-8", errors="ignore") as fh:
+                    lines = [l for l in fh.read().splitlines() if l.strip()]
                 last = lines[-1][:200] if lines else ""
             except OSError:
                 pass
@@ -995,7 +997,8 @@ def _redirect_log(cmd):
 
 def _read_tail(p, n=40000):
     try:
-        return open(p, encoding="utf-8", errors="ignore").read()[-n:]
+        with open(p, encoding="utf-8", errors="ignore") as fh:
+            return fh.read()[-n:]
     except OSError:
         return ""
 
@@ -1021,27 +1024,28 @@ def agent_detail(path, aid):
             continue
         task, texts, tools = "", [], 0
         try:
-            for line in open(af, encoding="utf-8"):
-                try:
-                    o = json.loads(line)
-                except ValueError:
-                    continue
-                m = o.get("message")
-                if not isinstance(m, dict):
-                    continue
-                c = m.get("content")
-                if m.get("role") == "user" and isinstance(c, str) and not task:
-                    s = c.strip()                              # keep paragraphs (.cmdcode is pre-wrap)
-                    if s and not s.startswith("<"):
-                        task = s[:8000]                        # full prompt, not the 160-char card blurb
-                if isinstance(c, list):
-                    for b in c:
-                        if not isinstance(b, dict):
-                            continue
-                        if b.get("type") == "tool_use":
-                            tools += 1
-                        elif b.get("type") == "text" and b.get("text", "").strip() and not b["text"].lstrip().startswith("<"):
-                            texts.append(b["text"].strip())
+            with open(af, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        o = json.loads(line)
+                    except ValueError:
+                        continue
+                    m = o.get("message")
+                    if not isinstance(m, dict):
+                        continue
+                    c = m.get("content")
+                    if m.get("role") == "user" and isinstance(c, str) and not task:
+                        s = c.strip()                          # keep paragraphs (.cmdcode is pre-wrap)
+                        if s and not s.startswith("<"):
+                            task = s[:8000]                    # full prompt, not the 160-char card blurb
+                    if isinstance(c, list):
+                        for b in c:
+                            if not isinstance(b, dict):
+                                continue
+                            if b.get("type") == "tool_use":
+                                tools += 1
+                            elif b.get("type") == "text" and b.get("text", "").strip() and not b["text"].lstrip().startswith("<"):
+                                texts.append(b["text"].strip())
         except OSError:
             break
         running = False

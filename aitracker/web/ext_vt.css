@@ -537,3 +537,24 @@ html.light {
   .vtmgrfoot .vtcapx { flex: 1 1 auto; }
   .vtmgrall { margin-left: 0; }
 }
+
+/* Last-resort fallback banner for _popupBlockedNotice() -- only rendered if BOTH the control
+   room's CR.dialogs.toast and the classic dashboard's own toast() are missing, which should
+   never happen in practice (see that function's comment). Non-blocking, click-to-dismiss,
+   auto-clears itself -- never a native dialog. */
+.vtfallbacknotice {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 4000;
+  max-width: 320px;
+  padding: 10px 14px;
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--line3);
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0,0,0,.3);
+}

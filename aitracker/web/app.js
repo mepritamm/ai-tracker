@@ -1170,14 +1170,23 @@ function checkCompletions(d){
 // every 2s) and loadSide() (session list, every 5s) hit different endpoints and must not block
 // each other — a slow /api/list must not stall /api/session refreshes, or vice versa. Cleared in
 // `finally` so a rejected fetch can't leave poll() permanently unable to start again.
-let pollBusy=false;
+// pollBusy only limits how many fetches are in flight at once — it does NOT prove the fetch that
+// eventually resolves is still the one we want to paint. Selecting a new session (pick->track->
+// poll) while a previous poll's fetch is still in flight can't be stopped, so instead every call
+// is tagged with the session id it was issued for + a monotonic sequence number; the response is
+// applied only if BOTH still match when it lands (id: are we still on that session; seq: is this
+// the latest request issued, so an out-of-order reply for an older request on the SAME id can't
+// clobber a newer one either). Anything else is a stale reply and is silently dropped.
+let pollBusy=false, pollSeq=0;
 async function poll(){
   if(!cur||pollBusy)return;
   pollBusy=true;
+  const seq=++pollSeq, id=cur;
   let d;
-  try{d=await(await fetch("/api/session?id="+encodeURIComponent(cur))).json()}
+  try{d=await(await fetch("/api/session?id="+encodeURIComponent(id))).json()}
   catch(e){return}
   finally{pollBusy=false;}
+  if(seq!==pollSeq||id!==cur)return;   // superseded by a newer poll, or the selection moved on — discard
   if(d.error){$("hmeta").innerHTML=`<span class=dot></span> ${esc(d.error)}: ${esc(cur)}`;return}
   lastData=d;render(d);loadFlags();checkCompletions(d);
 }
