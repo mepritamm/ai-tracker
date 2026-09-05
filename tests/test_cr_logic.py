@@ -542,6 +542,157 @@ def _detail_driver_js():
     js.append("OUT2.merged = window.CR.detail._internal.mergeTimeline(mergeDetail)"
               ".map(function(e){ return { kind: e.kind, t: e.t }; });")
 
+    # -----------------------------------------------------------------------
+    # 13) THE PROGRESS-SPINE TIME WINDOW.
+    #
+    # The reported defect, reproduced exactly: a 192h session whose real events
+    # all land in its first quarter-hour. Marker pct is (t - t0) / span, so
+    # un-windowed every one of them is crushed into the left few percent of the
+    # gutter and the 2%-collision nudge stacks them into an illegible pile. A
+    # window re-bases the axis onto [winT0, winT1] and drops what falls outside.
+    # -----------------------------------------------------------------------
+    MIN_MS = 60 * 1000
+    HOUR_MS = 60 * MIN_MS
+
+    long_first = BASE_MS - 192 * HOUR_MS
+    long_detail = make_detail(
+        todos=[],
+        requests=[{"t": iso_ms(long_first + k * 5 * MIN_MS), "text": "p%d" % k} for k in range(4)]
+        + [{"t": iso_ms(BASE_MS - 10 * MIN_MS), "text": "recent"}],
+    )
+
+    # Window CLIPPING of the bar: A falls entirely outside a trailing 1h window,
+    # B only overlaps it (60m long, 30m of it visible), C is running inside it.
+    clip_detail = make_detail(
+        todos=[
+            {"content": "A", "status": "completed", "activeForm": "",
+             "started_at": epoch_sec(BASE_MS - 4 * HOUR_MS), "ended_at": epoch_sec(BASE_MS - 3 * HOUR_MS)},
+            {"content": "B", "status": "completed", "activeForm": "",
+             "started_at": epoch_sec(BASE_MS - 90 * MIN_MS), "ended_at": epoch_sec(BASE_MS - 30 * MIN_MS)},
+            {"content": "C", "status": "in_progress", "activeForm": "",
+             "started_at": epoch_sec(BASE_MS - 20 * MIN_MS), "ended_at": None},
+        ],
+        requests=[{"t": iso_ms(BASE_MS - 4 * HOUR_MS), "text": "go"}],
+    )
+
+    # Panning off the live edge: "to go" is a claim about the FUTURE, so a window
+    # dragged into the past must not assert what was pending back then.
+    pan_detail = make_detail(
+        todos=[
+            {"content": "A", "status": "completed", "activeForm": "",
+             "started_at": epoch_sec(BASE_MS - 4 * HOUR_MS), "ended_at": epoch_sec(BASE_MS - 150 * MIN_MS)},
+            {"content": "P", "status": "pending", "activeForm": "",
+             "started_at": None, "ended_at": None},
+        ],
+        requests=[{"t": iso_ms(BASE_MS - 4 * HOUR_MS), "text": "go"}],
+    )
+
+    js.append("var longDetail = %s;" % json.dumps(long_detail))
+    js.append("OUT2.long_all = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(longDetail, %d);"
+              " return { windowed: r.windowed, total: r.total,"
+              "          marks: r.markers.map(function(m){ return { kind: m.kind, pct: m.pct }; }) };"
+              " })();" % BASE_MS)
+    js.append("OUT2.long_win = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(longDetail, %d,"
+              "   { spanMs: %d, endMs: %d });"
+              " return { windowed: r.windowed, atLiveEdge: r.atLiveEdge, winSpanMs: r.winSpanMs,"
+              "          realMarkers: r.realMarkers,"
+              "          marks: r.markers.map(function(m){ return { kind: m.kind, pct: m.pct }; }) };"
+              " })();" % (BASE_MS, HOUR_MS, BASE_MS))
+
+    # A long-IDLE session: 2192h elapsed with nothing in the last hour. Confirmed
+    # against a real session on this machine (63f5fe77, 2192.2h, 0 todos), where
+    # a trailing window legitimately contains no recorded event at all.
+    idle_detail = make_detail(
+        todos=[],
+        requests=[{"t": iso_ms(BASE_MS - 2192 * HOUR_MS + k * 5 * MIN_MS), "text": "p%d" % k}
+                  for k in range(3)],
+    )
+    js.append("var idleDetail = %s;" % json.dumps(idle_detail))
+    js.append("OUT2.idle_all = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(idleDetail, %d);"
+              " return { realMarkers: r.realMarkers, n: r.markers.length };"
+              " })();" % BASE_MS)
+    js.append("OUT2.idle_win = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(idleDetail, %d,"
+              "   { spanMs: %d, endMs: %d });"
+              " return { realMarkers: r.realMarkers, n: r.markers.length,"
+              "          kinds: r.markers.map(function(m){ return m.kind; }) };"
+              " })();" % (BASE_MS, HOUR_MS, BASE_MS))
+
+    # A todo whose ended_at is PRESENT but corrupt. hasTimes only requires a
+    # parseable started_at, so this really does reach the time-proportional
+    # branch. It must contribute nothing rather than a duration invented from
+    # garbage — the regression an adversarial review caught in the first cut.
+    corrupt_detail = make_detail(
+        todos=[
+            {"content": "good", "status": "completed", "activeForm": "",
+             "started_at": epoch_sec(BASE_MS - 60 * MIN_MS), "ended_at": epoch_sec(BASE_MS - 30 * MIN_MS)},
+            {"content": "corrupt", "status": "completed", "activeForm": "",
+             "started_at": epoch_sec(BASE_MS - 90 * MIN_MS), "ended_at": "not-a-timestamp"},
+        ],
+        requests=[{"t": iso_ms(BASE_MS - 90 * MIN_MS), "text": "go"}],
+    )
+    js.append("var corruptDetail = %s;" % json.dumps(corrupt_detail))
+    js.append("OUT2.corrupt = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(corruptDetail, %d);"
+              " return { timeAccurate: r.timeAccurate,"
+              "          segs: r.segments.map(function(s){ return { idx: s.idx, ms: s.elapsedMs, w: s.widthPct }; }),"
+              "          finite: r.segments.every(function(s){ return isFinite(s.widthPct); }) };"
+              " })();" % BASE_MS)
+
+    js.append("var clipDetail = %s;" % json.dumps(clip_detail))
+    js.append("OUT2.clip_all = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(clipDetail, %d);"
+              " return { windowed: r.windowed, barWindowed: r.barWindowed, timeAccurate: r.timeAccurate,"
+              "          segs: r.segments.map(function(s){ return { idx: s.idx, kind: s.kind, widthPct: s.widthPct }; }),"
+              "          sum: r.segments.reduce(function(a,s){ return a+s.widthPct; }, 0) };"
+              " })();" % BASE_MS)
+    js.append("OUT2.clip_win = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(clipDetail, %d,"
+              "   { spanMs: %d, endMs: %d });"
+              " return { windowed: r.windowed, barWindowed: r.barWindowed,"
+              "          segs: r.segments.map(function(s){ return { idx: s.idx, kind: s.kind, widthPct: s.widthPct }; }),"
+              "          sum: r.segments.reduce(function(a,s){ return a+s.widthPct; }, 0) };"
+              " })();" % (BASE_MS, HOUR_MS, BASE_MS))
+
+    js.append("var panDetail = %s;" % json.dumps(pan_detail))
+    js.append("OUT2.pan_live = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(panDetail, %d,"
+              "   { spanMs: %d, endMs: %d });"
+              " return { atLiveEdge: r.atLiveEdge,"
+              "          kinds: r.segments.map(function(s){ return s.kind; }) };"
+              " })();" % (BASE_MS, HOUR_MS, BASE_MS))
+    js.append("OUT2.pan_back = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(panDetail, %d,"
+              "   { spanMs: %d, endMs: %d });"
+              " return { atLiveEdge: r.atLiveEdge,"
+              "          kinds: r.segments.map(function(s){ return s.kind; }) };"
+              " })();" % (BASE_MS, HOUR_MS, BASE_MS - 2 * HOUR_MS))
+
+    # 14) which chips are offered, and the window clamps behind the drag-pan
+    js.append("OUT2.span_choices = {"
+              " long: window.CR.detail._internal.spineSpanChoices(%d).map(function(c){ return c.key; }),"
+              " short: window.CR.detail._internal.spineSpanChoices(%d).map(function(c){ return c.key; }),"
+              " twoh: window.CR.detail._internal.spineSpanChoices(%d).map(function(c){ return c.key; }),"
+              " zero: window.CR.detail._internal.spineSpanChoices(0).map(function(c){ return c.key; }),"
+              " nul: window.CR.detail._internal.spineSpanChoices(null).map(function(c){ return c.key; })"
+              " };" % (192 * HOUR_MS, 10 * MIN_MS, 2 * HOUR_MS))
+
+    js.append("OUT2.win_clamp = (function(){"
+              " var W = window.CR.detail._internal.spineWindow;"
+              " var now = %d, first = now - %d;"
+              " return {"
+              "   none: W({ spineSpanMs: null, spineEndMs: null }, first, now),"
+              "   no_ui: W(null, first, now),"
+              "   anchored: W({ spineSpanMs: %d, spineEndMs: null }, first, now).endMs - now,"
+              "   past_first: W({ spineSpanMs: %d, spineEndMs: now - %d }, first, now).endMs - first,"
+              "   future: W({ spineSpanMs: %d, spineEndMs: now + %d }, first, now).endMs - now,"
+              "   span_gt_session: W({ spineSpanMs: %d, spineEndMs: null }, first, now).endMs - now"
+              " }; })();" % (BASE_MS, 4 * HOUR_MS, HOUR_MS, HOUR_MS, 10 * HOUR_MS,
+                             HOUR_MS, 5 * HOUR_MS, 24 * HOUR_MS))
+
     return "\n".join(js)
 
 
@@ -820,6 +971,132 @@ class TestCRLogic(unittest.TestCase):
         self.assertEqual(r["total"], 0)
         self.assertEqual(r["segCount"], 0)
         self.assertEqual(r["ariaLabel"], "Progress: no tasks recorded.")
+
+    # -- the spine's TIME WINDOW: chips + drag-pan --------------------------
+
+    def test_spine_window_omitted_is_the_whole_session_unchanged(self):
+        """Backward compatibility is the whole reason `win` is a third, optional
+        argument: every pre-existing caller and test passes two, and must keep
+        getting the un-windowed spine.
+
+        This asserts the NUMBERS, not just the flags. An earlier version of this
+        test checked only `windowed is False` — which an adversarial review
+        correctly called out as unable to catch broken segment math."""
+        self.assertFalse(self.OUT["long_all"]["windowed"])
+        self.assertFalse(self.OUT["clip_all"]["windowed"])
+        self.assertFalse(self.OUT["clip_all"]["barWindowed"])
+
+        # clipDetail un-windowed: A spent 60m, B 60m, C 20m (running, to now) of a
+        # 4h session. Proportions are of the 140m actually spent: 42.86/42.86/14.29.
+        segs = {s["idx"]: s["widthPct"] for s in self.OUT["clip_all"]["segs"]}
+        self.assertEqual(sorted(segs), [0, 1, 2])
+        self.assertAlmostEqual(segs[0], 42.86, delta=0.5)
+        self.assertAlmostEqual(segs[1], 42.86, delta=0.5)
+        self.assertAlmostEqual(segs[2], 14.29, delta=0.5)
+
+    def test_unparseable_ended_at_contributes_nothing_not_a_bogus_duration(self):
+        """Found by adversarial review. `ended_at` absent means "still running"
+        (-> now); `ended_at` PRESENT but corrupt must stay null and contribute 0.
+        Collapsing the two would turn garbage into a live-looking duration, and
+        the todo would swell to fill the bar."""
+        r = self.OUT["corrupt"]
+        self.assertTrue(r["timeAccurate"], "a parseable started_at still counts")
+        self.assertTrue(r["finite"], "no NaN/Infinity widths")
+        by_idx = {s["idx"]: s for s in r["segs"]}
+        self.assertEqual(by_idx[1]["ms"], 0, "corrupt ended_at must yield 0ms")
+        # the good todo therefore takes the whole bar, and the corrupt one only
+        # the 3% FLOOR that keeps every segment clickable
+        self.assertGreater(by_idx[0]["w"], by_idx[1]["w"])
+
+    def test_spine_unwindowed_long_session_crushes_markers_into_the_left_edge(self):
+        """Pins the DEFECT, so the fix below has something to be a fix OF: over a
+        192h session every real event lands in the left few percent of the gutter."""
+        marks = self.OUT["long_all"]["marks"]
+        real = [m for m in marks if m["kind"] != "now"]
+        self.assertGreaterEqual(len(real), 4)
+        # the four early prompts are 5 minutes apart in a 192-hour session: even
+        # after the 2%-collision nudge they are all still jammed against the left
+        early = sorted(m["pct"] for m in real)[:4]
+        self.assertLess(max(early), 8.0, "expected the crowding this window fixes")
+
+    def test_spine_window_rebases_markers_onto_the_visible_span(self):
+        """The fix: a trailing 1h window drops the 192h-old events entirely and
+        positions what remains against the WINDOW, not the session."""
+        w = self.OUT["long_win"]
+        self.assertTrue(w["windowed"])
+        self.assertTrue(w["atLiveEdge"])
+        self.assertEqual(w["winSpanMs"], 60 * 60 * 1000)
+        kinds = sorted(m["kind"] for m in w["marks"])
+        # only the 10-minutes-ago prompt and NOW survive a trailing 1h window
+        self.assertEqual(kinds, ["now", "prompt"])
+        prompt = [m for m in w["marks"] if m["kind"] == "prompt"][0]
+        # 10 minutes before the end of a 60-minute window -> 50/60 == 83.3%
+        self.assertAlmostEqual(prompt["pct"], 83.3, delta=1.0)
+
+    def test_empty_window_is_detected_past_the_synthetic_now_marker(self):
+        """`now` is pushed onto the marker list on EVERY render, so it is never
+        evidence that anything happened in view. Counting it would have meant the
+        "nothing in this window" message never fired on precisely the sessions
+        that need it — a long-idle one windowed to its last hour. Pinned against
+        a real 2192h session on this machine (63f5fe77) that behaves this way."""
+        self.assertEqual(self.OUT["idle_all"]["realMarkers"], 3)
+        w = self.OUT["idle_win"]
+        self.assertEqual(w["kinds"], ["now"], "only the synthetic marker survives")
+        self.assertEqual(w["n"], 1)
+        self.assertEqual(w["realMarkers"], 0, "an empty window must read as empty")
+        # and the live-edge window over a session that IS active still has content
+        self.assertEqual(self.OUT["long_win"]["realMarkers"], 1)
+
+    def test_spine_window_clips_bar_segments_to_the_visible_range(self):
+        """A todo outside the window is dropped, and one that merely OVERLAPS it
+        contributes only its visible part -- never its whole duration."""
+        allw = self.OUT["clip_all"]
+        self.assertTrue(allw["timeAccurate"])
+        self.assertEqual([s["idx"] for s in allw["segs"]], [0, 1, 2])
+        self.assertAlmostEqual(allw["sum"], 100.0, places=2)
+
+        win = self.OUT["clip_win"]
+        self.assertTrue(win["barWindowed"])
+        # A (ended 3h ago) is gone; B contributes its visible 30m, C its 20m
+        self.assertEqual([s["idx"] for s in win["segs"]], [1, 2])
+        by_idx = {s["idx"]: s["widthPct"] for s in win["segs"]}
+        self.assertAlmostEqual(by_idx[1], 60.0, delta=0.5)   # 30m of 50m visible
+        self.assertAlmostEqual(by_idx[2], 40.0, delta=0.5)   # 20m of 50m visible
+        self.assertAlmostEqual(win["sum"], 100.0, places=2)
+
+    def test_spine_window_panned_into_the_past_drops_pending_todos(self):
+        """'to go' is a claim about the future. Anchored at the live edge the
+        pending todo shows; dragged back two hours it must not, because what was
+        still pending at that moment is not something the log records."""
+        live = self.OUT["pan_live"]
+        self.assertTrue(live["atLiveEdge"])
+        self.assertIn("pending", live["kinds"])
+
+        back = self.OUT["pan_back"]
+        self.assertFalse(back["atLiveEdge"])
+        self.assertNotIn("pending", back["kinds"])
+        self.assertEqual(back["kinds"], ["done"])
+
+    def test_spine_span_choices_only_offers_spans_shorter_than_the_session(self):
+        """A no-op chip is worse than no chip: a 10-minute session gets none."""
+        c = self.OUT["span_choices"]
+        self.assertEqual(c["long"], ["15m", "1h", "6h", "24h"])
+        self.assertEqual(c["twoh"], ["15m", "1h"])
+        self.assertEqual(c["short"], [])
+        self.assertEqual(c["zero"], [])
+        self.assertEqual(c["nul"], [])
+
+    def test_spine_window_clamps_so_a_drag_pan_cannot_leave_the_session(self):
+        """The drag-pan writes ui.spineEndMs straight from pointer deltas, so
+        every bound that keeps the window sane lives in spineWindow()."""
+        c = self.OUT["win_clamp"]
+        self.assertIsNone(c["none"], "no span chosen == All == no window")
+        self.assertIsNone(c["no_ui"], "no ui object must not throw")
+        self.assertEqual(c["anchored"], 0, "endMs null == pinned to the live edge")
+        # dragged 10h back on a 4h session: the window's LEFT edge stops at first
+        self.assertEqual(c["past_first"], 60 * 60 * 1000)
+        self.assertEqual(c["future"], 0, "cannot pan into the future")
+        self.assertEqual(c["span_gt_session"], 0, "span longer than the session pins to now")
 
     def test_spine_segments_ended_at_alone_is_not_mistaken_for_real_timing(self):
         """Regression for the exact real-world shape confirmed live: a completed

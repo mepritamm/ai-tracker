@@ -514,10 +514,22 @@
 .cr .crd-spine-head {
   display: flex;
   align-items: baseline;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 10px;
 }
-.cr .crd-spine-chevron { color: var(--text-muted); }
+
+/* The spine summary sentence. Visually hidden, but announced -- the container is
+   a role="group" (not the old role="img", which hid every control inside it). */
+.cr .crd-spine-sr {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0; border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
 .cr .crd-spine-label {
   text-transform: uppercase;
   letter-spacing: .08em;
@@ -677,6 +689,156 @@
   color: var(--text-muted);
 }
 .cr .crd-spine-mid { color: var(--text-secondary); }
+
+/* ------------------------- time window: chips + pan ------------------------ */
+
+.cr .crd-spine-spans {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 4px;
+}
+.cr .crd-spine-span {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 9px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: var(--radius-pill, 999px);
+  border: 1px solid var(--line-subtle);
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease, border-color .15s ease;
+}
+.cr .crd-spine-span:hover {
+  background: var(--fill-row-hover);
+  color: var(--text-secondary);
+}
+.cr .crd-spine-span.is-on {
+  background: var(--surface-agent-quiet);
+  border-color: var(--line-agent);
+  color: var(--text-thinking);
+}
+.cr .crd-spine-span:focus-visible {
+  outline: 2px solid var(--line-focus);
+  outline-offset: 2px;
+}
+/* the "now" reset only exists while panned off the live edge -- dashed so it
+   reads as a return-to-default, not as another span choice */
+.cr .crd-spine-live {
+  border-style: dashed;
+  border-color: var(--line-agent);
+  color: var(--text-thinking);
+}
+
+.cr .crd-spine-track { position: relative; }
+/* pan only once a chip has narrowed the window; `pan-y` keeps the page's own
+   vertical scroll working on a phone while we take the horizontal axis */
+.cr .crd-spine-track.is-pannable { cursor: grab; touch-action: pan-y; }
+.cr .crd-spine-track.is-panning { cursor: grabbing; user-select: none; }
+
+/* An empty strip reads as broken, so both empty states say what they are. */
+.cr .crd-spine-bar:empty {
+  border-top: 1px dashed var(--line-subtle);
+  border-bottom: 1px dashed var(--line-subtle);
+}
+.cr .crd-spine.is-empty-window .crd-spine-track::after {
+  content: "nothing recorded in this window " "\2014" " drag to pan, or pick a longer span";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+/* ------------------------------ live motion -------------------------------
+   Full-motion treatment. The design doc specifies ONE animation on the spine
+   (the 2.4s dot pulse); everything else below is additive and is called out as
+   a deviation in the change report. Every rule has a reduced-motion off-switch,
+   and the segment entry animation is gated in JS on the segment set actually
+   changing -- otherwise the 2s poll would restart it forever. */
+
+@keyframes crd-seg-in {
+  from { opacity: 0; transform: scaleX(.55); }
+  to   { opacity: 1; transform: scaleX(1); }
+}
+@keyframes crd-shimmer {
+  from { background-position: -140% 0; }
+  to   { background-position: 240% 0; }
+}
+@keyframes crd-edge-breathe {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: .45; }
+}
+@keyframes crd-now-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: .4; }
+}
+
+.cr .crd-spine-bar.is-fresh .crd-seg {
+  animation: crd-seg-in .34s cubic-bezier(.22,.61,.36,1) both;
+  transform-origin: left center;
+}
+.cr .crd-spine-bar.is-fresh .crd-seg:nth-child(2) { animation-delay: .035s; }
+.cr .crd-spine-bar.is-fresh .crd-seg:nth-child(3) { animation-delay: .07s; }
+.cr .crd-spine-bar.is-fresh .crd-seg:nth-child(4) { animation-delay: .105s; }
+.cr .crd-spine-bar.is-fresh .crd-seg:nth-child(5) { animation-delay: .14s; }
+.cr .crd-spine-bar.is-fresh .crd-seg:nth-child(6) { animation-delay: .175s; }
+.cr .crd-spine-bar.is-fresh .crd-seg:nth-child(n+7) { animation-delay: .21s; }
+
+/* width/position changes (a span chip, a pan, a todo completing) glide */
+.cr .crd-seg { transition: flex-basis .4s cubic-bezier(.22,.61,.36,1); }
+.cr .crd-mark { transition: left .4s cubic-bezier(.22,.61,.36,1); }
+.cr .crd-spine-track.is-panning .crd-seg,
+.cr .crd-spine-track.is-panning .crd-mark { transition: none; } /* follow the finger */
+
+/* a light sweep across the running segment -- the "still working" tell */
+.cr .crd-spine { --crd-shimmer: rgba(255,255,255,.55); }
+.tracker-next.is-dark .crd-spine { --crd-shimmer: rgba(255,235,180,.14); }
+/* NO `overflow: hidden` on the segment here, deliberately: .crd-seg-edge is
+   absolutely positioned to sit 4px PROUD of the bar (top/bottom: -4px), so
+   clipping the segment would silently amputate the design's leading edge. It is
+   also unnecessary -- a background never paints outside its own element's box,
+   so the sweep is already bounded by the ::after itself. */
+.cr .crd-seg-running::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0; /* under the label, over the fill -- never washing out the text */
+  pointer-events: none;
+  background: linear-gradient(100deg, transparent 22%, var(--crd-shimmer) 50%, transparent 78%);
+  background-size: 220% 100%;
+  animation: crd-shimmer 2.8s linear infinite;
+}
+/* the label rides above the sweep; the edge above both. Scoped to these two
+   classes rather than a blanket child rule, because .crd-seg-edge is absolutely
+   positioned and `position: relative` would knock it out of place. */
+.cr .crd-seg-running .crd-seg-running-label,
+.cr .crd-seg-running .crd-seg-running-elapsed { position: relative; z-index: 1; }
+.cr .crd-seg-running .crd-seg-edge { z-index: 2; }
+/* the running segment's leading edge and the NOW tick breathe on the same 2.4s
+   clock as the dot, so the three read as one heartbeat rather than three */
+.cr .crd-seg-edge { animation: crd-edge-breathe var(--motion-pulse-duration, 2.4s) ease-in-out infinite; }
+.cr .crd-mark-now .crd-mark-tick,
+.cr .crd-mark-now .crd-mark-word {
+  animation: crd-now-pulse var(--motion-pulse-duration, 2.4s) ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cr .crd-spine-bar.is-fresh .crd-seg,
+  .cr .crd-seg-running::after,
+  .cr .crd-seg-edge,
+  .cr .crd-mark-now .crd-mark-tick,
+  .cr .crd-mark-now .crd-mark-word { animation: none; }
+  .cr .crd-seg-running::after { display: none; }
+  .cr .crd-seg,
+  .cr .crd-mark { transition: none; }
+}
 
 /* ============================== three columns ============================== */
 
@@ -1589,6 +1751,22 @@
      it below the phone breakpoint rather than let it show through the
      (unhidden, pre-existing) desktop header on phone. */
   .cr .crd-statchips { display: none; }
+
+  /* The window chips stay on EVERY viewport -- they are the control that makes a
+     long session readable, and a phone is exactly where you triage one. They
+     belong in this <=600px tier (not the narrower <=480px sub-range) so the whole
+     phone tier gets them, and they meet the same ">= 44px hit target" rule the
+     back chevron below follows -- via a real box size, not a scaled glyph. Five
+     chips (All + 15m/1h/6h/24h) at 44px plus gaps is ~232px inside a ~336px phone
+     content width, and flex-wrap catches any session that offers fewer or more. */
+  .cr .crd-spine-spans { margin-left: 0; width: 100%; flex-wrap: wrap; gap: 4px; }
+  .cr .crd-spine-span {
+    min-height: 44px;
+    min-width: 44px;
+    padding: 4px 10px;
+    font-size: 11px;
+  }
+
   .cr .crd-phonehead {
     display: flex;
     align-items: center;

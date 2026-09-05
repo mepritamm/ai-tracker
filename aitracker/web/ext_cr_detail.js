@@ -324,25 +324,77 @@
     return cands.length ? Math.min.apply(Math, cands) : null;
   }
 
-  // The progress spine's derived layout. Pure: (session, nowMs) -> plan object.
+  // ---- progress-spine time window (span chips + drag-pan) -------------------
+  //
+  // The spine draws in TWO coordinate systems: the bar is a flex row of
+  // duration-PROPORTIONAL widths, while the gutter is a real TIME AXIS
+  // (marker pct = (t - t0) / span). A long session therefore crushes every real
+  // event into the first sliver of the gutter -- on a 192h session every marker
+  // landed inside the left ~3% and the 2%-collision nudge below stacked them into
+  // one illegible pile against the edge.
+  //
+  // The window fixes the axis: it re-bases marker pct onto [winT0, winT1] and,
+  // when (and only when) per-todo timings exist, clips the bar's segments to the
+  // same range. With no timings the bar carries no time meaning at all, so it is
+  // left whole rather than filtered on a number the session never recorded --
+  // the same "never invented precision" rule the equal-width fallback keeps.
+  var SPINE_SPANS = [
+    { key: "15m", ms: 15 * 60 * 1000 },
+    { key: "1h", ms: 60 * 60 * 1000 },
+    { key: "6h", ms: 6 * 60 * 60 * 1000 },
+    { key: "24h", ms: 24 * 60 * 60 * 1000 }
+  ];
+
+  // A span is only worth offering if it actually hides something, so a 12-minute
+  // session gets no chips at all rather than five no-op ones. "All" is implicit.
+  function spineSpanChoices(elapsedMs) {
+    if (!elapsedMs || elapsedMs <= 0) return [];
+    return SPINE_SPANS.filter(function (c) { return c.ms < elapsedMs; });
+  }
+
+  // ui state -> concrete window. endMs == null means "anchored to the live edge",
+  // which is what keeps a running session's window following the clock on each
+  // 2s poll instead of drifting backwards off the end.
+  function spineWindow(ui, firstMs, nowMs) {
+    if (!ui || !ui.spineSpanMs) return null;
+    var span = ui.spineSpanMs;
+    var end = ui.spineEndMs == null ? nowMs : ui.spineEndMs;
+    if (end > nowMs) end = nowMs;
+    // never pan past the first event: the window's left edge stops at firstMs
+    if (firstMs != null && end - span < firstMs) end = firstMs + span;
+    if (end > nowMs) end = nowMs; // span longer than the session -> pinned to now
+    return { spanMs: span, endMs: end };
+  }
+
+  // The progress spine's derived layout. Pure: (session, nowMs, win) -> plan object.
   //
   // todos[i].started_at / todos[i].ended_at (snake_case, epoch seconds — see parseEpochSec
   // above and claude.py:1209-1210) drive the `hasTimes` branch below when every active todo
   // carries a started_at; this function falls back to an honest equal-width split among
   // active/pending todos otherwise — never fabricating a per-todo duration.
-  function spineSegments(session, nowMs) {
+  function spineSegments(session, nowMs, win) {
     var todos = (session.todos || []).filter(function (t) { return t && typeof t === "object"; });
     var total = todos.length;
     var firstMs = firstEventTime(session);
     var elapsedMs = firstMs != null ? Math.max(0, nowMs - firstMs) : null;
+    // `win` is optional: omitted (every pre-existing caller and test) == whole
+    // session, in which case winT0/winT1 collapse onto firstMs/nowMs and every
+    // number below is what it was before the window existed.
+    var windowed = !!(win && win.spanMs) && firstMs != null && elapsedMs != null;
+    var winT1 = windowed ? win.endMs : nowMs;
+    var winT0 = windowed ? win.endMs - win.spanMs : firstMs;
+    var winSpanMs = windowed ? win.spanMs : elapsedMs;
     var out = {
       segments: [], markers: [], elapsedMs: elapsedMs, firstMs: firstMs,
       doneCount: 0, runningCount: 0, pendingCount: 0, total: total, ariaLabel: "",
-      timeAccurate: false
+      timeAccurate: false,
+      windowed: windowed, winT0: winT0, winT1: winT1, winSpanMs: winSpanMs,
+      atLiveEdge: !windowed || winT1 >= nowMs, barWindowed: false
     };
     if (!total) {
       out.ariaLabel = "Progress: no tasks recorded.";
-      out.markers = buildMarkers(session, nowMs, firstMs, elapsedMs);
+      out.markers = buildMarkers(session, nowMs, winT0, winT1, windowed);
+      out.realMarkers = countRealMarkers(out.markers);
       return out;
     }
 
@@ -364,22 +416,48 @@
     var segs = [];
     if (hasTimes) {
       out.timeAccurate = true;
-      var spentTotal = 0, spentByIdx = {};
+      out.barWindowed = windowed; // only here do the bar's widths mean real time
+      var spentTotal = 0, spentByIdx = {}, visActive = [];
       activeIdx.forEach(function (i) {
         var t = todos[i];
         var started = parseEpochSec(t.started_at);
+        // An ABSENT ended_at means "still running" -> now. An ended_at that is
+        // present but UNPARSEABLE stays null and yields 0: promoting corrupt data
+        // to "now" would fabricate a duration, which is the one thing this
+        // function's honest equal-width fallback exists to avoid.
         var ended = t.ended_at != null ? parseEpochSec(t.ended_at) : nowMs;
-        var ms = (started != null && ended != null) ? Math.max(0, ended - started) : 0;
+        var usable = started != null && ended != null;
+        var ms;
+        if (!usable) {
+          ms = 0;
+        } else if (windowed) {
+          // clip the todo's real [started, ended] span to the visible window, so a
+          // todo that merely OVERLAPS the window contributes only its visible part
+          var a = Math.max(started, winT0), b = Math.min(ended, winT1);
+          ms = Math.max(0, b - a);
+        } else {
+          ms = Math.max(0, ended - started);
+        }
+        // a todo entirely outside the window is dropped, not drawn at FLOOR width
+        if (windowed && ms <= 0) return;
+        visActive.push(i);
         spentByIdx[i] = ms; spentTotal += ms;
       });
-      var usedPct = spentTotal > 0 ? Math.min(MAX_USED, (spentTotal / elapsedMs) * 100) : 0;
-      var pendingEach = pendIdx.length ? (100 - usedPct) / pendIdx.length : 0;
-      activeIdx.forEach(function (i) {
+      // percentages are of the WINDOW when windowed, of the session otherwise
+      var denomMs = windowed ? Math.max(1, winT1 - winT0) : elapsedMs;
+      // "to go" is a claim about the future, so pending todos only belong in a
+      // window that still touches the live edge -- a window panned into the past
+      // would otherwise assert what was pending back then, which we cannot know.
+      var showPending = !windowed || out.atLiveEdge;
+      var visPend = showPending ? pendIdx : [];
+      var usedPct = spentTotal > 0 ? Math.min(MAX_USED, (spentTotal / denomMs) * 100) : 0;
+      var pendingEach = visPend.length ? (100 - usedPct) / visPend.length : 0;
+      visActive.forEach(function (i) {
         var pct = spentTotal > 0 ? (spentByIdx[i] / spentTotal) * usedPct : 0;
         segs.push({ idx: i, kind: i === runIdx ? "running" : "done", widthPct: Math.max(pct, FLOOR),
           elapsedMs: spentByIdx[i], todo: todos[i] });
       });
-      pendIdx.forEach(function (i) {
+      visPend.forEach(function (i) {
         segs.push({ idx: i, kind: "pending", widthPct: Math.max(pendingEach, FLOOR), todo: todos[i] });
       });
       segs.sort(function (a, b) { return a.idx - b.idx; });
@@ -414,7 +492,8 @@
     var sum = segs.reduce(function (s, x) { return s + x.widthPct; }, 0) || 1;
     segs.forEach(function (s) { s.widthPct = (s.widthPct / sum) * 100; });
     out.segments = segs;
-    out.markers = buildMarkers(session, nowMs, firstMs, elapsedMs);
+    out.markers = buildMarkers(session, nowMs, winT0, winT1, windowed);
+    out.realMarkers = countRealMarkers(out.markers);
 
     var failMarker = out.markers.filter(function (m) { return m.kind === "fail"; })[0];
     var askMarker = out.markers.filter(function (m) { return m.kind === "ask"; })[0];
@@ -427,7 +506,13 @@
     return out;
   }
 
-  function buildMarkers(session, nowMs, firstMs, elapsedMs) {
+  // "now" is synthesised on every render, so it is not evidence that anything
+  // happened in the window -- only the recorded events count as content.
+  function countRealMarkers(markers) {
+    return markers.filter(function (m) { return m.kind !== "now"; }).length;
+  }
+
+  function buildMarkers(session, nowMs, t0, t1, windowed) {
     var markers = [];
     (session.requests || []).forEach(function (r) {
       var t = parseT(r.t);
@@ -456,8 +541,15 @@
     });
     markers.push({ t: nowMs, kind: "now", label: "NOW", title: "Now · " + fmtClock(nowMs) });
     markers.sort(function (a, b) { return a.t - b.t; });
-    if (firstMs != null && elapsedMs) {
-      markers.forEach(function (m) { m.pct = Math.max(0, Math.min(100, ((m.t - firstMs) / elapsedMs) * 100)); });
+    var span = (t0 != null && t1 != null) ? (t1 - t0) : null;
+    if (span != null && span > 0) {
+      // Only a real window drops events. Un-windowed, everything is kept and
+      // clamped exactly as before -- a marker outside [firstMs, nowMs] cannot
+      // normally exist, and silently losing one would be worse than a clamp.
+      if (windowed) {
+        markers = markers.filter(function (m) { return m.t >= t0 && m.t <= t1; });
+      }
+      markers.forEach(function (m) { m.pct = Math.max(0, Math.min(100, ((m.t - t0) / span) * 100)); });
       for (var i = 1; i < markers.length; i++) {
         if (Math.abs(markers[i].pct - markers[i - 1].pct) < 2) {
           markers[i].pct = Math.min(100, markers[i - 1].pct + 2);
@@ -1053,15 +1145,18 @@
         '<input class="crd-note-queue-input" type="text" placeholder="Queue a note for this session…">' +
         '<button class="crd-btn crd-btn-solid" data-act="note-queue-send">Queue</button>' +
       "</div>" +
-      '<div class="crd-spine" role="img">' +
+      '<div class="crd-spine" role="group" aria-label="Progress spine">' +
+        '<span class="crd-spine-sr" aria-live="polite"></span>' +
         '<div class="crd-spine-head">' +
-          '<span class="crd-spine-chevron">' + ico("chevron-down") + "</span>" +
           '<span class="crd-spine-label">PROGRESS SPINE</span>' +
           '<span class="crd-spine-count mono"></span>' +
+          '<span class="crd-spine-spans" role="group" aria-label="Spine time window"></span>' +
           '<span class="crd-spine-hint mono">segment width = time actually spent · click to jump the chat there</span>' +
         "</div>" +
-        '<div class="crd-spine-bar"></div>' +
-        '<div class="crd-spine-gutter"></div>' +
+        '<div class="crd-spine-track">' +
+          '<div class="crd-spine-bar"></div>' +
+          '<div class="crd-spine-gutter"></div>' +
+        "</div>" +
         '<div class="crd-spine-foot mono">' +
           '<span class="crd-spine-first"></span>' +
           '<span class="crd-spine-mid"></span>' +
@@ -1152,6 +1247,11 @@
       // additive on top of the all/talk preset — see timelineEntryVisible() below.
       timelineKindsOn: {},
       agentsShowFinished: false,
+      // progress-spine time window. spineSpanMs null == "All" (whole session);
+      // spineEndMs null == anchored to the live edge so the window follows the
+      // clock on each 2s poll instead of sliding off the end of a live session.
+      spineSpanMs: null,
+      spineEndMs: null,
       searchOpen: false,
       flagOpen: false,
       noteOpen: false
@@ -1242,6 +1342,77 @@
       var nearBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 60;
       if (nearBottom) loadOlderNarration(ctx, ui, node);
     });
+
+    // ---- spine drag-to-pan ----
+    // Only meaningful once a span chip has narrowed the window; with "All" there
+    // is nothing to pan to. The handlers live on the .crd-spine-track WRAPPER,
+    // never on the bar/gutter themselves, because renderSpine replaces those two
+    // elements' innerHTML on every poll -- a listener or a pointer capture held
+    // on a replaced child would be destroyed mid-drag.
+    (function wireSpinePan() {
+      var track = qs(node, ".crd-spine-track");
+      if (!track) return;
+      var drag = null;
+
+      track.addEventListener("pointerdown", function (ev) {
+        if (!ui.spineSpanMs) return; // "All" -> nothing to pan
+        if (ev.button != null && ev.button !== 0) return;
+        // clear any stale swallow-the-click flag: if a previous pan ended without
+        // the click ever arriving (pointer released off-window), the flag would
+        // otherwise sit true and eat the next legitimate segment click
+        ui.spineJustPanned = false;
+        var w = track.clientWidth || 1;
+        drag = {
+          x0: ev.clientX, w: w, moved: false, captured: false,
+          end0: ui.spineEndMs == null ? (ui.spineNowMs || Date.now()) : ui.spineEndMs
+        };
+        // NOTE: deliberately NO setPointerCapture here, and no is-panning class.
+        // Both wait until the gesture proves itself a drag -- see pointermove.
+      });
+
+      track.addEventListener("pointermove", function (ev) {
+        if (!drag) return;
+        var dx = ev.clientX - drag.x0;
+        if (!drag.moved) {
+          if (Math.abs(dx) <= 3) return; // still a click, not a drag
+          drag.moved = true;
+          track.classList.add("is-panning");
+          // Capture LAZILY, only now that this is genuinely a drag. Capturing on
+          // pointerdown retargets the subsequent `click` to this wrapper (Pointer
+          // Events spec); since .crd-spine-track carries no data-act, the
+          // delegated handler's closest("[data-act]") would return null and
+          // click-to-jump would silently stop working for every click while a
+          // span chip was active. Verified live: with capture on pointerdown a
+          // plain segment click retargeted to DIV.crd-spine-track.
+          try { track.setPointerCapture(ev.pointerId); drag.captured = true; } catch (e) {}
+        }
+        // drag RIGHT pulls older time into view, so the window's end moves back
+        ui.spineEndMs = drag.end0 - (dx / drag.w) * ui.spineSpanMs;
+        // Clamp at WRITE time, not just at read. spineWindow() would bound the
+        // rendered window anyway, but the raw value would keep running past the
+        // end of the session and bank the excess as slack -- drag far enough off
+        // the start and you would then have to drag all the way back before the
+        // spine moved at all. Reusing spineWindow keeps ONE clamp, not two.
+        var clamped = spineWindow(ui, firstEventTime(ui.spineSession || {}),
+                                  ui.spineNowMs || Date.now());
+        if (clamped) ui.spineEndMs = clamped.endMs;
+        repaintSpine(node, ctx, ui);
+      });
+
+      function endPan(ev) {
+        if (!drag) return;
+        track.classList.remove("is-panning");
+        if (drag.captured) {
+          try { track.releasePointerCapture(ev.pointerId); } catch (e) {}
+        }
+        // a pan must not also fire the segment's click-to-jump; the click event
+        // arrives immediately after pointerup, so one flag is enough to swallow it
+        ui.spineJustPanned = drag.moved;
+        drag = null;
+      }
+      track.addEventListener("pointerup", endPan);
+      track.addEventListener("pointercancel", endPan);
+    })();
 
     // ---- single delegated click handler ----
     node.addEventListener("click", function (ev) {
@@ -1364,8 +1535,22 @@
           if (ui.forkTarget) ctx.go("detail", ui.forkTarget);
           break;
         case "spine-segment": {
+          // swallow the click that trails a drag-pan (see endPan above)
+          if (ui.spineJustPanned) { ui.spineJustPanned = false; break; }
           var idx = parseInt(t.getAttribute("data-idx"), 10);
           scrollTimelineToTodo(node, ui, idx);
+          break;
+        }
+        case "spine-span": {
+          var raw = t.getAttribute("data-span");
+          ui.spineSpanMs = raw === "all" ? null : parseInt(raw, 10) || null;
+          ui.spineEndMs = null; // a fresh span always re-anchors to the live edge
+          repaintSpine(node, ctx, ui);
+          break;
+        }
+        case "spine-now": {
+          ui.spineEndMs = null;
+          repaintSpine(node, ctx, ui);
           break;
         }
         case "timeline-filter": {
@@ -1646,6 +1831,14 @@
     // panel keys are localStorage-scoped per session; rebind on first sight of a session id
     if (firstMount || ui._boundSid !== sid) {
       ui._boundSid = sid;
+      // The spine's window is an ABSOLUTE-time cursor (spineEndMs is wall-clock
+      // ms), and this `ui` is created once per page load -- mount() does not run
+      // again when you switch sessions. Without this reset the next session
+      // opens already panned to the previous one's timestamp, showing its own
+      // "nothing in this window" empty state over hours of real activity.
+      ui.spineSpanMs = null;
+      ui.spineEndMs = null;
+      ui.spineJustPanned = false;
       Object.keys(ui.panels).forEach(function (key) {
         var wrap = ui.panels[key];
         var def = key === "timeline" ? false : defaultFolded(); // FIX 8: cr.cardsFolded pref
@@ -1661,7 +1854,7 @@
     renderPhonePresence(node, session, nowSec);
     renderPhoneStop(node, session);
     renderForkBanner(node, ctx, session, ui);
-    renderSpine(node, ctx, session, nowMs);
+    renderSpine(node, ctx, session, nowMs, ui);
 
     renderDecisions(ui.panels.decisions, session);
     renderPhoneAwaiting(node, session);
@@ -1904,11 +2097,28 @@
     }
   }
 
-  function renderSpine(node, ctx, session, nowMs) {
-    var plan = spineSegments(session, nowMs);
+  // Repaint just the spine from the cached session -- used by the span chips and
+  // the drag-pan, which change only the window and must not wait for the next
+  // 2s poll (nor re-run the whole detail render) to show it.
+  function repaintSpine(node, ctx, ui) {
+    if (ui && ui.spineSession) renderSpine(node, ctx, ui.spineSession, ui.spineNowMs, ui);
+  }
+
+  function renderSpine(node, ctx, session, nowMs, ui) {
+    // cached so repaintSpine() can redraw on a chip click or a drag frame
+    if (ui) { ui.spineSession = session; ui.spineNowMs = nowMs; }
+    var win = spineWindow(ui, firstEventTime(session), nowMs);
+    var plan = spineSegments(session, nowMs, win);
     var doneN = plan.doneCount, total = plan.total;
     qs(node, ".crd-spine-count").textContent = doneN + " of " + total +
-      (plan.elapsedMs != null ? " · " + fmtDurMs(plan.elapsedMs) + " elapsed" : "");
+      (plan.elapsedMs != null ? " · " + fmtDurMs(plan.elapsedMs) + " elapsed" : "") +
+      (plan.windowed ? " · showing " + fmtDurMs(plan.winSpanMs) +
+        (plan.atLiveEdge ? " to now" : " ending " + fmtClock(plan.winT1)) : "");
+
+    renderSpineSpans(node, plan, ui);
+
+    var track = qs(node, ".crd-spine-track");
+    if (track) track.classList.toggle("is-pannable", !!plan.windowed);
 
     var bar = qs(node, ".crd-spine-bar");
     bar.innerHTML = plan.segments.map(function (s, i) {
@@ -1969,12 +2179,71 @@
       }
     }
 
-    // Update aria-label to include approximate indicator
+    // Entry animation is gated on the segment set ACTUALLY changing. Without this
+    // the 2s poll re-runs the animation on every render and the whole spine
+    // strobes -- the difference between "alive" and "unusable".
+    var sig = plan.segments.map(function (x) { return x.kind + ":" + x.idx; }).join("|") +
+      "#" + plan.markers.length;
+    if (bar.getAttribute("data-sig") !== sig) {
+      bar.setAttribute("data-sig", sig);
+      bar.classList.remove("is-fresh");
+      void bar.offsetWidth; // reflow, so the animation restarts rather than no-ops
+      bar.classList.add("is-fresh");
+    }
+
+    // An empty window is a real state (pan into a quiet stretch of a long
+    // session): say so rather than showing a blank strip that reads as broken.
+    var spineEl = qs(node, ".crd-spine");
+    // NB: realMarkers, not markers.length -- the synthetic NOW marker is always
+    // present at the live edge, so counting it would mean this message never
+    // showed on exactly the sessions that need it (a long-idle session windowed
+    // to its last hour has nothing in view but NOW).
+    spineEl.classList.toggle("is-empty-window",
+      !!plan.windowed && !plan.segments.length && !plan.realMarkers);
+
     var finalAriaLabel = plan.ariaLabel;
     if (isApproximate && hasTimedSegments) {
       finalAriaLabel += " Timings are inferred.";
     }
-    qs(node, ".crd-spine").setAttribute("aria-label", finalAriaLabel);
+    if (plan.windowed) {
+      finalAriaLabel += " Showing the last " + fmtDurMs(plan.winSpanMs) +
+        (plan.atLiveEdge ? " up to now." : " up to " + fmtClock(plan.winT1) + ".");
+    }
+    // The summary lands in a visually-hidden live region instead of an aria-label
+    // on the container: the container is a role="group" so that the segment
+    // buttons and the window chips inside it stay reachable, and a role="img"
+    // (what this used to be) would have hidden every one of them.
+    var srEl = qs(node, ".crd-spine-sr");
+    if (srEl && srEl.textContent !== finalAriaLabel) srEl.textContent = finalAriaLabel;
+  }
+
+  // The window chips: "All" plus every ladder span shorter than the session, and
+  // a "now" reset that only appears once the view has been panned off the live
+  // edge. Rewritten only when the row actually changes, so a 2s poll cannot steal
+  // focus from a chip the user is tabbed onto.
+  function renderSpineSpans(node, plan, ui) {
+    var el = qs(node, ".crd-spine-spans");
+    if (!el) return;
+    var choices = spineSpanChoices(plan.elapsedMs);
+    var cur = ui && ui.spineSpanMs ? ui.spineSpanMs : null;
+    var panned = !!(plan.windowed && !plan.atLiveEdge);
+    var sig = choices.map(function (c) { return c.key; }).join(",") + "|" + cur + "|" + panned;
+    if (el.getAttribute("data-sig") === sig) return;
+    el.setAttribute("data-sig", sig);
+    if (!choices.length) { el.innerHTML = ""; return; }
+    var html = '<button type="button" class="crd-spine-span' + (cur == null ? " is-on" : "") +
+      '" data-act="spine-span" data-span="all" aria-pressed="' + (cur == null) +
+      '" title="Show the whole session">All</button>';
+    choices.forEach(function (c) {
+      html += '<button type="button" class="crd-spine-span' + (cur === c.ms ? " is-on" : "") +
+        '" data-act="spine-span" data-span="' + c.ms + '" aria-pressed="' + (cur === c.ms) +
+        '" title="Show only the last ' + c.key + ' · drag the spine to pan">' + c.key + "</button>";
+    });
+    if (panned) {
+      html += '<button type="button" class="crd-spine-span crd-spine-live" data-act="spine-now"' +
+        ' title="Jump back to the live edge">now</button>';
+    }
+    el.innerHTML = html;
   }
 
   // ---- State column panels ----
@@ -2902,6 +3171,9 @@
   // Expose pure functions for testability / reuse by a future self-check.
   window.CR.detail._internal = {
     spineSegments: spineSegments,
+    spineSpanChoices: spineSpanChoices,
+    spineWindow: spineWindow,
+    SPINE_SPANS: SPINE_SPANS,
     mergeTimeline: mergeTimeline,
     deriveLinks: deriveLinks,
     stateOf: stateOf,
