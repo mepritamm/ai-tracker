@@ -1,7 +1,59 @@
 let cur=localStorage.getItem("sid")||"", timer=null;
 // ponytail: one sprite + one helper; every emoji call site becomes ico(<name>).
-function ico(name, cls){ return '<svg class="ico'+(cls?' '+cls:'')+'" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#i-'+name+'"/></svg>' }
+// Icon STYLE is server policy (config ICON_STYLE): "icons" (the SVG sprite, default) | "emoji" |
+// "text" (monochrome typographic glyphs). Both glyph maps cover every sprite id; a name missing
+// from a map falls back to the SVG icon, so an unknown name degrades to an icon, never to blank.
+const ICO_EMOJI={"agent":"🤖","alert":"⚠️","arrow-down":"⬇️","arrow-up":"⬆️","bell":"🔔","bell-off":"🔕","branch":"🔀","chat":"💬","check":"✅","chevron":"▶️","chevron-down":"🔽","chevron-left":"◀️","circle":"⚪","clock":"🕐","close":"❌","compass":"🧭","copy":"📋","desktop":"🖥️","diagram":"📊","diamond":"🔷","download":"⬇️","edit":"✏️","expand":"↔️","expand-vertical":"↕️","external":"🔗","eye":"👁️","file":"📄","flag":"🚩","folder":"📁","gear":"⚙️","hammer":"🔨","heart":"❤️","help":"❓","hourglass":"⏳","jump-top":"⏫","keyboard":"⌨️","layout":"▦","menu":"☰","moon":"🌙","mouse":"🖱️","note":"📝","panel":"▤","pin":"📌","play":"▶️","plus":"➕","puzzle":"🧩","redo":"🔄","return":"↩️","search":"🔍","send":"📤","spark":"✨","stop":"⏹️","sun":"☀️","unlock":"🔓","working":"🟡","x":"❌"};
+const ICO_TEXT={"agent":"◉","alert":"⚠","arrow-down":"↓","arrow-up":"↑","bell":"♪","bell-off":"∅","branch":"⎇","chat":"❝","check":"✓","chevron":"▸","chevron-down":"▾","chevron-left":"‹","circle":"○","clock":"◷","close":"✕","compass":"⊕","copy":"⧉","desktop":"▭","diagram":"▦","diamond":"◆","download":"⬇","edit":"✎","expand":"⤢","expand-vertical":"⇕","external":"↗","eye":"◎","file":"▤","flag":"⚑","folder":"▣","gear":"⚙","hammer":"⚒","heart":"♥","help":"?","hourglass":"⧖","jump-top":"⤒","keyboard":"⌨","layout":"◧","menu":"☰","moon":"☾","mouse":"↖","note":"✐","panel":"▥","pin":"†","play":"▶","plus":"＋","puzzle":"❖","redo":"⟲","return":"↩","search":"⌕","send":"➤","spark":"✦","stop":"■","sun":"☀","unlock":"⇪","working":"◐","x":"✗"};
+const ICO_STYLES=["icons","emoji","text"];
+let _icoStyle="icons", _icoScale=100;
+const _icoEsc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+// One renderer for both call paths. `dat` adds data-ico (static, re-switchable page icons only) —
+// ico() leaves it off so the default "icons" markup stays byte-identical to what it always was.
+function _icoHTML(name,cls,style,dat){
+  const g=style==="emoji"?ICO_EMOJI[name]:style==="text"?ICO_TEXT[name]:null, c=cls?" "+cls:"", d=dat?' data-ico="'+_icoEsc(name)+'"':"";
+  return g?'<span class="ico ico-glyph'+c+'"'+d+' aria-hidden="true">'+_icoEsc(g)+'</span>'
+          :'<svg class="ico'+c+'"'+d+' viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#i-'+name+'"/></svg>';
+}
+function ico(name, cls){ return _icoHTML(name,cls,_icoStyle,0) }
 window.ico = ico;
+window.icoStyle = ()=>_icoStyle;
+window.icoScale = ()=>_icoScale;
+// Raw glyph char for a name under the CURRENT style, or null in "icons" style — for generators
+// elsewhere (ext_cr_boot.js, ext_vt.js) that build their own markup/DOM instead of calling ico().
+window.icoChar = name=>_icoStyle==="emoji"?ICO_EMOJI[name]:_icoStyle==="text"?ICO_TEXT[name]:null;
+// Apply a style + size, the way setTheme() applies a theme: set the root attribute/var, cache it,
+// re-render what is already on the page, then announce it so other modules can redraw.
+function applyIconStyle(style,scalePercent){
+  const s=ICO_STYLES.indexOf(style)>=0?style:"icons";
+  let k=parseFloat(scalePercent); if(!(k>0))k=100; k=Math.max(75,Math.min(200,k));
+  _icoStyle=s; _icoScale=k;
+  document.documentElement.setAttribute("data-icon-style",s);
+  document.documentElement.style.setProperty("--ico-scale",k/100);
+  try{localStorage.iconStyle=s;localStorage.iconScale=k/100}catch(e){}
+  // Convert the icons baked into index.html. Never the sprite defs, never the product logo.
+  document.querySelectorAll("svg.ico[data-ico],span.ico-glyph[data-ico]").forEach(el=>{
+    const name=el.getAttribute("data-ico"); if(!name)return;
+    if(el.closest&&el.closest("svg.brandsprite"))return;
+    if(el.querySelector&&el.querySelector('use[href="#brandMark"]'))return;
+    const cls=(el.getAttribute("class")||"").split(/\s+/).filter(c=>c&&c!=="ico"&&c!=="ico-glyph").join(" ");
+    try{el.outerHTML=_icoHTML(name,cls,s,1)}catch(e){}
+  });
+  document.dispatchEvent(new CustomEvent("iconstylechange",{detail:{style:s,scale:k}}));
+}
+window.applyIconStyle=applyIconStyle;
+// Sync with what the <head> pre-paint script already restored (it set the attribute/var but can't
+// convert the static markup), then correct from server config — non-blocking, never throws.
+try{applyIconStyle(localStorage.iconStyle,parseFloat(localStorage.iconScale)*100)}catch(e){}
+function _icoBoot(){
+  try{
+    fetch("/api/config").then(r=>r.ok?r.json():null).then(c=>{
+      if(!c||(!c.ICON_STYLE&&!c.ICON_SCALE))return;   // older config: keep the cached values
+      applyIconStyle(c.ICON_STYLE?c.ICON_STYLE.value:_icoStyle, c.ICON_SCALE?c.ICON_SCALE.value:_icoScale);
+    }).catch(()=>{});
+  }catch(e){}
+}
+if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",_icoBoot); else _icoBoot();
 // Dark (default) / Light theme — the class is set pre-paint by the <head> script; sync button + meta here.
 function setTheme(t){document.documentElement.classList.toggle("light",t==="light");try{localStorage.theme=t}catch(e){}var b=document.getElementById("themebtn");if(b)b.innerHTML=t==="light"?ico("moon"):ico("sun");var m=document.getElementById("themecolor");if(m)m.content=t==="light"?"#f4efe3":"#0c0f15";document.dispatchEvent(new CustomEvent("themechange",{detail:{theme:t}}));}
 function toggleTheme(){setTheme(document.documentElement.classList.contains("light")?"dark":"light");}

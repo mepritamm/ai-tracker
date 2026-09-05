@@ -235,9 +235,34 @@ def _is_pictographic(ch):
     return any(lo <= cp <= hi for lo, hi in _PICTOGRAPHIC_RANGES)
 
 
+# ICO_EMOJI and ICO_TEXT (app.js) are the deliberate glyph sources for the
+# "emoji" and "text" ICON_STYLEs -- ICO_EMOJI is REQUIRED to contain actual
+# emoji, and ICO_TEXT deliberately packs in the same kind of plain typographic
+# symbols this file already whitelists via _KEPT_TYPOGRAPHIC above (just too
+# many, all on one line, to spell out individually there). Both are data this
+# sweep was never meant to catch, not a leftover the SVG-icon migration missed.
+# Blank just those two literals (space-preserving-newlines, so line numbers
+# elsewhere in the file stay correct) before scanning; everywhere else in
+# app.js, and every other file, is still scanned in full.
+_ICO_GLYPH_MAP_LITERAL_RE = re.compile(r'const\s+(?:ICO_EMOJI|ICO_TEXT)\s*=\s*\{.*?\}\s*;', re.DOTALL)
+
+
+def _blank_ico_glyph_map_literals(text):
+    out = text
+    while True:
+        m = _ICO_GLYPH_MAP_LITERAL_RE.search(out)
+        if not m:
+            return out
+        start, end = m.span()
+        blanked = "".join(c if c == "\n" else " " for c in out[start:end])
+        out = out[:start] + blanked + out[end:]
+
+
 def _scan_for_emoji(path, kind):
     with open(path, encoding="utf-8") as fh:
         raw = fh.read()
+    if kind == "js" and os.path.basename(path) == "app.js":
+        raw = _blank_ico_glyph_map_literals(raw)
     stripped = _strip_comments(raw, kind)
     offenders = []
     for lineno, line in enumerate(stripped.splitlines(), start=1):
@@ -275,6 +300,219 @@ class TestBuiltPageCarriesIcons(unittest.TestCase):
         html = page.build_page()
         self.assertIn("<symbol id=i-", html, "assembled page lost the icon sprite during inlining")
         self.assertIn("function ico(", html, "assembled page lost the ico() helper during inlining")
+
+
+# ============================================================================
+# 5. ICO_EMOJI and ICO_TEXT (the style-switch glyph maps) cover every sprite icon,
+#    exactly -- no gaps, no stragglers.
+# ============================================================================
+#
+# ICON_STYLE lets a user switch the whole app to "emoji" or "text" glyphs instead
+# of the SVG sprite. ico(name, cls) looks the name up in ICO_EMOJI/ICO_TEXT for
+# those styles and falls back to the SVG <use> only for the default "icons"
+# style -- so a name missing from one of these maps renders NOTHING (or the
+# wrong glyph) the moment someone switches style, with no error anywhere.
+#
+# This is regex-parsed from source (a literal `"key":"value"` scan of the
+# `const ICO_EMOJI={...};` / `const ICO_TEXT={...};` object literals in app.js),
+# not a JS evaluator -- it only sees entries written as literal quoted
+# key:value pairs, which is how both maps are actually authored.
+_MAP_LITERAL_RE = re.compile(r'const\s+(ICO_EMOJI|ICO_TEXT)\s*=\s*\{(.*?)\}\s*;')
+_MAP_ENTRY_RE = re.compile(r'"([a-z0-9-]+)"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _parse_icon_glyph_map(js_text, const_name):
+    """Return {name: glyph} for `const <const_name>={...};` in app.js, or None
+    if that const isn't found at all."""
+    m = re.search(r'const\s+' + const_name + r'\s*=\s*\{(.*?)\}\s*;', js_text, re.DOTALL)
+    if m is None:
+        return None
+    return dict(_MAP_ENTRY_RE.findall(m.group(1)))
+
+
+def _sprite_icon_names():
+    """Every `id=i-NAME` symbol in the index.html sprite (excludes #brandMark,
+    which isn't `i-`-prefixed)."""
+    return set(_DEFINED_RE.findall(_read("index.html")))
+
+
+class TestGlyphMapsCoverEverySpriteIcon(unittest.TestCase):
+    def test_both_maps_cover_every_sprite_icon_and_nothing_else(self):
+        js = _read("app.js")
+        sprite = _sprite_icon_names()
+        self.assertGreater(len(sprite), 0, "no sprite icons found -- check the extraction")
+
+        for const_name in ("ICO_EMOJI", "ICO_TEXT"):
+            glyphs = _parse_icon_glyph_map(js, const_name)
+            self.assertIsNotNone(glyphs, "no `const %s={...};` object literal found in app.js" % const_name)
+            keys = set(glyphs)
+
+            missing = sorted(sprite - keys)
+            self.assertEqual(
+                missing, [],
+                "Sprite icon(s) missing from %s -- switching to that icon style will "
+                "render nothing (or fall through wrong) for: %s" % (const_name, ", ".join(missing))
+            )
+
+            extra = sorted(keys - sprite)
+            self.assertEqual(
+                extra, [],
+                "%s has entry/entries for name(s) not in the icon sprite (dead or "
+                "misspelled): %s" % (const_name, ", ".join(extra))
+            )
+
+
+# ============================================================================
+# 6. No glyph-map entry is empty.
+# ============================================================================
+
+class TestNoEmptyGlyphMapEntry(unittest.TestCase):
+    def test_every_map_value_is_a_non_empty_string(self):
+        js = _read("app.js")
+        offenders = []
+        for const_name in ("ICO_EMOJI", "ICO_TEXT"):
+            glyphs = _parse_icon_glyph_map(js, const_name) or {}
+            for name, glyph in glyphs.items():
+                if not isinstance(glyph, str) or glyph == "":
+                    offenders.append("%s[%r] = %r" % (const_name, name, glyph))
+        self.assertEqual(
+            offenders, [],
+            "Empty glyph-map entry -- renders a blank where an icon should be:\n" +
+            "\n".join("  " + o for o in offenders)
+        )
+
+
+# ============================================================================
+# 7. Every static icon in index.html is tagged with a matching data-ico, so the
+#    boot-time style switch can find and convert it.
+# ============================================================================
+#
+# applyIconStyle() converts already-rendered static markup by selecting
+# `svg.ico[data-ico]` / `span.ico-glyph[data-ico]` and re-rendering from the
+# name in that attribute. An `<svg class=ico>` with no `data-ico` (or one whose
+# value doesn't match its own `<use href="#i-NAME">`) silently never converts:
+# it stays whatever it was rendered as, forever, no matter what style the user
+# picks.
+#
+# Explicitly EXCLUDED (by construction of the regex, since neither ever
+# actually carries `class=ico`, but spelled out here since the task called it
+# out): the sprite's own `<symbol id=i-NAME>` definitions (a `<symbol>`, not an
+# `<svg class=ico>`), and the product logo (`<svg><use href="#brandMark"/>`,
+# which is not `#i-`-prefixed and is never `class=ico`).
+_STATIC_ICON_RE = re.compile(r'<svg\s+([^>]*\bclass=ico\b[^>]*)>\s*<use href="#i-([a-z0-9-]+)"')
+_DATA_ICO_ATTR_RE = re.compile(r'\bdata-ico=([a-z0-9-]+)\b')
+
+
+class TestStaticIconsTaggedAndConsistent(unittest.TestCase):
+    def test_every_static_ico_svg_carries_a_matching_data_ico(self):
+        html = _read("index.html")
+        untagged, mismatched = [], []
+        n = 0
+        for m in _STATIC_ICON_RE.finditer(html):
+            n += 1
+            attrs, use_name = m.groups()
+            lineno = html.count("\n", 0, m.start()) + 1
+            dm = _DATA_ICO_ATTR_RE.search(attrs)
+            if dm is None:
+                untagged.append((use_name, lineno))
+            elif dm.group(1) != use_name:
+                mismatched.append((use_name, dm.group(1), lineno))
+        self.assertGreater(n, 0, "no static `<svg class=ico>...<use href=#i-...>` icons found -- check the regex")
+        self.assertEqual(
+            untagged, [],
+            "Static icon(s) with no data-ico attribute -- applyIconStyle() can never "
+            "convert them when the user switches icon style:\n" + "\n".join(
+                "  #i-%s at index.html:%d has no data-ico" % (name, ln) for name, ln in untagged
+            )
+        )
+        self.assertEqual(
+            mismatched, [],
+            "Static icon(s) whose data-ico doesn't match their own #i-NAME -- "
+            "applyIconStyle() would convert them to the WRONG icon:\n" + "\n".join(
+                "  index.html:%d: <use href=#i-%s> but data-ico=%s" % (ln, use, dat)
+                for use, dat, ln in mismatched
+            )
+        )
+
+
+# ============================================================================
+# 8. --ico-scale is actually wired: defined once, driving the base .ico rule,
+#    and no new icon rule quietly reintroduces a fixed size that ignores it.
+# ============================================================================
+
+_CSS_RULE_RE = re.compile(r'([^{}]+)\{([^{}]*)\}')
+
+
+def _css_rules(text):
+    """Yield (selector_text, body_text) for every rule in a CSS file, including
+    ones nested inside an @media block. Text scan, not a real CSS parser: it
+    finds every innermost {...} pair -- an @media's own wrapping brace can
+    never itself complete a match (its own body always contains a further
+    nested `{` before the first `}`), so only actual rule bodies come out."""
+    return _CSS_RULE_RE.findall(text)
+
+
+# A selector is treated as "an icon svg rule" only if it targets `svg` (as the
+# element itself, or the rightmost part of a descendant selector) AND mentions
+# one of the icon-system's own class conventions: the shared `.ico` class, or
+# one of the Control Room rail/detail/tracker-next icon-wrapper prefixes
+# (`cr-`, `crd-`, `tn-`) that the codebase actually uses for icon containers.
+# This deliberately does NOT flag `.ring svg` (app.css) -- a raw, non-icon
+# progress-donut <svg> with no `class=ico`/sprite `<use>` involved at all -- or
+# similar decorative/diagram svg elsewhere; those were never part of the icon
+# system and the scale knob was never meant to touch them.
+_ICON_SELECTOR_HINT_RE = re.compile(r'\.(ico\b|cr-[\w-]+|crd-[\w-]+|tn-[\w-]+)')
+
+
+class TestIconScaleWired(unittest.TestCase):
+    def test_ico_scale_variable_defined_and_drives_base_rule(self):
+        css = _read("app.css")
+        self.assertRegex(css, r'--ico-scale\s*:', "--ico-scale is not defined in app.css")
+
+        bodies = [body for sel, body in _css_rules(css)
+                  if ".ico" in [p.strip() for p in sel.split(",")]]
+        self.assertTrue(bodies, "no base `.ico{...}` rule found in app.css")
+        body = bodies[0]
+        w = re.search(r'width:\s*([^;]+);', body)
+        h = re.search(r'height:\s*([^;]+);', body)
+        self.assertIsNotNone(w, "base .ico rule has no width")
+        self.assertIn("var(--ico-scale)", w.group(1), "base .ico rule's width doesn't reference --ico-scale")
+        self.assertIsNotNone(h, "base .ico rule has no height")
+        self.assertIn("var(--ico-scale)", h.group(1), "base .ico rule's height doesn't reference --ico-scale")
+
+    def test_no_icon_svg_rule_hardcodes_a_px_width_without_ico_scale(self):
+        offenders = []
+        for fn in _web_names(".css"):
+            text = _read(fn)
+            for sel, body in _css_rules(text):
+                for part in (p.strip() for p in sel.split(",")):
+                    if part != "svg" and not part.endswith(" svg"):
+                        continue
+                    if not _ICON_SELECTOR_HINT_RE.search(part):
+                        continue
+                    if ".cr-rail-brand" in part:
+                        continue  # documented exception: the product logo inside the
+                                  # CR rail, deliberately unscaled
+                    if re.search(r'width:\s*\d+px', body) and "var(--ico-scale)" not in body:
+                        offenders.append("%s: `%s { %s }`" % (fn, part, body.strip()))
+        self.assertEqual(
+            offenders, [],
+            "Icon <svg> rule sets a hardcoded px width without var(--ico-scale) -- it "
+            "will silently ignore ICON_SCALE:\n" + "\n".join(offenders)
+        )
+
+
+# ============================================================================
+# 9. The assembled page carries the style/scale machinery, not just the sprite.
+# ============================================================================
+
+class TestBuiltPageCarriesIconConfig(unittest.TestCase):
+    def test_build_page_inlines_style_and_scale_machinery(self):
+        html = page.build_page()
+        self.assertIn("applyIconStyle", html, "assembled page lost applyIconStyle()")
+        self.assertIn("--ico-scale", html, "assembled page lost the --ico-scale variable")
+        self.assertIn("localStorage.iconStyle", html,
+                      "assembled page lost the pre-paint restore of the cached icon style")
 
 
 if __name__ == "__main__":

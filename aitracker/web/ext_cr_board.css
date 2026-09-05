@@ -105,7 +105,7 @@
   cursor: pointer;
 }
 .tracker-next .cr-rail-toggle:hover { background: var(--fill-row-hover); }
-.tracker-next .cr-rail-toggle svg { width: 18px; height: 18px; }
+.tracker-next .cr-rail-toggle svg { width: calc(18px * var(--ico-scale)); height: calc(18px * var(--ico-scale)); }
 
 .tracker-next .cr-back {
   flex: 0 0 auto;
@@ -221,7 +221,7 @@
   font: 600 11.5px/1 var(--font-sans);
   cursor: pointer;
 }
-.tracker-next .cr-newsession svg { width: 14px; height: 14px; }
+.tracker-next .cr-newsession svg { width: calc(14px * var(--ico-scale)); height: calc(14px * var(--ico-scale)); }
 
 /* ============================================================
    TOP BAR — responsive (BLOCKER 1 + BLOCKER 2)
@@ -494,7 +494,7 @@
   border-radius: var(--radius-sm);
 }
 .tracker-next .cr-rail-chevron:hover { background: var(--fill-row-hover); }
-.tracker-next .cr-rail-chevron svg { width: 14px; height: 14px; transition: transform .15s ease; }
+.tracker-next .cr-rail-chevron svg { width: calc(14px * var(--ico-scale)); height: calc(14px * var(--ico-scale)); transition: transform .15s ease; }
 .tracker-next .cr-rail--collapsed .cr-rail-chevron svg { transform: rotate(180deg); }
 
 .tracker-next .cr-rail-search {
@@ -509,7 +509,7 @@
   background: var(--surface-sunken);
   border: 1px solid var(--line-subtle);
 }
-.tracker-next .cr-rail-search svg { width: 13px; height: 13px; color: var(--text-muted); flex: 0 0 auto; }
+.tracker-next .cr-rail-search svg { width: calc(13px * var(--ico-scale)); height: calc(13px * var(--ico-scale)); color: var(--text-muted); flex: 0 0 auto; }
 .tracker-next .cr-rail-search input {
   flex: 1;
   min-width: 0;
@@ -1231,7 +1231,7 @@
 /* BUG FIX: doc 02's tile-anatomy table puts the `▸` chevron FIRST, beside the
  * 🤖, in the tile head — not trailing next to "expand". Sizing rule moved
  * along with the chevron's new position. */
-.tracker-next .cr-tile--agentgroup .cr-tile-head svg { width: 12px; height: 12px; color: var(--text-muted); flex: 0 0 auto; }
+.tracker-next .cr-tile--agentgroup .cr-tile-head svg { width: calc(12px * var(--ico-scale)); height: calc(12px * var(--ico-scale)); color: var(--text-muted); flex: 0 0 auto; }
 /* Doc: a plain, secondary-coloured title ("Agents · ai-tracker") — not the
  * bold primary-ink title every other tile state uses. */
 .tracker-next .cr-tile--agentgroup .cr-tile-title--agent {

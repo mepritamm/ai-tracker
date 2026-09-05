@@ -59,9 +59,37 @@ window.CR = window.CR || {};
     // ponytail: no class here on purpose. The pre-sprite icon() emitted a bare
     // <svg>, and every call site's layout was tuned against that; `.cr .cr-glyph`
     // sets display:block, which would silently turn inline icons into block ones.
+    // Style-aware (app.js's ICON_STYLE, via its window.icoChar(name) accessor): "icons" keeps the
+    // bare <svg> byte-identical to what this always emitted; "emoji"/"text" swaps in a glyph span
+    // instead, tagged with data-ico so refreshIcons() below can find and re-swap it later.
+    var g = (typeof window.icoChar === 'function') ? window.icoChar(name) : null;
+    if (g) return '<span class="ico-glyph" data-ico="' + name + '" aria-hidden="true">' + g + '</span>';
     return '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">' +
       '<use href="#i-' + name + '"/></svg>';
   }
+  // Re-render every icon already on the page under `root` (control room builds its DOM once and
+  // keeps it) after an iconstylechange. Two shapes to find: a previously-swapped glyph span
+  // (tagged data-ico above) and this file's own untagged icons-style <svg> — untagged is the
+  // "icons" style's byte-identical contract above, so its NAME is read back off the <use href>
+  // instead of a data attribute.
+  function refreshIcons(root) {
+    if (!root || !root.querySelectorAll) return;
+    root.querySelectorAll('span.ico-glyph[data-ico]').forEach(function (el) {
+      var name = el.getAttribute('data-ico');
+      if (name) { try { el.outerHTML = icon(name); } catch (e) {} }
+    });
+    root.querySelectorAll('svg[focusable="false"] > use[href^="#i-"]').forEach(function (u) {
+      var svg = u.parentNode;
+      var href = u.getAttribute('href') || '';
+      if (!svg || svg.hasAttribute('data-ico')) return;
+      try { svg.outerHTML = icon(href.slice(3)); } catch (e) {}
+    });
+  }
+  document.addEventListener('iconstylechange', function () {
+    if (!mounted) return;
+    var root = document.getElementById('nextRoot');
+    if (root) refreshIcons(root);
+  });
 
   // ----------------------------------------------------------------------
   // Theme resolution (01-foundations.md "Theme resolution (decision 3)")

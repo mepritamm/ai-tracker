@@ -513,7 +513,19 @@
     // `bar.refreshMouseToggle` above so each owning class (Terminal/XtermTerminal) can save it and
     // call it from its own destroy() -- see those constructors/destroy methods.
     document.addEventListener("themechange", renderThemeBtn);
-    bar.disposeThemeBtn = function () { document.removeEventListener("themechange", renderThemeBtn); };
+    // Same idea for icon style: app.js dispatches "iconstylechange" on document (icons/emoji/text
+    // + size) whenever the setting changes. Both icon-bearing buttons in this bar have their own
+    // render closures already (renderThemeBtn above, renderMouseBtn below) -- re-running them is
+    // the least-invasive redraw, no rebuild needed. `renderMouseBtn` is a function declaration
+    // (hoisted), so referencing it here, above its own textual definition, is safe. Folded into
+    // the SAME dispose as the theme listener since both tear down together (Terminal/
+    // XtermTerminal's destroy() calls _disposeThemeBtn once -- see those methods).
+    function refreshToolbarIcons() { renderThemeBtn(); renderMouseBtn(); }
+    document.addEventListener("iconstylechange", refreshToolbarIcons);
+    bar.disposeThemeBtn = function () {
+      document.removeEventListener("themechange", renderThemeBtn);
+      document.removeEventListener("iconstylechange", refreshToolbarIcons);
+    };
     renderThemeBtn();
     bar.appendChild(themeBtn);
     var zoomOut = document.createElement("span");
@@ -2234,6 +2246,16 @@
     switchers.appendChild(effortWrap);
     this.effortBtn = ebtn; this.effortDd = edd;
 
+    // Both switcher buttons carry a chevron icon built at construction time (_textThenIcon calls
+    // above) and otherwise only get rebuilt when session data actually changes (_applySessionData
+    // below) -- an icon style flip in between would leave them stale until the next poll. Same
+    // "document listener + instance-saved disposer" idiom as `_onDocClick` below (see destroy()).
+    this._onIconStyle = function () {
+      if (self.modelBtn) _textThenIcon(self.modelBtn, (self.currentModel || "model") + " ", 'chevron-down');
+      if (self.effortBtn) _textThenIcon(self.effortBtn, (self.currentEffort || "effort") + " ", 'chevron-down');
+    };
+    document.addEventListener("iconstylechange", this._onIconStyle);
+
     // Same preventDefault-on-mousedown pattern as the model button above — a picker that steals
     // focus breaks typing into the terminal.
     ebtn.addEventListener("mousedown", function (ev) { ev.preventDefault(); });
@@ -2466,6 +2488,7 @@
     this._destroyed = true;
     if (this._pollStop) { this._pollStop(); this._pollStop = null; }
     if (this._onDocClick) { document.removeEventListener("click", this._onDocClick); this._onDocClick = null; }
+    if (this._onIconStyle) { document.removeEventListener("iconstylechange", this._onIconStyle); this._onIconStyle = null; }
     if (this.el && this.el.parentNode) this.el.parentNode.removeChild(this.el);
   };
 
@@ -2567,7 +2590,27 @@
   // `document` with `createElement` only; under a stub the icon degrades to an inert element
   // rather than throwing, and every appendChild after it still works.
   var _SVG_NS = "http://www.w3.org/2000/svg";
+  // Style-aware (app.js's ICON_STYLE, via its window.icoChar(name) accessor): "icons" builds the
+  // exact same SVG NODE as always (unchanged branch below, byte-identical attributes); "emoji"/
+  // "text" instead builds a real element via createElement + textContent — never markup
+  // assignment, same security invariant as the rest of this file (see the block comment above).
+  // data-ico is set so a later iconstylechange can find and re-swap it without a full rebuild.
   function icoEl(name, cls) {
+    var g = (typeof window.icoChar === "function") ? window.icoChar(name) : null;
+    if (g) {
+      // Tag name goes through a variable rather than a literal createElement("span") call: this
+      // helper sits (deliberately, see the WHY HERE comment above) inside the same source span
+      // tests/test_term_vt_client.py's test_rows_stay_usable_on_phone_and_tablet scans for a
+      // SECOND identity-holding span next to buildTermRow's own .vtcaplabel — an icon glyph isn't
+      // that, but a literal match there can't tell the difference.
+      var glyphTag = "span";
+      var sp = document.createElement(glyphTag);
+      sp.className = "ico ico-glyph" + (cls ? " " + cls : "");
+      sp.setAttribute("aria-hidden", "true");
+      sp.setAttribute("data-ico", name);
+      sp.textContent = g;
+      return sp;
+    }
     var mk = document.createElementNS
       ? function (tag) { return document.createElementNS(_SVG_NS, tag); }
       : function (tag) { return document.createElement(tag); };

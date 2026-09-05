@@ -412,4 +412,4 @@
 .tracker-next.is-dark .tn-emo-f { color: var(--text-failed); }
 .tracker-next.is-dark .tn-emo-d { color: var(--state-done); }
 .tracker-next.is-dark .tn-emo-n { color: var(--text-thinking); }
-.tracker-next .tn-emo svg { width: 1em; height: 1em; display: inline-block; vertical-align: -0.15em; flex-shrink: 0; }
+.tracker-next .tn-emo svg { width: calc(1em * var(--ico-scale)); height: calc(1em * var(--ico-scale)); display: inline-block; vertical-align: -0.15em; flex-shrink: 0; }

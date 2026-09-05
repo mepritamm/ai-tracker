@@ -796,6 +796,8 @@
   // matches the exact env var name each key falls back to per config.py's own _ENV_NAME.
   var _ENVCHIP = {
     LIVE_WINDOW: null,   // never had an env var of its own — config.json > built-in default
+    ICON_STYLE: null,    // ditto — no env var, config.json > built-in default
+    ICON_SCALE: null,    // ditto — no env var, config.json > built-in default
     TERM_RENDERER: 'TRACKER_TERM_RENDERER',
     MAX_TERMS: 'TRACKER_MAX_TERMS',
     TERMINAL: 'TRACKER_TERMINAL',
@@ -978,6 +980,22 @@
     return h('div', { class: 'cr-slider-wrap' }, [input, out]);
   }
 
+  // Same shape as sliderCtlCommit (label tracks the thumb, onCommit fires once on
+  // 'change') but also takes `onInput`, fired on every 'input' tick while dragging --
+  // for a control that needs an instant, non-persisted visual preview during the drag
+  // itself (icon-size live preview) on top of the debounced server commit on release.
+  // sliderCtlCommit is left untouched above; MAX_TERMS keeps using that one as-is.
+  function sliderCtlLive(min, max, value, onCommit, onInput, suffix) {
+    var out = h('span', { class: 'cr-slider-val cr-mono' }, [String(value) + (suffix || '')]);
+    var input = h('input', { class: 'cr-slider', type: 'range', min: min, max: max, value: value });
+    input.addEventListener('input', function () {
+      out.textContent = input.value + (suffix || '');
+      onInput(Number(input.value));
+    });
+    input.addEventListener('change', function () { onCommit(Number(input.value)); });
+    return h('div', { class: 'cr-slider-wrap' }, [input, out]);
+  }
+
   function textFieldCtl(value, onCommit, opts) {
     opts = opts || {};
     var inp = h('input', {
@@ -1034,7 +1052,12 @@
     // onCommit)` builds, POSTs on commit, shows an honest Saved/Failed badge, and rolls the
     // control back to the server's last-known-good value on failure (never leaves the UI
     // showing a value the server rejected as if it had been accepted).
-    function serverRow(label, key, sub, ctlFn) {
+    // `onFail`, if given, runs BEFORE the section re-render on a rejected save -- for a
+    // row whose control has side effects beyond its own DOM (icon style/size apply live
+    // to the whole page instantly, not just to this control), the re-render alone snaps
+    // the control back but leaves that outside effect showing the rejected value. Optional
+    // and additive: existing callers that don't pass it behave exactly as before.
+    function serverRow(label, key, sub, ctlFn, onFail) {
       var meta = srv.cfg && srv.cfg[key];
       var value = meta ? meta.value : undefined;
       var status = statusBadge();
@@ -1046,6 +1069,7 @@
             showStatus(status, true);
           } else {
             showStatus(status, false, (resp && resp.error) || 'request failed');
+            if (typeof onFail === 'function') onFail();
             renderSection();   // snap every control in this section back to last-known-good
           }
         });
@@ -1062,6 +1086,39 @@
           segmented([['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']], themeVal, function (v) {
             if (_ctx && _ctx.theme && _ctx.theme.set) _ctx.theme.set(v);
           })));
+        // Re-applies the last server-known-good icon style/scale -- used to snap the
+        // LIVE preview (applyIconStyle, applied instantly by the two rows below, ahead
+        // of any server round-trip) back if a save is rejected. serverRow's own
+        // renderSection() already rebuilds the controls themselves; this covers the
+        // page-wide visual effect those controls also trigger, which a DOM re-render
+        // alone doesn't touch.
+        function revertIconPreview() {
+          if (typeof window.applyIconStyle !== 'function') return;
+          var styleVal = (srv.cfg && srv.cfg.ICON_STYLE) ? srv.cfg.ICON_STYLE.value : 'icons';
+          var scaleVal = (srv.cfg && srv.cfg.ICON_SCALE) ? srv.cfg.ICON_SCALE.value : 100;
+          window.applyIconStyle(styleVal || 'icons', scaleVal != null ? scaleVal : 100);
+        }
+        body.appendChild(serverRow('Icon style', 'ICON_STYLE',
+          'Icons draws the built-in symbol set; Emoji uses colour emoji; Text uses plain typographic glyphs.',
+          function (value, onCommit) {
+            return segmented([['icons', 'Icons'], ['emoji', 'Emoji'], ['text', 'Text']], value || 'icons', function (v) {
+              if (typeof window.applyIconStyle === 'function') {
+                var scaleVal = (srv.cfg && srv.cfg.ICON_SCALE) ? srv.cfg.ICON_SCALE.value : 100;
+                window.applyIconStyle(v, scaleVal != null ? scaleVal : 100);
+              }
+              onCommit(v);
+            });
+          }, revertIconPreview));
+        body.appendChild(serverRow('Icon size', 'ICON_SCALE',
+          'Scales icons/emoji across the app. Drag for a live preview; releases the slider to save.',
+          function (value, onCommit) {
+            return sliderCtlLive(75, 200, value != null ? value : 100, onCommit, function (v) {
+              if (typeof window.applyIconStyle === 'function') {
+                var styleVal = (srv.cfg && srv.cfg.ICON_STYLE) ? srv.cfg.ICON_STYLE.value : 'icons';
+                window.applyIconStyle(styleVal || 'icons', v);
+              }
+            }, '%');
+          }, revertIconPreview));
         // Tri-state, drawn with the same `segmented` control as Theme above: a
         // two-state switch cannot express 'auto' and would collapse it away on
         // first touch, leaving no way back to the default.

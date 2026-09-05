@@ -183,7 +183,7 @@ CONFIG_FILE = os.path.join(_HERE, "config.json")
 # VALIDATORS (below) using exactly this key set, and GET /api/config reports exactly these.
 # TRACKER_AUTH is deliberately not a member.
 EDITABLE = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL",
-            "TERM_APP", "TERM_ALLOW", "PORT", "HOST")
+            "TERM_APP", "TERM_ALLOW", "PORT", "HOST", "ICON_STYLE", "ICON_SCALE")
 
 # Keys that only bind at process startup -- the dialog labels these "takes effect on
 # restart" and never claims a live apply for them.
@@ -234,6 +234,12 @@ VALIDATORS = {
     "TERM_ALLOW":    _v_str(4000),              # one argv prefix per line; a generous cap, not a real limit
     "PORT":          _v_int(1, 65535),
     "HOST":          _v_str(255),
+    "ICON_STYLE":    _v_enum(("icons", "emoji", "text")),
+    # Percent int, not a float: it fits the existing _v_int validator and the existing
+    # integer slider control in the Config dialog with zero new machinery. 75..200% covers
+    # "a bit smaller" to "twice as big" without letting a typo shrink icons to nothing or
+    # blow up the layout.
+    "ICON_SCALE":    _v_int(75, 200),
 }
 
 # The real env var name backing each key, where one exists (LIVE_WINDOW never had one).
@@ -386,6 +392,31 @@ def resolve_host(overrides):
     return os.environ.get("HOST", "127.0.0.1") or "127.0.0.1"
 
 
+def resolve_icon_style(overrides):
+    """How the SPA renders UI icons: "icons" (the sprite -- see the icon-conversion work),
+    "emoji" (the old glyphs), or "text" (a plain-text fallback). No env var backs this --
+    config.json > built-in default, same as LIVE_WINDOW. Default "icons" is deliberately
+    what the app already renders today, so an unconfigured install's appearance doesn't
+    change under this feature."""
+    if "ICON_STYLE" in overrides and overrides["ICON_STYLE"] in ("icons", "emoji", "text"):
+        return overrides["ICON_STYLE"]
+    return "icons"
+
+
+def resolve_icon_scale(overrides):
+    """Icon size as an integer percent of the sprite's native size (75..200). No env var --
+    config.json > built-in default. Default 100 is exactly today's size, so an unconfigured
+    install's appearance doesn't change under this feature."""
+    if "ICON_SCALE" in overrides:
+        try:
+            v = int(overrides["ICON_SCALE"])
+            if 75 <= v <= 200:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return 100
+
+
 _RESOLVERS = {
     "LIVE_WINDOW": resolve_live_window,
     "TERM_RENDERER": resolve_term_renderer,
@@ -395,6 +426,8 @@ _RESOLVERS = {
     "TERM_ALLOW": resolve_term_allow,
     "PORT": resolve_port,
     "HOST": resolve_host,
+    "ICON_STYLE": resolve_icon_style,
+    "ICON_SCALE": resolve_icon_scale,
 }
 
 # The four keys that ALSO exist as a plain, freely-reassignable module attribute (see the
