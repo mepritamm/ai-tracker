@@ -515,7 +515,7 @@ def list_sessions(limit=200):
         now_line = ""
         if (time.time() - mt) < LIVE_WINDOW and not sm["ended"]:
             if sm["waiting"]:
-                now_line = "⏳ waiting for your answer"
+                now_line = "⧖ waiting for your answer"
             elif bg:
                 now_line = "⚙ %d background agent%s" % (bg, "" if bg == 1 else "s")
             elif todo_current:

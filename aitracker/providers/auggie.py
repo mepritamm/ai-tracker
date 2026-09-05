@@ -362,7 +362,7 @@ def list_auggie():
         now_line = ""
         if (time.time() - e["mtime"]) < LIVE_WINDOW and not e.get("ended"):
             if e.get("waiting"):
-                now_line = "⏳ waiting for your answer"
+                now_line = "⧖ waiting for your answer"
             elif todo_current:
                 now_line = "▶ " + now_phrase(todo_current)
             elif e.get("last_text"):

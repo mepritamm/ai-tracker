@@ -2060,6 +2060,7 @@ function __makeEl(tag) {
 
 var document = {
   createElement: function (tag) { return __makeEl(tag); },
+  createElementNS: function (ns, tag) { return __makeEl(tag); },
   _listeners: {},
   addEventListener: function (type, fn) { (document._listeners[type] = document._listeners[type] || []).push(fn); },
   removeEventListener: function (type, fn) {
@@ -2069,6 +2070,12 @@ var document = {
   },
 };
 var window = {};   // esc's own `window.esc ||` fallback (its extracted line, below) needs this global
+
+// app.js defines `ico` as a page-global (concatenated before every ext_*.js by page.py at serve
+// time -- see aitracker/page.py) -- ext_vt.js calls it directly with no local fallback (unlike
+// `esc`, which has one via `window.esc ||`, extracted separately as _ESC_SRC). This harness never
+// loads app.js, so `ico` is stubbed here verbatim from its real app.js shape.
+function ico(name, cls) { return '<svg class="ico' + (cls ? ' ' + cls : '') + '" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#i-' + name + '"/></svg>'; }
 
 function fakeEvent(overrides) {
   var ev = { stopPropagation: function () {}, preventDefault: function () {} };
@@ -2386,18 +2393,36 @@ class TestContextBarEffortLabel(unittest.TestCase):
     """Task 7, executed: `ContextBar.prototype._applySessionData`'s real handling of
     `meta.effort` -- labelled when present, falls back to "effort ▾" when absent, and survives an
     unrecognised value (a future CLI tier) without throwing, rendering it as-is and marking no
-    dropdown item current."""
+    dropdown item current.
+
+    ext_vt.js no longer puts the "▾" glyph into `textContent` -- `_textThenIcon` sets the label
+    text (with a trailing space) and then appends a real `<svg><use href="#i-chevron-down"/></svg>`
+    child node (see `icoEl`/`_textThenIcon` in ext_vt.js), so a user-derived label string never has
+    to be concatenated with markup. This test therefore asserts on the label text with the glyph
+    stripped (`.trim()`) and separately confirms the chevron survives as a real child node."""
 
     @unittest.skipUnless(_HAS_NODE, "node not available")
     def test_effort_label_present_absent_and_unrecognized(self):
         script = _HARNESS_PRELUDE + _CONTEXT_BAR_MOCKS + _ESC_SRC + _CONTEXT_BAR_HELPERS_SRC + _CONTEXT_BAR_SRC + """
+function _hasChevronDownIcon(el) {
+  for (var i = 0; i < el.children.length; i++) {
+    var c = el.children[i];
+    if (c.tagName === 'svg') {
+      for (var j = 0; j < c.children.length; j++) {
+        if (c.children[j].tagName === 'use' && c.children[j].getAttribute('href') === '#i-chevron-down') return true;
+      }
+    }
+  }
+  return false;
+}
 async function main() {
   var container = document.createElement('div');
   var bar = new ContextBar(container, 'sid1', 'tty1', 'cwd', function () { return null; });
   var results = {};
 
   bar._applySessionData({ meta: { effort: 'high' }, tokens: { in: 0, out: 0 } });
-  results.withEffort = bar.effortBtn.textContent;
+  results.withEffort = bar.effortBtn.textContent.trim();
+  results.withEffortHasChevron = _hasChevronDownIcon(bar.effortBtn);
   bar._openEffortDropdown();
   var highCur = false;
   for (var i = 0; i < bar.effortDd.children.length; i++) {
@@ -2409,14 +2434,15 @@ async function main() {
   bar._closeEffortDropdown();
 
   bar._applySessionData({ meta: {}, tokens: { in: 0, out: 0 } });
-  results.withoutEffort = bar.effortBtn.textContent;
+  results.withoutEffort = bar.effortBtn.textContent.trim();
 
   var threw = false;
   try {
     bar._applySessionData({ meta: { effort: 'banana' }, tokens: { in: 0, out: 0 } });
   } catch (e) { threw = true; }
   results.threwOnUnrecognized = threw;
-  results.unrecognizedLabel = bar.effortBtn.textContent;
+  results.unrecognizedLabel = bar.effortBtn.textContent.trim();
+  results.unrecognizedHasChevron = _hasChevronDownIcon(bar.effortBtn);
 
   bar._openEffortDropdown();
   var anyCurrent = false;
@@ -2430,11 +2456,13 @@ async function main() {
 main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
 """
         result = _run_node(script)
-        self.assertEqual(result["withEffort"], "high ▾")
+        self.assertEqual(result["withEffort"], "high")
+        self.assertTrue(result["withEffortHasChevron"], "the effort button must keep its chevron-down icon node")
         self.assertTrue(result["highMarkedCurrent"], "a recognised effort must mark its own dropdown item current")
-        self.assertEqual(result["withoutEffort"], "effort ▾")
+        self.assertEqual(result["withoutEffort"], "effort")
         self.assertFalse(result["threwOnUnrecognized"])
-        self.assertEqual(result["unrecognizedLabel"], "banana ▾")
+        self.assertEqual(result["unrecognizedLabel"], "banana")
+        self.assertTrue(result["unrecognizedHasChevron"], "the chevron icon must survive an unrecognised effort value too")
         self.assertFalse(result["anyItemMarkedCurrentForUnrecognized"])
 
 
@@ -2771,6 +2799,7 @@ function __makeEl(tag) {
 
 var document = {
   createElement: function (tag) { return __makeEl(tag); },
+  createElementNS: function (ns, tag) { return __makeEl(tag); },
   _listeners: {},
   addEventListener: function (type, fn) { (document._listeners[type] = document._listeners[type] || []).push(fn); },
   removeEventListener: function (type, fn) {
@@ -2781,6 +2810,11 @@ var document = {
 };
 document.body = document.createElement("body");
 var window = {};   // esc's own `window.esc ||` fallback needs this global, same as _CONTEXT_BAR_MOCKS
+
+// Same app.js page-global gap as _CONTEXT_BAR_MOCKS above (see its own comment): ext_vt.js's
+// buildManager/renderManagerBody call `ico()` directly with no local fallback, and this harness
+// never loads app.js, so it is stubbed here verbatim from its real app.js shape.
+function ico(name, cls) { return '<svg class="ico' + (cls ? ' ' + cls : '') + '" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#i-' + name + '"/></svg>'; }
 
 // ----- test-driver helpers: find controls by the SAME classes/text the real renderManagerBody
 // gives them, never by reaching into a closure's private locals. `all` (the Close-all / "Yes,
@@ -2797,7 +2831,17 @@ function findCancelBtn() {
   return null;
 }
 function findRowKillButtons() {
-  return mgrBodyEl.querySelectorAll(".vtcapx").filter(function (b) { return b.textContent === "✕"; });
+  // The kill buttons no longer carry a "✕" glyph in textContent -- ext_vt.js's buildTermRow now
+  // appends the close icon as a real <svg> child node (icoEl/_iconOnly; see that file's header
+  // comment) and sets textContent only for text-labelled actions like "peek". The durable, stable
+  // identifier both buildTermRow call sites (the manager panel and the floating cap block) give
+  // every kill button is its own aria-label, always prefixed "kill this terminal" (see the `aria:`
+  // entries in ext_vt.js) -- an attribute the row sets specifically so an icon-only control still
+  // announces a real accessible name, not an artifact of this test.
+  return mgrBodyEl.querySelectorAll(".vtcapx").filter(function (b) {
+    var aria = b.getAttribute("aria-label") || "";
+    return aria.indexOf("kill this terminal") === 0;
+  });
 }
 function hasWarning() { return mgrBodyEl.querySelectorAll(".vtmgrwarn").length > 0; }
 """

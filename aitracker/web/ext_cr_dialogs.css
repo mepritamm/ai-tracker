@@ -106,25 +106,24 @@
 .cr .cr-glyph { display: block; }
 
 /* ---- emoji tinting (owner override, supersedes doc 01 decision 4) ----
- * Kept in lockstep with the same-named rules in ext_cr.css
- * (`.tracker-next .tn-emo*`) — see that file's comment for the full
- * palette-anchor reasoning: grayscale(1) -> sepia(1) -> hue-rotate per
- * role, with saturate/brightness/contrast held IDENTICAL across all 5
- * roles within a theme so only the hue angle differs (that uniformity
- * is what keeps the role differentiation faint, per the owner's
- * instruction that theme harmony now wins over glyph identity). Both
- * copies must be edited together; a mismatch here is a bug. */
+ * Glyphs are now inline SVG using `currentColor`, so each role is tinted
+ * by a plain `color:` token instead of a filter stack. The token choices
+ * are deliberately muted to preserve the owner's intent: faint role
+ * differentiation with theme harmony winning over glyph identity. Both
+ * copies (this one and the sibling in ext_cr.css) must be edited
+ * together; a mismatch here is a bug. */
 .cr .cr-emo { font-style: normal; }
-.cr .tn-emo   { filter: grayscale(1) sepia(1) hue-rotate(0deg)   saturate(1.4) brightness(.55) contrast(1.1); }
-.cr .tn-emo-a { filter: grayscale(1) sepia(1) hue-rotate(-13deg) saturate(1.4) brightness(.55) contrast(1.1); }
-.cr .tn-emo-f { filter: grayscale(1) sepia(1) hue-rotate(-25deg) saturate(1.4) brightness(.55) contrast(1.1); }
-.cr .tn-emo-d { filter: grayscale(1) sepia(1) hue-rotate(108deg) saturate(1.4) brightness(.55) contrast(1.1); }
-.cr .tn-emo-n { filter: grayscale(1) sepia(1) hue-rotate(7deg)   saturate(1.4) brightness(.55) contrast(1.1); }
-.cr.is-dark .tn-emo   { filter: grayscale(1) sepia(1) hue-rotate(-6deg)  saturate(1.5) brightness(1.35) contrast(1.05); }
-.cr.is-dark .tn-emo-a { filter: grayscale(1) sepia(1) hue-rotate(-4deg)  saturate(1.5) brightness(1.35) contrast(1.05); }
-.cr.is-dark .tn-emo-f { filter: grayscale(1) sepia(1) hue-rotate(-24deg) saturate(1.5) brightness(1.35) contrast(1.05); }
-.cr.is-dark .tn-emo-d { filter: grayscale(1) sepia(1) hue-rotate(71deg)  saturate(1.5) brightness(1.35) contrast(1.05); }
-.cr.is-dark .tn-emo-n { filter: grayscale(1) sepia(1) hue-rotate(8deg)   saturate(1.5) brightness(1.35) contrast(1.05); }
+.cr .tn-emo   { color: var(--text-secondary); }
+.cr .tn-emo-a { color: var(--text-awaiting); }
+.cr .tn-emo-f { color: var(--text-flagged); }
+.cr .tn-emo-d { color: var(--state-done); }
+.cr .tn-emo-n { color: var(--text-thinking); }
+.cr.is-dark .tn-emo   { color: var(--text-agent); }
+.cr.is-dark .tn-emo-a { color: var(--text-awaiting); }
+.cr.is-dark .tn-emo-f { color: var(--text-failed); }
+.cr.is-dark .tn-emo-d { color: var(--state-done); }
+.cr.is-dark .tn-emo-n { color: var(--text-thinking); }
+.cr .tn-emo svg  { width: calc(1em * var(--ico-scale)); height: calc(1em * var(--ico-scale)); display: inline-block; vertical-align: -0.15em; flex-shrink: 0; }
 
 .cr .cr-rot-180 { transform: rotate(180deg); }
 

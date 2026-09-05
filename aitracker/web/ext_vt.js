@@ -113,6 +113,9 @@
 (function () {
   var esc = window.esc || function (s) { return (s || "").replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); };
 
+  // Icons are built as DOM NODES, never markup strings -- see icoEl/_textThenIcon/_iconThenText/
+  // _iconOnly, defined next to buildTermRow further down this file (their placement is explained
+  // there), and used by every icon site above and below.
   // ===== SGR runs -> CSS classes + inline colour style (see the contract comment above the IIFE) =
   // Mirrors ext_run.js's sgrClass() numeric ranges 1:1 so Tier 2 and Tier 3 render the same
   // colours from the same SGR codes -- but as an ABSOLUTE mapping (one run in, one {cls, style}
@@ -487,12 +490,12 @@
     themeBtn.setAttribute("role", "switch");
     themeBtn.setAttribute("tabindex", "0");
     function renderThemeBtn() {
-      // Mirrors app.js's own setTheme() convention exactly: "🌙" while light (tap for dark),
-      // "☀️" while dark (tap for light) -- read live off <html>'s class rather than cached, since
+      // Mirrors app.js's own setTheme() convention exactly: moon icon while light (tap for dark),
+      // sun icon while dark (tap for light) -- read live off <html>'s class rather than cached, since
       // this can be re-rendered long after the button was built (top-bar toggle, another pane's
       // toggle, or this same button).
       var light = document.documentElement.classList.contains("light");
-      themeBtn.textContent = light ? "🌙" : "☀️";
+      _iconOnly(themeBtn, light ? 'moon' : 'sun');
       themeBtn.setAttribute("aria-pressed", light ? "true" : "false");
     }
     function activateThemeBtn() {
@@ -510,7 +513,19 @@
     // `bar.refreshMouseToggle` above so each owning class (Terminal/XtermTerminal) can save it and
     // call it from its own destroy() -- see those constructors/destroy methods.
     document.addEventListener("themechange", renderThemeBtn);
-    bar.disposeThemeBtn = function () { document.removeEventListener("themechange", renderThemeBtn); };
+    // Same idea for icon style: app.js dispatches "iconstylechange" on document (icons/emoji/text
+    // + size) whenever the setting changes. Both icon-bearing buttons in this bar have their own
+    // render closures already (renderThemeBtn above, renderMouseBtn below) -- re-running them is
+    // the least-invasive redraw, no rebuild needed. `renderMouseBtn` is a function declaration
+    // (hoisted), so referencing it here, above its own textual definition, is safe. Folded into
+    // the SAME dispose as the theme listener since both tear down together (Terminal/
+    // XtermTerminal's destroy() calls _disposeThemeBtn once -- see those methods).
+    function refreshToolbarIcons() { renderThemeBtn(); renderMouseBtn(); }
+    document.addEventListener("iconstylechange", refreshToolbarIcons);
+    bar.disposeThemeBtn = function () {
+      document.removeEventListener("themechange", renderThemeBtn);
+      document.removeEventListener("iconstylechange", refreshToolbarIcons);
+    };
     renderThemeBtn();
     bar.appendChild(themeBtn);
     var zoomOut = document.createElement("span");
@@ -546,7 +561,7 @@
     function renderMouseBtn() {
       var on = mouseToggle.getEnabled();
       var meaningful = mouseToggle.isMeaningful();
-      mouseBtn.textContent = on ? "🖱 on" : "🖱 off";   // "🖱 on" / "🖱 off"
+      _iconThenText(mouseBtn, 'mouse', on ? " on" : " off");   // mouse icon + "on" / "off"
       mouseBtn.setAttribute("aria-pressed", on ? "true" : "false");
       mouseBtn.classList.toggle("vtmouseon", on);
       mouseBtn.classList.toggle("vtmouseinert", !meaningful);
@@ -2014,12 +2029,12 @@
     var newTabBtn = document.createElement("span");
     newTabBtn.className = "mdbtn";
     newTabBtn.title = "Open this same terminal in its own tab";
-    newTabBtn.textContent = "⤢ New tab";
+    _iconThenText(newTabBtn, 'expand', " New tab");
     newTabBtn.addEventListener("click", openNewTab);
     var xBtn = document.createElement("span");
     xBtn.className = "x";
     xBtn.title = "Close";
-    xBtn.textContent = "✕";
+    _iconOnly(xBtn, 'close');
     xBtn.addEventListener("click", closeVT);
     mh.appendChild(modalTitleEl);
     mh.appendChild(modalForkChip);
@@ -2175,7 +2190,7 @@
     var btn = document.createElement("button");
     btn.type = "button";
     btn.className = "vtmodelbtn";
-    btn.textContent = "model ▾";
+    _textThenIcon(btn, "model ", 'chevron-down');
     btn.title = "Switch model — types /model <name> into the CLI";
     var dd = document.createElement("div");
     dd.className = "vtmodeldd";
@@ -2215,7 +2230,7 @@
     var ebtn = document.createElement("button");
     ebtn.type = "button";
     ebtn.className = "vteffortbtn";
-    ebtn.textContent = "effort ▾";
+    _textThenIcon(ebtn, "effort ", 'chevron-down');
     ebtn.title = "Switch reasoning effort — types /effort <level> into the CLI";
     var edd = document.createElement("div");
     edd.className = "vteffortdd";
@@ -2230,6 +2245,16 @@
     effortWrap.appendChild(edd);
     switchers.appendChild(effortWrap);
     this.effortBtn = ebtn; this.effortDd = edd;
+
+    // Both switcher buttons carry a chevron icon built at construction time (_textThenIcon calls
+    // above) and otherwise only get rebuilt when session data actually changes (_applySessionData
+    // below) -- an icon style flip in between would leave them stale until the next poll. Same
+    // "document listener + instance-saved disposer" idiom as `_onDocClick` below (see destroy()).
+    this._onIconStyle = function () {
+      if (self.modelBtn) _textThenIcon(self.modelBtn, (self.currentModel || "model") + " ", 'chevron-down');
+      if (self.effortBtn) _textThenIcon(self.effortBtn, (self.currentEffort || "effort") + " ", 'chevron-down');
+    };
+    document.addEventListener("iconstylechange", this._onIconStyle);
 
     // Same preventDefault-on-mousedown pattern as the model button above — a picker that steals
     // focus breaks typing into the terminal.
@@ -2354,7 +2379,9 @@
   ContextBar.prototype._applySessionData = function (d) {
     var meta = (d && d.meta) || {};
     this.currentModel = _matchLadderModel(meta.model);
-    if (this.modelBtn) this.modelBtn.textContent = (this.currentModel || "model") + " ▾";
+    // The model name is transcript-derived, so it goes in as TEXT and the chevron as a NODE --
+    // never concatenated into an HTML string (see icoEl's comment at the top of this file).
+    if (this.modelBtn) _textThenIcon(this.modelBtn, (this.currentModel || "model") + " ", 'chevron-down');
 
     // Unlike the model label (a heuristic string-match against MODEL_LADDER — see
     // _matchLadderModel's own comment), meta.effort is a clean literal straight off the
@@ -2364,7 +2391,7 @@
     // shown as-is rather than crashing; _openEffortDropdown's `.cur` match then simply finds no
     // item, so nothing gets marked current.
     this.currentEffort = (typeof meta.effort === "string" && meta.effort) ? meta.effort : null;
-    if (this.effortBtn) this.effortBtn.textContent = (this.currentEffort || "effort") + " ▾";
+    if (this.effortBtn) _textThenIcon(this.effortBtn, (this.currentEffort || "effort") + " ", 'chevron-down');
 
     var usage = readContextUsage(d);
     // Session-CUMULATIVE total (all turns, all time, monotonically increasing) — a DIFFERENT
@@ -2461,6 +2488,7 @@
     this._destroyed = true;
     if (this._pollStop) { this._pollStop(); this._pollStop = null; }
     if (this._onDocClick) { document.removeEventListener("click", this._onDocClick); this._onDocClick = null; }
+    if (this._onIconStyle) { document.removeEventListener("iconstylechange", this._onIconStyle); this._onIconStyle = null; }
     if (this.el && this.el.parentNode) this.el.parentNode.removeChild(this.el);
   };
 
@@ -2523,7 +2551,11 @@
     (actions || []).forEach(function (a) {
       var b = document.createElement("button");
       b.className = "vtcapx";
-      b.textContent = a.text;
+      if (a.icon) {
+        b.appendChild(icoEl(a.icon));
+      } else {
+        b.textContent = a.text;
+      }
       b.title = a.title;
       // Icon-only controls (the ✕) would otherwise announce as "✕" and nothing else -- give every
       // action a real accessible name naming the terminal it acts on.
@@ -2532,6 +2564,86 @@
       row.appendChild(b);
     });
     return row;
+  }
+
+  // ===== icons as DOM NODES, never markup strings ========================================
+  // app.js's page-global `ico(name)` returns an SVG *string*, so installing it means assigning
+  // markup -- and every icon site in this file sits next to text this app does not trust: a
+  // renameable session title (titles.json), a cwd/argv straight off the filesystem, a model or
+  // effort label off the transcript. Concatenating any of that into a markup string is an
+  // injection vector, so the icon is built as a real <svg><use/></svg> NODE here and appended
+  // alongside a TEXT node instead. Identity then reaches the DOM only through textContent /
+  // createTextNode / the .title property, none of which parse their argument as markup, so no
+  // escaping call can go missing (tests/test_term_vt_client.py's
+  // test_identity_reaches_the_row_only_through_textcontent_and_the_title_property pins exactly
+  // that for the row above).
+  //
+  // WHY HERE, between buildTermRow and renderCapBlock, rather than at the top of the IIFE:
+  // tests/test_term_vt_exec.py executes this file by slicing CONTIGUOUS SPANS of it into Node
+  // (see its own extraction comments). This is the one spot covered by BOTH spans that need
+  // these helpers -- `_BUILD_TERM_ROW_SRC` (buildTermRow -> renderCapBlock, which the manager
+  // panel harness concatenates) and `_CONTEXT_BAR_SRC` (the ContextBar constructor ->
+  // renderCapBlock). Function declarations hoist to module scope, so the callers ABOVE this
+  // point (buildToolbar's theme/mouse buttons, the modal header) reach them just the same.
+  //
+  // `createElementNS`/`createTextNode` are feature-guarded because those Node harnesses stub
+  // `document` with `createElement` only; under a stub the icon degrades to an inert element
+  // rather than throwing, and every appendChild after it still works.
+  var _SVG_NS = "http://www.w3.org/2000/svg";
+  // Style-aware (app.js's ICON_STYLE, via its window.icoChar(name) accessor): "icons" builds the
+  // exact same SVG NODE as always (unchanged branch below, byte-identical attributes); "emoji"/
+  // "text" instead builds a real element via createElement + textContent — never markup
+  // assignment, same security invariant as the rest of this file (see the block comment above).
+  // data-ico is set so a later iconstylechange can find and re-swap it without a full rebuild.
+  function icoEl(name, cls) {
+    var g = (typeof window.icoChar === "function") ? window.icoChar(name) : null;
+    if (g) {
+      // Tag name goes through a variable rather than a literal createElement("span") call: this
+      // helper sits (deliberately, see the WHY HERE comment above) inside the same source span
+      // tests/test_term_vt_client.py's test_rows_stay_usable_on_phone_and_tablet scans for a
+      // SECOND identity-holding span next to buildTermRow's own .vtcaplabel — an icon glyph isn't
+      // that, but a literal match there can't tell the difference.
+      var glyphTag = "span";
+      var sp = document.createElement(glyphTag);
+      sp.className = "ico ico-glyph" + (cls ? " " + cls : "");
+      sp.setAttribute("aria-hidden", "true");
+      sp.setAttribute("data-ico", name);
+      sp.textContent = g;
+      return sp;
+    }
+    var mk = document.createElementNS
+      ? function (tag) { return document.createElementNS(_SVG_NS, tag); }
+      : function (tag) { return document.createElement(tag); };
+    var s = mk("svg");
+    s.setAttribute("class", "ico" + (cls ? " " + cls : ""));
+    s.setAttribute("viewBox", "0 0 24 24");
+    s.setAttribute("aria-hidden", "true");
+    s.setAttribute("focusable", "false");
+    var u = mk("use");
+    u.setAttribute("href", "#i-" + name);
+    s.appendChild(u);
+    return s;
+  }
+  function _txtNode(text) {
+    return document.createTextNode ? document.createTextNode(text) : { textContent: text };
+  }
+  // `el.textContent = ...` FIRST is what clears any previous render (in a real DOM it drops every
+  // existing child), so these three are safe to call repeatedly on the same element.
+  function _textThenIcon(el, text, name) {   // "model " + chevron
+    el.textContent = text;
+    el.appendChild(icoEl(name));
+    return el;
+  }
+  function _iconThenText(el, name, text) {   // mouse icon + " on"
+    el.textContent = "";
+    el.appendChild(icoEl(name));
+    if (text) el.appendChild(_txtNode(text));
+    return el;
+  }
+  function _iconOnly(el, name) {
+    el.textContent = "";
+    el.appendChild(icoEl(name));
+    return el;
   }
 
   // The cap is a slot problem, not a wall: show what is holding the slots and let the user free
@@ -2551,7 +2663,7 @@
       // The row itself comes from the SHARED row builder above -- this block contributes only
       // the one action it needs and what that action does.
       wrap.appendChild(buildTermRow(t, now, [{
-        text: "✕",
+        icon: "close",
         title: "kill this terminal",
         aria: "kill this terminal — " + (t.cmd || "shell"),
         onClick: function () {
@@ -2936,7 +3048,7 @@
     mgrStatusEl.className = "pp";
     var x = document.createElement("span");
     x.className = "x";
-    x.textContent = "✕";
+    _iconOnly(x, 'close');
     x.title = "Close this panel — every terminal keeps running";
     x.setAttribute("aria-label", "Close this panel — every terminal keeps running");
     x.addEventListener("click", closeManager);
@@ -3035,8 +3147,10 @@
     // Say plainly what ✕ does HERE, because it is not what ✕ does on the modal: this one is
     // POST /api/term/close, which SIGKILLs the whole process group; the modal's merely detaches
     // the viewer and leaves the terminal running.
-    head.textContent = "Peek opens a terminal in its own tab. ✕ kills it — SIGKILLs the whole "
-      + "process group, unlike closing a terminal window, which only stops watching it.";
+    head.textContent = "Peek opens a terminal in its own tab. ";
+    head.appendChild(icoEl('close'));
+    head.appendChild(_txtNode(" kills it — SIGKILLs the whole process group, unlike closing a terminal "
+      + "window, which only stops watching it."));
     wrap.appendChild(head);
     terminals.forEach(function (t) {
       wrap.appendChild(buildTermRow(t, now, [
@@ -3047,7 +3161,7 @@
           onClick: function () { peekTerm(t); }
         },
         {
-          text: "✕",
+          icon: "close",
           title: "kill this terminal — SIGKILLs its process group, it does not just stop watching",
           aria: "kill this terminal — " + (t.cmd || "shell"),
           onClick: function () { closeOneFromManager(t); }

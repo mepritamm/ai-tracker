@@ -59,7 +59,7 @@
   // --- panel --------------------------------------------------------------
   function build() {
     host.innerHTML =
-      '<div class="card" id=runcard><h2><span>▶ Run a command</span>' +
+      '<div class="card" id=runcard><h2><span>' + ico('play') + ' Run a command</span>' +
       '<span class=cnt id=runstate></span></h2>' +
       '<div class=cbody style="padding:10px 12px">' +
       '<div class=runbar><input id=runcmd class=runinput placeholder="git status" spellcheck=false>' +

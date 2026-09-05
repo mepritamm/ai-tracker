@@ -1,6 +1,61 @@
 let cur=localStorage.getItem("sid")||"", timer=null;
+// ponytail: one sprite + one helper; every emoji call site becomes ico(<name>).
+// Icon STYLE is server policy (config ICON_STYLE): "icons" (the SVG sprite, default) | "emoji" |
+// "text" (monochrome typographic glyphs). Both glyph maps cover every sprite id; a name missing
+// from a map falls back to the SVG icon, so an unknown name degrades to an icon, never to blank.
+const ICO_EMOJI={"agent":"🤖","alert":"⚠️","arrow-down":"⬇️","arrow-up":"⬆️","bell":"🔔","bell-off":"🔕","branch":"🔀","chat":"💬","check":"✅","chevron":"▶️","chevron-down":"🔽","chevron-left":"◀️","circle":"⚪","clock":"🕐","close":"❌","compass":"🧭","copy":"📋","desktop":"🖥️","diagram":"📊","diamond":"🔷","download":"⬇️","edit":"✏️","expand":"↔️","expand-vertical":"↕️","external":"🔗","eye":"👁️","file":"📄","flag":"🚩","folder":"📁","gear":"⚙️","hammer":"🔨","heart":"❤️","help":"❓","hourglass":"⏳","jump-top":"⏫","keyboard":"⌨️","layout":"▦","menu":"☰","moon":"🌙","mouse":"🖱️","note":"📝","panel":"▤","pin":"📌","play":"▶️","plus":"➕","puzzle":"🧩","redo":"🔄","return":"↩️","search":"🔍","send":"📤","spark":"✨","stop":"⏹️","sun":"☀️","unlock":"🔓","working":"🟡","x":"❌"};
+const ICO_TEXT={"agent":"◉","alert":"⚠","arrow-down":"↓","arrow-up":"↑","bell":"♪","bell-off":"∅","branch":"⎇","chat":"❝","check":"✓","chevron":"▸","chevron-down":"▾","chevron-left":"‹","circle":"○","clock":"◷","close":"✕","compass":"⊕","copy":"⧉","desktop":"▭","diagram":"▦","diamond":"◆","download":"⬇","edit":"✎","expand":"⤢","expand-vertical":"⇕","external":"↗","eye":"◎","file":"▤","flag":"⚑","folder":"▣","gear":"⚙","hammer":"⚒","heart":"♥","help":"?","hourglass":"⧖","jump-top":"⤒","keyboard":"⌨","layout":"◧","menu":"☰","moon":"☾","mouse":"↖","note":"✐","panel":"▥","pin":"†","play":"▶","plus":"＋","puzzle":"❖","redo":"⟲","return":"↩","search":"⌕","send":"➤","spark":"✦","stop":"■","sun":"☀","unlock":"⇪","working":"◐","x":"✗"};
+const ICO_STYLES=["icons","emoji","text"];
+let _icoStyle="icons", _icoScale=100;
+const _icoEsc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+// One renderer for both call paths. `dat` adds data-ico (static, re-switchable page icons only) —
+// ico() leaves it off so the default "icons" markup stays byte-identical to what it always was.
+function _icoHTML(name,cls,style,dat){
+  const g=style==="emoji"?ICO_EMOJI[name]:style==="text"?ICO_TEXT[name]:null, c=cls?" "+cls:"", d=dat?' data-ico="'+_icoEsc(name)+'"':"";
+  return g?'<span class="ico ico-glyph'+c+'"'+d+' aria-hidden="true">'+_icoEsc(g)+'</span>'
+          :'<svg class="ico'+c+'"'+d+' viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#i-'+name+'"/></svg>';
+}
+function ico(name, cls){ return _icoHTML(name,cls,_icoStyle,0) }
+window.ico = ico;
+window.icoStyle = ()=>_icoStyle;
+window.icoScale = ()=>_icoScale;
+// Raw glyph char for a name under the CURRENT style, or null in "icons" style — for generators
+// elsewhere (ext_cr_boot.js, ext_vt.js) that build their own markup/DOM instead of calling ico().
+window.icoChar = name=>_icoStyle==="emoji"?ICO_EMOJI[name]:_icoStyle==="text"?ICO_TEXT[name]:null;
+// Apply a style + size, the way setTheme() applies a theme: set the root attribute/var, cache it,
+// re-render what is already on the page, then announce it so other modules can redraw.
+function applyIconStyle(style,scalePercent){
+  const s=ICO_STYLES.indexOf(style)>=0?style:"icons";
+  let k=parseFloat(scalePercent); if(!(k>0))k=100; k=Math.max(75,Math.min(200,k));
+  _icoStyle=s; _icoScale=k;
+  document.documentElement.setAttribute("data-icon-style",s);
+  document.documentElement.style.setProperty("--ico-scale",k/100);
+  try{localStorage.iconStyle=s;localStorage.iconScale=k/100}catch(e){}
+  // Convert the icons baked into index.html. Never the sprite defs, never the product logo.
+  document.querySelectorAll("svg.ico[data-ico],span.ico-glyph[data-ico]").forEach(el=>{
+    const name=el.getAttribute("data-ico"); if(!name)return;
+    if(el.closest&&el.closest("svg.brandsprite"))return;
+    if(el.querySelector&&el.querySelector('use[href="#brandMark"]'))return;
+    const cls=(el.getAttribute("class")||"").split(/\s+/).filter(c=>c&&c!=="ico"&&c!=="ico-glyph").join(" ");
+    try{el.outerHTML=_icoHTML(name,cls,s,1)}catch(e){}
+  });
+  document.dispatchEvent(new CustomEvent("iconstylechange",{detail:{style:s,scale:k}}));
+}
+window.applyIconStyle=applyIconStyle;
+// Sync with what the <head> pre-paint script already restored (it set the attribute/var but can't
+// convert the static markup), then correct from server config — non-blocking, never throws.
+try{applyIconStyle(localStorage.iconStyle,parseFloat(localStorage.iconScale)*100)}catch(e){}
+function _icoBoot(){
+  try{
+    fetch("/api/config").then(r=>r.ok?r.json():null).then(c=>{
+      if(!c||(!c.ICON_STYLE&&!c.ICON_SCALE))return;   // older config: keep the cached values
+      applyIconStyle(c.ICON_STYLE?c.ICON_STYLE.value:_icoStyle, c.ICON_SCALE?c.ICON_SCALE.value:_icoScale);
+    }).catch(()=>{});
+  }catch(e){}
+}
+if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",_icoBoot); else _icoBoot();
 // Dark (default) / Light theme — the class is set pre-paint by the <head> script; sync button + meta here.
-function setTheme(t){document.documentElement.classList.toggle("light",t==="light");try{localStorage.theme=t}catch(e){}var b=document.getElementById("themebtn");if(b)b.textContent=t==="light"?"🌙":"☀️";var m=document.getElementById("themecolor");if(m)m.content=t==="light"?"#f4efe3":"#0c0f15";document.dispatchEvent(new CustomEvent("themechange",{detail:{theme:t}}));}
+function setTheme(t){document.documentElement.classList.toggle("light",t==="light");try{localStorage.theme=t}catch(e){}var b=document.getElementById("themebtn");if(b)b.innerHTML=t==="light"?ico("moon"):ico("sun");var m=document.getElementById("themecolor");if(m)m.content=t==="light"?"#f4efe3":"#0c0f15";document.dispatchEvent(new CustomEvent("themechange",{detail:{theme:t}}));}
 function toggleTheme(){setTheme(document.documentElement.classList.contains("light")?"dark":"light");}
 setTheme(document.documentElement.classList.contains("light")?"light":"dark");
 const $=id=>document.getElementById(id);
@@ -38,9 +93,9 @@ function mdBlock(s){
           // unsupported diagram type — still readable, but LABEL it so the reader can see
           // it was an intended diagram (not a plain code fence) whose renderer isn't baked in yet
           : (()=>{ const t=(src.match(/^\s*(?:%%.*\n)*\s*([A-Za-z][A-Za-z0-9_-]*)/)||[,""])[1]||"unknown";
-              return `<div class="cblock mmdfall"><div class=mmdftag>🧜 mermaid: ${esc(t)}</div><button class=codecopy onclick="copyCode(this)" title="Copy this block">⧉ Copy</button><pre class=mdpre><code>${esc(src)}</code></pre></div>`; })();
+              return `<div class="cblock mmdfall"><div class=mmdftag>${ico("diagram")} mermaid: ${esc(t)}</div><button class=codecopy onclick="copyCode(this)" title="Copy this block">${ico('copy')} Copy</button><pre class=mdpre><code>${esc(src)}</code></pre></div>`; })();
         out.push(`<div class="mmd-slot" data-mmd-src="${b64}">${fallback}</div>`); continue; }
-      out.push(`<div class=cblock><button class=codecopy onclick="copyCode(this)" title="Copy this block">⧉ Copy</button><pre class=mdpre><code>${esc(src)}</code></pre></div>`); continue; }
+      out.push(`<div class=cblock><button class=codecopy onclick="copyCode(this)" title="Copy this block">${ico('copy')} Copy</button><pre class=mdpre><code>${esc(src)}</code></pre></div>`); continue; }
     const hm=l.match(/^(#{1,6})\s+(.*)$/);
     if(hm){ const lv=Math.min(hm[1].length,4)+1; out.push(`<h${lv} class=mdh>${md(hm[2])}</h${lv}>`); i++; continue; }
     if(l.includes("|")&&i+1<L.length&&sep(L[i+1])){
@@ -77,7 +132,7 @@ function mdBlock(s){
 // mermaidSvg() dispatches by the first non-blank keyword; state/class/er/journey are
 // translated to flowchart syntax and reuse _mermaidSvgFlow so their labelled edges and
 // layered layout come for free. Anything else (gantt, mindmap, timeline, gitGraph, …)
-// returns null and mdBlock renders the fence as code with a "🧜 mermaid: <type>" tag —
+// returns null and mdBlock renders the fence as code with an icon + "mermaid: <type>" tag —
 // still readable, but visibly an intended diagram whose renderer isn't baked in yet.
 // ponytail: layered layout, straight bezier edges — no crossing minimisation.
 const MMDSH={"[[":"rect","((":"circle","([":"stadium","[":"rect","(":"round","{":"diamond",">":"rect"};
@@ -562,7 +617,10 @@ function _mermaidJourneySvg(src){
   const lines=(src||"").replace(/\r/g,"").split("\n");
   let started=false, secN=0, taskN=0, curSec=null;
   const outL=[], secIds=[];
-  const face=s=>({5:"😊",4:"🙂",3:"😐",2:"😕",1:"😞"}[s]||"·");
+  // ponytail: a 5-dot meter, not emoji faces. This string is interpolated into
+  // mermaid's own ["..."] label syntax, so ico()'s double-quoted SVG would end
+  // the label early and corrupt the DSL -- plain ●/○ carry the score safely.
+  const face=s=>(s>=1&&s<=5)?"●".repeat(s)+"○".repeat(5-s):"·";
   for(let raw of lines){
     let l=raw.replace(/%%.*$/,"").trim(); if(!l)continue;
     if(!started){ if(!/^(journey|userJourney)\b/i.test(l))return null;
@@ -814,7 +872,7 @@ document.addEventListener("themechange", ()=>upgradeMermaidIn(document));
 
 function ago(sec){sec=Math.max(0,sec|0);if(sec<60)return sec+"s ago";if(sec<3600)return(sec/60|0)+"m ago";if(sec<86400)return(sec/3600|0)+"h ago";return(sec/86400|0)+"d ago"}
 function base(p){return (p||"").split("/").pop()}
-const SRC={"claude-desktop":"🖥 Desktop","cli":"⌨ CLI","sdk-cli":"⚙ SDK","claude-vscode":"⧉ VS Code","auggie":"◆ Auggie","augment-vscode":"◆ Augment (VS Code)","augment-cursor":"◆ Augment (Cursor)"};
+const SRC={"claude-desktop":ico("desktop")+" Desktop","cli":ico('keyboard')+" CLI","sdk-cli":ico('gear')+" SDK","claude-vscode":ico('copy')+" VS Code","auggie":ico('diamond')+" Auggie","augment-vscode":ico('diamond')+" Augment (VS Code)","augment-cursor":ico('diamond')+" Augment (Cursor)"};
 const srcLabel=v=>SRC[v]||v||"";
 const CIRC=2*Math.PI*51; // progress-ring circumference
 
@@ -850,8 +908,8 @@ function renderSide(){
     $("slist").innerHTML=searchResults.length?searchResults.map(s=>{
       const live=now-s.mtime<LIVE;
       return `<div class="sitem ${s.id===cur?'active':''}" onclick="pick('${s.id}')" title="${esc(s.title||'')}">`+
-        `<div class=srow1><span class="dot ${live?'live':''}"></span><span class=nm>${s.agent?'🤖 ':''}${esc(s.title||s.project||s.id.slice(0,8))}</span>`+
-        `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename">✎</span></div>`+
+        `<div class=srow1><span class="dot ${live?'live':''}"></span><span class=nm>${s.agent?ico('agent')+' ':''}${esc(s.title||s.project||s.id.slice(0,8))}</span>`+
+        `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename">${ico('edit')}</span></div>`+
         `<div class=smeta><span class=proj>${esc(s.project)}</span>${s.inQuery?' · <span class=smatch>your query</span>':''} · <span>${s.matches}×</span></div>`+
         (s.snippet?`<div class=ssnip>${hl(s.snippet,q)}</div>`:"")+
         `</div>`;
@@ -861,7 +919,7 @@ function renderSide(){
   }
   const liveN=sessions.filter(s=>now-s.mtime<LIVE).length;
   const lc=$("livecount");
-  lc.textContent=liveOnly?`${liveN} live ✕`:`${liveN} live`;
+  lc.innerHTML=liveOnly?`${liveN} live ${ico('close')}`:`${liveN} live`;
   lc.title=liveOnly?"Showing live only — click to show all":"Click to show live sessions only";
   lc.classList.toggle("on",liveOnly);
   const found=sessions.find(s=>s.id===cur); if(found)selEntry=found;
@@ -906,7 +964,7 @@ function renderSide(){
   if(pruned) localStorage.setItem("agrpOpen",JSON.stringify([...expandedGroups]));
   const kidsBlock=ks=>`<div class=agrpkids>${ks.slice().sort((x,y)=>y.mtime-x.mtime).map(k=>sessionRow(k,now)).join("")}</div>`;
   const hasPin=items.some(x=>x.pinned); let _sec=null;   // Pinned / Recent section labels (only when there are pins)
-  const secDiv=it=>{ if(!hasPin)return ""; const s=it.pinned?"pin":"recent"; if(s===_sec)return ""; _sec=s; return `<div class=secband>${s==="pin"?"📌 Pinned":"Recent"}</div>`; };
+  const secDiv=it=>{ if(!hasPin)return ""; const s=it.pinned?"pin":"recent"; if(s===_sec)return ""; _sec=s; return `<div class=secband>${s==="pin"?ico('pin')+" Pinned":"Recent"}</div>`; };
   $("slist").innerHTML=items.length?items.map(it=>{
     const _d=secDiv(it);
     if(it.t==="s"){
@@ -918,7 +976,7 @@ function renderSide(){
     const b=it.b, open=expandedGroups.has(b.key);
     return _d+`<div class="agrp ${open?'open':''}">`+
       `<div class=agrphdr onclick="toggleGroup('${encodeURIComponent(b.key)}')" title="${esc(b.key)}">`+
-        `<span class=agrpchev>${open?"▾":"▸"}</span><span class=agrpname>🤖 Agents · ${esc(b.label)}</span>`+
+        `<span class=agrpchev>${open?ico('chevron-down'):ico('chevron')}</span><span class=agrpname>${ico('agent')} Agents · ${esc(b.label)}</span>`+
         `<span class=agrpn>${b.live?b.live+" live / ":""}${b.kids.length}</span></div>`+
       (open?kidsBlock(b.kids):"")+
       `</div>`;
@@ -933,30 +991,30 @@ function sessionRow(s,now,ex){
   const bits=[`<span class=proj>${s.title?esc(s.project):s.id.slice(0,8)}</span>`];
   if(s.source)bits.push(srcLabel(s.source));
   bits.push(ago(now-s.mtime));
-  const chev=ex?`<span class="agtoggle${ex.open?' open':''}" onclick="toggleGroup('${encodeURIComponent(ex.gk)}');event.stopPropagation()" title="${ex.open?'Collapse':'Expand'} agent sessions">🤖</span>`:"";
-  const kidchip=ex?` · <span class=agentbadge title="agent sessions this one spawned">🤖 ${ex.live?ex.live+" live / ":""}${ex.n} agent${ex.n==1?"":"s"}</span>`:"";
+  const chev=ex?`<span class="agtoggle${ex.open?' open':''}" onclick="toggleGroup('${encodeURIComponent(ex.gk)}');event.stopPropagation()" title="${ex.open?'Collapse':'Expand'} agent sessions">${ico('agent')}</span>`:"";
+  const kidchip=ex?` · <span class=agentbadge title="agent sessions this one spawned">${ico('agent')} ${ex.live?ex.live+" live / ":""}${ex.n} agent${ex.n==1?"":"s"}</span>`:"";
   // in-transcript background agents (Task/Workflow) running now — they spawn no separate session, so this is their only sidebar cue
-  const bgchip=s.bg?` · <span class="agentbadge live" title="${s.bg} background agent${s.bg==1?'':'s'} running now">🤖 ${s.bg} running</span>`:"";
-  // a parent row: clicking the title toggles its agents too (not just the 🤖 button) while still opening it
+  const bgchip=s.bg?` · <span class="agentbadge live" title="${s.bg} background agent${s.bg==1?'':'s'} running now">${ico('agent')} ${s.bg} running</span>`:"";
+  // a parent row: clicking the title toggles its agents too (not just the agent-toggle button) while still opening it
   const onclick=ex?`pickToggle('${s.id}','${encodeURIComponent(ex.gk)}')`:`pick('${s.id}')`;
-  const noteBadge=s.note_count?`<span class=notebadge title="${s.note_count} note${s.note_count==1?'':'s'}">📝${s.note_count}</span>`:"";
-  // open 🚩 count (server-owned, from flags.json) — without it a flag on a session you aren't
+  const noteBadge=s.note_count?`<span class=notebadge title="${s.note_count} note${s.note_count==1?'':'s'}">${ico('note')}${s.note_count}</span>`:"";
+  // open flag count (server-owned, from flags.json) — without it a flag on a session you aren't
   // looking at is invisible, which is how two of them sat unnoticed.
-  const flagBadge=s.open_flags?`<span class=flagbadge title="${s.open_flags} open flag${s.open_flags==1?'':'s'}">🚩${s.open_flags}</span>`:"";
+  const flagBadge=s.open_flags?`<span class=flagbadge title="${s.open_flags} open flag${s.open_flags==1?'':'s'}">${ico('flag')}${s.open_flags}</span>`:"";
   // end-state: waiting on your answer (wins, even while still live) > completed its last run.
   // "done" is gated to the live window (a session that JUST finished) — not every stale idle
-  // session — so the ✅ marks fresh completions instead of flooding the list green.
+  // session — so the checkmark marks fresh completions instead of flooding the list green.
   const status=s.waiting?"waiting":(s.ended&&live?"done":"");
   const statusBadge=status==="waiting"
-    ?`<span class="statusbadge waiting" title="waiting for your answer — respond in the session">⏳ answer</span>`
-    :status==="done"?`<span class="statusbadge done" title="completed its last run">✅ done</span>`:"";
+    ?`<span class="statusbadge waiting" title="waiting for your answer — respond in the session">${ico('hourglass')} answer</span>`
+    :status==="done"?`<span class="statusbadge done" title="completed its last run">${ico('check')} done</span>`:"";
   return `<div class="sitem ${s.id===cur?'active':''}${s.pinned?' pinned':''}${s.agent?' agentrow':''}${ex?' hasagents':''}${status?' '+status:''}${s.open_flags?' flagged':''}" onclick="${onclick}" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
-    `<div class=srow1>${chev}<span class="dot ${live?'live':''}"></span><span class=nm>${s.agent?'🤖 ':''}${esc(label)}</span>`+
+    `<div class=srow1>${chev}<span class="dot ${live?'live':''}"></span><span class=nm>${s.agent?ico('agent')+' ':''}${esc(label)}</span>`+
     `${statusBadge}${flagBadge}${noteBadge}`+
     (s._runs>1?`<span class="agentbadge runs" title="ran ${s._runs}× — collapsed; opens the latest">×${s._runs}</span>`:"")+
-    `<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">📌</span>`+
-    `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename this session">✎</span></div>`+
-    `<div class=smeta>${s.agent?'<span class=agentbadge>🤖 Agent</span> · ':''}${bits.join(" · ")}${kidchip}${bgchip}</div></div>`;
+    `<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">${ico('pin')}</span>`+
+    `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename this session">${ico('edit')}</span></div>`+
+    `<div class=smeta>${s.agent?'<span class=agentbadge>'+ico('agent')+' Agent</span> · ':''}${bits.join(" · ")}${kidchip}${bgchip}</div></div>`;
 }
 // collapse agent sessions that are re-runs of the same task (first prompt) into one row, newest as
 // representative, with _runs=N — so a finding re-executed 12× shows once, not twelve times.
@@ -1034,7 +1092,7 @@ function clearSearch(){searchResults=null;$("q").value="";$("qclear").style.disp
 // Server searches the full parsed detail (both providers, one endpoint); each hit carries full
 // text so a click opens the existing modal (diff/output for files/commands, text otherwise).
 let dHits=null, dSid=null, dTimer=null;
-const DKIND={narration:"💬 narration",prompt:"⌨ prompt",file:"📄 file",command:"$ command",todo:"○ todo"};
+const DKIND={narration:ico('chat')+" narration",prompt:ico('keyboard')+" prompt",file:ico('file')+" file",command:"$ command",todo:ico('circle')+" todo"};
 function doDetailSearch(){ clearTimeout(dTimer); dTimer=setTimeout(runDetailSearch,180); }
 async function runDetailSearch(){
   const q=$("dq").value.trim();
@@ -1060,7 +1118,7 @@ function openHit(i){
   const h=dHits[i]; if(!h)return;
   if(h.kind==="file"){ const j=curFiles.findIndex(f=>f.path===h.text); if(j>=0)return openDiff(j); }
   if(h.kind==="command"){ const j=curCmds.findIndex(c=>c.cmd===h.text); if(j>=0)return openCmd(j); }
-  openText(DKIND[h.kind]?DKIND[h.kind].replace(/^\S+\s/,""):h.kind, h.t?tago(h.t):"", h.text);
+  openText(DKIND[h.kind]?DKIND[h.kind].replace(/^(?:<svg[\s\S]*?<\/svg>|\S+)\s*/,""):h.kind, h.t?tago(h.t):"", h.text);
 }
 function clearDetailSearch(){ $("dq").value=""; dHits=null; $("dqclear").style.display="none"; $("dsc").textContent=""; $("dresults").style.display="none"; }
 function toggleDetailSearch(){   // header 🔍 reveals/hides the full-width search card, like the flag card
@@ -1111,7 +1169,7 @@ let lastData=null;
 // ---- completion notifications: agent/shell running -> done ----
 let soundOn=localStorage.getItem("soundOff")!=="1";
 let notifSession=null, notifRunning=null, audioCtx=null;
-function setBell(){const b=$("bell");if(b){b.textContent=soundOn?"🔔":"🔕";b.title="Completion sound: "+(soundOn?"on":"muted");}}
+function setBell(){const b=$("bell");if(b){b.innerHTML=soundOn?ico("bell"):ico("bell-off");b.title="Completion sound: "+(soundOn?"on":"muted");}}
 function toggleSound(){soundOn=!soundOn;localStorage.setItem("soundOff",soundOn?"0":"1");setBell();if(soundOn){beep();primeNotify();}}
 function beep(){
   try{
@@ -1139,7 +1197,7 @@ addEventListener("pointerdown",primeNotify,{once:true});
 function toast(msg,sub){
   const el=document.createElement("div");
   el.className="toast";
-  el.innerHTML=`<span class=tk>✓</span><div><div class=tt>${esc(msg)}</div>${sub?`<div class=tsub>${esc(sub)}</div>`:""}</div>`;
+  el.innerHTML=`<span class=tk>${ico('check')}</span><div><div class=tt>${esc(msg)}</div>${sub?`<div class=tsub>${esc(sub)}</div>`:""}</div>`;
   el.onclick=()=>el.remove();
   $("toasts").appendChild(el);
   requestAnimationFrame(()=>el.classList.add("show"));
@@ -1190,7 +1248,7 @@ async function poll(){
   if(d.error){$("hmeta").innerHTML=`<span class=dot></span> ${esc(d.error)}: ${esc(cur)}`;return}
   lastData=d;render(d);loadFlags();checkCompletions(d);
 }
-const KICON={commit:"⎇",test:"✓",install:"⬇",build:"🔨",git:"⎇",cmd:"$"};
+const KICON={commit:ico('branch'),test:ico('check'),install:ico('download'),build:ico('hammer'),git:ico('branch'),cmd:"$"};
 // Fork lineage banners (registry.py: d.continued_as/d.continued_from, on every provider's
 // detail dict). index.html has no static slot for this — it's an optional, provider-
 // agnostic feature — so the two banner elements are created once here and reused on every
@@ -1231,7 +1289,7 @@ function renderForkLinks(d){
     const pid=d.continued_from;
     from.style.display="flex";
     from.onclick=null;
-    from.innerHTML=`<span class=txt>↩ Forked from <span class="link blue" onclick="pick('${pid}')">${esc(label(pid))}</span></span>`;
+    from.innerHTML=`<span class=txt>${ico('return')} Forked from <span class="link blue" onclick="pick('${pid}')">${esc(label(pid))}</span></span>`;
   }else{
     from.style.display="none";
   }
@@ -1259,12 +1317,12 @@ function render(d){
   $("ringsub").textContent=`${c.done||0} of ${c.todos||0} tasks`;
 
   // title + active badge. Server-owned `waiting` (an unanswered question) wins over both
-  // live and idle — the same precedence the sidebar ⏳ uses. A session blocked on the user
+  // live and idle — the same precedence the sidebar hourglass icon uses. A session blocked on the user
   // isn't idle, and calling it "idle 26m ago" is what hid that it needed an answer.
   $("htitle").textContent=title;
   $("activebadge").style.display="inline-flex";
   if(d.waiting){
-    $("activebadge").innerHTML='<span class="dot amber"></span>⏳ waiting on you · '+ago(idle).replace(" ago","");
+    $("activebadge").innerHTML='<span class="dot amber"></span>'+ico("hourglass")+' waiting on you · '+ago(idle).replace(" ago","");
     $("activebadge").style.color="var(--amber)";$("activebadge").style.background="var(--amber-deep)";$("activebadge").style.borderColor="var(--amber-line)";
   }else if(!live){
     $("activebadge").innerHTML='<span class=dot></span>idle '+ago(idle);
@@ -1276,9 +1334,9 @@ function render(d){
 
   // meta line
   const meta=[];
-  if(m.cwd)meta.push("📁 "+esc(base(m.cwd)));
-  if(m.gitBranch)meta.push("⎇ "+esc(m.gitBranch));
-  if(src)meta.push("⌨ "+esc(src));
+  if(m.cwd)meta.push(ico('folder')+" "+esc(base(m.cwd)));
+  if(m.gitBranch)meta.push(ico('branch')+" "+esc(m.gitBranch));
+  if(src)meta.push(ico('keyboard')+" "+src);
   meta.push(`${(d.tokens.in/1000|0)}k in / ${(d.tokens.out/1000|0)}k out`);
   if(m.version)meta.push("v"+esc(m.version));
   $("hmeta").innerHTML=meta.map(x=>`<span>${x}</span>`).join("");
@@ -1289,10 +1347,10 @@ function render(d){
   const nAgents=(d.agents_bg||[]).length+(d.agent_sessions||[]).length, nAgentsRun=(d.agents_bg||[]).filter(a=>a.running).length+(d.agent_sessions||[]).filter(a=>a.running).length;
   const nShells=(d.shells||[]).length, nShellsRun=(d.shells||[]).filter(s=>s.running).length;
   $("chips").innerHTML=
-    chip("✓ done",`${c.done}/${c.todos}`,"good","card_todos")+chip("＋ created",c.created,"blue","card_files")+chip("✎ edited",c.edited,"","card_files")+
-    chip("👁 read",c.read,"","card_files")+chip("⎇ commits",c.commits,"","card_cmds")+chip("tests",c.tests,"","card_cmds")+
-    chip("✗ failed",c.tests_failed,"bad","card_cmds")+chip("⚠ errors",c.errors,"bad","card_cmds")+
-    bgchip("🤖 agents",nAgents,"agents",nAgentsRun)+bgchip("⌨ shells",nShells,"shells",nShellsRun)+chip("searches",c.searches);
+    chip(ico('check')+" done",`${c.done}/${c.todos}`,"good","card_todos")+chip(ico('plus')+" created",c.created,"blue","card_files")+chip(ico('edit')+" edited",c.edited,"","card_files")+
+    chip(ico('eye')+" read",c.read,"","card_files")+chip(ico('branch')+" commits",c.commits,"","card_cmds")+chip("tests",c.tests,"","card_cmds")+
+    chip(ico('x')+" failed",c.tests_failed,"bad","card_cmds")+chip(ico('alert')+" errors",c.errors,"bad","card_cmds")+
+    bgchip(ico('agent')+" agents",nAgents,"agents",nAgentsRun)+bgchip(ico('keyboard')+" shells",nShells,"shells",nShellsRun)+chip("searches",c.searches);
 
   // background agents (click to read full narration)
   // background agents — running shown; finished tucked behind a disclosure
@@ -1308,7 +1366,7 @@ function render(d){
       // live agent sessions shown; finished ones tucked behind a disclosure (they can number in the dozens)
       const asCard=a=>
         `<div class="agent clk agentrow" onclick="pick('${a.id}')" title="Open this agent session${a.runs>1?' ('+a.runs+' runs — opens the latest)':''}">`+
-        `<div class=top><span class="dot ${a.running?'live':''}"></span><span class=nm>🤖 ${esc(a.title||a.wt||a.id.slice(0,8))}</span>`+
+        `<div class=top><span class="dot ${a.running?'live':''}"></span><span class=nm>${ico('agent')} ${esc(a.title||a.wt||a.id.slice(0,8))}</span>`+
         (a.runs>1?` <span class=tag title="ran ${a.runs}× — collapsed">×${a.runs}</span>`:"")+
         (a.wt?` <span class=tag>${esc(a.wt.slice(0,16))}</span>`:"")+`<span class=chev>open ›</span></div>`+
         `<div class=ft><span>agent session</span><span>·</span><span style=color:${a.running?'var(--green2)':'var(--dim)'}>${a.running?'running':'done'}</span>`+
@@ -1316,7 +1374,7 @@ function render(d){
       const asRun=asx.filter(a=>a.running), asDone=asx.filter(a=>!a.running);
       html+=asRun.map(asCard).join("");
       if(asDone.length){
-        html+=`<div class=disclosure onclick=toggleAgentSessDone()>${showAgentSessDone?"▾ Hide":"▸ Show"} ${asDone.length} finished agent session${asDone.length==1?"":"s"}</div>`;
+        html+=`<div class=disclosure onclick=toggleAgentSessDone()>${showAgentSessDone?ico('chevron-down')+" Hide":ico('chevron')+" Show"} ${asDone.length} finished agent session${asDone.length==1?"":"s"}</div>`;
         if(showAgentSessDone)html+=asDone.map(asCard).join("");
       }
     }
@@ -1330,7 +1388,7 @@ function render(d){
     bg.forEach((a,i)=>(a.running?run:done).push(card(a,i)));
     if(bg.length) html+=run.length?run.join(""):(asx.length?"":"<div class=empty>No agents running right now.</div>");
     if(done.length){
-      html+=`<div class=disclosure onclick=toggleAgentsDone()>${showAgentsDone?"▾ Hide":"▸ Show"} ${done.length} finished</div>`;
+      html+=`<div class=disclosure onclick=toggleAgentsDone()>${showAgentsDone?ico('chevron-down')+" Hide":ico('chevron')+" Show"} ${done.length} finished</div>`;
       if(showAgentsDone)html+=done.join("");
     }
     $("bg").innerHTML=html;
@@ -1352,7 +1410,7 @@ function render(d){
     shl.forEach((s,i)=>(s.running?run:done).push(card(s,i)));
     let html=run.length?run.join(""):"<div class=empty>No shells running right now.</div>";
     if(done.length){
-      html+=`<div class=disclosure onclick=toggleShellsDone()>${showShellsDone?"▾ Hide":"▸ Show"} ${done.length} finished</div>`;
+      html+=`<div class=disclosure onclick=toggleShellsDone()>${showShellsDone?ico('chevron-down')+" Hide":ico('chevron')+" Show"} ${done.length} finished</div>`;
       if(showShellsDone)html+=done.join("");
     }
     $("sh").innerHTML=html;
@@ -1370,7 +1428,7 @@ function render(d){
   const ov=d.overview||{};
   curOv=ov;
   $("ov_goal").innerHTML=md(ov.goal||"—");
-  $("ov_now").innerHTML="▶ "+md(ov.now||(live?"working…":"idle"));
+  $("ov_now").innerHTML=ico('play')+" "+md(ov.now||(live?"working…":"idle"));
   $("ov_sofar").innerHTML=md(ov.sofar||"—");
   const ocm=ov.commits||[];
   $("ov_crow").style.display=ocm.length?"flex":"none";
@@ -1382,13 +1440,13 @@ function render(d){
   $("nowbanner").style.display=ov.now?"flex":"none";
   $("nowbanner").classList.toggle("done",!live&&!d.waiting);
   $("nowbanner").classList.toggle("waiting",!!d.waiting);
-  const nowClean=(ov.now||"").replace(/^(?:▶|⚙|✓|⏳)\s+/,"").replace(/^Idle — last said:\s*/,"");
+  const nowClean=(ov.now||"").replace(/^(?:▶|⚙|✓|⧖)\s+/,"").replace(/^Idle — last said:\s*/,"");
   $("nowlbl").textContent=d.waiting?"Waiting on your answer":(live?"Now working on":"Completed last task");
-  $("nowtext").innerHTML=(d.waiting?"⏳ ":live?"▶ ":"✓ ")+md(nowClean)+(live&&!d.waiting?'<span class=cursor>▍</span>':"");
+  $("nowtext").innerHTML=(d.waiting?ico('hourglass')+' ':live?ico('play')+" ":ico('check')+" ")+md(nowClean)+(live&&!d.waiting?'<span class=cursor>▍</span>':"");
   // the last file touched — click jumps to the Files panel and opens its diff
   const lastFile=(d.files||[])[0];
   $("nowfile").style.display=lastFile?"":"none";
-  if(lastFile)$("nowfile").innerHTML=`📄 <span class=nfn>${esc(base(lastFile.path))}</span>`;
+  if(lastFile)$("nowfile").innerHTML=`${ico('file')} <span class=nfn>${esc(base(lastFile.path))}</span>`;
 
   // narration — unbounded, server-paginated. The poll ships only the newest page
   // (d.narrative) + the full count (d.narrative_total); we keep an accumulator so
@@ -1423,7 +1481,7 @@ function render(d){
   winList("prs", prs, (p,i)=>{
     const st=p.state||"";  // "merged"/"closed" when the session's logs revealed it; else open
     const badge=st?` <span class="prstate ${st}">${st}</span>`:"";
-    const atag=p.agent?' <span class=agenttag title="opened by a background agent">🤖 agent</span>':'';
+    const atag=p.agent?' <span class=agenttag title="opened by a background agent">'+ico('agent')+' agent</span>':'';
     return `<div class="item prrow"><a class=prlink href="${esc(p.url)}" target=_blank rel=noopener title="${esc(p.url)}">`+
     `<span class="kind ${p.created?'new':''}">${p.created?'created':'worked on'}</span>${badge}${atag} `+
     `<b>${esc((p.repo?p.repo+' ':'')+'#'+p.num)}</b><span class=prurl>${esc(p.url)}</span>`+
@@ -1441,8 +1499,8 @@ function render(d){
       (q.options&&q.options.length?`<div class=decopts>${q.options.map(o=>`<span class=decopt>${esc(o)}</span>`).join("")}</div>`:"")
     ).join("");
     const foot=x.open
-      ? `<div class="decans open">⏳ awaiting your answer — decide in the session</div>`
-      : `<div class=decans><span class=deck>✓ decided</span> ${md(x.answer||"")}</div>`;
+      ? `<div class="decans open">${ico('hourglass')} awaiting your answer — decide in the session</div>`
+      : `<div class=decans><span class=deck>${ico('check')} decided</span> ${md(x.answer||"")}</div>`;
     return `<div class="decitem${x.open?' isopen':''}">${qs}${foot}`+
            `<div class=dectime>${x.t?ago(d.now-Date.parse(x.t)/1000):""}</div></div>`;
   }).join(""):"<div class=empty>no questions asked</div>";
@@ -1451,11 +1509,11 @@ function render(d){
   const td=d.todos||[];
   const order={completed:0,in_progress:1,pending:2};
   const sorted=[...td].sort((a,b)=>(order[a.status]??3)-(order[b.status]??3));
-  const TICON={completed:"✓",in_progress:"▶",pending:"○"};
+  const TICON={completed:ico('check'),in_progress:ico('play'),pending:ico('circle')};
   $("todoc").textContent=td.length?c.done+"/"+td.length:"";
   curTodos=sorted;
   winList("todos", sorted, (t,i)=>
-    `<div class="todo t-${t.status} clk" onclick="openTodo(${i})"><span class=ic>${TICON[t.status]||"○"}</span><span class=tx>${md(t.content)}</span></div>`, "no todos in this session");
+    `<div class="todo t-${t.status} clk" onclick="openTodo(${i})"><span class=ic>${TICON[t.status]||ico('circle')}</span><span class=tx>${md(t.content)}</span></div>`, "no todos in this session");
 
   // requests (markdown + click to read full)
   curReqs=[...(d.requests||[])].reverse();
@@ -1468,14 +1526,14 @@ function render(d){
   curFiles=fs;
   $("filec").textContent=fs.length||"";
   winList("files", fs, (f,i)=>
-    `<div class="item filerow" onclick="openDiff(${i})" title="View diff"><div class=fpath><span class="kind ${f.created?'new':''}">${f.created?'created':'edited'}</span>${f.agent?' <span class=agenttag title="edited by a background agent">🤖 agent</span>':''} <b>${esc(base(f.path))}</b><span class=chev>diff ›</span></div>`+
+    `<div class="item filerow" onclick="openDiff(${i})" title="View diff"><div class=fpath><span class="kind ${f.created?'new':''}">${f.created?'created':'edited'}</span>${f.agent?' <span class=agenttag title="edited by a background agent">'+ico('agent')+' agent</span>':''} <b>${esc(base(f.path))}</b><span class=chev>diff ›</span></div>`+
     `<div class="muted mono" style=font-size:11px;margin-top:3px>${esc(f.path.replace("/"+base(f.path),""))} · ${f.ops}× · ${ago(d.now-Date.parse(f.last)/1000)}</div></div>`, "no files written yet");
 
   // commands (click to see output)
   curCmds=d.commands||[];
   $("cmdc").textContent=curCmds.length||"";
   winList("cmds", curCmds, (x,i)=>
-    `<div class="item clk" onclick="openCmd(${i})"><span class="${x.ok?'ok':'bad'}">${x.ok?'✓':'✗'}</span> <span class=muted>${KICON[x.kind]||'$'}</span> `+
+    `<div class="item clk" onclick="openCmd(${i})"><span class="${x.ok?'ok':'bad'}">${x.ok?ico('check'):ico('x')}</span> <span class=muted>${KICON[x.kind]||'$'}</span> `+
     `<span class="cmd mono">${esc(x.cmd)}</span> <span class=chev style=float:right;color:var(--dim)>output ›</span></div>`, "—");
 
   syncModal();   // keep an open narration/request modal live with this poll
@@ -1504,10 +1562,10 @@ async function openDiff(i){
 function updateMdToggle(){
   const btn=$("diffmd");
   if(btn){ btn.style.display=isMd(curDiffFile&&curDiffFile.path)?"":"none";
-           btn.textContent=diffMode==="md"?"◧ Diff":"◧ Rendered"; }
+           btn.innerHTML=diffMode==="md"?ico('layout')+" Diff":ico('layout')+" Rendered"; }
   const ab=$("diffall");   // expand-all only makes sense in diff mode with edits to expand
   if(ab){ ab.style.display=(diffMode==="diff"&&curDiffOps.length)?"":"none";
-          ab.textContent=diffAllExpanded?"⇕ Collapse":"⇕ Expand all"; }
+          ab.innerHTML=diffAllExpanded?ico('expand-vertical')+" Collapse":ico('expand-vertical')+" Expand all"; }
 }
 function toggleDiffMd(){ diffMode=diffMode==="md"?"diff":"md"; updateMdToggle(); renderDiffView(); }
 function toggleDiffAll(){
@@ -1550,7 +1608,7 @@ function _anchorIdx(a,f){
 }
 function _expBar(idx,dir,n){
   return `<div class=diffexp onclick="diffExpandMore(${idx},'${dir}')" title="show more of the file">`+
-         `${dir==='up'?'↑':'↓'} ${n} more line${n===1?'':'s'} ${dir==='up'?'above':'below'}</div>`;
+         `${dir==='up'?ico('arrow-up'):ico('arrow-down')} ${n} more line${n===1?'':'s'} ${dir==='up'?'above':'below'}</div>`;
 }
 function renderOpDiff(op,idx,fileLines){
   const hunk=renderDiff(op.diff);
@@ -1658,12 +1716,12 @@ async function openCmd(i){
   $("msgtitle").textContent="Command";
   $("msgwhen").textContent=tago(x.t);
   $("msgbody").className="msgbody cmdmode";
-  $("msgbody").innerHTML=`<div class=cmdcode><span class="${x.ok?'ok':'bad'}">${x.ok?'✓':'✗'}</span> ${esc(x.cmd)}</div><div class=empty>loading output…</div>`;
+  $("msgbody").innerHTML=`<div class=cmdcode><span class="${x.ok?'ok':'bad'}">${x.ok?ico('check'):ico('x')}</span> ${esc(x.cmd)}</div><div class=empty>loading output…</div>`;
   $("msgmodal").style.display="flex";
   let d;
   try{d=await(await fetch(`/api/output?id=${encodeURIComponent(cur)}&cmd=${encodeURIComponent(x.id)}`)).json()}
   catch(e){d={}}
-  $("msgbody").innerHTML=`<div class=cmdcode><span class="${x.ok?'ok':'bad'}">${x.ok?'✓':'✗'}</span> ${esc(d.cmd||x.cmd)}</div>`+
+  $("msgbody").innerHTML=`<div class=cmdcode><span class="${x.ok?'ok':'bad'}">${x.ok?ico('check'):ico('x')}</span> ${esc(d.cmd||x.cmd)}</div>`+
     (d.out?`<pre class=cmdout>${esc(d.out)}</pre>`:"<div class=empty>no output captured</div>");
 }
 let curShells=[], curAgents=[], curTodos=[];
@@ -1709,7 +1767,7 @@ function closeMsg(){$("msgmodal").style.display="none";}
 function copyModal(bodyId,btn){
   const el=$(bodyId); if(!el)return;
   const text=el.innerText||el.textContent||"";
-  const done=()=>{if(btn){const o=btn.textContent;btn.textContent="✓ Copied";setTimeout(()=>btn.textContent=o,1200);}};
+  const done=()=>{if(btn){const o=btn.innerHTML;btn.innerHTML=ico('check')+" Copied";setTimeout(()=>btn.innerHTML=o,1200);}};
   if(navigator.clipboard&&navigator.clipboard.writeText){
     navigator.clipboard.writeText(text).then(done).catch(()=>fallbackCopy(el,done));
   }else{fallbackCopy(el,done);}
@@ -1725,7 +1783,7 @@ function copyCode(btn){
   const code=btn.parentNode.querySelector("code")||btn.parentNode.querySelector(".mdpre");
   if(!code)return;
   const text=code.innerText||code.textContent||"";
-  const done=()=>{const o=btn.innerHTML;btn.classList.add("ok");btn.innerHTML="✓ Copied";setTimeout(()=>{btn.innerHTML=o;btn.classList.remove("ok");},1200);};
+  const done=()=>{const o=btn.innerHTML;btn.classList.add("ok");btn.innerHTML=ico('check')+" Copied";setTimeout(()=>{btn.innerHTML=o;btn.classList.remove("ok");},1200);};
   if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(()=>fallbackCopy(code,done));}
   else fallbackCopy(code,done);
 }
@@ -1759,13 +1817,13 @@ document.addEventListener("keydown",e=>{if(e.key==="Escape"){closeDiff();closeMs
 const PUSH_SAYS={
   turn:{toast:"Queued — lands when the session finishes this turn",
         tip:"Queued — the session picks it up when it finishes this turn. Click to un-queue.",
-        chip:"⏳ queued"},
+        chip:ico('hourglass')+" queued"},
   wake:{toast:"Queued — this session is idle, so it lands the next time it runs",
         tip:"Queued — this session is idle. It has no turn to finish, so the note lands the next time you prompt it or resume it. Click to un-queue.",
-        chip:"⏳ queued · on wake"},
-  none:{toast:"Queued — this tool can't auto-deliver, use ⧉ copy",
-        tip:"Queued, but this tool has no hook to deliver it — use ⧉ copy. Click to un-queue.",
-        chip:"⏳ queued · copy it"}};
+        chip:ico('hourglass')+" queued · on wake"},
+  none:{toast:"Queued — this tool can't auto-deliver, use copy",
+        tip:"Queued, but this tool has no hook to deliver it — use copy. Click to un-queue.",
+        chip:ico('hourglass')+" queued · copy it"}};
 function pushSays(){return PUSH_SAYS[(lastData&&lastData.push_when)||"turn"]||PUSH_SAYS.turn}
 function renderNotes(notes){
   const el=$("notes_list"), nc=$("notec");
@@ -1778,13 +1836,13 @@ function renderNotes(notes){
     const idx=notes.length-1-ri;   // actual index in the server's array (for delete)
     const push=n.pushed
       ?`<span class="link amber" onclick="pushNote(${idx})" title="${esc(says.tip)}">${says.chip}</span>`
-      :`<span class="link green" onclick="pushNote(${idx})" title="Send this into the live session">▶ push</span>`;
+      :`<span class="link green" onclick="pushNote(${idx})" title="Send this into the live session">${ico('play')} push</span>`;
     return `<div class="noteitem${n.pushed?" queued":""}">`+
       `<div class=ntxt>${esc(n.text||"")}</div>`+
       `<div class=nft>`+
-        `<span class="link blue" onclick="copyNote(${idx})" title="Copy to clipboard">⧉ copy</span>`+
+        `<span class="link blue" onclick="copyNote(${idx})" title="Copy to clipboard">${ico('copy')} copy</span>`+
         push+
-        `<span class="link grey" onclick="removeNote(${idx})">✕ remove</span>`+
+        `<span class="link grey" onclick="removeNote(${idx})">${ico('close')} remove</span>`+
       `</div></div>`;
   }).join(""):`<div class=empty>no notes yet</div>`;
 }
@@ -1832,10 +1890,10 @@ function flagRow(f,now,withWho){
   const who=withWho?`<div class=who onclick="jumpToFlag('${f.session}')" title="Open this session">`+
     `${esc((s&&(s.title||s.project))||f.project||f.session.slice(0,8))}</div>`:"";
   return `<div class="flag ${f.resolved?'done':'open'}">${who}`+
-    `<div class=note>${f.resolved?'✓ ':'🚩 '}${esc(f.note)}</div>`+
+    `<div class=note>${f.resolved?ico('check')+' ':ico('flag')+' '}${esc(f.note)}</div>`+
     (f.context?`<div class=ctx>while: ${esc(f.context)}</div>`:"")+
     `<div class=ft><span>${ago(now-f.ts)}</span>`+
-    `<span class="link blue" onclick="resolveFlag(${f.id})">${f.resolved?'reopen':'✓ resolve'}</span>`+
+    `<span class="link blue" onclick="resolveFlag(${f.id})">${f.resolved?'reopen':ico('check')+' resolve'}</span>`+
     `<span class="link grey" onclick="delFlag(${f.id})">delete</span></div></div>`;
 }
 function renderFlags(){
@@ -1883,7 +1941,7 @@ function toggleAllFlags(){
 }
 async function addFlag(){
   if(!cur){alert("Pick a session first");return}
-  const note=prompt("🚩 Flag an issue or gap to resolve:");
+  const note=prompt("Flag an issue or gap to resolve:");
   if(!note||!note.trim())return;
   const s=sessions.find(x=>x.id===cur)||{};
   await fetch("/api/flags",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -1894,7 +1952,7 @@ async function flagAction(path,id){
   await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});
   loadFlags();
 }
-// the Flags panel is opt-in: hidden until the header "🚩 Flag an issue" button reveals it
+// the Flags panel is opt-in: hidden until the header "Flag an issue" button reveals it
 function toggleFlags(){
   const c=$("flagcard"); if(!c)return;
   const show=c.style.display==="none";
@@ -1960,7 +2018,7 @@ function winList(elId, items, render, empty, opts){
   const top=el.scrollTop;
   let html=items.slice(0,shown).map(render).join("");
   const older=total-shown;                 // local window + server-side not-yet-loaded
-  if(older>0) html+=`<div class=loadmore>↓ ${older} older — scroll to load</div>`;
+  if(older>0) html+=`<div class=loadmore>${ico('arrow-down')} ${older} older — scroll to load</div>`;
   el.innerHTML=html;
   el.scrollTop=top;
   // Load the next batch as the "↓ older" sentinel nears the bottom of THIS box.

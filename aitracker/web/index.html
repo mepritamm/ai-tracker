@@ -3,7 +3,7 @@
 <title>AI Session Tracker</title>
 <link rel=icon href="data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20viewBox=%270%200%2032%2032%27%3E%3Crect%20x=%272.5%27%20y=%272.5%27%20width=%2727%27%20height=%2727%27%20rx=%278%27%20fill=%27%2311161f%27%20stroke=%27%23f5b443%27%20stroke-width=%272%27/%3E%3Cpath%20d=%27M6.5%2018h3.6l2-5.6%203%2010%202.2-6.3%201.5%201.9H25%27%20fill=%27none%27%20stroke=%27%23f5b443%27%20stroke-width=%272.3%27%20stroke-linecap=%27round%27%20stroke-linejoin=%27round%27/%3E%3Ccircle%20cx=%2723.4%27%20cy=%279%27%20r=%273%27%20fill=%27%2329d398%27/%3E%3C/svg%3E">
 <meta name=theme-color id=themecolor content="#0c0f15">
-<script>try{if(localStorage.theme==='light')document.documentElement.classList.add('light')}catch(e){}</script>
+<script>try{if(localStorage.theme==='light')document.documentElement.classList.add('light');var s=localStorage.iconStyle;if(s)document.documentElement.setAttribute('data-icon-style',s);var k=parseFloat(localStorage.iconScale);if(k>0)document.documentElement.style.setProperty('--ico-scale',k)}catch(e){}</script>
 <meta name=mobile-web-app-capable content=yes>
 <meta name=apple-mobile-web-app-capable content=yes>
 <meta name=apple-mobile-web-app-status-bar-style content=black-translucent>
@@ -14,7 +14,64 @@
 <link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel=stylesheet>
 <style>__CSS__</style></head><body>
-<svg class=brandsprite aria-hidden=true focusable=false><symbol id=brandMark viewBox="0 0 32 32"><rect x='2.5' y='2.5' width='27' height='27' rx='8' fill='var(--brand-plate, transparent)' stroke='currentColor' stroke-width='2'/><path d='M6.5 18h3.6l2-5.6 3 10 2.2-6.3 1.5 1.9H25' fill='none' stroke='currentColor' stroke-width='2.3' stroke-linecap='round' stroke-linejoin='round'/><circle cx='23.4' cy='9' r='3' fill='var(--brand-dot, currentColor)'/></symbol></svg>
+<svg class=brandsprite aria-hidden=true focusable=false><symbol id=brandMark viewBox="0 0 32 32"><rect x='2.5' y='2.5' width='27' height='27' rx='8' fill='var(--brand-plate, transparent)' stroke='currentColor' stroke-width='2'/><path d='M6.5 18h3.6l2-5.6 3 10 2.2-6.3 1.5 1.9H25' fill='none' stroke='currentColor' stroke-width='2.3' stroke-linecap='round' stroke-linejoin='round'/><circle cx='23.4' cy='9' r='3' fill='var(--brand-dot, currentColor)'/></symbol>
+<symbol id=i-sun viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='4'/><path d='M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6L17 7M7 17l-1.4 1.4'/></symbol>
+<symbol id=i-moon viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M20 14.5A8 8 0 1 1 9.5 4 6.5 6.5 0 0 0 20 14.5Z'/></symbol>
+<symbol id=i-bell-off viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M6 16v-4a6 6 0 0 1 9.5-4.9M18 12v4l1.5 2h-15'/><path d='M10 20a2 2 0 0 0 4 0'/><path d='M4 4l16 16'/></symbol>
+<symbol id=i-flag viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M6 21V3'/><path d='M6 4h11l-3 3.5 3 3.5H6z'/></symbol>
+<symbol id=i-compass viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M15 9l-2 6-6 2 2-6z'/></symbol>
+<symbol id=i-note viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M5 4h14v16H5z'/><path d='M8 9h8M8 13h8M8 17h5'/></symbol>
+<symbol id=i-agent viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M5 9h14v9a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2z'/><path d='M12 9V5'/><circle cx='12' cy='4' r='1.3' fill='currentColor'/><circle cx='9' cy='14' r='1.2' fill='currentColor'/><circle cx='15' cy='14' r='1.2' fill='currentColor'/></symbol>
+<symbol id=i-heart viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M12 20.5c-.3 0-.6-.1-.8-.3C7 16.9 3 13.2 3 9.3 3 6.6 5.1 4.5 7.7 4.5c1.6 0 3.1.8 4 2.1.9-1.3 2.4-2.1 4-2.1 2.6 0 4.7 2.1 4.7 4.8 0 3.9-4 7.6-8.2 10.9-.2.2-.5.3-.8.3z'/></symbol>
+<symbol id=i-diagram viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M8 7l3 8M16 7l-3 8'/><circle cx='6' cy='6' r='2.2'/><circle cx='18' cy='6' r='2.2'/><circle cx='12' cy='18' r='2.2'/></symbol>
+<symbol id=i-desktop viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M4 5h16v11H4z'/><path d='M9 20h6M12 16v4'/></symbol>
+<symbol id=i-pin viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M12 21s7-7.58 7-12A7 7 0 0 0 5 9c0 4.42 7 12 7 12z'/><circle cx='12' cy='9' r='2.3' fill='currentColor'/></symbol>
+<symbol id=i-chat viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M4 5h16v11H9l-5 4z'/></symbol>
+<symbol id=i-file viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M7 3h7l4 4v14H7z'/><path d='M14 3v4h4'/></symbol>
+<symbol id=i-hammer viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M14.5 2.5l4.2 4.2-2.6 2.6-4.2-4.2z'/><path d='M13.7 8.1L4.6 17.2a1.4 1.4 0 0 0 2 2l9.1-9.1'/></symbol>
+<symbol id=i-folder viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M3 6h6l2 2h10v11H3z'/></symbol>
+<symbol id=i-eye viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M2 12s4-7 10-7 10 7 10 7-4 7-10 7-10-7-10-7z'/><circle cx='12' cy='12' r='2.6'/></symbol>
+<symbol id=i-hourglass viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M6 3h12M6 21h12M6 3c0 4.5 5 6 6 9-1 3-6 4.5-6 9M18 3c0 4.5-5 6-6 9 1 3 6 4.5 6 9'/></symbol>
+<symbol id=i-unlock viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M5 11h14v9H5z'/><path d='M8 11V7a4 4 0 0 1 7.5-2'/></symbol>
+<symbol id=i-gear viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='7'/><circle cx='12' cy='12' r='3'/><path d='M12 3v2.5M12 18.5V21M21 12h-2.5M5.5 12H3M18.4 5.6l-1.8 1.8M7.4 16.6l-1.8 1.8M18.4 18.4l-1.8-1.8M7.4 7.4L5.6 5.6'/></symbol>
+<symbol id=i-spark viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M12 2l1.8 6.2L20 10l-6.2 1.8L12 18l-1.8-6.2L4 10l6.2-1.8z'/></symbol>
+<symbol id=i-search viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M10.5 3a7.5 7.5 0 1 0 4.66 13.4l4.72 4.72 1.42-1.42-4.72-4.72A7.5 7.5 0 0 0 10.5 3zm0 2a5.5 5.5 0 1 1 0 11 5.5 5.5 0 0 1 0-11z'/></symbol>
+<symbol id=i-chevron viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M8 5l7 7-7 7'/></symbol>
+<symbol id=i-check viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M4 12.5l5 5L20 7'/></symbol>
+<symbol id=i-alert viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M12 3l10 18H2L12 3zm0 6v5m0 3.2h.01'/></symbol>
+<symbol id=i-bell viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M12 3a5 5 0 0 0-5 5v3.4L5 15v1.5h14V15l-2-3.6V8a5 5 0 0 0-5-5zM9.5 19a2.5 2.5 0 0 0 5 0'/></symbol>
+<symbol id=i-branch viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M6 3v9a4 4 0 0 0 4 4h4M6 3a2 2 0 1 1 0 4 2 2 0 0 1 0-4zm12 4a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm-6 13a2 2 0 1 1 0-4 2 2 0 0 1 0 4z'/></symbol>
+<symbol id=i-panel viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M4 5h16v14H4zM9 5v14'/></symbol>
+<symbol id=i-redo viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M8 8h9v-4l5 5-5 5v-4H8a4 4 0 1 0 0 8h5v2H8a6 6 0 1 1 0-12z'/></symbol>
+<symbol id=i-edit viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M4 20l1-5L16 4l4 4L9 19l-5 1z'/></symbol>
+<symbol id=i-clock viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zm0 4v5l4 2'/></symbol>
+<symbol id=i-stop viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M6 6h12v12H6z'/></symbol>
+<symbol id=i-send viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M3 11l18-8-8 18-2-8-8-2z'/></symbol>
+<symbol id=i-puzzle viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M9 4h4v2a2 2 0 0 0 4 0V4h3v4h-2a2 2 0 0 0 0 4h2v3h-4a2 2 0 0 0 0 4h-4v-3a2 2 0 0 0-4 0v3H4v-4h2a2 2 0 0 0 0-4H4V8h3V4a2 2 0 0 1 4 0z'/></symbol>
+<symbol id=i-help viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M9.2 9.5a2.8 2.8 0 1 1 4.4 2.3c-.9.6-1.6 1.1-1.6 2.2'/><circle cx='12' cy='17.2' r='1' fill='currentColor'/></symbol>
+<symbol id=i-working viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M12 3a9 9 0 0 1 9 9'/></symbol>
+<symbol id=i-close viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M6 6l12 12M18 6L6 18'/></symbol>
+<symbol id=i-mouse viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><rect x='7' y='3' width='10' height='18' rx='5'/><path d='M12 6v4'/></symbol>
+<symbol id=i-x viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M6 6l12 12M18 6L6 18'/></symbol>
+<symbol id=i-chevron-down viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M5 8.5l7 7 7-7'/></symbol>
+<symbol id=i-chevron-left viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M16 5l-7 7 7 7'/></symbol>
+<symbol id=i-play viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M8 4.5l11.5 7.5L8 19.5z'/></symbol>
+<symbol id=i-circle viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='8'/></symbol>
+<symbol id=i-diamond viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M12 3l9 9-9 9-9-9z'/></symbol>
+<symbol id=i-copy viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><rect x='9' y='9' width='12' height='12' rx='2'/><path d='M15 6V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h1'/></symbol>
+<symbol id=i-expand-vertical viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M12 4v16M8 8l4-4 4 4M8 16l4 4 4-4'/></symbol>
+<symbol id=i-arrow-up viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M12 20V4M5 11l7-7 7 7'/></symbol>
+<symbol id=i-arrow-down viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M12 4v16M5 13l7 7 7-7'/></symbol>
+<symbol id=i-menu viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M4 7h16M4 12h16M4 17h16'/></symbol>
+<symbol id=i-plus viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M12 5v14M5 12h14'/></symbol>
+<symbol id=i-jump-top viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M4 4h16M12 21V8.5M6 14.5l6-6 6 6'/></symbol>
+<symbol id=i-expand viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M14 4h6v6M20 4l-7.5 7.5M10 20H4v-6M4 20l7.5-7.5'/></symbol>
+<symbol id=i-external viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3'/></symbol>
+<symbol id=i-layout viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='5' width='18' height='14' rx='2'/><path d='M10 5v14M6 9.5h1M6 12h1M6 14.5h1'/></symbol>
+<symbol id=i-keyboard viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='6' width='18' height='12' rx='2'/><path d='M7 10h.01M10.5 10h.01M14 10h.01M17.5 10h.01M8 14h8'/></symbol>
+<symbol id=i-download viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M12 3v11M7 9.5l5 5 5-5M5 20h14'/></symbol>
+<symbol id=i-return viewBox="0 0 24 24" fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M9 9l-5 5 5 5M20 4v6a4 4 0 0 1-4 4H4'/></symbol>
+</svg>
 <div class=app>
 <aside class=side>
   <div class=sidehead>
@@ -24,15 +81,15 @@
     </div>
     <div class=sidetop2>
       <div class=livebadge id=livecount onclick=toggleLiveOnly() title="Click to show live sessions only">0 live</div>
-      <span class=themetoggle id=themebtn onclick=toggleTheme() title="Toggle light / dark" role=button aria-label="Toggle theme">☀️</span>
-      <span class=bell id=bell onclick=toggleSound() title="Completion sound: on">🔔</span>
-      <span class=allflagsbtn id=allflagsbtn onclick=toggleAllFlags() title="Open flags across every session" role=button aria-label="All flags">🚩<span class=n id=allflagsn></span></span>
+      <span class=themetoggle id=themebtn onclick=toggleTheme() title="Toggle light / dark" role=button aria-label="Toggle theme"><svg class=ico data-ico=sun viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-sun"/></span>
+      <span class=bell id=bell onclick=toggleSound() title="Completion sound: on"><svg class=ico data-ico=bell viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-bell"/></span>
+      <span class=allflagsbtn id=allflagsbtn onclick=toggleAllFlags() title="Open flags across every session" role=button aria-label="All flags"><svg class=ico data-ico=flag viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-flag"/><span class=n id=allflagsn></span></span>
     </div>
     <div id=ext_launch_side></div>
     <div class=searchbox>
-      <span class=ic onclick=doSearch()>⌕</span>
+      <span class=ic onclick=doSearch()><svg class=ico data-ico=search viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-search"/></span>
       <input id=q placeholder="search sessions…" autocomplete=off>
-      <span class=ic id=qclear onclick=clearSearch() style=display:none>✕</span>
+      <span class=ic id=qclear onclick=clearSearch() style=display:none><svg class=ico data-ico=close viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-close"/></span>
     </div>
   </div>
   <!-- every session's flags in one place: a flag raised on a session you're not looking at
@@ -44,7 +101,7 @@
 <div class=scrim id=scrim onclick=closeDrawer()></div>
 <main>
 <header class=hd>
-  <button class=hbtn id=drawerBtn onclick=toggleDrawer() aria-label="Open sessions and terminals" title="Sessions and Terminals">☰</button>
+  <button class=hbtn id=drawerBtn onclick=toggleDrawer() aria-label="Open sessions and terminals" title="Sessions and Terminals"><svg class=ico data-ico=menu viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-menu"/></button>
   <div class=hero>
     <div class=ring>
       <svg width=122 height=122 viewBox="0 0 122 122">
@@ -55,7 +112,7 @@
       <div class=ringctr><div class=ringpct><span id=ringpct>0</span><span>%</span></div><div class=ringsub id=ringsub>0 of 0 tasks</div></div>
     </div>
     <div class=htitle>
-      <div class=htop><h2 id=htitle>Pick a session</h2><span class=activebadge id=activebadge style=display:none><span class=dot></span>active</span><button class=srchbtn id=dsearchbtn onclick=toggleDetailSearch() title="Search in this session" aria-label="Search in this session">🔍</button><span class=tn-pair><button class=tn-entry id=tryNext title="Open the new Control Room experience">✦ Try the new experience</button><button class=flagbtn id=flagbtn onclick=toggleFlags() title="Flag an issue or gap in this session">🚩 Flag an issue<span id=flagbtnc></span></button></span></div>
+      <div class=htop><h2 id=htitle>Pick a session</h2><span class=activebadge id=activebadge style=display:none><span class=dot></span>active</span><button class=srchbtn id=dsearchbtn onclick=toggleDetailSearch() title="Search in this session" aria-label="Search in this session"><svg class=ico data-ico=search viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-search"/></button><span class=tn-pair><button class=tn-entry id=tryNext title="Open the new Control Room experience"><svg class=ico data-ico=spark viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-spark"/> Try the new experience</button><button class=flagbtn id=flagbtn onclick=toggleFlags() title="Flag an issue or gap in this session"><svg class=ico data-ico=flag viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-flag"/> Flag an issue<span id=flagbtnc></span></button></span></div>
       <div class=hmeta id=hmeta>Pick a recent session or search on the left.</div>
       <div class=chips id=chips></div>
     </div>
@@ -72,21 +129,21 @@
 </header>
 <div class=body>
   <div class="card span2" id=dsearchcard style=display:none>
-    <h2><span>🔍 Search this session</span><span class=cnt id=dsc></span></h2>
+    <h2><span><svg class=ico data-ico=search viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-search"/> Search this session</span><span class=cnt id=dsc></span></h2>
     <div class=cbody style=max-height:52vh>
       <div class="searchbox dsearch">
-        <span class=ic>⌕</span>
+        <span class=ic><svg class=ico data-ico=search viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-search"/></span>
         <input id=dq placeholder="search narration, prompts, files, commands…" autocomplete=off oninput=doDetailSearch()>
-        <span class=ic id=dqclear onclick=clearDetailSearch() style=display:none>✕</span>
+        <span class=ic id=dqclear onclick=clearDetailSearch() style=display:none><svg class=ico data-ico=close viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-close"/></span>
       </div>
       <div id=dresults style=display:none></div>
     </div>
   </div>
   <div class="card span2" id=flagcard style=display:none>
-    <h2><span>🚩 Flag an issue — report a gap in this session</span><span class=cnt id=flagc style=color:var(--red)></span></h2>
+    <h2><span><svg class=ico data-ico=flag viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-flag"/> Flag an issue — report a gap in this session</span><span class=cnt id=flagc style=color:var(--red)></span></h2>
     <div class=cbody style=max-height:300px>
       <div class=flagwrap id=flags><div class=empty>—</div></div>
-      <button class=addflag onclick=addFlag()>🚩 Flag an issue or gap</button>
+      <button class=addflag onclick=addFlag()><svg class=ico data-ico=flag viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-flag"/> Flag an issue or gap</button>
     </div>
   </div>
   <div id=ext_launch></div>
@@ -99,22 +156,22 @@
       <div class=cbody style="padding:6px 8px;max-height:300px" id=todos><div class=empty>—</div></div>
     </div>
     <div class=card id=prpanel style=display:none>
-      <h2><span>🔀 Pull requests</span><span class=cnt id=prc style=color:var(--amber)></span></h2>
+      <h2><span><svg class=ico data-ico=branch viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-branch"/> Pull requests</span><span class=cnt id=prc style=color:var(--amber)></span></h2>
       <div class=cbody style="padding:6px 8px;max-height:230px" id=prs><div class=empty>—</div></div>
     </div>
     <div class=card id=notespanel>
-      <h2><span>🧭 Plan on the go</span><span class=cnt id=notec style=color:var(--violet)></span></h2>
+      <h2><span><svg class=ico data-ico=compass viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-compass"/> Plan on the go</span><span class=cnt id=notec style=color:var(--violet)></span></h2>
       <div class=notesub>Add small notes for this session.</div>
       <div class=cbody style=max-height:320px>
         <div class=flagwrap id=notes_list><div class=empty>no notes yet</div></div>
         <div class=noteadd>
           <textarea id=noteinput placeholder="Plan ahead — type a note for this session…" rows=2></textarea>
-          <button class=addnote onclick=addNote()>📝 Add note</button>
+          <button class=addnote onclick=addNote()><svg class=ico data-ico=note viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-note"/> Add note</button>
         </div>
       </div>
     </div>
     <div class=card id=decpanel style=display:none>
-      <h2><span>🧭 Decisions &amp; open questions</span><span class=cnt id=decc style=color:var(--amber)></span></h2>
+      <h2><span><svg class=ico data-ico=compass viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-compass"/> Decisions &amp; open questions</span><span class=cnt id=decc style=color:var(--amber)></span></h2>
       <div class=cbody style="padding:8px 10px;max-height:340px" id=dec><div class=empty>—</div></div>
     </div>
     <div class=card id=card_summary>
@@ -151,34 +208,34 @@
 </main>
 <div class=bgscrim id=bgscrim onclick=closeBgDrawer()></div>
 <aside class=bgdrawer id=bgdrawer data-tab=agents aria-label="Background work">
-  <div class=bgdh><span aria-hidden=true>🤖</span><div class=bgdtitle>Background work</div><span class=x onclick=closeBgDrawer() title="Close (Esc)">✕</span></div>
+  <div class=bgdh><span aria-hidden=true><svg class=ico data-ico=agent viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-agent"/></span><div class=bgdtitle>Background work</div><span class=x onclick=closeBgDrawer() title="Close (Esc)"><svg class=ico data-ico=close viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-close"/></span></div>
   <div class=bgtabs>
-    <div class="bgtab on" id=bgtab_agents onclick="setBgTab('agents')">🤖 Agents</div>
-    <div class=bgtab id=bgtab_shells onclick="setBgTab('shells')">⌨ Shells</div>
+    <div class="bgtab on" id=bgtab_agents onclick="setBgTab('agents')"><svg class=ico data-ico=agent viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-agent"/> Agents</div>
+    <div class=bgtab id=bgtab_shells onclick="setBgTab('shells')"><svg class=ico data-ico=keyboard viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-keyboard"/> Shells</div>
   </div>
   <div class=bgdbody>
     <div class="card span2" id=bgpanel style=display:none>
-      <h2><span>🤖 Background agents</span><span class=cnt id=bgc style=color:#f5b443></span></h2>
+      <h2><span><svg class=ico data-ico=agent viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-agent"/> Background agents</span><span class=cnt id=bgc style=color:#f5b443></span></h2>
       <div class=bggrid id=bg></div>
     </div>
     <div class="card span2" id=shpanel style=display:none>
-      <h2><span>⌨ Background shells</span><span class=cnt id=shc style=color:#f5b443></span></h2>
+      <h2><span><svg class=ico data-ico=keyboard viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-keyboard"/> Background shells</span><span class=cnt id=shc style=color:#f5b443></span></h2>
       <div class=bggrid id=sh></div>
     </div>
   </div>
 </aside></div>
 <div id=nextRoot class="tracker-next cr" hidden></div>
-<footer class=foot>Made with ❤️ in Bengaluru. Developed by <a href="https://tinyurl.com/pritamm93" target=_blank rel=noopener>Pritam</a>.</footer>
+<footer class=foot>Made with <svg class=ico data-ico=heart viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-heart"/> in Bengaluru. Developed by <a href="https://tinyurl.com/pritamm93" target=_blank rel=noopener>Pritam</a>.</footer>
 <div class=toasts id=toasts></div>
 <div class=overlay id=diffmodal onclick="if(event.target===this)closeDiff()">
   <div class=modal>
-    <div class=mh><span class=fn id=diffname>file</span><span class=pp id=diffpath></span><span class=mnav><span class=mbtn onclick="navModal(-1)" title="Previous (←)">‹</span><span id=diffnav class=mpos></span><span class=mbtn onclick="navModal(1)" title="Next (→)">›</span><span class=mbtn onclick="navFirst()" title="Jump to latest">⤒</span></span><span class=mdbtn onclick="copyModal('diffbody',this)" title="Copy to clipboard">⧉ Copy</span><span class=mdbtn onclick="popOut('diffname','diffbody')" title="Open in a new tab">⤢ New tab</span><span class=mdbtn id=diffall onclick=toggleDiffAll() title="Show the whole file around every edit" style=display:none>⇕ Expand all</span><span class=mdbtn id=diffmd onclick=toggleDiffMd() style=display:none>◧ Rendered</span><span class=x onclick=closeDiff()>✕</span></div>
+    <div class=mh><span class=fn id=diffname>file</span><span class=pp id=diffpath></span><span class=mnav><span class=mbtn onclick="navModal(-1)" title="Previous"><svg class=ico data-ico=chevron-left viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-chevron-left"/></span><span id=diffnav class=mpos></span><span class=mbtn onclick="navModal(1)" title="Next"><svg class=ico data-ico=chevron viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-chevron"/></span><span class=mbtn onclick="navFirst()" title="Jump to latest"><svg class=ico data-ico=jump-top viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-jump-top"/></span></span><span class=mdbtn onclick="copyModal('diffbody',this)" title="Copy to clipboard"><svg class=ico data-ico=copy viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-copy"/> Copy</span><span class=mdbtn onclick="popOut('diffname','diffbody')" title="Open in a new tab"><svg class=ico data-ico=expand viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-expand"/> New tab</span><span class=mdbtn id=diffall onclick=toggleDiffAll() title="Show the whole file around every edit" style=display:none><svg class=ico data-ico=expand-vertical viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-expand-vertical"/> Expand all</span><span class=mdbtn id=diffmd onclick=toggleDiffMd() style=display:none><svg class=ico data-ico=layout viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-layout"/> Rendered</span><span class=x onclick=closeDiff()><svg class=ico data-ico=close viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-close"/></span></div>
     <div class=mb id=diffbody></div>
   </div>
 </div>
 <div class=overlay id=msgmodal onclick="if(event.target===this)closeMsg()">
   <div class=modal>
-    <div class=mh><span class=fn id=msgtitle>Narration</span><span class=pp id=msgwhen></span><span class=mnav><span class=mbtn onclick="navModal(-1)" title="Previous (←)">‹</span><span id=msgnav class=mpos></span><span class=mbtn onclick="navModal(1)" title="Next (→)">›</span><span class=mbtn onclick="navFirst()" title="Jump to latest">⤒</span></span><span class=mdbtn onclick="copyModal('msgbody',this)" title="Copy to clipboard">⧉ Copy</span><span class=mdbtn onclick="popOut('msgtitle','msgbody')" title="Open in a new tab">⤢ New tab</span><span class=x onclick=closeMsg()>✕</span></div>
+    <div class=mh><span class=fn id=msgtitle>Narration</span><span class=pp id=msgwhen></span><span class=mnav><span class=mbtn onclick="navModal(-1)" title="Previous"><svg class=ico data-ico=chevron-left viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-chevron-left"/></span><span id=msgnav class=mpos></span><span class=mbtn onclick="navModal(1)" title="Next"><svg class=ico data-ico=chevron viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-chevron"/></span><span class=mbtn onclick="navFirst()" title="Jump to latest"><svg class=ico data-ico=jump-top viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-jump-top"/></span></span><span class=mdbtn onclick="copyModal('msgbody',this)" title="Copy to clipboard"><svg class=ico data-ico=copy viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-copy"/> Copy</span><span class=mdbtn onclick="popOut('msgtitle','msgbody')" title="Open in a new tab"><svg class=ico data-ico=expand viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-expand"/> New tab</span><span class=x onclick=closeMsg()><svg class=ico data-ico=close viewBox="0 0 24 24" aria-hidden=true focusable=false><use href="#i-close"/></span></div>
     <div class=msgbody id=msgbody></div>
   </div>
 </div>

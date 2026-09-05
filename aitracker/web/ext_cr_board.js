@@ -539,9 +539,9 @@ window.CR = window.CR || {};
       return wrap.firstElementChild;
     }
 
-    function emoji(char, cls, label) {
+    function glyph(name, cls, label) {
       return h('span', { class: 'tn-emo' + (cls ? ' ' + cls : ''), 'aria-hidden': 'true', title: label || null },
-        [char]);
+        [icon(name)]);
     }
 
     // -- shell (built once) ------------------------------------------------
@@ -854,12 +854,21 @@ window.CR = window.CR || {};
     // "absolute feature parity with the old default view, including the
     // information present in there". Returns the parts joined, never one.
     function railRowMeta(s, now) {
-      var parts = [];
-      if (s.open_flags) parts.push('🚩 ' + s.open_flags);
-      if (s.note_count) parts.push('📝 ' + s.note_count);
-      if (s.bg) parts.push('🤖 ' + s.bg);
-      parts.push(ago(now - (s.mtime || 0)));
-      return parts.join(' · ');
+      // Resolved with the icon conversion: the glyphs are ELEMENTS now, so this
+      // builds an ARRAY and concat()s -- never .join(), which would stringify a
+      // glyph span into "[object HTMLSpanElement]" (the exact trap the icon
+      // branch's own merge notes call out).
+      var groups = [];
+      if (s.open_flags) groups.push([glyph('flag', 'tn-emo-f'), ' ' + s.open_flags + ' flag' + (s.open_flags !== 1 ? 's' : '')]);
+      if (s.note_count) groups.push([glyph('note', ''), ' ' + s.note_count]);
+      if (s.bg) groups.push([glyph('agent', ''), ' ' + s.bg]);
+      groups.push([ago(now - (s.mtime || 0))]);
+      var out = [];
+      groups.forEach(function (g, i) {
+        if (i) out.push(' · ');
+        out = out.concat(g);
+      });
+      return out;
     }
 
     // BUG FIX: todoTicks() (the full tick bar) was only ever called from the board
@@ -916,7 +925,7 @@ window.CR = window.CR || {};
 
       if (pinnedShown.length) {
         container.appendChild(h('div', { class: 'cr-rail-group-header' },
-          ['📌 Pinned — ' + pinnedShown.length + ' · newest first']));
+          [glyph('pin'), 'Pinned — ' + pinnedShown.length + ' · newest first']));
         pinnedShown.forEach(function (s) { container.appendChild(railRow(s, now)); });
       }
       if (unpinnedShown.length || !opts) {
@@ -947,10 +956,10 @@ window.CR = window.CR || {};
           container.appendChild(h('div', {
             class: 'cr-rail-agentrow' + (isOpen ? ' cr-rail-agentrow--open' : ''),
             tabindex: '0', role: 'button', 'aria-expanded': isOpen ? 'true' : 'false',
-            title: '🤖 Agents · ' + b.label, 'aria-label': '🤖 Agents · ' + b.label,
+            title: 'Agents · ' + b.label, 'aria-label': 'Agents · ' + b.label,
             onclick: function () { ctx && ctx.emit && ctx.emit('rail:expandAgents', { group: g }); },
             onkeydown: function (e) { if (e.key === 'Enter') ctx && ctx.emit && ctx.emit('rail:expandAgents', { group: g }); }
-          }, [emoji('🤖', '', null), '🤖 Agents · ' + esc(b.label) + (b.live ? ' (' + b.live + ' live)' : ''),
+          }, [glyph('agent', '', null), 'Agents · ' + esc(b.label) + (b.live ? ' (' + b.live + ' live)' : ''),
               h('span', { class: 'cr-rail-agentchevron' }, [icon('chevron', '<path d="M9 6l6 6-6 6"/>')])]));
           if (isOpen) {
             collapseAgentRuns(b.sessions).sort(function (a, c) { return (c.mtime || 0) - (a.mtime || 0); })
@@ -975,7 +984,10 @@ window.CR = window.CR || {};
       var baseSessions = railLiveOnly
         ? sessions.filter(function (s) { return (now - (s.mtime || 0)) < LIVE_WINDOW; })
         : sessions;
-      els.railCount.textContent = railLiveOnly ? (baseSessions.length + ' live ✕') : String(sessions.length);
+      // innerHTML is safe here: the only interpolated value is a NUMBER (a count),
+      // never a session-derived string. The clear-the-filter affordance is an icon.
+      if (railLiveOnly) els.railCount.innerHTML = baseSessions.length + ' live ' + ico('close');
+      else els.railCount.textContent = String(sessions.length);
       els.railCount.classList.toggle('cr-rail-count--on', railLiveOnly);
       var railCountLabel = railLiveOnly ? 'Showing live only — click to show all' : 'Click to show live sessions only';
       els.railCount.title = railCountLabel;
@@ -1268,7 +1280,10 @@ window.CR = window.CR || {};
       var projLabel = s.title ? (s.project || '') : (s.id || '').slice(0, 8);
       var srcLabelText = toolLabel(s.source);
       var isLiveRow = (now - (s.mtime || 0)) < LIVE_WINDOW;
-      var statusText = s.waiting ? '⏳ answer' : ((s.ended && isLiveRow) ? '✅ done' : '');
+      // Icon conversion: no literal emoji here -- the badge renders through the
+      // shared sprite (glyph/'hourglass'/'check'), same as every other icon in
+      // this file, so it follows ICON_STYLE (icons/emoji/text) like the rest.
+      var statusKind = s.waiting ? 'waiting' : ((s.ended && isLiveRow) ? 'done' : '');
       // GAP CLOSE: flag_text rides the row's existing tooltip too — same reasoning as
       // tileHead() above. '' when null/absent, so an unflagged row's tooltip is
       // byte-for-byte unchanged.
@@ -1283,30 +1298,31 @@ window.CR = window.CR || {};
         (s.model ? '\nModel: ' + s.model : '') +
         (todoLabel ? '\n' + (s.todo_done || 0) + ' of ' + s.todo_total + ' todos done' +
           (s.todo_current ? ' — in progress: ' + s.todo_current : '') : '') +
-        (s.flag_text ? '\n🚩 ' + s.flag_text : '') +
-        (s.note_count ? '\n📝 ' + s.note_count + ' note' + (s.note_count === 1 ? '' : 's') : '');
+        (s.flag_text ? '\nFlags: ' + s.flag_text : '') +
+        (s.note_count ? '\nNotes: ' + s.note_count + ' note' + (s.note_count === 1 ? '' : 's') : '');
       // Colour never carries meaning alone: the state word (and, for a pinned
       // session, "(pinned)") rides along in aria-label (title keeps the fuller
       // prompt/cwd/snippet tooltip it already had).
       var label = name + (s.pinned ? ' (pinned)' : '') + (dir ? ', ' + dir : '') + ' — ' + orbStateWord(state) +
         (todoLabel ? ', ' + todoLabel + ' todos' : '');
       // Search-result rows (requirement 5's ordering note): the server's
-      // ranking is used AS-IS — a pinned hit still shows its 📌 marker inline
-      // rather than being pulled into a separate "Pinned" group the way
-      // browsing does, which would re-sort exactly what search must not.
-      var displayName = (s.pinned ? '📌 ' : '') + (s.agent ? '🤖 ' : '') + name;
+      // ranking is used AS-IS — pinned and agent states are shown via dot
+      // colour and UI elements, not as inline prefixes, to keep the title
+      // clean and avoid duplicate visual indicators.
+      var displayName = name;
       // GAP CLOSE (rail parity): the classic sidebar's row carries an inline
-      // pin toggle (📌, togglePin()) and rename control (✎, renameSession())
-      // — the rail only ever DISPLAYED pinned state (the 📌 prefix above),
-      // with no way to pin/unpin or rename a session anywhere in this UI.
-      // Mirrors classic exactly: same `stopPropagation` (so clicking either
-      // button opens nothing), same title/on-state semantics.
+      // pin toggle (pin icon, togglePin()) and rename control (edit icon,
+      // renameSession()) — the rail only ever DISPLAYED pinned state (the dot
+      // colour + aria-label above), with no way to pin/unpin or rename a
+      // session anywhere in this UI. Mirrors classic exactly: same
+      // `stopPropagation` (so clicking either button opens nothing), same
+      // title/on-state semantics.
       var actions = h('div', { class: 'cr-rail-actions' }, [
         h('button', {
           class: 'cr-rail-pin' + (s.pinned ? ' cr-rail-pin--on' : ''), type: 'button',
           title: s.pinned ? 'Unpin' : 'Pin to top', 'aria-label': s.pinned ? 'Unpin' : 'Pin to top',
           onclick: function (e) { e.stopPropagation(); toggleSessionPin(s.id); }
-        }, ['📌']),
+        }, [glyph('pin', '')]),
         h('button', {
           class: 'cr-rail-rename', type: 'button',
           title: 'Rename', 'aria-label': 'Rename this session',
@@ -1314,7 +1330,7 @@ window.CR = window.CR || {};
             e.stopPropagation();
             if (ctx && typeof ctx.dialog === 'function') ctx.dialog('rename', { sessionId: s.id, currentTitle: s.title || '' });
           }
-        }, ['✎']),
+        }, [glyph('edit', '')]),
       ]);
       return h('div', {
         class: 'cr-rail-row' + (s.id === selectedSessionId ? ' cr-rail-row--selected' : ''),
@@ -1327,17 +1343,28 @@ window.CR = window.CR || {};
           h('span', { class: 'cr-rail-title' }, [displayName]),
           dirLine ? h('span', { class: 'cr-rail-dir' }, [dirLine]) : null,
         ]),
-        statusText ? h('span', {
-          class: 'cr-rail-status cr-rail-status--' + (s.waiting ? 'waiting' : 'done'),
-          title: s.waiting ? 'waiting for your answer — respond in the session' : 'completed its last run',
-        }, [statusText]) : null,
+        statusKind ? h('span', {
+          class: 'cr-rail-status cr-rail-status--' + statusKind,
+          title: statusKind === 'waiting'
+            ? 'waiting for your answer — respond in the session'
+            : 'completed its last run',
+        }, [glyph(statusKind === 'waiting' ? 'hourglass' : 'check', ''),
+            ' ' + (statusKind === 'waiting' ? 'answer' : 'done')]) : null,
         h('span', { class: 'cr-rail-meta' },
           // GAP CLOSE (rail parity): `s._runs` only exists on a row folded by
           // collapseAgentRuns() above (a re-run collapsed into one row) —
           // classic's own `×N` badge (app.js: `s._runs>1`), absent everywhere
-          // else, same as todoLabel already was.
-          [[s._runs > 1 ? ('×' + s._runs) : '', todoLabel, projLabel, srcLabelText, railRowMeta(s, now)]
-            .filter(Boolean).join(' · ')]),
+          // else, same as todoLabel already was. railRowMeta() can return icon
+          // elements (glyph()), not just strings, so this stays an array
+          // `.concat()` rather than a `.join()` — a naive string join would
+          // stringify a DOM node instead of rendering it.
+          // The project name and source label are the classic sidebar's own
+          // meta line (app.js sessionRow's `bits`), added here for parity.
+          (s._runs > 1 ? ['×' + s._runs + ' · '] : [])
+            .concat(todoLabel ? [todoLabel + ' · '] : [])
+            .concat(projLabel ? [projLabel + ' · '] : [])
+            .concat(srcLabelText ? [srcLabelText + ' · '] : [])
+            .concat(railRowMeta(s, now))),
         actions,
       ]);
     }
@@ -1453,13 +1480,13 @@ window.CR = window.CR || {};
       els.flagCountBtn = h('button', {
         class: 'cr-flagcount', type: 'button', title: 'Open the flag list', 'aria-label': 'Open the flag list',
         onclick: function () { ctx && ctx.emit && ctx.emit('open:flags'); }
-      }, [emoji('🚩', 'tn-emo-f'), '0']);
+      }, [glyph('flag', 'tn-emo-f'), '0']);
       els.topbar.appendChild(els.flagCountBtn);
 
       els.topbar.appendChild(h('button', {
         class: 'cr-bell', type: 'button', title: 'Notifications', 'aria-label': 'Notifications',
         onclick: function () { ctx && ctx.emit && ctx.emit('toggle:notifications'); }
-      }, [emoji('🔔', '')]));
+      }, [glyph('bell', '')]));
 
       // BLOCKER 1: 'Config'/'Help' labels wrapped in `.cr-topbar-label` so the
       // phone-tier CSS can drop to icon-only — `title`/`aria-label` already
@@ -1467,12 +1494,12 @@ window.CR = window.CR || {};
       els.topbar.appendChild(h('button', {
         class: 'cr-icon-btn', type: 'button', title: 'Config', 'aria-label': 'Config',
         onclick: function () { ctx && ctx.emit && ctx.emit('open:config'); }
-      }, [emoji('⚙️', ''), h('span', { class: 'cr-topbar-label' }, ['Config'])]));
+      }, [glyph('gear', ''), h('span', { class: 'cr-topbar-label' }, ['Config'])]));
 
       els.topbar.appendChild(h('button', {
         class: 'cr-icon-btn', type: 'button', title: 'Help', 'aria-label': 'Help',
         onclick: function () { ctx && ctx.emit && ctx.emit('open:help'); }
-      }, [emoji('❓', ''), h('span', { class: 'cr-topbar-label' }, ['Help'])]));
+      }, [glyph('help', ''), h('span', { class: 'cr-topbar-label' }, ['Help'])]));
 
       buildThemeControl();
 
@@ -1749,8 +1776,8 @@ window.CR = window.CR || {};
       if (state === 'failing') return 'fail: ' + (s && s.fail_cmd);
       return { awaiting: 'Waiting on you', working: 'Working', landed: 'Landed' }[state] || state;
     }
-    function stateEmoji(state) {
-      return { awaiting: ['⏳', 'tn-emo-a'], working: ['🟡', ''], flagged: ['🚩', 'tn-emo-f'], failing: ['❌', 'tn-emo-f'], landed: ['✅', 'tn-emo-d'] }[state] || ['', ''];
+    function stateIcon(state) {
+      return { awaiting: ['hourglass', 'tn-emo-a'], working: ['working', ''], flagged: ['flag', 'tn-emo-f'], failing: ['x', 'tn-emo-f'], landed: ['check', 'tn-emo-d'] }[state] || ['', ''];
     }
 
     function todoTicks(s) {
@@ -1817,7 +1844,7 @@ window.CR = window.CR || {};
     }
 
     function tileHead(s, state, now) {
-      var ew = stateEmoji(state);
+      var ew = stateIcon(state);
       // GAP CLOSE: flag_text (registry.py's list dict, s.flag_text) is the unresolved
       // flag's own text — the badge above already carries the COUNT (stateWord's "N
       // flags open"); the text rides the same `title` tooltip mechanism every other
@@ -1831,10 +1858,10 @@ window.CR = window.CR || {};
       var flagTitle = (state === 'flagged' && s.flag_text) ? s.flag_text
         : (state === 'failing' && s.fail_cmd) ? stateWord(state, s) : null;
       var kids = [
-        emoji(ew[0], ew[1]),
+        glyph(ew[0], ew[1]),
         h('span', { class: 'cr-tile-state', title: flagTitle }, [stateWord(state, s) + (state === 'awaiting' ? ' · ' + ago(now - (s.mtime || 0)) : '')]),
       ];
-      if (s.pinned) kids.push(emoji('📌', '', 'Pinned'));
+      if (s.pinned) kids.push(glyph('pin', '', 'Pinned'));
       var head = h('div', { class: 'cr-tile-head', 'data-state': state }, kids);
       if (state === 'working') {
         var dot = h('span', { class: 'cr-tile-dot is-working' });
@@ -1943,7 +1970,7 @@ window.CR = window.CR || {};
         // Rendered honestly with what exists rather than fabricating the
         // other two counters — REQUIRED ADDITION in the report.
         var sidebar = h('div', { class: 'cr-tile-sidebar' }, [
-          h('div', { class: 'cr-tile-counts' }, [emoji('📝', 'tn-emo-n'), (s.note_count || 0) + ' notes']),
+          h('div', { class: 'cr-tile-counts' }, [glyph('note', 'tn-emo-n'), (s.note_count || 0) + ' notes']),
           h('button', {
             class: 'cr-tile-action', type: 'button',
             onclick: function (e) { e.stopPropagation(); ctx && ctx.emit && ctx.emit('terminal:open', { id: s.id }); }
@@ -1965,7 +1992,7 @@ window.CR = window.CR || {};
     function agentGroupTile(t, now) {
       var attrs = tileBaseAttrs(t);
       attrs.class = 'cr-tile cr-tile--agentgroup';
-      attrs.title = '🤖 Agents · ' + t.label;
+      attrs.title = 'Agents · ' + t.label;
       var total = t.sessions.length;
       var live = t.sessions.filter(function (s) { return sessionState(s, now) !== 'idle'; }).length;
       var sentence = total + ' background agent' + (total === 1 ? '' : 's') +
@@ -1973,7 +2000,7 @@ window.CR = window.CR || {};
       return h('div', attrs, [
         h('div', { class: 'cr-tile-head' }, [
           icon('chevron', '<path d="M9 6l6 6-6 6"/>'),
-          emoji('🤖', ''),
+          glyph('agent', ''),
         ]),
         h('div', { class: 'cr-tile-title cr-tile-title--agent' }, ['Agents · ' + t.label]),
         h('div', { class: 'cr-tile-line' }, [sentence]),

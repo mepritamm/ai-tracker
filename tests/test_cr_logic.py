@@ -1140,7 +1140,7 @@ function makeEl() {
 
 var stubEl = makeEl();
 window.document = {
-  createElement: () => makeEl(), createTextNode: () => makeEl(),
+  createElement: () => makeEl(), createElementNS: (ns, tag) => makeEl(), createTextNode: () => makeEl(),
   getElementById: () => stubEl, querySelector: () => stubEl, querySelectorAll: () => [stubEl],
   addEventListener() {}, dispatchEvent() {},
   documentElement: stubEl, body: stubEl, head: stubEl, readyState: "complete",

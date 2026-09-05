@@ -520,21 +520,28 @@ class TestRenamedLaunchButtonsAndNewControls(unittest.TestCase):
         self.src = open(_EXT_LAUNCH_JS, encoding="utf-8").read()
 
     def test_here_pair_labels(self):
-        self.assertIn("▶ Open terminal here", self.src)
-        self.assertIn("⟲ Resume terminal here", self.src)
+        # Symbols became inline <svg><use href="#i-NAME"/></svg> icons emitted by ico(name) --
+        # the icon builds its href at runtime by concatenation, so the literal call site
+        # (ico("play")/ico("redo")) is what the static source actually shows. The words remain
+        # the durable part of the label.
+        self.assertIn("Open terminal here", self.src)
+        self.assertIn('ico("play")', self.src)
+        self.assertIn("Resume terminal here", self.src)
+        self.assertIn('ico("redo")', self.src)
 
     def test_external_pair_is_renamed(self):
-        self.assertIn("↗ External terminal", self.src)
-        self.assertIn("↗ External resume", self.src)
+        self.assertIn("External terminal", self.src)
+        self.assertIn("External resume", self.src)
+        self.assertIn('ico("external")', self.src)
         # the old, unqualified labels must not survive the rename
-        self.assertNotIn(">↗ Terminal</button>", self.src)
-        self.assertNotIn(">↗ Resume</button>", self.src)
+        self.assertNotIn(">Terminal</button>", self.src)
+        self.assertNotIn(">Resume</button>", self.src)
 
     def test_external_pair_is_still_host_gated(self):
         # Unchanged: the native "External …" buttons are still built inside the localOnly()
         # branch, so they stay off the DOM entirely off-localhost.
         gate_idx = self.src.index("if (localOnly())")
-        ext_idx = self.src.index("↗ External terminal")
+        ext_idx = self.src.index("External terminal")
         self.assertGreater(ext_idx, gate_idx)
 
     def test_detail_pane_render_is_back_to_four_buttons(self):

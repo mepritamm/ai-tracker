@@ -284,6 +284,72 @@ class TestApiConfigWrite(_ServerCase):
         self.assertEqual(j["MAX_TERMS"], {"value": 5, "overridden": True, "restart": False})
 
 
+class TestApiConfigIconKeys(_ServerCase):
+    """ICON_STYLE/ICON_SCALE -- the two Config-dialog knobs added for the icon-sprite
+    conversion (config.py: config.EDITABLE/config.VALIDATORS, resolve_icon_style/
+    resolve_icon_scale). Same POST/GET round-trip idiom as TestApiConfigWrite above;
+    kept as its own class since it's a distinct feature, not a MAX_TERMS variant."""
+
+    def test_icon_style_each_valid_value_round_trips(self):
+        for val in ("icons", "emoji", "text"):
+            st, j = self._post("/api/config", {"key": "ICON_STYLE", "value": val})
+            self.assertEqual(st, 200)
+            self.assertEqual(j, {"ok": True, "key": "ICON_STYLE", "value": val, "restart": False})
+
+            # a separate GET confirms it actually reached config.json, not just the echo
+            st, j = self._get_json("/api/config")
+            self.assertEqual(st, 200)
+            self.assertEqual(j["ICON_STYLE"], {"value": val, "overridden": True, "restart": False})
+            self.assertEqual(json.load(open(config.CONFIG_FILE))["ICON_STYLE"], val)
+
+    def test_icon_style_invalid_value_is_rejected_and_never_reaches_disk(self):
+        st, j = self._post("/api/config", {"key": "ICON_STYLE", "value": "sparkles"})
+        self.assertEqual(st, 400)
+        self.assertEqual(j, {"error": "invalid value for ICON_STYLE"})
+        self.assertFalse(os.path.exists(config.CONFIG_FILE))
+
+    def test_icon_scale_in_range_value_round_trips(self):
+        st, j = self._post("/api/config", {"key": "ICON_SCALE", "value": 150})
+        self.assertEqual(st, 200)
+        self.assertEqual(j, {"ok": True, "key": "ICON_SCALE", "value": 150, "restart": False})
+
+        st, j = self._get_json("/api/config")
+        self.assertEqual(st, 200)
+        self.assertEqual(j["ICON_SCALE"], {"value": 150, "overridden": True, "restart": False})
+        self.assertEqual(json.load(open(config.CONFIG_FILE))["ICON_SCALE"], 150)
+
+    def test_icon_scale_out_of_range_is_rejected_and_never_reaches_disk(self):
+        # below range
+        st, j = self._post("/api/config", {"key": "ICON_SCALE", "value": 74})
+        self.assertEqual(st, 400)
+        self.assertEqual(j, {"error": "invalid value for ICON_SCALE"})
+        self.assertFalse(os.path.exists(config.CONFIG_FILE))
+
+        # above range
+        st, j = self._post("/api/config", {"key": "ICON_SCALE", "value": 201})
+        self.assertEqual(st, 400)
+        self.assertEqual(j, {"error": "invalid value for ICON_SCALE"})
+        self.assertFalse(os.path.exists(config.CONFIG_FILE))
+
+    def test_icon_scale_boundary_values_are_accepted(self):
+        """Off-by-one guard on the [75, 200] clamp -- both edges must be INSIDE the range."""
+        for val in (75, 200):
+            st, j = self._post("/api/config", {"key": "ICON_SCALE", "value": val})
+            self.assertEqual(st, 200)
+            self.assertEqual(j, {"ok": True, "key": "ICON_SCALE", "value": val, "restart": False})
+            st, j = self._get_json("/api/config")
+            self.assertEqual(j["ICON_SCALE"], {"value": val, "overridden": True, "restart": False})
+
+    def test_icon_keys_default_in_snapshot_when_unoverridden(self):
+        """Nothing overridden anywhere -> the defaults that reproduce today's appearance
+        exactly: ICON_STYLE "icons", ICON_SCALE 100 (see resolve_icon_style/
+        resolve_icon_scale in config.py)."""
+        st, j = self._get_json("/api/config")
+        self.assertEqual(st, 200)
+        self.assertEqual(j["ICON_STYLE"], {"value": "icons", "overridden": False, "restart": False})
+        self.assertEqual(j["ICON_SCALE"], {"value": 100, "overridden": False, "restart": False})
+
+
 # =============================================================================
 # 2. GET /api/search -- whole-stack cross-session search (not /api/list's 200 window)
 # =============================================================================

@@ -384,72 +384,32 @@
    overrides rather than composes (this file has already been bitten
    by that mistake once — don't repeat it).
 
-   DEVIATION FROM DOC 01 / decision 4, PER OWNER INSTRUCTION (this pass):
-   decision 4 asked for emoji to keep "their own identity — a flag still
-   reads red-ish, a tick green-ish." The owner has now explicitly
-   overridden that: theme harmony wins over glyph identity. The previous
-   pass's partial `sepia(.25-.4)` base — kept over full-colour source
-   art — was confirmed in a live render to still read as a foreign
-   multi-colour object sitting on the surface. Partial sepia can't
-   out-compete an emoji's own saturated native colour no matter how much
-   hue-rotate/saturate is piled on top of it.
+   TRANSITION TO INLINE SVG (this pass):
+   Glyphs are now inline SVG elements using `stroke="currentColor"` instead
+   of emoji. The old filter-based approach (grayscale → sepia → hue-rotate)
+   is incompatible with stroked SVG. Each role is now tinted directly by a
+   plain `color:` CSS token. Token choices are deliberately muted to
+   preserve the owner's design intent: faint role differentiation with
+   theme harmony winning over glyph identity. Five roles per theme (neutral,
+   awaiting, flagged, done, note) — each role's color token stays uniform
+   across both light and dark contexts, with the theme providing the
+   override (e.g., text-secondary in light, text-agent in dark). Both
+   copies (this one and the sibling in ext_cr_dialogs.css) must be edited
+   together; a mismatch is a bug. */
+.tracker-next .tn-emo   { color: var(--text-secondary); font-style: normal; }
+.tracker-next .tn-emo-a { color: var(--text-awaiting); font-style: normal; }
+.tracker-next .tn-emo-f { color: var(--text-flagged); font-style: normal; }
+.tracker-next .tn-emo-d { color: var(--state-done); font-style: normal; }
+.tracker-next .tn-emo-n { color: var(--text-thinking); font-style: normal; }
 
-   NEW RECIPE: `grayscale(1)` first, which erases every source hue
-   entirely (a red flag and a green tick both become plain luminance),
-   then `sepia(1)` to re-introduce exactly ONE fixed warm hue (empirically
-   ~38deg out of CSS's sepia matrix, for a mid-tone grayscale input — the
-   classic recolour trick: sepia needs a neutral base to rotate, not an
-   emoji's own scattered native hues). `hue-rotate()` then lands that one
-   hue on the nearest real ink token for the role. `saturate()`,
-   `brightness()` and `contrast()` are IDENTICAL across all 5 roles
-   within a theme — the only thing that varies role to role is the hue
-   angle; chroma and lightness stay constant. That is what "faint role
-   differentiation" means here: a flag sits warmer (hue ~13deg, toward
-   --text-flagged / --text-failed) than a tick (cooler, hue ~108-146deg,
-   --text-link / --state-done's forest/sage) — but neither is punched up
-   or down in intensity relative to the other, unlike the old recipe
-   (saturate ranged 1.05-1.65, brightness .7-.97, per role — that
-   inconsistency was itself part of why roles read as separate foreign
-   objects instead of one family).
-
-   Anchors used (verbatim palette hex, from the token blocks above):
-     neutral/agent (.tn-emo)   -> text-secondary #4A4237 (light) /
-                                   text-agent #C6B29B (dark)
-     awaiting      (.tn-emo-a) -> text-awaiting #9A4F19 (light) /
-                                   text-awaiting #F5C98E (dark)
-     flagged       (.tn-emo-f) -> text-flagged #7D3A28 (light) /
-                                   text-failed #E0A491 (dark — a closer
-                                   hue match to light's flagged than
-                                   dark's own text-flagged is)
-     done          (.tn-emo-d) -> text-link / state-done #3B5747 (light) /
-                                   #8FB187 (dark)
-     note          (.tn-emo-n) -> text-thinking #8A6D14 (light) /
-                                   #E5CB79 (dark)
-   Each hue-rotate() below is that anchor's HSL hue minus sepia(1)'s own
-   ~38deg base. LIGHT: brightness(.55) pulls the sepia base (which lands
-   ~L55-60% on typical mid-tone emoji art) down into the ink range the
-   target tokens actually sit in (L~25-35%), so glyphs read darker than
-   the cream surface (surface-page/-sunken #F1EEE0/#F4F1E8), per the
-   legibility floor. DARK: brightness(1.35) pushes that same base up into
-   the light-accent range the dark tokens use instead (L~61-77%), so
-   glyphs read lighter than the ink surface (surface-page/-sunken
-   #1E1B17/#243235). Legibility check: both directions land comfortably
-   past the 3:1 non-text floor (light ink ~L30% on ~L90% cream; dark tint
-   ~L70-77% on ~L10-15% ink) — no role needed to be backed off. */
-.tracker-next .tn-emo   { filter: grayscale(1) sepia(1) hue-rotate(0deg)   saturate(1.4) brightness(.55) contrast(1.1); font-style: normal; } /* neutral/agent -> text-secondary #4A4237 */
-.tracker-next .tn-emo-a { filter: grayscale(1) sepia(1) hue-rotate(-13deg) saturate(1.4) brightness(.55) contrast(1.1); font-style: normal; } /* awaiting -> text-awaiting #9A4F19 */
-.tracker-next .tn-emo-f { filter: grayscale(1) sepia(1) hue-rotate(-25deg) saturate(1.4) brightness(.55) contrast(1.1); font-style: normal; } /* flagged -> text-flagged #7D3A28 */
-.tracker-next .tn-emo-d { filter: grayscale(1) sepia(1) hue-rotate(108deg) saturate(1.4) brightness(.55) contrast(1.1); font-style: normal; } /* done -> text-link/state-done #3B5747 */
-.tracker-next .tn-emo-n { filter: grayscale(1) sepia(1) hue-rotate(7deg)   saturate(1.4) brightness(.55) contrast(1.1); font-style: normal; } /* note -> text-thinking #8A6D14 */
-
-/* Dark theme: same construction, brightness inverted to push light
-   instead of pulling dark (the surface is ink, not cream), saturate and
-   contrast nudged for the reason the old recipe already called out —
-   the identical saturate() reads more intense against a dark surface
-   than a light one — though it stays uniform across roles within this
-   block, per the "faint differentiation via hue only" rule above. */
-.tracker-next.is-dark .tn-emo   { filter: grayscale(1) sepia(1) hue-rotate(-6deg)  saturate(1.5) brightness(1.35) contrast(1.05); } /* neutral/agent -> text-agent #C6B29B */
-.tracker-next.is-dark .tn-emo-a { filter: grayscale(1) sepia(1) hue-rotate(-4deg)  saturate(1.5) brightness(1.35) contrast(1.05); } /* awaiting -> text-awaiting #F5C98E */
-.tracker-next.is-dark .tn-emo-f { filter: grayscale(1) sepia(1) hue-rotate(-24deg) saturate(1.5) brightness(1.35) contrast(1.05); } /* flagged -> text-failed #E0A491 */
-.tracker-next.is-dark .tn-emo-d { filter: grayscale(1) sepia(1) hue-rotate(71deg)  saturate(1.5) brightness(1.35) contrast(1.05); } /* done -> state-done #8FB187 */
-.tracker-next.is-dark .tn-emo-n { filter: grayscale(1) sepia(1) hue-rotate(8deg)   saturate(1.5) brightness(1.35) contrast(1.05); } /* note -> text-thinking #E5CB79 */
+/* Dark theme: override tokens to the light-accent range for contrast on
+   a dark surface, while preserving role semantics (awaiting, flagged, etc).
+   Same role differentiation logic: color hue varies by role, but intensity
+   is uniform within theme, keeping roles tied to a common family rather
+   than reads as separate foreign objects. */
+.tracker-next.is-dark .tn-emo   { color: var(--text-agent); }
+.tracker-next.is-dark .tn-emo-a { color: var(--text-awaiting); }
+.tracker-next.is-dark .tn-emo-f { color: var(--text-failed); }
+.tracker-next.is-dark .tn-emo-d { color: var(--state-done); }
+.tracker-next.is-dark .tn-emo-n { color: var(--text-thinking); }
+.tracker-next .tn-emo svg { width: calc(1em * var(--ico-scale)); height: calc(1em * var(--ico-scale)); display: inline-block; vertical-align: -0.15em; flex-shrink: 0; }

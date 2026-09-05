@@ -912,19 +912,30 @@ def _rail_row_meta_driver_js():
     return r"""
 var OUT = {};
 (function () {
-  // railRowMeta()'s only dependency is app.js's own `ago()` string builder --
-  // stubbed to a fixed sentinel so an assertion about "the age is present"
-  // can never be satisfied by some other number that happens to appear.
+  // railRowMeta()'s dependencies: app.js's `ago()` string builder, stubbed to a
+  // fixed sentinel so "the age is present" can never be satisfied by some other
+  // number that happens to appear; and glyph(), which since the icon conversion
+  // returns a DOM ELEMENT -- stubbed to a marker string so the harness can
+  // assert which icons were emitted without a DOM.
   function ago(sec) { return 'AGE'; }
+  function glyph(name, cls) { return '<' + name + '>'; }
+  // railRowMeta returns an ARRAY (of strings and glyph elements) -- flatten it
+  // for assertion. Deliberately NOT the production path's job: this is only so
+  // the test can express "these parts are all present, in one row".
+  function flat(parts) { return parts.join(''); }
 
   %s
 
   var NOW = 1000;
-  OUT['plain']        = railRowMeta({ mtime: NOW }, NOW);
-  OUT['flagged']      = railRowMeta({ mtime: NOW, open_flags: 2 }, NOW);
-  OUT['noted']        = railRowMeta({ mtime: NOW, note_count: 3 }, NOW);
-  OUT['bg']           = railRowMeta({ mtime: NOW, bg: 4 }, NOW);
-  OUT['all_at_once']  = railRowMeta({ mtime: NOW, open_flags: 2, note_count: 3, bg: 4 }, NOW);
+  OUT['plain']        = flat(railRowMeta({ mtime: NOW }, NOW));
+  OUT['flagged']      = flat(railRowMeta({ mtime: NOW, open_flags: 2 }, NOW));
+  OUT['noted']        = flat(railRowMeta({ mtime: NOW, note_count: 3 }, NOW));
+  OUT['bg']           = flat(railRowMeta({ mtime: NOW, bg: 4 }, NOW));
+  OUT['all_at_once']  = flat(railRowMeta({ mtime: NOW, open_flags: 2, note_count: 3, bg: 4 }, NOW));
+  // The icon conversion's own trap: a glyph is an ELEMENT, so a .join() in the
+  // production path would render "[object HTMLSpanElement]". Pin that the row
+  // builder never does that.
+  OUT['no_stringified_dom'] = OUT['all_at_once'].indexOf('[object') < 0;
 })();
 console.log("===RAIL_TOGGLE_JSON_START===");
 console.log(JSON.stringify(OUT));
@@ -956,6 +967,7 @@ class TestRailRowMetaParity(unittest.TestCase):
         """THE REGRESSION, precisely: before the fix this returned the flag
         count ALONE and the age vanished from the row."""
         r = self.OUT["flagged"]
+        self.assertIn("<flag>", r)
         self.assertIn("2", r)
         self.assertIn("AGE", r)
 
@@ -963,11 +975,13 @@ class TestRailRowMetaParity(unittest.TestCase):
         """Note counts were tooltip-only in the rail; classic shows a visible
         badge, so parity means the count reaches the row itself."""
         r = self.OUT["noted"]
+        self.assertIn("<note>", r)
         self.assertIn("3", r)
         self.assertIn("AGE", r)
 
     def test_a_background_agent_row_keeps_its_age(self):
         r = self.OUT["bg"]
+        self.assertIn("<agent>", r)
         self.assertIn("4", r)
         self.assertIn("AGE", r)
 
@@ -975,8 +989,14 @@ class TestRailRowMetaParity(unittest.TestCase):
         """The whole point of parity: flags, notes, agents and age coexist on
         one row rather than the first one winning and hiding the rest."""
         r = self.OUT["all_at_once"]
-        for expected in ("2", "3", "4", "AGE"):
+        for expected in ("<flag>", "2", "<note>", "3", "<agent>", "4", "AGE"):
             self.assertIn(expected, r)
+
+    def test_row_never_stringifies_a_glyph_element(self):
+        """Since the icon conversion a glyph is a DOM element, so a .join() in
+        the row builder renders "[object HTMLSpanElement]" instead of an icon --
+        a trap this repo has already been bitten by once."""
+        self.assertTrue(self.OUT["no_stringified_dom"])
 
 
 class TestRailWidthMatchesClassicSidebar(unittest.TestCase):

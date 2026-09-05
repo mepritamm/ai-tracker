@@ -99,7 +99,7 @@
       "+ New Claude session</button>" +
       '<button class="mini extlaunchbtn" id=sidemanagetermbtn ' +
       'title="See every terminal running right now — peek into one, close one, or close them all">' +
-      "☰ Manage terminals</button>" +
+      ico("menu") + " Manage terminals</button>" +
       "</div>";
     var nc = document.getElementById("sidenewcwdbtn");
     if (nc) nc.onclick = function () { openPicker("cwd"); };
@@ -178,7 +178,7 @@
     pkTitleEl.className = "fn";
     var x = document.createElement("span");
     x.className = "x";
-    x.textContent = "✕";
+    x.innerHTML = ico("close");
     x.title = "Close";
     x.onclick = closePicker;
     mh.appendChild(pkTitleEl);
@@ -394,11 +394,11 @@
     const vtHtml =
       '<button class="mini extlaunchbtn" id=extvtopenbtn ' +
       'title="Open a terminal right here in the browser, cd\'d to this session\'s working directory">' +
-      "▶ Open terminal here</button>" +
+      ico("play") + " Open terminal here</button>" +
       (resumable
         ? '<button class="mini extlaunchbtn" id=extvtresumebtn ' +
           'title="Resume this session in a terminal right here in the browser (claude --resume)">' +
-          "⟲ Resume terminal here</button>"
+          ico("redo") + " Resume terminal here</button>"
         : "");
 
     let nativeHtml = "";
@@ -411,10 +411,10 @@
         nativeHtml =
           '<span id=extnative>' +
           '<button class="mini extlaunchbtn" id=extopenbtn ' +
-          'title="Open an external Terminal/iTerm window, cd\'d here — this machine only">↗ External terminal</button>' +
+          'title="Open an external Terminal/iTerm window, cd\'d here — this machine only">' + ico("external") + ' External terminal</button>' +
           (resumable
             ? '<button class="mini extlaunchbtn" id=extresumebtn ' +
-              'title="Resume via claude --resume in an external Terminal/iTerm window — this machine only">↗ External resume</button>'
+              'title="Resume via claude --resume in an external Terminal/iTerm window — this machine only">' + ico("external") + ' External resume</button>'
             : "") +
           "</span>";
       }

@@ -74,7 +74,7 @@ def login_page():
       "<div class=lt>AI Session Tracker</div><div class=ls>Private dashboard · protected access</div>"
       "<div class=lf><label>Username</label><input id=lu autocomplete=username autofocus></div>"
       "<div class=lf><label>Password</label><input id=lp type=password autocomplete=current-password></div>"
-      "<button class=lb type=submit>🔓 Unlock dashboard</button>"
+      "<button class=lb type=submit><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round' aria-hidden='true' focusable='false' style='width:1em;height:1em;vertical-align:-0.15em'><path d='M5 11h14v9H5z'/><path d='M8 11V7a4 4 0 0 1 7.5-2'/></svg> Unlock dashboard</button>"
       "<div class=le id=lerr></div>"
       "<div class=lfoot>HTTP Basic via <code>TRACKER_AUTH</code> · constant-time · read-only</div>"
       "</form></div>"

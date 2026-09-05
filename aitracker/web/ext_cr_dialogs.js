@@ -168,8 +168,11 @@
     return btn;
   }
 
-  function emoji(ch, cls, label) {
-    return h('span', { class: 'cr-emo tn-emo' + (cls ? ' ' + cls : ''), 'aria-hidden': 'true', title: label || null }, [ch]);
+  function glyph(name, cls, label) {
+    var span = h('span', { class: 'cr-emo tn-emo' + (cls ? ' ' + cls : ''), 'aria-hidden': 'true', title: label || null });
+    var iconEl = icon(name);
+    if (iconEl) span.appendChild(iconEl);
+    return span;
   }
 
   // ---------------------------------------------------------------------------
@@ -191,7 +194,7 @@
   function errorState(opts) {
     opts = opts || {};
     return h('div', { class: 'cr-state cr-state-error', role: 'alert' }, [
-      h('div', { class: 'cr-state-title' }, [emoji('⚠️', 'tn-emo-f'), ' ', opts.title || "Couldn't read this"]),
+      h('div', { class: 'cr-state-title' }, [glyph('alert', 'tn-emo-f'), ' ', opts.title || "Couldn't read this"]),
       h('div', { class: 'cr-state-body' }, [opts.body || 'Everything before the failure is shown.']),
     ]);
   }
@@ -231,7 +234,7 @@
     if (localStorage.getItem('cr.notif.nudgeDismissed') === '1') return null;
     if (!('Notification' in window) || Notification.permission !== 'default') return null;
     var row = h('div', { class: 'cr-nudge', role: 'note' }, [
-      emoji('🔔', 'tn-emo'),
+      glyph('bell', 'tn-emo'),
       h('span', { class: 'cr-nudge-text' }, [
         'Desktop alerts are off. Turn them on to hear about finished agents while this tab is in the background.',
       ]),
@@ -290,7 +293,7 @@
     var dismissed = false;
     var timer = null;
     var el = h('div', { class: 'cr-toast', role: 'status' }, [
-      emoji(opts.icon || '✅', opts.iconClass || 'tn-emo-d'),
+      glyph(opts.icon || 'check', opts.iconClass || 'tn-emo-d'),
       h('div', { class: 'cr-toast-body' }, [
         h('div', { class: 'cr-toast-title' }, [title]),
         opts.meta ? h('div', { class: 'cr-toast-meta' }, [opts.meta]) : null,
@@ -391,9 +394,10 @@
     });
     var head = h('div', { class: 'cr-dialog-head' }, [
       h('div', { class: 'cr-dialog-heading' }, [
-        // emoCls: role variant per doc 01's emoji table (e.g. 'tn-emo-f' for
-        // the flags 🚩 dialog) — defaults to the base tint when omitted.
-        emo ? emoji(emo, emoCls || null) : null,
+        // emo: an icon NAME (see the sprite symbol list); emoCls: role-tint
+        // class for it (e.g. 'tn-emo-f' for the flags dialog) — defaults to
+        // the base tint when omitted.
+        emo ? glyph(emo, emoCls || null) : null,
         h('h2', { id: titleId, class: 'cr-dialog-title' }, [title]),
       ]),
       h('div', { class: 'cr-dialog-context' }, [contextStr || '']),
@@ -584,7 +588,7 @@
     ['Alt+Enter', 'Sends newline-without-submit, not a submit.'],
     ['Ctrl+Space', 'Sends NUL.'],
     ['Mouse reporting', 'Press/drag/release/wheel forwarded to any program that asks for it.'],
-    ['Renderer switch', 'Toolbar ☀️/🌙 and a renderer control — xterm (default) or grid, per terminal.'],
+    ['Renderer switch', 'Toolbar theme toggle and a renderer control — xterm (default) or grid, per terminal.'],
     ['Model / effort', '/model <name> and /effort <level> typed into the CLI when it is in the foreground.'],
   ];
 
@@ -622,15 +626,15 @@
 
     wrap.appendChild(h('div', { class: 'cr-seccards' }, [
       h('div', { class: 'cr-seccard cr-seccard-brick' }, [
-        h('div', { class: 'cr-seccard-title' }, [emoji('⚠️', 'tn-emo-f'), ' Read this before you expose the server']),
+        h('div', { class: 'cr-seccard-title' }, [glyph('alert', 'tn-emo-f'), ' Read this before you expose the server']),
         h('ul', {}, [
           h('li', {}, ['The in-browser terminal is an unrestricted shell, reachable wherever the server is — no allowlist applies to it.']),
           h('li', {}, ['Treat TRACKER_AUTH with the seriousness you’d give a root password, and rotate it if you expose it publicly.']),
-          h('li', {}, ['"Local only" on the ↗ external-terminal buttons is best-effort, not a guarantee — a tunnel terminates locally too.']),
+          h('li', {}, ['"Local only" on the external-terminal buttons is best-effort, not a guarantee — a tunnel terminates locally too.']),
         ]),
       ]),
       h('div', { class: 'cr-seccard cr-seccard-forest' }, [
-        h('div', { class: 'cr-seccard-title' }, [emoji('✅', 'tn-emo-d'), ' What is actually confined']),
+        h('div', { class: 'cr-seccard-title' }, [glyph('check', 'tn-emo-d'), ' What is actually confined']),
         h('ul', {}, [
           h('li', {}, ['cat and ls in the command runner are confined to the session’s own directory — they can’t read your keys.']),
           h('li', {}, ['The command runner has no shell: argv is shlex.split and execvp’d, so shell metacharacters are never operators.']),
@@ -652,7 +656,7 @@
     // README.md:104-108) it always was.
 
     wrap.appendChild(h('div', { class: 'cr-help-footer' }, [
-      emoji('🧩', 'tn-emo'),
+      glyph('puzzle', 'tn-emo'),
       h('span', {}, ['Your tool isn’t listed? A provider is two functions.']),
       h('a', { class: 'cr-link', href: '#', text: 'Read' }),
     ]));
@@ -709,8 +713,8 @@
     PROVIDER_NOTES.forEach(function (p) {
       var card = h('div', { class: 'cr-provider-card' + (p.degraded ? ' is-degraded' : '') }, [
         h('div', { class: 'cr-provider-name' }, [p.name]),
-        p.ok ? h('div', { class: 'cr-provider-note' }, [emoji('✅', 'tn-emo-d'), ' ' + p.ok]) : null,
-        p.degraded ? h('div', { class: 'cr-provider-note cr-provider-degraded' }, [emoji('⏳', 'tn-emo-a'), ' ' + p.degraded]) : null,
+        p.ok ? h('div', { class: 'cr-provider-note' }, [glyph('check', 'tn-emo-d'), ' ' + p.ok]) : null,
+        p.degraded ? h('div', { class: 'cr-provider-note cr-provider-degraded' }, [glyph('hourglass', 'tn-emo-a'), ' ' + p.degraded]) : null,
       ]);
       wrap.appendChild(card);
     });
@@ -732,7 +736,7 @@
     // Header subtitle: 5c gives Help a bare "?" (not "ai-tracker" — that was never
     // this dialog's real subtitle, just a placeholder left over before the artboard
     // was consulted).
-    var chrome = buildChrome('help', 'Help', '❓', '?', false);
+    var chrome = buildChrome('help', 'Help', 'help', '?', false);
     chrome.panel.classList.add('cr-dialog-help');
     var tabs = h('div', { class: 'cr-tabpills', role: 'tablist' });
     var pane = h('div', { class: 'cr-tabpane' });
@@ -792,6 +796,8 @@
   // matches the exact env var name each key falls back to per config.py's own _ENV_NAME.
   var _ENVCHIP = {
     LIVE_WINDOW: null,   // never had an env var of its own — config.json > built-in default
+    ICON_STYLE: null,    // ditto — no env var, config.json > built-in default
+    ICON_SCALE: null,    // ditto — no env var, config.json > built-in default
     TERM_RENDERER: 'TRACKER_TERM_RENDERER',
     MAX_TERMS: 'TRACKER_MAX_TERMS',
     TERMINAL: 'TRACKER_TERMINAL',
@@ -974,6 +980,22 @@
     return h('div', { class: 'cr-slider-wrap' }, [input, out]);
   }
 
+  // Same shape as sliderCtlCommit (label tracks the thumb, onCommit fires once on
+  // 'change') but also takes `onInput`, fired on every 'input' tick while dragging --
+  // for a control that needs an instant, non-persisted visual preview during the drag
+  // itself (icon-size live preview) on top of the debounced server commit on release.
+  // sliderCtlCommit is left untouched above; MAX_TERMS keeps using that one as-is.
+  function sliderCtlLive(min, max, value, onCommit, onInput, suffix) {
+    var out = h('span', { class: 'cr-slider-val cr-mono' }, [String(value) + (suffix || '')]);
+    var input = h('input', { class: 'cr-slider', type: 'range', min: min, max: max, value: value });
+    input.addEventListener('input', function () {
+      out.textContent = input.value + (suffix || '');
+      onInput(Number(input.value));
+    });
+    input.addEventListener('change', function () { onCommit(Number(input.value)); });
+    return h('div', { class: 'cr-slider-wrap' }, [input, out]);
+  }
+
   function textFieldCtl(value, onCommit, opts) {
     opts = opts || {};
     var inp = h('input', {
@@ -1010,7 +1032,7 @@
     // this dialog is always served BY the tracker it's showing settings for, so
     // location.host already IS that address.
     var subtitle = (window.location && window.location.host) || '';
-    var chrome = buildChrome('config', 'Config', '⚙️', subtitle, true);
+    var chrome = buildChrome('config', 'Config', 'gear', subtitle, true);
     chrome.panel.classList.add('cr-dialog-config');
 
     var sections = ['Interface', 'Board', 'Terminal', 'Notifications', 'Server', 'Tunnel', 'Data files'];
@@ -1030,7 +1052,12 @@
     // onCommit)` builds, POSTs on commit, shows an honest Saved/Failed badge, and rolls the
     // control back to the server's last-known-good value on failure (never leaves the UI
     // showing a value the server rejected as if it had been accepted).
-    function serverRow(label, key, sub, ctlFn) {
+    // `onFail`, if given, runs BEFORE the section re-render on a rejected save -- for a
+    // row whose control has side effects beyond its own DOM (icon style/size apply live
+    // to the whole page instantly, not just to this control), the re-render alone snaps
+    // the control back but leaves that outside effect showing the rejected value. Optional
+    // and additive: existing callers that don't pass it behave exactly as before.
+    function serverRow(label, key, sub, ctlFn, onFail) {
       var meta = srv.cfg && srv.cfg[key];
       var value = meta ? meta.value : undefined;
       var status = statusBadge();
@@ -1042,6 +1069,7 @@
             showStatus(status, true);
           } else {
             showStatus(status, false, (resp && resp.error) || 'request failed');
+            if (typeof onFail === 'function') onFail();
             renderSection();   // snap every control in this section back to last-known-good
           }
         });
@@ -1058,6 +1086,39 @@
           segmented([['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']], themeVal, function (v) {
             if (_ctx && _ctx.theme && _ctx.theme.set) _ctx.theme.set(v);
           })));
+        // Re-applies the last server-known-good icon style/scale -- used to snap the
+        // LIVE preview (applyIconStyle, applied instantly by the two rows below, ahead
+        // of any server round-trip) back if a save is rejected. serverRow's own
+        // renderSection() already rebuilds the controls themselves; this covers the
+        // page-wide visual effect those controls also trigger, which a DOM re-render
+        // alone doesn't touch.
+        function revertIconPreview() {
+          if (typeof window.applyIconStyle !== 'function') return;
+          var styleVal = (srv.cfg && srv.cfg.ICON_STYLE) ? srv.cfg.ICON_STYLE.value : 'icons';
+          var scaleVal = (srv.cfg && srv.cfg.ICON_SCALE) ? srv.cfg.ICON_SCALE.value : 100;
+          window.applyIconStyle(styleVal || 'icons', scaleVal != null ? scaleVal : 100);
+        }
+        body.appendChild(serverRow('Icon style', 'ICON_STYLE',
+          'Icons draws the built-in symbol set; Emoji uses colour emoji; Text uses plain typographic glyphs.',
+          function (value, onCommit) {
+            return segmented([['icons', 'Icons'], ['emoji', 'Emoji'], ['text', 'Text']], value || 'icons', function (v) {
+              if (typeof window.applyIconStyle === 'function') {
+                var scaleVal = (srv.cfg && srv.cfg.ICON_SCALE) ? srv.cfg.ICON_SCALE.value : 100;
+                window.applyIconStyle(v, scaleVal != null ? scaleVal : 100);
+              }
+              onCommit(v);
+            });
+          }, revertIconPreview));
+        body.appendChild(serverRow('Icon size', 'ICON_SCALE',
+          'Scales icons/emoji across the app. Drag for a live preview; releases the slider to save.',
+          function (value, onCommit) {
+            return sliderCtlLive(75, 200, value != null ? value : 100, onCommit, function (v) {
+              if (typeof window.applyIconStyle === 'function') {
+                var styleVal = (srv.cfg && srv.cfg.ICON_STYLE) ? srv.cfg.ICON_STYLE.value : 'icons';
+                window.applyIconStyle(styleVal || 'icons', v);
+              }
+            }, '%');
+          }, revertIconPreview));
         // Tri-state, drawn with the same `segmented` control as Theme above: a
         // two-state switch cannot express 'auto' and would collapse it away on
         // first touch, leaving no way back to the default.
@@ -1118,7 +1179,7 @@
           function (value, onCommit) {
             return toggleCtl(value !== false, onCommit);
           }));
-        body.appendChild(serverRow('External terminal app', 'TERM_APP', 'Terminal or iTerm, for the ↗ external-terminal buttons.',
+        body.appendChild(serverRow('External terminal app', 'TERM_APP', 'Terminal or iTerm, for the external-terminal buttons.',
           function (value, onCommit) {
             return segmented([['Terminal', 'Terminal'], ['iTerm', 'iTerm']], value || 'Terminal', onCommit);
           }));
@@ -1335,11 +1396,11 @@
       body.innerHTML = '';
       if (mode === 'diff' && viewMode === 'diff') {
         if (payload.expandAboveLabel !== false) {
-          body.appendChild(h('div', { class: 'cr-context-bar', onclick: function () { if (payload.onExpandAbove) payload.onExpandAbove(); } }, ['↑ expand ' + (payload.aboveCount || 0) + ' lines above']));
+          body.appendChild(h('div', { class: 'cr-context-bar', onclick: function () { if (payload.onExpandAbove) payload.onExpandAbove(); } }, [icon('arrow-up'), ' expand ' + (payload.aboveCount || 0) + ' lines above']));
         }
         (payload.lines || []).forEach(function (l) { body.appendChild(diffLineRow(l)); });
         if (payload.belowCount) {
-          body.appendChild(h('div', { class: 'cr-context-bar', onclick: function () { if (payload.onExpandBelow) payload.onExpandBelow(); } }, ['↓ expand ' + payload.belowCount + ' lines below']));
+          body.appendChild(h('div', { class: 'cr-context-bar', onclick: function () { if (payload.onExpandBelow) payload.onExpandBelow(); } }, [icon('arrow-down'), ' expand ' + payload.belowCount + ' lines below']));
         }
       } else if (mode === 'diff' && viewMode === 'rendered') {
         // NOTE: "Rendered" needs the shared markdown renderer (capability 31, owned by
@@ -1420,7 +1481,8 @@
     chrome.panel.classList.add('cr-dialog-popout');
 
     var stateEl = h('span', { class: 'cr-runstate cr-mono' }, ['starting…']);
-    var killBtn = h('button', { class: 'cr-btn cr-btn-quiet cr-btn-danger', type: 'button', text: '■ Kill' });
+    var killBtn = h('button', { class: 'cr-btn cr-btn-quiet cr-btn-danger', type: 'button' },
+      [icon('stop'), ' Kill']);
     var toolbar = h('div', { class: 'cr-popout-toolbar' }, [
       h('span', { class: 'cr-popout-path cr-mono' }, [cmd]),
       stateEl,
@@ -1586,7 +1648,7 @@
   // payload: {flags:[{id, session, sessionTitle, text, resolved}], onOpen, onResolve, onReopen, onDelete}
   function renderFlagsList(payload) {
     payload = payload || {};
-    var chrome = buildChrome('flags', 'Flags', '🚩', (payload.flags || []).length + ' total', false, 'tn-emo-f');
+    var chrome = buildChrome('flags', 'Flags', 'flag', (payload.flags || []).length + ' total', false, 'tn-emo-f');
     var list = h('div', { class: 'cr-flag-list' });
     function paint() {
       list.innerHTML = '';
@@ -1692,7 +1754,7 @@
             h('div', { class: 'cr-termcap-meta cr-mono' }, [cwdTail(t.cwd) + ' · ' + timeAgo(t.started)]),
           ]),
           h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'peek', onclick: function () { if (payload.onPeek) payload.onPeek(t); } }),
-          h('button', { class: 'cr-btn cr-btn-quiet cr-btn-danger', type: 'button', text: '✕ kill', onclick: function () { if (payload.onKill) payload.onKill(t); } }),
+          h('button', { class: 'cr-btn cr-btn-quiet cr-btn-danger', type: 'button', onclick: function () { if (payload.onKill) payload.onKill(t); } }, [icon('close'), ' kill']),
         ]));
       });
       chrome.body.appendChild(list);
@@ -1703,7 +1765,7 @@
       ]);
       var closeAllBtn = h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Close all', onclick: function () { closeAllBtn.hidden = true; confirmRow.hidden = false; } });
       chrome.body.appendChild(h('div', { class: 'cr-cfg-footer' }, [
-        h('p', { class: 'cr-cfg-footer-note' }, ['Closing this dialog detaches; ✕ kills.']),
+        h('p', { class: 'cr-cfg-footer-note' }, ['Closing this dialog detaches; the kill button stops it.']),
         closeAllBtn,
         confirmRow,
       ]));
@@ -1821,7 +1883,7 @@
 
   function renderForkLineage(payload) {
     payload = payload || {};
-    var chrome = buildChrome('fork-lineage', 'Fork lineage', '🔀', payload.sid || '', false);
+    var chrome = buildChrome('fork-lineage', 'Fork lineage', 'branch', payload.sid || '', false);
     var body = chrome.body;
     // FIX 5: the header subtitle is only the raw id (buildChrome's 4th arg) -- colour/id
     // never carries meaning alone (doc 04's own rule), so say in words which session this
@@ -1854,7 +1916,7 @@
 
   function renderRenameSession(payload) {
     payload = payload || {};
-    var chrome = buildChrome('rename', 'Rename session', '✎', payload.sessionId || '', false);
+    var chrome = buildChrome('rename', 'Rename session', 'edit', payload.sessionId || '', false);
     var input = h('input', { class: 'cr-textfield', type: 'text', value: payload.currentTitle || '' });
     chrome.body.appendChild(input);
     chrome.body.appendChild(h('div', { class: 'cr-cfg-actions', style: 'margin-top:12px' }, [

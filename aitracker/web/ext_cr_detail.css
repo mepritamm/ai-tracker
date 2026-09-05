@@ -190,7 +190,7 @@
   justify-content: center;
   flex: 0 0 auto;
 }
-.cr .crd-rename svg { width: 15px; height: 15px; }
+.cr .crd-rename svg { width: calc(15px * var(--ico-scale)); height: calc(15px * var(--ico-scale)); }
 
 .cr .crd-pill-pinned {
   background: var(--surface-raised);
@@ -309,7 +309,7 @@
   color: var(--text-thinking);
 }
 .cr .crd-ico { width: 14px; height: 14px; display: inline-flex; }
-.cr .crd-ico svg { width: 14px; height: 14px; }
+.cr .crd-ico svg { width: calc(14px * var(--ico-scale)); height: calc(14px * var(--ico-scale)); }
 
 .cr .crd-btn-solid {
   background: var(--fill-action);
@@ -437,7 +437,7 @@
 .cr .crd-forkcard[hidden] { display: none; }
 .cr .crd-fork-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .cr .crd-fork-ico { color: var(--text-dusk); }
-.cr .crd-fork-ico svg { width: 13px; height: 13px; }
+.cr .crd-fork-ico svg { width: calc(13px * var(--ico-scale)); height: calc(13px * var(--ico-scale)); }
 .cr .crd-fork-label {
   text-transform: uppercase;
   letter-spacing: .07em;
