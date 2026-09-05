@@ -499,18 +499,40 @@ var OUT = {};
   var railMode = 'unrelated-seed-value';
   var applyRailModeCalls = 0;
   function applyRailMode() { applyRailModeCalls++; }
+  // The same subscription now also owns the board-tile-cap repaint (Config's
+  // "Board tiles" row -> cr.boardTileCount), so the harness has to supply the
+  // two names that branch closes over in mount(): the poll's last state and
+  // the board renderer. Both are counted, never asserted by identity.
+  var lastState = null;
+  var renderBoardCalls = 0;
+  function renderBoard(s) { renderBoardCalls++; }
 
   %s
 
-  function fire(payload) {
+  function fire(payload, state) {
     railMode = 'unrelated-seed-value';
     applyRailModeCalls = 0;
+    renderBoardCalls = 0;
+    lastState = (state === undefined) ? null : state;
     REGISTRY['cr:pref'](payload);
-    return { railModeAfter: railMode, applyRailModeCalls: applyRailModeCalls };
+    return {
+      railModeAfter: railMode,
+      applyRailModeCalls: applyRailModeCalls,
+      renderBoardCalls: renderBoardCalls,
+    };
   }
 
-  OUT['wrong_key_is_ignored'] = fire({ key: 'cr.boardTileCount', value: 'open' });
+  OUT['wrong_key_is_ignored'] = fire({ key: 'cr.pollIntervalMs', value: 1000 });
   OUT['missing_payload_is_ignored'] = fire(null);
+  // THE BOARD-TILES FIX: Config writes cr.boardTileCount, boardTileCap() reads
+  // it fresh -- but before this branch existed nothing repainted, so the slider
+  // was a dead control. With a live state the board must re-render exactly once
+  // (which also redraws the cap footer, renderBoard -> renderCapFooter), and the
+  // rail must be left completely alone.
+  OUT['board_tiles_repaints'] = fire({ key: 'cr.boardTileCount', value: 5 }, { sessions: [], now: 0 });
+  // ...and before the first poll has landed there is no state to paint from:
+  // the branch must no-op rather than throw on a null lastState.
+  OUT['board_tiles_without_state_is_safe'] = fire({ key: 'cr.boardTileCount', value: 5 });
   OUT['explicit_open'] = fire({ key: 'tracker.rail.mode', value: 'open' });
   OUT['explicit_collapsed'] = fire({ key: 'tracker.rail.mode', value: 'collapsed' });
   OUT['garbage_coerces_to_auto'] = fire({ key: 'tracker.rail.mode', value: 'not-a-real-mode' });
@@ -806,11 +828,33 @@ class TestBoardSubscribesToConfigPrefChanges(unittest.TestCase):
 
     def test_ignores_a_payload_for_a_different_config_key(self):
         """The handler must filter on `payload.key` -- a 'cr:pref' emission
-        for an unrelated Config row (e.g. the board-tile-count slider) must
-        not touch railMode or trigger a re-render."""
+        for an unrelated Config row (e.g. the poll-interval control) must
+        not touch railMode, and must not repaint the board either."""
         r = self.OUT["wrong_key_is_ignored"]
         self.assertEqual(r["railModeAfter"], "unrelated-seed-value")
         self.assertEqual(r["applyRailModeCalls"], 0)
+        self.assertEqual(r["renderBoardCalls"], 0)
+
+    def test_board_tile_count_repaints_the_board(self):
+        """THE BOARD-TILES FIX, precisely: Config's "Board tiles" slider
+        writes cr.boardTileCount and boardTileCap() already read it fresh --
+        but nothing repainted on the write, so moving the slider changed a
+        number in localStorage and left the board on screen untouched. The
+        subscription must re-render the board (which redraws the cap footer
+        with it) and must not disturb the rail."""
+        r = self.OUT["board_tiles_repaints"]
+        self.assertEqual(r["renderBoardCalls"], 1)
+        self.assertEqual(r["railModeAfter"], "unrelated-seed-value")
+        self.assertEqual(r["applyRailModeCalls"], 0)
+
+    def test_board_tile_count_without_a_state_does_not_throw(self):
+        """Edge case: the pref can be changed before the first poll has
+        landed, so lastState is still null. The branch must no-op rather
+        than throw (a throw here would kill the whole cr:pref handler, taking
+        the rail-mode row down with it)."""
+        r = self.OUT["board_tiles_without_state_is_safe"]
+        self.assertEqual(r["renderBoardCalls"], 0)
+        self.assertEqual(r["railModeAfter"], "unrelated-seed-value")
 
     def test_ignores_a_missing_payload(self):
         r = self.OUT["missing_payload_is_ignored"]
@@ -842,3 +886,220 @@ class TestBoardSubscribesToConfigPrefChanges(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# RAIL PARITY WITH THE CLASSIC SIDEBAR (owner ask: the rail must be "the same
+# size width" as the old default view and "in absolute feature parity ...
+# including the information present in there").
+#
+# Two halves are pinned here:
+#   1. railRowMeta() no longer swallows metadata. It used to `return` on the
+#      FIRST truthy of open_flags / bg / age, so a FLAGGED row silently lost
+#      its age and a row with background agents lost it too -- while the
+#      classic sidebar (app.js sessionRow) shows the flag badge, the note
+#      badge, the agent chip AND the age all at once.
+#   2. The rail width is one variable (--cr-rail-w) set to the classic
+#      sidebar's own 300px, read by every rule that sets a rail width, so the
+#      three rules can never drift apart again.
+# ---------------------------------------------------------------------------
+
+def _rail_row_meta_driver_js():
+    html = _read_page()
+    bundle = _extract_script_content(html)
+    fn_src = _extract_function(bundle, "railRowMeta")
+
+    return r"""
+var OUT = {};
+(function () {
+  // railRowMeta()'s only dependency is app.js's own `ago()` string builder --
+  // stubbed to a fixed sentinel so an assertion about "the age is present"
+  // can never be satisfied by some other number that happens to appear.
+  function ago(sec) { return 'AGE'; }
+
+  %s
+
+  var NOW = 1000;
+  OUT['plain']        = railRowMeta({ mtime: NOW }, NOW);
+  OUT['flagged']      = railRowMeta({ mtime: NOW, open_flags: 2 }, NOW);
+  OUT['noted']        = railRowMeta({ mtime: NOW, note_count: 3 }, NOW);
+  OUT['bg']           = railRowMeta({ mtime: NOW, bg: 4 }, NOW);
+  OUT['all_at_once']  = railRowMeta({ mtime: NOW, open_flags: 2, note_count: 3, bg: 4 }, NOW);
+})();
+console.log("===RAIL_TOGGLE_JSON_START===");
+console.log(JSON.stringify(OUT));
+""" % fn_src
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestRailRowMetaParity(unittest.TestCase):
+    """THE BUG: railRowMeta() returned early on the first truthy field, so a
+    flagged rail row showed ONLY its flag count -- no age, no note count, no
+    background-agent count. The classic sidebar shows all of them together."""
+
+    @classmethod
+    def setUpClass(cls):
+        js = _rail_row_meta_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "railRowMeta harness failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_json(stdout)
+
+    def test_plain_row_still_shows_only_the_age(self):
+        """The unchanged base case: nothing to report but recency."""
+        self.assertEqual(self.OUT["plain"], "AGE")
+
+    def test_a_flagged_row_keeps_its_age(self):
+        """THE REGRESSION, precisely: before the fix this returned the flag
+        count ALONE and the age vanished from the row."""
+        r = self.OUT["flagged"]
+        self.assertIn("2", r)
+        self.assertIn("AGE", r)
+
+    def test_a_noted_row_shows_the_note_count_and_the_age(self):
+        """Note counts were tooltip-only in the rail; classic shows a visible
+        badge, so parity means the count reaches the row itself."""
+        r = self.OUT["noted"]
+        self.assertIn("3", r)
+        self.assertIn("AGE", r)
+
+    def test_a_background_agent_row_keeps_its_age(self):
+        r = self.OUT["bg"]
+        self.assertIn("4", r)
+        self.assertIn("AGE", r)
+
+    def test_everything_at_once_is_all_present(self):
+        """The whole point of parity: flags, notes, agents and age coexist on
+        one row rather than the first one winning and hiding the rest."""
+        r = self.OUT["all_at_once"]
+        for expected in ("2", "3", "4", "AGE"):
+            self.assertIn(expected, r)
+
+
+class TestRailWidthMatchesClassicSidebar(unittest.TestCase):
+    """The owner asked for the rail to be "the same size width" as the old
+    default view. The classic sidebar is `.side{width:300px}` (app.css)."""
+
+    def test_rail_width_variable_is_the_classic_sidebar_width(self):
+        page = _read_page()
+        self.assertIn("--cr-rail-w: 300px", page)
+
+    def test_no_rule_still_hardcodes_the_old_rail_width(self):
+        """Three separate rules set a rail width (open, mobile overlay, and
+        the overlay's "collapsed is still the full row rail" case). They must
+        all read the variable -- a leftover literal is exactly how they drift."""
+        page = _read_page()
+        self.assertNotIn("width: 232px", page)
+
+    def test_status_badge_is_styled_for_both_states(self):
+        """Colour never carries meaning alone here, but an unstyled badge would
+        still inherit muted body text and read as noise -- pin both classes."""
+        page = _read_page()
+        self.assertIn("cr-rail-status--waiting", page)
+        self.assertIn("cr-rail-status--done", page)
+
+
+# ---------------------------------------------------------------------------
+# BOARD FILTER vs AGENT-GROUP TILES.
+#
+# THE BUGS (one line carried both): the group branch of passesFilter() read
+# `t.session.open_flags`, but an agent-group tile has no `.session` at all --
+# it aggregates several under `.sessions` (plural). So:
+#   1. the 'flagged' filter threw a TypeError as soon as any group tile was on
+#      the board, and
+#   2. every other filter returned a flat false, hiding the grouped sessions
+#      from 'awaiting'/'working' -- even though triageCounts() counts exactly
+#      those sessions in the strip above. A cell could read "1 WORKING" and
+#      still render "Nothing matches that filter right now."
+# ---------------------------------------------------------------------------
+
+def _passes_filter_driver_js():
+    html = _read_page()
+    bundle = _extract_script_content(html)
+    fn_src = _extract_function(bundle, "passesFilter")
+
+    return r"""
+var OUT = {};
+(function () {
+  var activeFilter = null;
+  var lastState = { now: 1000 };
+  // The real sessionState() vocabulary, reduced to what these cases need.
+  function sessionState(s, now) {
+    if (s.waiting) return 'awaiting';
+    if (s.open_flags) return 'flagged';
+    if (!s.ended) return 'working';
+    return 'idle';
+  }
+
+  %s
+
+  function run(filter, tile) {
+    activeFilter = filter;
+    try { return { ok: passesFilter(tile, 1000) }; }
+    catch (e) { return { threw: String(e && e.message || e) }; }
+  }
+
+  var groupWorking = { kind: 'agent-group', group: 'g1',
+                       sessions: [{ ended: false }], mtime: 1000, pinned: false };
+  var groupFlagged = { kind: 'agent-group', group: 'g2',
+                       sessions: [{ open_flags: 2, ended: true }], mtime: 1000, pinned: false };
+  var groupIdle    = { kind: 'agent-group', group: 'g3',
+                       sessions: [{ ended: true }], mtime: 1000, pinned: false };
+  var soloWorking  = { kind: 'session', state: 'working', session: { ended: false } };
+
+  OUT['group_flagged_under_flagged'] = run('flagged', groupFlagged);
+  OUT['group_working_under_working'] = run('working', groupWorking);
+  OUT['group_idle_under_working']    = run('working', groupIdle);
+  OUT['solo_working_under_working']  = run('working', soloWorking);
+  OUT['no_filter_passes_group']      = run(null, groupWorking);
+})();
+console.log("===RAIL_TOGGLE_JSON_START===");
+console.log(JSON.stringify(OUT));
+""" % fn_src
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestBoardFilterHandlesAgentGroupTiles(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        js = _passes_filter_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "passesFilter harness failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_json(stdout)
+
+    def test_flagged_filter_does_not_throw_on_a_group_tile(self):
+        """BUG 1: `t.session.open_flags` on a tile whose sessions live under
+        `.sessions` is a TypeError, not a false -- it took the whole render
+        down rather than merely filtering the tile out."""
+        r = self.OUT["group_flagged_under_flagged"]
+        self.assertNotIn("threw", r, "flagged filter threw on a group tile: %r" % (r,))
+        self.assertTrue(r["ok"])
+
+    def test_working_filter_surfaces_a_group_with_a_working_member(self):
+        """BUG 2: the strip counts the grouped sessions, so the filter has to
+        be able to show them -- otherwise the count and the board disagree."""
+        r = self.OUT["group_working_under_working"]
+        self.assertNotIn("threw", r)
+        self.assertTrue(r["ok"])
+
+    def test_working_filter_still_excludes_a_group_with_no_working_member(self):
+        """The fix must not turn into "every group always passes"."""
+        r = self.OUT["group_idle_under_working"]
+        self.assertNotIn("threw", r)
+        self.assertFalse(r["ok"])
+
+    def test_individual_session_tiles_are_unaffected(self):
+        r = self.OUT["solo_working_under_working"]
+        self.assertTrue(r["ok"])
+
+    def test_no_active_filter_still_passes_everything(self):
+        r = self.OUT["no_filter_passes_group"]
+        self.assertTrue(r["ok"])

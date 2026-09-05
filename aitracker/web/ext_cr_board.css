@@ -25,7 +25,7 @@
  * collide with `app.css`'s classic-dashboard selectors, and every color /
  * radius / shadow / duration is a `var(--...)` token from cr.css — never a
  * literal hex or a hardcoded shadow. Structural layout numbers that doc 02
- * specifies as literal pixel constants (232px rail, 54px top bar, 48px
+ * specifies as literal pixel constants (300px rail, 54px top bar, 48px
  * collapsed rail, 88px triage strip, 13px board gap, 7px state dot, etc.)
  * are not part of the foundations token scale and are written literally,
  * exactly as the doc gives them.
@@ -272,7 +272,7 @@
    the session rail's auto-collapse tier (1024-1279px -> 48/56px collapsed,
    `applyRailMode`/`bindResize` in ext_cr_board.js) frees up room. It doesn't:
    the rail's OWN threshold is `innerWidth < 1280`, so at exactly 1280px (and
-   up through ~1347px) the rail has already snapped back to its full 232px
+   up through ~1347px) the rail has already snapped back to its full 300px
    OPEN width while the topbar is still nowrap — a viewport-width cliff where
    available content width actually *drops* (~1004px vs. ~1048-1072px just
    below 1280) as the window grows. Measured: `.cr-newsession` right edge
@@ -409,11 +409,21 @@
 }
 
 /* ============================================================
-   SESSION RAIL — 232px open / 48px collapsed
+   SESSION RAIL — 300px open / 48px collapsed
    ============================================================ */
 .tracker-next .cr-rail {
   flex: 0 0 auto;
-  width: 232px;
+  /* Rail width is ONE constant, defined here and read by every rule that sets
+   * it (the open rail, the mobile overlay, and the overlay's "collapsed is
+   * still the full row rail" case) -- three rules that must always agree, so
+   * they read the variable rather than repeating a literal.
+   * OWNER RULING: this was 300px, the control-room spec's own literal. It is
+   * now 300px to MATCH THE CLASSIC SIDEBAR (.side, app.css) exactly -- the
+   * owner asked for the rail to be "the same size width" as the old default
+   * view. The collapsed (48px) and detail-orb (56px) widths are a different
+   * feature and are deliberately unchanged. */
+  --cr-rail-w: 300px;
+  width: var(--cr-rail-w);
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -631,6 +641,21 @@
   color: var(--text-muted);
 }
 
+/* GAP CLOSE (rail parity): the classic sidebar's waiting/done status badge
+ * (app.js sessionRow's `.statusbadge`), which the rail never carried at all.
+ * Colour-only, no fill: the existing --state-awaiting/--state-done tokens are
+ * already proven against BOTH palettes as the rail-dot colours right above
+ * (.cr-rail-dot.is-waiting / .is-landed), so reusing them here cannot repeat
+ * the "a light palette nobody ever checked" bug -- a background fill would
+ * have needed a contrast pair that does not exist as a token. */
+.tracker-next .cr-rail-status {
+  flex: 0 0 auto;
+  font: var(--fw-trace) 10px/var(--lh-trace) var(--font-mono);
+  white-space: nowrap;
+}
+.tracker-next .cr-rail-status--waiting { color: var(--state-awaiting); }
+.tracker-next .cr-rail-status--done { color: var(--state-done); }
+
 /* GAP CLOSE (rail parity): pin/rename controls the classic sidebar always
  * carries inline (app.js: `.ren{opacity:0}` / `.sitem:hover .ren{opacity:.8}`
  * / `.pin{opacity:0}` / `.sitem:hover .pin{opacity:.6}` / `.pin.on{opacity:1}`
@@ -767,16 +792,16 @@
     bottom: 0;
     left: 0;
     z-index: 40;
-    width: 232px;
+    width: var(--cr-rail-w);
     box-shadow: var(--shadow-overlay);
     transform: translateX(-100%);
     transition: transform .24s ease;
   }
   .tracker-next .cr-rail.cr-rail--overlay-open { transform: translateX(0); }
-  .tracker-next .cr-rail--collapsed { width: 232px; } /* an opened overlay is always the full row rail */
+  .tracker-next .cr-rail--collapsed { width: var(--cr-rail-w); } /* an opened overlay is always the full row rail */
   /* ...except in the detail view, which defaults to its 56px orb rail on
    * mobile overlay (the default under 'auto'); explicit toggles override to
-   * the full 232px row rail. `.cr-rail--detail` is applied only when
+   * the full 300px row rail. `.cr-rail--detail` is applied only when
    * collapsed and wins over the rule above by appearing later, same specificity. */
   .tracker-next .cr-rail--detail { width: 56px; }
 }

@@ -443,7 +443,7 @@ window.CR = window.CR || {};
     // key's vocabulary was 'open'|'collapsed' with 'open' as the literal default,
     // so a stored 'open' was indistinguishable from 'never chose' -- and the dead
     // toggle wrote one on every frustrated click. Reading those values as an
-    // EXPLICIT 'open' here would hand existing users a 232px rail in the detail
+    // EXPLICIT 'open' here would hand existing users a 300px rail in the detail
     // view they never asked for. A new key starts everyone at 'auto', which is
     // byte-for-byte the old default behaviour. The stale key is left alone.
     var railMode = (localStorage.getItem('tracker.rail.mode') || 'auto');
@@ -810,7 +810,7 @@ window.CR = window.CR || {};
       var collapsed = (railMode === 'auto') ? autoCollapsed : (railMode === 'collapsed');
       els.rail.classList.toggle('cr-rail--collapsed', collapsed);
       // 56px orb styling is the COLLAPSED detail rail; once the user expands it
-      // explicitly the full 232px row rail must win, so --detail comes off too.
+      // explicitly the full 300px row rail must win, so --detail comes off too.
       els.rail.classList.toggle('cr-rail--detail', isDetail && collapsed);
       var label = collapsed ? 'Expand session rail' : 'Collapse session rail';
       els.railChevron.setAttribute('title', label);
@@ -846,10 +846,20 @@ window.CR = window.CR || {};
       });
     }
 
+    // GAP CLOSE (rail parity, owner ruling): this used to `return` on the FIRST
+    // truthy of flags/bg/age, so a flagged row silently LOST its age and a row
+    // with background agents lost it too -- the classic sidebar (app.js
+    // sessionRow) shows the flag badge, the agent chip AND the age together.
+    // Doc 02's "one trailing slot" row anatomy is superseded by the owner's
+    // "absolute feature parity with the old default view, including the
+    // information present in there". Returns the parts joined, never one.
     function railRowMeta(s, now) {
-      if (s.open_flags) return '🚩 ' + s.open_flags;
-      if (s.bg) return '🤖 ' + s.bg;
-      return ago(now - (s.mtime || 0));
+      var parts = [];
+      if (s.open_flags) parts.push('🚩 ' + s.open_flags);
+      if (s.note_count) parts.push('📝 ' + s.note_count);
+      if (s.bg) parts.push('🤖 ' + s.bg);
+      parts.push(ago(now - (s.mtime || 0)));
+      return parts.join(' · ');
     }
 
     // BUG FIX: todoTicks() (the full tick bar) was only ever called from the board
@@ -1242,6 +1252,23 @@ window.CR = window.CR || {};
       // real list-dict session) — falls back to the prompt/title tooltip
       // exactly as before whenever it's absent, so this is purely additive.
       var todoLabel = railTodoLabel(s);
+      // GAP CLOSE (rail parity, owner ruling): the classic sidebar's meta line is
+      // `project · source · age` (app.js sessionRow's `bits`), and its row carries a
+      // waiting/done status badge. The rail had NONE of the three. Mirrored here
+      // field-for-field, reusing what already exists rather than re-deriving:
+      //   - project: classic shows s.project when a custom title replaced it,
+      //     else the short id -- the exact same ternary, not an approximation.
+      //   - source: this file's OWN toolLabel() (used by the tiles already),
+      //     which wraps app.js's srcLabel/SRC map. Never a second copy of it.
+      //   - status: app.js's own end-state rule verbatim -- "waiting on your
+      //     answer" wins even while still live, and "done" is gated to the live
+      //     window so stale idle sessions don't flood the rail with checkmarks.
+      // Both `waiting` and `ended` ride the SHARED list dict (claude.py and
+      // auggie.py both emit them), so this lights up for both providers.
+      var projLabel = s.title ? (s.project || '') : (s.id || '').slice(0, 8);
+      var srcLabelText = toolLabel(s.source);
+      var isLiveRow = (now - (s.mtime || 0)) < LIVE_WINDOW;
+      var statusText = s.waiting ? '⏳ answer' : ((s.ended && isLiveRow) ? '✅ done' : '');
       // GAP CLOSE: flag_text rides the row's existing tooltip too — same reasoning as
       // tileHead() above. '' when null/absent, so an unflagged row's tooltip is
       // byte-for-byte unchanged.
@@ -1300,12 +1327,17 @@ window.CR = window.CR || {};
           h('span', { class: 'cr-rail-title' }, [displayName]),
           dirLine ? h('span', { class: 'cr-rail-dir' }, [dirLine]) : null,
         ]),
+        statusText ? h('span', {
+          class: 'cr-rail-status cr-rail-status--' + (s.waiting ? 'waiting' : 'done'),
+          title: s.waiting ? 'waiting for your answer — respond in the session' : 'completed its last run',
+        }, [statusText]) : null,
         h('span', { class: 'cr-rail-meta' },
           // GAP CLOSE (rail parity): `s._runs` only exists on a row folded by
           // collapseAgentRuns() above (a re-run collapsed into one row) —
           // classic's own `×N` badge (app.js: `s._runs>1`), absent everywhere
           // else, same as todoLabel already was.
-          [[s._runs > 1 ? ('×' + s._runs) : '', todoLabel, railRowMeta(s, now)].filter(Boolean).join(' · ')]),
+          [[s._runs > 1 ? ('×' + s._runs) : '', todoLabel, projLabel, srcLabelText, railRowMeta(s, now)]
+            .filter(Boolean).join(' · ')]),
         actions,
       ]);
     }
@@ -1613,7 +1645,7 @@ window.CR = window.CR || {};
 
     function tileId(t) { return t.kind === 'session' ? t.session.id : 'group:' + t.group; }
 
-    function passesFilter(t) {
+    function passesFilter(t, now) {
       if (!activeFilter) return true;
       // PINNED (owner addition): not a per-tile `state` value, so it needs its
       // own branch, same shape as the 'flagged' special-case below. An
@@ -1622,7 +1654,25 @@ window.CR = window.CR || {};
       // onto the group) — read straight off `t` for a group, off `t.session`
       // for an individual session tile.
       if (activeFilter === 'pinned') return t.kind === 'session' ? !!t.session.pinned : !!t.pinned;
-      if (t.kind !== 'session') return activeFilter !== 'flagged' ? false : t.session.open_flags > 0;
+      // TWO BUGS on the line this replaces, both in the group-tile branch:
+      //   1. It read `t.session.open_flags` -- but an agent-group tile has NO
+      //      `.session`; it aggregates several under `.sessions` (plural, see
+      //      agentGroups()). So the 'flagged' filter threw a TypeError the
+      //      moment any group tile was on the board.
+      //   2. Every other filter returned a flat `false`, so the sessions folded
+      //      into a group were invisible to the 'awaiting'/'working' filters --
+      //      while triageCounts() counts those same sessions in the strip. That
+      //      is a cell reading a non-zero count that renders an empty board.
+      // A group passes when ANY member session matches, which is the same
+      // question the strip's own count asked.
+      if (t.kind !== 'session') {
+        var when = (typeof now === 'number') ? now : ((lastState && lastState.now) || 0);
+        return (t.sessions || []).some(function (m) {
+          return activeFilter === 'flagged'
+            ? !!m.open_flags
+            : sessionState(m, when) === activeFilter;
+        });
+      }
       if (activeFilter === 'flagged') return !!t.session.open_flags;
       return t.state === activeFilter;
     }
@@ -1630,7 +1680,7 @@ window.CR = window.CR || {};
     function renderBoard(state) {
       var sessions = state.sessions || [], now = state.now;
       var allTiles = boardTiles(sessions, now);
-      var tiles = allTiles.filter(passesFilter);
+      var tiles = allTiles.filter(function (t) { return passesFilter(t, now); });
 
       // A8: mirrors renderRail()'s / renderSessionsView()'s own scroll-position
       // preservation across a poll re-render — same pattern (snapshot scrollTop
@@ -2036,7 +2086,18 @@ window.CR = window.CR || {};
         // is the same dead-control bug this whole change exists to remove, so the board
         // has to actually listen rather than assume it is the only writer.
         ctx.on('cr:pref', function (payload) {
-          if (!payload || payload.key !== 'tracker.rail.mode') return;
+          if (!payload) return;
+          // Config's "Board tiles" row writes cr.boardTileCount, which boardTileCap()
+          // reads fresh on every call -- but nothing repainted on the write, so the
+          // slider moved a number in localStorage and left the board untouched until
+          // some unrelated poll happened to redraw it. That is the identical
+          // dead-control bug the rail-mode branch below exists to fix, so the cap
+          // gets the same treatment: repaint the board (and its cap footer) now.
+          if (payload.key === 'cr.boardTileCount') {
+            if (lastState) renderBoard(lastState);
+            return;
+          }
+          if (payload.key !== 'tracker.rail.mode') return;
           var v = payload.value;
           railMode = (v === 'open' || v === 'collapsed') ? v : 'auto';
           applyRailMode();
