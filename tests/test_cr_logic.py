@@ -253,6 +253,16 @@ def _board_driver_js():
         "idle_stale_failing": make_session("k", NOW - (LIVE_WINDOW + 7 * 86400),
                                             ended=False, waiting=False, open_flags=0,
                                             fail_cmd="pytest -q"),
+        # THE BOARD-TAB BUG (reports/control-room-refinements.md): a session whose
+        # foreground turn closed (ended=True, providers/claude.py's _tail_scan reads
+        # only the main transcript) while it still has background agents running
+        # right now (bg=3, mtime fresh -- providers/claude.py's _mtime_and_bg folds
+        # background-agent mtimes into the session's own mtime) must read 'working',
+        # never 'landed'. This is the REAL field combination production emits, not a
+        # hand-picked ended=False that assumes the bug away -- see
+        # tests/test_cr_board_working_bg.py for proof list_sessions() actually
+        # produces it off an on-disk transcript.
+        "working_ended_with_running_bg": make_session("l", NOW - 5, ended=True, bg=3),
     }
     # 6b) 8-tile cap holds with a mix of states, failing included -- and RANK still
     #     orders failing tiles ahead of plain working ones within the cap.
@@ -691,6 +701,14 @@ class TestCRLogic(unittest.TestCase):
         server constant that the JS literal doesn't follow would be caught here."""
         self.assertEqual(self.OUT["states"]["boundary_live"], "working")
         self.assertEqual(self.OUT["states"]["boundary_idle"], "idle")
+
+    def test_session_state_working_wins_over_ended_when_bg_agents_are_running(self):
+        """THE BOARD-TAB BUG: `ended=True` alone must never resolve to 'landed' when
+        `bg>0` -- a session with running background agents is still WORKING even
+        though its own foreground transcript already closed. Pins the real
+        production shape (ended=True, bg=3, fresh mtime), not the vacuous
+        ended=False fixture the old test used."""
+        self.assertEqual(self.OUT["states"]["working_ended_with_running_bg"], "working")
 
     def test_session_state_stale_fail_cmd_does_not_read_as_failing(self):
         """THE CORE REGRESSION (the defect that nearly shipped, reports/drift/): a
@@ -1552,6 +1570,146 @@ class TestCRFailingTileRender(unittest.TestCase):
 
     def test_flagged_tile_renders_its_flag_count_not_failing(self):
         self.assertEqual(self.OUT["flagged"], "3 flags open")
+
+
+# ---------------------------------------------------------------------------
+# Triage strip (WAITING ON YOU / WORKING / FLAGGED / PINNED) — the "board tab
+# counters are dead" report: a user saw the first three permanently read 0
+# while PINNED was correct. triageCounts() (the pure function, already pinned
+# in TestCRLogic's "13) triageCounts" case above) computes correctly in
+# isolation -- this section instead drives the REAL CR.board.mount()/update()
+# render path (same technique as TestCRFailingTileRender above) so a
+# regression in the WIRING between triageCounts() and the DOM -- a dropped
+# `now`, a renamed key, an exception thrown earlier in update() that aborts
+# before renderTriage() ever runs (leaving cells frozen at their build-time
+# "0", which is indistinguishable from "the count really is 0" without a test
+# like this one) -- fails loudly instead of shipping silently.
+# ---------------------------------------------------------------------------
+
+_TRIAGE_JS_TAIL = r"""
+var root = makeReal('div');
+docBody.appendChild(root);
+window.CR.board.mount(root, {});
+window.CR.board.update({ sessions: %(sessions)s, now: %(now)d });
+
+function cellCount(key) {
+  var cells = queryAllReal(root, '.cr-triage-cell--' + key);
+  if (!cells.length) return null;
+  var counts = queryAllReal(cells[0], '.cr-triage-count');
+  if (!counts.length) return null;
+  // renderTriage() updates this span with a direct `.textContent =`
+  // assignment (never rebuilds it via h()), so this reads the SAME plain
+  // property the real code writes -- unlike TestCRFailingTileRender's
+  // `_children[0].textContent`, which only works for text set once at
+  // construction time via h()'s children array.
+  return counts[0].textContent;
+}
+
+var out = {
+  rendered: { awaiting: cellCount('awaiting'), working: cellCount('working'),
+              flagged: cellCount('flagged'), pinned: cellCount('pinned') },
+  pure: window.CR.board.triageCounts(%(sessions)s, %(now)d),
+  // tr_work carries ended:true, bg:3 (the real production shape) -- prove
+  // sessionState() agrees with the WORKING count instead of drifting into
+  // 'landed', which is exactly the two-derivations trap this fix closes.
+  tr_work_state: window.CR.board.sessionState(%(sessions)s[1], %(now)d)
+};
+
+console.log("===CR_TRIAGE_JSON_START===");
+console.log(JSON.stringify(out));
+"""
+
+
+def _triage_driver_js():
+    bundle_html = _read_page()
+    bundle_js = _extract_script_content(bundle_html)
+    now = NOW
+    sessions = [
+        make_session("tr_wait", now - 5, waiting=True),
+        # THE REAL BUG SHAPE, not the vacuous one this fixture used to hand-pick
+        # (ended=False, which is exactly the field production gets WRONG --
+        # a fixture that assumes the bug's own symptom away proves nothing).
+        # A real Claude session with running background agents reads
+        # ended=True (providers/claude.py's _tail_scan only looks at the main
+        # transcript) while bg>0 and mtime is fresh (providers/claude.py's
+        # _mtime_and_bg folds background-agent activity into mtime) -- see
+        # tests/test_cr_board_working_bg.py for proof list_sessions() really
+        # emits this combination from an on-disk transcript, not just this
+        # hand-built dict. triageCounts() must still count it WORKING.
+        make_session("tr_work", now - 5, waiting=False, ended=True, bg=3),
+        # flagged/pinned count across ALL sessions regardless of liveness
+        # (triageCounts()'s own doc comment) -- mtime pushed well outside
+        # LIVE_WINDOW to prove that.
+        make_session("tr_flag", now - 5000, ended=True, open_flags=2),
+        make_session("tr_pin", now - 5000, ended=True, pinned=True),
+        # a plain idle session must not be miscounted into any of the four.
+        make_session("tr_idle", now - 5000, ended=True),
+    ]
+    tail = _TRIAGE_JS_TAIL % {"sessions": json.dumps(sessions), "now": now}
+    return "\n".join([_FAILTILE_JS_PREAMBLE, bundle_js, _FAILTILE_JS_MID, tail])
+
+
+def _extract_triage_json(stdout):
+    marker = "===CR_TRIAGE_JSON_START==="
+    idx = stdout.find(marker)
+    if idx < 0:
+        raise ValueError("marker not found in node output:\n" + stdout)
+    return json.loads(stdout[idx + len(marker):].strip())
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestCRTriageStripRendersLiveCounts(unittest.TestCase):
+    """Drives the REAL mount()/update() render path so the triage strip's four
+    DOM cells are proven to reflect triageCounts()'s output, not just that the
+    pure function itself is correct.
+
+    FIX (was vacuous): `tr_work` used to be built with `ended=False` -- the
+    exact field production gets WRONG (providers/claude.py's `ended` only
+    looks at the main transcript, so a session with live background agents
+    reads `ended=True`). A fixture that hand-picks the field's correct value
+    proves the renderer can count a session that was never actually broken;
+    it stayed green with the real bug fully present. `tr_work` now carries
+    the REAL shape (`ended=True, bg=3`, fresh mtime) that production emits
+    for a session whose foreground turn closed while its background agents
+    keep running -- see tests/test_cr_board_working_bg.py for proof
+    list_sessions() really emits this combination off an on-disk transcript."""
+
+    @classmethod
+    def setUpClass(cls):
+        js = _triage_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Triage-strip driver failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_triage_json(stdout)
+
+    def test_pure_counts_are_one_each(self):
+        self.assertEqual(self.OUT["pure"], {"awaiting": 1, "working": 1, "flagged": 1, "pinned": 1})
+
+    def test_rendered_awaiting_cell_matches_the_pure_count(self):
+        self.assertEqual(self.OUT["rendered"]["awaiting"], "1")
+
+    def test_rendered_working_cell_matches_the_pure_count(self):
+        """THE BUG this pins against: WORKING reading 0 forever while a live
+        session with running background agents exists (ended=True, bg=3) --
+        proven here through the actual DOM, not just triageCounts() in
+        isolation, and against the REAL production field combination, not a
+        hand-picked ended=False that assumes the bug away."""
+        self.assertEqual(self.OUT["rendered"]["working"], "1")
+
+    def test_rendered_flagged_cell_matches_the_pure_count(self):
+        self.assertEqual(self.OUT["rendered"]["flagged"], "1")
+
+    def test_rendered_pinned_cell_matches_the_pure_count(self):
+        self.assertEqual(self.OUT["rendered"]["pinned"], "1")
+
+    def test_ended_true_with_running_bg_agents_is_working_not_landed(self):
+        """sessionState() must agree with the counter -- the exact two-derivations
+        trap the fix closes. tr_work (ended=True, bg=3) must read 'working',
+        never 'landed'."""
+        self.assertEqual(self.OUT["tr_work_state"], "working")
 
 
 # ---------------------------------------------------------------------------

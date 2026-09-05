@@ -131,7 +131,15 @@
           '<span class="cr-emo tn-emo" aria-hidden="true">' + ico('gear') + '</span>Config</button>' +
         '<button type="button" class="cr-term-headpill" data-action="help">' +
           '<span class="cr-emo tn-emo" aria-hidden="true">' + ico('help') + '</span>Help</button>' +
-        '<button type="button" class="cr-term-close" data-action="close" title="Close — detaches, does not kill" aria-label="Close terminal — detaches, does not kill">' + ico('close') + '</button>' +
+        // FIX: every OTHER header/control-bar button already pairs icon + a
+        // visible word (Config/Help right above, External terminal/resume, New
+        // tab/terminal/session, Manage terminals, Theme, Copy, Kill below) —
+        // this one shipped icon-only, readable only via title/aria-label. Same
+        // label markup those siblings use (an aria-hidden icon span, then a
+        // plain text node), same `cr-term-close` class (kept distinct from
+        // Kill's own class so it never inherits Kill's destructive styling —
+        // see ext_cr_term.css's own comment on that button's CSS).
+        '<button type="button" class="cr-term-close" data-action="close" title="Close — detaches, does not kill" aria-label="Close terminal — detaches, does not kill"><span class="cr-emo tn-emo" aria-hidden="true">' + ico('close') + '</span>Close</button>' +
       '</div>';
     shell.appendChild(head);
 

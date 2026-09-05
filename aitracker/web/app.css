@@ -348,6 +348,9 @@ a{color:var(--blue)}
 .prtime{color:var(--dim);font-size:11px;font-family:'JetBrains Mono',monospace;flex:0 0 auto;white-space:nowrap}
 .prlink .chev{color:var(--dim);font-size:11px;flex:0 0 auto}
 .prlink:hover .chev{color:var(--blue)}
+/* Links panel group labels ("Generated here" / "Worked on") — same uppercase/
+   muted eyebrow language as .card>h2, not a new visual language. */
+.linkgrp{display:flex;justify-content:space-between;padding:8px 14px 4px;font-size:10px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--dim)}
 /* in-session search */
 .dsearch{margin:10px 12px}
 #dresults{border-top:1px solid var(--line)}

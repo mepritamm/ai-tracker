@@ -59,28 +59,13 @@
 
   // FIX 4: this used to redeclare its own esc() here — an exact second copy of
   // ext_cr_detail.js's, itself a copy of app.js's global `esc()` (app.js:7) plus quote
-  // escaping. Neither call site below (mdLite()'s markdown-lite body, a plain digit count)
-  // interpolates into an HTML attribute, so nothing here actually needs the quote
+  // escaping. The only call site below (a plain digit count, ~line 700) doesn't
+  // interpolate into an HTML attribute, so nothing here actually needs the quote
   // handling — this file now falls through to app.js's own top-level `esc()`, reachable
   // by bare name like every other app.js top-level declaration (no local shadow left to
   // block it). ext_cr_detail.js keeps the one quote-escaping esc() Control Room still
   // needs (its attribute-interpolation call sites genuinely require it); REQUIRED
   // ADDITION: app.js's `esc()` should absorb `"`/`'` escaping so even that copy can go.
-
-  // Minimal, deliberately dumb markdown-lite for copy that lives INSIDE this module's
-  // own dialogs (Help lede, degraded-state copy). This is NOT capability #31 (full
-  // markdown rendering of narration/prompts/todos/files) — that renderer belongs to
-  // the detail module (doc 03) and every consumer, this one included, should call the
-  // SAME implementation rather than fork a second one. See REQUIRED ADDITION in the
-  // handoff report: `ctx.markdown(text) -> HTMLElement` (or a `CR.md` shared global).
-  function mdLite(s) {
-    var out = esc(s || '')
-      .replace(/`([^`]+)`/g, '<code>$1</code>')
-      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-      .replace(/\n\n+/g, '</p><p>')
-      .replace(/\n/g, '<br>');
-    return '<p>' + out + '</p>';
-  }
 
   // Strips terminal escape sequences for the plain-text `renderRunOutput` pane below.
   // This is NOT ext_run.js's ansiHtml() (SGR -> <span class="aNN">, HTML-escaped) — that
@@ -436,7 +421,11 @@
     _layer.appendChild(wrap);
     _layer.setAttribute('aria-hidden', 'false');
     var untrap = trapFocus(built.panel);
-    var entry = { name: name, wrap: wrap, panel: built.panel, opener: opener, untrap: untrap, update: built.update };
+    // wantsPoll: an opt-in flag a dialog's builder sets on the object it returns
+    // (alongside backdrop/panel/update) to declare "feed me the poll broadcast".
+    // update() below refuses to forward a poll-tagged payload to any dialog that
+    // didn't opt in — see update()'s own comment for why this lives at the seam.
+    var entry = { name: name, wrap: wrap, panel: built.panel, opener: opener, untrap: untrap, update: built.update, wantsPoll: !!built.wantsPoll };
     _stack.push(entry);
     // Focus the first focusable control, else the panel itself.
     var f = built.panel.querySelector(FOCUSABLE);
@@ -459,9 +448,27 @@
   }
 
   // CR.dialogs.update(state) — forwarded to the topmost dialog's own updater, if any.
+  //
+  // SEAM FIX: this is the ONLY caller ext_cr_boot.js's SIDE_EXT poll hook uses (it
+  // broadcasts {kind:'poll', flags, sessions, now} on every ~5s poll tick so the
+  // Flags dialog stays live without a second fetch loop) — and it used to forward
+  // that blob to WHICHEVER dialog happened to be topmost, unconditionally. A dialog
+  // that never asked for poll data (e.g. the directory picker, mid "+ New terminal"
+  // flow) would have its real payload clobbered the moment a poll tick landed while
+  // it was on screen. Fixing this per-dialog (as manage-terminals's own `update`
+  // closure below does, belt-and-braces) only protects the dialogs someone
+  // remembered to guard — the next dialog anyone adds inherits the bug by default.
+  // Fixing it HERE instead flips that default: a poll-tagged payload is refused
+  // unless the dialog's own builder opted in (`wantsPoll: true` on the object it
+  // returns from open()/REGISTRY[name](...) — see renderFlagsList, the one real
+  // consumer). Every other update() caller (a dialog's own re-open with a richer
+  // payload, via open()'s same-name dedupe path above) never carries `kind:'poll'`
+  // and is unaffected.
   function update(state) {
     var top = topEntry();
-    if (top && typeof top.update === 'function') top.update(state);
+    if (!top || typeof top.update !== 'function') return;
+    if (state && state.kind === 'poll' && !top.wantsPoll) return;
+    top.update(state);
   }
 
   // ---------------------------------------------------------------------------
@@ -1403,18 +1410,26 @@
           body.appendChild(h('div', { class: 'cr-context-bar', onclick: function () { if (payload.onExpandBelow) payload.onExpandBelow(); } }, [icon('arrow-down'), ' expand ' + payload.belowCount + ' lines below']));
         }
       } else if (mode === 'diff' && viewMode === 'rendered') {
-        // NOTE: "Rendered" needs the shared markdown renderer (capability 31, owned by
-        // the detail module) to be faithful for a .md file's diff. Absent that shared
-        // seam on ctx today, this falls back to mdLite() — flagged as REQUIRED ADDITION.
+        // "Rendered" needs to be faithful for a .md file's diff — full document markup
+        // (headings/lists/tables/fences), not just inline spans — so this calls app.js's
+        // OWN block-level renderer, `mdBlock` (global — app.js is concatenated ahead of
+        // every ext_cr_*.js file into one <script> tag by page.py's build_page(), the
+        // same reachable-global pattern ext_cr_detail.js's mdHtml() already relies on).
+        // This used to fall back to this module's own local markdown-lite fork (since
+        // deleted) that silently dropped italics/links/headings/lists/tables/fences —
+        // same text, worse rendering, purely because of which dialog showed it.
         var pre = h('div', { class: 'cr-rendered-md' });
-        pre.innerHTML = mdLite((payload.lines || []).map(function (l) { return l.text; }).join('\n'));
+        pre.innerHTML = mdBlock((payload.lines || []).map(function (l) { return l.text; }).join('\n'));
         body.appendChild(pre);
       } else if (mode === 'output') {
         var pre2 = h('pre', { class: 'cr-outputtext' }, [payload.text || '']);
         body.appendChild(pre2);
       } else {
+        // 'text' mode is the narration/prompt full-text pop-out (capability 27/34) —
+        // the same document-shaped, potentially multi-paragraph content app.js's own
+        // openText() renders with mdBlock() (app.js ~1690). Same renderer, same reason.
         var textWrap = h('div', { class: 'cr-rendered-md' });
-        textWrap.innerHTML = mdLite(payload.text || '');
+        textWrap.innerHTML = mdBlock(payload.text || '');
         body.appendChild(textWrap);
       }
     }
@@ -1670,7 +1685,11 @@
     }
     paint();
     chrome.body.appendChild(list);
-    return { backdrop: chrome.backdrop, panel: chrome.panel, update: function (state) { if (state && state.flags) { payload.flags = state.flags; paint(); } } };
+    // wantsPoll: true — this is the one dialog that legitimately consumes the
+    // {kind:'poll', flags, sessions, now} broadcast ext_cr_boot.js's SIDE_EXT hook
+    // sends on every poll tick (see CR.dialogs.update()'s own comment for why the
+    // opt-in lives here instead of every OTHER dialog needing to guard itself).
+    return { backdrop: chrome.backdrop, panel: chrome.panel, wantsPoll: true, update: function (state) { if (state && state.flags) { payload.flags = state.flags; paint(); } } };
   }
 
   // ---------------------------------------------------------------------------
@@ -1771,7 +1790,24 @@
       ]));
     }
     paint();
-    return { backdrop: chrome.backdrop, panel: chrome.panel, update: function (p) { payload = p || {}; paint(); } };
+    // FIX: CR.dialogs.update(state) (dialogs.js's generic forwarder) hands its state blob
+    // to WHICHEVER dialog is topmost, unconditionally — it's ext_cr_boot.js's SIDE_EXT hook
+    // broadcasting {flags, sessions, now} on every poll round so the flags dialog stays live.
+    // This dialog's own re-open calls (_openManageDialog/_openCapDialog in ext_cr_term.js)
+    // always carry `terminals` (or `error`); the broadcast carries neither. A blind
+    // `payload = p || {}` replace was clobbering a real {terminals,max,...} payload with the
+    // broadcast's unrelated shape on the very next poll, so `terms.length`/`max` both read 0
+    // and the dialog fell to the empty state a couple seconds after opening. Ignore any update
+    // that isn't actually meant for this dialog instead of accepting whatever lands on top.
+    return {
+      backdrop: chrome.backdrop, panel: chrome.panel,
+      update: function (p) {
+        p = p || {};
+        if (!('terminals' in p) && !('error' in p)) return;
+        payload = p;
+        paint();
+      },
+    };
   }
 
   // ---------------------------------------------------------------------------

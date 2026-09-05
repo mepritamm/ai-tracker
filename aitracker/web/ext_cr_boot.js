@@ -600,6 +600,33 @@ window.CR = window.CR || {};
   // through loadSide()/poll(), the same two loops app.js already runs.
   // ----------------------------------------------------------------------
 
+  // Pin / unpin from the detail view — cr_detail.js's own "toggle-pin" click
+  // case already flips its local session.pinned optimistically (its own
+  // paintPinButton) and never calls fetch() itself (this file's own
+  // "cr_detail.js only ever emits an intent" contract, same as cr:rename just
+  // above); this bridges it to the SAME POST /api/pin route classic's
+  // togglePin() (app.js) and the rail's toggleSessionPin() (ext_cr_board.js,
+  // not ours to edit) already write through -- a third caller of one route,
+  // not a second pin store. loadSide() refreshes the sidebar's own pinned
+  // section and (via SIDE_EXT.push) the rail; poll() refreshes this exact
+  // session's own detail dict so a failed write self-corrects on the header
+  // instead of leaving the optimistic flip stuck.
+  on('cr:pin-toggle', function (payload) {
+    var sid = payload && payload.sessionId;
+    if (!sid || typeof fetch !== 'function') return;
+    var pinned = !!(payload && payload.pinned);
+    fetch('/api/pin', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sid, pinned: pinned }),
+    }).then(function (r) { return r.ok; }).then(function (ok) {
+      emit('notify', { text: ok ? (pinned ? 'Pinned.' : 'Unpinned.') : 'Couldn’t update the pin.' });
+      if (typeof loadSide === 'function') loadSide();
+      if (ok && typeof cur !== 'undefined' && sid === cur && typeof poll === 'function') poll();
+    }).catch(function () {
+      emit('notify', { text: 'Couldn’t reach the server — the pin wasn’t saved.' });
+    });
+  });
+
   // Flag an issue — same POST /api/flags body shape as classic's addFlag(),
   // just sourced from the payload's sessionId instead of the global `cur`
   // (the detail view can flag a session that isn't the currently-tracked
@@ -901,7 +928,12 @@ window.CR = window.CR || {};
         try { window.CR.board.update({ sessions: list, now: now }); } catch (e) { console.error('[CR] board.update threw', e); }
       }
       if (window.CR.dialogs && typeof window.CR.dialogs.update === 'function') {
-        try { window.CR.dialogs.update({ flags: buildFlagsPayload().flags, sessions: list, now: now }); } catch (e) { console.error('[CR] dialogs.update threw', e); }
+        // kind:'poll' tags this as the generic poll broadcast (not a dialog's own
+        // re-open with a richer payload) — CR.dialogs.update()'s seam refuses to
+        // forward a poll-tagged payload to any dialog that hasn't opted in via
+        // `wantsPoll: true` (today: only the flags dialog), so a dialog that never
+        // asked for poll data can no longer have its real payload clobbered by it.
+        try { window.CR.dialogs.update({ kind: 'poll', flags: buildFlagsPayload().flags, sessions: list, now: now }); } catch (e) { console.error('[CR] dialogs.update threw', e); }
       }
       if (window.CR.term && typeof window.CR.term.update === 'function') {
         try { window.CR.term.update({ sessions: list }); } catch (e) { console.error('[CR] term.update threw', e); }

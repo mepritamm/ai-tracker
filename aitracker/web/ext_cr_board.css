@@ -91,17 +91,27 @@
   border-bottom: 1px solid var(--line-subtle);
 }
 
+/* GAP CLOSE (visible top-bar labels): was a fixed 28x28 icon-only square --
+ * widened to a `min-width` pill so its new "Sessions" `.cr-topbar-label`
+ * (ext_cr_board.js buildTopBar) has room to sit next to the icon at full
+ * width, same shape as `.cr-icon-btn` below. The 1280-1439px and <=480px
+ * tiers (further down this file) hide the label and zero the added
+ * gap/padding, so this control looks and measures EXACTLY as it did before
+ * at both of those tiers -- only the >=1440px default width grows. */
 .tracker-next .cr-rail-toggle {
   flex: 0 0 auto;
-  width: 28px;
+  min-width: 28px;
   height: 28px;
+  padding: 0 6px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  gap: 6px;
   border-radius: var(--radius-sm);
   border: 1px solid transparent;
   background: transparent;
   color: var(--text-secondary);
+  font: var(--fw-row-max) var(--fs-row-max)/var(--lh-row-max) var(--font-sans);
   cursor: pointer;
 }
 .tracker-next .cr-rail-toggle:hover { background: var(--fill-row-hover); }
@@ -337,8 +347,18 @@
 @media (min-width: 1280px) and (max-width: 1439px) {
   .tracker-next .cr-back .cr-topbar-label,
   .tracker-next .cr-icon-btn .cr-topbar-label,
-  .tracker-next .cr-newsession .cr-topbar-label { display: none; }
+  .tracker-next .cr-newsession .cr-topbar-label,
+  /* GAP CLOSE (visible top-bar labels): the three newly-labelled controls
+   * join this SAME icon-only-at-this-tier rule list, exactly as instructed --
+   * never a second compaction mechanism. */
+  .tracker-next .cr-rail-toggle .cr-topbar-label,
+  .tracker-next .cr-flagcount .cr-topbar-label,
+  .tracker-next .cr-bell .cr-topbar-label { display: none; }
   .tracker-next .cr-newsession { gap: 0; }
+  /* Undoes the base rule's added gap/padding (see .cr-rail-toggle above) so
+   * the icon-only button measures exactly as it did before this label was
+   * added -- same reasoning as cr-newsession's own `gap: 0` line above. */
+  .tracker-next .cr-rail-toggle { gap: 0; padding: 0; }
 }
 
 @media (max-width: 480px) {
@@ -347,8 +367,13 @@
 
   /* Blocker 2 — rail toggle: was a bare 28x28 box (no padding to grow).
      Grown to a real 44x44 box outright (row already has room once wrapped;
-     see arithmetic in the file-level Blocker 1 comment). 28px -> 44px. */
-  .tracker-next .cr-rail-toggle { width: 44px; height: 44px; }
+     see arithmetic in the file-level Blocker 1 comment). 28px -> 44px.
+     GAP CLOSE (visible top-bar labels) — `padding: 0` undoes the base
+     rule's added `0 6px` (see .cr-rail-toggle above) now that its new
+     "Sessions" label is hidden right below, so the icon still centres in
+     the 44px box exactly as it did before the label existed. */
+  .tracker-next .cr-rail-toggle { width: 44px; height: 44px; padding: 0; }
+  .tracker-next .cr-rail-toggle .cr-topbar-label { display: none; }
 
   /* Blocker 1 — Back: label collapses to icon-only ("‹" stays visible as
      the permanent glyph, "Classic dashboard" is the hidden `.cr-topbar-label`
@@ -376,7 +401,11 @@
      (17.5px) + 2px border = 6+6+17.5+2 = 31.5px. flagcount gets `min-height`
      only (keeps its digit); bell/Config/Help become fixed 44x44 icon-only
      boxes once their `.cr-topbar-label` hides. 31.5px -> 44px both ways. */
+  /* GAP CLOSE (visible top-bar labels): the DIGIT still never hides (per the
+   * comment above) -- only the new "Flags " word does, same icon-only
+   * compaction every other labelled control gets at this tier. */
   .tracker-next .cr-flagcount { min-height: 44px; padding: 0 10px; }
+  .tracker-next .cr-flagcount .cr-topbar-label { display: none; }
   .tracker-next .cr-bell,
   .tracker-next .cr-icon-btn {
     width: 44px;
@@ -384,6 +413,7 @@
     padding: 0;
     justify-content: center;
   }
+  .tracker-next .cr-bell .cr-topbar-label,
   .tracker-next .cr-icon-btn .cr-topbar-label { display: none; }
 
   /* Blocker 2 — theme segment buttons: padding 6px10 + font 11px/1 (11px
@@ -595,6 +625,42 @@
   border: 1px solid var(--line-agent);
   box-shadow: var(--glow-agent-soft);
 }
+/* GAP CLOSE (rail parity, "clearer/smoother like the old view"): classic's
+ * `.sitem` carries these FOUR state modifier classes straight on the row
+ * (app.css: `.pinned`/`.waiting`/`.done`/`.flagged`) so a session's state
+ * reads at a glance from the row's own fill/border, not just a 7px dot.
+ * Ported here with the control room's own state tokens (never app.css's
+ * --amber-bg/--gold/--green2/--red hex values) -- same information, this
+ * surface's visual language. Declared in the SAME relative order as
+ * app.css's own pinned -> waiting -> done -> flagged rules so a row that
+ * matches more than one class resolves identically (later rule wins on
+ * equal specificity): flagged's border is the strongest signal and wins
+ * last, exactly as it does in the classic sidebar. */
+.tracker-next .cr-rail-row--pinned { background: var(--surface-agent-quiet); }
+/* GAP CLOSE (rail parity — "session markers/pinned and other pieces of
+ * information must be same in both the UIs"): classic's `.sitem.hasagents`
+ * (app.css) puts a full amber border on a parent row that spawned agent
+ * children. Ported with the same border/border-left composition classic
+ * uses (declared BEFORE waiting/done/flagged, same as app.css's own order)
+ * so a row that's also waiting/done/flagged still shows the amber border on
+ * three sides while that state's own colour takes just the left edge --
+ * never app.css's --amber-line hex, the control room's own --line-agent
+ * token (ext_cr.css) instead. */
+.tracker-next .cr-rail-row--hasagents { border: 1px solid var(--line-agent); }
+.tracker-next .cr-rail-row--waiting {
+  background: var(--surface-awaiting);
+  border-left: 3px solid var(--line-awaiting);
+}
+.tracker-next .cr-rail-row--done {
+  border-left: 3px solid var(--line-done);
+}
+.tracker-next .cr-rail-row--flagged {
+  border-left: 3px solid var(--line-flagged);
+}
+/* classic's `.sitem.agentrow .nm{color:var(--gold)}` -- an agent-session row's
+ * own name reads in the agent tint, same token the pin-on state and the
+ * agent-bucket header (.cr-rail-agentrow) already use. */
+.tracker-next .cr-rail-title--agent { color: var(--text-agent); }
 .tracker-next .cr-rail-dot {
   flex: 0 0 auto;
   width: 7px;
@@ -717,6 +783,23 @@
   font-variant-numeric: tabular-nums;
   color: var(--text-muted);
 }
+/* FIX (collapsed footer clipping): the 48px-wide `.cr-rail--collapsed` (its
+ * own rule above sets `overflow: hidden` on `.cr-rail`) leaves this footer
+ * only ~20px of content width once the base rule's 14px side padding is
+ * subtracted -- fine for the expanded "scroll · N more" phrase, but the
+ * collapsed content is a single unbreakable "+N" token (ext_cr_board.js's
+ * renderRail) that silently clips at 3-4 digits (a realistic count: this
+ * machine alone sees 900+ sessions). Smaller diff than teaching the JS to
+ * abbreviate ("+1.2k") -- CSS-only, and the FULL count still rides `title`
+ * (set alongside `textContent` in renderRail) either way. */
+.tracker-next .cr-rail--collapsed .cr-rail-footer {
+  padding: 8px 2px;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  font-size: 9px;
+  letter-spacing: -.03em;
+}
 
 /* collapsed rail: 48px orb column */
 .tracker-next .cr-rail--collapsed .cr-rail-list {
@@ -725,13 +808,41 @@
   align-items: center;
   gap: 6px;
   padding: 8px 0;
+  /* FIX (collapsed alignment): `.cr-rail-list` (base rule, above) is
+   * `overflow-y: auto` and inherits that here -- once the column has more
+   * orbs than fit, a scrollbar renders INSIDE the 48px box and eats part of
+   * its width, so the centred (`align-items: center`) orbs get optically
+   * shifted left by half the scrollbar's width whenever it's present, and
+   * shift back the instant it isn't (e.g. one poll adds a session). Hiding
+   * the scrollbar removes that width fluctuation entirely -- the column
+   * stays scrollable (wheel/touch/keyboard all still work), it just never
+   * reserves gutter space for a visible track. */
+  scrollbar-width: none;
 }
+.tracker-next .cr-rail--collapsed .cr-rail-list::-webkit-scrollbar { width: 0; height: 0; }
 .tracker-next .cr-rail--collapsed .cr-rail-group-header,
 .tracker-next .cr-rail--collapsed .cr-rail-label,
 .tracker-next .cr-rail--collapsed .cr-rail-search,
 .tracker-next .cr-rail--collapsed .cr-rail-groupby,
-.tracker-next .cr-rail--collapsed .cr-rail-count { display: none; }
-.tracker-next .cr-rail--collapsed .cr-rail-header { justify-content: center; }
+.tracker-next .cr-rail--collapsed .cr-rail-count,
+/* FIX (collapsed header centring): `.cr-rail-title-group` (the wrapper
+ * around the now-hidden `.cr-rail-label`) is `flex: 1` on the base rule --
+ * left visible-but-empty, it still claims all the header's remaining flex
+ * space, which shoves the brand mark and the collapse chevron to opposite
+ * edges of the 48px column instead of letting `justify-content: center`
+ * (below) centre them as a pair. Hidden here alongside its sibling. */
+.tracker-next .cr-rail--collapsed .cr-rail-title-group { display: none; }
+.tracker-next .cr-rail--collapsed .cr-rail-header {
+  justify-content: center;
+  /* The header's base padding (14px 12px 10px) plus its brand mark (20px) +
+   * gap (8px) + chevron (22px) = 74px of content in a 48px column -- too
+   * wide to centre without clipping. Dropping the brand mark for this tier
+   * (purely decorative once the rail is a bare orb strip) and tightening
+   * the side padding leaves just the collapse/expand toggle, which now
+   * centres cleanly with room to spare. */
+  padding: 14px 4px 10px;
+}
+.tracker-next .cr-rail--collapsed .cr-rail-brand { display: none; }
 
 .tracker-next .cr-orb-divider {
   width: 20px;
@@ -810,11 +921,13 @@
 }
 
 /* Mobile rail scrim — sits behind the overlay-open rail, in front of the
- * board. No scrim/backdrop token exists in 01-foundations.md, so the fill is
- * a literal rgba (same precedent as the working-tile pulse keyframes, which
- * also use a literal rgba where no token covers the need). Only present
- * below 1024px, i.e. exactly the width band where the rail is an overlay
- * (see the tier-boundary note above the rail-overlay media query). */
+ * board. Was a hardcoded rgba() with no light/dark handling — now the shared
+ * `--scrim` token (ext_cr.css, defined per-theme under .tracker-next /
+ * .tracker-next.is-dark), same as ext_cr_dialogs.css's .cr-backdrop and
+ * ext_cr_boot.css's .cr-scrim. Fallback is this rule's own prior literal
+ * value. Only present below 1024px, i.e. exactly the width band where the
+ * rail is an overlay (see the tier-boundary note above the rail-overlay
+ * media query). */
 .tracker-next .cr-rail-scrim {
   display: none;
 }
@@ -827,7 +940,7 @@
     bottom: 0;
     left: 0;
     z-index: 39;
-    background: rgba(0, 0, 0, .35);
+    background: var(--scrim, rgba(0, 0, 0, .35));
     opacity: 0;
     pointer-events: none;
     transition: opacity .24s ease;

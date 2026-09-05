@@ -24,6 +24,7 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 import aitracker.config as config
 from aitracker import registry, server as _server
@@ -467,6 +468,10 @@ class TestDrillDownRoutes(_AuggieEnv):
         return r.status, json.loads(body)
 
     def test_session_route_carries_the_three_capabilities(self):
+        # registry.parse_any() now runs annotate_liveness() (util.py), which marks
+        # `/abs/new.py` and `rel/app.py` alive=False (the fixture never actually writes
+        # them to disk) but no longer DROPS them -- files/agents/commands must still
+        # reach the client through the real HTTP route regardless of on-disk liveness.
         st, d = self._get("/api/session?id=auggie:s1")
         self.assertEqual(st, 200)
         self.assertTrue(d["files"], "files must not be empty for an Auggie session")

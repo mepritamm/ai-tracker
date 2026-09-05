@@ -1123,3 +1123,79 @@ class TestBoardFilterHandlesAgentGroupTiles(unittest.TestCase):
     def test_no_active_filter_still_passes_everything(self):
         r = self.OUT["no_filter_passes_group"]
         self.assertTrue(r["ok"])
+
+
+# ---------------------------------------------------------------------------
+# TOP-BAR VISIBLE LABELS (user's own words, twice: "Get the text beside the
+# symbols/icons/emojis such that it's easily readable to everyone like
+# previously"). Three icon-only top-bar controls got a title/aria-label but
+# no VISIBLE word: `.cr-rail-toggle` (leftmost, collapses/expands the rail),
+# `.cr-flagcount` (a bare number with no noun), `.cr-bell` (no text at all).
+# Fixed by reusing the EXISTING `.cr-topbar-label` span pattern Config/Help/
+# New session already use (buildTopBar in ext_cr_board.js) -- never a second
+# labelling mechanism -- which means the SAME responsive rules (the
+# 1280-1439px and <=480px tiers in ext_cr_board.css) had to be extended to
+# cover these three new labels too, or the top bar would overflow/wrap at
+# those widths instead of degrading to icon-only like every other labelled
+# control already does.
+# ---------------------------------------------------------------------------
+
+def _extract_style_content(html):
+    m = re.search(r'<style>(.*?)</style>', html, re.DOTALL)
+    if not m:
+        raise AssertionError("No <style> tag found in assembled page")
+    return m.group(1)
+
+
+class TestTopBarVisibleLabels(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = _read_page()
+        cls.bundle = _extract_script_content(cls.html)
+        cls.css = _extract_style_content(cls.html)
+
+    def test_rail_toggle_carries_a_sessions_label(self):
+        self.assertIn(
+            "icon('panel', '<rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M9 4v16\"/>'),\n"
+            "          h('span', { class: 'cr-topbar-label' }, ['Sessions'])]);",
+            self.bundle,
+        )
+
+    def test_flagcount_carries_a_flags_label_before_the_count(self):
+        """The count must stay the LAST child (update() mutates
+        `els.flagCountBtn.lastChild.textContent` directly) -- the label is a
+        new MIDDLE child, so this also pins that ordering never regresses."""
+        self.assertIn(
+            "h('span', { class: 'cr-topbar-label' }, ['Flags ']), '0']);",
+            self.bundle,
+        )
+
+    def test_bell_carries_an_alerts_label(self):
+        self.assertIn(
+            "[glyph('bell', ''), h('span', { class: 'cr-topbar-label' }, ['Alerts'])]",
+            self.bundle,
+        )
+
+    def test_1280_1439_tier_hides_all_three_new_labels(self):
+        m = re.search(
+            r'@media \(min-width: 1280px\) and \(max-width: 1439px\)\s*\{(.*?)\n\}',
+            self.css, re.DOTALL,
+        )
+        self.assertIsNotNone(m, "1280-1439px top-bar tier not found in assembled CSS")
+        block = m.group(1)
+        for sel in ('.tracker-next .cr-rail-toggle .cr-topbar-label',
+                    '.tracker-next .cr-flagcount .cr-topbar-label',
+                    '.tracker-next .cr-bell .cr-topbar-label'):
+            self.assertIn(sel, block, "missing from the 1280-1439px icon-only tier: %r" % sel)
+
+    def test_480px_tier_hides_all_three_new_labels(self):
+        # Two separate `@media (max-width: 480px)` blocks exist in this file
+        # (top bar, and an unrelated rail block further down) -- scanning the
+        # WHOLE CSS for these three specific selectors is unambiguous either
+        # way, since none of them are ever used outside the top bar.
+        for sel in ('.tracker-next .cr-rail-toggle .cr-topbar-label',
+                    '.tracker-next .cr-flagcount .cr-topbar-label',
+                    '.tracker-next .cr-bell .cr-topbar-label'):
+            self.assertIn(sel + ' { display: none; }', self.css,
+                           "missing <=480px icon-only rule: %r" % sel)

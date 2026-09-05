@@ -462,6 +462,27 @@ class TestApiSessionSharedFields(_ServerCase):
         self.assertEqual(j["note_count"], 1)
         self.assertEqual(j["open_flags"], 1)
 
+    def test_pin_route_round_trips_pinned_and_unpinned(self):
+        """The control-room detail view's new pin toggle (ext_cr_detail.js's `.crd-pin`
+        button, bridged via 'cr:pin-toggle' in ext_cr_boot.js) POSTs this SAME /api/pin
+        route classic's togglePin() (app.js) and the rail's toggleSessionPin()
+        (ext_cr_board.js) already use -- unlike the test above (which only ever pins),
+        this proves the round trip BOTH ways: pinning must report pinned, and a
+        following unpin must actually clear it again (not just append-only)."""
+        _write_claude("c2b")
+        st, j = self._get_json("/api/session?id=c2b")
+        self.assertIs(j["pinned"], False, "starts unpinned")
+
+        st, j = self._post("/api/pin", {"session": "c2b", "pinned": True})
+        self.assertEqual(st, 200)
+        st, j = self._get_json("/api/session?id=c2b")
+        self.assertIs(j["pinned"], True, "pin must be reflected on the detail dict")
+
+        st, j = self._post("/api/pin", {"session": "c2b", "pinned": False})
+        self.assertEqual(st, 200)
+        st, j = self._get_json("/api/session?id=c2b")
+        self.assertIs(j["pinned"], False, "unpin must actually clear it, not just no-op")
+
     def test_todo_times_approximate_and_per_todo_timestamp_keys(self):
         _write_claude_with_todo("c3")
         _write_auggie_with_todo("a3")
@@ -496,6 +517,41 @@ class TestServedPageNotHostGated(_ServerCase):
         # the exact bug class conventions.md calls out: a `.remote` CSS class hiding a
         # recorded-user-data control from a remote/tunnel viewer. Must be fully gone.
         self.assertNotIn(".remote", page)
+
+    def test_detail_pin_toggle_is_always_rendered_in_both_label_forms(self):
+        """GAP CLOSE: the detail view's PINNED marker used to be a display-only pill,
+        `hidden` outright whenever the session wasn't pinned -- so there was no way to
+        pin an unpinned session from this view at all. `.crd-pin` (ext_cr_detail.js) is
+        now a real toggle button, unconditionally present in the skeleton (never
+        `hidden`), with paintPinButton() filling in BOTH the "Pinned" (on) and "Pin"
+        (off) visible label text plus a distinct title for each direction -- pinned
+        again by exact substring, the same idiom this suite already uses for JS-source
+        pins (e.g. TestRailPrefConfigRowAndVocabulary in test_cr_rail_toggle.py)."""
+        st, body = self._get("/")
+        self.assertEqual(st, 200)
+        page = body.decode("utf-8", "replace")
+
+        # the button itself: a real <button>, unconditionally in the skeleton (no
+        # `hidden` attribute -- this is the actual fix, since the old markup this
+        # replaced was `<span class="crd-pill crd-pill-pinned" hidden>`).
+        self.assertIn(
+            '<button class="crd-pin" data-act="toggle-pin" type="button" aria-pressed="false">'
+            '<span class="crd-ico"></span><span class="crd-btn-label"></span></button>',
+            page,
+        )
+        # both visible label words paintPinButton() can produce for the same button.
+        self.assertIn('"Pinned" : "Pin"', page)
+        # both title/aria-label copies for the two toggle directions.
+        self.assertIn('"Unpin this session" : "Pin to top"', page)
+        # not gated to localhost (conventions.md: a control that only RECORDS user data
+        # must work from a remote host, e.g. over a tunnel) -- unlike the "External"
+        # button (deliberately isLocalhost-gated a few lines above it in renderHeader,
+        # since it needs the machine's own bound port), no line of the served page ever
+        # pairs the pin toggle with an isLocalhost/location.hostname check.
+        for line in page.splitlines():
+            if "crd-pin" in line:
+                self.assertNotIn("isLocalhost", line)
+                self.assertNotIn("location.hostname", line)
 
         controls = ('class=addflag', 'class=addnote', 'data-act="toggle-flag"',
                     'data-act="rename"', 'togglePin(')

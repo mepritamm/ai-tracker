@@ -104,17 +104,23 @@
   outline: 2px solid var(--line-focus);
   outline-offset: 2px;
 }
+/* FIX: now carries a visible "Close" word (ext_cr_term.js), same as every
+   other header/control-bar button — was an icon-only 26x26 circle. Same pill
+   shape as its neutral siblings (.cr-term-headpill just above), kept as its
+   own class (not merged into .cr-term-headpill/.cr-term-kill) so this stays
+   the one place that can carry the Close-vs-Kill distinction: neutral here,
+   Kill's own `cr-term-kill`/`cr-term-btn-danger`-style rules elsewhere stay
+   the only red one. */
 .cr .cr-term-close {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
+  gap: 5px;
+  padding: 5px 10px;
   border-radius: 999px;
-  border: 1px solid transparent;
+  border: 1px solid var(--line-default);
   background: transparent;
-  color: var(--text-muted);
-  font-size: 14px;
+  color: var(--text-secondary);
+  font: 600 11.5px/1.2 var(--font-sans);
   cursor: pointer;
 }
 .cr .cr-term-close:hover { background: var(--fill-row-hover); color: var(--text-primary); }
@@ -408,9 +414,10 @@
 /* BLOCKER 2 — phone touch targets (terminal surface). Phone tier only;
    the 760px tablet-shell tier above (and desktop) keep their density. */
 @media (max-width: 480px) {
-  /* Close (X): explicit 26x26 box, room to grow (head uses
-     justify-content: space-between on a full-width mobile shell). 26px -> 44px. */
-  .cr .cr-term-close { width: 44px; height: 44px; }
+  /* Close: now a labelled pill, same shape/sizing math as the Head pill
+     (Config/Help) rule right below — `min-height` -> 44px, not a fixed
+     square box (that was only ever right for the old icon-only 26x26 circle). */
+  .cr .cr-term-close { min-height: 44px; }
 
   /* Head pill (Config/Help): padding 5px10 + font 11.5px/1.2 (13.8px line) +
      2px border = 5+5+13.8+2 = 25.8px. `min-height` -> 44px. */

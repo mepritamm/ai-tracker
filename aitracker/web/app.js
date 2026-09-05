@@ -62,14 +62,26 @@ const $=id=>document.getElementById(id);
 const esc=s=>(s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 // tiny inline markdown for narration/requests: escape first, then `code`,
 // **bold**, *italic*, [text](url). No `_` italics — identifiers use underscores.
-function md(s){
+function md(s,safe){
   let h=esc(s);
   h=h.replace(/`([^`]+)`/g,(m,c)=>`<code>${c}</code>`);
   h=h.replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>");
-  h=h.replace(/(^|[^*])\*(?!\s)([^*\n]+?)\*/g,"$1<em>$2</em>");
+  // `safe` (mdSafe below) drops single-asterisk italics only -- machine output (shell
+  // stdout, agent last-message/task text) legitimately contains literal `*` in globs
+  // (`*.py`) and separator lines (`*** 3 failed ***`), and this rule was matching those
+  // and corrupting them (`*.py and *.js` -> `<em>.py and </em>.js`). `**bold**`, `code`,
+  // and links above are unaffected -- they don't collide with real machine output.
+  if(!safe)h=h.replace(/(^|[^*])\*(?!\s)([^*\n]+?)\*/g,"$1<em>$2</em>");
   h=h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target=_blank rel=noopener>$1</a>');
   return h;
 }
+// Machine-output-safe variant of md() -- escape first (same as md()), keep inline code/
+// bold/links, drop single-asterisk italics. Use this (never plain md()) for any surface
+// that renders raw command/tool output or a machine-authored label verbatim: background
+// shell stdout, background agent last-message, agent task text -- NOT for prose surfaces
+// (narration, notes, summary goal/now/sofar, ask questions), which keep full md()/mdHtml().
+function mdSafe(s){ return md(s,true); }
+window.mdSafe=mdSafe;
 // block-level markdown for the full-text modal: headers, tables, lists, code fences
 function mdBlock(s){
   const L=(s||"").replace(/\r/g,"").split("\n"), out=[]; let i=0;
@@ -872,7 +884,16 @@ document.addEventListener("themechange", ()=>upgradeMermaidIn(document));
 
 function ago(sec){sec=Math.max(0,sec|0);if(sec<60)return sec+"s ago";if(sec<3600)return(sec/60|0)+"m ago";if(sec<86400)return(sec/3600|0)+"h ago";return(sec/86400|0)+"d ago"}
 function base(p){return (p||"").split("/").pop()}
-const SRC={"claude-desktop":ico("desktop")+" Desktop","cli":ico('keyboard')+" CLI","sdk-cli":ico('gear')+" SDK","claude-vscode":ico('copy')+" VS Code","auggie":ico('diamond')+" Auggie","augment-vscode":ico('diamond')+" Augment (VS Code)","augment-cursor":ico('diamond')+" Augment (Cursor)"};
+// One plain-TEXT source-of-truth for the words (no markup, ever) -- SRC (the HTML label used by
+// renderSide()'s tiles/rows) is built FROM this, so the two can never drift. Any consumer that
+// needs the word ALONE (no icon glyph) -- e.g. ext_cr_board.js's toolLabel() -- calls srcText(),
+// never regex-strips SRC's HTML (that was the bug: stripping `<svg ...>`/`<span ...>` markup with
+// a `^\S+\s*` regex leaves the tag's OWN attributes behind as literal text whenever the icon is
+// more than one whitespace-free token, e.g. `class="ico ico-glyph" aria-hidden="true">CLI`).
+const SRC_ICON={"claude-desktop":"desktop","cli":"keyboard","sdk-cli":"gear","claude-vscode":"copy","auggie":"diamond","augment-vscode":"diamond","augment-cursor":"diamond"};
+const SRC_TEXT={"claude-desktop":"Desktop","cli":"CLI","sdk-cli":"SDK","claude-vscode":"VS Code","auggie":"Auggie","augment-vscode":"Augment (VS Code)","augment-cursor":"Augment (Cursor)"};
+const srcText=v=>SRC_TEXT[v]||v||"";
+const SRC={}; for(const k in SRC_TEXT) SRC[k]=ico(SRC_ICON[k])+" "+SRC_TEXT[k];
 const srcLabel=v=>SRC[v]||v||"";
 const CIRC=2*Math.PI*51; // progress-ring circumference
 
@@ -884,6 +905,16 @@ let sessions=[], searchResults=null, liveOnly=false;
 // server owns policy, client renders it -- one clock for liveness, not two).
 let listNow=Date.now()/1000;   // seeded before the first poll lands; overwritten immediately after
 const LIVE=300; // seconds since last activity a session stays "live" (5 min)
+// SHARED SEAM (parity requirement: "the session markers/pinned and other pieces of
+// information must be same in both the UIs"): the ONE place "is this session still
+// working" is decided. A session is working when its own foreground turn hasn't
+// closed (`!s.ended`) OR it has background agents active right now (`s.bg`) — either
+// half true means WORKING, live-gated so a long-stale session doesn't count. Classic's
+// sessionRow() status badge AND the control room's ext_cr_board.js `isWorking()` (which
+// feeds sessionState/triageCounts/railRow) both call this — defining it twice is exactly
+// how the two views disagreed before (ext_cr_board.js got the bg-aware fix, app.js didn't).
+function isSessionWorking(s,live){ return !!live && (!s.ended || !!s.bg); }
+window.isSessionWorking=isSessionWorking;
 const EXT=[];   // feature modules (web/ext_*.js) push a fn(d); called at the end of every render
 // Live terminal count for the sidebar's "Manage terminals" badge, read off /api/list's
 // X-Term-Count response header (same header-not-body trick as X-Server-Now above -- see
@@ -1004,7 +1035,11 @@ function sessionRow(s,now,ex){
   // end-state: waiting on your answer (wins, even while still live) > completed its last run.
   // "done" is gated to the live window (a session that JUST finished) — not every stale idle
   // session — so the checkmark marks fresh completions instead of flooding the list green.
-  const status=s.waiting?"waiting":(s.ended&&live?"done":"");
+  // Gated with `!isSessionWorking(s,live)` (the SAME shared predicate the control room's
+  // isWorking() calls) so a session with background agents still running never shows
+  // "✓ done" / the green `.sitem.done` row here while the board calls it "working" —
+  // that cross-view disagreement is the parity bug this closes.
+  const status=s.waiting?"waiting":((s.ended&&live&&!isSessionWorking(s,live))?"done":"");
   const statusBadge=status==="waiting"
     ?`<span class="statusbadge waiting" title="waiting for your answer — respond in the session">${ico('hourglass')} answer</span>`
     :status==="done"?`<span class="statusbadge done" title="completed its last run">${ico('check')} done</span>`:"";
@@ -1263,6 +1298,118 @@ const KICON={commit:ico('branch'),test:ico('check'),install:ico('download'),buil
 // falling back to the id's short form when the target isn't in it yet. Shared with
 // Control Room, which used to keep its own copy of this lookup.
 function sessionLabel(id){const hit=sessions.find(s=>s.id===id);return hit?(hit.title||hit.project||id.slice(0,8)):id.slice(0,8);}
+
+// ---- Links panel derivation — THE shared seam for both dashboards ----
+// Moved here (verbatim) from ext_cr_detail.js, which used to keep its own copy.
+// app.js loads before every ext_cr_*.js file (see aitracker/page.py's read_ext(),
+// sorted glob), so this is the one place both renderers can reach: the classic
+// sidebar's renderLinksPanel() below, and ext_cr_detail.js's renderLinks(), which
+// now calls this same global function instead of defining its own. Keep this in
+// lockstep with the shared detail-dict shape (files[]/prs[]/narrative[]/requests[]/
+// commands[]) — do NOT fork a second implementation in either file.
+//
+// Derives the Links panel's two groups from data that DOES exist (prs[], files[])
+// plus a generic URL scan of narration/prompt/command text.
+//
+// REQUIRED ADDITION (unchanged from the control-room original): this is a
+// best-effort approximation, not a real parser feature. The parser never
+// records WebFetch calls or a generic "links this session touched" list —
+// only PR urls (util.py:collect_prs, PR-shaped urls only) and local file
+// writes. A `session.links[]` field emitted at the shared seam (mirroring how
+// `prs` is built) would replace this regex scan with something that actually
+// counts WebFetch reads.
+function _dlParseT(iso){ if(!iso)return null; const ms=Date.parse(iso); return isNaN(ms)?null:ms; }
+const _dlURL_RE=/https?:\/\/[^\s<>"'()\[\]]+/g;
+function _dlHostOf(url){ const m=/^https?:\/\/([^\/]+)/.exec(url); return m?m[1]:""; }
+function _dlIsLocalHost(h){ return /^(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/.test(h); }
+function deriveLinks(session){
+  const map={};
+  function add(url,group,verb,agent,t){
+    url=url.replace(/[)\].,;'"]+$/,"");
+    if(!url)return;
+    const e=map[url];
+    if(!e){ map[url]={url,group,verb,agent:!!agent,count:1,t:t||0}; return; }
+    e.count++;
+    if(group==="generated")e.group="generated"; // generated beats worked-on
+    if(agent)e.agent=true;
+    if(t&&t>e.t)e.t=t;
+  }
+  (session.prs||[]).forEach(p=>{
+    const t=_dlParseT(p.t);
+    if(p.created) add(p.url,"generated",p.state==="merged"?"merged":(p.state==="closed"?"closed":"created"),p.agent,t);
+    else add(p.url,"worked","cited",p.agent,t);
+  });
+  (session.files||[]).forEach(f=>{
+    // f.alive is set by registry.parse_any()'s annotate_liveness() (util.py) --
+    // false means the local path no longer exists on disk. `files` itself still
+    // carries the entry (the Files panel needs the honest full history), but a
+    // dead link is exactly the noise this panel should not surface. `alive` is
+    // undefined for detail dicts built before this field existed -- treated as
+    // alive so nothing regresses there.
+    if(f.created&&f.alive!==false) add(f.path,"generated","wrote",f.agent,_dlParseT(f.last));
+  });
+  const texts=[];
+  (session.narrative||[]).forEach(n=>texts.push([n.text,_dlParseT(n.t)]));
+  (session.requests||[]).forEach(r=>texts.push([r.text,_dlParseT(r.t)]));
+  (session.commands||[]).forEach(c=>texts.push([c.cmd,_dlParseT(c.t)]));
+  texts.forEach(([text,t])=>{
+    if(!text)return;
+    _dlURL_RE.lastIndex=0;
+    let m;
+    while((m=_dlURL_RE.exec(text))){
+      const url=m[0].replace(/[)\].,;'"]+$/,"");
+      if(/\/(pull|pull-requests|merge_requests)\/\d+/.test(url))continue; // handled via prs[] above
+      const h=_dlHostOf(url);
+      if(_dlIsLocalHost(h)) add(url,"generated","endpoint",false,t);
+      else add(url,"worked","cited",false,t);
+    }
+  });
+  const all=Object.keys(map).map(k=>map[k]);
+  all.forEach(e=>{ if(e.group==="worked"&&e.count>1)e.verb="read ×"+e.count; });
+  const generated=all.filter(e=>e.group==="generated").sort((a,b)=>b.t-a.t);
+  const worked=all.filter(e=>e.group==="worked").sort((a,b)=>b.t-a.t);
+  return {generated,worked,total:all.length};
+}
+window.deriveLinks=deriveLinks;
+
+// ---- Links panel — classic sidebar rendering of deriveLinks() above ----
+// Built the same way renderForkLinks() builds its banner: the container isn't
+// in index.html (file ownership keeps this change inside app.js/app.css), so
+// it's created once and appended into the activity column, then repainted on
+// every render() pass. Reuses the existing PR-row visual language (.prlink/
+// .prurl/.prtime/.kind/.agenttag/.chev from the Pull requests panel) rather
+// than inventing a new one.
+function renderLinksPanel(d){
+  let panel=$("linkspanel");
+  if(!panel){
+    panel=document.createElement("div");
+    panel.className="card"; panel.id="linkspanel";
+    panel.innerHTML='<h2><span>Links</span><span class=cnt id=linkc></span></h2><div class=cbody id=links></div>';
+    const col=document.querySelector(".actcol");
+    if(col)col.appendChild(panel);
+  }
+  const links=deriveLinks(d);
+  const cnt=$("linkc"); if(cnt)cnt.textContent=links.total||"";
+  // Only an http(s) URL is clickable -- and only http:/https: schemes ever
+  // reach an href. Local file paths (and anything else, e.g. a hostile
+  // "javascript:" value smuggled in as a fake path) render as inert text,
+  // matching the fact that a browser can't usefully open a local path anyway.
+  const row=e=>{
+    const isHttp=/^https?:\/\//i.test(e.url);
+    const verbCls=e.group==="generated"?"kind new":"kind";
+    const agentTag=e.agent?`<span class=agenttag>${ico('agent')} agent</span>`:"";
+    const timeTag=e.t?`<span class=prtime>${ago(d.now-e.t/1000)}</span>`:"";
+    const body=`<span class="${verbCls}">${esc(e.verb)}</span>${agentTag}<span class=prurl title="${esc(e.url)}">${esc(e.url)}</span>${timeTag}`;
+    return isHttp
+      ? `<a class=prlink href="${esc(e.url).replace(/"/g,"&quot;")}" target=_blank rel=noopener>${body}<span class=chev>open ›</span></a>`
+      : `<div class=prlink>${body}</div>`;
+  };
+  let html="";
+  if(links.generated.length) html+=`<div class=linkgrp><span>Generated here</span><span>${links.generated.length}</span></div>`+links.generated.map(row).join("");
+  if(links.worked.length) html+=`<div class=linkgrp><span>Worked on</span><span>${links.worked.length}</span></div>`+links.worked.map(row).join("");
+  const box=$("links"); if(box)box.innerHTML=html||"<div class=empty>no links yet</div>";
+}
+
 function renderForkLinks(d){
   let as=$("forkas"), from=$("forkfrom");
   if(!as){
@@ -1381,7 +1528,11 @@ function render(d){
     const card=(a,i)=>
       `<div class="agent clk" onclick="openAgent(${i})"><div class=top><span class="dot ${a.running?'amber':''}"></span><span class=nm>${esc(a.task||a.id)}</span>`+
       (a.wf?` <span class=tag>${esc(a.wf.slice(0,12))}</span>`:"")+`<span class=chev>›</span></div>`+
-      `<div class=last>${esc(a.last||"")}</div>`+
+      // a.last is the agent's own free-text last message -- machine output (can
+      // legitimately contain literal `*.py` globs / `*** ... ***` separator lines),
+      // so it goes through mdSafe() (inline: `code`/**bold**/links, NO single-asterisk
+      // italics -- see mdSafe()'s comment), not plain md() and not plain esc().
+      `<div class=last>${mdSafe(a.last||"")}</div>`+
       `<div class=ft><span>${a.tools} tools</span><span>·</span><span style=color:${a.running?'var(--amber)':'var(--dim)'}>${a.running?'running':'done'}</span>`+
       `${a.ts?"<span>·</span><span>"+ago(d.now-Date.parse(a.ts)/1000)+"</span>":""}</div></div>`;
     const run=[],done=[];
@@ -1403,7 +1554,13 @@ function render(d){
     $("shc").textContent=shRun?`${shRun} running`:"all finished";
     const card=(s,i)=>
       `<div class="agent clk" onclick="openShell(${i})"><div class=top><span class="dot ${s.running?'amber':''}"></span><span class=nm>${esc(s.desc||s.cmd)}</span><span class=chev>›</span></div>`+
-      `<div class="last mono" style=font-size:11px>${esc(s.last||s.cmd)}</div>`+
+      // s.last is raw shell stdout -- the most exposed machine-output surface (a mono
+      // font showing literal command output), so it renders via mdSafe() like a.last
+      // above, never plain md() (which was corrupting globs like `*.py` and separator
+      // lines like `*** 3 failed, 2 passed ***`). The s.cmd FALLBACK (no output captured
+      // yet) is a shell command, not free text -- `*`/`_`/backticks are shell
+      // metacharacters there, so it stays on plain esc(), never md()/mdSafe().
+      `<div class="last mono" style=font-size:11px>${s.last?mdSafe(s.last):esc(s.cmd||"")}</div>`+
       `<div class=ft><span>${esc(s.id)}</span><span>·</span><span style=color:${s.running?'var(--amber)':'var(--dim)'}>${s.running?'running':'done'}</span>`+
       `${s.ts?"<span>·</span><span>"+ago(d.now-Date.parse(s.ts)/1000)+"</span>":""}</div></div>`;
     const run=[],done=[];
@@ -1420,6 +1577,7 @@ function render(d){
   $("srcnote").textContent=d.note||"";
 
   renderForkLinks(d);   // fork lineage banner(s) — see function def for why
+  renderLinksPanel(d);  // Links panel — shared deriveLinks(), see function def for why
 
   // per-session notes stack (plan-ahead notes the user wrote, newest-first display)
   renderNotes(d.notes||[]);
@@ -1838,7 +1996,9 @@ function renderNotes(notes){
       ?`<span class="link amber" onclick="pushNote(${idx})" title="${esc(says.tip)}">${says.chip}</span>`
       :`<span class="link green" onclick="pushNote(${idx})" title="Send this into the live session">${ico('play')} push</span>`;
     return `<div class="noteitem${n.pushed?" queued":""}">`+
-      `<div class=ntxt>${esc(n.text||"")}</div>`+
+      // per-session notes are user-authored free text -- the control room already
+      // renders these with mdHtml() (crd-note-row); same data, so md() here too.
+      `<div class=ntxt>${md(n.text||"")}</div>`+
       `<div class=nft>`+
         `<span class="link blue" onclick="copyNote(${idx})" title="Copy to clipboard">${ico('copy')} copy</span>`+
         push+

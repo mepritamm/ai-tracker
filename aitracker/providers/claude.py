@@ -503,24 +503,39 @@ def list_sessions(limit=200):
         # here: that would need a full transcript parse to recover, which the list path must not do.
         todo_total, todo_done, todo_current, todo_current_index = todo_summary(load_tasks(sid))
         # now_line: a short "what is it doing right now" phrase for the board tile — LIVE
-        # sessions only (inside LIVE_WINDOW and not ended); everything else gets "" for free,
-        # no extra file access. Priority mirrors overview.py's build_overview (running agents >
-        # in-progress todo > latest narration), computed entirely off data this poll already
-        # loaded: `bg` (the same _mtime_and_bg call above), `todo_current` (the same
-        # load_tasks() call above), and sm["waiting"]/sm["last_text"] (the same bounded tail
-        # read _session_meta already did for waiting/ended — see _tail_scan). Unlike
-        # build_overview, a running background agent here can't afford its `lead` detail (that
-        # needs a full parse_agents() scan of the agent transcripts — the expensive read this
-        # field must not trigger), so it's just a count.
+        # sessions only; everything else gets "" for free, no extra file access. Priority
+        # mirrors overview.py's build_overview (running agents > in-progress todo > latest
+        # narration), computed entirely off data this poll already loaded: `bg` (the same
+        # _mtime_and_bg call above), `todo_current` (the same load_tasks() call above), and
+        # sm["waiting"]/sm["last_text"] (the same bounded tail read _session_meta already
+        # did for waiting/ended — see _tail_scan). Unlike build_overview, a running
+        # background agent here can't afford its `lead` detail (that needs a full
+        # parse_agents() scan of the agent transcripts — the expensive read this field must
+        # not trigger), so it's just a count.
+        #
+        # BUG FIX: the `bg` branch used to sit BEHIND `not sm["ended"]` in the outer gate,
+        # making it unreachable for exactly the sessions it exists to describe. `ended` is
+        # computed by _tail_scan from the MAIN transcript alone (see _tail_scan's own
+        # docstring) — it says nothing about background agents. `mt` (this session's
+        # liveness mtime, from _mtime_and_bg just above) DOES fold in background-agent
+        # activity, so a session whose foreground turn already closed with assistant text
+        # (ended=True) can still be live (mt fresh) with agents actively running (bg>0).
+        # That combination made the outer gate's `not sm["ended"]` false, so `bg` was never
+        # even inspected — measured in production as `now_line: ''` on a session with
+        # `bg: 3`. Only the `bg` check itself now sits outside the `not ended` guard; the
+        # waiting/todo/last-text branches stay gated on `not ended` exactly as before (a
+        # session with running background agents but no fresh foreground turn should say
+        # what its agents are doing, not resurface a stale waiting/todo/narration line from
+        # before its foreground turn closed).
         now_line = ""
-        if (time.time() - mt) < LIVE_WINDOW and not sm["ended"]:
-            if sm["waiting"]:
+        if (time.time() - mt) < LIVE_WINDOW:
+            if not sm["ended"] and sm["waiting"]:
                 now_line = "⧖ waiting for your answer"
             elif bg:
                 now_line = "⚙ %d background agent%s" % (bg, "" if bg == 1 else "s")
-            elif todo_current:
+            elif not sm["ended"] and todo_current:
                 now_line = "▶ " + now_phrase(todo_current)
-            elif sm.get("last_text"):
+            elif not sm["ended"] and sm.get("last_text"):
                 now_line = now_phrase(sm["last_text"])
         out.append({
             "id": sid,
@@ -780,7 +795,7 @@ def parse_agents(path):
                                 if nm == "Write" or nm in EDIT_TOOLS:   # agents write files too
                                     finp = b.get("input") or {}
                                     fp = finp.get("file_path") or finp.get("notebook_path")
-                                    if fp:
+                                    if fp and isinstance(fp, str):
                                         fe = agent_files.setdefault(
                                             fp, {"path": fp, "ops": 0, "created": False, "agent": True})
                                         fe["ops"] += 1
@@ -1249,18 +1264,23 @@ def parse_session(path):
                             elif st == "completed":
                                 tt["ended"] = ts               # latest completion wins
                     elif name == "Write":
+                        # isinstance guard on every file_path below: `inp` is model-authored
+                        # JSON, so a malformed `file_path` can be a list/dict. These paths are
+                        # used as DICT KEYS, and an unhashable one raised TypeError all the way
+                        # out to a 500 on /api/session. Drop the malformed entry at ingestion --
+                        # the trust boundary -- rather than letting it poison the shared shape.
                         fp = inp.get("file_path")
-                        if fp:
+                        if fp and isinstance(fp, str):
                             e = files.setdefault(fp, {"path": fp, "ops": 0, "created": True})
                             e["ops"] += 1; e["last"] = ts; e["created"] = True
                     elif name in EDIT_TOOLS:
                         fp = inp.get("file_path") or inp.get("notebook_path")
-                        if fp:
+                        if fp and isinstance(fp, str):
                             e = files.setdefault(fp, {"path": fp, "ops": 0, "created": False})
                             e["ops"] += 1; e["last"] = ts
                     elif name == "Read":
                         fp = inp.get("file_path")
-                        if fp:
+                        if fp and isinstance(fp, str):
                             reads[fp] = ts
                     elif name == "Bash":
                         c = inp.get("command", "")

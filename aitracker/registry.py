@@ -5,6 +5,7 @@ from .providers.augment_ext import AugmentVscodeProvider, AugmentCursorProvider
 # line-by-line (`^(import |from )`), so a wrapped import leaves its tail behind and
 # `make bundle` emits a file that won't parse.
 from .store import load_pins, load_notes, load_flags, load_forks, resolve_fork_child, fork_parent_of
+from .util import annotate_liveness
 
 
 PROVIDERS = [ClaudeProvider(), AuggieProvider(),
@@ -120,6 +121,20 @@ def parse_any(sid):
     # with no extra round trip.
     d["continued_as"] = resolve_fork_child(sid)
     d["continued_from"] = fork_parent_of(sid)
+    # Links-panel liveness: mark each `files` entry with `alive` (local path still on
+    # disk, or unconditionally True for a remote URL) and de-dupe by normalized path --
+    # see util.annotate_liveness for why this lives HERE (the one seam both providers'
+    # detail dicts and both UIs — classic dashboard and control room — pass through)
+    # rather than inside each provider's own parse(). This does NOT drop anything and
+    # does NOT touch counts.created/counts.edited: `files` stays the session's complete,
+    # honest history (a file created then later cleaned up still counts as created) --
+    # only the control room's Links panel (ext_cr_detail.js's deriveLinks) reads `alive`
+    # to skip dead rows; the Files panel still shows every entry. Pass the session's own
+    # cwd (when the provider recorded one) so a relative `path` -- Claude stores the
+    # model's raw file_path with no cwd anchoring, unlike Auggie -- can be judged
+    # against the right root instead of left unresolved (see util.annotate_liveness).
+    if d.get("files"):
+        d["files"] = annotate_liveness(d["files"], (d.get("meta") or {}).get("cwd"))
     # Board "failing" tile signal (ext_cr_board.js's sessionState()) — the SAME field name
     # as all_sessions()'s list dict, so the client derives "failing" off one field regardless
     # of which view it's looking at. Claude/Auggie's parse() now sets this themselves (off

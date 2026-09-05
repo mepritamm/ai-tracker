@@ -159,11 +159,259 @@ footer.foot[hidden],
 #diffmodal[hidden],
 #msgmodal[hidden] { display: none !important; }
 
+/* ============================================================
+   #msgmodal dark-theme bridge (control view only)
+   Ground truth, read from the actual call path, not assumed: a narration
+   entry opened from the control view (ext_cr_detail.js's openTimelineEntry())
+   does NOT open one of ext_cr_dialogs.js's own `.cr`-scoped dialogs — it
+   calls app.js's shared openText()/#msgmodal, the SAME static overlay
+   classic's own "Narration" row (openMsg(), app.js) has always used.
+   #msgmodal is a real node in index.html, a SIBLING of #nextRoot — never
+   its descendant — so no `.cr .cr-dialog` rule in ext_cr_dialogs.css can
+   ever reach it (that file's own scoping rule, "every selector lives
+   under `.cr`", is right; #msgmodal just isn't under it). Left alone,
+   #msgmodal reads classic's OWN --card/--text/... tokens (app.css :root /
+   html.light) — kept dark/light-in-sync with Control Room's theme pref by
+   ext_cr_boot.js's syncClassicTheme(), but that is a DIFFERENT palette
+   (classic's cool blue-black) from Control Room's own warm-stone one, so
+   a dialog opened FROM the control view didn't "clearly maintain the
+   color theme for the dark-themed control view" the way the rest of the
+   view does.
+   Fix: repoint #msgmodal's colors at Control Room's OWN dark tokens —
+   every var() below is one ext_cr.css's `.tracker-next.is-dark` block
+   already defines, with that same block's own hex copied in as the
+   literal fallback (nothing invented here) — but ONLY while the control
+   view's dark theme is the one actually on screen. Gated with the general
+   sibling combinator on `#nextRoot.is-dark:not([hidden])`: `.is-dark` is
+   Control Room's own resolved-dark flag, and `:not([hidden])` is "the
+   'next' UI is the one currently shown" (ext_cr_boot.js's setUiMode()
+   only ever clears `#nextRoot[hidden]` for 'next'). Classic's own default
+   appearance — reached with #nextRoot hidden, whichever theme its own
+   button last picked — never matches this selector, so it is completely
+   untouched, satisfying "don't change the default UI's dialog color."
+   Precedent for an ext_cr_boot.css rule addressing #msgmodal/#diffmodal
+   by id: the `[hidden]` block immediately above already does exactly
+   that for a different (display) concern. #diffmodal is NOT included
+   here — grepped ext_cr_detail.js/board.js/term.js and Control Room
+   never opens it, so it would be an unverified, drive-by change. */
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .modal {
+  background: var(--surface-raised, #2A251F);
+  border-color: var(--line-default, #6E6354);
+  color: var(--text-primary, #FBFAF7);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .mh {
+  border-bottom-color: var(--line-subtle, #403A31);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .pp {
+  color: var(--text-muted, #A89C8B);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .mnav .mbtn {
+  color: var(--text-muted, #A89C8B);
+  border-color: var(--line-default, #6E6354);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .mnav .mbtn:hover {
+  color: var(--text-primary, #FBFAF7);
+  border-color: var(--line-focus, #8FB187);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .mnav .mpos {
+  color: var(--text-muted, #A89C8B);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .mdbtn {
+  color: var(--text-muted, #A89C8B);
+  border-color: var(--line-default, #6E6354);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .mdbtn:hover {
+  color: var(--text-primary, #FBFAF7);
+  border-color: var(--line-focus, #8FB187);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .x {
+  color: var(--text-muted, #A89C8B);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .x:hover {
+  background: var(--fill-row-hover, rgba(251,250,247,.06));
+  color: var(--text-primary, #FBFAF7);
+}
+/* Body prose: headings, paragraphs (inherit), list markers (inherit
+   currentColor), inline `code` spans, fenced code blocks, tables, links —
+   the exact legibility checklist this task called for. */
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .msgbody,
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .mdh {
+  color: var(--text-primary, #FBFAF7);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal a {
+  color: var(--text-link, #8FB187);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal code {
+  background: var(--surface-sunken, #1A1714);
+  color: var(--text-dusk, #A8C0C9);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .mdpre {
+  background: var(--surface-sunken, #1A1714);
+  border-color: var(--line-default, #6E6354);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .mdpre code {
+  background: none;
+  color: var(--text-secondary, #D8CFC2);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .mdt th,
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .mdt td {
+  border-color: var(--line-default, #6E6354);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .mdt th {
+  background: var(--surface-top, #231F1A);
+  color: var(--text-primary, #FBFAF7);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .codecopy {
+  background: var(--surface-raised, #2A251F);
+  color: var(--text-muted, #A89C8B);
+  border-color: var(--line-default, #6E6354);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .codecopy:hover {
+  color: var(--text-primary, #FBFAF7);
+  border-color: var(--line-focus, #8FB187);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .codecopy.ok {
+  color: var(--state-done, #8FB187);
+  border-color: var(--line-done, #6E9478);
+}
+/* Unsupported-mermaid-family fallback tag (mdBlock()'s mmdftag) — classic
+   styles it amber; CR's nearest role for "flagged as an approximation, not
+   an error" is its own thinking/agent-quiet pairing. */
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal .mmdftag {
+  color: var(--text-thinking, #E5CB79);
+  background: var(--surface-agent-quiet, #322A16);
+  border-color: var(--line-agent, #A9862C);
+}
+#nextRoot.is-dark:not([hidden]) ~ #msgmodal ::-webkit-scrollbar-thumb {
+  background: var(--line-default, #6E6354);
+}
+
+/* ============================================================
+   #msgmodal LIGHT-theme bridge (control view only)
+   Same defect, the other theme: with the control view active and in LIGHT
+   theme, #msgmodal had no bridge at all, so it fell back to classic's own
+   light palette (app.css's html.light block) instead of ext_cr.css's
+   `.tracker-next` ("Cream") one — a visible mismatch against the rest of
+   the control view, which the dark block above already fixed for dark.
+   Why this is a SEPARATE block instead of widening the dark block's own
+   gate to `#nextRoot:not([hidden]) ~ #msgmodal` and letting var() pick the
+   right value per theme (the obvious-looking simplification, and the one
+   that would HALVE the rule count instead of doubling it): #msgmodal is a
+   SIBLING of #nextRoot, never its descendant, so it is never inside
+   `.tracker-next`/`.tracker-next.is-dark` — the only two places
+   ext_cr.css defines --surface-raised/--text-primary/etc. No ancestor of
+   #msgmodal defines those custom properties (app.css's :root defines a
+   completely different token set — --card/--text/... — for classic's own
+   palette), so every var(--token, ...) below NEVER actually resolves to
+   the custom property; it silently falls straight through to its own
+   literal fallback, always. That is true of the dark block above too —
+   confirmed by reading it, not assumed — so widening its gate would just
+   make #msgmodal render the DARK block's hardcoded fallbacks unconditionally,
+   in light theme too. The var() form is kept anyway (matching the dark
+   block's own convention, and documenting which real ext_cr.css token
+   each fallback mirrors) even though only the literal ever actually
+   applies here.
+   Gated on `#nextRoot:not(.is-dark):not([hidden])` — the control view is
+   on screen AND its resolved theme is NOT dark — so classic's own default
+   #msgmodal appearance (#nextRoot hidden, whichever theme classic's own
+   button last picked) never matches this selector either, same as the
+   dark block. */
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .modal {
+  background: var(--surface-raised, #FFFFFF);
+  border-color: var(--line-default, #CFC7B7);
+  color: var(--text-primary, #1E1B17);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .mh {
+  border-bottom-color: var(--line-subtle, #E7E2D5);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .pp {
+  color: var(--text-muted, #877866);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .mnav .mbtn {
+  color: var(--text-muted, #877866);
+  border-color: var(--line-default, #CFC7B7);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .mnav .mbtn:hover {
+  color: var(--text-primary, #1E1B17);
+  border-color: var(--line-focus, #3B5747);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .mnav .mpos {
+  color: var(--text-muted, #877866);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .mdbtn {
+  color: var(--text-muted, #877866);
+  border-color: var(--line-default, #CFC7B7);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .mdbtn:hover {
+  color: var(--text-primary, #1E1B17);
+  border-color: var(--line-focus, #3B5747);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .x {
+  color: var(--text-muted, #877866);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .x:hover {
+  background: var(--fill-row-hover, rgba(0,0,0,.04));
+  color: var(--text-primary, #1E1B17);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .msgbody,
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .mdh {
+  color: var(--text-primary, #1E1B17);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal a {
+  color: var(--text-link, #3B5747);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal code {
+  background: var(--surface-sunken, #F4F1E8);
+  color: var(--text-dusk, #395D6A);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .mdpre {
+  background: var(--surface-sunken, #F4F1E8);
+  border-color: var(--line-default, #CFC7B7);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .mdpre code {
+  background: none;
+  color: var(--text-secondary, #4A4237);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .mdt th,
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .mdt td {
+  border-color: var(--line-default, #CFC7B7);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .mdt th {
+  background: var(--surface-top, #FBFAF7);
+  color: var(--text-primary, #1E1B17);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .codecopy {
+  background: var(--surface-raised, #FFFFFF);
+  color: var(--text-muted, #877866);
+  border-color: var(--line-default, #CFC7B7);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .codecopy:hover {
+  color: var(--text-primary, #1E1B17);
+  border-color: var(--line-focus, #3B5747);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .codecopy.ok {
+  color: var(--state-done, #3B5747);
+  border-color: var(--line-done, #B9CBBF);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal .mmdftag {
+  color: var(--text-thinking, #8A6D14);
+  background: var(--surface-agent-quiet, #FBF3DC);
+  border-color: var(--line-agent, #D9B855);
+}
+#nextRoot:not(.is-dark):not([hidden]) ~ #msgmodal ::-webkit-scrollbar-thumb {
+  background: var(--line-default, #CFC7B7);
+}
+
 .cr-scrim {
   position: fixed;
   inset: 0;
   z-index: 100;
-  background: rgba(20, 16, 10, .45);
+  /* Was a hardcoded rgba() with no light/dark handling — now the shared
+     `--scrim` token (ext_cr.css). This element carries `.tracker-next`
+     (+ live `.is-dark`) directly on itself (see the class-name comment
+     above), so the token resolves without needing any ancestor. Fallback
+     is this rule's own prior literal value. */
+  background: var(--scrim, rgba(20, 16, 10, .45));
   display: flex;
   align-items: center;
   justify-content: center;

@@ -33,7 +33,10 @@
 .cr .cr-backdrop {
   position: absolute;
   inset: 0;
-  background: rgba(20, 18, 14, .38);
+  /* Was a hardcoded rgba() with no light/dark handling — now the shared
+     `--scrim` token (ext_cr.css, defined per-theme under .tracker-next /
+     .tracker-next.is-dark). Fallback is this rule's own prior literal value. */
+  background: var(--scrim, rgba(20, 18, 14, .38));
 }
 
 .cr .cr-dialog {
@@ -498,6 +501,15 @@
 .cr .cr-runoutput-empty { padding: 12px; color: var(--text-muted, #877866); font-style: italic; }
 .cr .cr-rendered-md { padding: 12px; font-family: var(--font-sans, sans-serif); line-height: 1.6; }
 .cr .cr-rendered-md code { font-family: var(--font-mono, monospace); background: var(--surface-sunken, #F4F1E8); padding: 1px 4px; border-radius: 3px; }
+/* mdBlock()'s `.mdp`/`.mdul`/`.mdt`/`.cblock`/`.mdpre`/`.codecopy`/`.mmd` are already
+   styled generically under the `.cr` scope (ext_cr_detail.css) -- only its `.mdh`
+   headings are styled per-container there (narration/notes/prompt/summary), since a
+   bare heading needs a size/weight/margin decision. This pop-out (renderDiffPopout's
+   diff-vs-rendered toggle and its narration-text mode, both now routed through
+   mdBlock() instead of a local markdown-lite fork) is one more such container --
+   same declarations as ext_cr_detail.css's rule, reused rather than re-authored. */
+.cr .cr-rendered-md .mdh { font-size: 14px; font-weight: 700; margin: 12px 0 6px; color: var(--text-primary, #1E1B17); }
+.cr .cr-rendered-md .mdh:first-child { margin-top: 0; }
 
 /* ---- narration-with-diagram pop-out ---- */
 .cr .cr-diagram-card {

@@ -185,10 +185,15 @@
   // wraps app.js's OWN `md()` inline-markdown renderer (app.js:10-17), which escapes
   // first (`let h=esc(s)`) and only ever adds closed, safe tags (<code>/<strong>/<em>/
   // <a target=_blank rel=noopener>) — so the string this returns is exactly as safe
-  // as calling esc() was. Every field NOT explicitly named by the doc's capability
-  // #31 list (narration, prompts, todos, notes, agent output, .md files) is left on
-  // plain esc() in this file — e.g. decision questions/options and the Summary
-  // Goal/Now/So-far fields aren't named there, so they're deliberately left alone.
+  // as calling esc() was. Fields that are NOT session-authored free text stay on
+  // plain esc() in this file — shell commands (c.cmd) and file paths (e.target)
+  // legitimately contain `*`/`_`/backticks/`[`/`]` as shell metacharacters or path
+  // syntax, and running them through markdown would corrupt what they actually say.
+  // GAP CLOSE: the Summary Goal/Now/So-far fields (renderSummary), the agents panel's
+  // task text (renderAgentsPanel's a.task), and the "ask" timeline entry's question +
+  // options (entryHtml()) used to be the one asymmetry capability #31 missed — the
+  // SAME session-authored text as narration/prompts/notes, rendered on esc() only
+  // because of which panel it happened to land in, not because of what it was.
   function mdHtml(ctx, text) {
     // TASK 2 (capability #33, "Copy per code block — on every fence"):
     // ctx.markdown (ext_cr_boot.js) wraps app.js's inline-only `md()` (backtick
@@ -221,6 +226,22 @@
       try { return ctx.markdown(text).innerHTML; } catch (e) {}
     }
     return esc(text); // ctx.markdown absent (older bootstrap) — old esc()-only behaviour
+  }
+  // MACHINE-OUTPUT-SAFE variant, for text that is machine-authored rather than prose --
+  // an agent's `task` label can legitimately read "delete the stray *.pyc" or similar,
+  // and ctx.markdown() always calls app.js's full md(), whose single-asterisk italics
+  // rule corrupts that glob (see app.js's mdSafe() comment). ctx.markdown has no "safe"
+  // knob (boot.js hard-codes md()), so this calls app.js's OWN global mdSafe() directly
+  // -- same reachable-global pattern this file already uses for mdBlock/shortModel --
+  // rather than forking a second inline-markdown implementation. Prose surfaces (summary
+  // goal/now/sofar, notes, narration, ask questions) are unaffected -- they keep calling
+  // mdHtml(ctx, text) above, unchanged.
+  function mdHtmlSafe(text) {
+    if (text && text.indexOf("```") !== -1) {
+      try { if (typeof mdBlock === "function") return mdBlock(text); } catch (e) {}
+    }
+    try { if (typeof mdSafe === "function") return mdSafe(text || ""); } catch (e) {}
+    return esc(text); // mdSafe absent (older app.js) -- old esc()-only behaviour
   }
 
   // ============================== shared empty/error/degraded states (FIX 5, FIX 6) ==============================
@@ -518,62 +539,12 @@
   // Derives the Links panel's two groups from data that DOES exist (prs[], files[]) plus
   // a generic URL scan of narration/prompt/command text.
   //
-  // REQUIRED ADDITION: this is a best-effort approximation, not a real parser feature.
-  // The parser never records WebFetch calls or a generic "links this session touched"
-  // list — only PR urls (util.py:collect_prs, PR-shaped urls only) and local file writes.
-  // A `session.links[]` field emitted at the shared seam (mirroring how `prs` is built)
-  // would replace this regex scan with something that actually counts WebFetch reads.
-  var URL_RE = /https?:\/\/[^\s<>"'()\[\]]+/g;
-  function hostOf(url) {
-    var m = /^https?:\/\/([^\/]+)/.exec(url);
-    return m ? m[1] : "";
-  }
-  function isLocalHost(h) {
-    return /^(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/.test(h);
-  }
-  function deriveLinks(session) {
-    var map = {};
-    function add(url, group, verb, agent, t) {
-      url = url.replace(/[)\].,;'"]+$/, "");
-      if (!url) return;
-      var e = map[url];
-      if (!e) { map[url] = { url: url, group: group, verb: verb, agent: !!agent, count: 1, t: t || 0 }; return; }
-      e.count++;
-      if (group === "generated") e.group = "generated"; // generated beats worked-on
-      if (agent) e.agent = true;
-      if (t && t > e.t) e.t = t;
-    }
-    (session.prs || []).forEach(function (p) {
-      var t = parseT(p.t);
-      if (p.created) add(p.url, "generated", p.state === "merged" ? "merged" : (p.state === "closed" ? "closed" : "created"), p.agent, t);
-      else add(p.url, "worked", "cited", p.agent, t);
-    });
-    (session.files || []).forEach(function (f) {
-      if (f.created) add(f.path, "generated", "wrote", f.agent, parseT(f.last));
-    });
-    var texts = [];
-    (session.narrative || []).forEach(function (n) { texts.push([n.text, parseT(n.t)]); });
-    (session.requests || []).forEach(function (r) { texts.push([r.text, parseT(r.t)]); });
-    (session.commands || []).forEach(function (c) { texts.push([c.cmd, parseT(c.t)]); });
-    texts.forEach(function (pair) {
-      var text = pair[0], t = pair[1];
-      if (!text) return;
-      URL_RE.lastIndex = 0;
-      var m;
-      while ((m = URL_RE.exec(text))) {
-        var url = m[0].replace(/[)\].,;'"]+$/, "");
-        if (/\/(pull|pull-requests|merge_requests)\/\d+/.test(url)) continue; // handled via prs[] above
-        var h = hostOf(url);
-        if (isLocalHost(h)) add(url, "generated", "endpoint", false, t);
-        else add(url, "worked", "cited", false, t);
-      }
-    });
-    var all = Object.keys(map).map(function (k) { return map[k]; });
-    all.forEach(function (e) { if (e.group === "worked" && e.count > 1) e.verb = "read ×" + e.count; });
-    var generated = all.filter(function (e) { return e.group === "generated"; }).sort(function (a, b) { return b.t - a.t; });
-    var worked = all.filter(function (e) { return e.group === "worked"; }).sort(function (a, b) { return b.t - a.t; });
-    return { generated: generated, worked: worked, total: all.length };
-  }
+  // MOVED to app.js (window.deriveLinks) — the shared seam: app.js loads before every
+  // ext_cr_*.js file (aitracker/page.py's read_ext(), sorted glob), so the classic
+  // sidebar's Links panel and this file's renderLinks() both call the SAME function
+  // now, instead of this file keeping its own fork. `deriveLinks` below resolves to
+  // that global (no local shadow left in this scope) — behaviour is byte-identical to
+  // what used to live here; see app.js for the REQUIRED ADDITION note and full logic.
 
   // ============================== narration diagrams (FIX 2, capabilities #32/#33) ==============================
   // Detects a fenced ```mermaid block inside one narration entry's text and reduces it
@@ -906,6 +877,27 @@
     return fallback || "";
   }
 
+  // Paints the `.crd-pin` toggle button for a given pinned state -- called from
+  // renderHeader() on every render pass AND from the click handler's own
+  // optimistic update (case "toggle-pin" below), so there is exactly one place
+  // that knows what "pinned" vs "unpinned" looks like, never two paint
+  // implementations drifting apart. Both states stay visible words + icon
+  // (never icon-only), matching the "text beside the symbol" rule the rest of
+  // this header follows; `aria-pressed` + a real <button> makes it Enter/
+  // Space-activatable with no extra keydown wiring needed.
+  function paintPinButton(node, ctx, pinned) {
+    var btn = qs(node, ".crd-pin");
+    if (!btn) return;
+    pinned = !!pinned;
+    btn.classList.toggle("is-on", pinned);
+    btn.setAttribute("aria-pressed", pinned ? "true" : "false");
+    var label = pinned ? "Unpin this session" : "Pin to top";
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+    qs(btn, ".crd-ico").innerHTML = svgIcon(ctx, "pin");
+    qs(btn, ".crd-btn-label").textContent = pinned ? "Pinned" : "Pin";
+  }
+
   function makePanel(ctx, sid, col, key, title, opts) {
     opts = opts || {};
     var defCollapsed = opts.defaultCollapsed === false ? false : defaultFolded();
@@ -971,7 +963,15 @@
             '<span class="crd-div"></span>' +
             '<span class="crd-metaline mono"></span>' +
             '<span class="crd-pill crd-pill-state"></span>' +
-            '<span class="crd-pill crd-pill-agents" hidden></span>' +
+            // GAP CLOSE (owner ask: "make the N AGENTS RUNNING tab clickable ...
+            // track the agent live from the session header itself"): this used to
+            // be a display-only <span>, inert no matter how many agents were
+            // running. Now a real <button type=button data-act> — keyboard-
+            // activatable for free, same delegated click handler every other
+            // header control here already uses (case "focus-agents" below).
+            // renderHeader() sets title/aria-label/hidden on every render pass,
+            // same convention as paintPinButton()/the flag badge above.
+            '<button type="button" class="crd-pill crd-pill-agents" data-act="focus-agents" hidden></button>' +
             // FIX (design-audit drift 2): 5b collapses actions to ONE inline row —
             // Open terminal (solid) · Resume (outline) · Queue a note, right-aligned
             // at the end of THIS row (margin-left:auto), not a second action block
@@ -981,8 +981,8 @@
             // they're kept reachable here as small icon buttons rather than removed,
             // see the module report for exactly where they landed.
             '<span class="crd-row1-actions">' +
-              '<button class="crd-iconbtn" data-act="toggle-search" title="Search this session" aria-label="Search this session"><span class="crd-ico"></span></button>' +
-              '<button class="crd-iconbtn crd-flagbtn" data-act="toggle-flag" title="Flag an issue" aria-label="Flag an issue"><span class="crd-ico"></span><span class="crd-flag-badge" hidden></span></button>' +
+              '<button class="crd-iconbtn" data-act="toggle-search" title="Search this session" aria-label="Search this session"><span class="crd-ico"></span><span class="crd-btn-label">Search</span></button>' +
+              '<button class="crd-iconbtn crd-flagbtn" data-act="toggle-flag" title="Flag an issue" aria-label="Flag an issue"><span class="crd-ico"></span><span class="crd-btn-label">Flag</span><span class="crd-flag-badge" hidden></span></button>' +
               '<button class="crd-btn crd-btn-solid" data-act="open-terminal">Open terminal</button>' +
               '<button class="crd-btn crd-btn-outline" data-act="resume">Resume</button>' +
               '<button class="crd-btn crd-btn-ai" data-act="toggle-note">Queue a note</button>' +
@@ -991,8 +991,18 @@
           "</div>" +
           '<div class="crd-id-row2">' +
             '<h1 class="crd-goal"></h1>' +
-            '<button class="crd-rename" data-act="rename" title="Rename" aria-label="Rename session"></button>' +
-            '<span class="crd-pill crd-pill-pinned" hidden><span class="tn-emo" aria-hidden="true"></span> Pinned</span>' +
+            '<button class="crd-rename" data-act="rename" type="button" title="Rename" aria-label="Rename session"><span class="crd-ico"></span><span class="crd-btn-label">Rename</span></button>' +
+            // FIX (gap close): the PINNED marker used to be a display-only pill,
+            // `hidden` outright whenever the session wasn't pinned -- so there was
+            // no way to pin an unpinned session from this view at all, and no way
+            // to unpin one either (only the classic sidebar's togglePin() and the
+            // rail's toggleSessionPin() could write /api/pin). Now a real, ALWAYS
+            // rendered toggle button (paintPinButton below fills icon/label/aria
+            // state on every render pass and right after a click) -- same
+            // shared /api/pin seam, bridged from 'cr:pin-toggle' in ext_cr_boot.js
+            // exactly like 'cr:rename'/'cr:flag-create'/'cr:note-push' already are
+            // (this file's own contract rule 5: no fetch() calls here).
+            '<button class="crd-pin" data-act="toggle-pin" type="button" aria-pressed="false"><span class="crd-ico"></span><span class="crd-btn-label"></span></button>' +
           "</div>" +
           // Doc 03 row 2's "goal" text (the session's last request, overview.py's
           // `goal`) -- demoted to its own line below the name (see TASK 1 FIX in
@@ -1101,7 +1111,8 @@
         // session.term_tty data arrives — this skeleton default matches the same
         // honest "nothing to target yet" copy that gate uses.
         '<button class="crd-phone-stop" data-act="phone-stop" aria-label="Stop" disabled ' +
-          'title="Not available yet — there’s no terminal attached to stop.">' + ico("stop") + "</button>" +
+          'title="Not available yet — there’s no terminal attached to stop.">' +
+          '<span class="crd-ico">' + ico("stop") + '</span><span class="crd-btn-label">Stop</span></button>' +
       "</div>" +
     "</div>";
 
@@ -1263,6 +1274,37 @@
           // ("fork-lineage", …)) rather than the camelCase names this file first guessed.
           ctx.dialog("rename", { sessionId: sid, currentTitle: ui.lastTitle || "" });
           break;
+        case "toggle-pin": {
+          // Same "intent only, never fetch()" contract as every other case here
+          // (file header comment, contract rule 5) -- 'cr:pin-toggle' is bridged
+          // to the EXISTING POST /api/pin route in ext_cr_boot.js, the SAME route
+          // classic's togglePin() (app.js) and the rail's toggleSessionPin()
+          // (ext_cr_board.js) already write through, so pinning here is
+          // immediately visible to both of those on their own next poll/refresh
+          // (registry.py reads pins.json live) -- no second pin store.
+          var sessNow = ui.lastSession || {};
+          var nextPinned = !sessNow.pinned;
+          sessNow.pinned = nextPinned;   // optimistic — instant header feedback
+          paintPinButton(node, ctx, nextPinned);
+          ctx.emit("cr:pin-toggle", { sessionId: sid, pinned: nextPinned });
+          break;
+        }
+        case "focus-agents": {
+          // GAP CLOSE: "track the agent live from the session header itself."
+          // The "Agents & shells" evidence panel (EVIDENCE_PANELS above,
+          // renderAgentsPanel()) is ALREADY a live view -- it's repainted on
+          // every render() pass off ui.lastSession, same as every other panel
+          // here, not a payload captured once at open time (the exact dialog
+          // bug just fixed elsewhere in this app, ext_cr_dialogs.js:1774).
+          // Clicking the pill just expands and scrolls to that SAME panel
+          // instead of opening a second, poll-blind surface -- so "live"
+          // comes for free from the render loop that already exists.
+          var agentsWrap = ui.panels.agents;
+          if (!agentsWrap) return;
+          setPanelCollapsed(ctx, agentsWrap, sid, false);
+          agentsWrap.scrollIntoView({ block: "start", behavior: "smooth" });
+          break;
+        }
         case "toggle-search":
           ui.searchOpen = !ui.searchOpen;
           qs(node, ".crd-searchcard").hidden = !ui.searchOpen;
@@ -1411,7 +1453,7 @@
           break;
         case "agents-show-finished":
           ui.agentsShowFinished = !ui.agentsShowFinished;
-          renderAgentsPanel(ui.panels.agents, ui, ui.lastSession);
+          renderAgentsPanel(ui.panels.agents, ctx, ui, ui.lastSession);
           break;
         case "agent-open":
           ctx.dialog("agent-transcript", { sessionId: sid, agentId: t.getAttribute("data-id") });
@@ -1625,12 +1667,12 @@
     renderPhoneAwaiting(node, session);
     renderPRs(ui.panels.prs, session);
     renderLinks(ui.panels.links, session);
-    renderSummary(ui.panels.summary, session);
+    renderSummary(ui.panels.summary, ctx, session);
     renderPlan(ui.panels.plan, ctx, session);
 
     renderFiles(ui.panels.files, session);
     renderCommands(ui.panels.commands, session);
-    renderAgentsPanel(ui.panels.agents, ui, session);
+    renderAgentsPanel(ui.panels.agents, ctx, ui, session);
     renderRunPanel(ui.panels.run, session);
     renderTerminalPanel(ui.panels.terminal, session);
 
@@ -1724,11 +1766,23 @@
     }
     pill.setAttribute("aria-label", sessionName + " — " + st.word);
 
+    // GAP CLOSE: the pill is now a real button (see the SKELETON comment above)
+    // rather than display-only text -- `hidden` when the count is zero keeps it
+    // both invisible AND out of the tab order (no separate disabled/inert flag
+    // needed). Title + aria-label spell out what clicking it does, matching the
+    // pattern the pin/search/flag buttons in this same row already follow.
+    // Deliberately NOT gated on location.hostname/isLocalhost (see the comment
+    // on the "external" button below for the ONE control that is) -- this has
+    // to work from a phone/tablet over a tunnel same as every other control here.
     var agentsRunning = (session.agents_bg || []).filter(function (a) { return a.running; }).length;
     var agentsPill = qs(node, ".crd-pill-agents");
     if (agentsRunning) {
+      var agentsLabel = agentsRunning + " agent" + (agentsRunning === 1 ? "" : "s") + " running";
+      var agentsHint = "Track " + agentsLabel + " live — jump to Agents & shells";
       agentsPill.hidden = false;
-      agentsPill.textContent = agentsRunning + " agent" + (agentsRunning === 1 ? "" : "s") + " running";
+      agentsPill.textContent = agentsLabel;
+      agentsPill.title = agentsHint;
+      agentsPill.setAttribute("aria-label", agentsHint);
     } else {
       agentsPill.hidden = true;
     }
@@ -1747,16 +1801,16 @@
       goalEl.hidden = !goalText;
       goalEl.textContent = goalText;
     }
-    qs(node, ".crd-rename").innerHTML = svgIcon(ctx, "edit");
+    qs(node, ".crd-rename .crd-ico").innerHTML = svgIcon(ctx, "edit");
 
     // FIX (drift A10): session.pinned used to be present only on the board-list dict
     // (registry.py:70), never on parse_any()'s per-session detail — the shared seam now
     // merges it into the detail dict too, so this simple truthy read (already correct
-    // for both the pinned and unpinned case — the pill markup carries its own icon +
-    // "Pinned" text, this only ever toggles `hidden`) starts actually firing.
-    var pinnedPill = qs(node, ".crd-pill-pinned");
-    pinnedPill.hidden = !session.pinned;
-    qs(pinnedPill, ".tn-emo").innerHTML = svgIcon(ctx, "pin");
+    // for both the pinned and unpinned case) actually fires.
+    // GAP CLOSE: the marker used to just toggle `hidden` on a display-only pill --
+    // paintPinButton() (above) now keeps BOTH states visible, so pinning is
+    // reachable from this view too, not only unpinning.
+    paintPinButton(node, ctx, session.pinned);
 
     // FIX (design-audit drift 2): search/flag are demoted to small icon buttons in
     // the row1 actions cluster (see the SKELETON comment) rather than the old
@@ -2009,16 +2063,20 @@
     setPanelBody(wrap, html);
   }
 
-  function renderSummary(wrap, session) {
+  function renderSummary(wrap, ctx, session) {
     var ov = session.overview || {};
     setPanelCount(wrap, "");
+    // GAP CLOSE: the classic sidebar already renders these three fields through
+    // md() (app.js:1439-1441, `#osumbody md(ov.goal)` etc) -- this panel was still
+    // on plain esc(), the exact same-data-two-renderings asymmetry mdHtml()'s own
+    // comment above now calls out. mdHtml(ctx, ...) is the shared seam both use.
     setPanelBody(wrap,
       '<div class="crd-summary-field"><div class="crd-summary-label">Goal</div>' +
-      '<div class="crd-summary-body">' + esc(ov.goal || "—") + "</div></div>" +
+      '<div class="crd-summary-body">' + mdHtml(ctx, ov.goal || "—") + "</div></div>" +
       '<div class="crd-summary-field"><div class="crd-summary-label">Now</div>' +
-      '<div class="crd-summary-body crd-summary-now">' + esc(ov.now || "—") + "</div></div>" +
+      '<div class="crd-summary-body crd-summary-now">' + mdHtml(ctx, ov.now || "—") + "</div></div>" +
       '<div class="crd-summary-field"><div class="crd-summary-label">So far</div>' +
-      '<div class="crd-summary-body">' + esc(ov.sofar || "—") + "</div></div>"
+      '<div class="crd-summary-body">' + mdHtml(ctx, ov.sofar || "—") + "</div></div>"
     );
   }
 
@@ -2055,8 +2113,13 @@
     if (!files.length) { setPanelBody(wrap, emptyHtml("No files touched yet", "This session hasn't created or edited any. It will fill in as it works.")); return; }
     var rows = files.map(function (f) {
       var isMd = /\.md$/i.test(f.path || "");
+      // f.alive === false: the path no longer exists on disk (annotate_liveness(),
+      // util.py). The row still renders -- this IS the session's real history -- just
+      // dimmed, reusing the same `opacity: .5` "honestly not current" convention this
+      // stylesheet already uses for crd-btn:disabled, rather than inventing a new class.
+      var dead = f.alive === false;
       return '<div class="crd-file-row' + (f.agent ? " crd-agent-row" : "") + '" data-act="file-row" data-path="' +
-        esc(f.path) + '">' +
+        esc(f.path) + '"' + (dead ? ' style="opacity:.5" title="No longer on disk"' : "") + '>' +
         '<span class="crd-file-path mono">' + esc(f.path) + "</span>" +
         (f.created ? '<span class="crd-file-created">+' + (f.ops || 1) + "</span>" :
           '<span class="crd-file-edited">−' + (f.ops || 1) + "</span>") +
@@ -2130,7 +2193,7 @@
     });
   }
 
-  function renderAgentsPanel(wrap, ui, session) {
+  function renderAgentsPanel(wrap, ctx, ui, session) {
     if (!wrap || !session) return;
     var agentsBg = session.agents_bg || [];
     var shells = session.shells || [];
@@ -2152,8 +2215,15 @@
       // called this surface out specifically). Empty -> no chip at all.
       var modelTag = a.model ? '<span class="crd-agent-model mono" title="' + esc(a.model) + '">' +
         esc(shortModel(a.model)) + "</span>" : "";
+      // GAP CLOSE: a.task is the session-authored free text (the "shells and
+      // everything" the owner named) -- mdHtmlSafe() only when it's actually present;
+      // the a.aid/"background agent" fallbacks are an id or a literal label, never
+      // markdown-authored, so they stay on plain esc() same as before. mdHtmlSafe(),
+      // not mdHtml(): a task label is machine/agent-authored (can read "delete the
+      // stray *.pyc"), so single-asterisk italics must not fire on it.
+      var titleHtml = a.task ? mdHtmlSafe(a.task) : esc(a.aid || "background agent");
       return '<div class="crd-agent-row-item"><span class="crd-state-dot ' + (g.running ? "is-working" : "is-done") +
-        '"></span><span class="crd-agent-title">' + esc(a.task || a.aid || "background agent") + "</span>" +
+        '"></span><span class="crd-agent-title">' + titleHtml + "</span>" +
         tag + modelTag + '<button class="crd-open-link" data-act="agent-open" data-id="' + esc(a.aid) + '">open ›</button></div>'; // "opening the latest"
     }
     function shellRow(s) {
@@ -2405,7 +2475,10 @@
     if (e.kind === "ask") {
       var d = e.decision;
       var q0 = (d.questions && d.questions[0]) || { q: "", options: [] };
-      var opts = (q0.options || []).map(function (o) { return '<span class="crd-ask-pill">' + esc(o) + "</span>"; }).join("");
+      // GAP CLOSE: the question and its options are session-authored free text
+      // same as narration/prompts -- mdHtml(ctx, ...), not esc(). See the mdHtml()
+      // comment above for why this was the one asymmetry capability #31 missed.
+      var opts = (q0.options || []).map(function (o) { return '<span class="crd-ask-pill">' + mdHtml(ctx, o) + "</span>"; }).join("");
       // FIX (design-audit drift 6): 5b's ask bubble carries a mini-header
       // ("hourglass It asked you · still open") above the question — only while it's
       // still open; a closed decision doesn't claim to still be open. 5b's
@@ -2413,7 +2486,7 @@
       var miniHead = d.open ? '<div class="crd-ask-minihead"><span class="tn-emo-a" aria-hidden="true">' + svgIcon(ctx, "hourglass") + '</span>' +
         '<span class="crd-ask-minihead-label">It asked you · still open</span></div>' : "";
       return '<div class="crd-entry crd-entry-ask"' + entryOpenAttrs(e) + '><span class="crd-entry-ts mono crd-ts-ask">' + fmtClock(e.t) + "</span>" +
-        '<div class="crd-bubble crd-bubble-ask">' + miniHead + '<div class="crd-ask-q">' + esc(q0.q) + "</div>" +
+        '<div class="crd-bubble crd-bubble-ask">' + miniHead + '<div class="crd-ask-q">' + mdHtml(ctx, q0.q) + "</div>" +
         '<div class="crd-ask-opts">' + opts + "</div>" +
         '<div class="crd-ask-note">View-only — answer in the session. The tracker never writes to it.</div></div></div>';
     }

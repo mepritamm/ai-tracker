@@ -57,12 +57,34 @@ window.CR = window.CR || {};
   // already uses for pr_num et al: the check below is a no-op today (no provider
   // ever sets `fail_cmd`) and lights up the instant one does, with zero risk to
   // any session that doesn't carry the field.
+  // BUG FIX: `s.ended` (both providers/claude.py and providers/auggie.py) is computed
+  // from the MAIN transcript alone — true the instant the foreground turn closes with
+  // assistant text, even while background agents the session spawned are still running.
+  // `s.bg` (providers/claude.py's _mtime_and_bg — Auggie has no background-agent concept
+  // and always emits `bg: 0`, so this reduces to the original `!s.ended` check there,
+  // unaffected) counts those live background agents. A session is genuinely still
+  // WORKING whenever either half is true: its own foreground turn hasn't finished, OR
+  // it has background agents active right now. This is the ONE place that test is made —
+  // sessionState() and triageCounts() below both call it, so the board's WORKING count,
+  // its tile state, the rail dot colour and the orb pip can never disagree on it again
+  // (the bug this fixes: a session with ended:true, bg:3, fresh mtime counted as
+  // WORKING==0 and rendered as a 'landed' tile with an empty now_line).
+  // PARITY FIX: delegates to app.js's `isSessionWorking()` (defined once, globally --
+  // app.js is concatenated ahead of every ext_cr_*.js by page.py's build_page()) rather
+  // than keeping its own copy of the formula. Two copies of this exact predicate is what
+  // let classic's sidebar and this board disagree in the first place (classic never got
+  // the bg-aware fix); a shared global is the actual fix for the parity requirement.
+  function isWorking(s, live) {
+    if (typeof isSessionWorking === 'function') return isSessionWorking(s, live);
+    return !!live && (!s.ended || !!s.bg);
+  }
+
   function sessionState(s, now) {
     var live = (now - (s.mtime || 0)) < LIVE_WINDOW;
     if (s.waiting) return 'awaiting';
     if (s.open_flags) return 'flagged';
     if (live && s.fail_cmd) return 'failing';
-    if (live && !s.ended) return 'working';
+    if (isWorking(s, live)) return 'working';
     if (live && s.ended) return 'landed';
     return 'idle';
   }
@@ -303,7 +325,7 @@ window.CR = window.CR || {};
     sessions.forEach(function (s) {
       var live = (now - (s.mtime || 0)) < LIVE_WINDOW;
       if (s.waiting) awaiting++;
-      else if (live && !s.ended) working++;
+      else if (isWorking(s, live)) working++;
       if (s.open_flags) flagged++;
       if (s.pinned) pinned++;
     });
@@ -346,10 +368,19 @@ window.CR = window.CR || {};
   // '', 'cli', 'claude-desktop', 'sdk-cli', 'claude-vscode', 'auggie',
   // 'augment-vscode', 'augment-cursor') — so claude-desktop/sdk-cli/
   // claude-vscode sessions rendered their raw internal id on their tile.
-  // `srcLabel` IS reachable here: page.py concatenates every web/*.js file
+  // `srcText` IS reachable here: page.py concatenates every web/*.js file
   // into ONE <script> tag, app.js first (page.py: read("app.js") +
-  // read_ext(".js")), so its top-level `const srcLabel` sits in the same
+  // read_ext(".js")), so its top-level `const srcText` sits in the same
   // script-level scope this IIFE closes over — verified by reading page.py.
+  //
+  // FIX (raw HTML leaking into the rail/tiles): this used to call srcLabel()
+  // — app.js's HTML-bearing map (`ico(name)+" "+text`) — and strip the icon
+  // off with a `^\S+\s*` regex. That only removes the icon tag's FIRST
+  // whitespace-free token (`<svg`/`<span`), so the tag's OWN attributes
+  // rendered as literal text (e.g. "class="ico ico-glyph" aria-hidden=...").
+  // Fixed at the shared seam instead of patching the regex: app.js now
+  // exports `srcText`, a plain-TEXT map with no markup at all, so there is
+  // nothing to strip.
   //
   // Round-5 drift (decision 4b): 5a's own board tiles render this label as an
   // all-lowercase, no-parens literal ("2m · claude cli"), never the Title-
@@ -358,17 +389,17 @@ window.CR = window.CR || {};
   // cli", 4 for "auggie cli", 6 for "augment vs code", 6 for "augment
   // cursor", all lowercase, all inline text, never CSS text-transform). Kept
   // as a TRANSFORM applied over the real map's output, not a second
-  // hand-written table: strip SRC's leading icon glyph, drop parens,
-  // lowercase, then two small CONTENT-driven (never source-id-keyed)
-  // fixups — a bare vendor-less word gets a "claude " prefix (every
-  // Claude-family SRC label omits the vendor, since SRC is this app's own
-  // map and Claude is its default/implied vendor; Auggie/Augment already
-  // spell theirs), and the one vendor word with no surface of its own
-  // ("auggie") gets " cli" appended. '' falls back to the 'cli' entry
-  // (srcLabel('') itself resolves to '' — SRC has no '' key, only 'cli').
+  // hand-written table: lowercase srcText's word, drop parens, then two small
+  // CONTENT-driven (never source-id-keyed) fixups — a bare vendor-less word
+  // gets a "claude " prefix (every Claude-family SRC_TEXT label omits the
+  // vendor, since SRC_TEXT is this app's own map and Claude is its default/
+  // implied vendor; Auggie/Augment already spell theirs), and the one vendor
+  // word with no surface of its own ("auggie") gets " cli" appended. ''
+  // falls back to the 'cli' entry (srcText('') itself resolves to '' —
+  // SRC_TEXT has no '' key, only 'cli').
   function toolLabel(source) {
-    if (typeof srcLabel !== 'function') return source || 'unknown';
-    var label = srcLabel(source || 'cli').replace(/^\S+\s*/, '').toLowerCase().replace(/[()]/g, '');
+    if (typeof srcText !== 'function') return source || 'unknown';
+    var label = srcText(source || 'cli').toLowerCase().replace(/[()]/g, '');
     if (!label) return source || 'unknown';
     if (label.indexOf('aug') !== 0) label = 'claude ' + label;
     else if (label === 'auggie') label += ' cli';
@@ -459,6 +490,28 @@ window.CR = window.CR || {};
     var expandedRailGroup = null;     // which agent-group bucket (by `group` key) is expanded
                                        // in the rail — 'rail:expandAgents' toggles this; own
                                        // state, single-module, per this file's own scope note.
+
+    // GAP CLOSE (rail parity, requirement: "session markers/pinned and other pieces of
+    // information must be same in both the UIs"): classic's `.sitem.hasagents` (app.css)
+    // puts an amber border on a PARENT row that spawned agent children — computed there
+    // from `kids[s.id]`, itself keyed by each agent session's own `parentId` (app.js,
+    // `_pick_parent` in providers/claude.py). The rail groups every agent session under a
+    // collapsible "Agents · <label>" bucket (renderSessionRows' agentBuckets, keyed by
+    // `s.group` — the repo/sandbox, NOT any one parent) rather than nesting them inline, so
+    // there is no per-row "these are MY kids" list to reuse directly. But the underlying
+    // FACT — did session X specifically originate one or more agent sessions — is still
+    // exactly `s.agent && s.parentId` on the full session list, same field classic reads;
+    // that fact is independent of how/where the children are displayed. Recomputed once per
+    // render (renderRail/renderSessionsView, the only two entry points that see the full
+    // unfiltered `state.sessions`) into this plain-object id set, then read by railRow()
+    // below — a module-level var, same pattern as `selectedSessionId` just above, rather
+    // than threading a new parameter through every railRow() call site.
+    var railAgentParentIds = {};
+    function computeAgentParentIds(sessions) {
+      var ids = {};
+      (sessions || []).forEach(function (s) { if (s.agent && s.parentId) ids[s.parentId] = true; });
+      return ids;
+    }
     // STRUCTURAL FIX: the rail + top bar are now mounted once (see buildShell()
     // below) and persist across every view; only the content region swaps. These
     // two track WHICH view is currently showing, fed by boot.js's own
@@ -974,6 +1027,7 @@ window.CR = window.CR || {};
     function renderRail(state) {
       if (!els.railList) return;
       var sessions = state.sessions || [], now = state.now;
+      railAgentParentIds = computeAgentParentIds(sessions);
       // GAP CLOSE (rail parity): classic's "N live ✕" pill (app.js's
       // `livecount`) filters the WHOLE sidebar to live sessions on click; the
       // rail's count was display-only. Isolated to this file's two rail-only
@@ -1010,8 +1064,20 @@ window.CR = window.CR || {};
         shown = renderSessionRows(els.railList, baseSessions, now).total;
       }
 
+      // FIX (collapsed rail alignment, 48px column): the expanded footer's
+      // "scroll · N more" wraps at 48px wide (no room for the phrase) and
+      // clips to "scrol . N more" -- collapsed gets a compact "+N" instead,
+      // with the full sentence kept in `title` so nothing is lost, just
+      // reflowed. The expanded form is untouched.
       var more = baseSessions.length - shown;
-      els.railFooter.textContent = 'scroll · ' + Math.max(0, more) + ' more';
+      var moreN = Math.max(0, more);
+      if (collapsed) {
+        els.railFooter.textContent = '+' + moreN;
+        els.railFooter.title = moreN + ' more session' + (moreN === 1 ? '' : 's') + ' — expand the rail to see them';
+      } else {
+        els.railFooter.textContent = 'scroll · ' + moreN + ' more';
+        els.railFooter.removeAttribute('title');
+      }
 
       els.railList.scrollTop = scrollTop;
       if (activeWasSearch) els.railSearchInput.focus();
@@ -1145,6 +1211,7 @@ window.CR = window.CR || {};
     function renderSessionsView(state) {
       if (!els.sessionsList) return;
       var sessions = state.sessions || [], now = state.now;
+      railAgentParentIds = computeAgentParentIds(sessions);
       var totalCount = sessionsTotalCount(sessions);
       var maxPage = Math.max(0, Math.ceil(totalCount / sessionsPageSize) - 1);
       if (sessionsPage > maxPage) sessionsPage = maxPage;   // clamp BEFORE rendering/slicing
@@ -1283,7 +1350,13 @@ window.CR = window.CR || {};
       // Icon conversion: no literal emoji here -- the badge renders through the
       // shared sprite (glyph/'hourglass'/'check'), same as every other icon in
       // this file, so it follows ICON_STYLE (icons/emoji/text) like the rest.
-      var statusKind = s.waiting ? 'waiting' : ((s.ended && isLiveRow) ? 'done' : '');
+      // BUG FIX: gated with `!isWorking(s, isLiveRow)` (the SAME shared predicate
+      // sessionState()/triageCounts() use) so a session whose background agents are
+      // still running never gets the "done" checkmark here -- unlike app.js's classic
+      // sidebar, which pairs its own (unmodified) ended-only "done" badge with a
+      // separate always-shown `bgchip` ("N running"), the rail row has no such second
+      // badge, so `done` here must be the one place that already accounts for `bg`.
+      var statusKind = s.waiting ? 'waiting' : ((s.ended && isLiveRow && !isWorking(s, isLiveRow)) ? 'done' : '');
       // GAP CLOSE: flag_text rides the row's existing tooltip too — same reasoning as
       // tileHead() above. '' when null/absent, so an unflagged row's tooltip is
       // byte-for-byte unchanged.
@@ -1310,6 +1383,46 @@ window.CR = window.CR || {};
       // colour and UI elements, not as inline prefixes, to keep the title
       // clean and avoid duplicate visual indicators.
       var displayName = name;
+      // GAP CLOSE (rail parity, this pass): classic's row is a single element
+      // that carries FOUR state modifier classes straight off the session --
+      // `.sitem.pinned` (amber fill), `.sitem.waiting`/`.sitem.done`/
+      // `.sitem.flagged` (a coloured left border, `.waiting` also fills amber)
+      // -- so the row itself reads as pinned/waiting/done/flagged at a glance,
+      // not just via a small dot or a text badge buried in the meta line. The
+      // rail row had none of these; only the dot colour and the (easy-to-miss
+      // at this size) status text carried the signal. Ported onto
+      // `.cr-rail-row` as `--pinned`/`--waiting`/`--done`/`--flagged`, styled
+      // in ext_cr_board.css with the control room's own state tokens
+      // (--surface-awaiting/--line-awaiting etc.), not app.css's hex values --
+      // same INFORMATION, the control room's own visual language. Classic's
+      // `.sitem.agentrow .nm{color:gold}` + its `ico('agent')` name prefix are
+      // ported the same way, below, onto the title span.
+      // classic's `.sitem.hasagents` equivalent — see railAgentParentIds' own
+      // comment above for what "has agent children" means once the rail's
+      // grouped-bucket display replaces classic's inline nesting. `!s.agent`
+      // guards against a nested agent-of-an-agent, which _pick_parent()
+      // (providers/claude.py) can never actually produce, but which classic
+      // itself also excludes by construction (nesting is human-parent only).
+      var hasAgentChildren = !s.agent && !!railAgentParentIds[s.id];
+      var rowMods = (s.pinned ? ' cr-rail-row--pinned' : '')
+        + (s.agent ? ' cr-rail-row--agent' : '')
+        + (hasAgentChildren ? ' cr-rail-row--hasagents' : '')
+        + (statusKind === 'waiting' ? ' cr-rail-row--waiting' : '')
+        + (statusKind === 'done' ? ' cr-rail-row--done' : '')
+        + (s.open_flags ? ' cr-rail-row--flagged' : '');
+      // classic prefixes the agent icon onto the NAME itself (app.js
+      // sessionRow: `s.agent?ico('agent')+' ':''`) for any row that IS an
+      // agent session -- these rows only ever reach railRow() via an
+      // expanded "Agents · <group>" bucket (renderSessionRows above), never
+      // the flat pinned/unpinned list, but the marker belongs on the row
+      // regardless of which caller renders it.
+      var titleChildren = s.agent ? [glyph('agent', ''), ' ' + displayName] : [displayName];
+      // GAP CLOSE (rail parity): the classic sidebar's own meta line reads
+      // `[Agent ·] project · source · age` -- the "Agent" chip only rides
+      // the FIRST slot ahead of everything else. Mirrors that ordering by
+      // unshifting it onto the meta concat chain below, rather than a new
+      // element the row anatomy doesn't have room for.
+      var agentChip = s.agent ? [glyph('agent', ''), ' Agent · '] : [];
       // GAP CLOSE (rail parity): the classic sidebar's row carries an inline
       // pin toggle (pin icon, togglePin()) and rename control (edit icon,
       // renameSession()) — the rail only ever DISPLAYED pinned state (the dot
@@ -1333,14 +1446,14 @@ window.CR = window.CR || {};
         }, [glyph('edit', '')]),
       ]);
       return h('div', {
-        class: 'cr-rail-row' + (s.id === selectedSessionId ? ' cr-rail-row--selected' : ''),
+        class: 'cr-rail-row' + (s.id === selectedSessionId ? ' cr-rail-row--selected' : '') + rowMods,
         tabindex: '0', role: 'button', title: titleAttr, 'aria-label': label, 'data-id': s.id,
         onclick: function () { openSession(s.id); },
         onkeydown: function (e) { if (e.key === 'Enter') openSession(s.id); }
       }, [
         h('span', { class: 'cr-rail-dot ' + dotClass }),
         h('div', { class: 'cr-rail-titlewrap' }, [
-          h('span', { class: 'cr-rail-title' }, [displayName]),
+          h('span', { class: 'cr-rail-title' + (s.agent ? ' cr-rail-title--agent' : '') }, titleChildren),
           dirLine ? h('span', { class: 'cr-rail-dir' }, [dirLine]) : null,
         ]),
         statusKind ? h('span', {
@@ -1359,8 +1472,10 @@ window.CR = window.CR || {};
           // `.concat()` rather than a `.join()` — a naive string join would
           // stringify a DOM node instead of rendering it.
           // The project name and source label are the classic sidebar's own
-          // meta line (app.js sessionRow's `bits`), added here for parity.
-          (s._runs > 1 ? ['×' + s._runs + ' · '] : [])
+          // meta line (app.js sessionRow's `bits`), added here for parity —
+          // `agentChip` leads, matching classic's own "Agent · " lead-in.
+          agentChip
+            .concat(s._runs > 1 ? ['×' + s._runs + ' · '] : [])
             .concat(todoLabel ? [todoLabel + ' · '] : [])
             .concat(projLabel ? [projLabel + ' · '] : [])
             .concat(srcLabelText ? [srcLabelText + ' · '] : [])
@@ -1423,11 +1538,21 @@ window.CR = window.CR || {};
     function buildTopBar() {
       els.topbar.innerHTML = '';
 
+      // GAP CLOSE (visible top-bar labels, user's own words, twice: "Get the
+      // text beside the symbols/icons/emojis such that it's easily readable
+      // to everyone like previously"): this control already had a title/
+      // aria-label ("Collapse session rail" / kept dynamic below by
+      // toggleRail's own updates) -- the ask is a VISIBLE word, not an
+      // accessible name. Reuses the exact `.cr-topbar-label` pattern Config/
+      // Help/New session already use below, so the SAME responsive rules
+      // (ext_cr_board.css, the 1280-1439px and <=480px tiers) apply to it
+      // automatically once those rule lists are extended (see that file).
       els.railToggleTop = h('button', {
         class: 'cr-rail-toggle', type: 'button',
         title: 'Collapse session rail', 'aria-label': 'Collapse session rail',
         onclick: toggleRail
-      }, [icon('panel', '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>')]);
+      }, [icon('panel', '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>'),
+          h('span', { class: 'cr-topbar-label' }, ['Sessions'])]);
       els.topbar.appendChild(els.railToggleTop);
 
       // NOTE: "the way back" to the classic dashboard is a `document.body`-
@@ -1477,16 +1602,26 @@ window.CR = window.CR || {};
 
       els.topbar.appendChild(h('span', { class: 'cr-topbar-spacer' }));
 
+      // GAP CLOSE (visible top-bar labels): read as a bare number before --
+      // "🚩 0" has no noun. "Flags" rides a `.cr-topbar-label` span BETWEEN the
+      // glyph and the count so `update()`'s `els.flagCountBtn.lastChild.
+      // textContent = ' ' + flagTotal` (below) keeps updating the SAME last
+      // child (the plain count text node) untouched -- the label is a new
+      // MIDDLE child, never the thing that mutates.
       els.flagCountBtn = h('button', {
         class: 'cr-flagcount', type: 'button', title: 'Open the flag list', 'aria-label': 'Open the flag list',
         onclick: function () { ctx && ctx.emit && ctx.emit('open:flags'); }
-      }, [glyph('flag', 'tn-emo-f'), '0']);
+      }, [glyph('flag', 'tn-emo-f'), h('span', { class: 'cr-topbar-label' }, ['Flags ']), '0']);
       els.topbar.appendChild(els.flagCountBtn);
 
+      // GAP CLOSE (visible top-bar labels): this control had no visible text
+      // at all before -- title/aria-label carried "Notifications", but the
+      // word itself never reached the screen. "Alerts" (shorter than
+      // "Notifications") keeps the button compact next to Flags/Config/Help.
       els.topbar.appendChild(h('button', {
         class: 'cr-bell', type: 'button', title: 'Notifications', 'aria-label': 'Notifications',
         onclick: function () { ctx && ctx.emit && ctx.emit('toggle:notifications'); }
-      }, [glyph('bell', '')]));
+      }, [glyph('bell', ''), h('span', { class: 'cr-topbar-label' }, ['Alerts'])]));
 
       // BLOCKER 1: 'Config'/'Help' labels wrapped in `.cr-topbar-label` so the
       // phone-tier CSS can drop to icon-only — `title`/`aria-label` already

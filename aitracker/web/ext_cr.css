@@ -150,6 +150,15 @@
   --shadow-overlay: 2px 10px 30px rgba(30,27,23,.18);
   --glow-agent: 0 0 0 1px rgba(217,184,85,.35), 0 2px 14px rgba(217,184,85,.28);
   --glow-agent-soft: 0 0 10px rgba(217,184,85,.20);
+  /* --scrim: NEW (not from 01-foundations.md — an audit found three backdrop/scrim
+     colours hardcoded with no light/dark handling at all: ext_cr_dialogs.css's
+     .cr-backdrop, ext_cr_boot.css's .cr-scrim, ext_cr_board.css's .cr-rail-scrim,
+     each rgba(20-ish, 18-ish, 10-ish, .35-.45) — all in the same warm-stone hue
+     family already, just never theme-varying and never a token. Softer/lighter
+     here (light theme sits under a light page, so a lighter, less opaque tint
+     reads as a scrim rather than a slab); --surface-inverse's own RGB (#1E1B17)
+     supplies the hue so this stays in-family rather than inventing a new one. */
+  --scrim: rgba(30, 27, 23, .38);
 
   /* ---- typography stacks (3) ---- */
   --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
@@ -340,6 +349,12 @@
   --shadow-overlay: 2px 10px 30px rgba(0,0,0,.66);
   --glow-agent: 0 0 0 1px rgba(217,184,85,.4), 0 2px 16px rgba(217,184,85,.3);
   --glow-agent-soft: 0 0 12px rgba(217,184,85,.22);
+  /* --scrim: NEW, see the light block's own comment for why this token exists.
+     Deeper here — --surface-inverse's dark-block RGB (#100E0C) at a higher
+     opacity, so the backdrop reads as genuinely behind the (also dark) page
+     rather than nearly blending into it. Same warm-stone family as light,
+     never pure black. */
+  --scrim: rgba(16, 14, 12, .58);
 }
 
 /* ============================================================
