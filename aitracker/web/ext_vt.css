@@ -357,7 +357,17 @@
 }
 .vtmodelitem:hover, .vteffortitem:hover { background: var(--raised); color: var(--text); }
 .vtmodelitem.cur, .vteffortitem.cur { color: var(--green2); }
-.vtmodelitem.cur::after, .vteffortitem.cur::after { content: ' ✓'; }
+.vtmodelitem.cur::after, .vteffortitem.cur::after {
+  content: '';
+  display: inline-block;
+  width: 0.85em;
+  height: 0.85em;
+  margin-left: 0.35em;
+  vertical-align: -0.1em;
+  background-color: currentColor;
+  -webkit-mask: var(--ico-check) no-repeat center/contain;
+  mask: var(--ico-check) no-repeat center/contain;
+}
 
 .vtctxreadout {
   flex: 1 1 auto;

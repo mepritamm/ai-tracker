@@ -118,10 +118,10 @@
       '</div>' +
       '<div class="cr-term-head-actions">' +
         '<button type="button" class="cr-term-headpill" data-action="config">' +
-          '<span class="cr-emo tn-emo" aria-hidden="true">⚙️</span>Config</button>' +
+          '<span class="cr-emo tn-emo" aria-hidden="true">' + ico('gear') + '</span>Config</button>' +
         '<button type="button" class="cr-term-headpill" data-action="help">' +
-          '<span class="cr-emo tn-emo" aria-hidden="true">❓</span>Help</button>' +
-        '<button type="button" class="cr-term-close" data-action="close" title="Close — detaches, does not kill" aria-label="Close terminal — detaches, does not kill">✕</button>' +
+          '<span class="cr-emo tn-emo" aria-hidden="true">' + ico('help') + '</span>Help</button>' +
+        '<button type="button" class="cr-term-close" data-action="close" title="Close — detaches, does not kill" aria-label="Close terminal — detaches, does not kill">' + ico('close') + '</button>' +
       '</div>';
     shell.appendChild(head);
 
@@ -137,19 +137,19 @@
       '</div>' +
       '<div class="cr-term-divider"></div>' +
       '<div class="cr-term-group" data-group="external">' +
-        '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="ext-terminal" title="Open an external Terminal/iTerm window, cd\'d here — this machine only" hidden>↗ External terminal</button>' +
-        '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="ext-resume" title="Resume via claude --resume in an external Terminal/iTerm window — this machine only" hidden>↗ External resume</button>' +
+        '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="ext-terminal" title="Open an external Terminal/iTerm window, cd\'d here — this machine only" hidden>' + ico('external') + ' External terminal</button>' +
+        '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="ext-resume" title="Resume via claude --resume in an external Terminal/iTerm window — this machine only" hidden>' + ico('external') + ' External resume</button>' +
       '</div>' +
       '<div class="cr-term-divider"></div>' +
       '<div class="cr-term-group" data-group="windows">' +
-        '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="new-tab" disabled>⤢ New tab</button>' +
-        '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="new-terminal">+ New terminal</button>' +
-        '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="new-claude">+ New Claude session</button>' +
+        '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="new-tab" disabled>' + ico('expand') + ' New tab</button>' +
+        '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="new-terminal">' + ico('plus') + ' New terminal</button>' +
+        '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="new-claude">' + ico('plus') + ' New Claude session</button>' +
       '</div>' +
       '<div class="cr-term-divider"></div>' +
       '<div class="cr-term-group" data-group="manage">' +
         '<button type="button" class="cr-term-btn cr-term-btn-ghost cr-term-btn-manage" data-action="manage">' +
-          '<span class="cr-emo" aria-hidden="true">☰</span> Manage terminals' +
+          '<span class="cr-emo" aria-hidden="true">' + ico('menu') + '</span> Manage terminals' +
           '<span class="cr-term-badge" data-el="badge" hidden>0</span>' +
         '</button>' +
       '</div>' +
@@ -159,7 +159,7 @@
           '<button type="button" data-renderer="grid" aria-pressed="false">grid</button>' +
         '</div>' +
         '<button type="button" class="cr-term-themebtn" data-action="theme">' +
-          '<span class="cr-emo tn-emo" aria-hidden="true">☀️</span>Theme</button>' +
+          '<span class="cr-emo tn-emo" aria-hidden="true">' + ico('sun') + '</span>Theme</button>' +
       '</div>';
     shell.appendChild(bar);
 
@@ -195,8 +195,8 @@
       '<div class="cr-term-status-right">' +
         '<button type="button" class="cr-term-pill cr-term-pill-model" data-action="model" hidden data-el="modelpill">model</button>' +
         '<button type="button" class="cr-term-pill cr-term-pill-effort" data-action="effort" hidden data-el="effortpill">effort</button>' +
-        '<button type="button" class="cr-term-iconbtn" data-action="copy">⧉ Copy</button>' +
-        '<button type="button" class="cr-term-iconbtn cr-term-kill" data-action="kill">■ Kill</button>' +
+        '<button type="button" class="cr-term-iconbtn" data-action="copy">' + ico('copy') + ' Copy</button>' +
+        '<button type="button" class="cr-term-iconbtn cr-term-kill" data-action="kill">' + ico('stop') + ' Kill</button>' +
       '</div>';
     shell.appendChild(status);
 
@@ -729,7 +729,7 @@
     if (!el.themeBtn || !ctx || !ctx.theme) return;
     var cur = ctx.theme.get ? ctx.theme.get() : "dark";
     var icon = el.themeBtn.querySelector(".cr-emo");
-    if (icon) icon.textContent = cur === "light" ? "🌙" : "☀️";
+    if (icon) icon.innerHTML = cur === "light" ? ico('moon') : ico('sun');
   }
 
   // ===== model / effort — dialogs own the picker UI; this file performs the actual inject,

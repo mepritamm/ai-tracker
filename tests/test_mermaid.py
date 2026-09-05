@@ -200,7 +200,13 @@ class TestMermaidVendorLoader(unittest.TestCase):
         # `gantt` still has no renderer; the fence stays a readable code block but is
         # tagged so the reader sees the intent (a diagram, not a mislabelled code fence).
         h = _js("```mermaid\ngantt\n  title x\n  section A\n    a : a1, 2014-01-01, 30d\n```", fn="mdBlock")
-        self.assertNotIn("<svg", h)
+        # A bare `'<svg' not in h` check is WRONG here: the fallback tag itself carries an
+        # icon (`ico("diagram")` -> `<svg class="ico">...<use href="#i-diagram"/></svg>`), so
+        # a genuine fallback legitimately contains an <svg>. Test the real markers instead —
+        # a rendered diagram wraps its svg in `<div class=mmd>` with `class=mmdsvg` on the svg
+        # itself (see test_mermaid_fence_renders_a_diagram); neither appears on a fallback.
+        self.assertNotIn("class=mmd>", h)
+        self.assertNotIn("mmdsvg", h)
         self.assertIn("class=mdpre", h)                 # you still get to read the diagram source
         self.assertIn("gantt", h)
         # …and the diagram-type tag is present, so the intent is visible without rendering
@@ -544,10 +550,19 @@ class TestJourneyDiagram(unittest.TestCase):
         for task in ("Make tea", "Go upstairs", "Do work", "Go downstairs", "Sit down"):
             self.assertIn(task, s)
 
-    def test_happiness_score_becomes_a_face_and_number(self):
+    def test_happiness_score_becomes_a_meter_and_number(self):
         s = _js(JOURNEY)
-        # score 5 → 😊, score 3 → 😐, score 1 → 😞 — all three appear at least once
-        self.assertIn("😊", s); self.assertIn("😐", s); self.assertIn("😞", s)
+        # Happiness scores render as a dot meter (● = filled, ○ = empty) plus the numeric score.
+        # Score 5 → ●●●●●, score 3 → ●●●○○, score 1 → ●○○○○. This cannot be an SVG icon
+        # because the string is interpolated into mermaid's ["..."] quoted-label syntax, and
+        # an SVG's double quotes would terminate the label and corrupt the diagram source.
+        # All three scores from JOURNEY appear at least once, both as meters and numbers.
+        self.assertIn("●●●●●", s)  # score 5 meter
+        self.assertIn("●●●○○", s)  # score 3 meter
+        self.assertIn("●○○○○", s)  # score 1 meter
+        self.assertIn("5", s)       # score 5 number
+        self.assertIn("3", s)       # score 3 number
+        self.assertIn("1", s)       # score 1 number
 
     def test_userJourney_alias_also_matches(self):
         s = _js("userJourney\n section S\n  Task: 4: Me")

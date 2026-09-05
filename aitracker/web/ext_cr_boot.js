@@ -49,34 +49,18 @@ window.CR = window.CR || {};
   }
 
   // ----------------------------------------------------------------------
-  // Glyphs — 01-foundations.md "Glyphs needed (not emoji)": spark, search,
-  // chevron, check, alert, bell, branch, panel, redo, edit, clock, stop, send.
-  // 24x24, stroke=currentColor, fill=none, no icon font/package. Path data
-  // matches cr_dialogs.js's own GLYPH_PATHS fallback set exactly (verified by
-  // reading that file) so the primary glyph and its degrade-path fallback are
-  // pixel-identical, not two competing drawings of the same icon.
+  // Glyphs — Icon drawings now live once as <symbol id="i-*"> entries in
+  // index.html's shared SVG sprite (the same sprite that already holds
+  // #brandMark). Both the control room and classic dashboard draw from one
+  // set, so they cannot drift. Stroke and fill come from the symbol,
+  // colour from currentColor.
   // ----------------------------------------------------------------------
-  var GLYPHS = {
-    spark: 'M12 2l1.8 6.2L20 10l-6.2 1.8L12 18l-1.8-6.2L4 10l6.2-1.8z',
-    search: 'M10.5 3a7.5 7.5 0 1 0 4.66 13.4l4.72 4.72 1.42-1.42-4.72-4.72A7.5 7.5 0 0 0 10.5 3zm0 2a5.5 5.5 0 1 1 0 11 5.5 5.5 0 0 1 0-11z',
-    chevron: 'M8 5l7 7-7 7',
-    check: 'M4 12.5l5 5L20 7',
-    alert: 'M12 3l10 18H2L12 3zm0 6v5m0 3.2h.01',
-    bell: 'M12 3a5 5 0 0 0-5 5v3.4L5 15v1.5h14V15l-2-3.6V8a5 5 0 0 0-5-5zM9.5 19a2.5 2.5 0 0 0 5 0',
-    branch: 'M6 3v9a4 4 0 0 0 4 4h4M6 3a2 2 0 1 1 0 4 2 2 0 0 1 0-4zm12 4a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm-6 13a2 2 0 1 1 0-4 2 2 0 0 1 0 4z',
-    panel: 'M4 5h16v14H4zM9 5v14',
-    redo: 'M8 8h9v-4l5 5-5 5v-4H8a4 4 0 1 0 0 8h5v2H8a6 6 0 1 1 0-12z',
-    edit: 'M4 20l1-5L16 4l4 4L9 19l-5 1z',
-    clock: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zm0 4v5l4 2',
-    stop: 'M6 6h12v12H6z',
-    send: 'M3 11l18-8-8 18-2-8-8-2z'
-  };
   function icon(name) {
-    var d = GLYPHS[name];
-    if (!d) return '';
-    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" ' +
-      'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">' +
-      '<path d="' + d + '"/></svg>';
+    // ponytail: no class here on purpose. The pre-sprite icon() emitted a bare
+    // <svg>, and every call site's layout was tuned against that; `.cr .cr-glyph`
+    // sets display:block, which would silently turn inline icons into block ones.
+    return '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">' +
+      '<use href="#i-' + name + '"/></svg>';
   }
 
   // ----------------------------------------------------------------------

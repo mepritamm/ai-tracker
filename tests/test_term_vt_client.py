@@ -260,8 +260,9 @@ class TestExtLaunchStillPassesTier1Contract(unittest.TestCase):
         # control -- it was not deleted when the in-browser terminal became primary. Only
         # the label text moved: the pair is now qualified "External" so that which-opens-
         # where is obvious beside the two "here" buttons.
-        self.assertIn("↗ External terminal", self.src)
-        self.assertIn("↗ External resume", self.src)
+        self.assertIn("External terminal", self.src)
+        self.assertIn("External resume", self.src)
+        self.assertIn('ico("external")', self.src)
 
 
 class TestContextBarModelSwitcher(unittest.TestCase):

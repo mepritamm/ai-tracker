@@ -363,7 +363,7 @@
     var markers = [];
     (session.requests || []).forEach(function (r) {
       var t = parseT(r.t);
-      if (t != null) markers.push({ t: t, kind: "prompt", glyph: "💬", label: "",
+      if (t != null) markers.push({ t: t, kind: "prompt", glyph: "chat", label: "",
         // FIX (design-audit drift 7): 5b's prompt marker tooltip reads "You asked · <clock>".
         title: "You asked · " + fmtClock(t) });
     });
@@ -376,13 +376,13 @@
     });
     (session.decisions || []).forEach(function (d) {
       var t = parseT(d.t);
-      if (t != null) markers.push({ t: t, kind: "ask", glyph: "⏳", label: "",
+      if (t != null) markers.push({ t: t, kind: "ask", glyph: "hourglass", label: "",
         title: ((d.questions && d.questions[0] && d.questions[0].q) || "Question") + " · " + fmtClock(t) });
     });
     (session.agents_bg || []).forEach(function (a) {
       if (!a.running && a.ts) {
         var t = parseT(a.ts);
-        if (t != null) markers.push({ t: t, kind: "agent", glyph: "🤖", label: "",
+        if (t != null) markers.push({ t: t, kind: "agent", glyph: "agent", label: "",
           title: (a.task || "Background agent") + " finished · " + fmtClock(t) });
       }
     });
@@ -673,7 +673,7 @@
       '<section class="crd-panel' + (opts.tint ? " crd-tint-" + opts.tint : "") + '"' +
       ' data-panel="' + esc(key) + '">' +
       '<header class="crd-panel-head" data-act="toggle-panel" data-panel="' + esc(key) + '" data-col="' + esc(col) + '">' +
-      '<span class="crd-chevron">' + (collapsed ? "▸" : "▾") + "</span>" +
+      '<span class="crd-chevron">' + (collapsed ? svgIcon(ctx, "chevron") : svgIcon(ctx, "chevron-down")) + "</span>" +
       '<span class="crd-panel-label">' + esc(title) + "</span>" +
       '<span class="crd-panel-count"></span>' +
       "</header>" +
@@ -684,10 +684,10 @@
     return wrap;
   }
 
-  function setPanelCollapsed(wrap, sid, val) {
+  function setPanelCollapsed(ctx, wrap, sid, val) {
     var key = wrap.getAttribute("data-panel");
     wrap.classList.toggle("is-collapsed", val);
-    qs(wrap, ".crd-chevron").textContent = val ? "▸" : "▾";
+    qs(wrap, ".crd-chevron").innerHTML = val ? svgIcon(ctx, "chevron") : svgIcon(ctx, "chevron-down");
     setCollapsed(sid, key, val);
   }
 
@@ -735,7 +735,7 @@
           '<div class="crd-id-row2">' +
             '<h1 class="crd-goal"></h1>' +
             '<button class="crd-rename" data-act="rename" title="Rename" aria-label="Rename session"></button>' +
-            '<span class="crd-pill crd-pill-pinned" hidden><span class="tn-emo" aria-hidden="true">📌</span> Pinned</span>' +
+            '<span class="crd-pill crd-pill-pinned" hidden><span class="tn-emo" aria-hidden="true"></span> Pinned</span>' +
           "</div>" +
         "</div>" +
       "</div>" +
@@ -761,7 +761,7 @@
       "</div>" +
       '<div class="crd-spine" role="img">' +
         '<div class="crd-spine-head">' +
-          '<span class="crd-spine-chevron">▾</span>' +
+          '<span class="crd-spine-chevron">' + ico("chevron-down") + "</span>" +
           '<span class="crd-spine-label">PROGRESS SPINE</span>' +
           '<span class="crd-spine-count mono"></span>' +
           '<span class="crd-spine-hint mono">segment width = time actually spent · click to jump the chat there</span>' +
@@ -789,7 +789,7 @@
             '<span class="crd-convonav">' +
               '<button data-act="convo-prev">‹ prev</button>' +
               '<button data-act="convo-next">next ›</button>' +
-              '<button data-act="convo-latest">⤒ latest</button>' +
+              '<button data-act="convo-latest">' + ico("jump-top") + " latest</button>" +
             "</span></div>" +
           '<div class="crd-col-body"></div>' +
         "</div>" +
@@ -806,7 +806,7 @@
         '<input class="crd-phone-input" type="text" placeholder="Queue a note…">' +
         '<button class="crd-phone-send" data-act="phone-send" aria-label="Send"></button>' +
         '<button class="crd-phone-stop" data-act="phone-stop" aria-label="Stop" disabled ' +
-          'title="Not available yet — there’s no server route to stop a running session.">■</button>' +
+          'title="Not available yet — there’s no server route to stop a running session.">' + ico("stop") + "</button>" +
       "</div>" +
     "</div>";
 
@@ -885,7 +885,7 @@
     var timelineWrap = el(
       '<section class="crd-panel crd-timeline-panel" data-panel="timeline">' +
         '<header class="crd-panel-head" data-act="toggle-panel" data-panel="timeline" data-col="convo">' +
-          '<span class="crd-chevron">▾</span>' +
+          '<span class="crd-chevron">' + svgIcon(ctx, "chevron-down") + "</span>" +
           '<span class="crd-panel-label">TIMELINE</span>' +
           // FIX (defect 2): the four words are real, individually-selectable filter
           // chips now (data-act="timeline-filter" data-mode="kind", same delegation
@@ -903,7 +903,7 @@
               '<button data-act="timeline-filter" data-mode="talk">talk only</button>' +
               // FIX (defect 3): panel-level pop-out — opens the newest entry of
               // whatever's currently visible, same as the "⤒ latest" convo-nav button.
-              '<button class="crd-timeline-popout" data-act="timeline-popout" title="Pop out the newest entry" aria-label="Pop out the newest entry">⤢</button>' +
+              '<button class="crd-timeline-popout" data-act="timeline-popout" title="Pop out the newest entry" aria-label="Pop out the newest entry">' + svgIcon(ctx, "expand") + "</button>" +
             "</span>" +
           "</span>" +
         "</header>" +
@@ -945,7 +945,7 @@
           var key = t.getAttribute("data-panel");
           var wrap = ui.panels[key];
           if (!wrap) return;
-          setPanelCollapsed(wrap, sid, !wrap.classList.contains("is-collapsed"));
+          setPanelCollapsed(ctx, wrap, sid, !wrap.classList.contains("is-collapsed"));
           break;
         }
         case "expand-all":
@@ -953,7 +953,7 @@
           var col = t.getAttribute("data-col");
           var list = col === "state" ? STATE_PANELS : EVIDENCE_PANELS;
           var val = act === "collapse-all";
-          list.forEach(function (p) { setPanelCollapsed(ui.panels[p[0]], sid, val); });
+          list.forEach(function (p) { setPanelCollapsed(ctx, ui.panels[p[0]], sid, val); });
           break;
         }
         case "rename":
@@ -1264,7 +1264,7 @@
         var wrap = ui.panels[key];
         var def = key === "timeline" ? false : defaultFolded(); // FIX 8: cr.cardsFolded pref
         var collapsed = getCollapsed(sid, key, def);
-        setPanelCollapsed(wrap, sid, collapsed);
+        setPanelCollapsed(ctx, wrap, sid, collapsed);
       });
     }
 
@@ -1329,11 +1329,11 @@
     var st = stateOf(session, nowSec);
     var pill = qs(node, ".crd-pill-state");
     pill.className = "crd-pill crd-pill-state crd-state-" + st.cls;
-    // Glyph needs its own tinted span (doc 01 table: ⏳ awaiting -> tn-emo-a,
-    // ✅ done -> tn-emo-d) so plain textContent won't do — it can't parse the
+    // Glyph needs its own tinted span (doc 01 table: hourglass awaiting -> tn-emo-a,
+    // check done -> tn-emo-d) so plain textContent won't do — it can't parse the
     // wrapper markup. st.word/st.age are still escaped since they land in HTML now.
-    var glyph = st.cls === "awaiting" ? '<span class="tn-emo-a" aria-hidden="true">⏳</span> ' :
-      (st.cls === "failed" ? "" : (st.cls === "done" ? '<span class="tn-emo-d" aria-hidden="true">✅</span> ' : ""));
+    var glyph = st.cls === "awaiting" ? '<span class="tn-emo-a" aria-hidden="true">' + svgIcon(ctx, "hourglass") + '</span> ' :
+      (st.cls === "failed" ? "" : (st.cls === "done" ? '<span class="tn-emo-d" aria-hidden="true">' + svgIcon(ctx, "check") + '</span> ' : ""));
     pill.innerHTML = glyph + esc(st.word) + (st.age ? " · " + esc(st.age) : "");
 
     var agentsRunning = (session.agents_bg || []).filter(function (a) { return a.running; }).length;
@@ -1347,19 +1347,21 @@
 
     var goal = (session.overview && session.overview.goal) || meta.title || "(untitled session)";
     qs(node, ".crd-goal").textContent = goal;
-    qs(node, ".crd-rename").innerHTML = svgIcon(ctx, "edit", "✎");
+    qs(node, ".crd-rename").innerHTML = svgIcon(ctx, "edit");
 
     // REQUIRED ADDITION: session.pinned is only present on the board-list dict
     // (registry.py:70), never on parse_any()'s detail dict — hidden unless the
     // bootstrap starts forwarding it.
-    qs(node, ".crd-pill-pinned").hidden = !session.pinned;
+    var pinnedPill = qs(node, ".crd-pill-pinned");
+    pinnedPill.hidden = !session.pinned;
+    qs(pinnedPill, ".tn-emo").innerHTML = svgIcon(ctx, "pin");
 
     // FIX (design-audit drift 2): search/flag are demoted to small icon buttons in
     // the row1 actions cluster (see the SKELETON comment) rather than the old
     // full-label pill buttons — icoEls indices still map search first, flag second.
     var icoEls = qsa(node, ".crd-row1-actions .crd-iconbtn .crd-ico");
-    if (icoEls[0]) icoEls[0].innerHTML = svgIcon(ctx, "search", "⌕");
-    if (icoEls[1]) icoEls[1].innerHTML = svgIcon(ctx, "alert", "⚠");
+    if (icoEls[0]) icoEls[0].innerHTML = svgIcon(ctx, "search");
+    if (icoEls[1]) icoEls[1].innerHTML = svgIcon(ctx, "alert");
 
     // REQUIRED ADDITION: session.open_flags (unresolved-flag count) is not on the
     // detail dict (see stateOf's note above) — shows "—" rather than a fabricated 0.
@@ -1409,7 +1411,7 @@
     if (!card) return;
     if (session.continued_as) {
       card.hidden = false;
-      qs(card, ".crd-fork-ico").innerHTML = svgIcon(ctx, "branch", "⑂");
+      qs(card, ".crd-fork-ico").innerHTML = svgIcon(ctx, "branch");
       qs(card, ".crd-fork-label").textContent = "Forked";
       qs(card, ".crd-fork-body").textContent =
         "You're on the original; a fresh copy continued the work — " +
@@ -1418,7 +1420,7 @@
       ui.forkTarget = session.continued_as;
     } else if (session.continued_from) {
       card.hidden = false;
-      qs(card, ".crd-fork-ico").innerHTML = svgIcon(ctx, "branch", "⑂");
+      qs(card, ".crd-fork-ico").innerHTML = svgIcon(ctx, "branch");
       qs(card, ".crd-fork-label").textContent = "Forked";
       qs(card, ".crd-fork-body").textContent =
         "You're on the copy; the original — " + forkSessionLabel(session.continued_from) +
@@ -1465,11 +1467,11 @@
     var gutter = qs(node, ".crd-spine-gutter");
     gutter.innerHTML = plan.markers.map(function (m) {
       var cls = "crd-mark crd-mark-" + m.kind;
-      // Doc 01 emoji table: ⏳ (ask) -> tn-emo-a, 🤖/💬 (agent/prompt) -> base tn-emo.
+      // Doc 01 icon table: hourglass (ask) -> tn-emo-a, agent/chat (agent/prompt) -> base tn-emo.
       var glyphCls = m.kind === "ask" ? "tn-emo-a" : "tn-emo";
       var content = m.kind === "fail" ? '<span class="crd-mark-word mono">FAIL</span>' :
         (m.kind === "now" ? '<span class="crd-mark-word mono">NOW</span>' :
-        (m.glyph ? '<span class="crd-mark-emoji ' + glyphCls + '" aria-hidden="true">' + m.glyph + "</span>" : ""));
+        (m.glyph ? '<span class="crd-mark-emoji ' + glyphCls + '" aria-hidden="true">' + svgIcon(ctx, m.glyph) + "</span>" : ""));
       return '<span class="' + cls + '" style="left:' + m.pct.toFixed(3) + '%" title="' + esc(m.title) + '">' +
         '<span class="crd-mark-tick"></span>' + content + "</span>";
     }).join("");
@@ -1610,7 +1612,7 @@
           '<button data-act="note-remove" data-idx="' + i + '">remove</button>' +
         "</span></div>";
     }).join("");
-    var body = '<div class="crd-plan-head"><span class="tn-emo-n" aria-hidden="true">📝</span> PLAN ON THE GO · ' + notes.length + " notes</div>" +
+    var body = '<div class="crd-plan-head"><span class="tn-emo-n" aria-hidden="true">' + svgIcon(ctx, "note") + '</span> PLAN ON THE GO · ' + notes.length + " notes</div>" +
       (rows || emptyHtml("No notes queued", "Jot one below — it'll queue for delivery.")) +
       '<div class="crd-plan-footer">' +
         '<input class="crd-plan-input" type="text" placeholder="Jot the next thing…">' +
@@ -1866,10 +1868,10 @@
       var q0 = (d.questions && d.questions[0]) || { q: "", options: [] };
       var opts = (q0.options || []).map(function (o) { return '<span class="crd-ask-pill">' + esc(o) + "</span>"; }).join("");
       // FIX (design-audit drift 6): 5b's ask bubble carries a mini-header
-      // ("⏳ It asked you · still open") above the question — only while it's
+      // ("hourglass It asked you · still open") above the question — only while it's
       // still open; a closed decision doesn't claim to still be open. 5b's
       // view-only copy also drops "itself" and adds the "never writes" clause.
-      var miniHead = d.open ? '<div class="crd-ask-minihead"><span class="tn-emo-a" aria-hidden="true">⏳</span>' +
+      var miniHead = d.open ? '<div class="crd-ask-minihead"><span class="tn-emo-a" aria-hidden="true">' + svgIcon(ctx, "hourglass") + '</span>' +
         '<span class="crd-ask-minihead-label">It asked you · still open</span></div>' : "";
       return '<div class="crd-entry crd-entry-ask"' + entryOpenAttrs(e) + '><span class="crd-entry-ts mono crd-ts-ask">' + fmtClock(e.t) + "</span>" +
         '<div class="crd-bubble crd-bubble-ask">' + miniHead + '<div class="crd-ask-q">' + esc(q0.q) + "</div>" +

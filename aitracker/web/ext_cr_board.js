@@ -478,9 +478,9 @@ window.CR = window.CR || {};
       return wrap.firstElementChild;
     }
 
-    function emoji(char, cls, label) {
+    function glyph(name, cls, label) {
       return h('span', { class: 'tn-emo' + (cls ? ' ' + cls : ''), 'aria-hidden': 'true', title: label || null },
-        [char]);
+        [icon(name)]);
     }
 
     // -- shell (built once) ------------------------------------------------
@@ -779,9 +779,9 @@ window.CR = window.CR || {};
     }
 
     function railRowMeta(s, now) {
-      if (s.open_flags) return '🚩 ' + s.open_flags;
-      if (s.bg) return '🤖 ' + s.bg;
-      return ago(now - (s.mtime || 0));
+      if (s.open_flags) return [glyph('flag', 'tn-emo-f'), ' ' + s.open_flags + ' flag' + (s.open_flags !== 1 ? 's' : '')];
+      if (s.bg) return [glyph('agent', ''), ' ' + s.bg];
+      return [ago(now - (s.mtime || 0))];
     }
 
     // BUG FIX: todoTicks() (the full tick bar) was only ever called from the board
@@ -838,7 +838,7 @@ window.CR = window.CR || {};
 
       if (pinnedShown.length) {
         container.appendChild(h('div', { class: 'cr-rail-group-header' },
-          ['📌 Pinned — ' + pinnedShown.length + ' · newest first']));
+          [glyph('pin'), 'Pinned — ' + pinnedShown.length + ' · newest first']));
         pinnedShown.forEach(function (s) { container.appendChild(railRow(s, now)); });
       }
       if (unpinnedShown.length || !opts) {
@@ -869,10 +869,10 @@ window.CR = window.CR || {};
           container.appendChild(h('div', {
             class: 'cr-rail-agentrow' + (isOpen ? ' cr-rail-agentrow--open' : ''),
             tabindex: '0', role: 'button', 'aria-expanded': isOpen ? 'true' : 'false',
-            title: '🤖 Agents · ' + b.label, 'aria-label': '🤖 Agents · ' + b.label,
+            title: 'Agents · ' + b.label, 'aria-label': 'Agents · ' + b.label,
             onclick: function () { ctx && ctx.emit && ctx.emit('rail:expandAgents', { group: g }); },
             onkeydown: function (e) { if (e.key === 'Enter') ctx && ctx.emit && ctx.emit('rail:expandAgents', { group: g }); }
-          }, [emoji('🤖', '', null), '🤖 Agents · ' + esc(b.label) + (b.live ? ' (' + b.live + ' live)' : ''),
+          }, [glyph('agent', '', null), 'Agents · ' + esc(b.label) + (b.live ? ' (' + b.live + ' live)' : ''),
               h('span', { class: 'cr-rail-agentchevron' }, [icon('chevron', '<path d="M9 6l6 6-6 6"/>')])]));
           if (isOpen) {
             b.sessions.slice().sort(function (a, c) { return (c.mtime || 0) - (a.mtime || 0); })
@@ -1165,10 +1165,10 @@ window.CR = window.CR || {};
       var label = name + (s.pinned ? ' (pinned)' : '') + (dir ? ', ' + dir : '') + ' — ' + orbStateWord(state) +
         (todoLabel ? ', ' + todoLabel + ' todos' : '');
       // Search-result rows (requirement 5's ordering note): the server's
-      // ranking is used AS-IS — a pinned hit still shows its 📌 marker inline
-      // rather than being pulled into a separate "Pinned" group the way
-      // browsing does, which would re-sort exactly what search must not.
-      var displayName = (s.pinned ? '📌 ' : '') + (s.agent ? '🤖 ' : '') + name;
+      // ranking is used AS-IS — pinned and agent states are shown via dot
+      // colour and UI elements, not as inline prefixes, to keep the title
+      // clean and avoid duplicate visual indicators.
+      var displayName = name;
       return h('div', {
         class: 'cr-rail-row' + (s.id === selectedSessionId ? ' cr-rail-row--selected' : ''),
         tabindex: '0', role: 'button', title: titleAttr, 'aria-label': label, 'data-id': s.id,
@@ -1181,7 +1181,7 @@ window.CR = window.CR || {};
           dirLine ? h('span', { class: 'cr-rail-dir' }, [dirLine]) : null,
         ]),
         h('span', { class: 'cr-rail-meta' },
-          [todoLabel ? (todoLabel + ' · ' + railRowMeta(s, now)) : railRowMeta(s, now)]),
+          (todoLabel ? [todoLabel + ' · '] : []).concat(railRowMeta(s, now))),
       ]);
     }
 
@@ -1269,13 +1269,13 @@ window.CR = window.CR || {};
       els.flagCountBtn = h('button', {
         class: 'cr-flagcount', type: 'button', title: 'Open the flag list', 'aria-label': 'Open the flag list',
         onclick: function () { ctx && ctx.emit && ctx.emit('open:flags'); }
-      }, [emoji('🚩', 'tn-emo-f'), '0']);
+      }, [glyph('flag', 'tn-emo-f'), '0']);
       els.topbar.appendChild(els.flagCountBtn);
 
       els.topbar.appendChild(h('button', {
         class: 'cr-bell', type: 'button', title: 'Notifications', 'aria-label': 'Notifications',
         onclick: function () { ctx && ctx.emit && ctx.emit('toggle:notifications'); }
-      }, [emoji('🔔', '')]));
+      }, [glyph('bell', '')]));
 
       // BLOCKER 1: 'Config'/'Help' labels wrapped in `.cr-topbar-label` so the
       // phone-tier CSS can drop to icon-only — `title`/`aria-label` already
@@ -1283,12 +1283,12 @@ window.CR = window.CR || {};
       els.topbar.appendChild(h('button', {
         class: 'cr-icon-btn', type: 'button', title: 'Config', 'aria-label': 'Config',
         onclick: function () { ctx && ctx.emit && ctx.emit('open:config'); }
-      }, [emoji('⚙️', ''), h('span', { class: 'cr-topbar-label' }, ['Config'])]));
+      }, [glyph('gear', ''), h('span', { class: 'cr-topbar-label' }, ['Config'])]));
 
       els.topbar.appendChild(h('button', {
         class: 'cr-icon-btn', type: 'button', title: 'Help', 'aria-label': 'Help',
         onclick: function () { ctx && ctx.emit && ctx.emit('open:help'); }
-      }, [emoji('❓', ''), h('span', { class: 'cr-topbar-label' }, ['Help'])]));
+      }, [glyph('help', ''), h('span', { class: 'cr-topbar-label' }, ['Help'])]));
 
       buildThemeControl();
 
@@ -1516,8 +1516,8 @@ window.CR = window.CR || {};
       }
       return { awaiting: 'Waiting on you', working: 'Working', landed: 'Landed' }[state] || state;
     }
-    function stateEmoji(state) {
-      return { awaiting: ['⏳', 'tn-emo-a'], working: ['🟡', ''], flagged: ['🚩', 'tn-emo-f'], landed: ['✅', 'tn-emo-d'] }[state] || ['', ''];
+    function stateIcon(state) {
+      return { awaiting: ['hourglass', 'tn-emo-a'], working: ['working', ''], flagged: ['flag', 'tn-emo-f'], landed: ['check', 'tn-emo-d'] }[state] || ['', ''];
     }
 
     function todoTicks(s) {
@@ -1584,12 +1584,12 @@ window.CR = window.CR || {};
     }
 
     function tileHead(s, state, now) {
-      var ew = stateEmoji(state);
+      var ew = stateIcon(state);
       var kids = [
-        emoji(ew[0], ew[1]),
+        glyph(ew[0], ew[1]),
         h('span', { class: 'cr-tile-state' }, [stateWord(state, s) + (state === 'awaiting' ? ' · ' + ago(now - (s.mtime || 0)) : '')]),
       ];
-      if (s.pinned) kids.push(emoji('📌', '', 'Pinned'));
+      if (s.pinned) kids.push(glyph('pin', '', 'Pinned'));
       var head = h('div', { class: 'cr-tile-head', 'data-state': state }, kids);
       if (state === 'working') {
         var dot = h('span', { class: 'cr-tile-dot is-working' });
@@ -1707,7 +1707,7 @@ window.CR = window.CR || {};
         // Rendered honestly with what exists rather than fabricating the
         // other two counters — REQUIRED ADDITION in the report.
         var sidebar = h('div', { class: 'cr-tile-sidebar' }, [
-          h('div', { class: 'cr-tile-counts' }, [emoji('📝', 'tn-emo-n'), (s.note_count || 0) + ' notes']),
+          h('div', { class: 'cr-tile-counts' }, [glyph('note', 'tn-emo-n'), (s.note_count || 0) + ' notes']),
           h('button', {
             class: 'cr-tile-action', type: 'button',
             onclick: function (e) { e.stopPropagation(); ctx && ctx.emit && ctx.emit('terminal:open', { id: s.id }); }
@@ -1729,7 +1729,7 @@ window.CR = window.CR || {};
     function agentGroupTile(t, now) {
       var attrs = tileBaseAttrs(t);
       attrs.class = 'cr-tile cr-tile--agentgroup';
-      attrs.title = '🤖 Agents · ' + t.label;
+      attrs.title = 'Agents · ' + t.label;
       var total = t.sessions.length;
       var live = t.sessions.filter(function (s) { return sessionState(s, now) !== 'idle'; }).length;
       var sentence = total + ' background agent' + (total === 1 ? '' : 's') +
@@ -1737,7 +1737,7 @@ window.CR = window.CR || {};
       return h('div', attrs, [
         h('div', { class: 'cr-tile-head' }, [
           icon('chevron', '<path d="M9 6l6 6-6 6"/>'),
-          emoji('🤖', ''),
+          glyph('agent', ''),
         ]),
         h('div', { class: 'cr-tile-title cr-tile-title--agent' }, ['Agents · ' + t.label]),
         h('div', { class: 'cr-tile-line' }, [sentence]),
