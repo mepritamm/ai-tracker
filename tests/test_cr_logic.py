@@ -210,7 +210,11 @@ def _board_driver_js():
         make_session("fresh", NOW - 5, ended=False),
     ]
 
-    # 4) The cap: default 8, configurable 3..8 via localStorage cr.boardTileCount, always clamped.
+    # 4) The cap: default 8, configurable 3..12 via localStorage cr.boardTileCount,
+    #    always clamped (doc 04 "Board tiles | slider 3-12, default 8" -- the owner
+    #    ruled doc 04's 3-12 wins over doc 02's superseded "never more than 8").
+    #    12 sessions here so a clamp of exactly 12 (and the passthrough at 10/12)
+    #    can be told apart from "ran out of sessions to show".
     cap_sessions = [make_session("s%d" % i, NOW - i, waiting=True) for i in range(12)]
 
     # 5) Regression: agent:true, group:"" must still get an individual tile (the "950
@@ -339,6 +343,12 @@ def _board_driver_js():
     js.append("OUT.cap_default = window.CR.board.boardTiles(capSessions, NOW).length;")
     js.append("window.localStorage.setItem('cr.boardTileCount', JSON.stringify(5));")
     js.append("OUT.cap_five = window.CR.board.boardTiles(capSessions, NOW).length;")
+    js.append("window.localStorage.setItem('cr.boardTileCount', JSON.stringify(10));")
+    js.append("OUT.cap_mid_ten = window.CR.board.boardTiles(capSessions, NOW).length;")
+    js.append("window.localStorage.setItem('cr.boardTileCount', JSON.stringify(12));")
+    js.append("OUT.cap_twelve = window.CR.board.boardTiles(capSessions, NOW).length;")
+    js.append("window.localStorage.setItem('cr.boardTileCount', JSON.stringify(13));")
+    js.append("OUT.cap_thirteen = window.CR.board.boardTiles(capSessions, NOW).length;")
     js.append("window.localStorage.setItem('cr.boardTileCount', JSON.stringify(20));")
     js.append("OUT.cap_clamp_high = window.CR.board.boardTiles(capSessions, NOW).length;")
     js.append("window.localStorage.setItem('cr.boardTileCount', JSON.stringify(1));")
@@ -586,12 +596,20 @@ class TestCRLogic(unittest.TestCase):
         self.assertEqual(self.OUT["idle_state_direct"], "idle")
 
     def test_board_tile_cap(self):
-        """Default cap is 8; cr.boardTileCount (localStorage) can lower it but the
-        result is always clamped to [3, 8]."""
+        """Default cap is 8; cr.boardTileCount (localStorage) can move it, always
+        clamped to [3, 12] -- the ceiling was raised 8 -> 12 per doc 04
+        ("Board tiles | slider 3-12, default 8"), an owner ruling that doc 04 wins
+        over doc 02's now-superseded "hard cap 8" (ext_cr_board.js's boardTileCap(),
+        ~line 198). Full clamp behaviour pinned: below the floor clamps up to 3, a
+        mid-range value (10) and the new ceiling itself (12) both pass through
+        unchanged, and one past the ceiling (13) clamps back down to 12."""
         self.assertEqual(self.OUT["cap_default"], 8)
         self.assertEqual(self.OUT["cap_five"], 5)
-        self.assertEqual(self.OUT["cap_clamp_high"], 8)  # 20 clamps down to 8
-        self.assertEqual(self.OUT["cap_clamp_low"], 3)   # 1 clamps up to 3
+        self.assertEqual(self.OUT["cap_mid_ten"], 10)     # 10 passes through unchanged
+        self.assertEqual(self.OUT["cap_twelve"], 12)      # 12 (the new ceiling) passes through
+        self.assertEqual(self.OUT["cap_thirteen"], 12)    # 13 clamps down to 12
+        self.assertEqual(self.OUT["cap_clamp_high"], 12)  # 20 clamps down to 12
+        self.assertEqual(self.OUT["cap_clamp_low"], 3)    # 1 clamps up to 3
 
     def test_board_tile_cap_holds_with_failing_tiles_present(self):
         """12 sessions (2 awaiting + 4 failing + 6 working) at the default cap must
@@ -1537,48 +1555,59 @@ class TestCRFailingTileRender(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Stat-chip row preference (ext_cr_detail.js's statChipsOn(), localStorage key
-# "tracker.next.statchips"): DEFAULT OFF, "1" -> on, anything else -> off,
-# an unreadable localStorage -> off. Also an UNEXPORTED closure function --
-# window.CR.detail._internal exposes spineSegments/mergeTimeline/etc. but not
-# this one (it's a tiny render-preference getter, not one of the designed
-# testable derivations). Driving the full detail-panel render just to read one
-# preference bit is impractical here (ext_cr_detail.js's mount() builds the
-# entire evidence-panel template), so per this batch's own instructions this
-# pins the PURE PREDICATE instead -- by exposing the REAL function object
-# (never re-implementing its logic): the driver splices one extra line onto
-# window.CR.detail._internal's own literal export object in the IN-MEMORY copy
-# of the bundle text used only for this Node subprocess (aitracker/web/*.js on
-# disk is never touched), naming the same real `statChipsOn` binding its
-# neighbours in that same object already close over.
+# Stat-chip row (ext_cr_detail.js's statChipsHtml(), doc 03 Row 3 / doc 04
+# capability #21): the row is now PERMANENT -- statChipsOn(), the
+# "tracker.next.statchips" localStorage key, the `cr:statchips` listener and
+# the Config toggle were ALL removed (owner ruling: docs 03/04 win over the
+# round-5 prototype that gated this behind a preference). There is no
+# predicate left to pin; this instead pins the actual 7-chip output --
+# doc order (files/commands/reads/commits/tests/tokens/branch), the "--"
+# missing-data marker for a null/absent datum, and a genuine zero rendering
+# "0" (never coerced to "--").
+#
+# statChipsHtml() is a pure function of a session dict -- no DOM, no
+# localStorage read at all now -- but it is still an UNEXPORTED closure
+# (window.CR.detail._internal exposes spineSegments/mergeTimeline/etc. but not
+# this one). Same technique the old statChipsOn probe used: splice one extra
+# line onto _internal's own literal export object in the IN-MEMORY copy of the
+# bundle text used only for this Node subprocess (aitracker/web/*.js on disk
+# is never touched), naming the same real `statChipsHtml` binding its
+# neighbours in that object already close over.
 # ---------------------------------------------------------------------------
 
-def _expose_statchips_on(bundle_js):
+def _expose_stat_chips_html(bundle_js):
     anchor = "spineSegments: spineSegments,"
     assert bundle_js.count(anchor) == 1, "ext_cr_detail.js's _internal export shape changed"
-    return bundle_js.replace(anchor, "spineSegments: spineSegments,\n    statChipsOn: statChipsOn,", 1)
+    return bundle_js.replace(anchor, "spineSegments: spineSegments,\n    statChipsHtml: statChipsHtml,", 1)
+
+
+_STAT_CHIP_LABEL_VAL_RE = re.compile(
+    r'<span class="crd-statchip-label">([^<]*)</span> '
+    r'<span class="crd-statchip-val">([^<]*)</span>'
+)
+
+
+def _parse_stat_chips(html):
+    """(label, value) pairs in the order they appear in the rendered row."""
+    return _STAT_CHIP_LABEL_VAL_RE.findall(html)
 
 
 _STATCHIPS_JS_TAIL = r"""
 var out = {};
-var K = "tracker.next.statchips";
-var fn = window.CR.detail._internal.statChipsOn;
+var fn = window.CR.detail._internal.statChipsHtml;
 
-localStorage.removeItem(K);
-out.absent = fn();
+// The whole point of the change: NEVER touches localStorage, and the row still
+// renders in full -- no preference key gates it any more.
+out.full_html = fn(%(full)s);
+out.missing_html = fn(%(missing)s);
+out.zero_html = fn(%(zero)s);
 
-localStorage.setItem(K, "1");
-out.on = fn();
-
-localStorage.setItem(K, "0");
-out.explicit_off = fn();
-
-localStorage.setItem(K, "yes");            // any non-"1" string -> off, never truthy-coerced
-out.garbage_value = fn();
-
+// Defensive: even an unreadable localStorage (private mode / sandboxed iframe)
+// must not stop the row from rendering, since nothing in it reads localStorage
+// at all any more.
 var _realGetItem = localStorage.getItem;
 localStorage.getItem = function () { throw new Error("storage blocked"); };
-out.throwing = fn();
+out.full_html_with_storage_blocked = fn(%(full)s);
 localStorage.getItem = _realGetItem;
 
 console.log("===CR_STATCHIPS_JSON_START===");
@@ -1588,8 +1617,33 @@ console.log(JSON.stringify(out));
 
 def _statchips_driver_js():
     bundle_html = _read_page()
-    bundle_js = _expose_statchips_on(_extract_script_content(bundle_html))
-    return "\n".join([_JS_PREAMBLE, bundle_js, _JS_MID, _STATCHIPS_JS_TAIL])
+    bundle_js = _expose_stat_chips_html(_extract_script_content(bundle_html))
+    full_detail = make_detail(
+        files=[{"path": "a"}, {"path": "b"}, {"path": "c"}],
+        commands=[{"cmd": "x"} for _ in range(5)],
+        counts={"done": 0, "todos": 0, "created": 0, "edited": 0, "read": 10,
+                "commits": 2, "tests": 4, "tests_failed": 0, "errors": 0,
+                "agents": 0, "searches": 0},
+        tokens={"in": 100, "out": 28412},
+        meta={"cwd": "/tmp/proj", "gitBranch": "term-tiers", "version": "1.0",
+              "sessionId": "sid", "entrypoint": "cli", "aiTitle": "",
+              "customTitle": "", "model": "", "effort": "", "title": "t"},
+    )
+    # Every datum null/absent -- must render "--" for all seven chips, never
+    # fall back to a stray truthy default the fixture happens to carry.
+    missing_detail = make_detail(files=None, commands=None, reads=None, commits=None,
+                                  counts=None, tokens=None, meta={})
+    # make_detail()'s own defaults are already all genuine zeros/empties (files=[],
+    # commands=[], counts.read/commits/tests/tests_failed=0, tokens={in:0,out:0})
+    # -- a real answer, not a missing one, so every one of those chips must read
+    # "0", never "--".
+    zero_detail = make_detail()
+    tail = _STATCHIPS_JS_TAIL % {
+        "full": json.dumps(full_detail),
+        "missing": json.dumps(missing_detail),
+        "zero": json.dumps(zero_detail),
+    }
+    return "\n".join([_JS_PREAMBLE, bundle_js, _JS_MID, tail])
 
 
 def _extract_statchips_json(stdout):
@@ -1601,7 +1655,11 @@ def _extract_statchips_json(stdout):
 
 
 @unittest.skipUnless(_HAS_NODE, "node not available")
-class TestCRStatChipsPreference(unittest.TestCase):
+class TestCRStatChips(unittest.TestCase):
+    """Replaces TestCRStatChipsPreference -- there is no preference left to pin.
+    Covers the new permanent-row behaviour instead (doc 03 Row 3 / doc 04
+    capability #21)."""
+
     @classmethod
     def setUpClass(cls):
         js = _statchips_driver_js()
@@ -1613,22 +1671,162 @@ class TestCRStatChipsPreference(unittest.TestCase):
             )
         cls.OUT = _extract_statchips_json(stdout)
 
-    def test_default_off_when_key_absent(self):
-        self.assertFalse(self.OUT["absent"])
+    def test_renders_with_no_localstorage_preference_present(self):
+        """The whole point of the change: statChipsHtml() produced real chip
+        markup even though this driver never once sets or reads any localStorage
+        key -- there is no preference gating it any more."""
+        chips = _parse_stat_chips(self.OUT["full_html"])
+        self.assertEqual(len(chips), 7)
 
-    def test_on_only_for_the_exact_string_one(self):
-        self.assertTrue(self.OUT["on"])
+    def test_renders_even_with_localstorage_unreadable(self):
+        """EDGE CASE carried over from the old statChipsOn probe: even a
+        localStorage.getItem that throws (private mode / sandboxed iframe) must
+        not stop the row rendering -- proof nothing in it depends on storage."""
+        chips = _parse_stat_chips(self.OUT["full_html_with_storage_blocked"])
+        self.assertEqual(len(chips), 7)
 
-    def test_explicit_zero_is_off(self):
-        self.assertFalse(self.OUT["explicit_off"])
+    def test_seven_chips_in_the_docs_order(self):
+        chips = _parse_stat_chips(self.OUT["full_html"])
+        labels = [label for label, _ in chips]
+        self.assertEqual(labels, ["files", "commands", "reads", "commits", "tests", "tokens", "branch"])
 
-    def test_any_other_value_is_off_not_truthy_coerced(self):
-        self.assertFalse(self.OUT["garbage_value"])
+    def test_seven_chips_render_the_correct_values(self):
+        values = dict(_parse_stat_chips(self.OUT["full_html"]))
+        self.assertEqual(values["files"], "3")
+        self.assertEqual(values["commands"], "5")
+        self.assertEqual(values["reads"], "10")
+        self.assertEqual(values["commits"], "2")
+        self.assertEqual(values["tests"], "4")
+        self.assertEqual(values["tokens"], "28,512")
+        self.assertEqual(values["branch"], "term-tiers")
 
-    def test_unreadable_localstorage_defaults_off(self):
-        """EDGE CASE: localStorage.getItem throwing (private mode / sandboxed
-        iframe) must degrade to OFF, never raise and never read as 'show'."""
-        self.assertFalse(self.OUT["throwing"])
+    def test_missing_datum_renders_the_dash_dash_marker(self):
+        """Every chip is null/absent in this fixture -- all seven must show the
+        doc's literal "--" marker, never a fabricated 0 or an empty string."""
+        values = dict(_parse_stat_chips(self.OUT["missing_html"]))
+        for label in ("files", "commands", "reads", "commits", "tests", "tokens", "branch"):
+            self.assertEqual(values[label], "--", label)
+
+    def test_genuine_zero_renders_zero_not_the_missing_marker(self):
+        """A real zero count (no files touched yet, no commits, etc.) is a real
+        answer, not a missing one -- must render "0", never coerced to "--"."""
+        values = dict(_parse_stat_chips(self.OUT["zero_html"]))
+        for label in ("files", "commands", "reads", "commits", "tests", "tokens"):
+            self.assertEqual(values[label], "0", label)
+
+
+# ---------------------------------------------------------------------------
+# Two more just-landed doc-win changes on the board tile itself (ext_cr_board.js),
+# both reversing a prior conditional back to the doc's "every tile" rule. Driven
+# through the REAL mount()/update() render path (same stub DOM as
+# TestCRFailingTileRender above), not just a pure derivation, since both of these
+# are markup/class decisions made inline in sessionTile().
+# ---------------------------------------------------------------------------
+
+_TILECLASS_JS_TAIL = r"""
+function renderOneTileFull(session) {
+  var root = makeReal('div');
+  docBody.appendChild(root);
+  window.CR.board.mount(root, {});
+  window.CR.board.update({ sessions: [session], now: NOW });
+  var tiles = queryAllReal(root, '.cr-tile');
+  if (!tiles.length) return null;
+  var tile = tiles[0];
+  var subs = queryAllReal(tile, '.cr-tile-sub');
+  var subText = null;
+  if (subs.length) {
+    var t = subs[0]._children[0];
+    subText = t ? t.textContent : '';
+  }
+  return { classes: Array.from(tile._classes), hasSub: subs.length > 0, subText: subText };
+}
+
+var NOW = %(now)d;
+var out = {};
+out.working_bg0 = renderOneTileFull(%(working_bg0)s);
+out.non_hero = renderOneTileFull(%(non_hero)s);
+
+console.log("===CR_TILECLASS_JSON_START===");
+console.log(JSON.stringify(out));
+"""
+
+
+def _tileclass_driver_js():
+    bundle_html = _read_page()
+    bundle_js = _extract_script_content(bundle_html)
+    now = NOW
+    # bg:0 (make_session's own default) -- a working tile with NO live background
+    # agent. Pre-fix this got no glow at all (`cr-tile--agent-glow` was only added
+    # when s.bg > 0); the border+glow now lives unconditionally on the base
+    # `.cr-tile--working` rule (ext_cr_board.css ~851), so this must carry it too.
+    working_bg0 = make_session("tc_work", now - 5, ended=False, bg=0)
+    # A plain non-hero tile (none of these fixtures are ever ranked/marked hero) --
+    # pre-fix the "project · tool" sub-line was hero-only.
+    non_hero = make_session("tc_sub", now - 5, ended=False, project="widgets", source="claude")
+    tail = _TILECLASS_JS_TAIL % {
+        "now": now,
+        "working_bg0": json.dumps(working_bg0),
+        "non_hero": json.dumps(non_hero),
+    }
+    return "\n".join([_FAILTILE_JS_PREAMBLE, bundle_js, _FAILTILE_JS_MID, tail])
+
+
+def _extract_tileclass_json(stdout):
+    marker = "===CR_TILECLASS_JSON_START==="
+    idx = stdout.find(marker)
+    if idx < 0:
+        raise ValueError("marker not found in node output:\n" + stdout)
+    return json.loads(stdout[idx + len(marker):].strip())
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestCRTileBorderGlowAndSubline(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        js = _tileclass_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Tile-class driver failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_tileclass_json(stdout)
+
+    def test_working_tile_with_bg_zero_still_gets_the_working_class(self):
+        """Every working tile carries `.cr-tile--working`, which now carries the
+        border-color: var(--line-agent) + glow unconditionally (ext_cr_board.css
+        ~851) -- a bg:0 session (no live background agent) must not be excluded."""
+        tile = self.OUT["working_bg0"]
+        self.assertIsNotNone(tile)
+        self.assertIn("cr-tile--working", tile["classes"])
+
+    def test_the_old_conditional_agent_glow_modifier_is_gone(self):
+        """The prior `cr-tile--agent-glow` modifier (added only when s.bg > 0) is
+        superseded -- it must never appear, even implicitly, now that the border+
+        glow lives directly on `.cr-tile--working`."""
+        tile = self.OUT["working_bg0"]
+        self.assertNotIn("cr-tile--agent-glow", tile["classes"])
+
+    def test_working_tile_css_rule_carries_border_and_glow_unconditionally(self):
+        """Static check on the actual stylesheet (ext_cr_board.css): the
+        `.cr-tile--working` rule itself -- not a separate opt-in modifier -- must
+        declare the agent border-color and the glow box-shadow."""
+        css_path = os.path.join(_AITRACKER, "web", "ext_cr_board.css")
+        with open(css_path, encoding="utf-8") as fh:
+            css = fh.read()
+        m = re.search(r"\.tracker-next \.cr-tile--working\s*\{([^}]*)\}", css)
+        self.assertIsNotNone(m, "no unconditional .cr-tile--working rule found")
+        rule_body = m.group(1)
+        self.assertIn("border-color: var(--line-agent)", rule_body)
+        self.assertIn("--glow-agent-soft", rule_body)
+
+    def test_non_hero_tile_renders_the_project_tool_sub_line(self):
+        """Doc 02 tile-anatomy table: EVERY tile gets a "project · tool" sub-line,
+        not just the hero -- the owner reversed the round-5 "hero only" drift."""
+        tile = self.OUT["non_hero"]
+        self.assertIsNotNone(tile)
+        self.assertTrue(tile["hasSub"])
+        self.assertIn("widgets", tile["subText"])
 
 
 if __name__ == "__main__":

@@ -266,6 +266,25 @@
    theme / New session are all reachable at both 390px and 820px — verified
    by the arithmetic above, no runtime measurement tool available here.
 
+   CR-DRIFT (measured with Playwright, both themes, board + detail): the wrap
+   boundary above was `max-width: 1024px`, which assumed single-row content
+   (~1072px, incl. gaps, excl. the bar's own 44px h-padding) always fits once
+   the session rail's auto-collapse tier (1024-1279px -> 48/56px collapsed,
+   `applyRailMode`/`bindResize` in ext_cr_board.js) frees up room. It doesn't:
+   the rail's OWN threshold is `innerWidth < 1280`, so at exactly 1280px (and
+   up through ~1347px) the rail has already snapped back to its full 232px
+   OPEN width while the topbar is still nowrap — a viewport-width cliff where
+   available content width actually *drops* (~1004px vs. ~1048-1072px just
+   below 1280) as the window grows. Measured: `.cr-newsession` right edge
+   1326px / `.cr-topbar-label` "New session" 1312px at 1280x900 (both past
+   the 1280px viewport, text clipped to "New se..."). 1440px is the first
+   width safely clear of the cliff (content flush at 1418px, 22px of padding
+   to spare) so the boundary below is raised to `max-width: 1439px` — the bar
+   now wraps for the whole rail-cliff range instead of only <=1024px. This is
+   independent of (and does not change) the rail's own 1024/1280 thresholds
+   or the separate `max-width: 1023px` overlay-rail queries elsewhere in this
+   file — only the topbar's own wrap point moved.
+
    BLOCKER 2 (touch targets, phone tier only — desktop/tablet density is
    untouched per instruction): every control in this section measured below
    44px effective height at phone width. Technique used throughout is either
@@ -276,7 +295,7 @@
    segments, New session) — never inflating the glyph/icon itself. See the
    per-control comments below for the arithmetic.
    ============================================================ */
-@media (max-width: 1024px) {
+@media (max-width: 1439px) {
   .tracker-next .cr-topbar {
     flex-wrap: wrap;
     height: auto;
@@ -656,16 +675,16 @@
 /* BUG FIX: no landed colour existed on the orb pip at all. */
 .tracker-next .cr-orb-pip.is-landed { background: var(--state-done); }
 
-/* BLOCKER 4 (tier boundary): this used to be `max-width: 1023px`, one pixel
- * off from ext_cr_detail.css's own compact-tier boundary (`max-width: 1024px`
- * / `min-width: 1025px`) — at exactly 1024px (classic iPad landscape) the
- * rail stayed docked (desktop behaviour) while the detail view had already
- * dropped to its single-column phone-adjacent stack. Realigned to the same
- * <=1024px boundary detail.css already uses, so 1024px gets ONE consistent
- * tier across both files. ext_cr_board.js's own `window.innerWidth < 1024`
- * checks (openRailOverlay/closeRailOverlay/applyRailMode/bindResize) are
- * updated alongside this to `<= 1024` so JS agrees with CSS at the boundary. */
-@media (max-width: 1024px) {
+/* Tier boundary (doc 02's breakpoint table): 1024–1279px is the "2 columns,
+ * rail collapsed to orbs, in-flow" tier; < 1024px is the "1 column, rail
+ * hidden/overlay" tier — so 1024px itself belongs to the WIDER tier, docked
+ * rail, not the overlay. A prior "BLOCKER 4" pass moved this to `max-width:
+ * 1024px` (`<=1024`) to match ext_cr_detail.css's own compact-tier boundary;
+ * the owner's docs-win ruling supersedes that reconciliation for the board/
+ * rail here — `max-width: 1023px` (`<1024`) matches the doc's own table.
+ * ext_cr_board.js's `window.innerWidth` checks (openRailOverlay/
+ * closeRailOverlay/applyRailMode/bindResize) use the matching `< 1024`. */
+@media (max-width: 1023px) {
   .tracker-next .cr-rail {
     position: fixed;
     top: 54px;
@@ -692,13 +711,13 @@
 /* Mobile rail scrim — sits behind the overlay-open rail, in front of the
  * board. No scrim/backdrop token exists in 01-foundations.md, so the fill is
  * a literal rgba (same precedent as the working-tile pulse keyframes, which
- * also use a literal rgba where no token covers the need). Only present at
- * or below 1024px, i.e. exactly the width band where the rail is an overlay
- * (see the Blocker 4 note above the rail-overlay media query). */
+ * also use a literal rgba where no token covers the need). Only present
+ * below 1024px, i.e. exactly the width band where the rail is an overlay
+ * (see the tier-boundary note above the rail-overlay media query). */
 .tracker-next .cr-rail-scrim {
   display: none;
 }
-@media (max-width: 1024px) {
+@media (max-width: 1023px) {
   .tracker-next .cr-rail-scrim {
     display: block;
     position: fixed;
@@ -756,12 +775,11 @@
   font: var(--fw-triage-count) var(--fs-triage-count-max)/var(--lh-triage-count) var(--font-serif);
   letter-spacing: var(--ls-triage-count);
   font-variant-numeric: tabular-nums;
-  /* BUG FIX: 01-foundations.md gives triage counts a 33-40px range, but the
-   * original prototype actually renders them at 31px — doc and prototype
-   * disagree here, and the prototype's rendered value wins per instruction.
-   * The token (--fs-triage-count-max, owned elsewhere) is left untouched;
-   * overridden at this use site only. */
-  font-size: 31px;
+  /* Doc 02 "Triage strip" table: counts are 33px (within 01-foundations.md's
+   * 33-40px range). The owner reversed the prior "prototype's 31px wins"
+   * exception — the doc's 33px is now implemented directly at this use site.
+   * The token (--fs-triage-count-max, owned elsewhere) is left untouched. */
+  font-size: 33px;
 }
 @media (max-width: 1439px) {
   .tracker-next .cr-triage-count { font-size: var(--fs-triage-count-min); }
@@ -827,7 +845,7 @@
 @media (max-width: 1279px) {
   .tracker-next .cr-board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
-@media (max-width: 1024px) {
+@media (max-width: 1023px) {
   .tracker-next .cr-board { grid-template-columns: minmax(0, 1fr); }
 }
 
@@ -843,25 +861,18 @@
 }
 .tracker-next .cr-tile--span2,
 .tracker-next .cr-tile--agentgroup { grid-column: span 2; }
-@media (max-width: 1024px) {
+@media (max-width: 1023px) {
   .tracker-next .cr-tile--span2,
   .tracker-next .cr-tile--agentgroup { grid-column: span 1; }
 }
 
-/* Plain 'working' state: shadow-raised only, default (--line-subtle) border —
-   5a itself shows a plain "Working" tile with no gold border/glow at all
-   (grep-verified: `border:1px solid var(--ads-line-subtle);box-shadow:var(--ads-shadow-raised)`).
-   The gold agent glow is a SEPARATE modifier, `.cr-tile--agent-glow` below,
-   added by ext_cr_board.js only when the session also has a live background
-   agent (see that file's sessionTile() for the rule + evidence). */
+/* Every 'Working' tile (doc 02 tile-anatomy table + 01-foundations.md ~line 271:
+   "A working tile gets --glow-agent-soft plus --shadow-raised", unconditional —
+   not gated on live background agents). The owner reversed the prior
+   bg-agent-only restriction (formerly a separate `.cr-tile--agent-glow`
+   modifier added only when `s.bg > 0`); that ruling is superseded, so the
+   border+glow now lives directly on the base working state. */
 .tracker-next .cr-tile--working {
-  box-shadow: var(--shadow-raised);
-}
-/* Item 3: 5a's OTHER simultaneously-"Working" tile carries this gold border +
-   glow, and its head shows a "🤖 2" live-background-agent badge where the
-   plain tile above shows only elapsed time — the glow marks background
-   agents, not the working state itself. */
-.tracker-next .cr-tile--agent-glow {
   border-color: var(--line-agent);
   box-shadow: var(--glow-agent-soft), var(--shadow-raised);
 }

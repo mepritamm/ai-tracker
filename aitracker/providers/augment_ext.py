@@ -270,6 +270,12 @@ def _parse(kind, prefix, src_label, sid):
         "files": files, "reads": [], "commands": [], "commits": [], "tests": [],
         "requests": [], "agents": [], "agents_bg": [], "agent_sessions": [], "shells": [],
         "decisions": [], "waiting": False,
+        # Same field/shape contract as Claude/Auggie's detail dict (see parse_session's
+        # parse_error), honestly None here always: this provider has no chat transcript to
+        # parse at all (per the LevelDB gap in the module docstring above) -- "can't know",
+        # not "nothing failed", but the two read the same to the client, which is correct:
+        # there's no line/record for it to point at either way.
+        "parse_error": None,
         "prs": [],
         "narrative": narrative,
         "message": NOTE[:2000],

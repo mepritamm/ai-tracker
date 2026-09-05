@@ -1095,15 +1095,29 @@ def parse_session(path):
     ctx_current = None    # occupancy off the LATEST usage block only — not summed, unlike tok_in/out
     n_search = 0
     t_first = t_last = None
+    # Board/detail "the transcript quietly lied" gap: a truncated or corrupted JSONL line
+    # used to just `continue` here with no record left anywhere that anything was lost -- a
+    # session cut off mid-write rendered identically to one that finished cleanly. Track the
+    # FIRST bad line (later ones are the same story, not new information) plus how many
+    # records parsed cleanly before it, so the detail dict can say so honestly. This must
+    # not change what gets skipped/kept -- see parse_error's own comment at the result dict
+    # below for the exact shape and the doc copy it exists to support.
+    parse_error = None
+    parse_ok_count = 0
+    line_no = 0
     with open(path, encoding="utf-8") as fh:
         for line in fh:
+            line_no += 1
             line = line.strip()
             if not line:
                 continue
             try:
                 o = json.loads(line)
             except ValueError:
+                if parse_error is None:
+                    parse_error = {"line": line_no, "parsed_before": parse_ok_count}
                 continue
+            parse_ok_count += 1
             ts = o.get("timestamp")
             if ts:
                 t_first = t_first or ts
@@ -1378,6 +1392,15 @@ def parse_session(path):
         # same filter (_is_real_bash_error) as the list-level derivation. Honestly None when
         # nothing really failed, never omitted.
         "fail_cmd": fail_cmd,
+        # Degraded-transcript signal (design_handoff_control_room/04, "Something broke":
+        # "Couldn't read this session — The transcript exists but a line failed to parse.
+        # Everything before it is shown."). None when every line in the main transcript
+        # parsed cleanly; otherwise {"line": <1-based line number of the FIRST bad line>,
+        # "parsed_before": <records successfully parsed before it>} -- parsing itself is
+        # UNCHANGED (still skips the bad line and keeps every good record, before AND
+        # after it), this only reports that it happened. Honestly None, never omitted --
+        # same always-present rule as fail_cmd above.
+        "parse_error": parse_error,
         "prs": [p for p in prs_sorted(prs, pr_states) if pr_worked(p, meta.get("cwd"))],   # created or worked-on, not prompt-only references
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": text_last[:2000],

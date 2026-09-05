@@ -128,6 +128,14 @@ def parse_any(sid):
     # guarantee as all_sessions()'s (line ~89 above) for any provider that doesn't (Augment
     # ext honestly has no Bash-equivalent concept, so it never will) — the key always exists.
     d.setdefault("fail_cmd", None)
+    # parse_error: honest "a line/record in this session's transcript failed to parse"
+    # signal (design_handoff_control_room/04's "Something broke" degraded state) — each
+    # provider computes its OWN raw fact (Claude off parse_session's per-line JSONL loop,
+    # Auggie off its task-storage sub-file reads, augment_ext honestly None since it has no
+    # chat transcript to parse at all), same shared-key contract as fail_cmd right above:
+    # this setdefault is the seam's defensive guarantee that the key ALWAYS exists even for
+    # a provider that never sets it, not a second implementation of the check itself.
+    d.setdefault("parse_error", None)
     # pinned/open_flags/note_count: same shared seam as all_sessions() above, same store.py
     # helpers, one implementation for every provider. Without this the detail header (pinned
     # pill, 🚩 count) has nothing to read and hides — these three small JSON files are already

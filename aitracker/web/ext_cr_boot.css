@@ -35,17 +35,12 @@
    Scoped tightly to #tryNext so it cannot affect any existing selector.
    Styled in the CLASSIC palette per doc (literal colours, not the new
    tokens) — it lives in the old UI, not the new one.
-   ============================================================ */
-header.hd {
-  /* Additive only: the classic header has no existing `position` declaration
-     (verified in app.css) and no descendant relies on it being static, so this
-     only gives #tryNext something to anchor to. Does not modify app.css. */
-  position: relative;
-}
+   Doc 02 places it inline in the sidebar's `.sidetop2` row, right after
+   `#livecount` (index.html) — normal flex-row flow, no absolute
+   positioning; `.sidetop2` (app.css) already supplies `display:flex;
+   gap:8px` and `#livecount{margin-right:auto}`, so #tryNext just needs
+   its own box styling, same as every other .sidetop2 sibling. */
 #tryNext.tn-entry {
-  position: absolute;
-  top: 22px;
-  right: 28px;
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -56,13 +51,9 @@ header.hd {
   font: 600 11.5px/1 'Source Sans 3', sans-serif;
   color: #f5b443;
   cursor: pointer;
-  z-index: 5;
 }
 #tryNext.tn-entry:hover { filter: brightness(1.12); }
 #tryNext.tn-entry:focus-visible { outline: 2px solid #f5b443; outline-offset: 2px; }
-@media (max-width: 720px) {
-  #tryNext.tn-entry { position: static; margin: 10px 0 0; }
-}
 
 /* ============================================================
    Shell root — #nextRoot (.tracker-next.cr)

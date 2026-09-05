@@ -162,7 +162,7 @@ window.CR = window.CR || {};
   // with `agent === true` are pulled out of individual ranking and folded
   // into one tile per `group` bucket (repo/sandbox), counted only while at
   // least one session in the bucket is non-idle, then appended after the
-  // individually-ranked tiles, before the 8-tile cap is applied.
+  // individually-ranked tiles, before the board tile cap (boardTileCap()) is applied.
   function agentGroups(sessions, now) {
     var buckets = {};
     var order = [];
@@ -185,17 +185,17 @@ window.CR = window.CR || {};
   }
 
   // Config now writes a user preference for the board's tile cap —
-  // `cr.boardTileCount`, a JSON-encoded integer 3-8 (localStorage). Read fresh
+  // `cr.boardTileCount`, a JSON-encoded integer 3-12 (localStorage). Read fresh
   // on every call (never cached at mount) so the Config change takes effect on
   // the next 2s poll re-render with no reload. Absent/unparseable/out-of-range
-  // always falls back to the hard ceiling of 8 — README decision 2's "the
-  // board never renders more than 8 tiles" is never something a stored value
-  // can raise, only lower.
+  // always falls back to the default of 8. Ceiling is 12 per doc 04
+  // ("Board tiles | slider 3-12, default 8") — the owner ruled doc 04's 3-12
+  // wins over doc 02's "never more than 8 tiles" line, which is superseded.
   function boardTileCap() {
     var raw = null;
     try { raw = JSON.parse(localStorage.getItem('cr.boardTileCount')); } catch (e) { raw = null; }
     var n = (typeof raw === 'number' && isFinite(raw)) ? Math.round(raw) : 8;
-    return Math.max(3, Math.min(8, n));
+    return Math.max(3, Math.min(12, n));
   }
 
   // Sessions destination, requirement 1: which session (if any) the tab should
@@ -222,10 +222,11 @@ window.CR = window.CR || {};
   }
 
   // THE RULE (doc 02 "Sort order — this is the design"; README decision 2):
-  // never more than 8 tiles (or fewer, per the user's cr.boardTileCount
-  // preference above); pinned group on top, unpinned below, newest first
-  // within each group — waiting-on-you outranks everything, including
-  // recency; idle sessions never get a tile; agent-group tiles sit last.
+  // never more than boardTileCap() tiles — default 8, user-adjustable 3-12 per
+  // doc 04 (owner-ruled to supersede doc 02's flat "never more than 8");
+  // pinned group on top, unpinned below, newest first within each group —
+  // waiting-on-you outranks everything, including recency; idle sessions
+  // never get a tile; agent-group tiles sit last.
   function boardTiles(sessions, now) {
     var individual = sessions
       // Exclude only agents that a group tile will actually represent (agent:true
@@ -401,7 +402,7 @@ window.CR = window.CR || {};
     // EXPLICIT user toggle and beat those rules. Before this tri-state the
     // mode was only 'open'|'collapsed' and applyRailMode() OR-ed the forced
     // conditions on top, so a click in the detail view (or on the board at
-    // 1025-1279px) was written to localStorage and then silently discarded --
+    // 1024-1279px) was written to localStorage and then silently discarded --
     // a visible button, correctly labelled, that did nothing.
     // NOTE the key is 'tracker.rail.mode', not the older 'tracker.rail'. The old
     // key's vocabulary was 'open'|'collapsed' with 'open' as the literal default,
@@ -693,18 +694,18 @@ window.CR = window.CR || {};
       // Requirement 2: the rail is unconditionally hidden while the Sessions
       // tab is showing its no-seed browse list — there is nothing to toggle.
       if (currentView === 'sessions') return;
-      // At or below 1024px the rail isn't in-flow (open vs collapsed doesn't
+      // Below 1024px the rail isn't in-flow (open vs collapsed doesn't
       // apply — doc 02's breakpoint table has it "hidden; rail becomes an
       // overlay"), so the same toggle drives the overlay drawer instead.
-      // BLOCKER 4: threshold is `<= 1024` (not `< 1024`) to agree with the
-      // CSS's `max-width: 1024px` rail-overlay tier — both files now treat
-      // 1024px itself as compact, matching ext_cr_detail.css's own boundary.
-      if (window.innerWidth <= 1024) {
+      // Threshold is `< 1024` (not `<= 1024`) so it agrees with the CSS's
+      // `max-width: 1023px` rail-overlay tier — 1024px itself belongs to
+      // the wider "2 columns, docked/collapsed rail" tier per the doc.
+      if (window.innerWidth < 1024) {
         if (railOverlayOpen) closeRailOverlay(); else openRailOverlay();
         return;
       }
       // Flip against what is ACTUALLY on screen, not against the stored mode:
-      // under 'auto' the two disagree (detail view and the 1025-1279px tier are
+      // under 'auto' the two disagree (detail view and the 1024-1279px tier are
       // collapsed while railMode still reads 'auto'/'open'), and flipping the
       // stored value there produced a no-op first click.
       railMode = els.rail.classList.contains('cr-rail--collapsed') ? 'open' : 'collapsed';
@@ -730,7 +731,7 @@ window.CR = window.CR || {};
 
     // Closes the mobile overlay drawer. Called on: the toggle (chevron / top-bar
     // button), the scrim click, Escape (bindKeyboard), selecting a session
-    // (openSession), and a resize back above 1024px (bindResize) — safe to call
+    // (openSession), and a resize back to >= 1024px (bindResize) — safe to call
     // when already closed.
     function closeRailOverlay() {
       railOverlayOpen = false;
@@ -754,13 +755,16 @@ window.CR = window.CR || {};
       var hideRail = (currentView === 'sessions');
       els.rail.classList.toggle('cr-rail--hidden', hideRail);
       if (els.railToggleTop) els.railToggleTop.hidden = hideRail;
-      // BLOCKER 4: lower bound is `>= 1025` (not `>= 1024`) so this in-flow
-      // "collapsed icon rail" tier (1025-1279) never overlaps the <=1024
-      // rail-overlay tier above — 1024 itself is now overlay-only, agreeing
-      // with the CSS's `max-width: 1024px` boundary.
-      // The detail view and the 1025-1279px tier collapse the rail BY DEFAULT,
+      // Lower bound is `>= 1024` (not `>= 1025`) so this in-flow "collapsed
+      // icon rail" tier (1024-1279, doc 02's breakpoint table) sits directly
+      // against the `< 1024` rail-overlay tier above with no gap and no
+      // overlap — 1024px itself is docked/collapsed, not overlay, per the
+      // doc's own table (a prior "BLOCKER 4" pass had shifted this to
+      // `>= 1025` to match the CSS's now-superseded `<=1024` overlay
+      // boundary; the owner's docs-win ruling supersedes that).
+      // The detail view and the 1024-1279px tier collapse the rail BY DEFAULT,
       // but an explicit toggle overrides them -- otherwise the control is dead.
-      var autoCollapsed = isDetail || (window.innerWidth < 1280 && window.innerWidth >= 1025);
+      var autoCollapsed = isDetail || (window.innerWidth < 1280 && window.innerWidth >= 1024);
       var collapsed = (railMode === 'auto') ? autoCollapsed : (railMode === 'collapsed');
       els.rail.classList.toggle('cr-rail--collapsed', collapsed);
       // 56px orb styling is the COLLAPSED detail rail; once the user expands it
@@ -778,8 +782,8 @@ window.CR = window.CR || {};
 
     function bindResize() {
       window.addEventListener('resize', function () {
-        var underlay = window.innerWidth <= 1024;
-        if (!underlay) closeRailOverlay();   // resizing back above 1024px cleans up the overlay + scrim
+        var underlay = window.innerWidth < 1024;
+        if (!underlay) closeRailOverlay();   // resizing back to >= 1024px cleans up the overlay + scrim
         applyRailMode();
       });
     }
@@ -1321,9 +1325,11 @@ window.CR = window.CR || {};
       // BLOCKER 1: 'New session' label wrapped in `.cr-topbar-label` so the
       // phone-tier CSS can drop to icon-only. `aria-label` is new — this
       // button previously had none, relying entirely on the (now hideable)
-      // text node for its accessible name.
+      // text node for its accessible name. `title` (doc 02: "icon-only
+      // controls need a `title` and an `aria-label` sourced from the same
+      // string") was missing entirely — added here, same text as aria-label.
       els.topbar.appendChild(h('button', {
-        class: 'cr-newsession', type: 'button', 'aria-label': 'New session',
+        class: 'cr-newsession', type: 'button', title: 'New session', 'aria-label': 'New session',
         onclick: function () { ctx && ctx.emit && ctx.emit('session:new'); }
       }, [icon('spark', '<path d="M12 2l2 7h7l-5.5 4.5L17 21l-5-4-5 4 1.5-7.5L3 9h7z"/>'),
           h('span', { class: 'cr-topbar-label' }, ['New session'])]));
@@ -1717,17 +1723,11 @@ window.CR = window.CR || {};
       var s = t.session, state = t.state;
       var cls = 'cr-tile cr-tile--' + state;
       if (t.hero) cls += ' cr-tile--hero cr-tile--span2';
-      // Item 3: the gold "agent" glow (border-line-agent + glow-agent-soft) marks
-      // a tile with LIVE BACKGROUND AGENTS, not merely the plain 'working' state —
-      // confirmed against 5a itself: two simultaneously-"Working" tiles, one
-      // glowing (head shows "🤖 2", a live background-agent count) and one plain
-      // (head shows only elapsed time, no bg-agent badge). `s.bg` is that exact
-      // count (providers/claude.py:448, "in-transcript background agents live
-      // now"); Auggie/augment_ext always emit `bg: 0` (no background-agent concept
-      // for those tools — providers/auggie.py:267/281, providers/augment_ext.py:194),
-      // so those sessions degrade cleanly to the plain 'working' treatment below,
-      // never to a broken or empty one.
-      if (state === 'working' && (s.bg || 0) > 0) cls += ' cr-tile--agent-glow';
+      // Doc 02 tile-anatomy table / 01-foundations.md ~line 271: EVERY 'Working'
+      // tile gets the --line-agent border plus --glow-agent-soft + --shadow-raised
+      // — unconditional, not gated on live background agents. (`.cr-tile--working`
+      // in ext_cr_board.css now carries border+glow directly; the owner reversed
+      // the prior "only when s.bg > 0" restriction that used to live here.)
       var attrs = tileBaseAttrs(t);
       attrs.class = cls;
       attrs.title = (s.prompt || s.title || '(no prompt)') + '\n' + (s.cwd || '') +
@@ -1737,15 +1737,12 @@ window.CR = window.CR || {};
         tileHead(s, state, now),
         h('div', { class: 'cr-tile-title' }, [tileTitleText(s, state)]),
       ];
-      // Round-5 drift (decision 4a): 5a's own non-hero tile anatomy is
-      // head -> title -> body only — no "project · tool" sub-line (grep-
-      // verified against the artboard's own tile markup: three divs, never
-      // four). The hero (awaiting) tile is left exactly as it rendered
-      // before — decision 3's explicit exception — sub-line included, since
-      // it isn't part of this round-5 density fix.
-      if (t.hero) {
-        body.push(h('div', { class: 'cr-tile-sub' }, [(s.project || '') + ' · ' + toolLabel(s.source)]));
-      }
+      // Doc 02 tile-anatomy table: EVERY tile gets a "project · tool" sub-line
+      // (mono 10.5px, muted) between the title and the live/summary line — not
+      // just the hero. The owner reversed the prior round-5 "hero only" drift
+      // (which had cited the artboard's three-div markup over the doc); the
+      // doc wins now, restored to all states.
+      body.push(h('div', { class: 'cr-tile-sub' }, [(s.project || '') + ' · ' + toolLabel(s.source)]));
       var line = tileLine(s, state);
       if (line) body.push(line);
       var ticks = todoTicks(s);
@@ -1808,8 +1805,8 @@ window.CR = window.CR || {};
       els.capfooter.innerHTML = '';
       // BUG FIX / preference support: the "8" in this sentence used to be a
       // literal, but the cap is now a user preference (cr.boardTileCount,
-      // clamped 3-8) — the copy's shape is doc 02's "Cap footer" verbatim,
-      // only the number is dynamic.
+      // clamped 3-12 per doc 04) — the copy's shape is doc 02's "Cap footer"
+      // verbatim, only the number is dynamic.
       els.capfooter.appendChild(h('span', { class: 'cr-capfooter-count' }, [allTiles.length + ' of ' + sessions.length]));
       els.capfooter.appendChild(document.createTextNode(
         ' — The board never shows more than ' + boardTileCap() + ' tiles. Everything else lives in the rail — pinned on top, newest first in each group. — '));

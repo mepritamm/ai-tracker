@@ -708,5 +708,19 @@ class PinnedTests(unittest.TestCase):
         self.assertFalse(parse_any("s_a")["pinned"])
 
 
+class RestartRequiredTests(unittest.TestCase):
+    """config.py's RESTART_REQUIRED (~line 196) -- what makes the Config dialog show
+    its 'takes effect on restart' note. TERMINAL joined PORT/HOST here per doc 04's
+    Config table ("Terminal enabled | toggle | TRACKER_TERMINAL | yes"), the one row
+    besides PORT/HOST marked Restart=yes -- because term_gate.py rereads
+    config.TERMINAL live on every request, so flipping it without a restart would
+    silently half-apply."""
+
+    def test_terminal_key_joins_port_and_host(self):
+        self.assertIn("PORT", config.RESTART_REQUIRED)
+        self.assertIn("HOST", config.RESTART_REQUIRED)
+        self.assertIn("TERMINAL", config.RESTART_REQUIRED)
+
+
 if __name__ == "__main__":
     unittest.main()

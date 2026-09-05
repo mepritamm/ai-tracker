@@ -97,6 +97,17 @@
     return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
   }
 
+  // FIX 5 (design-audit): doc 03's Terminal controls readout is an ABBREVIATED
+  // scale ("128k / 481k") — a different literal spec from the stat chip's exact
+  // comma-grouped count ("tokens 128,412"), so this is a second small formatter
+  // rather than reusing fmtNum() for the terminal panel's context readout.
+  function fmtK(n) {
+    if (n == null || isNaN(n)) return null;
+    n = Math.round(n);
+    if (Math.abs(n) < 1000) return String(n);
+    return Math.round(n / 1000) + "k";
+  }
+
   function parseT(iso) {
     if (!iso) return null;
     var ms = Date.parse(iso);
@@ -238,17 +249,6 @@
       if (raw == null) return true; // key absent -> preserve today's behaviour
       return JSON.parse(raw) !== false;
     } catch (e) { return true; }
-  }
-
-  // ============================== stat-chip row preference ==============================
-  // PREFERENCE CONTRACT, fixed with the Config-dialog agent building the toggle
-  // (ext_cr_dialogs.js, not owned here): localStorage key "tracker.next.statchips",
-  // "1" = show, "0" or absent = hide. DEFAULT OFF. Read defensively -- localStorage
-  // can throw in some contexts (private mode, sandboxed iframes) -- any unreadable
-  // or absent value is treated as OFF, never as "show".
-  var STATCHIPS_PREF_KEY = "tracker.next.statchips";
-  function statChipsOn() {
-    try { return localStorage.getItem(STATCHIPS_PREF_KEY) === "1"; } catch (e) { return false; }
   }
 
   // ============================== derived / pure logic ==============================
@@ -665,16 +665,16 @@
     return { word: "Idle", cls: "idle", age: fmtAge(idle) };
   }
 
-  // FIX (design-audit drift 1, REVERSED by owner ruling "Restore behind the Config
-  // dialog"): 5b dropped the files/commands/reads/commits/tests/branch/tokens
-  // stat-chip row outright and folded the token count into the metadata line
-  // instead (renderHeader below still builds that: project · branch · elapsed ·
-  // tokens). The row is now back, but OPT-IN and DEFAULT OFF — see statChipsOn()
-  // above and renderStatChips()/statChipsHtml() below. It renders only when the
-  // preference is on; the metaline's own token bit is untouched either way (kept
-  // for the collapsed default), so token count can appear twice when the chip row
-  // is switched on — that duplication is intentional, not a bug, since the two are
-  // read by different design decisions (5b's vs the owner's reversal of it).
+  // FIX (design-audit drift 1, SETTLED by owner ruling "always visible" — docs
+  // 03 Row 3 / 04 capability #21 win over the 5b prototype that dropped this row
+  // outright): the files/commands/reads/commits/tests/branch/tokens stat-chip
+  // row is now a PERMANENT part of the header — see renderStatChips()/
+  // statChipsHtml() below, called unconditionally from renderHeader's render
+  // pass. The metaline's own token bit is untouched (kept for its collapsed
+  // context line), so the token count appears twice — in the metaline AND the
+  // chip row — that duplication is intentional, not a bug: the two are read by
+  // different parts of the design (row 1's compact context vs row 3's full
+  // stat set).
   function fmtTokens(session) {
     var tokTotal = ((session.tokens && session.tokens.in) || 0) + ((session.tokens && session.tokens.out) || 0);
     return tokTotal ? fmtNum(tokTotal) + " tokens" : "";
@@ -751,16 +751,14 @@
     ].join("");
   }
 
-  // Callable both from renderHeader (every 2s poll) and from the two live-toggle
-  // listeners mount() wires up below (the Config dialog's own 'cr:statchips'
-  // dispatch, and 'storage' for a second tab) -- same function either way, so the
-  // row never drifts between "just toggled" and "next poll tick".
+  // Called from renderHeader on every 2s poll. Permanent row (owner ruling) --
+  // no preference gate, no `hidden` toggle; it always renders for whatever
+  // session is on screen. Doc 03's phone layout never lists this row among the
+  // phone detail's pieces, so it is hidden below the phone breakpoint in CSS
+  // (ext_cr_detail.css, max-width:600px) rather than here in JS.
   function renderStatChips(node, session) {
     var row = qs(node, ".crd-statchips");
     if (!row) return;
-    var on = statChipsOn();
-    row.hidden = !on;
-    if (!on) return;
     row.innerHTML = statChipsHtml(session);
   }
 
@@ -948,11 +946,11 @@
             '<button class="crd-rename" data-act="rename" title="Rename" aria-label="Rename session"></button>' +
             '<span class="crd-pill crd-pill-pinned" hidden><span class="tn-emo" aria-hidden="true">📌</span> Pinned</span>' +
           "</div>" +
-          // Row 3 — stat chips (doc 03 Row 3 / doc 04 capability #21). OPT-IN,
-          // DEFAULT OFF — see statChipsOn()/renderStatChips() above. `hidden`
-          // is the actual gate (renderStatChips toggles it); the class alone
-          // carries no visibility.
-          '<div class="crd-statchips" hidden></div>' +
+          // Row 3 — stat chips (doc 03 Row 3 / doc 04 capability #21). PERMANENT
+          // — no preference, no `hidden` gate; renderStatChips() fills it on
+          // every render pass. Hidden on phone via CSS only (doc's phone layout
+          // doesn't include this row).
+          '<div class="crd-statchips"></div>' +
         "</div>" +
       "</div>" +
       // Phone-only presence orb + live narration (doc 03 "Phone layout"): "34px
@@ -972,6 +970,13 @@
       "</div>" +
       '<div class="crd-card crd-flagcard" hidden>' +
         '<div class="crd-flag-count mono"></div>' +
+        // FIX 7 (design-audit): the flag's own text used to be reachable ONLY via
+        // the state pill's native `title` tooltip (hover-only, invisible on
+        // touch/phone/tablet) — flags are recorded user data, so it also needs a
+        // visible home. Plain textContent below (never innerHTML), same as the
+        // rest of this render pass's property-assignment convention — the tooltip
+        // on the pill stays too, for the untruncated hover case on desktop.
+        '<div class="crd-flag-text" hidden></div>' +
         '<textarea class="crd-flag-input" rows="2" placeholder="What needs a second look?"></textarea>' +
         '<div class="crd-flag-row">' +
           '<span class="crd-flag-note">View-only — this creates a flag entry; the tracker never writes to the session.</span>' +
@@ -1143,6 +1148,12 @@
           "</span>" +
         "</header>" +
         '<div class="crd-panel-body">' +
+          // FIX 9: doc 04's "Two different empties" — "Something broke" case,
+          // driven by session.parse_error (registry.py setdefault, populated by
+          // each provider's own parse loop). Sits above the entries, not instead
+          // of them, since a partial parse still renders everything before the
+          // failure. See renderParseErrorNotice().
+          '<div class="crd-timeline-parse-error" hidden></div>' +
           '<div class="crd-timeline-scroll"></div>' +
           '<div class="crd-timeline-live" hidden></div>' +
           '<div class="crd-timeline-foot mono">older turns page in as you scroll — history is unbounded</div>' +
@@ -1362,13 +1373,12 @@
         }
         case "terminal-model":
         case "terminal-effort":
-          // REQUIRED ADDITION: aitracker/web/cr_term.js's own model/effort dialogs
-          // (ctx.dialog("model", {current, ladder, onPick}), cr_term.js:594-607) are driven
-          // by that module's live pty state (the ladder + the /api/term/inject callback) —
-          // data this read-only detail panel doesn't have. Emitting a request instead of
-          // fabricating a ladder/onPick the bootstrap would have to fill in anyway; whichever
-          // module owns the attached pty for this session should open its own "model"/"effort"
-          // dialog in response.
+          // FIX 2 (design-audit): dead branch now — renderTerminalPanel() renders both
+          // buttons `disabled`, so a real click never reaches here. Left in place (not
+          // deleted) as the honest no-op it always was, in case something ever
+          // dispatches this data-act programmatically; see renderTerminalPanel()'s own
+          // comment for why this couldn't be wired to a real /api/term/inject call
+          // without editing a file this pass doesn't own.
           ctx.emit("cr:term-controls-request", { sessionId: sid, control: act === "terminal-model" ? "model" : "effort" });
           break;
         case "phone-send": {
@@ -1404,20 +1414,6 @@
       if (isTypingTarget(e)) return;
       if (e.key === "j") { e.preventDefault(); stepSession(ctx, ui, 1); }
       else if (e.key === "k") { e.preventDefault(); stepSession(ctx, ui, -1); }
-    });
-
-    // Live re-render of the stat-chip row on the Config dialog's own toggle
-    // (ext_cr_dialogs.js dispatches 'cr:statchips' on window when the pref
-    // changes — not ours to edit, only to listen for) and on 'storage' so a
-    // second tab flipping the same localStorage key stays in sync. mount()
-    // runs exactly once per page load (ext_cr_boot.js ensureMounted()'s
-    // `mounted` guard), so this never attaches twice.
-    window.addEventListener("cr:statchips", function () {
-      if (ui.lastSession) renderStatChips(node, ui.lastSession);
-    });
-    window.addEventListener("storage", function (ev) {
-      if (ev && ev.key != null && ev.key !== STATCHIPS_PREF_KEY) return;
-      if (ui.lastSession) renderStatChips(node, ui.lastSession);
     });
 
     root._crDetail = { node: node, ui: ui };
@@ -1464,12 +1460,33 @@
     if (target) target.scrollIntoView({ block: "center" });
   }
 
+  // FIX 3 (design-audit MED): the old match key was `data-todo-text`, always
+  // rendered as a literal empty string on the two narration entry kinds
+  // (entryHtml()'s narration branches) — no todo's text was ever actually
+  // written there, so this could never match anything. There is also no real
+  // per-entry link to a specific todo anywhere in the data (narration/tool
+  // entries don't carry a todo id) to populate that attribute honestly.
+  // What DOES exist on both sides: todos[i].started_at (epoch seconds, the
+  // same field spineSegments() already requires for its "hasTimes" branch)
+  // and every timeline entry's own `e.t` (epoch ms, mergeTimeline()). "That
+  // todo's first entry" is real and derivable as the earliest entry at or
+  // after the todo's own start time — so this now does a timestamp match
+  // instead of a fabricated text match, using the SAME `data-key` attribute
+  // entryOpenAttrs() already stamps on every entry kind (no new markup).
   function scrollTimelineToTodo(node, ui, idx) {
-    var todo = (ui.lastSession && ui.lastSession.todos || [])[idx];
-    if (!todo) return;
+    var session = ui.lastSession;
+    var todo = (session && session.todos || [])[idx];
+    var startMs = todo && parseEpochSec(todo.started_at);
+    if (startMs == null) return; // no real per-todo timestamp to match against — never guess
+    var entries = ui.timelineEntries || mergeTimeline(session);
+    var best = null;
+    entries.forEach(function (e) {
+      if (e.t >= startMs && (!best || e.t < best.t)) best = e;
+    });
+    if (!best) return;
     var scrollEl = qs(node, ".crd-timeline-scroll");
-    var match = qsa(scrollEl, "[data-todo-text]").filter(function (e) {
-      return e.getAttribute("data-todo-text") === (todo.content || "");
+    var match = qsa(scrollEl, "[data-key]").filter(function (e) {
+      return e.getAttribute("data-key") === best.key;
     })[0];
     if (match) match.scrollIntoView({ block: "center" });
   }
@@ -1630,8 +1647,14 @@
     if (icoEls[0]) icoEls[0].innerHTML = svgIcon(ctx, "search", "⌕");
     if (icoEls[1]) icoEls[1].innerHTML = svgIcon(ctx, "alert", "⚠");
 
-    // REQUIRED ADDITION: session.open_flags (unresolved-flag count) is not on the
-    // detail dict (see stateOf's note above) — shows "—" rather than a fabricated 0.
+    // FIX 4 (design-audit MED): session.open_flags/flag_text HAVE been on the
+    // detail dict for a while now (registry.py:131-153, the same shared seam
+    // the state pill's tooltip above already reads flag_text off of) — the
+    // stale comment that used to sit here, and the zero-state copy below,
+    // both still claimed the field "needs wiring". Fixed to show the real
+    // state either way: the actual open flag(s) when there are any, an honest
+    // "no open flags" empty state when there aren't — never a claim that a
+    // wired feature is unbuilt.
     var flagCount = session.open_flags;
     var flagBtn = qs(node, '[data-act="toggle-flag"]');
     var flagTitle = "Flag an issue" + (flagCount ? " · " + flagCount + " open" : "");
@@ -1642,7 +1665,16 @@
     flagBadge.textContent = flagCount || "";
     qs(node, ".crd-flagcard .crd-flag-count").textContent = flagCount ?
       flagCount + " open flag" + (flagCount === 1 ? "" : "s") + " on this session" :
-      "Open-flag count needs the board's flag store wired into this view (not yet on /api/session).";
+      "No open flags on this session.";
+    // FIX 7 (design-audit): flag text visible here too, not just the state
+    // pill's hover-only title (see above) — this card is already open when
+    // the reader taps "Flag an issue", so it is reachable on touch. Plain
+    // `.textContent` assignment (never innerHTML) — flag text is
+    // user-authored, and this is the same escaping-by-property-assignment
+    // convention `pill.title = session.flag_text` above already uses.
+    var flagTextEl = qs(node, ".crd-flagcard .crd-flag-text");
+    flagTextEl.hidden = !(flagCount && session.flag_text);
+    flagTextEl.textContent = (flagCount && session.flag_text) || "";
 
     var isLocalhost = /^(localhost|127\.0\.0\.1)/.test(location.hostname);
     qs(node, '[data-act="external"]').hidden = !isLocalhost;
@@ -2067,12 +2099,30 @@
     var meta = session.meta || {};
     var ctxWin = session.context || {};
     setPanelCount(wrap, "");
+    // FIX 2 (design-audit HIGH): these used to render fully clickable whenever
+    // this panel is visible, but the click routed to ext_cr_boot.js's
+    // cr:term-controls-request handler, which unconditionally claims "there's
+    // no way to find [a terminal] from here yet" — provably false at the only
+    // moment these buttons are shown (the panel itself is gated on
+    // term_attached === true, just above). The real fix is wiring this mirror
+    // to the SAME /api/term/inject path the terminal toolbar's own
+    // _openModelDialog/_openEffortDialog use (ext_cr_term.js:770-794,
+    // _injectSlash) — but that call is keyed on `st.tty`, a value private to
+    // that module's own open-overlay state, never threaded onto the session
+    // detail dict this panel reads (registry.py's term_attached is a bare
+    // boolean, no tty id). Reaching the real route from here would mean
+    // either adding a tty-by-session lookup to registry.py (a Python file
+    // this pass doesn't own) or teaching ext_cr_boot.js a new seam (a file
+    // this pass doesn't own either). Per the brief's own fallback, these are
+    // instead rendered honestly DISABLED with copy that says why, rather than
+    // left clickable against a stale lie.
+    var noRoute = "Not reachable from here yet — there’s no way to find this session’s terminal from the Evidence panel.";
     setPanelBody(wrap,
       '<div class="crd-term-row">' +
-        '<button class="crd-btn crd-btn-solid" data-act="terminal-model">model · ' + esc(shortModel(meta.model) || "—") + "</button>" +
-        '<button class="crd-btn crd-btn-outline" data-act="terminal-effort">effort · ' + esc(meta.effort || "—") + "</button>" +
-        '<span class="crd-term-ctx mono">' + (ctxWin.current != null ? fmtNum(ctxWin.current) : "—") + " / " +
-          (ctxWin.limit != null ? fmtNum(ctxWin.limit) : "—") + "</span>" +
+        '<button class="crd-btn crd-btn-solid" data-act="terminal-model" disabled aria-disabled="true" title="' + esc(noRoute) + '">model · ' + esc(shortModel(meta.model) || "—") + "</button>" +
+        '<button class="crd-btn crd-btn-outline" data-act="terminal-effort" disabled aria-disabled="true" title="' + esc(noRoute) + '">effort · ' + esc(meta.effort || "—") + "</button>" +
+        '<span class="crd-term-ctx mono">' + (ctxWin.current != null ? fmtK(ctxWin.current) : "—") + " / " +
+          (ctxWin.limit != null ? fmtK(ctxWin.limit) : "—") + "</span>" +
       "</div>" +
       '<div class="crd-panel-footnote">Shown only while a Claude CLI is actually in the pty’s foreground.</div>'
     );
@@ -2094,10 +2144,36 @@
     } catch (e) { return null; }
   }
 
+  // FIX 9 (design-audit HIGH): doc 04's "Two different empties" table, the
+  // "Something broke" row, verbatim: "Couldn't read this session — The
+  // transcript exists but a line failed to parse. Everything before it is
+  // shown." Server-side parsing behaviour is unchanged (bad lines/records were
+  // already silently skipped) — this only tells the reader their view is
+  // incomplete. `session.parse_error` is always present (registry.py
+  // setdefault): null when the transcript parsed cleanly (render nothing), or
+  // `{line, parsed_before}` on the first failure. `line` is an integer for
+  // Claude (1-based JSONL line) but null for Auggie (no single-file line
+  // concept) — handled without ever printing "line null". Reuses the SAME
+  // errorState() shared component "Couldn't load older turns" already calls
+  // (loadOlderNarration above), not a second implementation.
+  function renderParseErrorNotice(wrap, session) {
+    var box = qs(wrap, ".crd-timeline-parse-error");
+    if (!box) return;
+    var pe = session && session.parse_error;
+    if (!pe) { box.hidden = true; box.innerHTML = ""; return; }
+    var detail = pe.line != null ?
+      ("Failed at line " + pe.line + (pe.parsed_before != null ? " · " + pe.parsed_before + " parsed before it." : ".")) :
+      (pe.parsed_before != null ? pe.parsed_before + " record" + (pe.parsed_before === 1 ? "" : "s") + " parsed before it." : "");
+    box.hidden = false;
+    box.innerHTML = errorHtml("Couldn't read this session",
+      "The transcript exists but a line failed to parse. Everything before it is shown." + (detail ? " " + detail : ""));
+  }
+
   function renderTimeline(node, ui, session, ctx) {
     var wrap = ui.panels.timeline;
     var scrollEl = qs(wrap, ".crd-timeline-scroll");
     var filterEl = qs(wrap, ".crd-timeline-filters");
+    renderParseErrorNotice(wrap, session);
     var note = providerNote(session);
     // FIX 5: Auggie's PROVIDER_NOTES.degraded is about capability 48 (background
     // agents — handled in renderAgentsPanel below), NOT narration: its own `ok` field
@@ -2153,7 +2229,7 @@
           return '<span class="cr-diagram-pill' + (n.active ? " is-active" : "") + '">' + esc(n.label) + "</span>";
         }).join("");
         var b64 = _mmdEncodeSrc(diagram.src || "");
-        return '<div class="crd-entry crd-entry-narration crd-entry-diagram" data-todo-text=""' + entryOpenAttrs(e) + '>' +
+        return '<div class="crd-entry crd-entry-narration crd-entry-diagram"' + entryOpenAttrs(e) + '>' +
           '<span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
           '<div class="crd-narration-body">' + pre +
           '<div class="cr-diagram-card crd-diagram-inline">' +
@@ -2164,7 +2240,7 @@
               '<button class="crd-open-link crd-diagram-expand" data-act="narration-diagram" data-key="' + esc(e.key) + '">expand ›</button>' +
             "</div></div>" + suf + "</div></div>";
       }
-      return '<div class="crd-entry crd-entry-narration" data-todo-text=""' + entryOpenAttrs(e) + '>' +
+      return '<div class="crd-entry crd-entry-narration"' + entryOpenAttrs(e) + '>' +
         '<span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
         '<div class="crd-narration-text">' + mdHtml(ctx, e.text) + "</div></div>";
     }
@@ -2409,6 +2485,17 @@
         "";
       if (!filtered.length) scrollEl.innerHTML = timelineEmptyMessage(ui);
       if (olderEl) scrollEl.appendChild(olderEl); // FIX (defect 1): older status lives at the bottom now
+      // FIX (drift: toolrow overflow) — the CSS fix above lets the row shrink and
+      // ellipsize a long command/path, but the untruncated text must stay
+      // recoverable. `.crd-tool-name`'s own textContent is already the exact
+      // decoded string entryHtml() esc()'d in (tool-authored, e.g. a shell
+      // command or file path) — copying element.textContent -> element.title is
+      // a DOM property-to-property assignment, never a second pass through
+      // innerHTML/string concat, so there's no way for this text to be
+      // reinterpreted as markup.
+      qsa(scrollEl, ".crd-toolrow .crd-tool-name").forEach(function (nameEl) {
+        if (!nameEl.title) nameEl.title = nameEl.textContent;
+      });
       // Upgrade every diagram card just painted from its instant node-pill fallback to
       // the real mermaid.js render -- app.js's shared upgradeMermaidIn()/renderMermaid(),
       // the SAME function the classic UI's markdown modals call (app.js is concatenated

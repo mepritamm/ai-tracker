@@ -59,39 +59,29 @@
   --surface-sunken: #F4F1E8;
   --surface-trace: #F4F1E8;
   /* --surface-note/-provenance/-agent-quiet/-awaiting/-failed/-done/-flagged:
-     these 7 were re-saturated (was: near-white washes 1.06-1.19:1 from the
-     plain cream neutrals above — dark's equivalents sit 38-85 apart in a
-     simple RGB-distance sense, clearly separate surfaces; the old light
-     values collapsed to within ~8-19, i.e. barely distinguishable from
-     --surface-sunken or from each other). Same hue as before (already
-     matched dark's hue per surface) — only saturation raised and lightness
-     dropped a few points, just enough to read as a genuine tinted panel
-     while keeping every ink/line token that sits on top of it at or above
-     its WCAG floor (see the contrast table in the PR notes). */
-  --surface-note: #F2E9DE;
-  --surface-provenance: #E4EEF1;
+     restored to 01-foundations.md's exact light-theme hex (doc lines 45-53).
+     THE DOCS WIN: an earlier pass re-saturated these away from the doc to
+     chase a WCAG contrast target; that rationale is superseded — the doc's
+     literal values are the source of truth here, full stop. */
+  --surface-note: #F7F4EA;
+  --surface-provenance: #EDF2F3;
   --surface-inverse: #1E1B17;
-  --surface-agent-quiet: #F8E9BF;
-  --surface-agent-active: linear-gradient(160deg, #F8E9BF, #FFFFFF 55%, #E4EEF1);
-  --surface-awaiting: #F9E2CD;
-  --surface-failed: #F7D8CF;
-  --surface-done: #DBEBE0;
-  --surface-flagged: #F5DDD1;
+  --surface-agent-quiet: #FBF3DC;
+  --surface-agent-active: linear-gradient(160deg, #FBF3DC, #FFFFFF 55%, #EDF2F3);
+  --surface-awaiting: #FDF0E4;
+  --surface-failed: #FBEAE5;
+  --surface-done: #EDF3EE;
+  --surface-flagged: #FBEEE7;
   --surface-signal-fill: #F5DE9B;
 
   /* ink (13) */
   --text-primary: #1E1B17;
   --text-secondary: #4A4237;
-  /* --text-muted: darkened (was #877866, only 3.49-4.28:1 on the neutral
-     surfaces above — fails the 4.5:1 body-text floor on every one of them,
-     worst case 3.49:1 on --surface-page's darker gradient stop). New value
-     holds the same hue/saturation family as before, moved to 4.5-5.9:1. */
-  --text-muted: #6E6253;
+  /* --text-muted: restored to doc's exact value (doc line 59). THE DOCS WIN. */
+  --text-muted: #877866;
   --text-link: #3B5747;
-  /* --text-thinking: darkened a hair (was #8A6D14, 4.43:1 on the re-tinted
-     --surface-agent-quiet above — just under the 4.5:1 floor once that
-     surface's lightness dropped). New value: 4.51:1 on the same surface. */
-  --text-thinking: #826613;
+  /* --text-thinking: restored to doc's exact value (doc line 61). THE DOCS WIN. */
+  --text-thinking: #8A6D14;
   --text-awaiting: #9A4F19;
   --text-failed: #8A2F1B;
   --text-flagged: #7D3A28;
@@ -111,22 +101,14 @@
   /* lines (11) */
   --line-subtle: #E7E2D5;
   --line-default: #CFC7B7;
-  /* --line-strong / --state-idle (below): these had COLLAPSED to the exact
-     same hex (#A89C8B) — the one dark keeps them apart with (line-strong
-     L60%, lighter/more-assertive on a dark ground; state-idle L46%, deliberately
-     muted). Both are now distinct again, and both independently cleared 3:1
-     against every neutral surface incl. the darker --surface-page stop
-     (line-strong 3.77-4.63:1, state-idle 3.07-3.77:1) — line-strong kept as
-     the darker/more-assertive of the two, matching its dark role. */
-  --line-strong: #807360;
-  /* --line-agent: was identical to --state-thinking (#D9B855) — dark keeps
-     these visibly apart (line-agent #A9862C darker/border-weight, 41.8% L;
-     state-thinking #D9B855 lighter/dot-weight, 68.6% L). Re-derived from
-     dark's own line-agent hue/saturation (43.2°, 58.7%), darkened until it
-     clears 3:1 against the re-tinted --surface-agent-quiet (3.66:1) and
-     white (4.42:1), and kept a shade darker than the corrected
-     --state-thinking below so the border/dot distinction survives. */
-  --line-agent: #927426;
+  /* --line-strong: restored to doc's exact value (doc line 72). THE DOCS
+     WIN — it is identical to --state-idle in the doc's own light block;
+     that collision is the doc's, not a bug to correct here. */
+  --line-strong: #A89C8B;
+  /* --line-agent: restored to doc's exact value (doc line 73). THE DOCS
+     WIN — it is identical to --state-thinking in the doc's own light block;
+     that collision is the doc's, not a bug to correct here. */
+  --line-agent: #D9B855;
   --line-awaiting: #E8B98A;
   --line-failed: #E0A491;
   --line-done: #B9CBBF;
@@ -144,27 +126,20 @@
   --line-note: #6E8A75;
 
   /* state dots (6) */
-  /* --state-thinking/--state-awaiting/--state-flagged: the shipped light
-     block reused these three verbatim from dark (#D9B855/#E58F3C/#C27950 —
-     identical hex in both themes, unlike --state-done/-failed/-idle, which
-     already had independent light values). That reuse is fine on a dark
-     ground but fails the 3:1 non-text floor badly on light neutrals
-     (thinking 1.73-1.92:1, awaiting 2.25-2.52:1) and, once the tinted
-     surfaces above were re-saturated, --state-flagged joined them
-     (2.63:1 on the new --surface-flagged). All three re-derived from their
-     own dark hue/saturation family, darkened until they clear 3:1 against
-     both white and their own tinted surface — matching the treatment
-     --state-done/-failed/-idle already had. */
-  --state-thinking: #9E7F1F;
-  --state-awaiting: #B96719;
+  /* --state-thinking/--state-awaiting/--state-flagged: restored to doc's
+     exact light-theme values (doc lines 81,82,85). THE DOCS WIN — the doc
+     reuses --state-thinking/--line-agent (#D9B855) and matches dark for
+     --state-awaiting/--state-flagged verbatim; that is the doc's own
+     design, not a drift to correct. */
+  --state-thinking: #D9B855;
+  --state-awaiting: #E58F3C;
   --state-done: #3B5747;
   --state-failed: #C0553A;
-  --state-flagged: #A6613A;
-  /* --state-idle: was #A89C8B — identical to --line-strong (see that
-     comment). Re-derived from dark's own state-idle hue/saturation (32.7°,
-     13.9%), lightened relative to the new --line-strong so it stays the
-     subtler of the two while still clearing 3:1 (3.07-4.28:1). */
-  --state-idle: #91816E;
+  --state-flagged: #C27950;
+  /* --state-idle: restored to doc's exact value (doc line 86). THE DOCS
+     WIN — it is identical to --line-strong in the doc's own light block;
+     that collision is the doc's, not a bug to correct here. */
+  --state-idle: #A89C8B;
 
   /* fills (2) */
   --fill-action: linear-gradient(180deg, #3B5747, #2E4438);
@@ -310,6 +285,15 @@
   --text-awaiting: #F5C98E;
   --text-failed: #E0A491;
   --text-flagged: #E5BFA5;
+  /* --text-agent: the doc's dark block does NOT redefine this token, which
+     would mean inheriting light's #6F6455. Checked and NOT restored to
+     inherit: #6F6455 on the dark surfaces --text-agent actually paints
+     against (.cr-rail-agentrow/.cr-tile-agentexpand in ext_cr_board.css,
+     confirmed via repo-wide grep) measures ~2.6:1 against --surface-raised
+     #2A251F — well under the doc's own 4.5:1 body-text floor ("Contrast
+     floor" section) and a visible regression (muddy near-invisible label
+     text on every agent row/tile in dark mode). Kept as an explicit
+     dark-only override rather than silently failing the doc's own bar. */
   --text-agent: #C6B29B;
   --text-on-action: #1E1B17;
   --text-on-signal: #1E1B17;
@@ -341,16 +325,21 @@
   --state-flagged: #C27950;
   --state-idle: #877866;
 
-  /* fills (2) */
+  /* fills (2 + solid) */
   --fill-action: linear-gradient(180deg, #8FB187, #6E8A75);
-  --fill-row-hover: rgba(255,255,255,.06);
+  /* --fill-action-solid: was missing entirely (doc line 166). Added. */
+  --fill-action-solid: #8FB187;
+  /* --fill-row-hover: restored to doc's exact value (doc line 167). THE DOCS WIN. */
+  --fill-row-hover: rgba(251,250,247,.06);
 
-  /* material (2 of 4 — doc redefines shadow only; --glow-agent and
-     --glow-agent-soft are NOT redefined for dark, so they carry over
-     unchanged from .tracker-next above. This is exact to the doc, not an
-     omission: the wheat glow is deliberately theme-invariant. */
-  --shadow-raised: 1px 2px 5px rgba(0,0,0,.45);
-  --shadow-overlay: 2px 10px 30px rgba(0,0,0,.60);
+  /* material (4 of 4 — doc DOES redefine glow for dark, with different
+     alpha/blur than light (doc lines 170-171). Restored below; the prior
+     comment claiming the glow was "deliberately theme-invariant" was wrong
+     — the doc gives distinct dark values and they were never applied. */
+  --shadow-raised: 1px 2px 5px rgba(0,0,0,.5);
+  --shadow-overlay: 2px 10px 30px rgba(0,0,0,.66);
+  --glow-agent: 0 0 0 1px rgba(217,184,85,.4), 0 2px 16px rgba(217,184,85,.3);
+  --glow-agent-soft: 0 0 12px rgba(217,184,85,.22);
 }
 
 /* ============================================================

@@ -55,17 +55,23 @@ _ASTATE = {"COMPLETE": "completed", "COMPLETED": "completed", "DONE": "completed
 
 
 def _auggie_all():
-    """uuid -> task dict for every task file (roots + sub-tasks), with _mtime."""
+    """(uuid -> task dict for every task file (roots + sub-tasks), with _mtime; count of
+    task files that existed but failed to parse). Auggie's equivalent of a truncated Claude
+    JSONL line: this reads a whole JSON file per task, so a corrupt one used to just vanish
+    from the todo tree with no trace -- `failed` lets parse_auggie (the detail path, via
+    _auggie_todos_for below) report that honestly instead."""
     m = {}
+    failed = 0
     for f in glob.glob(os.path.join(config.AUGMENT_DIR, "task-storage", "tasks", "*")):
         try:
             t = json.load(open(f, encoding="utf-8"))
         except (OSError, ValueError):
+            failed += 1
             continue
         if isinstance(t, dict) and t.get("uuid"):
             t["_mtime"] = os.path.getmtime(f)
             m[t["uuid"]] = t
-    return m
+    return m, failed
 
 
 def _auggie_resolve(root, get, seen=None):
@@ -256,11 +262,19 @@ def _auggie_state(chat):
 
 
 def _auggie_todos_for(root_uuid):
+    """(todos, parse_error) -- parse_error is parse_auggie's detail-dict signal (same
+    contract as Claude's, see providers/claude.py's parse_session), None unless at least
+    one task-storage file existed but failed to parse. No exact "line" for a family of
+    separate files, so `line` stays None; `parsed_before` is how many todos were still
+    recovered despite the failure -- everything _auggie_resolve could reach stays shown,
+    unchanged, same as Claude's per-line skip."""
     if not root_uuid:
-        return []
-    allmap = _auggie_all()
+        return [], None
+    allmap, failed = _auggie_all()
     root = allmap.get(root_uuid)
-    return _auggie_resolve(root, allmap.get) if root else []
+    todos = _auggie_resolve(root, allmap.get) if root else []
+    parse_error = {"line": None, "parsed_before": len(todos)} if failed else None
+    return todos, parse_error
 
 
 # Fallback for the gap _auggie_resolve documents above: add_tasks/update_tasks key each
@@ -603,7 +617,7 @@ def parse_auggie(session_id):
     cwd = ide_cwd or _auggie_cwd(list(files.keys()))   # real cwd, like Claude's
     branch = _git_branch(cwd)
     tests = [c for c in cmds if c["kind"] == "test"]
-    todos = _auggie_todos_for(d.get("rootTaskUuid"))
+    todos, parse_error = _auggie_todos_for(d.get("rootTaskUuid"))
     # Approximate per-todo timings, joined by NAME (not id — see the comment above
     # _TASK_LINE_RE) against name_to_ids/task_times, both collected in the single
     # chatHistory pass above — mirrors parse_session()'s own todos/task_times join exactly,
@@ -665,6 +679,12 @@ def parse_auggie(session_id):
         # instead of a tail (Auggie has no tail-only fast path; this function always reads
         # the full session). Honestly None when nothing really failed, never omitted.
         "fail_cmd": fail_cmd,
+        # Degraded-transcript signal, SAME field/shape contract as Claude's detail dict (see
+        # parse_session's parse_error) -- off _auggie_todos_for above (task-storage files are
+        # this provider's "whole JSON file per record"; a corrupt one is the analogue of a
+        # truncated JSONL line). Honestly None when every task file this session's tree
+        # touches parsed cleanly.
+        "parse_error": parse_error,
 
         "prs": [p for p in prs_sorted(prs, pr_states) if pr_worked(p, cwd)],   # created or worked-on, not prompt-only references
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
