@@ -35,7 +35,7 @@ from aitracker.providers import claude as _claude
 
 _PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "VSCODE_WS_ROOT", "CURSOR_WS_ROOT",
           "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "NOTES_FILE", "TASKS_DIR", "PORT_FILE",
-          "TOKEN_FILE", "CONFIG_FILE", "FORKS_FILE")
+          "TOKEN_FILE", "CONFIG_FILE", "FORKS_FILE", "OPENCODE_DB")
 
 _CFG_ATTRS = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL")
 
@@ -85,6 +85,12 @@ def _empty_env():
     # _empty_env() makes, for the identical reason.
     config.VSCODE_WS_ROOT = tempfile.mkdtemp()
     config.CURSOR_WS_ROOT = tempfile.mkdtemp()
+    # OpenCode provider root -- WITHOUT this override OpencodeProvider.available() sees the
+    # real machine's actual ~/.local/share/opencode/opencode.db and real sessions leak into
+    # /api/list and /api/search (same failure mode the VSCode/Cursor override above guards
+    # against). A nonexistent path inside a fresh tempdir, not an empty string -- matches
+    # providers/opencode.py's available(): `bool(config.OPENCODE_DB) and os.path.isfile(...)`.
+    config.OPENCODE_DB = os.path.join(tempfile.mkdtemp(), "no-opencode.db")
     config.FLAGS_FILE = tempfile.mktemp(suffix=".json")
     config.TITLES_FILE = tempfile.mktemp(suffix=".json")
     config.PINS_FILE = tempfile.mktemp(suffix=".json")

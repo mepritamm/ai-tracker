@@ -446,11 +446,13 @@ def todo_times_approximate(provider_type):
     rather than exact. Always a bool on the detail dict, even with no todos at all, so the UI
     never has to special-case a provider.
     - "claude": False (exact ID join from task-store file stem == TaskUpdate's taskId)
+    - "opencode": False (its `todo` table carries real per-row time_created/time_updated,
+      not a name-matched guess -- exact, same as Claude, just via a different source)
     - "auggie": True (name-matched against chatHistory task ids from add_tasks/update_tasks echoes)
     - "augment": True (no timing source available; chat transcript in LevelDB unreadable stdlib-only)
     This is the ONE definition point shared by all providers; it lives here so the semantics
     stay consistent if the rule ever changes."""
-    return provider_type != "claude"
+    return provider_type not in ("claude", "opencode")
 
 
 def unified(old, new, cap=20000):

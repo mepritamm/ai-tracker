@@ -81,6 +81,16 @@ CURSOR_WS_ROOT = os.environ.get(
 )
 
 
+# opencode (anomalyco/opencode) keeps EVERYTHING — sessions, messages, parts, todos — in one
+# SQLite database, not per-session files like Claude/Auggie. Opened read-only (mode=ro) so the
+# tracker can never write to a live agent's store; see providers/opencode.py. Overridable for
+# tests / non-default XDG homes. Empty = provider disabled.
+OPENCODE_DB = os.environ.get(
+    "TRACKER_OPENCODE_DB",
+    os.path.expanduser("~/.local/share/opencode/opencode.db"),
+)
+
+
 # HTTP Basic Auth for the whole server. Empty = off (default; localhost dev unaffected).
 # Set TRACKER_AUTH="user:pass" to require a login on every route — the one gate that covers
 # every access path (localhost, LAN, Tailscale, ngrok), so remote viewers must authenticate.

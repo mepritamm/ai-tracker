@@ -736,6 +736,184 @@ def _run():
     assert push_when(True, 1, LIVE_WINDOW) == "turn", "just inside the live window -> this turn"
     assert push_when(False, LIVE_WINDOW, LIVE_WINDOW) == "none", "no drain beats liveness"
 
+    # opencode provider: SQLite-backed, epoch-MILLISECOND timestamps — the easiest bug to ship
+    # is a list() that forgets to divide by 1000, plus a tool part's error state must reach
+    # counts["errors"] (the same "reach the count" gap Auggie had for command exit status).
+    # Deep coverage lives in tests/test_opencode.py; this is the one-assertion trip-wire.
+    import sqlite3 as _sqlite3
+    from aitracker.providers.opencode import OpencodeProvider as _OpencodeProvider
+    _oc_path = tempfile.mktemp(suffix=".db")
+    _oc_conn = _sqlite3.connect(_oc_path)
+    _oc_conn.executescript("""
+        CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, workspace_id TEXT, parent_id TEXT,
+            slug TEXT, directory TEXT NOT NULL, path TEXT, title TEXT NOT NULL, version TEXT,
+            share_url TEXT, summary_additions INT, summary_deletions INT, summary_files INT,
+            summary_diffs INT, metadata TEXT, cost REAL, tokens_input INT, tokens_output INT,
+            tokens_reasoning INT, tokens_cache_read INT, tokens_cache_write INT, revert TEXT,
+            permission TEXT, agent TEXT, model TEXT, time_created INT, time_updated INT,
+            time_compacting INT, time_archived INT);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INT, time_updated INT, data TEXT);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INT,
+            time_updated INT, data TEXT);
+        CREATE TABLE todo (session_id TEXT, content TEXT, status TEXT, priority TEXT, position INT,
+            time_created INT, time_updated INT, PRIMARY KEY (session_id, position));
+        CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, vcs TEXT, name TEXT,
+            icon_url TEXT, time_created INT, time_updated INT, sandboxes TEXT, commands TEXT);
+    """)
+    _oc_now = int(time.time() * 1000)
+    _oc_conn.execute(
+        "INSERT INTO session (id, parent_id, directory, title, agent, model, tokens_input, tokens_output, "
+        "tokens_cache_read, tokens_cache_write, time_created, time_updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("ses_sc", "", "/work/repo", "Selfcheck opencode session", "build",
+         json.dumps({"id": "big-pickle", "providerID": "opencode", "variant": "default"}),
+         10, 5, 0, 0, _oc_now - 5000, _oc_now - 1000))
+    _oc_conn.execute("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?)",
+                      ("msg_sc", "ses_sc", _oc_now - 4000, _oc_now - 4000, json.dumps({"role": "assistant"})))
+    _oc_conn.execute(
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?,?)",
+        ("part_sc", "msg_sc", "ses_sc", _oc_now - 3000, _oc_now - 3000,
+         json.dumps({"type": "tool", "tool": "bash", "callID": "c1",
+                     "state": {"status": "error", "input": {"command": "npm test"}, "output": ""}})))
+    _oc_conn.commit()
+    _oc_conn.close()
+    _oc_snap = config.OPENCODE_DB
+    config.OPENCODE_DB = _oc_path
+    try:
+        _oc_items = {s["id"]: s for s in _OpencodeProvider().list()}
+        assert _oc_items["opencode:ses_sc"]["mtime"] < 1e11, \
+            "opencode mtime must be epoch SECONDS, not milliseconds: %r" % _oc_items["opencode:ses_sc"]["mtime"]
+        _oc_detail = _OpencodeProvider().parse("opencode:ses_sc")
+        assert _oc_detail["counts"]["errors"] == 1, \
+            "a bash part with state.status=='error' must reach counts['errors']"
+    finally:
+        config.OPENCODE_DB = _oc_snap
+        os.unlink(_oc_path)
+
+    # opencode provider, take two: full Claude-parity field coverage. The provider just
+    # gained todo_total/todo_done/todo_current/todo_current_index/pr_num/pr_url/pr_repo/
+    # pr_state/now_line/model/bg/fail_cmd/shells_running on the LIST dict, and sessionId/
+    # ended/aiTitle/version/effort/customTitle on the DETAIL dict's meta. Prove every one of
+    # them is REAL, not merely present: a real todo table (pending + in_progress + completed,
+    # each with its own ms timestamps), a real session.model JSON blob to parse, a real
+    # `gh pr create` transcript to summarize into pr_num/pr_repo, and id-namespacing checked
+    # in BOTH directions (list `id` prefixed "opencode:", meta `sessionId` bare).
+    _oc_path2 = tempfile.mktemp(suffix=".db")
+    _oc_conn2 = _sqlite3.connect(_oc_path2)
+    _oc_conn2.executescript("""
+        CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, workspace_id TEXT, parent_id TEXT,
+            slug TEXT, directory TEXT NOT NULL, path TEXT, title TEXT NOT NULL, version TEXT,
+            share_url TEXT, summary_additions INT, summary_deletions INT, summary_files INT,
+            summary_diffs INT, metadata TEXT, cost REAL, tokens_input INT, tokens_output INT,
+            tokens_reasoning INT, tokens_cache_read INT, tokens_cache_write INT, revert TEXT,
+            permission TEXT, agent TEXT, model TEXT, time_created INT, time_updated INT,
+            time_compacting INT, time_archived INT);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INT, time_updated INT, data TEXT);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INT,
+            time_updated INT, data TEXT);
+        CREATE TABLE todo (session_id TEXT, content TEXT, status TEXT, priority TEXT, position INT,
+            time_created INT, time_updated INT, PRIMARY KEY (session_id, position));
+        CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, vcs TEXT, name TEXT,
+            icon_url TEXT, time_created INT, time_updated INT, sandboxes TEXT, commands TEXT);
+    """)
+    _oc_now2 = int(time.time() * 1000)
+    _oc_conn2.execute(
+        "INSERT INTO session (id, parent_id, directory, title, agent, model, version, tokens_input, "
+        "tokens_output, tokens_cache_read, tokens_cache_write, time_created, time_updated) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("ses_full", "", "/work/full", "opencode full parity session", "build",
+         json.dumps({"id": "big-pickle", "providerID": "opencode"}), "1.18.18",
+         20, 10, 0, 0, _oc_now2 - 10000, _oc_now2 - 1000))
+    # one `gh pr create` bash call whose own output carries the PR URL -- `created` on the PR
+    # entry is set from PR_CREATE_RE matching the COMMAND text, not the output (see
+    # util.collect_prs / opencode.py's _list_state), so this is the only shape that lights
+    # up pr_num/pr_url/pr_repo on the list dict at all.
+    _oc_conn2.execute("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?)",
+                      ("msg_full1", "ses_full", _oc_now2 - 8000, _oc_now2 - 8000,
+                       json.dumps({"role": "assistant"})))
+    _oc_conn2.execute(
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?,?)",
+        ("part_full1", "msg_full1", "ses_full", _oc_now2 - 7000, _oc_now2 - 7000,
+         json.dumps({"type": "tool", "tool": "bash", "callID": "c_pr",
+                     "state": {"status": "completed",
+                               "input": {"command": "gh pr create --title 'Add opencode parity'"},
+                               "output": "Created PR: https://github.com/acme/widgets/pull/42\n"}})))
+    # a later, part-less message whose OWN time_created is the largest in the session --
+    # pins down _last_message_ended's answer deterministically (it reads the last MESSAGE
+    # row by time_created, not the last part).
+    _oc_conn2.execute("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?)",
+                      ("msg_full2", "ses_full", _oc_now2 - 500, _oc_now2 - 500,
+                       json.dumps({"role": "assistant", "time": {"completed": _oc_now2 - 400}})))
+    # 3 todos, one of each status, at KNOWN per-row ms timestamps -- the ms-vs-seconds bug is
+    # exactly what this block exists to catch (see _todos' docstring: real per-row timing,
+    # unlike Auggie's name-matched approximation).
+    _oc_conn2.executemany(
+        "INSERT INTO todo (session_id, content, status, position, time_created, time_updated) "
+        "VALUES (?,?,?,?,?,?)",
+        [("ses_full", "Ship docs", "pending", 0, _oc_now2 - 300000, _oc_now2 - 300000),
+         ("ses_full", "Wire the parser", "in_progress", 1, _oc_now2 - 200000, _oc_now2 - 200000),
+         ("ses_full", "Set up scaffolding", "completed", 2, _oc_now2 - 100000, _oc_now2 - 50000)])
+    _oc_conn2.commit()
+    _oc_conn2.close()
+    _oc_snap2 = config.OPENCODE_DB
+    config.OPENCODE_DB = _oc_path2
+    try:
+        _oc_full_items = {s["id"]: s for s in _OpencodeProvider().list()}
+        item = _oc_full_items["opencode:ses_full"]
+        for _k in ("todo_total", "todo_done", "todo_current", "todo_current_index", "pr_num",
+                   "pr_url", "pr_repo", "pr_state", "now_line", "model", "bg", "fail_cmd",
+                   "shells_running"):
+            assert _k in item, "opencode list dict missing %r: %r" % (_k, item)
+        assert item["id"] == "opencode:ses_full", \
+            "list dict id must be namespaced with opencode:: %r" % item["id"]
+        assert item["todo_total"] == 3, item["todo_total"]
+        assert item["todo_done"] == 1, item["todo_done"]
+        assert item["todo_current"] == "Wire the parser", \
+            "todo_current must be the in-progress todo's own content: %r" % item["todo_current"]
+        assert item["todo_current_index"] == 1, item["todo_current_index"]
+        assert item["model"] == "big-pickle", \
+            "opencode model must be the parsed id out of session.model's JSON, not the raw blob: %r" % item["model"]
+        assert item["shells_running"] == 0, \
+            "opencode has no background-shell concept -- shells_running must always be 0"
+        assert item["bg"] == 0, item["bg"]
+        assert item["pr_num"] == "42", item["pr_num"]
+        assert item["pr_repo"] == "acme/widgets", item["pr_repo"]
+        assert item["pr_url"] and item["pr_url"].endswith("/pull/42"), item["pr_url"]
+
+        detail = _OpencodeProvider().parse("opencode:ses_full")
+        meta = detail["meta"]
+        assert meta["sessionId"] == "ses_full", \
+            "meta.sessionId must be the BARE id, no opencode: prefix: %r" % meta["sessionId"]
+        assert meta["ended"] is True, meta["ended"]
+        assert meta["aiTitle"] == "opencode full parity session", meta["aiTitle"]
+        assert meta["version"] == "1.18.18", meta["version"]
+        assert meta["effort"] == "", meta["effort"]
+        assert meta["customTitle"] == "", meta["customTitle"]
+        assert detail["todo_times_approximate"] is False, \
+            "opencode's todo rows carry real per-row timestamps -- must NOT be flagged approximate"
+
+        todos = detail["todos"]
+        assert len(todos) == 3, todos
+        for _t in todos:
+            assert "id" in _t and "desc" in _t and "started_at" in _t and "ended_at" in _t, _t
+        t_pending, t_inprog, t_done = todos
+        assert t_pending["id"] == "0" and t_pending["desc"] == "", t_pending
+        assert t_pending["started_at"] is None and t_pending["ended_at"] is None, \
+            "a pending todo must have no timing at all: %r" % (t_pending,)
+        assert t_inprog["id"] == "1"
+        assert t_inprog["started_at"] == (_oc_now2 - 200000) / 1000.0, \
+            "todo started_at must be its OWN row's time_created / 1000 (db stores ms): %r" % t_inprog["started_at"]
+        assert 1e9 < t_inprog["started_at"] < 2e9, \
+            "a 1000x ms/seconds bug must fail loudly here: %r" % t_inprog["started_at"]
+        assert t_inprog["ended_at"] is None, "an in-progress todo has no ended_at yet"
+        assert t_done["id"] == "2"
+        assert t_done["started_at"] == (_oc_now2 - 100000) / 1000.0, t_done["started_at"]
+        assert t_done["ended_at"] == (_oc_now2 - 50000) / 1000.0, \
+            "completed todo's ended_at must be its OWN row's time_updated / 1000: %r" % t_done["ended_at"]
+        assert 1e9 < t_done["ended_at"] < 2e9, t_done["ended_at"]
+    finally:
+        config.OPENCODE_DB = _oc_snap2
+        os.unlink(_oc_path2)
+
     # Auggie: approximate per-todo timings recovered by NAME, not id -- add_tasks/update_tasks
     # key a task by a short per-call id that does NOT match the task-storage file's uuid (see
     # _auggie_resolve's docstring), so a todo's timing is recovered by matching its NAME back to

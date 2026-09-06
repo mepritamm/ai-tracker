@@ -27,7 +27,7 @@ from aitracker.util import _first_line, _iso_epoch
 from aitracker.providers import auggie as _auggie
 from aitracker.providers import claude as _claude
 
-_PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "TASKS_DIR", "NOTES_FILE", "PORT_FILE", "TOKEN_FILE")
+_PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "TASKS_DIR", "NOTES_FILE", "PORT_FILE", "TOKEN_FILE", "OPENCODE_DB")
 
 
 def _texts(resp):
@@ -55,6 +55,7 @@ def _empty_env():
     # dirs so the providers see nothing on this machine when tests build their fixtures.
     config.VSCODE_WS_ROOT = tempfile.mkdtemp()
     config.CURSOR_WS_ROOT = tempfile.mkdtemp()
+    config.OPENCODE_DB = os.path.join(tempfile.mkdtemp(), "no-opencode.db")
     config.NOTES_FILE = tempfile.mktemp(suffix=".json")
     _auggie._AUGGIE_LIST_CACHE.clear()
     _claude._META_CACHE.clear()
@@ -1458,7 +1459,7 @@ class TestBundle(unittest.TestCase):
         names = {type(p).__name__ for p in ns["PROVIDERS"]}
         self.assertEqual(
             names,
-            {"ClaudeProvider", "AuggieProvider", "AugmentVscodeProvider", "AugmentCursorProvider"})
+            {"ClaudeProvider", "AuggieProvider", "AugmentVscodeProvider", "AugmentCursorProvider", "OpencodeProvider"})
         sessions = ns["all_sessions"]()         # the shared seam -- must not raise
         self.assertIsInstance(sessions, list)
 

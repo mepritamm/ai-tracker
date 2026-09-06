@@ -81,7 +81,7 @@ class TestForkFollow(unittest.TestCase):
         self._snap = {k: getattr(config, k) for k in
                       ("PROJECTS", "FORKS_FILE", "TITLES_FILE", "PINS_FILE", "NOTES_FILE",
                        "FLAGS_FILE", "AUGMENT_DIR", "AUGGIE_SESSIONS",
-                       "VSCODE_WS_ROOT", "CURSOR_WS_ROOT")}
+                       "VSCODE_WS_ROOT", "CURSOR_WS_ROOT", "OPENCODE_DB")}
         config.PROJECTS = tempfile.mkdtemp()
         config.FORKS_FILE = tempfile.mktemp(suffix=".json")
         config.TITLES_FILE = tempfile.mktemp(suffix=".json")
@@ -93,6 +93,12 @@ class TestForkFollow(unittest.TestCase):
         os.makedirs(config.AUGGIE_SESSIONS)
         config.VSCODE_WS_ROOT = tempfile.mkdtemp()
         config.CURSOR_WS_ROOT = tempfile.mkdtemp()
+        # OpenCode provider root -- this class's tests call all_sessions() over the config.PROJECTS
+        # fixture dir, and without this override OpencodeProvider.available() sees this machine's
+        # real ~/.local/share/opencode/opencode.db and leaks real sessions in alongside the fixture
+        # ones. A nonexistent path inside a fresh tempdir, not an empty string -- matches
+        # providers/opencode.py's available(): `bool(config.OPENCODE_DB) and os.path.isfile(...)`.
+        config.OPENCODE_DB = os.path.join(tempfile.mkdtemp(), "no-opencode.db")
         _auggie._AUGGIE_LIST_CACHE.clear()
         _claude._META_CACHE.clear()
 
@@ -1091,7 +1097,7 @@ class TestListDoesNoPerSessionFileReads(unittest.TestCase):
         self._snap = {k: getattr(config, k) for k in
                       ("PROJECTS", "FORKS_FILE", "TITLES_FILE", "PINS_FILE", "NOTES_FILE",
                        "FLAGS_FILE", "AUGMENT_DIR", "AUGGIE_SESSIONS",
-                       "VSCODE_WS_ROOT", "CURSOR_WS_ROOT")}
+                       "VSCODE_WS_ROOT", "CURSOR_WS_ROOT", "OPENCODE_DB")}
         config.PROJECTS = tempfile.mkdtemp()
         config.FORKS_FILE = tempfile.mktemp(suffix=".json")
         config.TITLES_FILE = tempfile.mktemp(suffix=".json")
@@ -1103,6 +1109,13 @@ class TestListDoesNoPerSessionFileReads(unittest.TestCase):
         os.makedirs(config.AUGGIE_SESSIONS)
         config.VSCODE_WS_ROOT = tempfile.mkdtemp()
         config.CURSOR_WS_ROOT = tempfile.mkdtemp()
+        # OpenCode provider root -- THE fix for this class's regression: _count_forks_reads
+        # asserts an exact session count from all_sessions(), and without this override
+        # OpencodeProvider.available() sees this machine's real ~/.local/share/opencode/opencode.db
+        # and real sessions leak in on top of the fixture ones, breaking that count. A nonexistent
+        # path inside a fresh tempdir, not an empty string -- matches providers/opencode.py's
+        # available(): `bool(config.OPENCODE_DB) and os.path.isfile(...)`.
+        config.OPENCODE_DB = os.path.join(tempfile.mkdtemp(), "no-opencode.db")
         _auggie._AUGGIE_LIST_CACHE.clear()
         _claude._META_CACHE.clear()
 

@@ -1,6 +1,7 @@
 from .providers.claude import ClaudeProvider
 from .providers.auggie import AuggieProvider
 from .providers.augment_ext import AugmentVscodeProvider, AugmentCursorProvider
+from .providers.opencode import OpencodeProvider
 # NOTE: one line, no parenthesised continuation — scripts/bundle.py strips imports
 # line-by-line (`^(import |from )`), so a wrapped import leaves its tail behind and
 # `make bundle` emits a file that won't parse.
@@ -9,7 +10,7 @@ from .util import annotate_liveness
 
 
 PROVIDERS = [ClaudeProvider(), AuggieProvider(),
-             AugmentVscodeProvider(), AugmentCursorProvider()]
+             AugmentVscodeProvider(), AugmentCursorProvider(), OpencodeProvider()]
 
 
 def all_sessions():

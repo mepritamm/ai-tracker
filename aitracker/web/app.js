@@ -968,8 +968,8 @@ function base(p){return (p||"").split("/").pop()}
 // never regex-strips SRC's HTML (that was the bug: stripping `<svg ...>`/`<span ...>` markup with
 // a `^\S+\s*` regex leaves the tag's OWN attributes behind as literal text whenever the icon is
 // more than one whitespace-free token, e.g. `class="ico ico-glyph" aria-hidden="true">CLI`).
-const SRC_ICON={"claude-desktop":"desktop","cli":"keyboard","sdk-cli":"gear","claude-vscode":"copy","auggie":"diamond","augment-vscode":"diamond","augment-cursor":"diamond"};
-const SRC_TEXT={"claude-desktop":"Desktop","cli":"CLI","sdk-cli":"SDK","claude-vscode":"VS Code","auggie":"Auggie","augment-vscode":"Augment (VS Code)","augment-cursor":"Augment (Cursor)"};
+const SRC_ICON={"claude-desktop":"desktop","cli":"keyboard","sdk-cli":"gear","claude-vscode":"copy","auggie":"diamond","augment-vscode":"diamond","augment-cursor":"diamond","opencode":"triangle-fill"};
+const SRC_TEXT={"claude-desktop":"Desktop","cli":"CLI","sdk-cli":"SDK","claude-vscode":"VS Code","auggie":"Auggie","augment-vscode":"Augment (VS Code)","augment-cursor":"Augment (Cursor)","opencode":"opencode"};
 const srcText=v=>SRC_TEXT[v]||v||"";
 const SRC={}; for(const k in SRC_TEXT) SRC[k]=ico(SRC_ICON[k])+" "+SRC_TEXT[k];
 const srcLabel=v=>SRC[v]||v||"";
