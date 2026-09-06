@@ -701,6 +701,10 @@ window.CR = window.CR || {};
     var sessionsPage = 0;              // 0-indexed; reset on a fresh Sessions-tab landing,
                                         // a page-size change, or a new committed search query —
                                         // never merely by a poll re-render (see update()).
+    // SEARCH PARITY SEAM: these four also back the RAIL's own filtering now (railRowsFor()),
+    // not just this destination — the single debounced /api/search call, driven by every
+    // write to the shared uiState 'query' field (see scheduleSessionsSearch()'s call site
+    // in the mount() subscriber), rather than a second client-side matcher per view.
     var sessionsSearchQuery = '';      // '' -> browsing; non-empty -> the last COMMITTED query
     var sessionsSearchResults = null;  // null (nothing resolved yet for this query) | Array of
                                         // /api/search hits, server-ranked, used AS-IS (never re-sorted)
@@ -829,17 +833,22 @@ window.CR = window.CR || {};
       // second implementation.
       els.sessionsHeader = h('div', { class: 'cr-sessions-header' }, ['All sessions']);
 
-      // Its own search box — the persistent rail's search stays local to
-      // whatever's already loaded, but this one is shown only while the rail
-      // itself is hidden (requirement 2), and it must reach the WHOLE stack
-      // (requirement 5), not just the loaded page, so it is wired to
-      // scheduleSessionsSearch()/GET /api/search rather than the rail's
-      // client-side railRowsFor() filter.
+      // Its own search box — shown only while the rail itself is hidden
+      // (requirement 2), and it must reach the WHOLE stack (requirement 5), not
+      // just the loaded page. SEARCH PARITY SEAM (requirement 2): this used to
+      // call scheduleSessionsSearch() directly, bypassing uiState entirely — so
+      // typing here updated neither classic's search box nor the rail, a THIRD
+      // local query variable alongside classic's and the rail's. It now writes
+      // through the SAME shared 'query' field they do; the uiState subscriber
+      // (mount()) is what actually calls scheduleSessionsSearch()/GET /api/search
+      // now, for a write from ANY of the three boxes, and mirrors the value back
+      // into this input exactly as it already does for the rail's.
       els.sessionsSearchWrap = h('div', { class: 'cr-rail-search cr-sessions-search' }, [
         icon('search', '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>'),
         (els.sessionsSearchInput = h('input', {
           type: 'text', placeholder: 'Search every session', 'aria-label': 'Search every session',
-          oninput: function (e) { scheduleSessionsSearch(e.target.value); }
+          value: searchQuery,
+          oninput: function (e) { uiState.set('query', e.target.value); }
         })),
       ]);
 
@@ -1086,14 +1095,48 @@ window.CR = window.CR || {};
     // silently filter a view whose own search input says something different.
     // The rail's own unpaginated call (renderRail) omits it, so its behaviour
     // is unchanged: still filtered by its own live `searchQuery`.
+    //
+    // SEARCH PARITY SEAM (three implementations -> one): this used to be its own
+    // client-side substring matcher over only title+project+prompt of the loaded,
+    // 200-cap `sessions` array — never the transcript /api/search actually scans
+    // (providers/claude.py search_sessions(), full prompts/replies/tool inputs).
+    // A phrase that only appears deep in a transcript (an error string, say) would
+    // match the server's answer but not this filter, so the rail would show "no
+    // sessions match" for a query classic's sidebar showed a real hit for — same
+    // shared uiState 'query' key, two different verdicts.
+    //
+    // Fixed by DEFERRING to the server whenever it has actually answered THIS exact
+    // query: sessionsSearchQuery/sessionsSearchResults are the Sessions destination's
+    // own debounced /api/search call (registry.search_all() — both providers), now
+    // driven by every uiState 'query' write (see the subscriber in mount() and
+    // scheduleSessionsSearch()'s call site there), not just its own search box. Once
+    // that call has resolved for the query currently in the box, its hit-id set is
+    // authoritative (conventions.md rule 5: "server owns policy; client renders it")
+    // — a session is shown here IFF the server said it matches, full stop.
+    //
+    // The substring pass below only ever runs as INSTANT FEEDBACK while the server
+    // hasn't answered yet for this exact query (still debouncing, or mid-flight) —
+    // it can show EXTRA candidates for a keystroke or two, never fewer than the
+    // server will confirm, and it is fully replaced (never merged with) the real
+    // answer the moment commitSessionsSearch()'s fetch resolves (that success/error
+    // path re-renders the rail too — see below). It can therefore never be the thing
+    // that decides a session is ABSENT once the server has actually spoken for this
+    // query; it only ever fires before the server has spoken at all.
     function railRowsFor(sessions, qOverride) {
+      var raw = (typeof qOverride === 'string') ? qOverride : searchQuery;
+      var trimmed = String(raw || '').trim();
+      if (!trimmed) return sessions;
       // DEFECT 3: only the HAYSTACK used to be lowercased, and the needle came in raw
       // from the shared uiState 'query' field — which classic writes case-PRESERVED
       // (app.js:1204). Typing "Normal" in the classic search box therefore emptied the
       // control-room rail. Case is normalised HERE, at the comparison, so both sides
       // agree no matter which view stored the query.
-      var q = String(((typeof qOverride === 'string') ? qOverride : searchQuery) || '').toLowerCase();
-      if (!q) return sessions;
+      var q = trimmed.toLowerCase();
+      if (sessionsSearchQuery && sessionsSearchQuery.trim().toLowerCase() === q && sessionsSearchResults != null) {
+        var ids = {};
+        sessionsSearchResults.forEach(function (r) { ids[r.id] = true; });
+        return sessions.filter(function (s) { return !!ids[s.id]; });
+      }
       return sessions.filter(function (s) {
         return ((s.title || '') + ' ' + (s.project || '') + ' ' + (s.prompt || '')).toLowerCase().indexOf(q) >= 0;
       });
@@ -1450,9 +1493,15 @@ window.CR = window.CR || {};
     // Debounced so typing doesn't fire a request per keystroke; `sessionsSearchSeq`
     // is the stale-response guard — a slow response for an older query can never
     // overwrite a newer one's results, because it's only applied if its own
-    // sequence number is still the latest one issued.
+    // sequence number is still the latest one issued. SEAM: this is now the ONE
+    // place a search request is ever issued — driven by the uiState 'query'
+    // subscriber (mount()) for every write, from any of the three boxes (classic's,
+    // the rail's, this destination's own), not just this destination's input.
+    // Clearing the query resolves immediately (no visible lag on the common "hit
+    // Escape / clear" path); a real query still waits out the debounce.
     function scheduleSessionsSearch(raw) {
       clearTimeout(sessionsSearchDebounce);
+      if (!(raw || '').trim()) { commitSessionsSearch(raw); return; }
       sessionsSearchDebounce = setTimeout(function () { commitSessionsSearch(raw); }, 300);
     }
     function commitSessionsSearch(raw) {
@@ -1462,6 +1511,7 @@ window.CR = window.CR || {};
       if (!q) {
         sessionsSearchResults = null;
         sessionsSearchLoading = false;
+        renderRail(lastState);   // the rail's own railRowsFor() also gates on sessionsSearchQuery
         renderSessionsView(lastState);
         return;
       }
@@ -1475,11 +1525,16 @@ window.CR = window.CR || {};
         if (seq !== sessionsSearchSeq) return;   // a newer query already superseded this one
         sessionsSearchResults = Array.isArray(hits) ? hits : [];
         sessionsSearchLoading = false;
+        // SEAM: the rail's railRowsFor() defers to sessionsSearchResults the instant
+        // it's set for the query currently in the box — this is the repaint that
+        // swaps its transient local-substring guess for the server's real answer.
+        renderRail(lastState);
         renderSessionsView(lastState);
       }).catch(function () {
         if (seq !== sessionsSearchSeq) return;
         sessionsSearchResults = [];
         sessionsSearchLoading = false;
+        renderRail(lastState);
         renderSessionsView(lastState);
       });
     }
@@ -2390,6 +2445,13 @@ window.CR = window.CR || {};
     function sessionTile(t, now) {
       var s = t.session, state = t.state;
       var cls = 'cr-tile cr-tile--' + state;
+      // PINNED is orthogonal to `state` (a session is pinned AND working/idle/…), so it cannot
+      // ride the state class above — it needs its own modifier. Without this the board had no
+      // CSS hook for pinned at all: the pin glyph below is built with an empty class argument,
+      // so a pinned tile was indistinguishable from an unpinned one while the triage cell and
+      // the rail both marked it. Owner ruling: "the session markers/pinned … must be same in
+      // both the UIs". Paired rule in ext_cr_board.css uses --state-pinned (both themes).
+      if (s.pinned) cls += ' cr-tile--pinned';
       if (t.hero) cls += ' cr-tile--hero cr-tile--span2';
       // Doc 02 tile-anatomy table / 01-foundations.md ~line 271: EVERY 'Working'
       // tile gets the --line-agent border plus --glow-agent-soft + --shadow-raised
@@ -2659,7 +2721,15 @@ window.CR = window.CR || {};
           if (searchQuery === q) return;
           searchQuery = q;
           if (els.railSearchInput && els.railSearchInput.value !== searchQuery) els.railSearchInput.value = searchQuery;
+          // SEAM (one search for all three boxes): the Sessions destination's own input
+          // used to call scheduleSessionsSearch() directly and never touched uiState at
+          // all — this is the one place that call happens now, for a write from ANY of
+          // classic's box, the rail's, or this destination's (all three now mirror here
+          // first, so a value left in one input can never drift from what the others show).
+          if (els.sessionsSearchInput && els.sessionsSearchInput.value !== searchQuery) els.sessionsSearchInput.value = searchQuery;
+          scheduleSessionsSearch(searchQuery);
           renderRail(lastState);
+          if (currentView === 'sessions') renderSessionsView(lastState);
         } else if (key === 'liveOnly') {
           var lo = !!value;
           if (railLiveOnly === lo) return;

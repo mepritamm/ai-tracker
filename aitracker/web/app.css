@@ -4,6 +4,14 @@ html.light{--app:#f4efe3;--side:#efe8d8;--card:#fbf8f0;--raised:#f3ecdd;--line:#
    from the matching <symbol> in web/index.html: i-chevron-down, i-chevron, i-check) so they
    keep theming via currentColor/background-color while no longer needing a text glyph. */
 :root{--ico-scale:1;--ico-chevron-down:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 8.5l7 7 7-7'/%3E%3C/svg%3E");--ico-chevron:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 5l7 7-7 7'/%3E%3C/svg%3E");--ico-check:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 12.5l5 5L20 7'/%3E%3C/svg%3E")}
+/* --pin-blue: classic's pinned-marker colour, deliberately kept in sync with --state-pinned
+   in ext_cr.css (there aliased to --text-dusk) — the owner asked for "pin — blue" parity
+   between classic and the control room, and this dark-theme value (#A8C0C9) is copied
+   verbatim from --text-dusk's dark block in ext_cr.css. --pin-blue-bg is the translucent
+   row-wash derived from it, following this file's own solid/-bg pairing (--amber/--amber-bg). */
+:root{--pin-blue:#A8C0C9;--pin-blue-bg:rgba(168,192,201,.16)}
+/* light-theme counterpart — copied verbatim from --text-dusk's light block in ext_cr.css (#395D6A). */
+html.light{--pin-blue:#395D6A;--pin-blue-bg:rgba(57,93,106,.14)}
 html,body{transition:background .18s,color .18s}
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;background:var(--app);color:var(--text);font-family:'Source Sans 3',system-ui,sans-serif}
@@ -56,7 +64,7 @@ html,body{margin:0;height:100%;background:var(--app);color:var(--text);font-fami
 .pin.on{opacity:1;filter:none}
 /* touch devices have no :hover — surface pin/rename (were hover-only → unusable on the phone/tablet drawer) */
 @media(hover:none){.ren{opacity:.75}.pin{opacity:.6}}
-.sitem.pinned{background:var(--amber-bg)}
+.sitem.pinned{background:var(--pin-blue-bg)}
 .sitem.pinned.active{background:var(--selbg)}
 .smeta{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:11px;font-family:'JetBrains Mono',monospace;flex-wrap:wrap}
 .smeta .proj{color:var(--muted)}
@@ -86,6 +94,8 @@ html,body{margin:0;height:100%;background:var(--app);color:var(--text);font-fami
 /* open 🚩 count on a row — red so it reads as "needs attention", unlike the amber end-state */
 .sitem.flagged{border-left:3px solid var(--red)}
 .flagbadge{flex:0 0 auto;font-size:10px;border-radius:4px;padding:0 5px;margin-left:2px;font-weight:600;color:var(--red);background:var(--chipbg)}
+/* compact todo progress ("N/M") on a session row — see sessionRow()'s todoBadge in app.js */
+.todobadge{flex:0 0 auto;font-size:10px;border-radius:4px;padding:0 5px;margin-left:2px;font-weight:600;font-family:'JetBrains Mono',monospace;color:var(--blue);background:var(--blue-deep)}
 .ssnip{color:var(--dim);font-size:11px;margin-top:6px;line-height:1.35;font-family:'JetBrains Mono',monospace;overflow-wrap:anywhere}
 .ssnip b{color:var(--text);background:var(--hl);border-radius:2px}
 .smatch{color:var(--green)}
