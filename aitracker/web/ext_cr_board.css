@@ -1200,6 +1200,24 @@
   color: var(--text-muted);
 }
 
+/* TASK 2(b): a 0-count triage cell has nothing for a click to reveal — dim the
+ * whole cell (count + label together) so it reads as inert rather than broken.
+ * Still a real, focusable, clickable <button> — no `disabled`, no pointer-events
+ * change, opacity only. Uses the same opacity-dim pattern this file already uses
+ * for de-emphasised-but-clickable controls (.cr-rail-pin/.cr-rail-rename above),
+ * no new token or hex.
+ *
+ * Specificity check for "active still wins": the empty rule below is a single
+ * compound selector (.cr-triage-cell--empty, 1 class -> specificity 0,1,0). The
+ * override right after it is a TWO-class compound on the same element
+ * (.cr-triage-cell--empty.cr-triage-cell--active -> 0,2,0), which is strictly
+ * more specific regardless of source order or of the per-state
+ * `--awaiting/--working/--flagged/--pinned` rules above (also 0,1,0 or 0,2,0,
+ * but none of them touch `opacity` at all) — so a currently-active filter cell
+ * always renders at full strength even while its count is 0. */
+.tracker-next .cr-triage-cell--empty { opacity: .5; }
+.tracker-next .cr-triage-cell--empty.cr-triage-cell--active { opacity: 1; }
+
 .tracker-next .cr-triage-hist {
   min-width: 0;
   display: flex;

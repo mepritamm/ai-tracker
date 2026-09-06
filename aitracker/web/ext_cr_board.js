@@ -343,10 +343,12 @@ window.CR = window.CR || {};
 
   // THE RULE (doc 02 "Sort order — this is the design"; README decision 2),
   // as amended by the owner (supersedes doc 02's "idle sessions never get a
-  // tile"): never more than boardTileCap() tiles — default 8, user-adjustable
-  // 3-12 per doc 04; pinned group on top, unpinned below, newest first within
-  // each group — waiting-on-you outranks everything, including recency;
-  // agent-group tiles sit last.
+  // tile", AND its "pinned group on top, unpinned below"): never more than
+  // boardTileCap() tiles — default 8, user-adjustable 3-12 per doc 04; ordered
+  // by attention rank first — waiting-on-you outranks everything, including
+  // recency — then by most recent activity, full stop; agent-group tiles sit
+  // last. Pinned is a marker and a triage filter only, not a board sort key
+  // (see the sort comparator below for why).
   //
   // Two callers, two shapes of the same rule:
   //   - No `filterKey` (the default board view): idle sessions are NOT
@@ -403,9 +405,22 @@ window.CR = window.CR || {};
       .filter(function (s) { return !isGroupedAgent(s); })
       .map(function (s) { return { kind: 'session', session: s, state: sessionState(s, now) }; })
       .sort(function (a, b) {
+        // OWNER RULING (supersedes doc 02's "pinned group on top, unpinned below"):
+        // order by ATTENTION, then purely by RECENT ACTIVITY. Pinned is no longer a
+        // sort key on the board — it stays a marker (the pin glyph and the blue
+        // --state-pinned accent) and a triage filter, but it no longer hoists a
+        // session above more recent work.
+        //
+        // Why it changed: pinned outranked recency at EVERY rank, and since almost
+        // every session derives to 'idle' most of the time, the tiebreak that
+        // actually decided the board was `pinned` — four pinned sessions aged 22h /
+        // 3d / 7d / 8d sat above a session touched 8 MINUTES ago. The board reads as
+        // "what happened most recently", so an unlabelled hoist above it reads as a
+        // sorting bug rather than a feature. The rail keeps its pinned section
+        // because that one is CAPTIONED ("Pinned — N · newest first"), so it explains
+        // itself; this hoist never did.
         return (RANK[a.state] - RANK[b.state]) ||                                   // claim on attention first
-               ((b.session.pinned ? 1 : 0) - (a.session.pinned ? 1 : 0)) ||          // then pinned
-               (b.session.mtime - a.session.mtime);                                 // then recency
+               (b.session.mtime - a.session.mtime);                                 // then recency, full stop
       });
     var groups = agentGroups(sessions, now);
     var all = individual.concat(groups);
@@ -2424,6 +2439,10 @@ window.CR = window.CR || {};
       ['awaiting', 'working', 'flagged', 'pinned'].forEach(function (key) {
         els['triageCount_' + key].textContent = String(counts[key]);
         els['triageCell_' + key].classList.toggle('cr-triage-cell--active', activeFilter === key);
+        // TASK 2(b): a 0-count cell has nothing for a click to reveal — dim it so it
+        // reads as inert. Still a real, focusable, clickable <button> (no `disabled`):
+        // see ext_cr_board.css for the active-beats-empty specificity.
+        els['triageCell_' + key].classList.toggle('cr-triage-cell--empty', counts[key] === 0);
       });
 
       var hist = activityHistogram(sessions, now);
@@ -2468,6 +2487,24 @@ window.CR = window.CR || {};
 
     // -- board --------------------------------------------------------------
 
+    // TASK 2(a)/2(c): "0 waiting, click it, get the same generic 'Nothing
+    // matches that filter right now.'" reads as a broken control, not a
+    // correct empty triage bucket. One mapping, keyed by the same filter key
+    // `tileMatches`/`setFilter` already use, serves BOTH the board's empty
+    // state (renderBoard, below) and the cap footer's empty-filter sentence
+    // (renderCapFooter, below) — one wording, two call sites, no if-ladder at
+    // either. NOT reusing buildTriageShell's cell labels ('WAITING ON YOU' /
+    // 'WORKING' / …): those are terse uppercase noun labels for the strip
+    // itself, not sentences — forcing them into "Nothing is WAITING ON YOU
+    // right now." would read worse, not DRYer, so this is a small dedicated
+    // map next to them instead of a fork of the same string.
+    var BOARD_EMPTY_COPY = {
+      awaiting: 'Nothing is waiting on you right now.',
+      working: 'Nothing is working right now.',
+      flagged: 'No sessions have open flags.',
+      pinned: 'No sessions are pinned.'
+    };
+
     function tileId(t) { return t.kind === 'session' ? t.session.id : 'group:' + t.group; }
 
     // NOTE: the old in-closure passesFilter(t, now) is gone — its logic is now
@@ -2494,8 +2531,12 @@ window.CR = window.CR || {};
 
       els.board.innerHTML = '';
       if (!tiles.length) {
-        els.board.appendChild(h('div', { class: 'cr-board-empty' },
-          [activeFilter ? 'Nothing matches that filter right now.' : 'Nothing needs you right now.']));
+        // TASK 2(a): name the empty bucket instead of one generic sentence for every
+        // filter — the no-filter copy ('Nothing needs you right now.') is untouched.
+        var emptyCopy = activeFilter
+          ? (BOARD_EMPTY_COPY[activeFilter] || 'Nothing matches that filter right now.')
+          : 'Nothing needs you right now.';
+        els.board.appendChild(h('div', { class: 'cr-board-empty' }, [emptyCopy]));
       } else {
         tiles.forEach(function (t) { els.board.appendChild(t.kind === 'session' ? sessionTile(t, now) : agentGroupTile(t, now)); });
       }
@@ -2803,11 +2844,26 @@ window.CR = window.CR || {};
       // before for the unfiltered case, so this is a no-op there.
       var total = (typeof tiles.total === 'number') ? tiles.total : sessions.length;
       var showAll = !!uiState.get('showAll', false);
-      els.capfooter.appendChild(h('span', { class: 'cr-capfooter-count' }, [tiles.length + ' of ' + total]));
-      els.capfooter.appendChild(document.createTextNode(
-        showAll
-          ? ' — Showing every matching tile for this tab. — '
-          : ' — The board never shows more than ' + boardTileCap() + ' tiles. Everything else lives in the rail — pinned on top, newest first in each group. — '));
+      // TASK 2(c): "0 of 0" plus "the board never shows more than N tiles" reads as
+      // broken when a triage filter is legitimately, correctly empty — nothing is
+      // actually being cut off by the cap here, so that sentence (and the bare
+      // count it would otherwise pair with) is misleading rather than just terse.
+      // Reuses BOARD_EMPTY_COPY (same wording as the board's own empty state, one
+      // source of truth for "this bucket is empty") instead of a second string.
+      var emptyFiltered = !!activeFilter && total === 0;
+      if (emptyFiltered) {
+        els.capfooter.appendChild(document.createTextNode(
+          ' — ' + (BOARD_EMPTY_COPY[activeFilter] || 'Nothing matches that filter right now.') + ' — '));
+      } else {
+        els.capfooter.appendChild(h('span', { class: 'cr-capfooter-count' }, [tiles.length + ' of ' + total]));
+        els.capfooter.appendChild(document.createTextNode(
+          showAll
+            ? ' — Showing every matching tile for this tab. — '
+            : ' — The board never shows more than ' + boardTileCap() + ' tiles — ranked by what needs attention first, then by most recent activity. Everything else lives in the rail. — '));
+      }
+      // "Scroll for the rest" still makes sense even when the filter is empty — the rail
+      // is never filtered by the board's triage tabs, so the rest of the corpus is still
+      // sitting there to browse regardless of what this triage bucket found.
       els.capfooter.appendChild(h('button', {
         class: 'cr-capfooter-link', type: 'button',
         onclick: function () { els.railSearchInput && els.railSearchInput.focus(); els.rail.scrollIntoView({ block: 'nearest' }); }
@@ -2817,7 +2873,9 @@ window.CR = window.CR || {};
       // turn it back off even if the match count has since dropped to/below the cap. Shared
       // via uiState's 'showAll' (per the cross-view rule); setFilter() resets it to false on
       // every tab switch, so the expansion really does last only "until you switch away".
-      if (total > tiles.length || showAll) {
+      // Suppressed entirely in the emptyFiltered case — there is nothing to show
+      // more/fewer of when the match count is already 0.
+      if (!emptyFiltered && (total > tiles.length || showAll)) {
         els.capfooter.appendChild(document.createTextNode(' '));
         els.capfooter.appendChild(h('button', {
           class: 'cr-capfooter-link', type: 'button',

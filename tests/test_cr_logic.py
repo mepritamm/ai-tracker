@@ -834,10 +834,22 @@ class TestCRLogic(unittest.TestCase):
         got = [t["state"] for t in self.OUT["rank_order"]]
         self.assertEqual(got, ["awaiting", "flagged", "failing", "working", "landed"])
 
-    def test_board_tiles_pinned_beats_recency(self):
-        """Within the same rank, a pinned session outranks a strictly newer unpinned one."""
+    def test_board_tiles_recency_beats_pinned(self):
+        """Within the same rank, the NEWER session leads -- pinned no longer hoists.
+
+        INVERTED by owner ruling, not loosened. This asserted the opposite
+        ("a pinned session outranks a strictly newer unpinned one") until the
+        board's comparator dropped `pinned` as a sort key. The reason it changed:
+        almost every session derives to 'idle' most of the time, so the pinned
+        tiebreak was in practice the thing deciding the whole board -- four pinned
+        sessions aged 22h/3d/7d/8d sat above one touched 8 MINUTES earlier, which
+        reads as a sorting bug rather than a feature. Pinned is still a marker
+        (pin glyph, --state-pinned accent, cr-tile--pinned) and still a triage
+        filter; it just no longer reorders the board. The RAIL keeps its pinned
+        section, because that one is captioned and explains itself.
+        """
         got = [t["id"] for t in self.OUT["pin_order"]]
-        self.assertEqual(got, ["old_pinned", "new_unpinned"])
+        self.assertEqual(got, ["new_unpinned", "old_pinned"])
 
     def test_board_tiles_idle_sessions_still_derive_idle_state(self):
         """sessionState() itself is unchanged: an idle session still reads 'idle'
