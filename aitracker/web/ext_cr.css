@@ -136,6 +136,28 @@
   --state-done: #3B5747;
   --state-failed: #C0553A;
   --state-flagged: #C27950;
+  /* --state-working: canonical "session is working" colour, consumed by the classic
+     dashboard's own --st-working (app.css) for cross-view parity. Per the owner's
+     explicit, repeated ask for a GREEN working indicator, this deliberately departs
+     from 01-foundations.md's own state table (which gives Working "wheat" and reserves
+     forest/green for Landed) — the owner overrides the doc here, and forest green is
+     actively wrong for this slot since it would collide with --state-done. No LONGER
+     aliases --state-thinking. Value STARTED as classic's own historical live-dot green
+     (app.css --green, light value: #1f9d6b) — the only green the whole design-handoff
+     bundle ever attaches to a live/working dot at all (the "Today, recreated" mockup
+     section, reproducing the current app's own #29d398/#1f9d6b). Vivid/saturated so it
+     reads apart from the muted, desaturated --state-done green (#3B5747 light /
+     #8FB187 dark) at a 7px dot.
+     DARKENED to #1c9163 (from #1f9d6b): #1f9d6b measured only 2.82:1 against the light
+     --surface-page-ish warm-stone ground this dot sits on in classic's equivalent (--side,
+     #efe8d8) — below the WCAG 1.4.11 non-text 3:1 floor for a state indicator. #1c9163 keeps
+     the same hue (~156°, still the same emerald) and measures 3.26:1 against #efe8d8 (WCAG
+     relative-luminance formula), clearing the floor with a small margin, while staying
+     clearly distinct from --state-done's light value #3B5747 (2.0:1 between the two colours
+     — not a WCAG requirement, just a visual-separation check). Kept identical to app.css's
+     --st-working light value — that IS the cross-view parity this token exists for; the two
+     must be edited together. */
+  --state-working: #1c9163;
   /* --state-idle: restored to doc's exact value (doc line 86). THE DOCS
      WIN — it is identical to --line-strong in the doc's own light block;
      that collision is the doc's, not a bug to correct here. */
@@ -163,6 +185,14 @@
   --shadow-overlay: 2px 10px 30px rgba(30,27,23,.18);
   --glow-agent: 0 0 0 1px rgba(217,184,85,.35), 0 2px 14px rgba(217,184,85,.28);
   --glow-agent-soft: 0 0 10px rgba(217,184,85,.20);
+  /* --glow-working: always-on "lit" glow for a working session, in the canonical working
+     colour (rgba of --state-working/#1c9163 — RGB 28,145,99; kept in step with the
+     --state-working contrast fix above, was 31,157,107 for the old #1f9d6b). Modeled on
+     --glow-agent-soft directly above, turned up (wider spread + higher alpha) so it reads as
+     persistently lit rather than the soft ambient hint --glow-agent-soft provides. Same
+     geometry/opacity as before (14px blur, .32 alpha) — only the RGB changed, per the
+     owner's green ruling (and now again for the contrast fix). */
+  --glow-working: 0 0 14px rgba(28,145,99,.32);
   /* --scrim: NEW (not from 01-foundations.md — an audit found three backdrop/scrim
      colours hardcoded with no light/dark handling at all: ext_cr_dialogs.css's
      .cr-backdrop, ext_cr_boot.css's .cr-scrim, ext_cr_board.css's .cr-rail-scrim,
@@ -345,6 +375,12 @@
   --state-done: #8FB187;
   --state-failed: #D2735A;
   --state-flagged: #C27950;
+  /* --state-working: dark counterpart of the light block's own comment above — same
+     owner-directed green departure from the doc's "wheat" state table. Value is classic's
+     historical live-dot green, dark value (app.css --green: #29d398). Matches app.css's
+     own pulseDot keyframe halo colour (rgba(41,211,152,.55) = #29d398) exactly in this
+     (dark, default) theme. */
+  --state-working: #29d398;
   --state-idle: #877866;
   /* --state-pinned: see the light block's own comment above for why this
      token exists at all. Same alias here — --text-dusk's dark-theme value
@@ -367,6 +403,11 @@
   --shadow-overlay: 2px 10px 30px rgba(0,0,0,.66);
   --glow-agent: 0 0 0 1px rgba(217,184,85,.4), 0 2px 16px rgba(217,184,85,.3);
   --glow-agent-soft: 0 0 12px rgba(217,184,85,.22);
+  /* --glow-working: dark counterpart of the light block's own comment above — wider spread
+     and higher alpha than --glow-agent-soft, same relationship the light block keeps. Same
+     geometry/opacity as before (16px blur, .36 alpha) — only the RGB changed, to
+     --state-working's dark value #29d398 (RGB 41,211,152), per the owner's green ruling. */
+  --glow-working: 0 0 16px rgba(41,211,152,.36);
   /* --scrim: NEW, see the light block's own comment for why this token exists.
      Deeper here — --surface-inverse's dark-block RGB (#100E0C) at a higher
      opacity, so the backdrop reads as genuinely behind the (also dark) page

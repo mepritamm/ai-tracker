@@ -718,7 +718,16 @@ def parse_auggie(session_id):
     return {
         "meta": {"cwd": cwd, "title": title, "source": "auggie", "entrypoint": "auggie",
                  "gitBranch": branch,
-                 "model": _auggie_current_model(d.get("chatHistory"))},
+                 "model": _auggie_current_model(d.get("chatHistory")),
+                 # SAME derivation as list_auggie()'s list-dict `ended` (both call
+                 # _auggie_state on this session's own chatHistory) -- so the detail view's
+                 # working/landed predicate (ext_cr_detail.js's detailIsWorking()) can read
+                 # a real, provider-parity `ended` instead of falling back to a todo-derived
+                 # guess. Not reusing the `waiting`/`asks` values computed above: those are a
+                 # deeper full-transcript pass (parity with Claude's decisions panel), while
+                 # `ended` here intentionally matches the SAME rule the board/rail already show
+                 # for this session, not a second, independently-invented one.
+                 "ended": _auggie_state(d.get("chatHistory"))[1]},
                  # no "effort" key here: Auggie logs have no reasoning-effort concept
                  # (unlike model, which Auggie has but may be empty) — omit rather than fake
         "todos": todos,

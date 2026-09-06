@@ -744,17 +744,66 @@
   // the board does, not Failing. counts.errors/tests_failed stay exactly where they
   // already are as DATA (statChipsHtml() below) — this only changes which source
   // decides the failing STATE.
+  // JOB 3 / PARITY FIX: routes "is this session WORKING" through app.js's global
+  // isSessionWorking(s, live) — the ONE formula the board tile, the rail dot and
+  // (via this function) the detail view's state pill/glow must all agree on,
+  // rather than a second, separately-maintained AND/OR here drifting from theirs
+  // the way classic's sidebar once drifted from the board (see ext_cr_board.js's
+  // own isWorking() comment for that history).
+  //
+  // FIX (adversarial-review defect, CRITICAL): this function used to fabricate `ended`
+  // from `!inProgress` (a todo-derived guess) for EVERY provider, on the false premise
+  // that the detail dict carries no real `ended` boolean at all. It does: the SAME
+  // TRANSCRIPT-TAIL fact the list dict's `ended` is built from (providers/claude.py's
+  // `_tail_scan`/`_session_meta`: `ended = (not waiting) and last == "assistant_text"`)
+  // is threaded onto `session.meta.ended` for Auggie's detail dict (providers/auggie.py,
+  // via the SAME `_auggie_state()` list_auggie() already calls) — this renderer already
+  // reads sibling `session.meta.*` fields elsewhere (`session.meta.gitBranch`,
+  // `session.meta.sessionId`). The todo-derived guess disagreed with the real value in
+  // BOTH directions: a live session with no todos at all (Claude prunes ~/.claude/tasks/*
+  // after ~2 days, and most sessions never call TodoWrite) read `ended:true` here while
+  // the board/rail's REAL `ended:false` said "working" — glow missing; and a session that
+  // genuinely ended but left a stale `in_progress` todo read `ended:false` here while the
+  // real value was `true` — a permanent false glow. Prefer the real value when present;
+  // only sessions from a provider whose detail meta doesn't (yet) carry `ended` fall back
+  // to the old todo-derived approximation (see the per-provider note below).
+  //
+  // KNOWN GAP (not closed by this file — outside this pass's owned files): as of this
+  // fix, providers/claude.py's parse_session() detail dict does NOT put `ended` on its
+  // `meta` — verified directly against the return literal: `_session_meta()` (which DOES
+  // compute `ended` off `_tail_scan`) backs ONLY list_sessions()'s list dict; parse_session
+  // builds its own separate `meta = {}` from raw JSONL fields and never merges `ended`
+  // into it. So Claude Code sessions (unlike Auggie, fixed here) still fall through to the
+  // `!inProgress` fallback below until providers/claude.py's meta gains a real `ended` the
+  // same way — the two divergences above remain live for Claude sessions until that lands.
+  //
+  // The bg half is unaffected by any of this: a running background agent ~= the list
+  // dict's truthy `bg` (both providers gate it the same way — an agent file/session whose
+  // OWN mtime is inside LIVE_WINDOW, never "ever ran"; see providers/claude.py's
+  // `_mtime_and_bg`/`parse_agents` `"running": (now - mt) < LIVE_WINDOW` vs. this same gate
+  // on the list dict's `bg` count), so it is still adapted from `agents_bg` here as before.
+  // Either way, the FORMULA itself is never re-derived here — only its two inputs are
+  // sourced from the fields this dict actually has, then handed to the real,
+  // canonical isSessionWorking(s, live) (app.js) the board tile and rail dot also call.
+  function detailIsWorking(session, live) {
+    var runningBg = (session.agents_bg || []).some(function (a) { return a.running; });
+    var inProgress = (session.todos || []).some(function (t) { return t.status === "in_progress"; });
+    var realEnded = session.meta && typeof session.meta.ended === "boolean" ? session.meta.ended : null;
+    var ended = realEnded !== null ? realEnded : !inProgress;
+    var adapted = { ended: ended, bg: runningBg };
+    return typeof isSessionWorking === "function" ?
+      isSessionWorking(adapted, live) : (!!live && (!ended || runningBg));
+  }
+
   function stateOf(session, nowSec) {
     var idle = nowSec - (session.mtime || 0);
     var live = idle < LIVE_WINDOW;
     var openFlags = session.open_flags || 0;
-    var running = (session.agents_bg || []).some(function (a) { return a.running; });
-    var inProgress = (session.todos || []).some(function (t) { return t.status === "in_progress"; });
     var failing = live && !!session.fail_cmd;
     if (session.waiting) return { word: "Waiting on you", cls: "awaiting", age: fmtAge(idle) };
     if (openFlags) return { word: openFlags + " flag" + (openFlags === 1 ? "" : "s") + " open", cls: "flagged" };
     if (failing) return { word: "fail: " + session.fail_cmd, cls: "failed" };
-    if (live && (running || inProgress)) return { word: "Working", cls: "working" };
+    if (detailIsWorking(session, live)) return { word: "Working", cls: "working" };
     if (live) return { word: "Landed", cls: "done" };
     return { word: "Idle", cls: "idle", age: fmtAge(idle) };
   }
@@ -1149,6 +1198,14 @@
         '<input class="crd-note-queue-input" type="text" placeholder="Queue a note for this session…">' +
         '<button class="crd-btn crd-btn-solid" data-act="note-queue-send">Queue</button>' +
       "</div>" +
+      // FIX (job 2, owner correction: ABOVE the spine, not below it): the live
+      // "Now" card, directly above the progress spine so current state is the
+      // very first thing visible in the main session view, no scrolling into
+      // the conversation required. Was `.crd-timeline-live`, pinned to the
+      // bottom of the timeline panel below the scrolling history -- moved
+      // (not duplicated; see renderLiveEntry()/ui_findLiveEl() below, the ONE
+      // renderer/call site for this fact) rather than shown in both places.
+      '<div class="crd-now" hidden></div>' +
       '<div class="crd-spine" role="group" aria-label="Progress spine">' +
         '<span class="crd-spine-sr" aria-live="polite"></span>' +
         '<div class="crd-spine-head">' +
@@ -1184,7 +1241,15 @@
             '<span class="crd-convonav">' +
               '<button data-act="convo-prev">‹ prev</button>' +
               '<button data-act="convo-next">next ›</button>' +
-              '<button data-act="convo-latest">' + ico("jump-top") + " latest</button>" +
+              // The icon rides in the SAME `.crd-ico` wrapper every other header icon
+              // uses (see the Stop/Search/Flag/Rename/Pin buttons above) rather than a
+              // bare ico() call — that wrapper is what gives an icon a fixed CSS-px base
+              // (`.crd-ico svg { width: calc(14px * var(--ico-scale)) }`, ext_cr_detail.css)
+              // instead of inheriting this button's own fixed 10.5px font-size as its 1em
+              // base. A bare icon here still multiplies by --ico-scale, but off that tiny,
+              // non-scaling font-size base — so at 150%+ it visibly outgrows its "latest"
+              // label and its prev/next neighbours instead of tracking them.
+              '<button data-act="convo-latest"><span class="crd-ico">' + ico("jump-top") + "</span> latest</button>" +
             "</span></div>" +
           '<div class="crd-col-body"></div>' +
         "</div>" +
@@ -1327,7 +1392,6 @@
           // failure. See renderParseErrorNotice().
           '<div class="crd-timeline-parse-error" hidden></div>' +
           '<div class="crd-timeline-scroll"></div>' +
-          '<div class="crd-timeline-live" hidden></div>' +
           '<div class="crd-timeline-foot mono">older turns page in as you scroll — history is unbounded</div>' +
         "</div>" +
       "</section>"
@@ -1856,6 +1920,7 @@
     renderPhonePresence(node, session, nowSec);
     renderPhoneStop(node, session);
     renderForkBanner(node, ctx, session, ui);
+    renderLiveEntry(node, session, nowSec); // FIX 3 (job 2): the "Now" card, right above the spine
     renderSpine(node, ctx, session, nowMs, ui);
 
     renderDecisions(ui.panels.decisions, session);
@@ -1872,7 +1937,6 @@
     renderTerminalPanel(ui.panels.terminal, session);
 
     renderTimeline(node, ui, session, ctx);
-    renderLiveEntry(node, session, nowSec); // FIX 3
   }
 
   function renderBackline(node, session, state) {
@@ -3141,15 +3205,19 @@
     });
   }
 
-  // FIX 3: the live pinned entry. "live" is derived from data that actually exists on
-  // the detail dict — idle age vs LIVE_WINDOW (the same constant/threshold every other
-  // liveness check in this file uses) and session.overview.now (overview.py's own
+  // FIX 3 (job 2 relocation, owner correction: ABOVE the spine): the live "Now"
+  // card. "live" is derived from data that actually exists on the detail dict —
+  // idle age vs LIVE_WINDOW (the same constant/threshold every other liveness
+  // check in this file uses) and session.overview.now (overview.py's own
   // synthesis of "what it's doing right now": a running background agent, an
-  // in-progress todo, or the latest narration line — overview.py:20-38). Rendered as
-  // its OWN fixed element below the scrolling entries (not inside .crd-timeline-scroll,
-  // not part of mergeTimeline's sorted list), so re-painting it on every poll never
-  // reflows the scrollable history above — satisfies the doc's "layout-stable, never
-  // reflow" rule by construction rather than by a diffing trick.
+  // in-progress todo, or the latest narration line — overview.py:20-38).
+  // Originally rendered inside the timeline panel, below the scrolling history;
+  // now rendered into `.crd-now`, directly ABOVE the progress spine in the main
+  // session view (ext_cr_detail.js SKELETON, right before `.crd-spine`) so
+  // current state is the very first thing visible, no scrolling into the
+  // conversation required. Still ONE renderer / ONE call site — moved, not
+  // duplicated — and repainting it on every poll never reflows the timeline or
+  // anything else on the page.
   function renderLiveEntry(node, session, nowSec) {
     var wrap = ui_findLiveEl(node);
     if (!wrap) return;
@@ -3183,7 +3251,7 @@
       "</div>" +
       '<div class="crd-live-text">' + esc(ov.now) + "</div>";
   }
-  function ui_findLiveEl(node) { return qs(node, ".crd-timeline-live"); }
+  function ui_findLiveEl(node) { return qs(node, ".crd-now"); }
 
   function renderSearchResults(node, ui, query) {
     var box = qs(node, ".crd-search-results");
@@ -3219,6 +3287,8 @@
     mergeTimeline: mergeTimeline,
     deriveLinks: deriveLinks,
     stateOf: stateOf,
+    detailIsWorking: detailIsWorking,
+    renderLiveEntry: renderLiveEntry,
     firstEventTime: firstEventTime,
     extractDiagram: extractDiagram,
     groupAgentReruns: groupAgentReruns,

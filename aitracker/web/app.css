@@ -12,6 +12,73 @@ html.light{--app:#f4efe3;--side:#efe8d8;--card:#fbf8f0;--raised:#f3ecdd;--line:#
 :root{--pin-blue:#A8C0C9;--pin-blue-bg:rgba(168,192,201,.16)}
 /* light-theme counterpart — copied verbatim from --text-dusk's light block in ext_cr.css (#395D6A). */
 html.light{--pin-blue:#395D6A;--pin-blue-bg:rgba(57,93,106,.14)}
+/* --st-awaiting/--st-working/--st-landed/--st-flagged/--st-failed: classic's own dedicated
+   state tokens, kept in sync with the control room's --state-awaiting/--state-working
+   (own green, no longer aliased to --state-thinking)/--state-done/--state-flagged/
+   --state-failed in ext_cr.css, per the same cross-view colour-parity ask that produced
+   --pin-blue above. Dedicated tokens (not a repoint of --gold/--green/--green2/--red) so
+   classic's non-state uses of those tokens — badges, links, mermaid, etc. — are untouched.
+   Both dark (default :root) and light (html.light) values are given explicitly for every
+   token, even the three whose hex is identical across themes, so neither theme is ever
+   left borrowing the other's block.
+   --st-working: per the owner's explicit, repeated ask for a GREEN working indicator
+   (overriding 01-foundations.md's own "Working = wheat" state table — forest/green there
+   is reserved for Landed, and using it for Working would collide with --st-landed, the
+   exact confusion the owner asked to avoid). Dark value started as this file's OWN --green
+   literal (#29d398, line 1) rather than a var() repoint, so classic's other --green
+   consumers (badges, links, the live/connected pill, etc.) are unaffected — same "dedicated
+   token, not a repoint" discipline the rest of this block already follows. The light value
+   has since diverged from --green (#1f9d6b) — see the contrast fix below — which is exactly
+   what keeping this a dedicated token (not a repoint) was for: --green itself is untouched.
+   Classic's default is DARK (:root, #29d398); html.light is the override (see below) — note
+   the inverted default vs. the control room's .tracker-next (light-by-default).
+   LIGHT VALUE (#1c9163, was #1f9d6b): the original #1f9d6b measured only 2.82:1 against
+   this theme's --side (#efe8d8) — below the WCAG 1.4.11 non-text 3:1 floor, and this hex is
+   now a state indicator (dot fill + outline), which is a non-text UI element the floor
+   applies to. Darkened (same hue, ~156°, so it stays recognisably the same emerald) to
+   #1c9163, which measures 3.26:1 against #efe8d8 (verified with the WCAG relative-luminance
+   formula) — clears the floor with a small margin — while staying clearly distinct from
+   --st-landed's light value #3B5747 (contrast between the two colours themselves: 2.0:1;
+   not a WCAG requirement, just a visual-separation sanity check). --green/--green2 (line 2)
+   are UNCHANGED — this is a --st-working-only fix, per the "dedicated token" discipline
+   above; --green's own light value (#1f9d6b) still carries the same 2.82:1 shortfall it
+   always has, which is pre-existing and out of scope here.
+   --st-working-rgb: the R,G,B triplet of --st-working, as a bare "r,g,b" string (no rgba()
+   wrapper) so @keyframes pulseDot below can build `rgba(var(--st-working-rgb),alpha)` —
+   custom properties resolve on the ANIMATED ELEMENT, not inside the @keyframes rule itself,
+   so this makes the halo repaint per theme instead of the fixed rgba(41,211,152,.55) that
+   used to hardcode the DARK hex and stay dark-green even under html.light. Kept in step
+   with --st-working by hand (no calc()-from-hex in plain CSS) — the two must be edited
+   together. --amber-rgb: same fix for @keyframes pulseAmber, which had the identical bug
+   (rgba(245,180,67,.5) is dark --amber's own RGB, so pulseAmber's halo was ALSO stuck on
+   the dark hue in light theme).
+   --st-awaiting-text/--st-flagged-text/--st-failed-text: TEXT-on-surface variants, distinct
+   from the --st-* DOT/border colours above — added because pointing badge foregrounds at the
+   dot colours (the earlier "parity" fix) left light-theme badges under the 4.5:1 WCAG text
+   floor (.statusbadge.waiting ~1.6:1, .flagbadge ~2.8:1, .failbadge ~3.2:1 measured against
+   their REAL composited backgrounds — .sitem.waiting/.statusbadge.waiting double-wash the
+   same translucent --amber-bg, so the badge's own background is amber-bg composited over
+   amber-bg-over-side, not a single wash). ext_cr.css's control room already carries dedicated
+   text variants for exactly this purpose (--text-awaiting/--text-flagged/--text-failed) —
+   these tokens mirror them so the dot and its label text stay deliberately different, per that
+   design system:
+     - dark values are copied verbatim from ext_cr.css's dark --text-awaiting/-flagged/-failed
+       (#F5C98E/#E5BFA5/#E0A491) — all clear >=7.9:1 against their real dark badge backgrounds.
+     - light --st-flagged-text/--st-failed-text are copied verbatim from ext_cr.css's light
+       --text-flagged/--text-failed (#7D3A28/#8A2F1B) — 6.86:1 / 5.83:1 against their real
+       backgrounds (chipbg solid; red-bg composited once over --side).
+     - light --st-awaiting-text is NOT copied verbatim from ext_cr.css's --text-awaiting
+       (#9A4F19): that value only reaches 3.88:1 against classic's actual DOUBLE-composited
+       amber-bg wash (a background shape the control room's own badge never has), still short
+       of 4.5:1. Darkened along the same hue from #9A4F19 to #7E4014, which clears 5.17:1
+       against that same double-washed background — the explicit "derive one" fallback this
+       token's comment documents because the doc's own text variant doesn't clear THIS badge's
+       real background.
+   .statusbadge.done is left on --st-landed directly (not a new -text token): its badge
+   background (--green-bg, single-composited over --side, no extra row-wash) already measures
+   6.96:1 dark / 5.8:1 light with the dot colour itself — no text variant needed there. */
+:root{--st-awaiting:#E58F3C;--st-working:#29d398;--st-working-rgb:41,211,152;--st-landed:#8FB187;--st-flagged:#C27950;--st-failed:#D2735A;--amber-rgb:245,180,67;--st-awaiting-text:#F5C98E;--st-flagged-text:#E5BFA5;--st-failed-text:#E0A491}
+html.light{--st-awaiting:#E58F3C;--st-working:#1c9163;--st-working-rgb:28,145,99;--st-landed:#3B5747;--st-flagged:#C27950;--st-failed:#C0553A;--amber-rgb:169,116,29;--st-awaiting-text:#7E4014;--st-flagged-text:#7D3A28;--st-failed-text:#8A2F1B}
 html,body{transition:background .18s,color .18s}
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;background:var(--app);color:var(--text);font-family:'Source Sans 3',system-ui,sans-serif}
@@ -19,8 +86,8 @@ html,body{margin:0;height:100%;background:var(--app);color:var(--text);font-fami
 ::-webkit-scrollbar{width:10px;height:10px}
 ::-webkit-scrollbar-thumb{background:var(--line3);border-radius:6px;border:2px solid transparent;background-clip:content-box}
 ::-webkit-scrollbar-track{background:transparent}
-@keyframes pulseDot{0%{box-shadow:0 0 0 0 rgba(41,211,152,.55)}70%{box-shadow:0 0 0 7px rgba(41,211,152,0)}100%{box-shadow:0 0 0 0 rgba(41,211,152,0)}}
-@keyframes pulseAmber{0%{box-shadow:0 0 0 0 rgba(245,180,67,.5)}70%{box-shadow:0 0 0 6px rgba(245,180,67,0)}100%{box-shadow:0 0 0 0 rgba(245,180,67,0)}}
+@keyframes pulseDot{0%{box-shadow:0 0 0 0 rgba(var(--st-working-rgb),.55)}70%{box-shadow:0 0 0 7px rgba(var(--st-working-rgb),0)}100%{box-shadow:0 0 0 0 rgba(var(--st-working-rgb),0)}}
+@keyframes pulseAmber{0%{box-shadow:0 0 0 0 rgba(var(--amber-rgb),.5)}70%{box-shadow:0 0 0 6px rgba(var(--amber-rgb),0)}100%{box-shadow:0 0 0 0 rgba(var(--amber-rgb),0)}}
 @keyframes blink{0%,55%{opacity:1}56%,100%{opacity:.25}}
 @keyframes spinIn{from{stroke-dashoffset:var(--circ)}}
 .app{height:100vh;display:flex;overflow:hidden}
@@ -86,25 +153,40 @@ html,body{margin:0;height:100%;background:var(--app);color:var(--text);font-fami
 .agtoggle.open{opacity:1;filter:none}
 .sitem.hasagents{border-color:var(--amber-line)}
 /* end-state highlights: ⏳ waiting on your answer (prominent) vs ✅ completed its last run (subtle) */
-.sitem.waiting{border-left:3px solid var(--gold);background:var(--amber-bg)}
-.sitem.done{border-left:3px solid var(--green2)}
+.sitem.waiting{border-left:3px solid var(--st-awaiting);background:var(--amber-bg)}
+.sitem.done{border-left:3px solid var(--st-landed)}
 .statusbadge{flex:0 0 auto;font-size:10px;border-radius:4px;padding:0 5px;margin-left:2px;font-weight:600}
-.statusbadge.waiting{color:var(--amber);background:var(--amber-bg)}
-.statusbadge.done{color:var(--green2);background:var(--green-bg)}
-/* open 🚩 count on a row — red so it reads as "needs attention", unlike the amber end-state */
-.sitem.flagged{border-left:3px solid var(--red)}
-.flagbadge{flex:0 0 auto;font-size:10px;border-radius:4px;padding:0 5px;margin-left:2px;font-weight:600;color:var(--red);background:var(--chipbg)}
+/* Badge foreground repointed to the row's own state family — border/dot keep the DOT colour
+   (--st-*), badge TEXT uses that state's TEXT-on-surface variant (--st-*-text, see the :root/
+   html.light comment above): a prior pass pointed badge text at the dot colour directly, which
+   restored cross-view parity but dropped light-theme contrast to ~1.6-3.2:1 (below the 4.5:1
+   text floor) since a dot colour is tuned for a 3:1 non-text floor, not 4.5:1 text. Background
+   tints (--amber-bg/--green-bg/--chipbg) are left as-is: untouched by this ask, and already
+   accounted for when deriving the -text tokens' contrast above. .statusbadge.done keeps
+   --st-landed directly (see the token comment: its own background already clears 4.5:1 with
+   the dot colour, no separate text variant needed there). */
+.statusbadge.waiting{color:var(--st-awaiting-text);background:var(--amber-bg)}
+.statusbadge.done{color:var(--st-landed);background:var(--green-bg)}
+/* open 🚩 count on a row — matches the row's own --st-flagged border, not the shared --red */
+.sitem.flagged{border-left:3px solid var(--st-flagged)}
+.flagbadge{flex:0 0 auto;font-size:10px;border-radius:4px;padding:0 5px;margin-left:2px;font-weight:600;color:var(--st-flagged-text);background:var(--chipbg)}
 /* compact todo progress ("N/M") on a session row — see sessionRow()'s todoBadge in app.js */
 .todobadge{flex:0 0 auto;font-size:10px;border-radius:4px;padding:0 5px;margin-left:2px;font-weight:600;font-family:'JetBrains Mono',monospace;color:var(--blue);background:var(--blue-deep)}
-/* matches the control room's failing state, which the sidebar could not show */
-.failbadge{color:var(--red);background:var(--red-bg);border:1px solid var(--red-line);border-radius:4px;padding:0 5px;font-size:10px;display:inline-flex;align-items:center;gap:3px}
+/* matches the control room's failing state, which the sidebar could not show. Foreground
+   repointed from the shared --red to the dedicated --st-failed (was the one state consumer
+   still on --red, so classic's own failing badge disagreed with the control room's #D2735A/
+   #C0553A). --red-bg/--red-line stay: both are warm-red/terracotta hues extremely close to
+   --st-failed's own hue (dark ~15° vs --red's ~4°; light ~14° vs ~7°) and heavily
+   desaturated/translucent as tints, so --st-failed reads cleanly on them — no clash to fix,
+   and giving the tint its own dedicated token would be a repoint with no visible benefit. */
+.failbadge{color:var(--st-failed-text);background:var(--red-bg);border:1px solid var(--red-line);border-radius:4px;padding:0 5px;font-size:10px;display:inline-flex;align-items:center;gap:3px}
 .ssnip{color:var(--dim);font-size:11px;margin-top:6px;line-height:1.35;font-family:'JetBrains Mono',monospace;overflow-wrap:anywhere}
 .ssnip b{color:var(--text);background:var(--hl);border-radius:2px}
 .smatch{color:var(--green)}
 .sidefoot{padding:12px 14px;border-top:1px solid var(--line);color:var(--dim);font-size:11px;font-family:'JetBrains Mono',monospace;display:flex;align-items:center;justify-content:space-between}
 
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex:0 0 auto;background:var(--dim)}
-.dot.live{background:var(--green);animation:pulseDot 1.8s infinite}
+.dot.live{background:var(--st-working);animation:pulseDot 1.8s infinite}
 .dot.amber{background:var(--amber);animation:pulseAmber 1.8s infinite}
 
 /* main */
@@ -137,14 +219,50 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid var(--line)}
 .nowbanner{margin-top:16px;display:flex;align-items:center;gap:12px;background:linear-gradient(90deg,var(--glow),var(--blue-deep));border:1px solid var(--blue-line);border-left:3px solid var(--blue);border-radius:10px;padding:11px 14px}
 .nowbanner .dot{width:9px;height:9px;background:var(--blue);animation:pulseDot 1.8s infinite}
 .nowbanner .lbl{font-size:10px;letter-spacing:.6px;text-transform:uppercase;color:var(--muted)}
-.nowbanner.done{background:linear-gradient(90deg,var(--green-deep),var(--blue-deep));border-color:var(--green-line);border-left-color:var(--green)}
-.nowbanner.done .dot{background:var(--green);animation:none}
-.nowbanner.done .lbl{color:var(--green2)}
+/* .nowbanner.done shares the same "landed" semantic as .sitem.done (app.js:1773 toggles both
+   on `!live && !d.waiting`), so it must show the SAME green as the row/badge --st-landed, not
+   the shared/brighter --green,--green2 -- otherwise one completed session paints two different
+   greens on one page. border/dot repointed to --st-landed (kept solid, no separate text variant
+   needed for those two: dot is a fill, border is non-text). .lbl repointed to --st-landed too --
+   its 10px uppercase label sits on the same gradient background as before (--green-deep to
+   --blue-deep) and --st-landed clears 6.4-7.6:1 dark / 6.9-7.0:1 light against BOTH gradient
+   endpoints (computed with the real WCAG relative-luminance formula), comfortably above the
+   4.5:1 text floor, so no dedicated --st-landed-text token is needed here. */
+.nowbanner.done{background:linear-gradient(90deg,var(--green-deep),var(--blue-deep));border-color:var(--green-line);border-left-color:var(--st-landed)}
+.nowbanner.done .dot{background:var(--st-landed);animation:none}
+.nowbanner.done .lbl{color:var(--st-landed)}
 .nowfile{flex:0 0 auto;max-width:38%;display:flex;align-items:center;gap:5px;font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--muted);background:var(--blue-deep);border:1px solid var(--blue-line);border-radius:8px;padding:4px 9px;cursor:pointer;white-space:nowrap;overflow:hidden}
 .nowfile:hover{border-color:var(--blue);color:var(--head)}
 .nowfile .nfn{overflow:hidden;text-overflow:ellipsis}
 .nowbanner .txt{font-size:14px;color:var(--text);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .cursor{animation:blink 1s steps(1) infinite}
+/* prefers-reduced-motion: reduce -- covers EVERY indefinitely/attention-grabbing animating
+   element in this file: .dot.live/.dot.amber (sidebar+ring live indicators), .nowbanner .dot
+   (header "now" banner dot -- index.html renders it as a bare <span class=dot>, so neither
+   .live nor .amber ever matches it; it needs its OWN selector here), .cursor (the blinking
+   text-entry caret injected live-session text, the canonical reduced-motion offender -- an
+   indefinitely blinking element), and .flash (one-shot card-attention pulse). MUST come
+   AFTER every rule above that sets these elements' `animation` (all of them, this file) --
+   equal specificity (0-2-0 for .dot.live etc, and media queries add no specificity of their
+   own) means the LATER rule wins the cascade, so a reduced-motion override placed earlier in
+   source order would be silently re-overridden by the plain rules that follow it.
+   Static fallbacks, not disappearance: .dot.live/.dot.amber/.nowbanner .dot keep a solid
+   outline in their own state colour so they stay identifiable without the pulse (matching
+   ext_cr_board.css's .cr-tile-dot.is-working). .nowbanner.done .dot already switches to a
+   static --st-landed fill with no animation even outside this block, so its outline is
+   repointed to --st-landed (the same "landed" token the dot/row/badge all share -- not the
+   brighter shared --green) rather than inheriting the (blue, "still working") .nowbanner .dot
+   outline above -- otherwise a completed session would show a landed-green dot ringed in blue.
+   .cursor gets
+   an explicit opacity:1 (rather than an outline, which doesn't suit a text caret): merely
+   setting animation:none already leaves it fully opaque by default since nothing else sets
+   opacity, but the explicit value documents the fallback and pins it against a future
+   opacity rule landing on .cursor upstream of this block. .flash keeps its own static
+   version of the flashcard keyframe's peak (18%) box-shadow as the "look here" cue, rather
+   than losing the highlight outright -- its child .flash>h2{color:var(--blue)} was already a
+   second, motion-independent signal, but dropping the box-shadow too would still be a
+   needless loss of an identifiable static state for zero accessibility gain. */
+@media (prefers-reduced-motion: reduce){.dot.live,.dot.amber,.nowbanner .dot,.cursor,.flash{animation:none}.dot.live{outline:2px solid var(--st-working);outline-offset:2px}.dot.amber{outline:2px solid var(--amber);outline-offset:2px}.nowbanner .dot{outline:2px solid var(--blue);outline-offset:2px}.nowbanner.done .dot{outline-color:var(--st-landed)}.cursor{opacity:1}.flash{box-shadow:0 0 0 3px rgba(76,141,255,.4)}}
 .srcnote{margin-top:12px;padding:8px 12px;background:var(--amber-deep);border:1px solid var(--amber-line);border-left:3px solid var(--gold);border-radius:8px;color:var(--amber);font-size:12px}
 /* Fork lineage banners (registry.py's continued_as/continued_from) — inserted dynamically by
    app.js (index.html has no static slot for an optional, provider-agnostic feature). .forkas
