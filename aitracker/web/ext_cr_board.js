@@ -935,6 +935,27 @@ window.CR = window.CR || {};
       return (s.todo_done || 0) + '/' + s.todo_total;
     }
 
+    // The Sessions destination is a full-width list, not the tight rail, so it has
+    // room for the SAME widget the board tiles draw. It therefore calls todoTicks()
+    // rather than growing a third rendering of "how far along is this session"
+    // (the rail's compact N/M above is already the second) -- conventions rule 4:
+    // land a capability on the shared renderer, never fork it per view.
+    //
+    // The background-agent count gets its words back here too. The rail shows a
+    // bare glyph + number because it has no room; in this list "7 background
+    // agents" is what the board tile says, so both destinations now read alike.
+    function railRichProgress(s) {
+      var bits = [];
+      if (s.bg) {
+        bits.push(h('div', { class: 'cr-rail-bg' },
+          [glyph('agent', ''),
+           ' ' + s.bg + ' background agent' + (s.bg === 1 ? '' : 's')]));
+      }
+      var ticks = todoTicks(s);   // null when the session recorded no todos
+      if (ticks) bits.push(ticks);
+      return bits.length ? h('div', { class: 'cr-rail-progress' }, bits) : null;
+    }
+
     // Shared by the rail's own full-row mode AND the Sessions destination
     // (renderSessionsView below) — the owner's instruction is that both render
     // from the SAME ordering/grouping code, not a second copy. Appends group
@@ -955,6 +976,9 @@ window.CR = window.CR || {};
     // footer and the Sessions pager both need the UNWINDOWED total), `shown` is
     // how many individual rows this call actually rendered.
     function renderSessionRows(container, sessions, now, opts) {
+      // Passed straight through to every railRow() below: the rail calls this with
+      // no opts and keeps its compact rows; the Sessions destination asks for rich.
+      var rowOpts = (opts && opts.rich) ? { rich: true } : null;
       var filtered = railRowsFor(sessions.filter(function (s) { return !s.agent; }), opts ? '' : undefined);
       var order = railOrder(filtered);
       var flat = order.pinned.concat(order.unpinned);   // pinned-first, newest-first within each
@@ -979,7 +1003,7 @@ window.CR = window.CR || {};
       if (pinnedShown.length) {
         container.appendChild(h('div', { class: 'cr-rail-group-header' },
           [glyph('pin'), 'Pinned — ' + pinnedShown.length + ' · newest first']));
-        pinnedShown.forEach(function (s) { container.appendChild(railRow(s, now)); });
+        pinnedShown.forEach(function (s) { container.appendChild(railRow(s, now, rowOpts)); });
       }
       if (unpinnedShown.length || !opts) {
         // Decision 2: pinned already led above, untouched by any mode — this
@@ -992,12 +1016,12 @@ window.CR = window.CR || {};
         if (groupMode === 'none') {
           container.appendChild(h('div', { class: 'cr-rail-group-header' },
             ['Sessions — ' + unpinnedShown.length + ' · newest first']));
-          unpinnedShown.forEach(function (s) { container.appendChild(railRow(s, now)); });
+          unpinnedShown.forEach(function (s) { container.appendChild(railRow(s, now, rowOpts)); });
         } else {
           groupUnpinnedSessions(unpinnedShown, now, groupMode).forEach(function (g) {
             container.appendChild(h('div', { class: 'cr-rail-group-header' },
               [g.label + ' — ' + g.sessions.length]));
-            g.sessions.forEach(function (s) { container.appendChild(railRow(s, now)); });
+            g.sessions.forEach(function (s) { container.appendChild(railRow(s, now, rowOpts)); });
           });
         }
       }
@@ -1016,7 +1040,7 @@ window.CR = window.CR || {};
               h('span', { class: 'cr-rail-agentchevron' }, [icon('chevron', '<path d="M9 6l6 6-6 6"/>')])]));
           if (isOpen) {
             collapseAgentRuns(b.sessions).sort(function (a, c) { return (c.mtime || 0) - (a.mtime || 0); })
-              .forEach(function (s) { container.appendChild(railRow(s, now)); });
+              .forEach(function (s) { container.appendChild(railRow(s, now, rowOpts)); });
           }
         });
       }
@@ -1069,6 +1093,9 @@ window.CR = window.CR || {};
       // clips to "scrol . N more" -- collapsed gets a compact "+N" instead,
       // with the full sentence kept in `title` so nothing is lost, just
       // reflowed. The expanded form is untouched.
+      // A session folded into an agent GROUP row is deliberately counted here:
+      // "more" means "not shown as its own row", and the group row is a fold, not
+      // a listing. tests/test_cr_rail_polish.py pins this exact intent.
       var more = baseSessions.length - shown;
       var moreN = Math.max(0, more);
       if (collapsed) {
@@ -1229,10 +1256,11 @@ window.CR = window.CR || {};
           els.sessionsList.appendChild(h('div', { class: 'cr-sessions-empty' },
             ['No sessions match “' + sessionsSearchQuery + '”.']));
         } else {
-          page.forEach(function (s) { els.sessionsList.appendChild(railRow(s, now)); });
+          page.forEach(function (s) { els.sessionsList.appendChild(railRow(s, now, { rich: true })); });
         }
       } else {
-        renderSessionRows(els.sessionsList, sessions, now, { page: sessionsPage, pageSize: sessionsPageSize });
+        renderSessionRows(els.sessionsList, sessions, now,
+          { page: sessionsPage, pageSize: sessionsPageSize, rich: true });
       }
 
       els.sessionsList.scrollTop = scrollTop;
@@ -1272,9 +1300,14 @@ window.CR = window.CR || {};
     // pipClassFor() below, both built on top of the single sessionState()
     // derivation — never a second state derivation. 'idle' maps to '' because
     // both .cr-rail-dot and .cr-orb-pip already default to --state-idle grey.
+    // 'failing' was missing here while sessionState() has returned it since the
+    // fail_cmd field landed -- so a LIVE FAILING session fell through to '' and
+    // drew the same grey dot as an idle one, while the very same tile's text said
+    // "fail: <cmd>" and its icon was a red X. The dot is the only state signal the
+    // rail's collapsed orb mode has at all, so there it was the whole signal.
     var STATE_DOT_CLASS = {
       awaiting: 'is-waiting', working: 'is-live', flagged: 'is-flagged',
-      landed: 'is-landed', idle: ''
+      failing: 'is-failing', landed: 'is-landed', idle: ''
     };
     function stateDotClass(state) { return STATE_DOT_CLASS[state] || ''; }
 
@@ -1290,7 +1323,7 @@ window.CR = window.CR || {};
     // previous label omitted the state word entirely (title + "(pinned)" only),
     // which an earlier audit flagged — that suffix is dropped here since the
     // doc's format has no room for it and the state word is what's required.
-    var ORB_STATE_WORD = { awaiting: 'waiting on you', flagged: 'flagged', working: 'working', landed: 'landed', idle: 'idle' };
+    var ORB_STATE_WORD = { awaiting: 'waiting on you', flagged: 'flagged', working: 'working', failing: 'failing', landed: 'landed', idle: 'idle' };
     function orbStateWord(state) { return ORB_STATE_WORD[state] || state; }
 
     function railOrb(s, now) {
@@ -1306,7 +1339,11 @@ window.CR = window.CR || {};
       ]);
     }
 
-    function railRow(s, now) {
+    // `opts.rich` is set only by the Sessions destination (renderSessionsView /
+    // renderSessionRows below). The rail passes nothing and is untouched -- its
+    // rows are three tight lines already.
+    function railRow(s, now, opts) {
+      var rich = !!(opts && opts.rich);
       // BUG FIX: dotClass used to only distinguish is-waiting/is-live/default —
       // no flagged, no landed colour. Reuses sessionState() (the single state
       // derivation) and the same STATE_DOT_CLASS map pipClassFor() uses, so the
@@ -1330,7 +1367,9 @@ window.CR = window.CR || {};
       // `s.snippet` only exists on a decorated search-hit object (never on a
       // real list-dict session) — falls back to the prompt/title tooltip
       // exactly as before whenever it's absent, so this is purely additive.
-      var todoLabel = railTodoLabel(s);
+      // in rich mode the tick bar carries this, so the compact N/M would be a
+      // duplicate of the same number on the same row
+      var todoLabel = rich ? '' : railTodoLabel(s);
       // GAP CLOSE (rail parity, owner ruling): the classic sidebar's meta line is
       // `project · source · age` (app.js sessionRow's `bits`), and its row carries a
       // waiting/done status badge. The rail had NONE of the three. Mirrored here
@@ -1446,7 +1485,8 @@ window.CR = window.CR || {};
         }, [glyph('edit', '')]),
       ]);
       return h('div', {
-        class: 'cr-rail-row' + (s.id === selectedSessionId ? ' cr-rail-row--selected' : '') + rowMods,
+        class: 'cr-rail-row' + (s.id === selectedSessionId ? ' cr-rail-row--selected' : '') +
+          (rich ? ' cr-rail-row--rich' : '') + rowMods,
         tabindex: '0', role: 'button', title: titleAttr, 'aria-label': label, 'data-id': s.id,
         onclick: function () { openSession(s.id); },
         onkeydown: function (e) { if (e.key === 'Enter') openSession(s.id); }
@@ -1481,6 +1521,7 @@ window.CR = window.CR || {};
             .concat(srcLabelText ? [srcLabelText + ' · '] : [])
             .concat(railRowMeta(s, now))),
         actions,
+        rich ? railRichProgress(s) : null,
       ]);
     }
 

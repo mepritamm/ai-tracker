@@ -695,15 +695,21 @@
 .cr .crd-spine-spans {
   display: flex;
   align-items: center;
-  gap: 3px;
+  gap: calc(3px * var(--ico-scale, 1));
   margin-left: 4px;
+  flex-wrap: wrap;
 }
+/* Sized off the SAME `--ico-scale` the Config dialog's "Icon size" slider drives
+   (app.js applyIconStyle sets it on the document root, 0.75-2.0), so these grow
+   and shrink with every other glyph in the app instead of keeping a private
+   miniature type scale. The 11.5px/5px-11px base is `.crd-statchip`'s -- the
+   established chip size here -- rather than the 9px this control used to invent.
+   Font-family is inherited (sans), matching every other chip row. */
 .cr .crd-spine-span {
-  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  font-size: 9px;
-  line-height: 1;
-  padding: 3px 7px;
+  font-size: calc(11.5px * var(--ico-scale, 1));
+  line-height: 1.2;
+  padding: calc(5px * var(--ico-scale, 1)) calc(11px * var(--ico-scale, 1));
   border-radius: var(--radius-pill, 999px);
   border: 1px solid var(--line-subtle);
   background: none;
@@ -724,34 +730,55 @@
   outline: 2px solid var(--line-focus);
   outline-offset: 2px;
 }
-/* the "now" reset only exists while panned off the live edge -- dashed so it
-   reads as a return-to-default, not as another span choice */
+/* the "now" jump only exists while the strip is zoomed in -- dashed so it reads
+   as a return-to-default, not as another zoom choice */
 .cr .crd-spine-live {
   border-style: dashed;
   border-color: var(--line-agent);
   color: var(--text-thinking);
 }
 
-.cr .crd-spine-track { position: relative; }
-/* pan only once a chip has narrowed the window; `pan-y` keeps the page's own
-   vertical scroll working on a phone while we take the horizontal axis */
-.cr .crd-spine-track.is-pannable { cursor: grab; touch-action: pan-y; }
-.cr .crd-spine-track.is-panning { cursor: grabbing; user-select: none; }
+/* The viewport. renderSpine sets .crd-spine-track's width to the zoom
+   percentage, so anything above 100% overflows here and becomes scrollable --
+   the browser then owns the clamping at both ends, which is why no bespoke pan
+   arithmetic survives in the JS. */
+.cr .crd-spine-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+}
+/* claim the horizontal axis ONLY when there is something to scroll; `pan-y`
+   leaves the page's own vertical scrolling to the browser on a phone */
+.cr .crd-spine-scroll.is-scrollable { cursor: grab; touch-action: pan-y; }
+.cr .crd-spine-scroll.is-panning { cursor: grabbing; user-select: none; }
+.cr .crd-spine-scroll::-webkit-scrollbar { height: 6px; }
+.cr .crd-spine-scroll::-webkit-scrollbar-track { background: transparent; }
+.cr .crd-spine-scroll::-webkit-scrollbar-thumb {
+  background: var(--line-default);
+  border-radius: 999px;
+}
+.cr .crd-spine-track { position: relative; width: 100%; }
 
-/* An empty strip reads as broken, so both empty states say what they are. */
-.cr .crd-spine-bar:empty {
+/* The bar keeps its full height no matter what, so the spine can never read as
+   "vanished". With the zoom model there is only one way it can be empty -- the
+   session recorded no todos at all (Claude prunes its task files after a couple
+   of days) -- so name that case instead of showing a blank strip. */
+.cr .crd-spine-bar { min-height: 26px; }
+.cr .crd-spine.is-empty-bar .crd-spine-bar {
+  position: relative;
   border-top: 1px dashed var(--line-subtle);
   border-bottom: 1px dashed var(--line-subtle);
 }
-.cr .crd-spine.is-empty-window .crd-spine-track::after {
-  content: "nothing recorded in this window " "\2014" " drag to pan, or pick a longer span";
+.cr .crd-spine.is-empty-bar .crd-spine-bar::after {
+  content: "no tasks recorded for this session";
   position: absolute;
   inset: 0;
   display: flex;
   align-items: center;
   justify-content: center;
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: calc(9px * var(--ico-scale, 1));
   color: var(--text-muted);
   pointer-events: none;
 }
@@ -794,8 +821,8 @@
 /* width/position changes (a span chip, a pan, a todo completing) glide */
 .cr .crd-seg { transition: flex-basis .4s cubic-bezier(.22,.61,.36,1); }
 .cr .crd-mark { transition: left .4s cubic-bezier(.22,.61,.36,1); }
-.cr .crd-spine-track.is-panning .crd-seg,
-.cr .crd-spine-track.is-panning .crd-mark { transition: none; } /* follow the finger */
+.cr .crd-spine-scroll.is-panning .crd-seg,
+.cr .crd-spine-scroll.is-panning .crd-mark { transition: none; } /* follow the finger */
 
 /* a light sweep across the running segment -- the "still working" tell */
 .cr .crd-spine { --crd-shimmer: rgba(255,255,255,.55); }
@@ -1763,8 +1790,10 @@
   .cr .crd-spine-span {
     min-height: 44px;
     min-width: 44px;
-    padding: 4px 10px;
-    font-size: 11px;
+    padding: 4px calc(10px * var(--ico-scale, 1));
+    /* still scaled by the Config icon size -- a hard 11px here would have made
+       the phone the one place the slider did nothing */
+    font-size: calc(11.5px * var(--ico-scale, 1));
   }
 
   .cr .crd-phonehead {

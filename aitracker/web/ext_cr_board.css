@@ -620,6 +620,29 @@
   min-width: 0;
 }
 .tracker-next .cr-rail-row:hover { background: var(--fill-row-hover); }
+
+/* Sessions destination only. The row wraps so the progress block gets a line of
+   its own; the rail keeps its single-line rows untouched. `align-items` is left
+   at `center` deliberately -- switching it to flex-start here would re-align the
+   status dot and title against every other rail row in the app. */
+.tracker-next .cr-rail-row--rich { flex-wrap: wrap; }
+.tracker-next .cr-rail-progress {
+  flex: 0 0 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 2px;
+  padding-left: 16px;   /* clears the status dot, so it lines up under the title */
+}
+.tracker-next .cr-rail-bg {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  /* scaled by the Config "Icon size" slider, like every other glyph-bearing
+     label in the app -- a hard px here is exactly the drift being fixed */
+  font-size: calc(10.5px * var(--ico-scale, 1));
+  color: var(--text-muted);
+}
 .tracker-next .cr-rail-row--selected {
   background: var(--surface-raised);
   border: 1px solid var(--line-agent);
@@ -674,6 +697,9 @@
  * is-waiting existed, so most non-idle sessions showed no state colour. */
 .tracker-next .cr-rail-dot.is-flagged { background: var(--state-flagged); }
 .tracker-next .cr-rail-dot.is-landed { background: var(--state-done); }
+/* a live session with a failing command had no dot colour at all -- it was
+   indistinguishable from idle, in the one place the orb rail can show state */
+.tracker-next .cr-rail-dot.is-failing { background: var(--state-failed); }
 /* Decision 1 — the rail row's title + directory now stack in their own
  * column so the row can carry both without growing the dot/meta layout;
  * `.cr-rail-title` no longer needs its own flex-item sizing, its wrap does. */
@@ -886,6 +912,7 @@
 .tracker-next .cr-orb-pip.is-flagged { background: var(--state-flagged); }
 /* BUG FIX: no landed colour existed on the orb pip at all. */
 .tracker-next .cr-orb-pip.is-landed { background: var(--state-done); }
+.tracker-next .cr-orb-pip.is-failing { background: var(--state-failed); }
 
 /* Tier boundary (doc 02's breakpoint table): 1024–1279px is the "2 columns,
  * rail collapsed to orbs, in-flow" tier; < 1024px is the "1 column, rail

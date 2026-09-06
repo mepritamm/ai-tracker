@@ -111,23 +111,53 @@ class TestSpineWindowControlShipped(unittest.TestCase):
         i = self.page.find("ui._boundSid = sid;")
         self.assertGreater(i, -1)
         rebind = self.page[i:i + 900]
-        for field in ("ui.spineSpanMs = null;", "ui.spineEndMs = null;",
-                      "ui.spineJustPanned = false;"):
+        for field in ("ui.spineZoomMs = null;", "ui.spineJustPanned = false;",
+                      "sc0.scrollLeft = 0;"):
             self.assertIn(field, rebind, field + " not reset on session change")
 
-    def test_pan_clamps_at_write_time_so_drag_slack_cannot_accumulate(self):
-        """ui.spineEndMs is written straight from pointer deltas. If it were only
-        clamped when READ, dragging past the start of the session would bank the
-        excess and the spine would sit frozen until you dragged all of it back.
-        The pan therefore re-clamps through spineWindow -- the same single bound
-        the chips use, not a second copy of the arithmetic."""
-        self.assertIn("var clamped = spineWindow(ui, firstEventTime(", self.page)
+    def test_drag_moves_the_viewport_not_a_hand_rolled_cursor(self):
+        """The spine now scrolls a real overflow viewport, so the BROWSER clamps
+        both ends. That deletes a whole class of bug the previous window model
+        needed its own arithmetic (and its own clamp) to avoid — dragging past an
+        edge can no longer bank slack, because there is no cursor to bank it in.
+
+        Guard against a regression back to a bespoke cursor."""
+        self.assertIn("scroll.scrollLeft = drag.left0 - dx;", self.page)
+        self.assertNotIn("spineWindow", self.page, "the window cursor is gone")
+        self.assertNotIn("spineEndMs", self.page, "no absolute-time cursor survives")
+
+    def test_scroll_is_re_anchored_on_a_chip_click_not_on_every_poll(self):
+        """Found by adversarial review, and severe. The re-anchor guard originally
+        keyed on the computed zoom PERCENTAGE — but that is elapsedMs/span, and
+        elapsedMs grows on every 2s poll of a live session. The guard therefore
+        fired continuously, snapping the view back to the right edge about twice a
+        minute and ripping the page out from under an in-progress drag.
+
+        It must key on the user's actual chip choice, which only changes when they
+        click one."""
+        self.assertIn("ui._spineZoomKey !== ui.spineZoomMs", self.page)
+        self.assertNotIn("ui._spineZoomPct !== zoomPct", self.page,
+                         "re-anchor still keyed on a value that drifts with time")
+        # and a poll must not fight a drag that is already under way
+        self.assertIn("!ui.spineDragging", self.page)
+        self.assertIn("ui.spineDragging = true;", self.page)
+        self.assertIn("ui.spineDragging = false;", self.page)
+
+    def test_zoom_sets_the_track_width_so_the_strip_can_overflow(self):
+        """The chips widen the strip; they do not filter it. This is what makes
+        clicking one incapable of emptying the bar."""
+        self.assertIn('track.style.width = zoomPct.toFixed(2) + "%"', self.page)
+        self.assertIn("SPINE_ZOOM_CAP", self.page)
 
     def test_pan_is_touch_usable_without_eating_vertical_scroll(self):
         """`pan-y` hands us the horizontal axis and leaves the page's own vertical
         scrolling to the browser — the difference between a usable phone control
-        and a spine that traps the scroll."""
-        self.assertRegex(self.css, r"\.crd-spine-track\.is-pannable\s*\{[^}]*touch-action:\s*pan-y")
+        and a spine that traps the scroll. It is claimed ONLY while the strip is
+        actually scrollable, so an un-zoomed spine never interferes at all."""
+        self.assertRegex(
+            self.css,
+            r"\.crd-spine-scroll\.is-scrollable\s*\{[^}]*touch-action:\s*pan-y")
+        self.assertRegex(self.css, r"\.crd-spine-scroll\s*\{[^}]*overflow-x:\s*auto")
 
     def test_window_control_is_not_gated_by_host(self):
         """tracker-gap's localhost-vs-remote rule: no control the user RECORDS with
@@ -164,6 +194,31 @@ class TestSpineWindowControlShipped(unittest.TestCase):
                     j += 1
             i = self.css.find("@media", i + 1)
         self.fail("no @media block matching %r" % needle)
+
+    def test_chips_scale_with_the_config_icon_size(self):
+        """The user asked for these to match the icons/emoji/text size. That knob
+        is Config > Icon size, which app.js's applyIconStyle() exposes as the
+        `--ico-scale` custom property on the document root (0.75-2.0). Sizing off
+        that is the difference between a control that participates in the setting
+        and one with a private type scale nothing can change."""
+        i = self.css.find(".crd-spine-span {")
+        self.assertGreater(i, -1)
+        rule = self.css[i:self.css.find("}", i)]
+        self.assertIn("var(--ico-scale", rule, "font-size ignores the icon-size setting")
+        self.assertRegex(rule, r"font-size:\s*calc\(11\.5px \* var\(--ico-scale")
+        # 11.5px is .crd-statchip's size -- the established chip size in this app,
+        # not the 9px this control used to invent for itself
+        self.assertNotRegex(rule, r"font-size:\s*9px")
+
+    def test_empty_bar_keeps_its_height_and_says_why(self):
+        """"Clicking a chip makes the spine invisible" was the reported bug. The
+        zoom model removes the cause (nothing is filtered), but a session with no
+        todos at all still yields an empty bar — so it keeps full height and names
+        the reason rather than collapsing into a blank strip."""
+        self.assertRegex(self.css, r"\.crd-spine-bar\s*\{[^}]*min-height:\s*26px")
+        self.assertIn("is-empty-bar", self.css)
+        self.assertIn("no tasks recorded for this session", self.css)
+        self.assertIn('spineEl.classList.toggle("is-empty-bar", !plan.segments.length)', self.page)
 
     def test_chips_are_in_the_real_phone_tier_not_a_narrower_sub_range(self):
         """The phone tier in this file is <=600px; <=480px is a NARROWER sub-range

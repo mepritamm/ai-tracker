@@ -352,18 +352,22 @@
     return SPINE_SPANS.filter(function (c) { return c.ms < elapsedMs; });
   }
 
-  // ui state -> concrete window. endMs == null means "anchored to the live edge",
-  // which is what keeps a running session's window following the clock on each
-  // 2s poll instead of drifting backwards off the end.
-  function spineWindow(ui, firstMs, nowMs) {
-    if (!ui || !ui.spineSpanMs) return null;
-    var span = ui.spineSpanMs;
-    var end = ui.spineEndMs == null ? nowMs : ui.spineEndMs;
-    if (end > nowMs) end = nowMs;
-    // never pan past the first event: the window's left edge stops at firstMs
-    if (firstMs != null && end - span < firstMs) end = firstMs + span;
-    if (end > nowMs) end = nowMs; // span longer than the session -> pinned to now
-    return { spanMs: span, endMs: end };
+  // ui state -> how wide to draw the strip, as a percentage of its container.
+  //
+  // This is a ZOOM, not a filter. "All" is 100% -- the strip fits, exactly as it
+  // always did. Any other choice draws the strip WIDER than the panel so the
+  // chosen span fills the view and the rest is reached by scrolling. That is the
+  // whole point: a long session becomes readable without a single todo or event
+  // ever being hidden, which is what a filtering window could not promise.
+  //
+  // The cap matters. A real 2192h session on this machine at a 15m zoom would
+  // otherwise want 8,768,000% -- tens of millions of pixels. 60x is already a
+  // dramatic spread and stays inside every browser's layout limits.
+  var SPINE_ZOOM_CAP = 6000;
+  function spineZoomPct(ui, elapsedMs) {
+    var span = ui && ui.spineZoomMs;
+    if (!span || !elapsedMs || elapsedMs <= 0) return 100;
+    return Math.max(100, Math.min(SPINE_ZOOM_CAP, (elapsedMs / span) * 100));
   }
 
   // The progress spine's derived layout. Pure: (session, nowMs, win) -> plan object.
@@ -1150,12 +1154,14 @@
         '<div class="crd-spine-head">' +
           '<span class="crd-spine-label">PROGRESS SPINE</span>' +
           '<span class="crd-spine-count mono"></span>' +
-          '<span class="crd-spine-spans" role="group" aria-label="Spine time window"></span>' +
+          '<span class="crd-spine-spans" role="group" aria-label="Spine zoom"></span>' +
           '<span class="crd-spine-hint mono">segment width = time actually spent · click to jump the chat there</span>' +
         "</div>" +
-        '<div class="crd-spine-track">' +
-          '<div class="crd-spine-bar"></div>' +
-          '<div class="crd-spine-gutter"></div>' +
+        '<div class="crd-spine-scroll">' +
+          '<div class="crd-spine-track">' +
+            '<div class="crd-spine-bar"></div>' +
+            '<div class="crd-spine-gutter"></div>' +
+          "</div>" +
         "</div>" +
         '<div class="crd-spine-foot mono">' +
           '<span class="crd-spine-first"></span>' +
@@ -1247,11 +1253,11 @@
       // additive on top of the all/talk preset — see timelineEntryVisible() below.
       timelineKindsOn: {},
       agentsShowFinished: false,
-      // progress-spine time window. spineSpanMs null == "All" (whole session);
-      // spineEndMs null == anchored to the live edge so the window follows the
-      // clock on each 2s poll instead of sliding off the end of a live session.
-      spineSpanMs: null,
-      spineEndMs: null,
+      // progress-spine zoom. null == "All" == the strip fits its panel. Any
+      // other value is a span that should fill the view, making the strip wider
+      // than the panel; the scroll position itself lives on the DOM element, so
+      // there is no second copy of it to keep in sync.
+      spineZoomMs: null,
       searchOpen: false,
       flagOpen: false,
       noteOpen: false
@@ -1343,75 +1349,69 @@
       if (nearBottom) loadOlderNarration(ctx, ui, node);
     });
 
-    // ---- spine drag-to-pan ----
-    // Only meaningful once a span chip has narrowed the window; with "All" there
-    // is nothing to pan to. The handlers live on the .crd-spine-track WRAPPER,
-    // never on the bar/gutter themselves, because renderSpine replaces those two
-    // elements' innerHTML on every poll -- a listener or a pointer capture held
-    // on a replaced child would be destroyed mid-drag.
+    // ---- spine drag-to-scroll ----
+    // The handlers live on the .crd-spine-scroll VIEWPORT, never on the bar or
+    // gutter, because renderSpine replaces those two elements' innerHTML on
+    // every 2s poll -- a listener or a pointer capture held on a replaced child
+    // would be destroyed mid-drag.
+    //
+    // Dragging moves the viewport's own scrollLeft, so the browser clamps the
+    // ends for us: there is no bespoke pan arithmetic left to get wrong, and no
+    // way to accumulate slack by dragging past an edge.
     (function wireSpinePan() {
-      var track = qs(node, ".crd-spine-track");
-      if (!track) return;
+      var scroll = qs(node, ".crd-spine-scroll");
+      var track = scroll && qs(scroll, ".crd-spine-track");
+      if (!scroll || !track) return;
       var drag = null;
 
-      track.addEventListener("pointerdown", function (ev) {
-        if (!ui.spineSpanMs) return; // "All" -> nothing to pan
+      scroll.addEventListener("pointerdown", function (ev) {
+        // nothing to scroll when the strip already fits ("All", or a short session)
+        if (scroll.scrollWidth <= scroll.clientWidth + 1) return;
         if (ev.button != null && ev.button !== 0) return;
         // clear any stale swallow-the-click flag: if a previous pan ended without
         // the click ever arriving (pointer released off-window), the flag would
         // otherwise sit true and eat the next legitimate segment click
         ui.spineJustPanned = false;
-        var w = track.clientWidth || 1;
-        drag = {
-          x0: ev.clientX, w: w, moved: false, captured: false,
-          end0: ui.spineEndMs == null ? (ui.spineNowMs || Date.now()) : ui.spineEndMs
-        };
+        drag = { x0: ev.clientX, left0: scroll.scrollLeft, moved: false, captured: false };
+        ui.spineDragging = true;   // a 2s poll must not re-anchor mid-gesture
         // NOTE: deliberately NO setPointerCapture here, and no is-panning class.
         // Both wait until the gesture proves itself a drag -- see pointermove.
       });
 
-      track.addEventListener("pointermove", function (ev) {
+      scroll.addEventListener("pointermove", function (ev) {
         if (!drag) return;
         var dx = ev.clientX - drag.x0;
         if (!drag.moved) {
           if (Math.abs(dx) <= 3) return; // still a click, not a drag
           drag.moved = true;
-          track.classList.add("is-panning");
+          scroll.classList.add("is-panning");
           // Capture LAZILY, only now that this is genuinely a drag. Capturing on
-          // pointerdown retargets the subsequent `click` to this wrapper (Pointer
-          // Events spec); since .crd-spine-track carries no data-act, the
+          // pointerdown retargets the subsequent `click` to this element (Pointer
+          // Events spec); since .crd-spine-scroll carries no data-act, the
           // delegated handler's closest("[data-act]") would return null and
-          // click-to-jump would silently stop working for every click while a
-          // span chip was active. Verified live: with capture on pointerdown a
-          // plain segment click retargeted to DIV.crd-spine-track.
-          try { track.setPointerCapture(ev.pointerId); drag.captured = true; } catch (e) {}
+          // click-to-jump would silently stop working for every click on a
+          // scrollable spine. Verified live on the previous wrapper: with capture
+          // on pointerdown a plain segment click retargeted to the DIV.
+          try { scroll.setPointerCapture(ev.pointerId); drag.captured = true; } catch (e) {}
         }
-        // drag RIGHT pulls older time into view, so the window's end moves back
-        ui.spineEndMs = drag.end0 - (dx / drag.w) * ui.spineSpanMs;
-        // Clamp at WRITE time, not just at read. spineWindow() would bound the
-        // rendered window anyway, but the raw value would keep running past the
-        // end of the session and bank the excess as slack -- drag far enough off
-        // the start and you would then have to drag all the way back before the
-        // spine moved at all. Reusing spineWindow keeps ONE clamp, not two.
-        var clamped = spineWindow(ui, firstEventTime(ui.spineSession || {}),
-                                  ui.spineNowMs || Date.now());
-        if (clamped) ui.spineEndMs = clamped.endMs;
-        repaintSpine(node, ctx, ui);
+        // drag RIGHT reveals earlier time, exactly like dragging a map
+        scroll.scrollLeft = drag.left0 - dx;
       });
 
       function endPan(ev) {
+        ui.spineDragging = false;
         if (!drag) return;
-        track.classList.remove("is-panning");
+        scroll.classList.remove("is-panning");
         if (drag.captured) {
-          try { track.releasePointerCapture(ev.pointerId); } catch (e) {}
+          try { scroll.releasePointerCapture(ev.pointerId); } catch (e) {}
         }
         // a pan must not also fire the segment's click-to-jump; the click event
         // arrives immediately after pointerup, so one flag is enough to swallow it
         ui.spineJustPanned = drag.moved;
         drag = null;
       }
-      track.addEventListener("pointerup", endPan);
-      track.addEventListener("pointercancel", endPan);
+      scroll.addEventListener("pointerup", endPan);
+      scroll.addEventListener("pointercancel", endPan);
     })();
 
     // ---- single delegated click handler ----
@@ -1543,14 +1543,14 @@
         }
         case "spine-span": {
           var raw = t.getAttribute("data-span");
-          ui.spineSpanMs = raw === "all" ? null : parseInt(raw, 10) || null;
-          ui.spineEndMs = null; // a fresh span always re-anchors to the live edge
+          ui.spineZoomMs = raw === "all" ? null : parseInt(raw, 10) || null;
           repaintSpine(node, ctx, ui);
           break;
         }
         case "spine-now": {
-          ui.spineEndMs = null;
-          repaintSpine(node, ctx, ui);
+          // "now" is just the right-hand end of the strip once it is scrollable
+          var sc = qs(node, ".crd-spine-scroll");
+          if (sc) sc.scrollLeft = sc.scrollWidth;
           break;
         }
         case "timeline-filter": {
@@ -1831,14 +1831,16 @@
     // panel keys are localStorage-scoped per session; rebind on first sight of a session id
     if (firstMount || ui._boundSid !== sid) {
       ui._boundSid = sid;
-      // The spine's window is an ABSOLUTE-time cursor (spineEndMs is wall-clock
-      // ms), and this `ui` is created once per page load -- mount() does not run
-      // again when you switch sessions. Without this reset the next session
-      // opens already panned to the previous one's timestamp, showing its own
-      // "nothing in this window" empty state over hours of real activity.
-      ui.spineSpanMs = null;
-      ui.spineEndMs = null;
+      // `ui` is created once per PAGE LOAD -- mount() does not run again when you
+      // switch sessions -- so anything session-shaped has to be cleared here or it
+      // leaks into the next session. A zoom chosen for a 14h session is meaningless
+      // on a 3-minute one, and the scroll offset even more so.
+      ui.spineZoomMs = null;
+      ui._spineZoomKey = null;   // matches the reset zoom, so no spurious re-anchor
       ui.spineJustPanned = false;
+      ui.spineDragging = false;
+      var sc0 = qs(node, ".crd-spine-scroll");
+      if (sc0) sc0.scrollLeft = 0;
       Object.keys(ui.panels).forEach(function (key) {
         var wrap = ui.panels[key];
         var def = key === "timeline" ? false : defaultFolded(); // FIX 8: cr.cardsFolded pref
@@ -2107,18 +2109,37 @@
   function renderSpine(node, ctx, session, nowMs, ui) {
     // cached so repaintSpine() can redraw on a chip click or a drag frame
     if (ui) { ui.spineSession = session; ui.spineNowMs = nowMs; }
-    var win = spineWindow(ui, firstEventTime(session), nowMs);
-    var plan = spineSegments(session, nowMs, win);
+    // No window: the plan is always the WHOLE session, so nothing can be
+    // filtered out from under the user. The zoom below changes how much room
+    // that same set of segments and markers is drawn across.
+    var plan = spineSegments(session, nowMs);
+    var zoomPct = spineZoomPct(ui, plan.elapsedMs);
     var doneN = plan.doneCount, total = plan.total;
     qs(node, ".crd-spine-count").textContent = doneN + " of " + total +
       (plan.elapsedMs != null ? " · " + fmtDurMs(plan.elapsedMs) + " elapsed" : "") +
-      (plan.windowed ? " · showing " + fmtDurMs(plan.winSpanMs) +
-        (plan.atLiveEdge ? " to now" : " ending " + fmtClock(plan.winT1)) : "");
+      (zoomPct > 100 ? " · zoomed " + Math.round(zoomPct / 100) + "x · scroll or drag" : "");
 
-    renderSpineSpans(node, plan, ui);
+    renderSpineSpans(node, plan, ui, zoomPct);
 
+    var scroll = qs(node, ".crd-spine-scroll");
     var track = qs(node, ".crd-spine-track");
-    if (track) track.classList.toggle("is-pannable", !!plan.windowed);
+    if (track) track.style.width = zoomPct.toFixed(2) + "%";
+    if (scroll) {
+      scroll.classList.toggle("is-scrollable", zoomPct > 100);
+      // When the user PICKS a different zoom, jump to the live edge: the detail
+      // they just asked for is almost always at the recent end, and keeping the
+      // old pixel offset would strand them somewhere arbitrary.
+      //
+      // Keyed on ui.spineZoomMs (the chip they clicked), NOT on zoomPct. zoomPct
+      // is elapsedMs/span, and elapsedMs grows on every 2s poll of a live session
+      // -- keying on it re-anchored the scroll roughly every two seconds and tore
+      // the view out from under any drag in progress. The drag guard is belt and
+      // braces on top of that.
+      if (ui && !ui.spineDragging && ui._spineZoomKey !== ui.spineZoomMs) {
+        ui._spineZoomKey = ui.spineZoomMs;
+        scroll.scrollLeft = scroll.scrollWidth; // clamps itself to the max
+      }
+    }
 
     var bar = qs(node, ".crd-spine-bar");
     bar.innerHTML = plan.segments.map(function (s, i) {
@@ -2191,23 +2212,21 @@
       bar.classList.add("is-fresh");
     }
 
-    // An empty window is a real state (pan into a quiet stretch of a long
-    // session): say so rather than showing a blank strip that reads as broken.
+    // With the zoom model there is exactly ONE way the bar can be empty: the
+    // session recorded no todos at all (Claude prunes its task files after a
+    // couple of days, so most older sessions look like this). Say that plainly
+    // instead of leaving a blank strip that reads as broken -- and note the bar
+    // keeps its full height either way, so the spine never appears to vanish.
     var spineEl = qs(node, ".crd-spine");
-    // NB: realMarkers, not markers.length -- the synthetic NOW marker is always
-    // present at the live edge, so counting it would mean this message never
-    // showed on exactly the sessions that need it (a long-idle session windowed
-    // to its last hour has nothing in view but NOW).
-    spineEl.classList.toggle("is-empty-window",
-      !!plan.windowed && !plan.segments.length && !plan.realMarkers);
+    spineEl.classList.toggle("is-empty-bar", !plan.segments.length);
 
     var finalAriaLabel = plan.ariaLabel;
     if (isApproximate && hasTimedSegments) {
       finalAriaLabel += " Timings are inferred.";
     }
-    if (plan.windowed) {
-      finalAriaLabel += " Showing the last " + fmtDurMs(plan.winSpanMs) +
-        (plan.atLiveEdge ? " up to now." : " up to " + fmtClock(plan.winT1) + ".");
+    if (zoomPct > 100) {
+      finalAriaLabel += " Zoomed " + Math.round(zoomPct / 100) +
+        " times; scroll horizontally to move through the session.";
     }
     // The summary lands in a visually-hidden live region instead of an aria-label
     // on the container: the container is a role="group" so that the segment
@@ -2221,27 +2240,28 @@
   // a "now" reset that only appears once the view has been panned off the live
   // edge. Rewritten only when the row actually changes, so a 2s poll cannot steal
   // focus from a chip the user is tabbed onto.
-  function renderSpineSpans(node, plan, ui) {
+  function renderSpineSpans(node, plan, ui, zoomPct) {
     var el = qs(node, ".crd-spine-spans");
     if (!el) return;
     var choices = spineSpanChoices(plan.elapsedMs);
-    var cur = ui && ui.spineSpanMs ? ui.spineSpanMs : null;
-    var panned = !!(plan.windowed && !plan.atLiveEdge);
-    var sig = choices.map(function (c) { return c.key; }).join(",") + "|" + cur + "|" + panned;
+    var cur = ui && ui.spineZoomMs ? ui.spineZoomMs : null;
+    var zoomed = (zoomPct || 100) > 100;
+    var sig = choices.map(function (c) { return c.key; }).join(",") + "|" + cur + "|" + zoomed;
     if (el.getAttribute("data-sig") === sig) return;
     el.setAttribute("data-sig", sig);
     if (!choices.length) { el.innerHTML = ""; return; }
     var html = '<button type="button" class="crd-spine-span' + (cur == null ? " is-on" : "") +
       '" data-act="spine-span" data-span="all" aria-pressed="' + (cur == null) +
-      '" title="Show the whole session">All</button>';
+      '" title="Fit the whole session in view">All</button>';
     choices.forEach(function (c) {
       html += '<button type="button" class="crd-spine-span' + (cur === c.ms ? " is-on" : "") +
         '" data-act="spine-span" data-span="' + c.ms + '" aria-pressed="' + (cur === c.ms) +
-        '" title="Show only the last ' + c.key + ' · drag the spine to pan">' + c.key + "</button>";
+        '" title="Zoom in so ' + c.key + ' fills the view · then scroll or drag sideways">' +
+        c.key + "</button>";
     });
-    if (panned) {
+    if (zoomed) {
       html += '<button type="button" class="crd-spine-span crd-spine-live" data-act="spine-now"' +
-        ' title="Jump back to the live edge">now</button>';
+        ' title="Scroll to the live edge">now</button>';
     }
     el.innerHTML = html;
   }
@@ -3172,7 +3192,7 @@
   window.CR.detail._internal = {
     spineSegments: spineSegments,
     spineSpanChoices: spineSpanChoices,
-    spineWindow: spineWindow,
+    spineZoomPct: spineZoomPct,
     SPINE_SPANS: SPINE_SPANS,
     mergeTimeline: mergeTimeline,
     deriveLinks: deriveLinks,

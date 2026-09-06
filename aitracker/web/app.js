@@ -1032,6 +1032,13 @@ function sessionRow(s,now,ex){
   // open flag count (server-owned, from flags.json) — without it a flag on a session you aren't
   // looking at is invisible, which is how two of them sat unnoticed.
   const flagBadge=s.open_flags?`<span class=flagbadge title="${s.open_flags} open flag${s.open_flags==1?'':'s'}">${ico('flag')}${s.open_flags}</span>`:"";
+  // GAP CLOSE (cross-view uniformity): `fail_cmd` rides the SHARED list dict for
+  // every provider — registry.py sets it on every session — and the control room
+  // has rendered it as a "failing" state since it landed. The classic sidebar read
+  // it ZERO times, so a session whose last command failed was simply invisible in
+  // one of the two UIs. Same badge idiom as the flag/note counts beside it, and the
+  // same 'x' glyph the control room's own failing tiles use.
+  const failBadge=s.fail_cmd?`<span class=failbadge title="last command failed: ${esc(s.fail_cmd)}">${ico('x')} fail</span>`:"";
   // end-state: waiting on your answer (wins, even while still live) > completed its last run.
   // "done" is gated to the live window (a session that JUST finished) — not every stale idle
   // session — so the checkmark marks fresh completions instead of flooding the list green.
@@ -1045,7 +1052,7 @@ function sessionRow(s,now,ex){
     :status==="done"?`<span class="statusbadge done" title="completed its last run">${ico('check')} done</span>`:"";
   return `<div class="sitem ${s.id===cur?'active':''}${s.pinned?' pinned':''}${s.agent?' agentrow':''}${ex?' hasagents':''}${status?' '+status:''}${s.open_flags?' flagged':''}" onclick="${onclick}" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
     `<div class=srow1>${chev}<span class="dot ${live?'live':''}"></span><span class=nm>${s.agent?ico('agent')+' ':''}${esc(label)}</span>`+
-    `${statusBadge}${flagBadge}${noteBadge}`+
+    `${statusBadge}${failBadge}${flagBadge}${noteBadge}`+
     (s._runs>1?`<span class="agentbadge runs" title="ran ${s._runs}× — collapsed; opens the latest">×${s._runs}</span>`:"")+
     `<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">${ico('pin')}</span>`+
     `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename this session">${ico('edit')}</span></div>`+
