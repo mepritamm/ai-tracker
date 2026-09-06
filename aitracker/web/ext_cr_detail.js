@@ -1892,11 +1892,33 @@
     }
   }
 
+  // BUG FIX (cross-view uniformity): this header used to derive its source label
+  // with two regexes -- /auggie/i, then /augment/i, else the literal "Claude
+  // CLI". That collapsed FOUR distinct sources into one word: '', 'cli',
+  // 'claude-desktop', 'sdk-cli' and 'claude-vscode' ALL printed "Claude CLI",
+  // and 'augment-vscode'/'augment-cursor' both printed "Augment", losing the
+  // VS Code vs Cursor distinction. So opening a Claude Desktop session showed
+  // "Claude CLI" in its header while that same session's rail row and board tile
+  // -- in the SAME control room -- correctly read "claude desktop". Now delegates
+  // to the board's exported toolLabel(), which itself reads app.js's shared
+  // SRC_TEXT map, exactly as shortModel() above delegates to modelShort(). The
+  // old regexes survive ONLY as the board-not-mounted fallback, same shape as
+  // shortModel's.
+  function sourceLabel(meta) {
+    var raw = (meta && (meta.source || meta.entrypoint)) || "";
+    try {
+      var fn = window.CR && window.CR.board && window.CR.board.toolLabel;
+      if (typeof fn === "function") {
+        var out = fn(raw);
+        if (out) return out;
+      }
+    } catch (e) {}
+    return /auggie/i.test(raw) ? "Auggie" : (/augment/i.test(raw) ? "Augment" : "Claude CLI");
+  }
+
   function renderHeader(node, ctx, session, nowSec) {
     var meta = session.meta || {};
-    var src = /auggie/i.test(meta.source || meta.entrypoint || "") ? "Auggie" :
-      (/augment/i.test(meta.source || meta.entrypoint || "") ? "Augment" : "Claude CLI");
-    qs(node, ".crd-src").textContent = src;
+    qs(node, ".crd-src").textContent = sourceLabel(meta);
 
     var proj = basename(meta.cwd || "");
     // FIX (design-audit drift 1): 5b's metaline is "project · branch · elapsed ·

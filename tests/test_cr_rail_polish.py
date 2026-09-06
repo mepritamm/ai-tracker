@@ -819,8 +819,25 @@ def _extract_footer_json(stdout):
 class TestCollapsedRailFooterIsCompact(unittest.TestCase):
     """THE BUG: the expanded footer's "scroll · N more" wraps and clips to
     "scrol . N more" at the 48px collapsed width. Collapsed now renders a
-    compact "+N" with no wrapping; the expanded form must stay byte-for-byte
-    what it always was."""
+    compact "+N" with no wrapping; the collapsed form must stay byte-for-byte
+    what it always was.
+
+    ADVERSARIAL REVIEW FIX (since this class was first written): the expanded
+    sentence used to be `hidden = baseSessions.length - shown`, subtracting
+    two DIFFERENT populations -- `shown` counts only non-agent,
+    search-surviving, cap-admitted rows, while `baseSessions` counts EVERY
+    session including agent ones already visible inside their "Agents"
+    buckets. So it claimed sessions were hidden when they were already on
+    screen. It's now `hidden = res.total - res.shown` (the SAME population),
+    which for this fixture (1 individual session, 3 folded into an agent
+    bucket that's fully visible) is exactly 0 -- so the expanded footer reads
+    the plain "N session(s) · all shown" sentence, not "scroll · N more". The
+    ORIGINAL INTENT of this class -- collapsed gets a compact "+N" because the
+    full sentence clips at 48px, expanded keeps the full sentence -- is
+    unchanged; only the full sentence's WORDING is. The "Show N more · M
+    hidden" branch (reachable once the unpinned rows exceed the 25-row cap)
+    is covered separately below, in
+    TestExpandedRailFooterShowsMoreWhenTheCapIsExceeded."""
 
     @classmethod
     def setUpClass(cls):
@@ -834,14 +851,86 @@ class TestCollapsedRailFooterIsCompact(unittest.TestCase):
         cls.OUT = _extract_footer_json(stdout)
 
     def test_expanded_footer_is_unchanged(self):
-        self.assertEqual(self.OUT["expanded"], "scroll · 3 more")
+        """"Unchanged" now means: with nothing actually hidden (the 3 agent
+        sessions are folded into a visible bucket, not off-screen), the
+        expanded footer reads the plain "all shown" sentence -- the
+        hidden=0 branch -- not the old, buggy "scroll · 3 more"."""
+        self.assertEqual(self.OUT["expanded"], "1 session · all shown")
 
     def test_collapsed_footer_is_compact_and_never_wraps_the_old_phrase(self):
         self.assertEqual(self.OUT["collapsed"], "+3")
         self.assertNotIn("scroll", self.OUT["collapsed"])
 
     def test_re_expanding_restores_the_full_sentence(self):
-        self.assertEqual(self.OUT["expandedAgain"], "scroll · 3 more")
+        self.assertEqual(self.OUT["expandedAgain"], "1 session · all shown")
+
+
+_MORE_FOOTER_JS_TAIL = r"""
+var root = makeReal('div');
+docBody.appendChild(root);
+window.CR.board.mount(root, {});
+var footer = queryAllReal(root, '.cr-rail-footer')[0];
+
+var sessions = %(sessions)s;
+window.CR.board.update({ sessions: sessions, now: %(now)d });
+
+var out = {
+  text: footer.textContent,
+  hasMoreClass: footer._classes.has('cr-rail-footer--more'),
+  role: footer.getAttribute('role'),
+};
+
+console.log("===CR_MORE_FOOTER_JSON_START===");
+console.log(JSON.stringify(out));
+"""
+
+
+def _footer_over_cap_driver_js():
+    bundle_js = _extract_script_content(_read_page())
+    # 30 plain, unpinned, non-agent sessions -- exceeds RAIL_LIMIT_STEP (25),
+    # so renderSessionRows() actually caps them and res.total (30) > res.shown
+    # (25), landing on the "Show N more · M hidden" branch this class's own
+    # name is really about (hidden = res.total - res.shown = 5).
+    sessions = [make_session("cap_%d" % i, NOW - 5 - i, ended=True) for i in range(30)]
+    tail = _MORE_FOOTER_JS_TAIL % {"sessions": json.dumps(sessions), "now": NOW}
+    return "\n".join([_REAL_DOM_PREAMBLE, bundle_js, _REAL_DOM_MID, tail])
+
+
+def _extract_more_footer_json(stdout):
+    marker = "===CR_MORE_FOOTER_JSON_START==="
+    idx = stdout.find(marker)
+    if idx < 0:
+        raise ValueError("marker not found in node output:\n" + stdout)
+    return json.loads(stdout[idx + len(marker):].strip())
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestExpandedRailFooterShowsMoreWhenTheCapIsExceeded(unittest.TestCase):
+    """The THIRD footer state TestCollapsedRailFooterIsCompact's class name is
+    really about: with more unpinned sessions than the 25-row cap
+    (RAIL_LIMIT_STEP), hidden = res.total - res.shown is > 0, and the
+    expanded footer becomes a real "Show N more · M hidden" affordance --
+    class cr-rail-footer--more, role="button" -- rather than either the
+    collapsed "+N" orb-rail token or the "all shown" plain sentence."""
+
+    @classmethod
+    def setUpClass(cls):
+        js = _footer_over_cap_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Over-cap footer driver failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_more_footer_json(stdout)
+
+    def test_expanded_footer_shows_the_show_more_hidden_sentence(self):
+        # 30 unpinned sessions, cap 25 -> step = min(25, 5) = 5, hidden = 5.
+        self.assertEqual(self.OUT["text"], "Show 5 more · 5 hidden")
+
+    def test_footer_gets_the_more_button_affordances(self):
+        self.assertTrue(self.OUT["hasMoreClass"], "footer missing cr-rail-footer--more")
+        self.assertEqual(self.OUT["role"], "button")
 
 
 def _footer_four_digit_driver_js():

@@ -124,9 +124,16 @@ window.CR = window.CR || {};
   // 'activeness' reuses sessionState() — the ONE state derivation — never a
   // second one; ordered by the same attention-priority the board itself uses
   // (RANK), plus idle last (the rail, unlike the board, does show idle rows).
-  var ACTIVENESS_GROUP_ORDER = ['awaiting', 'flagged', 'working', 'landed', 'idle'];
+  // ADVERSARIAL REVIEW FIX: sessionState() can return SIX states -- it returns
+  // 'failing' whenever a live session has `fail_cmd` (see sessionState below) --
+  // but this list only ever named five. groupUnpinnedSessions() filters its
+  // buckets THROUGH this list, so under group-by "activeness" every failing
+  // session was dropped from the rail entirely: the one session you most need to
+  // see rendered nowhere at all. Ordered to match RANK above, which already
+  // slots failing between flagged and working.
+  var ACTIVENESS_GROUP_ORDER = ['awaiting', 'flagged', 'failing', 'working', 'landed', 'idle'];
   var ACTIVENESS_GROUP_LABEL = {
-    awaiting: 'Waiting on you', flagged: 'Flagged', working: 'Working',
+    awaiting: 'Waiting on you', flagged: 'Flagged', failing: 'Failing', working: 'Working',
     landed: 'Landed', idle: 'Idle'
   };
 
@@ -485,7 +492,31 @@ window.CR = window.CR || {};
     // rail had no equivalent of the sidebar's "N live ✕" click-to-filter.
     var railLiveOnly = false;
     var focusedTileId = null;         // preserved across update() re-renders
-    var selectedSessionId = null;     // for rail row highlight, set by ctx events if any
+    var selectedSessionId = null;     // fallback only -- see selectedId() below
+    // GAP CLOSE ("shared information across all the views ... any selection in
+    // this current view lands to the other view"): the control room kept its own
+    // `selectedSessionId` cache, initialised to null and written ONLY by its own
+    // openSession()/'session:selected' path. Classic's pick() (app.js) never
+    // touched it, so a session selected in the classic dashboard highlighted
+    // NOTHING here after switching views, and on a fresh load the rail showed no
+    // selection at all even though localStorage already remembered one.
+    //
+    // Both views already WRITE one place: classic's pick() sets `cur` AND
+    // localStorage 'sid', and this file's openSession() routes through
+    // ctx.go('detail', id), which calls that same pick() (ext_cr_boot.js). So the
+    // shared store existed the whole time -- the rail just wasn't reading it.
+    // This reads it, newest-writer-wins, instead of keeping a second copy that
+    // goes stale the moment the other view changes the selection.
+    // The `selectedSessionId` fallback survives for the case where app.js's
+    // globals aren't present (an isolated harness), so this never renders
+    // selection-blind under test.
+    var RAIL_LIMIT_STEP = 25;
+    var railLimit = RAIL_LIMIT_STEP;
+    function selectedId() {
+      if (typeof cur !== 'undefined' && cur) return cur;
+      try { var v = localStorage.getItem('sid'); if (v) return v; } catch (e) {}
+      return selectedSessionId || '';
+    }
     var lastState = { sessions: [], now: Math.floor(Date.now() / 1000) };
     var expandedRailGroup = null;     // which agent-group bucket (by `group` key) is expanded
                                        // in the rail — 'rail:expandAgents' toggles this; own
@@ -507,9 +538,24 @@ window.CR = window.CR || {};
     // below — a module-level var, same pattern as `selectedSessionId` just above, rather
     // than threading a new parameter through every railRow() call site.
     var railAgentParentIds = {};
-    function computeAgentParentIds(sessions) {
+    // GAP CLOSE ("the sessions view ... the data in the default/dashboard view is
+    // much richer"): this used to record a bare `true` per parent, which was
+    // enough to draw a border but not to say HOW MANY agents a session spawned.
+    // Classic's sidebar row carries that count inline (app.js sessionRow's
+    // `kidchip`: "3 live / 5 agents"), and it was the one field of classic's row
+    // the rail had no equivalent for. Now counts total and live per parent; the
+    // map stays truthy per parent, so `hasAgentChildren` below is unaffected.
+    // Both callers (the rail and the Sessions destination) pass `now`, which is
+    // already in scope at each -- the live share is a live-window comparison,
+    // the same LIVE_WINDOW every other liveness check in this file uses.
+    function computeAgentParentIds(sessions, now) {
       var ids = {};
-      (sessions || []).forEach(function (s) { if (s.agent && s.parentId) ids[s.parentId] = true; });
+      (sessions || []).forEach(function (s) {
+        if (!s.agent || !s.parentId) return;
+        var e = ids[s.parentId] || (ids[s.parentId] = { n: 0, live: 0 });
+        e.n++;
+        if ((now - (s.mtime || 0)) < LIVE_WINDOW) e.live++;
+      });
       return ids;
     }
     // STRUCTURAL FIX: the rail + top bar are now mounted once (see buildShell()
@@ -911,11 +957,30 @@ window.CR = window.CR || {};
       // builds an ARRAY and concat()s -- never .join(), which would stringify a
       // glyph span into "[object HTMLSpanElement]" (the exact trap the icon
       // branch's own merge notes call out).
+      // GAP CLOSE ("all the markers in place"): the flag and note counts moved
+      // OUT of this meta line and onto the title line as real badges, matching
+      // classic's own anatomy (app.js sessionRow puts flagBadge/noteBadge in
+      // `.srow1`, and only the bg "N running" chip in `.smeta`). Printing them
+      // in both places would double-report the same count on every flagged row.
       var groups = [];
-      if (s.open_flags) groups.push([glyph('flag', 'tn-emo-f'), ' ' + s.open_flags + ' flag' + (s.open_flags !== 1 ? 's' : '')]);
-      if (s.note_count) groups.push([glyph('note', ''), ' ' + s.note_count]);
-      if (s.bg) groups.push([glyph('agent', ''), ' ' + s.bg]);
       groups.push([ago(now - (s.mtime || 0))]);
+      // classic's own bgchip wording -- `${ico('agent')} ${s.bg} running` -- so
+      // the two views describe background agents with the same words, not "3"
+      // here and "3 running" there.
+      // "make those markers clickable ... such that one can track the agent live":
+      // the background-agent chip opens the session that owns those agents, where
+      // the agents panel lives.
+      // ponytail: opens the session, it does not deep-link to the agents panel --
+      // the detail module registers no bus listeners at all (only its own
+      // in-view [data-act="focus-agents"] pill), so scrolling straight to that
+      // panel from here would mean adding cross-module focus plumbing. Add that
+      // if landing on the session top proves to be a nuisance.
+      if (s.bg) groups.push([h('button', {
+        class: 'cr-rail-badge cr-rail-badge--bg', type: 'button',
+        title: s.bg + ' background agent' + (s.bg === 1 ? '' : 's') + ' running now \u2014 click to open the session',
+        'aria-label': s.bg + ' background agents running, open the session',
+        onclick: function (e) { e.stopPropagation(); openSession(s.id); },
+      }, [glyph('agent', ''), ' ' + s.bg + ' running'])]);
       var out = [];
       groups.forEach(function (g, i) {
         if (i) out.push(' · ');
@@ -976,10 +1041,15 @@ window.CR = window.CR || {};
     // footer and the Sessions pager both need the UNWINDOWED total), `shown` is
     // how many individual rows this call actually rendered.
     function renderSessionRows(container, sessions, now, opts) {
-      // Passed straight through to every railRow() below: the rail calls this with
-      // no opts and keeps its compact rows; the Sessions destination asks for rich.
+      // Passed straight through to every railRow() below: the Sessions destination
+      // asks for rich rows; the rail does not.
       var rowOpts = (opts && opts.rich) ? { rich: true } : null;
-      var filtered = railRowsFor(sessions.filter(function (s) { return !s.agent; }), opts ? '' : undefined);
+      // The second argument used to be `opts ? '' : undefined` -- i.e. "any caller
+      // passing opts wants no search filter". That was only ever true of the
+      // Sessions pager, which always sets pageSize; keying off pageSize lets the
+      // rail pass a limit (it no longer calls this with no opts at all) WITHOUT
+      // silently losing its own search box.
+      var filtered = railRowsFor(sessions.filter(function (s) { return !s.agent; }), (opts && opts.pageSize) ? '' : undefined);
       var order = railOrder(filtered);
       var flat = order.pinned.concat(order.unpinned);   // pinned-first, newest-first within each
       var agentBuckets = {};
@@ -996,6 +1066,14 @@ window.CR = window.CR || {};
         var startIdx = (opts.page || 0) * opts.pageSize;
         windowed = flat.slice(startIdx, startIdx + opts.pageSize);
         isLastPage = (startIdx + opts.pageSize) >= flat.length;
+      } else if (opts && opts.limit) {
+        // GAP CLOSE ("show less session in the control-view session rail"): the
+        // rail rendered every session it was handed -- 800+ rows, and with the
+        // taller row this pass introduces that is far worse, not better. Caps the
+        // UNPINNED rows only: pinned sessions are pinned precisely so they stay
+        // visible, so they never fall off the cap (this is also classic's own
+        // shape -- a PINNED section, then a bounded RECENT one).
+        windowed = order.pinned.concat(order.unpinned.slice(0, opts.limit));
       }
       var pinnedShown = windowed.filter(function (s) { return s.pinned; });
       var unpinnedShown = windowed.filter(function (s) { return !s.pinned; });
@@ -1005,7 +1083,13 @@ window.CR = window.CR || {};
           [glyph('pin'), 'Pinned — ' + pinnedShown.length + ' · newest first']));
         pinnedShown.forEach(function (s) { container.appendChild(railRow(s, now, rowOpts)); });
       }
-      if (unpinnedShown.length || !opts) {
+      // ADVERSARIAL REVIEW FIX: `!opts` used to be true for the rail, which passed
+      // no opts at all -- so the "Sessions - N - newest first" header always
+      // rendered. Passing `{limit}` made `opts` truthy and silently suppressed
+      // that header whenever every session happened to be pinned. `opts.limit`
+      // restores it for the rail without giving the Sessions pager (pageSize) a
+      // header it never had.
+      if (unpinnedShown.length || !opts || opts.limit) {
         // Decision 2: pinned already led above, untouched by any mode — this
         // is the "layer on top" of the SAME unpinnedShown rows/order. Mode
         // 'none' renders byte-for-byte what this always rendered (a single
@@ -1051,7 +1135,7 @@ window.CR = window.CR || {};
     function renderRail(state) {
       if (!els.railList) return;
       var sessions = state.sessions || [], now = state.now;
-      railAgentParentIds = computeAgentParentIds(sessions);
+      railAgentParentIds = computeAgentParentIds(sessions, now);
       // GAP CLOSE (rail parity): classic's "N live ✕" pill (app.js's
       // `livecount`) filters the WHOLE sidebar to live sessions on click; the
       // rail's count was display-only. Isolated to this file's two rail-only
@@ -1078,14 +1162,34 @@ window.CR = window.CR || {};
       var collapsed = els.rail.classList.contains('cr-rail--collapsed');
       els.railList.innerHTML = '';
 
-      var shown;
+      var shown, hiddenN;
       if (collapsed) {
         var filtered = railRowsFor(baseSessions.filter(function (s) { return !s.agent; }));
         var order = railOrder(filtered);
         renderCollapsedOrbs(order, now);
         shown = order.pinned.length + order.unpinned.length;
+        // Collapsed renders orbs for non-agent sessions only, so everything else
+        // genuinely is not on screen -- the footer's own label already says
+        // "expand the rail to see them".
+        hiddenN = baseSessions.length - shown;
       } else {
-        shown = renderSessionRows(els.railList, baseSessions, now).total;
+        var res = renderSessionRows(els.railList, baseSessions, now, { limit: railLimit });
+        shown = res.shown;
+        // ADVERSARIAL REVIEW FIX: this used to be `baseSessions.length - shown`,
+        // which subtracted two DIFFERENT populations. `shown` counts only the
+        // non-agent, search-surviving rows the cap let through, while
+        // baseSessions counts every session including agent ones (which are
+        // already on screen inside their "Agents" buckets) and search-filtered
+        // ones (which the user deliberately excluded). On this machine's real
+        // data -- 957 sessions, 141 of them agents -- the footer therefore read
+        // "141 hidden" FOREVER: clicking "Show more" until every row was
+        // rendered never reached zero, so the button never turned back into
+        // plain text and the "all shown" branch was unreachable. Worse, a search
+        // matching nothing produced an empty rail still claiming N hidden.
+        // `res.total` is flat.length -- the same filtered, non-agent population
+        // `res.shown` is drawn from -- so this now counts exactly what clicking
+        // the button would actually reveal, and reaches 0.
+        hiddenN = res.total - res.shown;
       }
 
       // FIX (collapsed rail alignment, 48px column): the expanded footer's
@@ -1093,17 +1197,54 @@ window.CR = window.CR || {};
       // clips to "scrol . N more" -- collapsed gets a compact "+N" instead,
       // with the full sentence kept in `title` so nothing is lost, just
       // reflowed. The expanded form is untouched.
-      // A session folded into an agent GROUP row is deliberately counted here:
-      // "more" means "not shown as its own row", and the group row is a fold, not
-      // a listing. tests/test_cr_rail_polish.py pins this exact intent.
-      var more = baseSessions.length - shown;
-      var moreN = Math.max(0, more);
+      // NOTE (rebase reconciliation): the other side of this merge deliberately
+      // counted a session folded into an agent GROUP row as "more", on the
+      // reading that "more" means "not shown as its own row". That reading is
+      // kept for the COLLAPSED footer (which is a label, not a control). The
+      // EXPANDED footer is now a "Show N more" BUTTON, and a button whose count
+      // includes rows clicking can never reveal is a button that never finishes:
+      // with 141 agent sessions on this machine it read "141 hidden" forever and
+      // the "all shown" state was unreachable. So the expanded count is drawn
+      // from the same population the button acts on (see renderSessionRows'
+      // res.total/res.shown above).
+      var moreN = Math.max(0, hiddenN);
       if (collapsed) {
+        // Collapsing must also DROP the expanded footer's show-more affordance:
+        // renderRail() reuses one footer element across both modes, so without
+        // this the click handler and role/tabindex set by the expanded branch
+        // below survive into the 48px orb rail, where "+N" is a label, not a
+        // button.
+        els.railFooter.classList.remove('cr-rail-footer--more');
+        els.railFooter.removeAttribute('role');
+        els.railFooter.removeAttribute('tabindex');
+        els.railFooter.onclick = null;
+        els.railFooter.onkeydown = null;
         els.railFooter.textContent = '+' + moreN;
         els.railFooter.title = moreN + ' more session' + (moreN === 1 ? '' : 's') + ' — expand the rail to see them';
+      } else if (moreN > 0) {
+        // GAP CLOSE ("show less session in the control-view session rail"): the
+        // footer used to be inert text telling you to scroll through all 800.
+        // Now the cap's escape hatch -- one click reveals the next page, so
+        // "fewer by default" never becomes "unreachable".
+        var step = Math.min(RAIL_LIMIT_STEP, moreN);
+        els.railFooter.textContent = 'Show ' + step + ' more · ' + moreN + ' hidden';
+        els.railFooter.title = 'Showing the newest ' + railLimit +
+          ' sessions (pinned always shown) — click to show ' + step + ' more';
+        els.railFooter.classList.add('cr-rail-footer--more');
+        els.railFooter.setAttribute('role', 'button');
+        els.railFooter.setAttribute('tabindex', '0');
+        els.railFooter.onclick = function () { railLimit += RAIL_LIMIT_STEP; renderRail(lastState); };
+        els.railFooter.onkeydown = function (e) {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); railLimit += RAIL_LIMIT_STEP; renderRail(lastState); }
+        };
       } else {
-        els.railFooter.textContent = 'scroll · ' + moreN + ' more';
+        els.railFooter.textContent = shown + ' session' + (shown === 1 ? '' : 's') + ' · all shown';
         els.railFooter.removeAttribute('title');
+        els.railFooter.classList.remove('cr-rail-footer--more');
+        els.railFooter.removeAttribute('role');
+        els.railFooter.removeAttribute('tabindex');
+        els.railFooter.onclick = null;
+        els.railFooter.onkeydown = null;
       }
 
       els.railList.scrollTop = scrollTop;
@@ -1238,7 +1379,7 @@ window.CR = window.CR || {};
     function renderSessionsView(state) {
       if (!els.sessionsList) return;
       var sessions = state.sessions || [], now = state.now;
-      railAgentParentIds = computeAgentParentIds(sessions);
+      railAgentParentIds = computeAgentParentIds(sessions, now);
       var totalCount = sessionsTotalCount(sessions);
       var maxPage = Math.max(0, Math.ceil(totalCount / sessionsPageSize) - 1);
       if (sessionsPage > maxPage) sessionsPage = maxPage;   // clamp BEFORE rendering/slicing
@@ -1330,7 +1471,7 @@ window.CR = window.CR || {};
       var title = s.title || s.project || s.id;
       var label = title + ' — ' + orbStateWord(sessionState(s, now));
       return h('button', {
-        class: 'cr-orb' + (s.id === selectedSessionId ? ' cr-orb--selected' : ''),
+        class: 'cr-orb' + (s.id === selectedId() ? ' cr-orb--selected' : ''),
         type: 'button', title: label, 'aria-label': label,
         onclick: function () { openSession(s.id); }
       }, [
@@ -1442,7 +1583,14 @@ window.CR = window.CR || {};
       // guards against a nested agent-of-an-agent, which _pick_parent()
       // (providers/claude.py) can never actually produce, but which classic
       // itself also excludes by construction (nesting is human-parent only).
-      var hasAgentChildren = !s.agent && !!railAgentParentIds[s.id];
+      var kids = (!s.agent && railAgentParentIds[s.id]) || null;
+      var hasAgentChildren = !!kids;
+      var kidChip = kids ? [' \u00b7 ', h('span', {
+        class: 'cr-rail-badge cr-rail-badge--kids',
+        title: kids.n + ' agent session' + (kids.n === 1 ? '' : 's') + ' this one spawned' +
+          (kids.live ? ', ' + kids.live + ' live now' : ''),
+      }, [glyph('agent', ''), ' ' + (kids.live ? kids.live + ' live / ' : '') +
+          kids.n + ' agent' + (kids.n === 1 ? '' : 's')])] : [];
       var rowMods = (s.pinned ? ' cr-rail-row--pinned' : '')
         + (s.agent ? ' cr-rail-row--agent' : '')
         + (hasAgentChildren ? ' cr-rail-row--hasagents' : '')
@@ -1469,6 +1617,35 @@ window.CR = window.CR || {};
       // session anywhere in this UI. Mirrors classic exactly: same
       // `stopPropagation` (so clicking either button opens nothing), same
       // title/on-state semantics.
+      // GAP CLOSE ("get the similar information like what we have in the existing
+      // session with all the markers in place (agent, pin marker, flag and
+      // others)"): classic's row carries a visible flag badge and note badge on
+      // its title line (app.js sessionRow's flagBadge/noteBadge). The rail only
+      // ever put these counts in the meta text and the tooltip, so a flagged
+      // session read identically to a clean one at a glance.
+      // ...and they are BUTTONS, not spans ("also make those markers clickable").
+      // The flag badge opens the flags dialog through boot's already-registered
+      // 'open:flags' listener (ext_cr_boot.js), which builds the payload via its
+      // own buildFlagsPayload() -- never a second copy of that payload built
+      // here. Same `stopPropagation` recipe the pin/rename buttons below use, so
+      // clicking a badge does not also open the session behind it.
+      var flagBadge = s.open_flags ? h('button', {
+        class: 'cr-rail-badge cr-rail-badge--flag', type: 'button',
+        title: s.open_flags + ' open flag' + (s.open_flags === 1 ? '' : 's') +
+          (s.flag_text ? ' \u2014 ' + s.flag_text : '') + ' \u2014 click to review',
+        'aria-label': s.open_flags + ' open flag' + (s.open_flags === 1 ? '' : 's') + ', review flags',
+        onclick: function (e) {
+          e.stopPropagation();
+          if (ctx && typeof ctx.emit === 'function') ctx.emit('open:flags', {});
+        },
+      }, [glyph('flag', ''), ' ' + s.open_flags]) : null;
+      // Notes live in the session's own detail view, so the note badge opens it.
+      var noteBadge = s.note_count ? h('button', {
+        class: 'cr-rail-badge cr-rail-badge--note', type: 'button',
+        title: s.note_count + ' note' + (s.note_count === 1 ? '' : 's') + ' \u2014 click to open the session',
+        'aria-label': s.note_count + ' note' + (s.note_count === 1 ? '' : 's') + ', open the session',
+        onclick: function (e) { e.stopPropagation(); openSession(s.id); },
+      }, [glyph('note', ''), ' ' + s.note_count]) : null;
       var actions = h('div', { class: 'cr-rail-actions' }, [
         h('button', {
           class: 'cr-rail-pin' + (s.pinned ? ' cr-rail-pin--on' : ''), type: 'button',
@@ -1485,42 +1662,69 @@ window.CR = window.CR || {};
         }, [glyph('edit', '')]),
       ]);
       return h('div', {
-        class: 'cr-rail-row' + (s.id === selectedSessionId ? ' cr-rail-row--selected' : '') +
+        class: 'cr-rail-row' + (s.id === selectedId() ? ' cr-rail-row--selected' : '') +
           (rich ? ' cr-rail-row--rich' : '') + rowMods,
         tabindex: '0', role: 'button', title: titleAttr, 'aria-label': label, 'data-id': s.id,
         onclick: function () { openSession(s.id); },
         onkeydown: function (e) { if (e.key === 'Enter') openSession(s.id); }
       }, [
-        h('span', { class: 'cr-rail-dot ' + dotClass }),
-        h('div', { class: 'cr-rail-titlewrap' }, [
+        // GAP CLOSE ("the current/existing dashboard view is much cleaner,
+        // increase the height and try to get the similar information"): this row
+        // was ONE horizontal flex line -- dot, titlewrap, status, meta, actions
+        // all on the same axis. `.cr-rail-meta` is `flex: 0 0 auto` (it never
+        // shrinks), so the moment the project and source labels joined it, the
+        // meta text claimed most of a ~290px rail and `.cr-rail-titlewrap`
+        // (flex:1) collapsed to a couple of characters -- session titles
+        // rendered as "A", "f.", "V", or vanished entirely. Restacked into the
+        // classic sidebar's own two-block anatomy (app.js sessionRow: `.srow1`
+        // carrying dot/title/badges/actions, then `.smeta` wrapping underneath),
+        // so the title always gets the full row width and the metadata wraps
+        // instead of competing with it. Same fields as before -- nothing was
+        // dropped, only re-laid out.
+        h('div', { class: 'cr-rail-r1' }, [
+          h('span', { class: 'cr-rail-dot ' + dotClass }),
           h('span', { class: 'cr-rail-title' + (s.agent ? ' cr-rail-title--agent' : '') }, titleChildren),
-          dirLine ? h('span', { class: 'cr-rail-dir' }, [dirLine]) : null,
+          statusKind ? h('span', {
+            class: 'cr-rail-status cr-rail-status--' + statusKind,
+            title: statusKind === 'waiting'
+              ? 'waiting for your answer \u2014 respond in the session'
+              : 'completed its last run',
+          }, [glyph(statusKind === 'waiting' ? 'hourglass' : 'check', ''),
+              ' ' + (statusKind === 'waiting' ? 'answer' : 'done')]) : null,
+          flagBadge,
+          noteBadge,
+          // classic keeps its re-run badge on the title line too
+          // (app.js: `.agentbadge.runs`), not buried in the meta text.
+          s._runs > 1 ? h('span', {
+            class: 'cr-rail-badge cr-rail-badge--runs',
+            title: 'ran ' + s._runs + '\u00d7 \u2014 collapsed; opens the latest',
+          }, ['\u00d7' + s._runs]) : null,
+          actions,
         ]),
-        statusKind ? h('span', {
-          class: 'cr-rail-status cr-rail-status--' + statusKind,
-          title: statusKind === 'waiting'
-            ? 'waiting for your answer — respond in the session'
-            : 'completed its last run',
-        }, [glyph(statusKind === 'waiting' ? 'hourglass' : 'check', ''),
-            ' ' + (statusKind === 'waiting' ? 'answer' : 'done')]) : null,
         h('span', { class: 'cr-rail-meta' },
-          // GAP CLOSE (rail parity): `s._runs` only exists on a row folded by
-          // collapseAgentRuns() above (a re-run collapsed into one row) —
-          // classic's own `×N` badge (app.js: `s._runs>1`), absent everywhere
-          // else, same as todoLabel already was. railRowMeta() can return icon
-          // elements (glyph()), not just strings, so this stays an array
-          // `.concat()` rather than a `.join()` — a naive string join would
-          // stringify a DOM node instead of rendering it.
-          // The project name and source label are the classic sidebar's own
-          // meta line (app.js sessionRow's `bits`), added here for parity —
-          // `agentChip` leads, matching classic's own "Agent · " lead-in.
+          // The project name and source label are the classic sidebar's own meta
+          // line (app.js sessionRow's `bits`); `agentChip` leads, matching
+          // classic's own "Agent \u00b7 " lead-in.
           agentChip
-            .concat(s._runs > 1 ? ['×' + s._runs + ' · '] : [])
-            .concat(todoLabel ? [todoLabel + ' · '] : [])
-            .concat(projLabel ? [projLabel + ' · '] : [])
-            .concat(srcLabelText ? [srcLabelText + ' · '] : [])
-            .concat(railRowMeta(s, now))),
-        actions,
+            .concat(todoLabel ? [todoLabel + ' \u00b7 '] : [])
+            .concat(projLabel ? [projLabel + ' \u00b7 '] : [])
+            .concat(srcLabelText ? [srcLabelText + ' \u00b7 '] : [])
+            .concat(railRowMeta(s, now))
+            // classic's own `kidchip` -- the count of agent sessions THIS one
+            // spawned, with the live share ahead of it. The rail buckets agent
+            // sessions under collapsible "Agents" headers rather than nesting
+            // them under the parent, so without this the parent row said nothing
+            // at all about how many it owns. Reaches the Sessions destination
+            // too: that view renders through this same railRow().
+            // ponytail: display only -- clicking it cannot expand that session's
+            // bucket, because the bucket is keyed by GROUP, not by parent id, and
+            // railAgentParentIds has no group key to hand it. Wire it up if
+            // jumping to the bucket turns out to be what people reach for.
+            .concat(kidChip)),
+        // The directory/model line keeps its own row beneath the meta line --
+        // it is control-room-only detail classic never had, and stacking it
+        // here is what stops it competing with the title for width.
+        dirLine ? h('span', { class: 'cr-rail-dir' }, [dirLine]) : null,
         rich ? railRichProgress(s) : null,
       ]);
     }
@@ -2373,6 +2577,10 @@ window.CR = window.CR || {};
       // so ext_cr_detail.js (loaded after this file) reuses it rather than
       // forking a second mapping.
       modelShort: modelShort,
+      // Exported for the SAME reason modelShort is: the detail header needs the
+      // source label and was re-deriving it with its own regexes (see the fix in
+      // ext_cr_detail.js's sourceLabel()). One mapping, one exporter.
+      toolLabel: toolLabel,
     };
   }
 

@@ -610,13 +610,33 @@
   text-overflow: ellipsis;
 }
 
+/* GAP CLOSE ("the current/existing dashboard view is much cleaner, increase the
+ * height"): the row was `display:flex; align-items:center` -- ONE horizontal
+ * line shared by the dot, the title, the status badge, the meta text and the
+ * action buttons. `.cr-rail-meta` never shrinks (flex:0 0 auto), so once the
+ * project and source labels joined it the meta claimed most of a ~290px rail
+ * and the title column was squeezed to one or two characters. Now a COLUMN, the
+ * way classic's `.sitem` stacks `.srow1` over `.smeta` (app.css), which is what
+ * makes the title's width independent of how much metadata a session has.
+ * Padding and margin follow classic's own row (11px/12px, 4px between rows),
+ * trimmed slightly for the narrower rail -- this is the "increase the height"
+ * the owner asked for: ~3 text lines per row instead of a crushed single one. */
 .tracker-next .cr-rail-row {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 6px 9px;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 9px 10px;
+  margin-bottom: 3px;
   border-radius: var(--radius-sm);
   cursor: pointer;
+  min-width: 0;
+}
+/* classic's `.srow1`: the title line, carrying dot, name, status/flag/note
+ * badges and the pin/rename actions on one axis. */
+.tracker-next .cr-rail-r1 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   min-width: 0;
 }
 .tracker-next .cr-rail-row:hover { background: var(--fill-row-hover); }
@@ -674,8 +694,31 @@
   background: var(--surface-awaiting);
   border-left: 3px solid var(--line-awaiting);
 }
+/* "also the color the session in green for the done or completed sessions":
+ * a done row carried a green LEFT BORDER only -- 3px on a ~290px row, which is
+ * not "the session is green", and it read identically to an idle row at a
+ * glance. Now takes the green surface too, the same surface+border pairing
+ * `--waiting` already uses right above. `--surface-done` is an existing token
+ * (ext_cr.css, light #EDF3EE / dark #22322A) that the board's own landed tile
+ * (.cr-tile--landed) already paints with, so this is the control room's
+ * established green in both palettes -- not a new colour invented here. */
 .tracker-next .cr-rail-row--done {
+  background: var(--surface-done);
   border-left: 3px solid var(--line-done);
+}
+/* ADVERSARIAL REVIEW FIX: `--pinned` and `--done` are independent booleans
+ * (rowMods builds them from `s.pinned` and `statusKind` separately), so a
+ * pinned session that just finished carries BOTH classes. Both selectors have
+ * identical specificity (0,2,0), so source order decides -- and `--done` is
+ * declared second, which meant the new green fill silently overrode the amber
+ * pinned fill and a pinned session stopped LOOKING pinned the moment it
+ * completed. Classic never had this problem because its `.sitem.done` sets only
+ * a border and no background at all (app.css), so pinned+done stays amber
+ * there. This restores classic's precedence explicitly rather than by relying
+ * on declaration order: pinned keeps its fill, and "done" still reads through
+ * the green left border and the check badge, which is how classic says it too. */
+.tracker-next .cr-rail-row--pinned.cr-rail-row--done {
+  background: var(--surface-agent-quiet);
 }
 .tracker-next .cr-rail-row--flagged {
   border-left: 3px solid var(--line-flagged);
@@ -700,19 +743,16 @@
 /* a live session with a failing command had no dot colour at all -- it was
    indistinguishable from idle, in the one place the orb rail can show state */
 .tracker-next .cr-rail-dot.is-failing { background: var(--state-failed); }
-/* Decision 1 — the rail row's title + directory now stack in their own
- * column so the row can carry both without growing the dot/meta layout;
- * `.cr-rail-title` no longer needs its own flex-item sizing, its wrap does. */
-.tracker-next .cr-rail-titlewrap {
+/* `.cr-rail-titlewrap` is gone with the restack above -- the title is now a
+ * direct child of `.cr-rail-r1` and takes the row's full width, so it is the
+ * flex:1 item itself. Sized like classic's own `.srow1 .nm` (app.css: 13.5px/
+ * 600) rather than the old 12px/400, which is the other half of "much cleaner
+ * ... increase the height": the session name is the row's primary text and now
+ * reads as it does in the view the owner is comparing against. */
+.tracker-next .cr-rail-title {
   flex: 1;
   min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-.tracker-next .cr-rail-title {
-  min-width: 0;
-  font: var(--fw-row-min) 12px/var(--lh-row-min) var(--font-sans);
+  font: 600 13px/1.3 var(--font-sans);
   color: var(--text-primary);
   white-space: nowrap;
   overflow: hidden;
@@ -726,12 +766,46 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* No longer a flex item fighting the title for width -- an ordinary block that
+ * WRAPS, exactly like classic's `.smeta`. `flex:0 0 auto` here was the specific
+ * declaration that crushed the title, so it must not come back. */
 .tracker-next .cr-rail-meta {
-  flex: 0 0 auto;
+  display: block;
+  min-width: 0;
   font: var(--fw-trace) 10.5px/var(--lh-trace) var(--font-mono);
   font-variant-numeric: tabular-nums;
   color: var(--text-muted);
+  overflow-wrap: anywhere;
 }
+/* GAP CLOSE ("all the markers in place ... and also make those markers
+ * clickable"): the flag / note / bg-running / re-run badges classic carries.
+ * Buttons (so `border:0` first, the same reset every other icon-only control in
+ * this file uses); `--runs` is a plain span and says so with its cursor. */
+.tracker-next .cr-rail-badge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  border: 0;
+  background: transparent;
+  padding: 0 4px;
+  border-radius: var(--radius-sm);
+  font: var(--fw-trace) 10px/1.6 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  cursor: pointer;
+  vertical-align: middle;
+}
+.tracker-next .cr-rail-badge:hover { background: var(--fill-row-hover); }
+.tracker-next .cr-rail-badge--flag { color: var(--text-flagged); }
+.tracker-next .cr-rail-badge--note { color: var(--text-agent); }
+.tracker-next .cr-rail-badge--bg { color: var(--state-thinking); }
+/* classic's `kidchip` -- how many agent sessions this one spawned. Display
+ * only (see railRow's ponytail note), so it does not claim to be clickable. */
+.tracker-next .cr-rail-badge--kids { color: var(--text-agent); cursor: default; }
+.tracker-next .cr-rail-badge--kids:hover { background: transparent; }
+.tracker-next .cr-rail-badge--runs { cursor: default; }
+.tracker-next .cr-rail-badge--runs:hover { background: transparent; }
 
 /* GAP CLOSE (rail parity): the classic sidebar's waiting/done status badge
  * (app.js sessionRow's `.statusbadge`), which the rail never carried at all.
@@ -773,7 +847,12 @@
   line-height: 1;
   color: var(--text-muted);
   cursor: pointer;
-  opacity: 0;
+  /* Classic rests these at opacity 0 and reveals them on row hover. Kept the
+   * reveal, but the resting state is faint-not-invisible: the owner's ask is
+   * that the markers read as CLICKABLE, and a control at zero opacity is
+   * undiscoverable until you happen to hover the right row. `--on` (a pinned
+   * session) still overrides to fully opaque below, same as classic's `.pin.on`. */
+  opacity: .3;
 }
 .tracker-next .cr-rail-row:hover .cr-rail-pin,
 .tracker-next .cr-rail-row:focus-within .cr-rail-pin,
@@ -818,6 +897,14 @@
  * machine alone sees 900+ sessions). Smaller diff than teaching the JS to
  * abbreviate ("+1.2k") -- CSS-only, and the FULL count still rides `title`
  * (set alongside `textContent` in renderRail) either way. */
+/* The rail cap's escape hatch. Only carries button affordances while the
+ * expanded footer is actually offering "Show N more" -- renderRail() strips the
+ * class again in the collapsed branch and when nothing is hidden. */
+.tracker-next .cr-rail-footer--more {
+  cursor: pointer;
+  color: var(--text-agent);
+}
+.tracker-next .cr-rail-footer--more:hover { background: var(--fill-row-hover); }
 .tracker-next .cr-rail--collapsed .cr-rail-footer {
   padding: 8px 2px;
   text-align: center;
