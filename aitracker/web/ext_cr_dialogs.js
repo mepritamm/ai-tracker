@@ -1750,39 +1750,115 @@
         return;
       }
       var terms = payload.terminals || [];
-      var max = payload.max || terms.length;
+      // FIX: the cap is the SERVER's number (conventions rule 5) — read straight off the
+      // response, never substituted. `payload.max || terms.length` fabricated one whenever the
+      // server sent none, which rendered "1 of 1 running — free a slot": a cap the server never
+      // claimed, painting the panel with the red at-cap treatment and telling the user to free a
+      // slot that was not in fact full. Omit the "of N" entirely instead of guessing it, exactly
+      // as ext_vt.js's renderManagerBody does.
+      var max = payload.max;
       var atCap = !!(max && terms.length >= max);
+      var count = terms.length + (max ? ' of ' + max : '') + ' running';
       chrome.panel.classList.toggle('cr-dialog-cap', atCap);
-      titleEl.textContent = atCap
-        ? (terms.length + ' of ' + max + ' running — free a slot')
-        : ('Manage terminals — ' + terms.length + ' of ' + max + ' running');
+      titleEl.textContent = atCap ? (count + ' — free a slot') : ('Manage terminals — ' + count);
       if (!terms.length) {
         chrome.body.appendChild(emptyState({ title: 'No terminals running', body: 'Open one from the top bar’s + New terminal / + New Claude session.' }));
         return;
       }
       var list = h('div', { class: 'cr-termcap-list' });
+      // Same whole-panel latch discipline as the dashboard manager's `_latchManager` (ext_vt.js):
+      // one destructive click at a time, so a double-tap can't fire two kills against a list that
+      // is about to be redrawn under it.
+      var rowBtns = [];
+      function latch(on) { rowBtns.forEach(function (b) { b.disabled = !!on; }); }
       terms.forEach(function (t) {
         // FIX 2: t.title never arrives from the server (term_vt.py's terminal rows carry
         // only the raw `session` uuid) -- resolve a human name via sessionTitleFor(), same
         // as ext_vt.js/ext_cr_boot.js, and fall back to a truncated id rather than the full
         // 36-char uuid (never "undefined": t.session is "" for a plain shell, never unset).
         var identity = t.session ? (sessionTitleFor(t.session) || t.session.slice(0, 8)) : null;
+        var peekBtn = h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'peek', onclick: function () { if (payload.onPeek) payload.onPeek(t); } });
+        var killBtn = h('button', { class: 'cr-btn cr-btn-quiet cr-btn-danger', type: 'button', onclick: function () {
+          if (!payload.onKill) return;
+          latch(true);
+          // onKill resolves once the server has confirmed the SIGKILL; releasing the latch on
+          // BOTH settle paths means a failed kill re-enables the panel instead of leaving every
+          // button dead until the dialog is reopened.
+          var p = payload.onKill(t);
+          if (p && typeof p.then === 'function') p.then(function () { latch(false); }, function () { latch(false); });
+          else latch(false);
+        } }, [icon('close'), ' kill']);
+        rowBtns.push(peekBtn, killBtn);
         list.appendChild(h('div', { class: 'cr-termcap-row' }, [
           h('div', {}, [
             h('div', { class: 'cr-termcap-title' }, [identity || cwdTail(t.cwd) || t.tty]),
             h('div', { class: 'cr-termcap-meta cr-mono' }, [cwdTail(t.cwd) + ' · ' + timeAgo(t.started)]),
           ]),
-          h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'peek', onclick: function () { if (payload.onPeek) payload.onPeek(t); } }),
-          h('button', { class: 'cr-btn cr-btn-quiet cr-btn-danger', type: 'button', onclick: function () { if (payload.onKill) payload.onKill(t); } }, [icon('close'), ' kill']),
+          peekBtn,
+          killBtn,
         ]));
       });
       chrome.body.appendChild(list);
+      // `armed` is ExtVT's arm-guard predicate, installed the moment the confirm is revealed and
+      // dropped on every repaint (paint() rebuilds this row hidden, so the panel can never come
+      // back already armed — the same disarm-on-every-redraw rule the dashboard manager states).
+      var armed = null;
+      var confirmBtn = h('button', {
+        class: 'cr-btn cr-btn-solid cr-btn-danger', type: 'button',
+        text: 'Yes, kill all ' + terms.length,
+        onclick: function () {
+          // THE data-loss guard. Without it the second click of a double-click on "Close all"
+          // lands on this button — revealed synchronously inside the first click's own handler,
+          // in the box that button just vacated — and kills every terminal with the warning never
+          // displayed for a single frame.
+          if (armed && armed()) return;
+          // FIX — THE DEAD BUTTON: this was `payload.onCloseAll()` with NO ARGUMENTS, while
+          // ext_cr_term.js's `_closeAllTerminals(terminals)` iterates `(terminals || [])`. The
+          // list was always undefined, so it mapped over an empty array, resolved immediately and
+          // killed NOTHING — "Close all" was a silent no-op in the Control Room while the
+          // dashboard's equivalent worked. Pass the list the rows were actually drawn from.
+          if (!payload.onCloseAll) return;
+          // The arm guard only covers the first ~500ms after arming. killSeries is SEQUENTIAL —
+          // one HTTP round trip per terminal — so a real close-all over several terminals
+          // routinely OUTLASTS that window, after which this still-visible button would happily
+          // fire a second kill sweep across a half-drained list. The guard stops the double-click;
+          // the latch stops the long-running overlap. Both are needed, they cover different spans.
+          latch(true);
+          var p = payload.onCloseAll(terms);
+          if (p && typeof p.then === 'function') p.then(function () { latch(false); }, function () { latch(false); });
+          else latch(false);
+        },
+      });
+      // Latched with the rest of the panel, so the sweep disables the button that started it.
+      rowBtns.push(confirmBtn);
+      // The keyboard twin of the same hazard: a HELD Enter auto-repeats keydown at ~30ms once the
+      // OS repeat delay elapses, and each repeat activates the focused button — so the timing
+      // guard alone would only postpone the kill past the arm delay, not prevent it. A repeat is
+      // never a deliberate second decision, so it never activates this button at all.
+      if (confirmBtn.addEventListener) {
+        confirmBtn.addEventListener('keydown', function (ev) { if (ev.repeat) ev.preventDefault(); });
+      }
       var confirmRow = h('div', { class: 'cr-inline-confirm', hidden: true }, [
-        h('span', {}, ['Kill every running terminal? This cannot be undone.']),
-        h('button', { class: 'cr-btn cr-btn-solid cr-btn-danger', type: 'button', text: 'Close all', onclick: function () { if (payload.onCloseAll) payload.onCloseAll(); } }),
-        h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Cancel', onclick: function () { confirmRow.hidden = true; closeAllBtn.hidden = false; } }),
+        h('span', {}, ['Kill every running terminal? This kills ' + terms.length + ' running terminal'
+          + (terms.length === 1 ? '' : 's') + ', including any Claude session inside them. It cannot be undone.']),
+        confirmBtn,
+        // Guarded too, so an accidental double-click doesn't silently DISARM the panel either —
+        // the second click is swallowed whole and the user is left looking at the warning they
+        // were meant to read, which is the entire point of the two-step.
+        h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Cancel', onclick: function () {
+          if (armed && armed()) return;
+          confirmRow.hidden = true; closeAllBtn.hidden = false;
+        } }),
       ]);
-      var closeAllBtn = h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Close all', onclick: function () { closeAllBtn.hidden = true; confirmRow.hidden = false; } });
+      var closeAllBtn = h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Close all', onclick: function () {
+        closeAllBtn.hidden = true;
+        confirmRow.hidden = false;
+        armed = (window.ExtVT && window.ExtVT.term) ? window.ExtVT.term.armGuard() : null;
+        // Revealing the warning leaves keyboard focus on a button that just went hidden, dropping
+        // a keyboard user to <body> and losing their place. Put it on the control the warning is
+        // asking about — safe ONLY because of the two guards above.
+        try { if (confirmBtn.focus) confirmBtn.focus(); } catch (e) {}
+      } });
       chrome.body.appendChild(h('div', { class: 'cr-cfg-footer' }, [
         h('p', { class: 'cr-cfg-footer-note' }, ['Closing this dialog detaches; the kill button stops it.']),
         closeAllBtn,
@@ -1825,9 +1901,40 @@
     payload = payload || {};
     var chrome = buildChrome('directory-picker', payload.title || 'Choose a directory', null, '', false);
     var titleEl = chrome.panel.querySelector('.cr-dialog-title');
+    // FIX: this picker used to `close()` SYNCHRONOUSLY, before onPick's POST /api/term/pty had
+    // resolved — so a second click (or a double-tap) fired a second spawn against a cap the first
+    // one was still consuming, and the modal was gone before the outcome was known. The dashboard's
+    // own picker (ext_launch.js's showPickerBusy) disables the control and waits. Do the same:
+    // one in-flight spawn at a time, close only once it settles. onPick returning a non-promise
+    // (an older caller) keeps the previous close-immediately behaviour.
+    //
+    // `busy` lives OUT HERE, not inside paint(), and that placement is the whole fix. This dialog
+    // re-opens ITSELF: _openDirectoryPicker shows it with {loading:true} and then again with the
+    // cwds list once GET /api/term/cwds resolves — and that second open runs update() -> paint().
+    // A busy flag scoped to paint() would be wiped by the dialog's own load sequence, handing back
+    // a fresh enabled Start button while the first POST was still in flight. Since the text field
+    // and Start button render even while loading, that race is reachable by simply typing a path
+    // and hitting Start before the directory list arrives.
+    var busy = false;
+    // The controls the CURRENT paint owns. `release()` must re-enable THESE, not the nodes the
+    // click happened to start on: a repaint can land between submit and settle (the loading ->
+    // cwds re-open does exactly that), and a release aimed at the old, detached button would
+    // clear `busy` while leaving the live Start button disabled and reading "Opening…" forever,
+    // with no further repaint to reconcile it — a dead dialog until it is closed and reopened.
+    var pickBtns = [];
+    var goBtn = null;
     function paint() {
       titleEl.textContent = payload.title || 'Choose a directory';
       chrome.body.innerHTML = '';
+      pickBtns = [];
+      function submit(path, btn) {
+        if (busy || !payload.onPick) return;
+        var p = payload.onPick(path);
+        if (!p || typeof p.then !== 'function') { close(); return; }
+        busy = true;
+        if (btn) { btn.disabled = true; btn.textContent = 'Opening…'; }
+        p.then(function () { close(); }, release);
+      }
       if (payload.loading) chrome.body.appendChild(emptyState({ title: 'Loading recent directories…', body: '' }));
       if (payload.note) chrome.body.appendChild(h('p', { class: 'cr-help-note' }, [payload.note]));
       var cwds = payload.cwds || [];
@@ -1837,13 +1944,15 @@
           var path = (entry && entry.path) || '';
           if (!path) return;
           var label = (entry && entry.label) || path;
-          list.appendChild(h('button', {
+          var rowBtn = h('button', {
             // `text:` assigns via el.textContent (h()'s own DOM-property path, line ~48) --
             // never innerHTML -- so an untrusted label/path can't break markup here.
             class: 'cr-btn cr-btn-quiet cr-fullrow', type: 'button', text: label,
             title: path,
-            onclick: function () { if (payload.onPick) payload.onPick(path); close(); },
-          }));
+            onclick: function () { submit(path, rowBtn); },
+          });
+          pickBtns.push(rowBtn);
+          list.appendChild(rowBtn);
         });
         chrome.body.appendChild(list);
       } else if (!payload.loading && !payload.note) {
@@ -1854,9 +1963,24 @@
       var input = h('input', { class: 'cr-textfield', type: 'text', placeholder: '/path/to/project' });
       var go = h('button', {
         class: 'cr-btn cr-btn-solid', type: 'button', text: 'Start',
-        onclick: function () { if (input.value.trim() && payload.onPick) payload.onPick(input.value.trim()); close(); },
+        onclick: function () { var v = input.value.trim(); if (v) submit(v, go); },
       });
+      pickBtns.push(go);
+      goBtn = go;
       chrome.body.appendChild(h('div', { class: 'cr-textfield-row' }, [input, go]));
+      // A spawn started before this repaint is STILL in flight — carry its disabled state onto the
+      // freshly built controls, or the repaint itself becomes the double-submit.
+      if (busy) {
+        pickBtns.forEach(function (b) { b.disabled = true; });
+        go.textContent = 'Opening…';
+      }
+    }
+
+    // Always reconciles whichever controls are on screen NOW.
+    function release() {
+      busy = false;
+      pickBtns.forEach(function (b) { b.disabled = false; });
+      if (goBtn) goBtn.textContent = 'Start';
     }
     paint();
     return { backdrop: chrome.backdrop, panel: chrome.panel, update: function (p) { payload = p || {}; paint(); } };
@@ -2074,6 +2198,12 @@
     // implementation. Returns the untrap cleanup fn, exactly like the internal call site
     // above (open()) uses it.
     trapFocus: trapFocus,
+    // Exposed read-only so a dialog that REPAINTS ITSELF ON A TIMER can check it is still the one
+    // on screen before re-opening. ext_cr_term.js's _repaintManage waits out the pty reap (a
+    // killed pty leaves GET /api/term/list only when the reader thread notices EOF) and then
+    // re-lists; without this it would re-open a dialog the user dismissed during that window,
+    // because open()'s same-name dedupe only applies while the dialog is still topmost.
+    topName: function () { var t = topEntry(); return t ? t.name : null; },
     CAPABILITIES: CAPABILITIES, // exposed read-only — tests/test_capability_table.py asserts against this directly
   };
 })();

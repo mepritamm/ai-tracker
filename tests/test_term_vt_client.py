@@ -91,8 +91,13 @@ class TestAssetsAreInlined(unittest.TestCase):
         # so ext_vt.js's definitions land after ext_launch.js's in the one concatenated script.
         # window.ExtVT must exist by the time a click can happen (after full load), which is true
         # regardless of order, but this pins the actual concatenation order this file assumed.
+        # Match the DEFINITION, not any mention. The bare name `window.ExtVT` now also appears
+        # earlier in the concatenated page as prose in ext_cr_term.js's comments and in its lazy
+        # `window.ExtVT && ...` reads (lazy precisely BECAUSE ext_cr_term.js is inlined first) --
+        # so indexing the bare name pinned whichever comment happened to come first rather than
+        # the concatenation order this test is actually about.
         self.assertLess(self.page.index("function localOnly"),   # ext_launch.js
-                         self.page.index("window.ExtVT"))         # ext_vt.js
+                         self.page.index("window.ExtVT = {"))     # ext_vt.js's own definition
 
 
 class TestSgrEncodingIsIsolated(unittest.TestCase):
@@ -2500,8 +2505,14 @@ class TestTerminalManagerPanel(unittest.TestCase):
         self.assertIn("mgrConfirmAll = false;",
                       _body_until(self.js, "function closeManager(", ["function openManager("]))
         # no bulk server route was invented -- close-all loops the existing per-tty one
+        # The per-tty loop now lives in killSeries(), split out of closeAll() so the Control Room's
+        # own manage-terminals dialog runs THIS policy rather than a second copy of it. The
+        # invariant is unchanged and still pinned, just where the loop actually is now: closeAll
+        # delegates, and the delegate loops the existing per-tty route.
         close_all = _body_until(self.js, "function closeAll(", ["window.ExtVT ="])
-        self.assertIn("closeTty(t.tty)", close_all)
+        self.assertIn("killSeries(terminals)", close_all)
+        kill_series = _body_until(self.js, "function killSeries(", ["function closeAll("])
+        self.assertIn("closeTty(t.tty)", kill_series)
         self.assertIn('"/api/term/close"',
                       _body_until(self.js, "function closeTty(", ["function _latchManager("]))
 
@@ -2514,7 +2525,10 @@ class TestTerminalManagerPanel(unittest.TestCase):
         self.assertIn('"?tty=" + encodeURIComponent(t.tty)', peek)
         self.assertIn('"&sid=" + encodeURIComponent(t.session || "")', peek)
         self.assertIn('"&mode=" + encodeURIComponent(t.mode || "")', peek)
-        self.assertIn('window.open(url, "_blank")', peek)
+        # The query-string builder moved into peekUrl() (still inside this slice) so the Control
+        # Room can CALL it instead of retyping the params -- the drift this test's own sid/mode
+        # assertions above exist to catch. peekTerm() still opens exactly one new tab with it.
+        self.assertIn('window.open(peekUrl(t), "_blank")', peek)
         # Blocked-popup handling is pinned on BEHAVIOUR, not on where the message text lives:
         # peekTerm() must route a null window.open() through the shared, non-blocking notice
         # helper -- never a blocking native alert() -- and that helper is separately checked (below,

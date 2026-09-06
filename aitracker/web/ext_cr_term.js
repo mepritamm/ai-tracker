@@ -18,13 +18,13 @@
 (function () {
   window.CR = window.CR || {};
 
-  // ===== hard-coded CLI ladders — mirrors ext_vt.js's own MODEL_LADDER/EFFORT_LADDER exactly.
-  // These are the CLI's OWN slash-command vocabulary (not discoverable from any API), so this is
-  // the one place a client is allowed to know them; duplicating the literal array is not the kind
-  // of duplication the brief warns about (that is about transport/resize/buffer engines) — see
-  // ext_vt.js's own comment on MODEL_LADDER for the provenance.
-  var MODEL_LADDER = ["haiku", "sonnet", "opus", "fable"];
-  var EFFORT_LADDER = ["low", "medium", "high", "xhigh", "max"];
+  // ===== CLI ladders — these are the CLI's own slash-command vocabulary, owned by ext_vt.js and
+  // exported as window.ExtVT.MODEL_LADDER/EFFORT_LADDER for exactly this reason; read LAZILY
+  // because page.py inlines this file before ext_vt.js, so window.ExtVT is undefined at
+  // module-eval time; an empty array degrades to an empty picker rather than throwing if
+  // ext_vt.js is absent.
+  function modelLadder() { return (window.ExtVT && window.ExtVT.MODEL_LADDER) || []; }
+  function effortLadder() { return (window.ExtVT && window.ExtVT.EFFORT_LADDER) || []; }
 
   // FIX 4: this used to redeclare its own esc() here, byte-for-byte identical to app.js's
   // top-level `esc()` (app.js:7) — a pure duplicate, not even the quote-escaping variant
@@ -576,7 +576,9 @@
       mode: mode,
       title: (mode === "new" ? "New Claude session" : "New terminal") + " — choose a directory",
       loading: true,
-      onPick: function (path) { _pickDirectory(path, mode); },
+      // RETURN the promise: the picker keeps itself open and disabled until the spawn settles,
+      // and can only do that if it gets something to await (see renderDirectoryPicker's submit()).
+      onPick: function (path) { return _pickDirectory(path, mode); },
     });
     fetch("/api/term/cwds").then(j).then(function (res) {
       var note = null;
@@ -590,7 +592,9 @@
         title: (mode === "new" ? "New Claude session" : "New terminal") + " — choose a directory",
         cwds: (res.j && res.j.cwds) || [],
         note: note,
-        onPick: function (path) { _pickDirectory(path, mode); },
+        // RETURN the promise: the picker keeps itself open and disabled until the spawn settles,
+      // and can only do that if it gets something to await (see renderDirectoryPicker's submit()).
+      onPick: function (path) { return _pickDirectory(path, mode); },
       });
     }).catch(function () {
       ctx.dialog("directory-picker", {
@@ -598,25 +602,37 @@
         title: (mode === "new" ? "New Claude session" : "New terminal") + " — choose a directory",
         cwds: [],
         note: "couldn't load recent directories — type a path below",
-        onPick: function (path) { _pickDirectory(path, mode); },
+        // RETURN the promise: the picker keeps itself open and disabled until the spawn settles,
+      // and can only do that if it gets something to await (see renderDirectoryPicker's submit()).
+      onPick: function (path) { return _pickDirectory(path, mode); },
       });
     });
   }
   function _pickDirectory(raw, mode) {
     var path = (raw == null ? "" : String(raw)).trim();
-    if (!path) { showToast("Choose or type a directory first."); return; }
-    post("/api/term/pty", { cwd: path, cols: 100, rows: 30, mode: mode }).then(j).then(function (res) {
+    // Reject rather than return undefined: an undefined return makes the picker fall back to its
+    // close-immediately path, which would tear the dialog down the moment the user pressed Start
+    // on an EMPTY field — exactly when they most need it to stay put.
+    if (!path) { showToast("Choose or type a directory first."); return Promise.reject(new Error("no directory chosen")); }
+    return post("/api/term/pty", { cwd: path, cols: 100, rows: 30, mode: mode }).then(j).then(function (res) {
       if (!res.ok || !res.j || !res.j.tty) {
         // FIX 2: 429 is the server's real structured cap-reached signal — term_vt.py's open_pty
         // returns {error, terminals} at status 429 when config.MAX_TERMS is hit — not a guessed
         // string match (this call hits /api/term/pty directly, so the status code is right here).
         if (res.status === 429) {
-          _openCapDialog(function () { _pickDirectory(path, mode); });
+          // The retry ignores the returned promise, so swallow its rejection here rather than
+          // leaving an unhandled one behind — _pickDirectory now reports its own failures.
+          _openCapDialog(function () { _pickDirectory(path, mode).catch(function () {}); });
           return;
         }
+        // Same wording as ext_launch.js's picker, deliberately: both halves of these messages are
+        // load-bearing. "on this server" says the gap is per-deployment rather than permanent, and
+        // the 403 names the two env vars that actually fix it — the Control Room used to drop both,
+        // leaving an operator with a dead end instead of the remedy.
         showToast((res.j && res.j.error) ||
-          (res.status === 404 ? "Opening a terminal at a chosen directory isn't available yet." :
-           res.status === 403 ? "In-browser terminal is disabled." : "Failed to open a terminal there."));
+          (res.status === 404 ? "Opening a terminal at a chosen directory isn’t available on this server yet." :
+           res.status === 403 ? "In-browser terminal is disabled — set TRACKER_TERMINAL=1 and TRACKER_AUTH."
+                              : "Failed to open a terminal there."));
         return;
       }
       showToast((mode === "new" ? "Starting a new Claude session" : "Terminal opened") + " — " + path);
@@ -638,7 +654,12 @@
   // threading through here). The one difference: this onKill also closes the dialog and replays
   // `retry` — the original action the user asked for — once the kill confirms, instead of just
   // refreshing the list in place.
+  // Bumped every time a cap dialog opens, so a kill-then-retry timer left over from an EARLIER
+  // cap dialog is dropped instead of replaying a request the user has since abandoned.
+  var _capGen = 0;
+
   function _openCapDialog(retry) {
+    _capGen++;
     fetch("/api/term/list").then(j).then(function (res) {
       if (!res.ok) {
         ctx.dialog("manage-terminals", {
@@ -657,9 +678,20 @@
         max: st.maxRunning,
         onPeek: _peekTerminal,
         onKill: function (t) {
-          _killTerminal(t).then(function () {
+          return _killTerminal(t).then(function () {
             if (window.CR.dialogs && typeof window.CR.dialogs.close === "function") window.CR.dialogs.close();
-            if (typeof retry === "function") retry();
+            // The slot frees when the READER THREAD notices EOF, not when the close response
+            // lands — retrying immediately re-POSTs /api/term/pty against a cap that is still
+            // full and bounces the user straight back into this same dialog. Wait the shared
+            // reap-settle beat (ext_vt.js's own renderCapBlock does exactly this), and re-check
+            // the generation first: a retry that fires after the user has moved on and opened
+            // something else would hijack whatever they opened instead.
+            var vt = _vt();
+            var gen = _capGen;
+            setTimeout(function () {
+              if (gen !== _capGen) return;
+              if (typeof retry === "function") retry();
+            }, (vt && vt.REAP_SETTLE_MS) || 0);
           }).catch(function () { showToast("Failed to kill terminal."); });
         },
         onCloseAll: _closeAllTerminals,
@@ -688,34 +720,80 @@
         terminals: st.running,
         max: st.maxRunning,
         onPeek: _peekTerminal,
-        onKill: _killTerminal,
+        // NOT the bare _killTerminal: that only refreshes st.running and the badge, so the killed
+        // row stayed visibly in the OPEN dialog until it was closed and reopened, and a failed
+        // kill reported nothing at all. Same discipline as the dashboard's closeOneFromManager —
+        // toast the outcome, then repaint after the reap-settle beat.
+        onKill: function (t) {
+          return _killTerminal(t).then(function () {
+            showToast("Terminal closed — " + (t.cmd || t.tty));
+            _repaintManage();
+          }).catch(function (e) {
+            showToast("Couldn’t close that terminal — " + e);
+          });
+        },
         onCloseAll: _closeAllTerminals,
       });
     }).catch(function (e) {
       ctx.dialog("manage-terminals", { error: "failed to reach the server: " + e });
     });
   }
+  // ===== every terminal ACTION below runs on window.ExtVT.term ==============================
+  // The shared terminal-action seam in ext_vt.js — the same one the dashboard's own manager runs
+  // on. This file owns Control Room CHROME and nothing else: the peek URL, the SIGKILL call, the
+  // kill sequencing and the reap-settle beat are not its to re-implement. Each of these used to
+  // be a retyped copy, and every copy had drifted from the original it was copied from.
+  function _vt() { return (window.ExtVT && window.ExtVT.term) || null; }
+
   function _peekTerminal(t) {
-    // Peek opens the terminal in its own tab — nothing is killed. Same URL scheme as
-    // ext_vt.js's own peekTerm(); a peeked terminal keeps its full context bar and fork chip.
-    var url = location.origin + location.pathname + "?tty=" + encodeURIComponent(t.tty) +
-      "&sid=" + encodeURIComponent(t.session || "") +
-      "&mode=" + encodeURIComponent(t.mode || "") +
-      "&forked=" + (t.forked ? "1" : "0");
-    var w = window.open(url, "_blank");
+    var vt = _vt();
+    if (!vt) { showToast("Terminal support isn’t loaded on this page."); return; }
+    var w = window.open(vt.peekUrl(t), "_blank");
     if (!w) showToast("Popup blocked — allow popups for this page to open a new tab.");
   }
+
   function _killTerminal(t) {
-    return post("/api/term/close", { tty: t.tty }).then(function (r) {
-      if (!r.ok) throw new Error("HTTP " + r.status);
+    var vt = _vt();
+    if (!vt) return Promise.reject(new Error("terminal support not loaded"));
+    // vt.closeTty already throws on a non-2xx, so the caller's .catch sees a real failure rather
+    // than a resolved promise carrying an error response.
+    return vt.closeTty(t.tty).then(function (r) {
       _refreshRunningList();
       return r;
     });
   }
+
   function _closeAllTerminals(terminals) {
-    return Promise.all((terminals || []).map(function (t) {
-      return post("/api/term/close", { tty: t.tty }).catch(function () {});
-    })).then(function () { _refreshRunningList(); });
+    var vt = _vt();
+    if (!vt) { showToast("Terminal support isn’t loaded on this page."); return Promise.resolve(); }
+    var total = (terminals || []).length;
+    // Sequential via the shared killSeries, not this file's old Promise.all: it resolves with the
+    // FAILURE COUNT, so a partial failure is reported instead of silently swallowed by the
+    // per-request `.catch(function () {})` that used to sit here.
+    return vt.killSeries(terminals).then(function (failures) {
+      if (failures) showToast("Some terminals could not be closed — " + failures + " of " + total + " failed");
+      else showToast("Closed all terminals — " + total + " killed");
+      _repaintManage();
+    });
+  }
+
+  // A pty leaves GET /api/term/list when the reader thread notices EOF, NOT when
+  // POST /api/term/close returns — so repainting on the response alone redraws a row for a
+  // terminal that is already dead. ext_vt.js owns that beat (REAP_SETTLE_MS); this reads it
+  // rather than picking a second number. Re-opening is the repaint path: CR.dialogs.open()
+  // dedupes a same-name topmost dialog into its own update(), so this refreshes the list in
+  // place instead of stacking a second copy.
+  function _repaintManage() {
+    var vt = _vt();
+    setTimeout(function () {
+      // Only repaint if the manage dialog is STILL the one on screen. The user can dismiss it
+      // inside the settle window, and open()'s same-name dedupe only folds into update() while
+      // this dialog is topmost — otherwise it PUSHES A NEW ONE, re-opening the dialog they just
+      // closed. A stale row until the next open is a far smaller sin than that.
+      var d = window.CR && window.CR.dialogs;
+      if (!d || typeof d.topName !== "function" || d.topName() !== "manage-terminals") return;
+      _openManageDialog();
+    }, (vt && vt.REAP_SETTLE_MS) || 0);
   }
   function _refreshRunningList() {
     fetch("/api/term/list").then(j).then(function (res) {
@@ -778,14 +856,14 @@
   function _openModelDialog() {
     ctx.dialog("model", {
       current: st.model,
-      ladder: MODEL_LADDER,
+      ladder: modelLadder(),
       onPick: function (name) { _injectSlash("/model " + name, "Couldn't switch model"); },
     });
   }
   function _openEffortDialog() {
     ctx.dialog("effort", {
       current: st.effort,
-      ladder: EFFORT_LADDER,
+      ladder: effortLadder(),
       onPick: function (level) { _injectSlash("/effort " + level, "Couldn't switch effort"); },
     });
   }
@@ -850,7 +928,11 @@
   function _killCurrent() {
     if (!st.tty) { showToast("No terminal attached."); return; }
     var tty = st.tty;
-    post("/api/term/close", { tty: tty }).then(function (r) {
+    // the same POST /api/term/close the dashboard's manager uses — via the shared seam, never a
+    // second hand-rolled copy.
+    var vt = _vt();
+    if (!vt) { showToast("Terminal support isn’t loaded on this page."); return; }
+    vt.closeTty(tty).then(function (r) {
       if (!r.ok) { showToast("Failed to kill terminal."); return; }
       showToast("Terminal killed.");
       close();
@@ -871,7 +953,10 @@
           continuedFrom: d.continued_from || null,
           onOpen: function (targetSid) { if (ctx.go) ctx.go("detail", targetSid); },
         });
-      }).catch(function () {});
+      }).catch(function (e) {
+        // never fail silently — the convention both files follow elsewhere.
+        showToast("Couldn’t load session lineage — " + e);
+      });
   }
 
   // ===== header info: cwd + resume command, from the session-detail dict =====================
@@ -910,17 +995,11 @@
     var pct = (typeof c.pct === "number") ? c.pct : null;
     return { current: c.current, limit: limit, pct: pct };
   }
-  function _matchLadderModel(raw) {
-    if (!raw) return null;
-    var low = String(raw).toLowerCase();
-    for (var i = 0; i < MODEL_LADDER.length; i++) {
-      if (low.indexOf(MODEL_LADDER[i]) !== -1) return MODEL_LADDER[i];
-    }
-    return null;
-  }
   function _applySessionData(d) {
     var meta = (d && d.meta) || {};
-    st.model = _matchLadderModel(meta.model);
+    // ext_vt.js owns this matcher and exports it precisely so a second copy can't drift.
+    var matchLadderModel = (window.ExtVT && window.ExtVT._matchLadderModel) || function (raw) { return raw; };
+    st.model = matchLadderModel(meta.model);
     st.effort = (typeof meta.effort === "string" && meta.effort) ? meta.effort : null;
     st.ctx = _readContextUsage(d);
     st.cumulative = (d && d.tokens) ? ((d.tokens.in | 0) + (d.tokens.out | 0)) : 0;

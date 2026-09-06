@@ -3247,12 +3247,18 @@
     // here even though the original POST /api/term/pty response could not carry it.
     // No `renderer` param on purpose: the list carries none, and bootStandalone() already
     // falls back to GET /api/term/renderer -- the server picks it, this file never guesses.
-    var url = location.origin + location.pathname + "?tty=" + encodeURIComponent(t.tty) +
+    var w = window.open(peekUrl(t), "_blank");
+    if (!w) _popupBlockedNotice();
+  }
+
+  // Split out of peekTerm so the Control Room's ☰ Manage terminals dialog builds the peek URL from
+  // THIS function rather than its own retyped copy (conventions rule 4). A second copy is how the
+  // `sid`/`mode`/`forked` params silently drift apart and a peeked terminal loses its context bar.
+  function peekUrl(t) {
+    return location.origin + location.pathname + "?tty=" + encodeURIComponent(t.tty) +
       "&sid=" + encodeURIComponent(t.session || "") +
       "&mode=" + encodeURIComponent(t.mode || "") +
       "&forked=" + (t.forked ? "1" : "0");
-    var w = window.open(url, "_blank");
-    if (!w) _popupBlockedNotice();
   }
 
   // The existing route -- no bulk variant was added server-side for "close all"; looping this one
@@ -3302,19 +3308,26 @@
       });
   }
 
-  function closeAll(terminals) {
-    mgrConfirmAll = false;
-    _latchManager(true);
-    // Sequential, not Promise.all: a dozen simultaneous SIGKILL+reap cycles on one server thread
-    // pool is needless, and a serial chain gives a deterministic failure count to report.
+  // The kill loop itself, split out of closeAll so the Control Room's ☰ Manage terminals dialog
+  // runs the SAME policy instead of its own Promise.all copy (conventions rule 4). Resolves with
+  // the failure COUNT so each caller words its own toast without re-deriving the sequencing.
+  // Sequential, not Promise.all: a dozen simultaneous SIGKILL+reap cycles on one server thread
+  // pool is needless, and a serial chain gives a deterministic failure count to report.
+  function killSeries(terminals) {
     var failures = 0;
     var chain = Promise.resolve();
-    terminals.forEach(function (t) {
+    (terminals || []).forEach(function (t) {
       chain = chain.then(function () {
         return closeTty(t.tty).catch(function () { failures++; });
       });
     });
-    chain.then(function () {
+    return chain.then(function () { return failures; });
+  }
+
+  function closeAll(terminals) {
+    mgrConfirmAll = false;
+    _latchManager(true);
+    killSeries(terminals).then(function (failures) {
       if (typeof toast === "function") {
         if (failures) toast("Some terminals could not be closed", failures + " of " + terminals.length + " failed");
         else toast("Closed all terminals", terminals.length + " killed");
@@ -3610,6 +3623,29 @@
   window.ExtVT.EFFORT_LADDER = EFFORT_LADDER;
   window.ExtVT._matchLadderModel = _matchLadderModel;
   window.ExtVT.readContextUsage = readContextUsage;
+
+  // ===== the shared TERMINAL-ACTION seam ====================================================
+  // One backend, two views (conventions rule 4). The Control Room renders its own chrome for
+  // "Manage terminals", but the POLICY behind those buttons is not its to re-implement: the peek
+  // URL, the SIGKILL call, the sequential kill loop, the reap-settle beat and the two-step arm
+  // delay all live here and are called from there. Every one of these was previously retyped in
+  // ext_cr_term.js, and each copy had already drifted (its "Close all" was a no-op, its kills
+  // raced the reaper, its confirm had no arm guard) -- which is the standing argument against the
+  // second copy, not an accident of this round.
+  window.ExtVT.term = {
+    REAP_SETTLE_MS: _REAP_SETTLE_MS,
+    peekUrl: peekUrl,
+    peek: peekTerm,
+    closeTty: closeTty,
+    killSeries: killSeries,
+    // Returns a predicate that is true while the just-armed confirm must swallow input. Handed
+    // out as a factory so `_ARM_GUARD_MS` stays the single definition of "how long" -- a caller
+    // that hardcoded 500 would be exactly the drift this seam exists to stop.
+    armGuard: function () {
+      var at = Date.now();
+      return function () { return Date.now() - at < _ARM_GUARD_MS; };
+    },
+  };
 
   // ===== render hook: participates in the normal 2s poll like every other ext module, and is
   // what genuinely puts #ext_vt to use (the modal is built as its child, not appended to
