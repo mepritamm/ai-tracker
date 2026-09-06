@@ -1,0 +1,3301 @@
+// cr_detail.js — Control Room detail view (doc 03-detail-view.md).
+//
+// Namespace: window.CR.detail = { mount(root, ctx), update(state) }.
+// Almost no network calls here (contract rule 5) — everything is derived from the
+// `session` detail dict the bootstrap already fetched from /api/session
+// (aitracker/registry.py:parse_any -> aitracker/providers/claude.py:parse_session
+// / aitracker/providers/auggie.py, whichever's return dict, shared shape). The ONE
+// exception (design-audit FIX 4a): loadOlderNarration() below fetches the EXISTING
+// `/api/narration?id=&offset=&limit=` route (server.py:313-333) to page in history
+// past the server's NARR_PAGE=60 cap on /api/session — the same route+shape
+// aitracker/web/app.js's own narrState paging already uses (app.js:1264-1271, read
+// not edited). No other network call is added anywhere else in this file.
+//
+// Real detail-dict key paths this file relies on (verified by reading the
+// providers, not guessed):
+//   meta            aitracker/providers/claude.py:976 {cwd,gitBranch,version,sessionId,
+//                   entrypoint,aiTitle,customTitle,model,effort,title}
+//                   aitracker/providers/auggie.py:382 {cwd,title,source,entrypoint,gitBranch,model}
+//   todos[]         {content,status,activeForm} — aitracker/store.py:67-70 (load_tasks) and
+//                   aitracker/providers/claude.py:892-893 (in-transcript TodoWrite fallback).
+//                   started_at/ended_at (snake_case, epoch SECONDS or null) are stamped by
+//                   claude.py:1209-1210 via util._ts_epoch — read via parseEpochSec() below,
+//                   not parseT()/Date.parse (which expects the ISO `.t` strings used elsewhere
+//                   in this file). Confirmed on a live /api/session payload: ended_at is
+//                   populated whenever a todo completed, but started_at is only set when the
+//                   transcript recorded an explicit TaskUpdate to "in_progress" — many real
+//                   sessions never do, so started_at is None there and the honest equal-width
+//                   fallback below is what actually renders for them (correct, not a bug).
+//   files[]         {path,ops,last,created,agent?} — aitracker/providers/claude.py:978,964-970
+//   reads[]         {path,t} — aitracker/providers/claude.py:979-980
+//   commands[]      {id,t,cmd,kind,ok} — aitracker/providers/claude.py:911,931,981 (capped to last 60)
+//   commits[]       {t,msg} — aitracker/providers/claude.py:918,982
+//   tests[]         same shape as commands, kind==='test' — claude.py:933,983
+//   requests[]      {t,text} — user prompts, chronological oldest-first — claude.py:853,984
+//   agents[]        {t,type,desc} — Task tool dispatches — claude.py:922-923,985
+//   agents_bg[]     {id,aid,wf,task,last,ts,running,tools} — claude.py:537-546,986
+//   shells[]        parse_shells() shape, opaque here — claude.py:971,988
+//   decisions[]     {t,open,answer,questions:[{q,header,options[]}]} — claude.py:924-929,990
+//   waiting         bool — claude.py:993
+//   prs[]           {url,repo,num,created,narr,state,t,agent?} — util.py:162-220, claude.py:994
+//                   NOTE: no PR title is ever captured (only url/repo/num) — see REQUIRED ADDITION.
+//   narrative[]     {t,text} — assistant's own words, newest-first — claude.py:869,995
+//                   (server pages this to NARR_PAGE=60 on /api/session — server.py:308-310)
+//   tokens          {in,out} — claude.py:997
+//   context         {current,limit,pct} — util.py:223-237, claude.py:1000
+//   counts          {done,todos,created,edited,read,commits,tests,tests_failed,errors,agents,searches}
+//                   claude.py:1001-1009
+//   mtime, now      epoch seconds — claude.py:1010-1011
+//   notes[]         {text,pushed} — claude.py:1012, store.py:87-96
+//   push_when       "turn"|"wake"|"none" — util.py:240-251, claude.py:1015
+//   overview        {where,goal,now,now_kind,sofar,commits[]} — overview.py:64-65
+//   continued_as / continued_from — fork lineage sid strings, "" when none — registry.py:106-107
+//
+// Fields the doc assumes but that do NOT exist in the detail dict — flagged as
+// REQUIRED ADDITIONs in the final report, not silently invented here:
+//   session.open_flags, session.note_count  (only on the LIST dict — registry.py:70-72
+//     all_sessions() — never merged into parse_any()'s per-session detail)
+//   a generic "links" array for the Links panel                (deriveLinks below)
+//   PR title text                                              (prs[] carries url/repo/num
+//     only — util.py:collect_prs is a regex-only URL scan; renderPRs below shows the
+//     honest "—" missing-data marker rather than letting repo/num masquerade as a title)
+//
+// session.term_attached and session.pinned WERE on this list (drift findings A4/A10) —
+// the shared seam now populates both on the per-session detail dict, so
+// renderTerminalPanel()/renderHeader() below read them directly, no longer forward-
+// compatible dead code.
+//
+// A triage-queue position ("1 of 4 needing attention") for the back-line hint is NOT
+// on this dict either (and never will be — it's a cross-session ranking, not a
+// per-session fact); ext_cr_boot.js's EXT.push now computes it separately via
+// CR.board.boardTiles() and passes it as `state.triage` to update() (drift finding A9).
+
+(function () {
+  window.CR = window.CR || {};
+
+  // Mirrors config.LIVE_WINDOW (server) / LIVE (app.js) — same constant, same
+  // meaning, per CLAUDE.md's "Liveness is one constant" rule. app.js's `LIVE`
+  // IS reachable here: page.py concatenates every web/*.js file into ONE
+  // <script> tag, app.js first (page.py: read("app.js") + read_ext(".js")),
+  // so its top-level `const LIVE = 300` sits in the same script-level scope
+  // this IIFE closes over — verified by reading page.py, not assumed (an
+  // earlier version of this comment claimed app.js wasn't reachable; that was
+  // false). Derived from it with a safe literal fallback only for the
+  // (currently never-exercised) case this file is ever loaded standalone.
+  var LIVE_WINDOW = (typeof LIVE !== 'undefined') ? LIVE : 300;
+
+  // ============================== small pure helpers ==============================
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function fmtNum(n) {
+    n = Math.round(n || 0);
+    return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  }
+
+  // FIX 5 (design-audit): doc 03's Terminal controls readout is an ABBREVIATED
+  // scale ("128k / 481k") — a different literal spec from the stat chip's exact
+  // comma-grouped count ("tokens 128,412"), so this is a second small formatter
+  // rather than reusing fmtNum() for the terminal panel's context readout.
+  function fmtK(n) {
+    if (n == null || isNaN(n)) return null;
+    n = Math.round(n);
+    if (Math.abs(n) < 1000) return String(n);
+    return Math.round(n / 1000) + "k";
+  }
+
+  function parseT(iso) {
+    if (!iso) return null;
+    var ms = Date.parse(iso);
+    return isNaN(ms) ? null : ms;
+  }
+
+  // todos[i].started_at / ended_at are epoch SECONDS (a number), the same convention as
+  // session.mtime/now (aitracker/util.py:_ts_epoch) -- NOT an ISO string like the `.t`
+  // fields elsewhere in this file, so they are never run through parseT()/Date.parse.
+  function parseEpochSec(v) {
+    return (typeof v === "number" && !isNaN(v)) ? v * 1000 : null;
+  }
+
+  function fmtClock(ms) {
+    if (ms == null || isNaN(ms)) return "--:--";
+    var d = new Date(ms);
+    var h = d.getHours(), m = d.getMinutes();
+    return (h < 10 ? "0" + h : h) + ":" + (m < 10 ? "0" + m : m);
+  }
+
+  function fmtAge(sec) {
+    sec = Math.max(0, Math.round(sec || 0));
+    if (sec < 60) return sec + "s";
+    if (sec < 3600) return Math.floor(sec / 60) + "m";
+    return Math.floor(sec / 3600) + "h " + Math.floor((sec % 3600) / 60) + "m";
+  }
+
+  function fmtDurMs(ms) {
+    if (ms == null || isNaN(ms)) return "";
+    return fmtAge(ms / 1000);
+  }
+
+  function initials(title) {
+    var words = (title || "").trim().split(/\s+/).filter(Boolean).slice(0, 2);
+    return words.map(function (w) { return w[0]; }).join("").toUpperCase() || "??";
+  }
+
+  // NOTE: Claude's raw model string ("claude-sonnet-4-5-20250929") isn't the short
+  // display name the doc's "model · sonnet" chip wants. The ONE shortening rule
+  // lives in ext_cr_board.js's modelShort (loaded before this file — page.py's
+  // read_ext() sorts ext_ files alphabetically, "ext_cr_board" < "ext_cr_detail")
+  // and is reused here rather than forked a second time, per the owner's
+  // standing policy. Same try/catch-delegate-to-another-module pattern as
+  // providerNote() below; the inline fallback (family name only, no version) is
+  // only ever exercised if board.js somehow isn't mounted yet.
+  function shortModel(m) {
+    try {
+      var fn = window.CR && window.CR.board && window.CR.board.modelShort;
+      if (typeof fn === "function") return fn(m) || "";
+    } catch (e) {}
+    if (!m) return "";
+    var hit = /sonnet|opus|haiku/i.exec(m);
+    return hit ? hit[0].toLowerCase() : m;
+  }
+
+  function basename(p) {
+    if (!p) return "";
+    var parts = String(p).split("/");
+    return parts[parts.length - 1] || p;
+  }
+
+  function el(html) {
+    var t = document.createElement("template");
+    t.innerHTML = html.trim();
+    return t.content.firstChild;
+  }
+
+  function qs(root, sel) { return root.querySelector(sel); }
+  function qsa(root, sel) { return Array.prototype.slice.call(root.querySelectorAll(sel)); }
+
+  // ============================== markdown rendering (capability #31, FIX 1) ==============================
+  // SECURITY: mdHtml() is the ONLY function in this file that turns session-authored
+  // text into HTML, and it does so by delegating to ctx.markdown(text) — never by
+  // interpolating raw text into innerHTML itself. ctx.markdown (ext_cr_boot.js:259)
+  // wraps app.js's OWN `md()` inline-markdown renderer (app.js:10-17), which escapes
+  // first (`let h=esc(s)`) and only ever adds closed, safe tags (<code>/<strong>/<em>/
+  // <a target=_blank rel=noopener>) — so the string this returns is exactly as safe
+  // as calling esc() was. Fields that are NOT session-authored free text stay on
+  // plain esc() in this file — shell commands (c.cmd) and file paths (e.target)
+  // legitimately contain `*`/`_`/backticks/`[`/`]` as shell metacharacters or path
+  // syntax, and running them through markdown would corrupt what they actually say.
+  // GAP CLOSE: the Summary Goal/Now/So-far fields (renderSummary), the agents panel's
+  // task text (renderAgentsPanel's a.task), and the "ask" timeline entry's question +
+  // options (entryHtml()) used to be the one asymmetry capability #31 missed — the
+  // SAME session-authored text as narration/prompts/notes, rendered on esc() only
+  // because of which panel it happened to land in, not because of what it was.
+  function mdHtml(ctx, text) {
+    // TASK 2 (capability #33, "Copy per code block — on every fence"):
+    // ctx.markdown (ext_cr_boot.js) wraps app.js's inline-only `md()` (backtick
+    // code/bold/italic/links), which never understood a ``` fence at all — so
+    // a fence just fell through the inline replaces untouched. Rather than
+    // write a second fence parser, text containing a fence is instead handed
+    // whole to app.js's OWN block renderer, `mdBlock` (global — app.js:19,
+    // concatenated ahead of this file into one <script> tag by page.py's
+    // build_page(), the SAME reachable-global pattern this file already uses
+    // for shortModel()/upgradeMermaidIn()). mdBlock() already emits
+    // `.cblock`/`.codecopy` per fence wired to app.js's existing `copyCode()`
+    // — clipboard API with a guarded execCommand fallback that never throws,
+    // "✓ Copied" WORD feedback (not colour alone), never hostname-gated, and
+    // not hover-only (app.css's `.codecopy` sits at opacity:.9 by default, so
+    // it's reachable on touch too) — exactly the button this capability
+    // needs, reused rather than forked. A mermaid fence inside that text
+    // degrades the SAME honest way capability #32 already does for narration
+    // elsewhere in this file: mdBlock's own `.mmd-slot` fallback (hand-rolled
+    // SVG for the 8 known families, an honestly-labelled readable code block
+    // otherwise), upgraded to the real vendored mermaid.js by
+    // upgradeMermaidIn() — see setPanelBody() below and renderTimelineEntries()
+    // above, which already call it. Fence-free text keeps the original
+    // inline-only path, unchanged.
+    if (text && text.indexOf("```") !== -1) {
+      try {
+        if (typeof mdBlock === "function") return mdBlock(text);
+      } catch (e) {}
+    }
+    if (ctx && typeof ctx.markdown === "function") {
+      try { return ctx.markdown(text).innerHTML; } catch (e) {}
+    }
+    return esc(text); // ctx.markdown absent (older bootstrap) — old esc()-only behaviour
+  }
+  // MACHINE-OUTPUT-SAFE variant, for text that is machine-authored rather than prose --
+  // an agent's `task` label can legitimately read "delete the stray *.pyc" or similar,
+  // and ctx.markdown() always calls app.js's full md(), whose single-asterisk italics
+  // rule corrupts that glob (see app.js's mdSafe() comment). ctx.markdown has no "safe"
+  // knob (boot.js hard-codes md()), so this calls app.js's OWN global mdSafe() directly
+  // -- same reachable-global pattern this file already uses for mdBlock/shortModel --
+  // rather than forking a second inline-markdown implementation. Prose surfaces (summary
+  // goal/now/sofar, notes, narration, ask questions) are unaffected -- they keep calling
+  // mdHtml(ctx, text) above, unchanged.
+  function mdHtmlSafe(text) {
+    if (text && text.indexOf("```") !== -1) {
+      try { if (typeof mdBlock === "function") return mdBlock(text); } catch (e) {}
+    }
+    try { if (typeof mdSafe === "function") return mdSafe(text || ""); } catch (e) {}
+    return esc(text); // mdSafe absent (older app.js) -- old esc()-only behaviour
+  }
+
+  // ============================== shared empty/error/degraded states (FIX 5, FIX 6) ==============================
+  // Calls the SAME components board/terminal are told to reuse (ext_cr_dialogs.js
+  // "shared state components — exported so board/detail/terminal reuse rather than
+  // fork", :160-208) instead of forking a second empty-panel div or a second degraded-
+  // provider paragraph. Those return a real HTMLElement (built via dialogs.js's own
+  // `h()`), which this file's string-built panels can't append directly — .outerHTML
+  // gets the markup those functions already produced (all closed tags, no user text
+  // interpolated raw; same trust level as mdHtml above). Falls back to the plain
+  // `.crd-empty` div this file used before if CR.dialogs isn't loaded yet.
+  function sharedStateHtml(name, opts, fallbackText) {
+    try {
+      var fn = window.CR && window.CR.dialogs && window.CR.dialogs[name];
+      if (typeof fn === "function") {
+        var node = fn(opts);
+        if (node && node.outerHTML) return node.outerHTML;
+      }
+    } catch (e) {}
+    return '<div class="crd-empty">' + esc(fallbackText || (opts && opts.title) || "") + "</div>";
+  }
+  function emptyHtml(title, body) {
+    return sharedStateHtml("emptyState", { title: title, body: body }, title);
+  }
+  function errorHtml(title, body) {
+    return sharedStateHtml("errorState", { title: title, body: body }, title);
+  }
+
+  // ============================== localStorage panel state ==============================
+
+  function panelKey(sid, key) { return "cr.detail.panel." + sid + "." + key; }
+
+  function getCollapsed(sid, key, def) {
+    try {
+      var v = localStorage.getItem(panelKey(sid, key));
+      return v === null ? def : v === "1";
+    } catch (e) { return def; }
+  }
+
+  function setCollapsed(sid, key, val) {
+    try { localStorage.setItem(panelKey(sid, key), val ? "1" : "0"); } catch (e) {}
+  }
+
+  // FIX 8: the Config dialog's "Cards start folded" toggle writes `cr.cardsFolded`
+  // as a JSON boolean (ext_cr_dialogs.js CFG_PREF_KEYS.cardsFolded = 'cr.cardsFolded',
+  // written via that module's writePref() -> localStorage.setItem(key,
+  // JSON.stringify(val)) — read, not forked, with the same JSON.parse). This is the
+  // DEFAULT for a panel with no stored per-session state yet; existing per-panel/
+  // per-session state (getCollapsed above) always overrides it once it exists.
+  function defaultFolded() {
+    try {
+      var raw = localStorage.getItem("cr.cardsFolded");
+      if (raw == null) return true; // key absent -> preserve today's behaviour
+      return JSON.parse(raw) !== false;
+    } catch (e) { return true; }
+  }
+
+  // ============================== derived / pure logic ==============================
+
+  // Earliest timestamp we can find anywhere in the detail dict — there is no explicit
+  // "session started at" field in the shared shape (claude.py tracks t_first internally
+  // for build_overview's "41m active" text but never returns it — overview.py:12-17).
+  // This is the best honest proxy: earliest of the first prompt, oldest loaded narration,
+  // oldest loaded command, oldest commit, oldest decision.
+  function firstEventTime(session) {
+    var cands = [];
+    var reqs = session.requests || [];
+    if (reqs.length) cands.push(parseT(reqs[0].t));
+    var narr = session.narrative || []; // newest-first
+    if (narr.length) cands.push(parseT(narr[narr.length - 1].t));
+    var cmds = session.commands || []; // newest-first, capped to last 60
+    if (cmds.length) cands.push(parseT(cmds[cmds.length - 1].t));
+    var commits = session.commits || []; // newest-first
+    if (commits.length) cands.push(parseT(commits[commits.length - 1].t));
+    (session.decisions || []).forEach(function (d) {
+      var t = parseT(d.t);
+      if (t != null) cands.push(t);
+    });
+    cands = cands.filter(function (x) { return x != null; });
+    return cands.length ? Math.min.apply(Math, cands) : null;
+  }
+
+  // ---- progress-spine time window (span chips + drag-pan) -------------------
+  //
+  // The spine draws in TWO coordinate systems: the bar is a flex row of
+  // duration-PROPORTIONAL widths, while the gutter is a real TIME AXIS
+  // (marker pct = (t - t0) / span). A long session therefore crushes every real
+  // event into the first sliver of the gutter -- on a 192h session every marker
+  // landed inside the left ~3% and the 2%-collision nudge below stacked them into
+  // one illegible pile against the edge.
+  //
+  // The window fixes the axis: it re-bases marker pct onto [winT0, winT1] and,
+  // when (and only when) per-todo timings exist, clips the bar's segments to the
+  // same range. With no timings the bar carries no time meaning at all, so it is
+  // left whole rather than filtered on a number the session never recorded --
+  // the same "never invented precision" rule the equal-width fallback keeps.
+  var SPINE_SPANS = [
+    { key: "15m", ms: 15 * 60 * 1000 },
+    { key: "1h", ms: 60 * 60 * 1000 },
+    { key: "6h", ms: 6 * 60 * 60 * 1000 },
+    { key: "24h", ms: 24 * 60 * 60 * 1000 }
+  ];
+
+  // A span is only worth offering if it actually hides something, so a 12-minute
+  // session gets no chips at all rather than five no-op ones. "All" is implicit.
+  function spineSpanChoices(elapsedMs) {
+    if (!elapsedMs || elapsedMs <= 0) return [];
+    return SPINE_SPANS.filter(function (c) { return c.ms < elapsedMs; });
+  }
+
+  // ui state -> how wide to draw the strip, as a percentage of its container.
+  //
+  // This is a ZOOM, not a filter. "All" is 100% -- the strip fits, exactly as it
+  // always did. Any other choice draws the strip WIDER than the panel so the
+  // chosen span fills the view and the rest is reached by scrolling. That is the
+  // whole point: a long session becomes readable without a single todo or event
+  // ever being hidden, which is what a filtering window could not promise.
+  //
+  // The cap matters. A real 2192h session on this machine at a 15m zoom would
+  // otherwise want 8,768,000% -- tens of millions of pixels. 60x is already a
+  // dramatic spread and stays inside every browser's layout limits.
+  var SPINE_ZOOM_CAP = 6000;
+  function spineZoomPct(ui, elapsedMs) {
+    var span = ui && ui.spineZoomMs;
+    if (!span || !elapsedMs || elapsedMs <= 0) return 100;
+    return Math.max(100, Math.min(SPINE_ZOOM_CAP, (elapsedMs / span) * 100));
+  }
+
+  // The progress spine's derived layout. Pure: (session, nowMs, win) -> plan object.
+  //
+  // todos[i].started_at / todos[i].ended_at (snake_case, epoch seconds — see parseEpochSec
+  // above and claude.py:1209-1210) drive the `hasTimes` branch below when every active todo
+  // carries a started_at; this function falls back to an honest equal-width split among
+  // active/pending todos otherwise — never fabricating a per-todo duration.
+  function spineSegments(session, nowMs, win) {
+    var todos = (session.todos || []).filter(function (t) { return t && typeof t === "object"; });
+    var total = todos.length;
+    var firstMs = firstEventTime(session);
+    var elapsedMs = firstMs != null ? Math.max(0, nowMs - firstMs) : null;
+    // `win` is optional: omitted (every pre-existing caller and test) == whole
+    // session, in which case winT0/winT1 collapse onto firstMs/nowMs and every
+    // number below is what it was before the window existed.
+    var windowed = !!(win && win.spanMs) && firstMs != null && elapsedMs != null;
+    var winT1 = windowed ? win.endMs : nowMs;
+    var winT0 = windowed ? win.endMs - win.spanMs : firstMs;
+    var winSpanMs = windowed ? win.spanMs : elapsedMs;
+    var out = {
+      segments: [], markers: [], elapsedMs: elapsedMs, firstMs: firstMs,
+      doneCount: 0, runningCount: 0, pendingCount: 0, total: total, ariaLabel: "",
+      timeAccurate: false,
+      windowed: windowed, winT0: winT0, winT1: winT1, winSpanMs: winSpanMs,
+      atLiveEdge: !windowed || winT1 >= nowMs, barWindowed: false
+    };
+    if (!total) {
+      out.ariaLabel = "Progress: no tasks recorded.";
+      out.markers = buildMarkers(session, nowMs, winT0, winT1, windowed);
+      out.realMarkers = countRealMarkers(out.markers);
+      return out;
+    }
+
+    var doneIdx = [], runIdx = -1, pendIdx = [];
+    todos.forEach(function (t, i) {
+      if (t.status === "completed") doneIdx.push(i);
+      else if (t.status === "in_progress") runIdx = i;
+      else pendIdx.push(i);
+    });
+    out.doneCount = doneIdx.length;
+    out.runningCount = runIdx >= 0 ? 1 : 0;
+    out.pendingCount = pendIdx.length;
+
+    var FLOOR = 3, MAX_USED = 88, GROUP_THRESHOLD = 16;
+    var activeIdx = doneIdx.concat(runIdx >= 0 ? [runIdx] : []);
+    var hasTimes = elapsedMs != null && activeIdx.length > 0 &&
+      activeIdx.every(function (i) { return parseEpochSec(todos[i].started_at) != null; });
+
+    var segs = [];
+    if (hasTimes) {
+      out.timeAccurate = true;
+      out.barWindowed = windowed; // only here do the bar's widths mean real time
+      var spentTotal = 0, spentByIdx = {}, visActive = [];
+      activeIdx.forEach(function (i) {
+        var t = todos[i];
+        var started = parseEpochSec(t.started_at);
+        // An ABSENT ended_at means "still running" -> now. An ended_at that is
+        // present but UNPARSEABLE stays null and yields 0: promoting corrupt data
+        // to "now" would fabricate a duration, which is the one thing this
+        // function's honest equal-width fallback exists to avoid.
+        var ended = t.ended_at != null ? parseEpochSec(t.ended_at) : nowMs;
+        var usable = started != null && ended != null;
+        var ms;
+        if (!usable) {
+          ms = 0;
+        } else if (windowed) {
+          // clip the todo's real [started, ended] span to the visible window, so a
+          // todo that merely OVERLAPS the window contributes only its visible part
+          var a = Math.max(started, winT0), b = Math.min(ended, winT1);
+          ms = Math.max(0, b - a);
+        } else {
+          ms = Math.max(0, ended - started);
+        }
+        // a todo entirely outside the window is dropped, not drawn at FLOOR width
+        if (windowed && ms <= 0) return;
+        visActive.push(i);
+        spentByIdx[i] = ms; spentTotal += ms;
+      });
+      // percentages are of the WINDOW when windowed, of the session otherwise
+      var denomMs = windowed ? Math.max(1, winT1 - winT0) : elapsedMs;
+      // "to go" is a claim about the future, so pending todos only belong in a
+      // window that still touches the live edge -- a window panned into the past
+      // would otherwise assert what was pending back then, which we cannot know.
+      var showPending = !windowed || out.atLiveEdge;
+      var visPend = showPending ? pendIdx : [];
+      var usedPct = spentTotal > 0 ? Math.min(MAX_USED, (spentTotal / denomMs) * 100) : 0;
+      var pendingEach = visPend.length ? (100 - usedPct) / visPend.length : 0;
+      visActive.forEach(function (i) {
+        var pct = spentTotal > 0 ? (spentByIdx[i] / spentTotal) * usedPct : 0;
+        segs.push({ idx: i, kind: i === runIdx ? "running" : "done", widthPct: Math.max(pct, FLOOR),
+          elapsedMs: spentByIdx[i], todo: todos[i] });
+      });
+      visPend.forEach(function (i) {
+        segs.push({ idx: i, kind: "pending", widthPct: Math.max(pendingEach, FLOOR), todo: todos[i] });
+      });
+      segs.sort(function (a, b) { return a.idx - b.idx; });
+    } else {
+      // Fallback: no per-todo timing exists. Equal-width split — never invented precision.
+      var usedPct2 = pendIdx.length ? Math.min(MAX_USED, (activeIdx.length / total) * 100) : 100;
+      if (!activeIdx.length) usedPct2 = 0;
+      var eachActive = activeIdx.length ? usedPct2 / activeIdx.length : 0;
+      var eachPending = pendIdx.length ? (100 - usedPct2) / pendIdx.length : 0;
+      todos.forEach(function (t, i) {
+        if (i === runIdx) segs.push({ idx: i, kind: "running", widthPct: Math.max(eachActive, FLOOR), elapsedMs: null, todo: t });
+        else if (t.status === "completed") segs.push({ idx: i, kind: "done", widthPct: Math.max(eachActive, FLOOR), elapsedMs: null, todo: t });
+        else segs.push({ idx: i, kind: "pending", widthPct: Math.max(eachPending, FLOOR), todo: t });
+      });
+    }
+
+    // group a long completed tail into "N earlier" (doc: >~16 todos)
+    if (segs.length > GROUP_THRESHOLD) {
+      var headDone = [];
+      for (var k = 0; k < segs.length; k++) {
+        if (segs[k].kind === "done") headDone.push(k); else break;
+      }
+      if (headDone.length > 4) {
+        var groupCount = headDone.length - 3; // keep the 3 most recent done segments visible
+        var grouped = segs.slice(0, groupCount);
+        var groupedWidth = grouped.reduce(function (s, x) { return s + x.widthPct; }, 0);
+        segs = [{ idx: -1, kind: "grouped", widthPct: groupedWidth, count: groupCount,
+          label: groupCount + " earlier" }].concat(segs.slice(groupCount));
+      }
+    }
+
+    var sum = segs.reduce(function (s, x) { return s + x.widthPct; }, 0) || 1;
+    segs.forEach(function (s) { s.widthPct = (s.widthPct / sum) * 100; });
+    out.segments = segs;
+    out.markers = buildMarkers(session, nowMs, winT0, winT1, windowed);
+    out.realMarkers = countRealMarkers(out.markers);
+
+    var failMarker = out.markers.filter(function (m) { return m.kind === "fail"; })[0];
+    var askMarker = out.markers.filter(function (m) { return m.kind === "ask"; })[0];
+    out.ariaLabel = "Progress: " + out.doneCount + " of " + total + " todos done" +
+      (out.runningCount ? ", 1 running" + (out.timeAccurate && segs.some(function (s) { return s.kind === "running"; }) ?
+        " for " + fmtDurMs(segs.filter(function (s) { return s.kind === "running"; })[0].elapsedMs) : "") : "") +
+      ", " + out.pendingCount + " to go." +
+      (failMarker ? " One failure at " + fmtClock(failMarker.t) + "." : "") +
+      (askMarker ? " One open question at " + fmtClock(askMarker.t) + "." : "");
+    return out;
+  }
+
+  // "now" is synthesised on every render, so it is not evidence that anything
+  // happened in the window -- only the recorded events count as content.
+  function countRealMarkers(markers) {
+    return markers.filter(function (m) { return m.kind !== "now"; }).length;
+  }
+
+  function buildMarkers(session, nowMs, t0, t1, windowed) {
+    var markers = [];
+    (session.requests || []).forEach(function (r) {
+      var t = parseT(r.t);
+      if (t != null) markers.push({ t: t, kind: "prompt", glyph: "chat", label: "",
+        // FIX (design-audit drift 7): 5b's prompt marker tooltip reads "You asked · <clock>".
+        title: "You asked · " + fmtClock(t) });
+    });
+    (session.commands || []).forEach(function (c) {
+      if (!c.ok) {
+        var t = parseT(c.t);
+        if (t != null) markers.push({ t: t, kind: "fail", glyph: "", label: "FAIL",
+          title: "Failed: " + (c.cmd || "") + " · " + fmtClock(t) });
+      }
+    });
+    (session.decisions || []).forEach(function (d) {
+      var t = parseT(d.t);
+      if (t != null) markers.push({ t: t, kind: "ask", glyph: "hourglass", label: "",
+        title: ((d.questions && d.questions[0] && d.questions[0].q) || "Question") + " · " + fmtClock(t) });
+    });
+    (session.agents_bg || []).forEach(function (a) {
+      if (!a.running && a.ts) {
+        var t = parseT(a.ts);
+        if (t != null) markers.push({ t: t, kind: "agent", glyph: "agent", label: "",
+          title: (a.task || "Background agent") + " finished · " + fmtClock(t) });
+      }
+    });
+    markers.push({ t: nowMs, kind: "now", label: "NOW", title: "Now · " + fmtClock(nowMs) });
+    markers.sort(function (a, b) { return a.t - b.t; });
+    var span = (t0 != null && t1 != null) ? (t1 - t0) : null;
+    if (span != null && span > 0) {
+      // Only a real window drops events. Un-windowed, everything is kept and
+      // clamped exactly as before -- a marker outside [firstMs, nowMs] cannot
+      // normally exist, and silently losing one would be worse than a clamp.
+      if (windowed) {
+        markers = markers.filter(function (m) { return m.t >= t0 && m.t <= t1; });
+      }
+      markers.forEach(function (m) { m.pct = Math.max(0, Math.min(100, ((m.t - t0) / span) * 100)); });
+      for (var i = 1; i < markers.length; i++) {
+        if (Math.abs(markers[i].pct - markers[i - 1].pct) < 2) {
+          markers[i].pct = Math.min(100, markers[i - 1].pct + 2);
+        }
+      }
+    } else {
+      markers.forEach(function (m) { m.pct = m.kind === "now" ? 100 : 0; });
+    }
+    return markers;
+  }
+
+  // Merges narration + prompts (+ decisions + commands + tool activity) into one
+  // chronological list. Pure: (session) -> [{kind, t, ...}] newest-first (defect 1 —
+  // matches curNarr/narrState/navFirst's "index 0 = newest" convention elsewhere).
+  //
+  // FIX (design-audit drift 8 — "the biggest gap"): 5b's timeline shows generic
+  // tool-call rows — "Edit · aitracker/web/ext_vt.js · 0.4s · +118 −31" — for every
+  // file the session touched, not just its shell commands. Before this fix,
+  // mergeTimeline only ever folded in requests/narrative/decisions/commands[], so
+  // file edits/writes/reads and Task-tool dispatches never appeared here at all —
+  // most of what an agent actually DOES was invisible in the one view built to show
+  // exactly that.
+  //
+  // What's populated from real fields (verified against parse_session, claude.py
+  // 978-985) and what genuinely is not available:
+  //   files[]  {path, ops, last, created, agent?} — "last" is the aggregate row's
+  //            OWN timestamp (one row per path, not one per edit), so this emits
+  //            ONE tool-call row per touched file at its last-touched time, tool
+  //            name Write/Edit from `created`, target = the full path, and `ops`
+  //            (the op COUNT, not a line diff) as the only real count available.
+  //   reads[]  {path, t} — no op count at all; renders name+target only.
+  //   agents[] {t, type, desc} — Task-tool dispatches; renders Task + its desc/type.
+  //   NOT available anywhere on the detail dict, for any of the three: a duration
+  //   (no per-op start/end pair — only one aggregate "last" timestamp per file, and
+  //   none at all for a Task dispatch) or a diff line-count ("+118 −31" — `ops` is
+  //   an edit-call tally, not lines added/removed; no such field exists). Rendered
+  //   as name + target + whatever count IS real (ops, when present) — see the
+  //   `// NOTE:` on entryHtml's "tool" case below for exactly what's omitted.
+  function mergeTimeline(session) {
+    var out = [];
+    (session.requests || []).forEach(function (r, i) {
+      var t = parseT(r.t);
+      out.push({ kind: "prompt", t: t == null ? 0 : t, text: r.text, key: "p" + i });
+    });
+    (session.narrative || []).forEach(function (n, i) { // newest-first in the dict; order fixed by sort below
+      var t = parseT(n.t);
+      out.push({ kind: "narration", t: t == null ? 0 : t, text: n.text, key: "n" + i });
+    });
+    (session.decisions || []).forEach(function (d, i) {
+      var t = parseT(d.t);
+      out.push({ kind: "ask", t: t == null ? 0 : t, decision: d, key: "a" + i });
+    });
+    (session.commands || []).forEach(function (c, i) {
+      var t = parseT(c.t);
+      out.push({ kind: c.ok ? "command" : "command-fail", t: t == null ? 0 : t, cmd: c, key: "c" + i });
+    });
+    (session.files || []).forEach(function (f, i) {
+      var t = parseT(f.last);
+      out.push({ kind: "tool", t: t == null ? 0 : t, verb: f.created ? "Write" : "Edit",
+        target: f.path, count: f.ops ? (f.ops + (f.ops === 1 ? " op" : " ops")) : "",
+        agent: !!f.agent, key: "f" + i });
+    });
+    (session.reads || []).forEach(function (r, i) {
+      var t = parseT(r.t);
+      out.push({ kind: "tool", t: t == null ? 0 : t, verb: "Read", target: r.path, count: "", agent: false, key: "rd" + i });
+    });
+    (session.agents || []).forEach(function (a, i) {
+      var t = parseT(a.t);
+      out.push({ kind: "tool", t: t == null ? 0 : t, verb: "Task",
+        target: (a.desc || a.type || "background agent"), count: "", agent: true, key: "ag" + i });
+    });
+    // FIX (defect 1): newest-first, matching the rest of the app — the server's own
+    // narrative[::-1] (claude.py:1269), classic's curNarr/narrState prepend-on-arrival
+    // (app.js:1391), and navFirst's own "index 0 = newest" comment (app.js:1591).
+    out.sort(function (a, b) { return b.t - a.t; });
+    return out;
+  }
+
+  // Derives the Links panel's two groups from data that DOES exist (prs[], files[]) plus
+  // a generic URL scan of narration/prompt/command text.
+  //
+  // MOVED to app.js (window.deriveLinks) — the shared seam: app.js loads before every
+  // ext_cr_*.js file (aitracker/page.py's read_ext(), sorted glob), so the classic
+  // sidebar's Links panel and this file's renderLinks() both call the SAME function
+  // now, instead of this file keeping its own fork. `deriveLinks` below resolves to
+  // that global (no local shadow left in this scope) — behaviour is byte-identical to
+  // what used to live here; see app.js for the REQUIRED ADDITION note and full logic.
+
+  // ============================== narration diagrams (FIX 2, capabilities #32/#33) ==============================
+  // Detects a fenced ```mermaid block inside one narration entry's text and reduces it
+  // to the doc's "node pill" shape — 03-detail-view.md's "Rendered diagram" timeline
+  // entry, and 04's narration-diagram pop-out (ext_cr_dialogs.js:908 renderNarrationDiagram,
+  // read not edited, payload {time, nodes:[{label,active}], edges, family, onPrev, onNext,
+  // onLatest}). The fence-tag test and the 8-family keyword dispatch mirror app.js's OWN
+  // mermaid detection (mdBlock's `/^mermaid$/i` fence-tag check, mermaidSvg's family
+  // dispatch — app.js:25-33,111-120, read not edited), so this recognises exactly the 8
+  // families the doc/Help capability list claims.
+  //
+  // It deliberately does NOT reuse app.js's geometry renderers (_mermaidSvgFlow et al) —
+  // those build full SVG node/edge layout, not the flat label list the pills dialog
+  // wants — and the RULES forbid adding mermaid.js, so this is a SIMPLE label
+  // extractor: split each body line on the run of mermaid "edge glyph" characters
+  // (-=.<>|*{}ox — covers -->, ->>, <|--, ||--o{, etc. across all 8 families) and keep
+  // the bracketed label (or bare id) on each side. This is a best-effort approximation
+  // of 8 different grammars, not a full mermaid parser — same spirit as deriveLinks()
+  // above, not a second markdown/diagram implementation of app.js's own renderer.
+  // "active" marks the LAST distinct node seen (read as "the state the diagram left
+  // off on") — there is no real signal for which node is "current" in narration text,
+  // so this is a judgment call, not a derived fact.
+  var MMD_FENCE_RE = /```\s*mermaid[ \t]*\r?\n([\s\S]*?)```/i;
+  var MMD_FAMILY_RE = [
+    [/^sequenceDiagram\b/i, "sequenceDiagram"],
+    [/^stateDiagram(?:-v2)?\b/i, "stateDiagram-v2"],
+    [/^classDiagram(?:-v2)?\b/i, "classDiagram"],
+    [/^erDiagram\b/i, "erDiagram"],
+    [/^(?:journey|userJourney)\b/i, "journey"],
+    [/^pie\b/i, "pie"],
+    [/^quadrantChart\b/i, "quadrantChart"],
+    [/^(?:flowchart|graph)\b/i, "flowchart"]
+  ];
+  var MMD_EDGE_RE = /[<>|*{}]*[-=.]{1,4}[<>|*{}ox]*/;
+  var MMD_SKIP_RE = /^(subgraph|end|direction|classDef|class|style|click|note|activate|deactivate|autonumber|accTitle|accDescr)\b/i;
+
+  function extractDiagram(text) {
+    if (!text || text.indexOf("```") === -1) return null;
+    var fm = MMD_FENCE_RE.exec(text);
+    if (!fm) return null;
+    var lines = fm[1].replace(/\r/g, "").split("\n")
+      .map(function (l) { return l.replace(/%%.*$/, "").trim(); })
+      .filter(Boolean);
+    if (!lines.length) return null;
+    var family = null;
+    for (var i = 0; i < MMD_FAMILY_RE.length; i++) {
+      if (MMD_FAMILY_RE[i][0].test(lines[0])) { family = MMD_FAMILY_RE[i][1]; break; }
+    }
+    if (!family) return null; // not one of the 8 recognised families — no fabricated diagram
+
+    var order = [], seen = {};
+    function push(raw) {
+      raw = (raw || "").trim();
+      if (!raw) return;
+      var bm = /[\[\(\{]\s*"?([^\]\)\}"]*)"?\s*[\]\)\}]/.exec(raw);
+      var label = bm ? bm[1].trim() : raw.replace(/^["']+|["']+$/g, "").trim();
+      if (!label) label = raw.split(/\s+/)[0];
+      label = label.split(/\s+/).slice(0, 5).join(" ");
+      if (label.length > 40) label = label.slice(0, 40) + "…";
+      if (!label || label === "*") return;
+      if (!seen[label]) { seen[label] = true; order.push(label); }
+    }
+    lines.slice(1).forEach(function (l) {
+      if (MMD_SKIP_RE.test(l)) return;
+      var m2 = MMD_EDGE_RE.exec(l);
+      if (m2 && m2[0].length >= 2) {
+        push(l.slice(0, m2.index));
+        push(l.slice(m2.index + m2[0].length).split(":")[0]);
+      } else {
+        push(l.split(":")[0]);
+      }
+    });
+    if (!order.length) return null;
+
+    return {
+      family: family,
+      nodes: order.map(function (label, i) { return { label: label, active: i === order.length - 1 }; }),
+      prefix: text.slice(0, fm.index),
+      suffix: text.slice(fm.index + fm[0].length),
+      // Raw mermaid source (no fences) -- NOT used by the label/pill extraction above,
+      // but needed by renderMermaid() (app.js, shared with the classic UI's mdBlock())
+      // to draw the REAL diagram rather than the flat pill-list approximation. Kept
+      // alongside the derived `nodes` rather than replacing them: nodes stay the
+      // fallback rendered instantly and reused by ext_cr_dialogs.js's pop-out today.
+      src: fm[1]
+    };
+  }
+
+  // REQUIRED ADDITION: session.open_flags (unresolved 🚩 count) is only computed inside
+  // registry.all_sessions() for the board list (registry.py:70-72) and never merged into
+  // parse_any()'s per-session detail dict — so the header's state pill can't see flags
+  // without that count. Treated as unknown (falsy) here.
+  //
+  // FIX (drift: two forked definitions of "failing"): this used to derive failing
+  // independently from counts.errors/counts.tests_failed, disagreeing with the board
+  // tile's own sessionState() (ext_cr_board.js), which gates on `live && s.fail_cmd`.
+  // Same predicate here now, so a session can't read "fail: pytest" on the board and
+  // "Landed" in its own detail header. `fail_cmd` is threaded onto the detail dict by
+  // the same server-side addition that put it on the list dict (registry.py) — a
+  // session that's gone stale (fail_cmd set but no longer live) reads Landed/Idle like
+  // the board does, not Failing. counts.errors/tests_failed stay exactly where they
+  // already are as DATA (statChipsHtml() below) — this only changes which source
+  // decides the failing STATE.
+  // JOB 3 / PARITY FIX: routes "is this session WORKING" through app.js's global
+  // isSessionWorking(s, live) — the ONE formula the board tile, the rail dot and
+  // (via this function) the detail view's state pill/glow must all agree on,
+  // rather than a second, separately-maintained AND/OR here drifting from theirs
+  // the way classic's sidebar once drifted from the board (see ext_cr_board.js's
+  // own isWorking() comment for that history).
+  //
+  // FIX (adversarial-review defect, CRITICAL): this function used to fabricate `ended`
+  // from `!inProgress` (a todo-derived guess) for EVERY provider, on the false premise
+  // that the detail dict carries no real `ended` boolean at all. It does: the SAME
+  // TRANSCRIPT-TAIL fact the list dict's `ended` is built from (providers/claude.py's
+  // `_tail_scan`/`_session_meta`: `ended = (not waiting) and last == "assistant_text"`)
+  // is threaded onto `session.meta.ended` for Auggie's detail dict (providers/auggie.py,
+  // via the SAME `_auggie_state()` list_auggie() already calls) — this renderer already
+  // reads sibling `session.meta.*` fields elsewhere (`session.meta.gitBranch`,
+  // `session.meta.sessionId`). The todo-derived guess disagreed with the real value in
+  // BOTH directions: a live session with no todos at all (Claude prunes ~/.claude/tasks/*
+  // after ~2 days, and most sessions never call TodoWrite) read `ended:true` here while
+  // the board/rail's REAL `ended:false` said "working" — glow missing; and a session that
+  // genuinely ended but left a stale `in_progress` todo read `ended:false` here while the
+  // real value was `true` — a permanent false glow. Prefer the real value when present;
+  // only sessions from a provider whose detail meta doesn't (yet) carry `ended` fall back
+  // to the old todo-derived approximation (see the per-provider note below).
+  //
+  // KNOWN GAP (not closed by this file — outside this pass's owned files): as of this
+  // fix, providers/claude.py's parse_session() detail dict does NOT put `ended` on its
+  // `meta` — verified directly against the return literal: `_session_meta()` (which DOES
+  // compute `ended` off `_tail_scan`) backs ONLY list_sessions()'s list dict; parse_session
+  // builds its own separate `meta = {}` from raw JSONL fields and never merges `ended`
+  // into it. So Claude Code sessions (unlike Auggie, fixed here) still fall through to the
+  // `!inProgress` fallback below until providers/claude.py's meta gains a real `ended` the
+  // same way — the two divergences above remain live for Claude sessions until that lands.
+  //
+  // The bg half is unaffected by any of this: a running background agent ~= the list
+  // dict's truthy `bg` (both providers gate it the same way — an agent file/session whose
+  // OWN mtime is inside LIVE_WINDOW, never "ever ran"; see providers/claude.py's
+  // `_mtime_and_bg`/`parse_agents` `"running": (now - mt) < LIVE_WINDOW` vs. this same gate
+  // on the list dict's `bg` count), so it is still adapted from `agents_bg` here as before.
+  // Either way, the FORMULA itself is never re-derived here — only its two inputs are
+  // sourced from the fields this dict actually has, then handed to the real,
+  // canonical isSessionWorking(s, live) (app.js) the board tile and rail dot also call.
+  function detailIsWorking(session, live) {
+    var runningBg = (session.agents_bg || []).some(function (a) { return a.running; });
+    var inProgress = (session.todos || []).some(function (t) { return t.status === "in_progress"; });
+    var realEnded = session.meta && typeof session.meta.ended === "boolean" ? session.meta.ended : null;
+    var ended = realEnded !== null ? realEnded : !inProgress;
+    var adapted = { ended: ended, bg: runningBg };
+    return typeof isSessionWorking === "function" ?
+      isSessionWorking(adapted, live) : (!!live && (!ended || runningBg));
+  }
+
+  function stateOf(session, nowSec) {
+    var idle = nowSec - (session.mtime || 0);
+    var live = idle < LIVE_WINDOW;
+    var openFlags = session.open_flags || 0;
+    var failing = live && !!session.fail_cmd;
+    if (session.waiting) return { word: "Waiting on you", cls: "awaiting", age: fmtAge(idle) };
+    if (openFlags) return { word: openFlags + " flag" + (openFlags === 1 ? "" : "s") + " open", cls: "flagged" };
+    if (failing) return { word: "fail: " + session.fail_cmd, cls: "failed" };
+    if (detailIsWorking(session, live)) return { word: "Working", cls: "working" };
+    if (live) return { word: "Landed", cls: "done" };
+    return { word: "Idle", cls: "idle", age: fmtAge(idle) };
+  }
+
+  // FIX (design-audit drift 1, SETTLED by owner ruling "always visible" — docs
+  // 03 Row 3 / 04 capability #21 win over the 5b prototype that dropped this row
+  // outright): the files/commands/reads/commits/tests/branch/tokens stat-chip
+  // row is now a PERMANENT part of the header — see renderStatChips()/
+  // statChipsHtml() below, called unconditionally from renderHeader's render
+  // pass. The metaline's own token bit is untouched (kept for its collapsed
+  // context line), so the token count appears twice — in the metaline AND the
+  // chip row — that duplication is intentional, not a bug: the two are read by
+  // different parts of the design (row 1's compact context vs row 3's full
+  // stat set).
+  function fmtTokens(session) {
+    var tokTotal = ((session.tokens && session.tokens.in) || 0) + ((session.tokens && session.tokens.out) || 0);
+    return tokTotal ? fmtNum(tokTotal) + " tokens" : "";
+  }
+
+  // ============================== stat chips (doc 03 Row 3 / doc 04 capability #21) ==============================
+  // Doc's exact set, order and separator: `files 18 · commands 42 · reads 96 ·
+  // commits 3 · tests 1 failing · tokens 128,412 · branch term-tiers`. Every value
+  // is read straight off the EXISTING detail dict — no fetch, no new server field:
+  //   files    session.files.length          (claude.py:1280, auggie.py:595)
+  //   commands session.commands.length       (claude.py:1283, auggie.py:598 -- same
+  //            array the Commands panel's own header count reads, capped to the
+  //            last 60 by the parser itself, not by this file)
+  //   reads    session.counts.read            (claude.py:1307, auggie.py:614)
+  //   commits  session.counts.commits         (claude.py:1307, auggie.py:614)
+  //   tests    session.counts.tests / .tests_failed (claude.py:1308, auggie.py:614)
+  //   tokens   session.tokens.in + .out       (claude.py:1299, auggie.py:609)
+  //   branch   session.meta.gitBranch         (claude.py meta, auggie.py:587)
+  // Verified directly in both providers (not guessed) -- all seven fields exist in
+  // the shared shape for BOTH Claude and Auggie, so the doc's `N/A` ("cannot exist
+  // for this provider") branch never actually fires for either provider today;
+  // only the `--` ("could exist but doesn't", e.g. no git branch) branch is
+  // reachable, and it is the one implemented below. A genuine zero count (e.g. "no
+  // files touched yet") is a real answer, not a missing one, and renders as "0" --
+  // `--` is reserved for a field that is null/undefined, never for a fabricated 0.
+  var STAT_CHIP_MISSING = "--"; // doc's literal marker (two hyphens, not an em dash)
+
+  function statChip(label, value, opts) {
+    opts = opts || {};
+    // "mono" is the shared utility class (app.css) every other mono-set element
+    // in this file already relies on for its font-family (.crd-metaline mono,
+    // .crd-cmd-text mono, …) rather than each .crd-* rule redeclaring it.
+    var cls = "crd-statchip mono" + (opts.tint ? " crd-statchip-" + opts.tint : "");
+    var title = opts.title ? ' title="' + esc(opts.title) + '"' : "";
+    return '<span class="' + cls + '"' + title + '>' +
+      '<span class="crd-statchip-label">' + esc(label) + "</span> " +
+      '<span class="crd-statchip-val">' + esc(value) + "</span></span>";
+  }
+
+  function statChipsHtml(session) {
+    var counts = session.counts || null;
+    var filesN = session.files ? session.files.length : null;
+    var cmdsN = session.commands ? session.commands.length : null;
+    var readsN = (counts && typeof counts.read === "number") ? counts.read :
+      (session.reads ? session.reads.length : null);
+    var commitsN = (counts && typeof counts.commits === "number") ? counts.commits :
+      (session.commits ? session.commits.length : null);
+    var testsTotal = (counts && typeof counts.tests === "number") ? counts.tests : null;
+    var testsFailed = (counts && typeof counts.tests_failed === "number") ? counts.tests_failed : 0;
+    var tokTotal = session.tokens ? ((session.tokens.in || 0) + (session.tokens.out || 0)) : null;
+    var branch = (session.meta && session.meta.gitBranch) || null;
+
+    // doc: "tests is the only chip that changes colour -- brick surface/border/
+    // text when failing. Everything else stays neutral, so a coloured chip
+    // always means something."
+    var testsVal, testsFailing = false;
+    if (testsTotal == null) {
+      testsVal = STAT_CHIP_MISSING;
+    } else if (testsFailed > 0) {
+      testsVal = testsFailed + " failing";
+      testsFailing = true;
+    } else {
+      testsVal = String(testsTotal);
+    }
+
+    return [
+      statChip("files", filesN != null ? String(filesN) : STAT_CHIP_MISSING),
+      statChip("commands", cmdsN != null ? String(cmdsN) : STAT_CHIP_MISSING),
+      statChip("reads", readsN != null ? String(readsN) : STAT_CHIP_MISSING),
+      statChip("commits", commitsN != null ? String(commitsN) : STAT_CHIP_MISSING),
+      statChip("tests", testsVal, testsFailing ? { tint: "failing" } : {}),
+      statChip("tokens", tokTotal != null ? fmtNum(tokTotal) : STAT_CHIP_MISSING),
+      statChip("branch", branch || STAT_CHIP_MISSING)
+    ].join("");
+  }
+
+  // Called from renderHeader on every 2s poll. Permanent row (owner ruling) --
+  // no preference gate, no `hidden` toggle; it always renders for whatever
+  // session is on screen. Doc 03's phone layout never lists this row among the
+  // phone detail's pieces, so it is hidden below the phone breakpoint in CSS
+  // (ext_cr_detail.css, max-width:600px) rather than here in JS.
+  function renderStatChips(node, session) {
+    var row = qs(node, ".crd-statchips");
+    if (!row) return;
+    row.innerHTML = statChipsHtml(session);
+  }
+
+  // ============================== phone: back-crumb, presence, narration, awaiting card ==============================
+  // The four pieces doc 03's "Phone layout" section names but the current build
+  // never implemented (owner ruling: "Finish it") -- additive only. Nothing here
+  // touches the progress spine, the merged conversation timeline
+  // (renderTimeline/renderLiveEntry below), or panel collapse behaviour; all three
+  // are called out as already-verified-correct and stay exactly as they are.
+
+  // Same honest "current file" derivation renderLiveEntry() already uses --
+  // session.files[0] (parser-sorted newest-`last`-first), shown only while that
+  // file's own `last` is itself inside LIVE_WINDOW. Read again here with the same
+  // rule rather than forked with a looser one.
+  function phonePresence(session, nowSec) {
+    var ov = session.overview || {};
+    var idle = nowSec - (session.mtime || 0);
+    var live = idle < LIVE_WINDOW && !!ov.now;
+    var topFile = (session.files || [])[0];
+    var fileTag = "";
+    if (topFile) {
+      var fileMs = parseT(topFile.last);
+      if (fileMs != null && (nowSec - fileMs / 1000) < LIVE_WINDOW) fileTag = basename(topFile.path);
+    }
+    return { live: live, now: ov.now || "", file: fileTag };
+  }
+
+  // Back chevron + ellipsed breadcrumb + "N/M" (doc: "back chevron + ellipsed
+  // breadcrumb + '7/11'"). The chevron button reuses the SAME data-act="back"
+  // the desktop back-line button already wires to ctx.go("board") (mount()'s
+  // delegated click handler) -- no new click logic. "N/M" is session.counts.done
+  // / .counts.todos, the SAME two numbers the progress spine's own header already
+  // shows as "7 of 11" (claude.py counts: done=len(done_todos), todos=len(todos))
+  // -- read again here rather than recomputing spineSegments() a second time.
+  function renderPhoneHead(node, session) {
+    var crumbEl = qs(node, ".crd-phonehead-crumb");
+    var progEl = qs(node, ".crd-phonehead-progress");
+    if (!crumbEl || !progEl) return;
+    var meta = session.meta || {};
+    var proj = basename(meta.cwd || "");
+    crumbEl.textContent = [proj || null, meta.gitBranch || null].filter(Boolean).join(" · ") ||
+      meta.title || "session";
+    var counts = session.counts || null;
+    progEl.textContent = (counts && typeof counts.done === "number" && typeof counts.todos === "number" && counts.todos > 0) ?
+      (counts.done + "/" + counts.todos) : "";
+  }
+
+  // 34px presence orb (state colour + the SAME state word the desktop pill shows,
+  // so colour never carries the state alone) + current file, then the live
+  // narration itself at 21px serif right below it.
+  function renderPhonePresence(node, session, nowSec) {
+    var orb = qs(node, ".crd-phone-orb");
+    var stateEl = qs(node, ".crd-phone-presence-state");
+    var fileEl = qs(node, ".crd-phone-presence-file");
+    var narrEl = qs(node, ".crd-phone-narration");
+    if (!orb || !stateEl || !fileEl || !narrEl) return;
+    var st = stateOf(session, nowSec);
+    orb.className = "crd-phone-orb crd-state-" + st.cls;
+    stateEl.textContent = st.word;
+    var pres = phonePresence(session, nowSec);
+    fileEl.hidden = !pres.file;
+    fileEl.textContent = pres.file || "";
+    narrEl.hidden = !pres.live;
+    narrEl.textContent = pres.live ? pres.now : "";
+  }
+
+  // FIX (drift): phone-stop mirrors the Evidence column's terminal-kill affordance for
+  // the phone breakpoint (one back-affordance rule doesn't apply here — this is the
+  // compose bar's stop button, not navigation). Gated the SAME way renderTerminalPanel
+  // gates model/effort: enabled only when registry.py's term_tty (parse_any(), NEW) is a
+  // real non-null string, honestly disabled with copy that says why otherwise — never a
+  // clickable button that cannot work.
+  function renderPhoneStop(node, session) {
+    var btn = qs(node, ".crd-phone-stop");
+    if (!btn) return;
+    var tty = typeof session.term_tty === "string" && session.term_tty ? session.term_tty : null;
+    btn.disabled = !tty;
+    btn.title = tty ? "Stop the attached terminal" :
+      "Not available yet — there’s no terminal attached to stop.";
+  }
+
+  // The awaiting-question card: same source (session.decisions, open pinned
+  // first) the Decisions panel already renders in full -- this is a compact,
+  // phone-only duplicate of just the top open question, not a second data path.
+  function renderPhoneAwaiting(node, session) {
+    var card = qs(node, ".crd-phone-awaiting");
+    if (!card) return;
+    var open = (session.decisions || []).filter(function (d) { return d.open; });
+    if (!open.length) { card.hidden = true; card.innerHTML = ""; return; }
+    var d = open[0];
+    var q0 = (d.questions && d.questions[0]) || { q: "", options: [] };
+    var opts = (q0.options || []).map(function (o) {
+      return '<div class="crd-phone-awaiting-opt">' + esc(o) + "</div>";
+    }).join("");
+    card.hidden = false;
+    card.innerHTML =
+      '<div class="crd-phone-awaiting-head"><span class="tn-emo-a" aria-hidden="true">' + ico('hourglass') + '</span> Waiting on you' +
+        (open.length > 1 ? '<span class="crd-phone-awaiting-more mono"> +' + (open.length - 1) + " more</span>" : "") +
+      "</div>" +
+      '<div class="crd-phone-awaiting-q">' + esc(q0.q) + "</div>" +
+      opts +
+      '<div class="crd-phone-awaiting-foot">View-only — answer in the session itself.</div>';
+  }
+
+  // FIX 5: the old ad-hoc `isDegradedTranscript` (meta.source/entrypoint sniffed for
+  // "augment" but not "auggie") is gone — replaced by providerNote() below, which
+  // reads ext_cr_dialogs.js's own PROVIDER_NOTES table via its public
+  // providerNoteFor(source), instead of re-deriving the same augment/auggie split
+  // a second time in this file.
+
+  // ============================== rendering ==============================
+
+  function svgIcon(ctx, name, fallback) {
+    try {
+      var s = ctx && ctx.icon && ctx.icon(name);
+      if (s) return s;
+    } catch (e) {}
+    return fallback || "";
+  }
+
+  // Paints the `.crd-pin` toggle button for a given pinned state -- called from
+  // renderHeader() on every render pass AND from the click handler's own
+  // optimistic update (case "toggle-pin" below), so there is exactly one place
+  // that knows what "pinned" vs "unpinned" looks like, never two paint
+  // implementations drifting apart. Both states stay visible words + icon
+  // (never icon-only), matching the "text beside the symbol" rule the rest of
+  // this header follows; `aria-pressed` + a real <button> makes it Enter/
+  // Space-activatable with no extra keydown wiring needed.
+  function paintPinButton(node, ctx, pinned) {
+    var btn = qs(node, ".crd-pin");
+    if (!btn) return;
+    pinned = !!pinned;
+    btn.classList.toggle("is-on", pinned);
+    btn.setAttribute("aria-pressed", pinned ? "true" : "false");
+    var label = pinned ? "Unpin this session" : "Pin to top";
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+    qs(btn, ".crd-ico").innerHTML = svgIcon(ctx, "pin");
+    qs(btn, ".crd-btn-label").textContent = pinned ? "Pinned" : "Pin";
+  }
+
+  function makePanel(ctx, sid, col, key, title, opts) {
+    opts = opts || {};
+    var defCollapsed = opts.defaultCollapsed === false ? false : defaultFolded();
+    var collapsed = getCollapsed(sid, key, defCollapsed);
+    var wrap = el(
+      '<section class="crd-panel' + (opts.tint ? " crd-tint-" + opts.tint : "") + '"' +
+      ' data-panel="' + esc(key) + '">' +
+      '<header class="crd-panel-head" data-act="toggle-panel" data-panel="' + esc(key) + '" data-col="' + esc(col) + '">' +
+      '<span class="crd-chevron">' + (collapsed ? svgIcon(ctx, "chevron") : svgIcon(ctx, "chevron-down")) + "</span>" +
+      '<span class="crd-panel-label">' + esc(title) + "</span>" +
+      '<span class="crd-panel-count"></span>' +
+      "</header>" +
+      '<div class="crd-panel-body"></div>' +
+      "</section>"
+    );
+    wrap.classList.toggle("is-collapsed", collapsed);
+    return wrap;
+  }
+
+  function setPanelCollapsed(ctx, wrap, sid, val) {
+    var key = wrap.getAttribute("data-panel");
+    wrap.classList.toggle("is-collapsed", val);
+    qs(wrap, ".crd-chevron").innerHTML = val ? svgIcon(ctx, "chevron") : svgIcon(ctx, "chevron-down");
+    setCollapsed(sid, key, val);
+  }
+
+  function setPanelCount(wrap, text) {
+    qs(wrap, ".crd-panel-count").innerHTML = text || "";
+  }
+
+  function setPanelBody(wrap, html) {
+    var bodyEl = qs(wrap, ".crd-panel-body");
+    bodyEl.innerHTML = html;
+    // mdHtml() (capability #33 fix above) can now hand back a mermaid
+    // `.mmd-slot` fallback for any panel that renders markdown (notes today)
+    // — upgrade it in place the same way renderTimelineEntries() already does
+    // for the conversation timeline, one call site rather than one per panel.
+    try { if (typeof upgradeMermaidIn === "function") upgradeMermaidIn(bodyEl); } catch (e) {}
+  }
+
+  // ---- skeleton ----
+
+  var SKELETON =
+    '<div class="crd">' +
+      '<div class="crd-backline">' +
+        '<button class="crd-back" data-act="back">‹ Back to the board</button>' +
+        '<span class="crd-back-hint mono"></span>' +
+      "</div>" +
+      // Phone-only status bar (doc 03 "Phone layout": "back chevron + ellipsed
+      // breadcrumb + '7/11'"). Hidden above the phone breakpoint; see
+      // ext_cr_detail.css. The chevron reuses data-act="back" — the SAME
+      // delegated click handler `.crd-back` above already wires to
+      // ctx.go("board"), not a second back-navigation path.
+      '<div class="crd-phonehead">' +
+        '<button class="crd-phonehead-back" data-act="back" aria-label="Back to the board" title="Back to the board">‹</button>' +
+        '<span class="crd-phonehead-crumb mono"></span>' +
+        '<span class="crd-phonehead-progress mono"></span>' +
+      "</div>" +
+      '<div class="crd-header">' +
+        '<div class="crd-id">' +
+          '<div class="crd-id-row1">' +
+            '<span class="crd-src"></span>' +
+            '<span class="crd-div"></span>' +
+            '<span class="crd-metaline mono"></span>' +
+            '<span class="crd-pill crd-pill-state"></span>' +
+            // GAP CLOSE (owner ask: "make the N AGENTS RUNNING tab clickable ...
+            // track the agent live from the session header itself"): this used to
+            // be a display-only <span>, inert no matter how many agents were
+            // running. Now a real <button type=button data-act> — keyboard-
+            // activatable for free, same delegated click handler every other
+            // header control here already uses (case "focus-agents" below).
+            // renderHeader() sets title/aria-label/hidden on every render pass,
+            // same convention as paintPinButton()/the flag badge above.
+            '<button type="button" class="crd-pill crd-pill-agents" data-act="focus-agents" hidden></button>' +
+            // FIX (design-audit drift 2): 5b collapses actions to ONE inline row —
+            // Open terminal (solid) · Resume (outline) · Queue a note, right-aligned
+            // at the end of THIS row (margin-left:auto), not a second action block
+            // below the header. Search/Flag/External aren't in 5b's row at all (the
+            // whole round 5 detail view drops them — verified across 5a/5b/5c/5d, not
+            // just this artboard); per the owner's "don't drop a capability" rule
+            // they're kept reachable here as small icon buttons rather than removed,
+            // see the module report for exactly where they landed.
+            '<span class="crd-row1-actions">' +
+              '<button class="crd-iconbtn" data-act="toggle-search" title="Search this session" aria-label="Search this session"><span class="crd-ico"></span><span class="crd-btn-label">Search</span></button>' +
+              '<button class="crd-iconbtn crd-flagbtn" data-act="toggle-flag" title="Flag an issue" aria-label="Flag an issue"><span class="crd-ico"></span><span class="crd-btn-label">Flag</span><span class="crd-flag-badge" hidden></span></button>' +
+              '<button class="crd-btn crd-btn-solid" data-act="open-terminal">Open terminal</button>' +
+              '<button class="crd-btn crd-btn-outline" data-act="resume">Resume</button>' +
+              '<button class="crd-btn crd-btn-ai" data-act="toggle-note">Queue a note</button>' +
+              '<button class="crd-btn crd-btn-bare" data-act="external" hidden>External</button>' +
+            "</span>" +
+          "</div>" +
+          '<div class="crd-id-row2">' +
+            '<h1 class="crd-goal"></h1>' +
+            '<button class="crd-rename" data-act="rename" type="button" title="Rename" aria-label="Rename session"><span class="crd-ico"></span><span class="crd-btn-label">Rename</span></button>' +
+            // FIX (gap close): the PINNED marker used to be a display-only pill,
+            // `hidden` outright whenever the session wasn't pinned -- so there was
+            // no way to pin an unpinned session from this view at all, and no way
+            // to unpin one either (only the classic sidebar's togglePin() and the
+            // rail's toggleSessionPin() could write /api/pin). Now a real, ALWAYS
+            // rendered toggle button (paintPinButton below fills icon/label/aria
+            // state on every render pass and right after a click) -- same
+            // shared /api/pin seam, bridged from 'cr:pin-toggle' in ext_cr_boot.js
+            // exactly like 'cr:rename'/'cr:flag-create'/'cr:note-push' already are
+            // (this file's own contract rule 5: no fetch() calls here).
+            '<button class="crd-pin" data-act="toggle-pin" type="button" aria-pressed="false"><span class="crd-ico"></span><span class="crd-btn-label"></span></button>' +
+          "</div>" +
+          // Doc 03 row 2's "goal" text (the session's last request, overview.py's
+          // `goal`) -- demoted to its own line below the name (see TASK 1 FIX in
+          // renderHeader), never occupying the h1. Hidden whenever there's no goal.
+          '<div class="crd-goalline" hidden></div>' +
+          // Row 3 — stat chips (doc 03 Row 3 / doc 04 capability #21). PERMANENT
+          // — no preference, no `hidden` gate; renderStatChips() fills it on
+          // every render pass. Hidden on phone via CSS only (doc's phone layout
+          // doesn't include this row).
+          '<div class="crd-statchips"></div>' +
+        "</div>" +
+      "</div>" +
+      // Phone-only presence orb + live narration (doc 03 "Phone layout"): "34px
+      // presence orb with 'Claude is thinking' and the current file" then "the
+      // live narration at 21px serif". Hidden above the phone breakpoint.
+      '<div class="crd-phone-presence">' +
+        '<span class="crd-phone-orb" aria-hidden="true"></span>' +
+        '<div class="crd-phone-presence-text">' +
+          '<span class="crd-phone-presence-state"></span>' +
+          '<span class="crd-phone-presence-file mono" hidden></span>' +
+        "</div>" +
+      "</div>" +
+      '<div class="crd-phone-narration" hidden></div>' +
+      '<div class="crd-card crd-searchcard" hidden>' +
+        '<input class="crd-search-input" type="text" placeholder="Search this session…">' +
+        '<div class="crd-search-results"></div>' +
+      "</div>" +
+      '<div class="crd-card crd-flagcard" hidden>' +
+        '<div class="crd-flag-count mono"></div>' +
+        // FIX 7 (design-audit): the flag's own text used to be reachable ONLY via
+        // the state pill's native `title` tooltip (hover-only, invisible on
+        // touch/phone/tablet) — flags are recorded user data, so it also needs a
+        // visible home. Plain textContent below (never innerHTML), same as the
+        // rest of this render pass's property-assignment convention — the tooltip
+        // on the pill stays too, for the untruncated hover case on desktop.
+        '<div class="crd-flag-text" hidden></div>' +
+        '<textarea class="crd-flag-input" rows="2" placeholder="What needs a second look?"></textarea>' +
+        '<div class="crd-flag-row">' +
+          '<span class="crd-flag-note">View-only — this creates a flag entry; the tracker never writes to the session.</span>' +
+          '<button class="crd-btn crd-btn-solid" data-act="submit-flag">Flag it</button>' +
+        "</div>" +
+      "</div>" +
+      // "Queue a note" (design-audit drift 2, new in 5b): opens this small card
+      // instead of a dialog (dialogs aren't ours to add to). Submitting calls the
+      // SAME 'cr:note-push' emit the Plan panel (renderPlan) and the phone bottom
+      // bar already use — a third entry point onto one push path, not a second one.
+      '<div class="crd-card crd-notecard" hidden>' +
+        '<input class="crd-note-queue-input" type="text" placeholder="Queue a note for this session…">' +
+        '<button class="crd-btn crd-btn-solid" data-act="note-queue-send">Queue</button>' +
+      "</div>" +
+      // FIX (job 2, owner correction: ABOVE the spine, not below it): the live
+      // "Now" card, directly above the progress spine so current state is the
+      // very first thing visible in the main session view, no scrolling into
+      // the conversation required. Was `.crd-timeline-live`, pinned to the
+      // bottom of the timeline panel below the scrolling history -- moved
+      // (not duplicated; see renderLiveEntry()/ui_findLiveEl() below, the ONE
+      // renderer/call site for this fact) rather than shown in both places.
+      '<div class="crd-now" hidden></div>' +
+      '<div class="crd-spine" role="group" aria-label="Progress spine">' +
+        '<span class="crd-spine-sr" aria-live="polite"></span>' +
+        '<div class="crd-spine-head">' +
+          '<span class="crd-spine-label">PROGRESS SPINE</span>' +
+          '<span class="crd-spine-count mono"></span>' +
+          '<span class="crd-spine-spans" role="group" aria-label="Spine zoom"></span>' +
+          '<span class="crd-spine-hint mono">segment width = time actually spent · click to jump the chat there</span>' +
+        "</div>" +
+        '<div class="crd-spine-scroll">' +
+          '<div class="crd-spine-track">' +
+            '<div class="crd-spine-bar"></div>' +
+            '<div class="crd-spine-gutter"></div>' +
+          "</div>" +
+        "</div>" +
+        '<div class="crd-spine-foot mono">' +
+          '<span class="crd-spine-first"></span>' +
+          '<span class="crd-spine-mid"></span>' +
+          '<span class="crd-spine-now"></span>' +
+        "</div>" +
+      "</div>" +
+      '<div class="crd-columns">' +
+        '<div class="crd-col crd-col-state">' +
+          '<div class="crd-col-eyebrow">State' +
+            '<span class="crd-colbtns">' +
+              '<button data-act="expand-all" data-col="state">Expand all</button>' +
+              '<button data-act="collapse-all" data-col="state">Collapse all</button>' +
+            "</span></div>" +
+          '<div class="crd-col-body"></div>' +
+        "</div>" +
+        '<div class="crd-col crd-col-convo">' +
+          '<div class="crd-col-eyebrow">Conversation' +
+            '<span class="crd-marker" title="Narration is the assistant’s own text, interleaved with your prompts in one timeline">Its own words</span>' +
+            '<span class="crd-convonav">' +
+              '<button data-act="convo-prev">‹ prev</button>' +
+              '<button data-act="convo-next">next ›</button>' +
+              // The icon rides in the SAME `.crd-ico` wrapper every other header icon
+              // uses (see the Stop/Search/Flag/Rename/Pin buttons above) rather than a
+              // bare ico() call — that wrapper is what gives an icon a fixed CSS-px base
+              // (`.crd-ico svg { width: calc(14px * var(--ico-scale)) }`, ext_cr_detail.css)
+              // instead of inheriting this button's own fixed 10.5px font-size as its 1em
+              // base. A bare icon here still multiplies by --ico-scale, but off that tiny,
+              // non-scaling font-size base — so at 150%+ it visibly outgrows its "latest"
+              // label and its prev/next neighbours instead of tracking them.
+              '<button data-act="convo-latest"><span class="crd-ico">' + ico("jump-top") + "</span> latest</button>" +
+            "</span></div>" +
+          '<div class="crd-col-body"></div>' +
+        "</div>" +
+        // Phone-only awaiting-question card (doc 03 "Phone layout": "the chat
+        // timeline -> the awaiting question card -> folded State and Evidence
+        // cards"). A direct grid child of .crd-columns (sibling of the three
+        // .crd-col-* blocks) so the phone breakpoint's `order` can place it
+        // between Conversation and State — see renderPhoneAwaiting() above and
+        // ext_cr_detail.css. Hidden above the phone breakpoint and whenever
+        // there is no open decision.
+        '<div class="crd-phone-awaiting" hidden></div>' +
+        '<div class="crd-col crd-col-evidence">' +
+          '<div class="crd-col-eyebrow">Evidence' +
+            '<span class="crd-colbtns">' +
+              '<button data-act="expand-all" data-col="evidence">Expand all</button>' +
+              '<button data-act="collapse-all" data-col="evidence">Collapse all</button>' +
+            "</span></div>" +
+          '<div class="crd-col-body"></div>' +
+        "</div>" +
+      "</div>" +
+      '<div class="crd-phonebar">' +
+        '<input class="crd-phone-input" type="text" placeholder="Queue a note…">' +
+        '<button class="crd-phone-send" data-act="phone-send" aria-label="Send"></button>' +
+        // Disabled/title updated per-render by renderPhoneStop() below, once real
+        // session.term_tty data arrives — this skeleton default matches the same
+        // honest "nothing to target yet" copy that gate uses.
+        '<button class="crd-phone-stop" data-act="phone-stop" aria-label="Stop" disabled ' +
+          'title="Not available yet — there’s no terminal attached to stop.">' +
+          '<span class="crd-ico">' + ico("stop") + '</span><span class="crd-btn-label">Stop</span></button>' +
+      "</div>" +
+    "</div>";
+
+  var STATE_PANELS = [
+    ["decisions", "Decisions & open questions"],
+    ["prs", "Pull requests"],
+    ["links", "Links"],
+    ["summary", "Session summary"],
+    ["plan", "Plan on the go"]
+  ];
+  var EVIDENCE_PANELS = [
+    ["files", "Files"],
+    ["commands", "Commands"],
+    ["agents", "Agents & shells"],
+    ["run", "Run a command"],
+    ["terminal", "Terminal controls"]
+  ];
+
+  function Detail() {}
+
+  Detail.prototype.mount = function (root, ctx) {
+    root.innerHTML = "";
+    var node = el(SKELETON);
+    root.appendChild(node);
+
+    var ui = {
+      sid: null,
+      panels: {}, // key -> wrap element
+      timelineSeen: 0,
+      // FIX (defect 1): the timeline is now newest-first (mergeTimeline sorts
+      // descending), matching curNarr/app.js's "index 0 = newest" convention
+      // (navFirst's own comment) and the server's own narrative[::-1]. "Stuck to
+      // latest" therefore means pinned at the TOP of the scroll now, not the bottom.
+      timelineStuckLatest: true,
+      timelineFilter: "all",
+      // FIX (defect 2): each of the four legend words is now its own toggle,
+      // additive on top of the all/talk preset — see timelineEntryVisible() below.
+      timelineKindsOn: {},
+      agentsShowFinished: false,
+      // progress-spine zoom. null == "All" == the strip fits its panel. Any
+      // other value is a span that should fill the view, making the strip wider
+      // than the panel; the scroll position itself lives on the DOM element, so
+      // there is no second copy of it to keep in sync.
+      spineZoomMs: null,
+      searchOpen: false,
+      flagOpen: false,
+      noteOpen: false
+    };
+
+    var stateBody = qs(node, ".crd-col-state .crd-col-body");
+    var evidenceBody = qs(node, ".crd-col-evidence .crd-col-body");
+    var convoBody = qs(node, ".crd-col-convo .crd-col-body");
+
+    STATE_PANELS.forEach(function (p) {
+      var opts = {};
+      if (p[0] === "plan") opts.tint = "note";
+      var wrap = makePanel(ctx, "_", "state", p[0], p[1], opts);
+      stateBody.appendChild(wrap);
+      ui.panels[p[0]] = wrap;
+    });
+    EVIDENCE_PANELS.forEach(function (p) {
+      var wrap = makePanel(ctx, "_", "evidence", p[0], p[1]);
+      evidenceBody.appendChild(wrap);
+      ui.panels[p[0]] = wrap;
+    });
+    // FIX (design-audit drift 3): 5b renders fork lineage as a small card at the
+    // BOTTOM of the Evidence column (after Terminal controls), not a full-width
+    // banner between the header and the spine — see renderForkBanner().
+    var forkCard = el(
+      '<div class="crd-forkcard" hidden>' +
+        '<div class="crd-fork-head"><span class="crd-ico crd-fork-ico"></span>' +
+          '<span class="crd-fork-label"></span></div>' +
+        '<div class="crd-fork-body"></div>' +
+        '<button class="crd-fork-link" data-act="fork-open"></button>' +
+      "</div>"
+    );
+    evidenceBody.appendChild(forkCard);
+    ui.forkCard = forkCard;
+
+    // Conversation timeline: single panel, starts expanded (doc: the only exception).
+    var timelineWrap = el(
+      '<section class="crd-panel crd-timeline-panel" data-panel="timeline">' +
+        '<header class="crd-panel-head" data-act="toggle-panel" data-panel="timeline" data-col="convo">' +
+          '<span class="crd-chevron">' + svgIcon(ctx, "chevron-down") + "</span>" +
+          '<span class="crd-panel-label">TIMELINE</span>' +
+          // FIX (defect 2): the four words are real, individually-selectable filter
+          // chips now (data-act="timeline-filter" data-mode="kind", same delegation
+          // + .is-active convention the all/talk preset buttons already use) instead
+          // of static legend text. See timelineEntryVisible()/TIMELINE_KIND_MAP.
+          '<span class="crd-timeline-filters">' +
+            '<span class="crd-timeline-kinds">' +
+              '<button data-act="timeline-filter" data-mode="kind" data-kind="prompts">prompts</button>' +
+              '<button data-act="timeline-filter" data-mode="kind" data-kind="narration">narration</button>' +
+              '<button data-act="timeline-filter" data-mode="kind" data-kind="tools">tools</button>' +
+              '<button data-act="timeline-filter" data-mode="kind" data-kind="results">results</button>' +
+            "</span>" +
+            '<span class="crd-timeline-presets">' +
+              '<button class="is-active" data-act="timeline-filter" data-mode="all">all</button>' +
+              '<button data-act="timeline-filter" data-mode="talk">talk only</button>' +
+              // FIX (defect 3): panel-level pop-out — opens the newest entry of
+              // whatever's currently visible, same as the "⤒ latest" convo-nav button.
+              '<button class="crd-timeline-popout" data-act="timeline-popout" title="Pop out the newest entry" aria-label="Pop out the newest entry">' + svgIcon(ctx, "expand") + "</button>" +
+            "</span>" +
+          "</span>" +
+        "</header>" +
+        '<div class="crd-panel-body">' +
+          // FIX 9: doc 04's "Two different empties" — "Something broke" case,
+          // driven by session.parse_error (registry.py setdefault, populated by
+          // each provider's own parse loop). Sits above the entries, not instead
+          // of them, since a partial parse still renders everything before the
+          // failure. See renderParseErrorNotice().
+          '<div class="crd-timeline-parse-error" hidden></div>' +
+          '<div class="crd-timeline-scroll"></div>' +
+          '<div class="crd-timeline-foot mono">older turns page in as you scroll — history is unbounded</div>' +
+        "</div>" +
+      "</section>"
+    );
+    convoBody.appendChild(timelineWrap);
+    ui.panels.timeline = timelineWrap;
+
+    var scrollEl = qs(timelineWrap, ".crd-timeline-scroll");
+    scrollEl.addEventListener("scroll", function () {
+      // FIX (defect 1): newest-first now means the newest entry sits at the TOP of
+      // the scroll box, so "stuck to the latest entry" is pinned at scrollTop≈0 —
+      // the inverse of the old oldest-first "stuck to the bottom" check.
+      var atTop = scrollEl.scrollTop < 40;
+      ui.timelineStuckLatest = atTop;
+      // FIX 4a (order flipped by defect 1): older history is now at the BOTTOM of
+      // the loaded window (oldest = smallest t = sorted last), so paging it in
+      // fires near the bottom of the scroll box, not the top.
+      var nearBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 60;
+      if (nearBottom) loadOlderNarration(ctx, ui, node);
+    });
+
+    // ---- spine drag-to-scroll ----
+    // The handlers live on the .crd-spine-scroll VIEWPORT, never on the bar or
+    // gutter, because renderSpine replaces those two elements' innerHTML on
+    // every 2s poll -- a listener or a pointer capture held on a replaced child
+    // would be destroyed mid-drag.
+    //
+    // Dragging moves the viewport's own scrollLeft, so the browser clamps the
+    // ends for us: there is no bespoke pan arithmetic left to get wrong, and no
+    // way to accumulate slack by dragging past an edge.
+    (function wireSpinePan() {
+      var scroll = qs(node, ".crd-spine-scroll");
+      var track = scroll && qs(scroll, ".crd-spine-track");
+      if (!scroll || !track) return;
+      var drag = null;
+
+      scroll.addEventListener("pointerdown", function (ev) {
+        // nothing to scroll when the strip already fits ("All", or a short session)
+        if (scroll.scrollWidth <= scroll.clientWidth + 1) return;
+        if (ev.button != null && ev.button !== 0) return;
+        // clear any stale swallow-the-click flag: if a previous pan ended without
+        // the click ever arriving (pointer released off-window), the flag would
+        // otherwise sit true and eat the next legitimate segment click
+        ui.spineJustPanned = false;
+        drag = { x0: ev.clientX, left0: scroll.scrollLeft, moved: false, captured: false };
+        ui.spineDragging = true;   // a 2s poll must not re-anchor mid-gesture
+        // NOTE: deliberately NO setPointerCapture here, and no is-panning class.
+        // Both wait until the gesture proves itself a drag -- see pointermove.
+      });
+
+      scroll.addEventListener("pointermove", function (ev) {
+        if (!drag) return;
+        var dx = ev.clientX - drag.x0;
+        if (!drag.moved) {
+          if (Math.abs(dx) <= 3) return; // still a click, not a drag
+          drag.moved = true;
+          scroll.classList.add("is-panning");
+          // Capture LAZILY, only now that this is genuinely a drag. Capturing on
+          // pointerdown retargets the subsequent `click` to this element (Pointer
+          // Events spec); since .crd-spine-scroll carries no data-act, the
+          // delegated handler's closest("[data-act]") would return null and
+          // click-to-jump would silently stop working for every click on a
+          // scrollable spine. Verified live on the previous wrapper: with capture
+          // on pointerdown a plain segment click retargeted to the DIV.
+          try { scroll.setPointerCapture(ev.pointerId); drag.captured = true; } catch (e) {}
+        }
+        // drag RIGHT reveals earlier time, exactly like dragging a map
+        scroll.scrollLeft = drag.left0 - dx;
+      });
+
+      function endPan(ev) {
+        ui.spineDragging = false;
+        if (!drag) return;
+        scroll.classList.remove("is-panning");
+        if (drag.captured) {
+          try { scroll.releasePointerCapture(ev.pointerId); } catch (e) {}
+        }
+        // a pan must not also fire the segment's click-to-jump; the click event
+        // arrives immediately after pointerup, so one flag is enough to swallow it
+        ui.spineJustPanned = drag.moved;
+        drag = null;
+      }
+      scroll.addEventListener("pointerup", endPan);
+      scroll.addEventListener("pointercancel", endPan);
+    })();
+
+    // ---- single delegated click handler ----
+    node.addEventListener("click", function (ev) {
+      var t = ev.target.closest("[data-act]");
+      if (!t) return;
+      var act = t.getAttribute("data-act");
+      var sid = ui.sid;
+      switch (act) {
+        case "back":
+          ctx.go("board");
+          break;
+        case "toggle-panel": {
+          var key = t.getAttribute("data-panel");
+          var wrap = ui.panels[key];
+          if (!wrap) return;
+          setPanelCollapsed(ctx, wrap, sid, !wrap.classList.contains("is-collapsed"));
+          break;
+        }
+        case "expand-all":
+        case "collapse-all": {
+          var col = t.getAttribute("data-col");
+          var list = col === "state" ? STATE_PANELS : EVIDENCE_PANELS;
+          var val = act === "collapse-all";
+          list.forEach(function (p) { setPanelCollapsed(ctx, ui.panels[p[0]], sid, val); });
+          break;
+        }
+        case "rename":
+          // NOTE: dialog name/shape follows the lowercase-hyphenated convention already
+          // established by aitracker/web/cr_term.js (ctx.dialog("model", …), ("effort", …),
+          // ("fork-lineage", …)) rather than the camelCase names this file first guessed.
+          ctx.dialog("rename", { sessionId: sid, currentTitle: ui.lastTitle || "" });
+          break;
+        case "toggle-pin": {
+          // Same "intent only, never fetch()" contract as every other case here
+          // (file header comment, contract rule 5) -- 'cr:pin-toggle' is bridged
+          // to the EXISTING POST /api/pin route in ext_cr_boot.js, the SAME route
+          // classic's togglePin() (app.js) and the rail's toggleSessionPin()
+          // (ext_cr_board.js) already write through, so pinning here is
+          // immediately visible to both of those on their own next poll/refresh
+          // (registry.py reads pins.json live) -- no second pin store.
+          var sessNow = ui.lastSession || {};
+          var nextPinned = !sessNow.pinned;
+          sessNow.pinned = nextPinned;   // optimistic — instant header feedback
+          paintPinButton(node, ctx, nextPinned);
+          ctx.emit("cr:pin-toggle", { sessionId: sid, pinned: nextPinned });
+          break;
+        }
+        case "focus-agents": {
+          // GAP CLOSE: "track the agent live from the session header itself."
+          // The "Agents & shells" evidence panel (EVIDENCE_PANELS above,
+          // renderAgentsPanel()) is ALREADY a live view -- it's repainted on
+          // every render() pass off ui.lastSession, same as every other panel
+          // here, not a payload captured once at open time (the exact dialog
+          // bug just fixed elsewhere in this app, ext_cr_dialogs.js:1774).
+          // Clicking the pill just expands and scrolls to that SAME panel
+          // instead of opening a second, poll-blind surface -- so "live"
+          // comes for free from the render loop that already exists.
+          var agentsWrap = ui.panels.agents;
+          if (!agentsWrap) return;
+          setPanelCollapsed(ctx, agentsWrap, sid, false);
+          agentsWrap.scrollIntoView({ block: "start", behavior: "smooth" });
+          break;
+        }
+        case "toggle-search":
+          ui.searchOpen = !ui.searchOpen;
+          qs(node, ".crd-searchcard").hidden = !ui.searchOpen;
+          if (ui.searchOpen) qs(node, ".crd-search-input").focus();
+          break;
+        case "toggle-flag":
+          ui.flagOpen = !ui.flagOpen;
+          qs(node, ".crd-flagcard").hidden = !ui.flagOpen;
+          break;
+        case "submit-flag": {
+          var note = qs(node, ".crd-flag-input").value.trim();
+          if (!note) return;
+          ctx.emit("cr:flag-create", { sessionId: sid, note: note, context: (ui.lastGoal || "") });
+          qs(node, ".crd-flag-input").value = "";
+          ui.flagOpen = false;
+          qs(node, ".crd-flagcard").hidden = true;
+          break;
+        }
+        // FIX (design-audit drift 2): "Queue a note" (new in 5b) opens this small
+        // card; submitting calls the SAME 'cr:note-push' emit renderPlan()'s own
+        // push button and the phone bottom bar's send button already use — a third
+        // entry point onto one existing path, not a second note-adding mechanism.
+        case "toggle-note":
+          ui.noteOpen = !ui.noteOpen;
+          qs(node, ".crd-notecard").hidden = !ui.noteOpen;
+          if (ui.noteOpen) qs(node, ".crd-note-queue-input").focus();
+          break;
+        case "note-queue-send": {
+          var qInput = qs(node, ".crd-note-queue-input");
+          var qText = qInput && qInput.value.trim();
+          if (!qText) return;
+          ctx.emit("cr:note-push", { sessionId: sid, text: qText });
+          qInput.value = "";
+          ui.noteOpen = false;
+          qs(node, ".crd-notecard").hidden = true;
+          break;
+        }
+        case "open-terminal":
+          // NOTE: 'terminal:open' + {id} is the EXACT event/payload aitracker/web/cr_board.js
+          // already emits for its own "open terminal" tile action (cr_board.js:737,812) —
+          // reused verbatim instead of inventing a second event for the same action.
+          ctx.emit("terminal:open", { id: sid });
+          break;
+        case "resume":
+          // REQUIRED ADDITION: no existing sibling event covers "resume this session in a
+          // terminal" (cr_board.js only has terminal:open, which cr_term.js treats as "attach/
+          // open a pty", not "run `claude --resume <sid>`"). Named to match the session:* /
+          // terminal:* namespaces already in use; the bootstrap needs to wire this one up.
+          ctx.emit("session:resume", { id: sid });
+          break;
+        case "external":
+          // REQUIRED ADDITION: the external URL needs the bound port (aitracker/config.py's
+          // PORT_FILE), which the detail dict never carries — the bootstrap must resolve it.
+          ctx.emit("session:openExternal", { id: sid });
+          break;
+        case "fork-open":
+          if (ui.forkTarget) ctx.go("detail", ui.forkTarget);
+          break;
+        case "spine-segment": {
+          // swallow the click that trails a drag-pan (see endPan above)
+          if (ui.spineJustPanned) { ui.spineJustPanned = false; break; }
+          var idx = parseInt(t.getAttribute("data-idx"), 10);
+          scrollTimelineToTodo(node, ui, idx);
+          break;
+        }
+        case "spine-span": {
+          var raw = t.getAttribute("data-span");
+          ui.spineZoomMs = raw === "all" ? null : parseInt(raw, 10) || null;
+          repaintSpine(node, ctx, ui);
+          break;
+        }
+        case "spine-now": {
+          // "now" is just the right-hand end of the strip once it is scrollable
+          var sc = qs(node, ".crd-spine-scroll");
+          if (sc) sc.scrollLeft = sc.scrollWidth;
+          break;
+        }
+        case "timeline-filter": {
+          // FIX (defect 2): "kind" chips (prompts/narration/tools/results) are
+          // independent, additive toggles; the "all"/"talk" buttons are the two
+          // shipped presets and reset any custom chip selection back to a clean
+          // slate (same shape as before — see updateTimelineFilterButtons/
+          // timelineEntryVisible for how the two combine).
+          var mode = t.getAttribute("data-mode");
+          if (mode === "kind") {
+            var kind = t.getAttribute("data-kind");
+            ui.timelineKindsOn = ui.timelineKindsOn || {};
+            ui.timelineKindsOn[kind] = !ui.timelineKindsOn[kind];
+          } else {
+            ui.timelineFilter = mode;
+            ui.timelineKindsOn = {};
+          }
+          updateTimelineFilterButtons(timelineWrap, ui);
+          // A filter swap replaces the whole visible set (not an incremental
+          // arrival at one end), so no top-growth scroll compensation applies.
+          renderTimelineEntries(scrollEl, ui, ui.lastSession, true, ctx, { noTopGrowth: true });
+          break;
+        }
+        case "timeline-popout":
+          openLatestTimelineEntry(ui);
+          break;
+        case "timeline-entry-open": {
+          var ekey = t.getAttribute("data-key");
+          openTimelineEntryByKey(ui, ekey);
+          break;
+        }
+        case "narration-diagram": {
+          var dkey = t.getAttribute("data-key");
+          var didx = -1;
+          (ui.diagramEntries || []).forEach(function (d, i) { if (d.key === dkey) didx = i; });
+          if (didx >= 0) openNarrationDiagram(ctx, ui, didx);
+          break;
+        }
+        case "convo-latest":
+          // FIX (defect 1): newest is at the TOP now (newest-first), not the bottom.
+          ui.timelineStuckLatest = true;
+          scrollEl.scrollTop = 0;
+          break;
+        case "convo-prev":
+          jumpPrompt(scrollEl, -1);
+          break;
+        case "convo-next":
+          jumpPrompt(scrollEl, 1);
+          break;
+        case "note-copy": {
+          var idx2 = parseInt(t.getAttribute("data-idx"), 10);
+          var n = (ui.lastSession && ui.lastSession.notes || [])[idx2];
+          // FIX 1: route through app.js's own copyNote(idx) (app.js ~1804) instead of a
+          // bare navigator.clipboard.writeText().catch(()=>{}) — that silently did nothing
+          // on a denied/unavailable Clipboard API. copyNote() reads the SAME note (by the
+          // SAME index) off app.js's `lastData`, which ctx.go()->pick() keeps pointed at
+          // whatever session this view has open, so it's the same note `n` above resolves.
+          // It already has its own navigator.clipboard + execCommand-textarea fallback.
+          // Its own toast() call writes into the classic #toasts div, which CR mode hides
+          // (ext_cr_boot.js's notifyDone wrapper documents the same gotcha) — so also emit
+          // the 'notify' bus event this module's other confirmations use, for a toast that
+          // is actually visible in Control Room.
+          if (n && typeof copyNote === "function") {
+            copyNote(idx2);
+            ctx.emit("notify", { text: "Note copied" });
+          }
+          break;
+        }
+        case "note-remove":
+          ctx.emit("cr:note-remove", { sessionId: sid, index: parseInt(t.getAttribute("data-idx"), 10) });
+          break;
+        case "note-push": {
+          var input = qs(node, ".crd-plan-input");
+          var text = input && input.value.trim();
+          if (!text) return;
+          ctx.emit("cr:note-push", { sessionId: sid, text: text });
+          input.value = "";
+          break;
+        }
+        case "file-row":
+          ctx.dialog("file-diff", { sessionId: sid, path: t.getAttribute("data-path") });
+          break;
+        case "command-row":
+          ctx.dialog("command-output", { sessionId: sid, cmdId: t.getAttribute("data-id") });
+          break;
+        case "agents-show-finished":
+          ui.agentsShowFinished = !ui.agentsShowFinished;
+          renderAgentsPanel(ui.panels.agents, ctx, ui, ui.lastSession);
+          break;
+        case "agent-open":
+          ctx.dialog("agent-transcript", { sessionId: sid, agentId: t.getAttribute("data-id") });
+          break;
+        case "shell-open":
+          ctx.dialog("shell-tail", { sessionId: sid, shellId: t.getAttribute("data-id") });
+          break;
+        case "run-submit": {
+          var argvInput = qs(node, ".crd-run-input");
+          var argv = argvInput && argvInput.value.trim();
+          if (!argv) return;
+          ctx.emit("cr:run-command", { sessionId: sid, argv: argv });
+          break;
+        }
+        case "terminal-model":
+        case "terminal-effort": {
+          // FIX 2 (design-audit), now closed: registry.py's term_tty (parse_any(), NEW)
+          // finally gives this file a real id to target, so this drives the SAME
+          // /api/term/inject path the terminal toolbar's own _openModelDialog/
+          // _openEffortDialog/_injectSlash use (ext_cr_term.js:770-794) — same dialog
+          // contract (ctx.dialog("model"|"effort", {current, ladder, onPick})), same
+          // payload shape — instead of the old cr:term-controls-request notice, which
+          // unconditionally claimed no terminal could be found even while this exact
+          // button was visible and enabled.
+          var ttyMe = ui.lastSession && ui.lastSession.term_tty;
+          if (!ttyMe) return; // disabled (renderTerminalPanel); a real click never reaches here
+          var isModel = act === "terminal-model";
+          var meta2 = ui.lastSession.meta || {};
+          ctx.dialog(isModel ? "model" : "effort", {
+            current: isModel ? shortModel(meta2.model) : (meta2.effort || null),
+            ladder: isModel ? MODEL_LADDER : EFFORT_LADDER,
+            onPick: function (val) {
+              _injectToTerminal(ctx, ttyMe, "/" + (isModel ? "model" : "effort") + " " + val,
+                isModel ? "Couldn’t switch model" : "Couldn’t switch effort");
+            }
+          });
+          break;
+        }
+        case "phone-send": {
+          var pInput = qs(node, ".crd-phone-input");
+          var pText = pInput && pInput.value.trim();
+          if (!pText) return;
+          ctx.emit("cr:note-push", { sessionId: sid, text: pText });
+          pInput.value = "";
+          break;
+        }
+        case "phone-stop": {
+          // FIX (drift): same term_tty seam — stops the attached terminal via the SAME
+          // /api/term/close route ext_cr_term.js's own ■ Kill (_killCurrent) uses,
+          // instead of the old cr:stop bus event (ext_cr_boot.js's handler only ever
+          // stopped a queued run-command job, an unrelated feature this button's copy
+          // never described). Disabled (see renderPhoneStop) whenever there's no real
+          // tty to target.
+          var ttySt = ui.lastSession && ui.lastSession.term_tty;
+          if (!ttySt) return;
+          _killTerminal(ctx, ttySt);
+          break;
+        }
+      }
+    });
+
+    qs(node, ".crd-search-input").addEventListener("input", function (ev) {
+      renderSearchResults(node, ui, ev.target.value);
+    });
+
+    // FIX 7: j/k session navigation. ext_cr_board.js's own bindKeyboard() already
+    // implements j/k, but its isBoardActive() deliberately returns false while detail
+    // is showing (cr_board.js — not ours to edit), so it never fires here. Mirrors the
+    // SAME guard shape locally (isTypingTarget/an isActive check) instead of forking
+    // board's private helpers, and gets the CURRENT triage order from board's own
+    // PUBLIC surface — CR.board.boardTiles(sessions, now), exported specifically "for
+    // tests / a bootstrap that wants the pure derivations directly" — over the exact
+    // `sessions`/`listNow` globals boot.js itself reads to feed board.update()
+    // (ext_cr_boot.js's SIDE_EXT push; app.js:692,698 declares them). Not a forked
+    // copy of boardTiles' ranking.
+    document.addEventListener("keydown", function (e) {
+      if (!root.isConnected || !isDetailActive(root)) return;
+      if (isTypingTarget(e)) return;
+      if (e.key === "j") { e.preventDefault(); stepSession(ctx, ui, 1); }
+      else if (e.key === "k") { e.preventDefault(); stepSession(ctx, ui, -1); }
+    });
+
+    root._crDetail = { node: node, ui: ui };
+  };
+
+  function isTypingTarget(e) {
+    var t = e.target;
+    if (!t) return false;
+    if (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable) return true;
+    var termRoot = document.getElementById("cr-term-root"); // never steal keys from the terminal
+    return !!(termRoot && termRoot.contains(t));
+  }
+
+  function isDetailActive(root) {
+    var nextRoot = document.getElementById("nextRoot");
+    if (!nextRoot || nextRoot.hidden) return false;
+    return !root.hidden; // root is boot.js's #cr-view-detail; .hidden toggles with showView()
+  }
+
+  function stepSession(ctx, ui, dir) {
+    if (!window.CR.board || typeof window.CR.board.boardTiles !== "function") return;
+    var list = (typeof sessions !== "undefined" && Array.isArray(sessions)) ? sessions : [];
+    if (!list.length) return;
+    var nowSec = (typeof listNow === "number") ? listNow : Math.floor(Date.now() / 1000);
+    var tiles = window.CR.board.boardTiles(list, nowSec).filter(function (t) { return t.kind === "session"; });
+    if (!tiles.length) return;
+    var idx = -1;
+    tiles.forEach(function (t, i) { if (t.session.id === ui.sid) idx = i; });
+    var next = idx < 0 ? 0 : Math.max(0, Math.min(tiles.length - 1, idx + dir));
+    var target = tiles[next] && tiles[next].session;
+    if (target && target.id !== ui.sid && ctx && typeof ctx.go === "function") ctx.go("detail", target.id);
+  }
+
+  function jumpPrompt(scrollEl, dir) {
+    var bubbles = qsa(scrollEl, ".crd-entry-prompt");
+    if (!bubbles.length) return;
+    var rectTop = scrollEl.getBoundingClientRect().top;
+    var idx = 0;
+    for (var i = 0; i < bubbles.length; i++) {
+      if (bubbles[i].getBoundingClientRect().top - rectTop > 4) { idx = i; break; }
+      idx = i;
+    }
+    var target = bubbles[Math.max(0, Math.min(bubbles.length - 1, idx + dir))];
+    if (target) target.scrollIntoView({ block: "center" });
+  }
+
+  // FIX 3 (design-audit MED): the old match key was `data-todo-text`, always
+  // rendered as a literal empty string on the two narration entry kinds
+  // (entryHtml()'s narration branches) — no todo's text was ever actually
+  // written there, so this could never match anything. There is also no real
+  // per-entry link to a specific todo anywhere in the data (narration/tool
+  // entries don't carry a todo id) to populate that attribute honestly.
+  // What DOES exist on both sides: todos[i].started_at (epoch seconds, the
+  // same field spineSegments() already requires for its "hasTimes" branch)
+  // and every timeline entry's own `e.t` (epoch ms, mergeTimeline()). "That
+  // todo's first entry" is real and derivable as the earliest entry at or
+  // after the todo's own start time — so this now does a timestamp match
+  // instead of a fabricated text match, using the SAME `data-key` attribute
+  // entryOpenAttrs() already stamps on every entry kind (no new markup).
+  function scrollTimelineToTodo(node, ui, idx) {
+    var session = ui.lastSession;
+    var todo = (session && session.todos || [])[idx];
+    var startMs = todo && parseEpochSec(todo.started_at);
+    if (startMs == null) return; // no real per-todo timestamp to match against — never guess
+    var entries = ui.timelineEntries || mergeTimeline(session);
+    var best = null;
+    entries.forEach(function (e) {
+      if (e.t >= startMs && (!best || e.t < best.t)) best = e;
+    });
+    if (!best) return;
+    var scrollEl = qs(node, ".crd-timeline-scroll");
+    var match = qsa(scrollEl, "[data-key]").filter(function (e) {
+      return e.getAttribute("data-key") === best.key;
+    })[0];
+    if (match) match.scrollIntoView({ block: "center" });
+  }
+
+  // ---- update ----
+  // update() is called on the CR.detail object with (state) — see below, implemented
+  // as free functions closing over the mounted node via root._crDetail.
+
+  var singleton = new Detail();
+
+  window.CR.detail = {
+    mount: function (root, ctx) {
+      this._root = root;
+      this._ctx = ctx;
+      singleton.mount(root, ctx);
+    },
+    update: function (state) {
+      renderUpdate(this._root, this._ctx, state);
+    }
+  };
+
+  function renderUpdate(root, ctx, state) {
+    if (!root || !root._crDetail) return;
+    var node = root._crDetail.node;
+    var ui = root._crDetail.ui;
+    var session = state && state.session;
+    if (!session) return;
+    var nowSec = state.now || Math.floor(Date.now() / 1000);
+    var nowMs = nowSec * 1000;
+    var sid = (session.meta && session.meta.sessionId) || session.id || ui.sid || "unknown";
+    var firstMount = ui.sid == null;
+    ui.sid = sid;
+    ui.lastSession = session;
+    ui.lastTitle = (session.meta && session.meta.title) || "";
+    ui.lastGoal = (session.overview && session.overview.goal) || ui.lastTitle;
+
+    // panel keys are localStorage-scoped per session; rebind on first sight of a session id
+    if (firstMount || ui._boundSid !== sid) {
+      ui._boundSid = sid;
+      // `ui` is created once per PAGE LOAD -- mount() does not run again when you
+      // switch sessions -- so anything session-shaped has to be cleared here or it
+      // leaks into the next session. A zoom chosen for a 14h session is meaningless
+      // on a 3-minute one, and the scroll offset even more so.
+      ui.spineZoomMs = null;
+      ui._spineZoomKey = null;   // matches the reset zoom, so no spurious re-anchor
+      ui.spineJustPanned = false;
+      ui.spineDragging = false;
+      var sc0 = qs(node, ".crd-spine-scroll");
+      if (sc0) sc0.scrollLeft = 0;
+      Object.keys(ui.panels).forEach(function (key) {
+        var wrap = ui.panels[key];
+        var def = key === "timeline" ? false : defaultFolded(); // FIX 8: cr.cardsFolded pref
+        var collapsed = getCollapsed(sid, key, def);
+        setPanelCollapsed(ctx, wrap, sid, collapsed);
+      });
+    }
+
+    renderBackline(node, session, state);
+    renderHeader(node, ctx, session, nowSec);
+    renderStatChips(node, session);
+    renderPhoneHead(node, session);
+    renderPhonePresence(node, session, nowSec);
+    renderPhoneStop(node, session);
+    renderForkBanner(node, ctx, session, ui);
+    renderLiveEntry(node, session, nowSec); // FIX 3 (job 2): the "Now" card, right above the spine
+    renderSpine(node, ctx, session, nowMs, ui);
+
+    renderDecisions(ui.panels.decisions, session);
+    renderPhoneAwaiting(node, session);
+    renderPRs(ui.panels.prs, session);
+    renderLinks(ui.panels.links, session);
+    renderSummary(ui.panels.summary, ctx, session);
+    renderPlan(ui.panels.plan, ctx, session);
+
+    renderFiles(ui.panels.files, session);
+    renderCommands(ui.panels.commands, session);
+    renderAgentsPanel(ui.panels.agents, ctx, ui, session);
+    renderRunPanel(ui.panels.run, session);
+    renderTerminalPanel(ui.panels.terminal, session);
+
+    renderTimeline(node, ui, session, ctx);
+  }
+
+  function renderBackline(node, session, state) {
+    var hint = qs(node, ".crd-back-hint");
+    // FIX (drift A9): ext_cr_boot.js's EXT.push now computes `state.triage` (index/total
+    // within CR.board.boardTiles()'s own triage-ranked order) on every 2s poll tick and
+    // passes it through update() — this read was already here, waiting for a supplier.
+    // Still hidden (not fabricated) whenever CR.board hasn't ranked this session at all
+    // (e.g. it's idle, or board hasn't mounted yet).
+    if (state && state.triage && state.triage.total) {
+      hint.hidden = false;
+      hint.textContent = state.triage.index + " of " + state.triage.total +
+        " needing attention · j / k to move between them";
+    } else {
+      hint.hidden = true;
+      hint.textContent = "";
+    }
+  }
+
+  // BUG FIX (cross-view uniformity): this header used to derive its source label
+  // with two regexes -- /auggie/i, then /augment/i, else the literal "Claude
+  // CLI". That collapsed FOUR distinct sources into one word: '', 'cli',
+  // 'claude-desktop', 'sdk-cli' and 'claude-vscode' ALL printed "Claude CLI",
+  // and 'augment-vscode'/'augment-cursor' both printed "Augment", losing the
+  // VS Code vs Cursor distinction. So opening a Claude Desktop session showed
+  // "Claude CLI" in its header while that same session's rail row and board tile
+  // -- in the SAME control room -- correctly read "claude desktop". Now delegates
+  // to the board's exported toolLabel(), which itself reads app.js's shared
+  // SRC_TEXT map, exactly as shortModel() above delegates to modelShort(). The
+  // old regexes survive ONLY as the board-not-mounted fallback, same shape as
+  // shortModel's.
+  function sourceLabel(meta) {
+    var raw = (meta && (meta.source || meta.entrypoint)) || "";
+    try {
+      var fn = window.CR && window.CR.board && window.CR.board.toolLabel;
+      if (typeof fn === "function") {
+        var out = fn(raw);
+        if (out) return out;
+      }
+    } catch (e) {}
+    return /auggie/i.test(raw) ? "Auggie" : (/augment/i.test(raw) ? "Augment" : "Claude CLI");
+  }
+
+  function renderHeader(node, ctx, session, nowSec) {
+    var meta = session.meta || {};
+    qs(node, ".crd-src").textContent = sourceLabel(meta);
+
+    var proj = basename(meta.cwd || "");
+    // FIX (design-audit drift 1): 5b's metaline is "project · branch · elapsed ·
+    // tokens" (its own mock: "ai-tracker · term-tiers · 41m · 128,412 tokens") — no
+    // full cwd path, and the elapsed figure matches the SAME "since first prompt"
+    // value the spine shows (firstEventTime), not "idle since last activity"; the
+    // token total that used to live in the stat-chip row is folded in here instead.
+    var firstMs = firstEventTime(session);
+    var elapsedStr = firstMs != null ? fmtAge(Math.max(0, nowSec - firstMs / 1000)) : null;
+    // Model tacks onto the SAME metadata line, subordinate to project/branch/
+    // elapsed/tokens — never its own visual element. Empty means render
+    // nothing (no "unknown"), handled by the existing .filter(Boolean).
+    var modelBit = shortModel(meta.model) || null;
+    var metaBits = [proj || null, meta.gitBranch || null, elapsedStr, fmtTokens(session) || null, modelBit].filter(Boolean);
+    var metaEl = qs(node, ".crd-metaline");
+    metaEl.textContent = metaBits.join(" · ");
+    metaEl.title = meta.model || "";
+
+    // TASK 1 FIX (owner-reported drift): the big header text used to be
+    // session.overview.goal (overview.py:19 `goal = requests[-1]["text"]` --
+    // literally the LAST PROMPT, verbatim), falling back to the session name
+    // only when there was no goal at all. Since a goal is present on almost
+    // every session, the name essentially never showed, breaking parity with
+    // the classic dashboard and the board tile, which both identify a session
+    // by its NAME. Derivation reused verbatim from the classic dashboard's own
+    // detail render over this SAME session.meta shape (aitracker/web/app.js:1249
+    // `const title=m.title||m.customTitle||m.aiTitle||cur.slice(0,8);`) rather
+    // than forking a third chain (conventions.md rule 4). `meta.title` is
+    // already server-resolved (providers/claude.py:1362 folds titles.json/
+    // customTitle/aiTitle/short-prompt into it) -- the extra fallbacks here are
+    // the same defensive belt-and-suspenders app.js keeps, so a still-missing
+    // title degrades honestly to a short id fragment, never "undefined".
+    var sid = meta.sessionId || session.id || "";
+    var sessionName = meta.title || meta.customTitle || meta.aiTitle ||
+      (sid ? sid.slice(0, 8) : "(untitled session)");
+
+    var st = stateOf(session, nowSec);
+    var pill = qs(node, ".crd-pill-state");
+    pill.className = "crd-pill crd-pill-state crd-state-" + st.cls;
+    // Glyph needs its own tinted span (doc 01 table: hourglass awaiting -> tn-emo-a,
+    // check done -> tn-emo-d) so plain textContent won't do — it can't parse the
+    // wrapper markup. st.word/st.age are still escaped since they land in HTML now.
+    var glyph = st.cls === "awaiting" ? '<span class="tn-emo-a" aria-hidden="true">' + svgIcon(ctx, "hourglass") + '</span> ' :
+      (st.cls === "failed" ? "" : (st.cls === "done" ? '<span class="tn-emo-d" aria-hidden="true">' + svgIcon(ctx, "check") + '</span> ' : ""));
+    pill.innerHTML = glyph + esc(st.word) + (st.age ? " · " + esc(st.age) : "");
+    // GAP CLOSE: session.flag_text (registry.py parse_any(), the unresolved flag's own
+    // text) had zero consumers — the pill above only ever showed the COUNT via
+    // stateOf()'s "N flags open". Surfaced via the pill's native `title` tooltip, the
+    // same DOM-property mechanism metaEl.title uses just above (no esc() needed — it's
+    // a property assignment, not innerHTML). null/no open flag -> removeAttribute, so
+    // there is never a stray empty tooltip.
+    if (st.cls === "flagged" && session.flag_text) {
+      pill.title = session.flag_text;
+    } else {
+      // GAP CLOSE (drift): the pill used to carry no tooltip at all outside the
+      // flagged case, so it never identified WHICH session it belonged to when
+      // read out of context (a screenshot, a screen reader). Same "<name> —
+      // <state word>" shape the board orb's own accessible label already uses
+      // (ext_cr_board.js:1148 `var label = title + ' — ' + orbStateWord(...)`)
+      // -- one derivation, not a second one invented here.
+      pill.title = sessionName + " — " + st.word;
+    }
+    pill.setAttribute("aria-label", sessionName + " — " + st.word);
+
+    // GAP CLOSE: the pill is now a real button (see the SKELETON comment above)
+    // rather than display-only text -- `hidden` when the count is zero keeps it
+    // both invisible AND out of the tab order (no separate disabled/inert flag
+    // needed). Title + aria-label spell out what clicking it does, matching the
+    // pattern the pin/search/flag buttons in this same row already follow.
+    // Deliberately NOT gated on location.hostname/isLocalhost (see the comment
+    // on the "external" button below for the ONE control that is) -- this has
+    // to work from a phone/tablet over a tunnel same as every other control here.
+    var agentsRunning = (session.agents_bg || []).filter(function (a) { return a.running; }).length;
+    var agentsPill = qs(node, ".crd-pill-agents");
+    if (agentsRunning) {
+      var agentsLabel = agentsRunning + " agent" + (agentsRunning === 1 ? "" : "s") + " running";
+      var agentsHint = "Track " + agentsLabel + " live — jump to Agents & shells";
+      agentsPill.hidden = false;
+      agentsPill.textContent = agentsLabel;
+      agentsPill.title = agentsHint;
+      agentsPill.setAttribute("aria-label", agentsHint);
+    } else {
+      agentsPill.hidden = true;
+    }
+
+    // The h1 is the session's NAME now (see the TASK 1 FIX note above) — doc
+    // 03's row 2 is "the goal, ... If there is no goal, fall back to the
+    // session title", but the goal here is the raw last prompt, not a title
+    // substitute, so it's demoted to its own line (.crd-goalline) below the
+    // name rather than ever occupying the name's slot. Hidden (not "—") when
+    // there's nothing to show, same honest-degrade convention as the rest of
+    // this header.
+    qs(node, ".crd-goal").textContent = sessionName;
+    var goalText = (session.overview && session.overview.goal) || "";
+    var goalEl = qs(node, ".crd-goalline");
+    if (goalEl) {
+      goalEl.hidden = !goalText;
+      goalEl.textContent = goalText;
+    }
+    qs(node, ".crd-rename .crd-ico").innerHTML = svgIcon(ctx, "edit");
+
+    // FIX (drift A10): session.pinned used to be present only on the board-list dict
+    // (registry.py:70), never on parse_any()'s per-session detail — the shared seam now
+    // merges it into the detail dict too, so this simple truthy read (already correct
+    // for both the pinned and unpinned case) actually fires.
+    // GAP CLOSE: the marker used to just toggle `hidden` on a display-only pill --
+    // paintPinButton() (above) now keeps BOTH states visible, so pinning is
+    // reachable from this view too, not only unpinning.
+    paintPinButton(node, ctx, session.pinned);
+
+    // FIX (design-audit drift 2): search/flag are demoted to small icon buttons in
+    // the row1 actions cluster (see the SKELETON comment) rather than the old
+    // full-label pill buttons — icoEls indices still map search first, flag second.
+    var icoEls = qsa(node, ".crd-row1-actions .crd-iconbtn .crd-ico");
+    if (icoEls[0]) icoEls[0].innerHTML = svgIcon(ctx, "search");
+    if (icoEls[1]) icoEls[1].innerHTML = svgIcon(ctx, "alert");
+
+    // FIX 4 (design-audit MED): session.open_flags/flag_text HAVE been on the
+    // detail dict for a while now (registry.py:131-153, the same shared seam
+    // the state pill's tooltip above already reads flag_text off of) — the
+    // stale comment that used to sit here, and the zero-state copy below,
+    // both still claimed the field "needs wiring". Fixed to show the real
+    // state either way: the actual open flag(s) when there are any, an honest
+    // "no open flags" empty state when there aren't — never a claim that a
+    // wired feature is unbuilt.
+    var flagCount = session.open_flags;
+    var flagBtn = qs(node, '[data-act="toggle-flag"]');
+    var flagTitle = "Flag an issue" + (flagCount ? " · " + flagCount + " open" : "");
+    flagBtn.title = flagTitle;
+    flagBtn.setAttribute("aria-label", flagTitle);
+    var flagBadge = qs(flagBtn, ".crd-flag-badge");
+    flagBadge.hidden = !flagCount;
+    flagBadge.textContent = flagCount || "";
+    qs(node, ".crd-flagcard .crd-flag-count").textContent = flagCount ?
+      flagCount + " open flag" + (flagCount === 1 ? "" : "s") + " on this session" :
+      "No open flags on this session.";
+    // FIX 7 (design-audit): flag text visible here too, not just the state
+    // pill's hover-only title (see above) — this card is already open when
+    // the reader taps "Flag an issue", so it is reachable on touch. Plain
+    // `.textContent` assignment (never innerHTML) — flag text is
+    // user-authored, and this is the same escaping-by-property-assignment
+    // convention `pill.title = session.flag_text` above already uses.
+    var flagTextEl = qs(node, ".crd-flagcard .crd-flag-text");
+    flagTextEl.hidden = !(flagCount && session.flag_text);
+    flagTextEl.textContent = (flagCount && session.flag_text) || "";
+
+    var isLocalhost = /^(localhost|127\.0\.0\.1)/.test(location.hostname);
+    qs(node, '[data-act="external"]').hidden = !isLocalhost;
+  }
+
+  // FIX (design-audit drift 3): 5b renders fork lineage as a small card at the
+  // BOTTOM of the Evidence column ("Forked" / "You're on the copy; the original is
+  // still running." / "Open the original"), not a full-width banner between the
+  // header and the spine. Copy for the continued_from direction is 5b's, verbatim;
+  // continued_as (this session forked ONWARD, no equivalent in the mock) gets the
+  // same card shape with a symmetric, equally short line rather than the old
+  // doc-derived paragraph.
+  // FIX 3: names the target session, the same way app.js's renderForkLinks() does
+  // (app.js ~1195, its inner `label(id)`). That `label` is a `const` closed over inside
+  // renderForkLinks() itself — a function-local binding, not a top-level app.js
+  // declaration — so it is NOT reachable from here the way a top-level app.js function
+  // would be (per this module's own contract comment above). Reimplemented as
+  // forkSessionLabel() below, reading the SAME top-level `sessions` array app.js's
+  // label() reads (app.js:821, a bare top-level `let`, which — like a top-level function —
+  // is directly reachable from every Control Room module). REQUIRED ADDITION for app.js:
+  // hoist `label` out of renderForkLinks() into a top-level function (e.g.
+  // `function forkSessionLabel(id)`) so both call sites share one implementation instead
+  // of two copies of the same one-liner.
+  function forkSessionLabel(id) {
+    var list = (typeof sessions !== "undefined" && sessions) || [];
+    var hit = null;
+    for (var i = 0; i < list.length; i++) { if (list[i].id === id) { hit = list[i]; break; } }
+    return hit ? (hit.title || hit.project || id.slice(0, 8)) : id.slice(0, 8);
+  }
+
+  function renderForkBanner(node, ctx, session, ui) {
+    var card = ui.forkCard || qs(node, ".crd-forkcard");
+    if (!card) return;
+    if (session.continued_as) {
+      card.hidden = false;
+      qs(card, ".crd-fork-ico").innerHTML = svgIcon(ctx, "branch");
+      qs(card, ".crd-fork-label").textContent = "Forked";
+      qs(card, ".crd-fork-body").textContent =
+        "You're on the original; a fresh copy continued the work — " +
+        forkSessionLabel(session.continued_as) + ".";
+      qs(card, ".crd-fork-link").textContent = "Open the copy";
+      ui.forkTarget = session.continued_as;
+    } else if (session.continued_from) {
+      card.hidden = false;
+      qs(card, ".crd-fork-ico").innerHTML = svgIcon(ctx, "branch");
+      qs(card, ".crd-fork-label").textContent = "Forked";
+      qs(card, ".crd-fork-body").textContent =
+        "You're on the copy; the original — " + forkSessionLabel(session.continued_from) +
+        " — is still running.";
+      qs(card, ".crd-fork-link").textContent = "Open the original";
+      ui.forkTarget = session.continued_from;
+    } else {
+      card.hidden = true;
+      ui.forkTarget = null;
+    }
+  }
+
+  // Repaint just the spine from the cached session -- used by the span chips and
+  // the drag-pan, which change only the window and must not wait for the next
+  // 2s poll (nor re-run the whole detail render) to show it.
+  function repaintSpine(node, ctx, ui) {
+    if (ui && ui.spineSession) renderSpine(node, ctx, ui.spineSession, ui.spineNowMs, ui);
+  }
+
+  function renderSpine(node, ctx, session, nowMs, ui) {
+    // cached so repaintSpine() can redraw on a chip click or a drag frame
+    if (ui) { ui.spineSession = session; ui.spineNowMs = nowMs; }
+    // No window: the plan is always the WHOLE session, so nothing can be
+    // filtered out from under the user. The zoom below changes how much room
+    // that same set of segments and markers is drawn across.
+    var plan = spineSegments(session, nowMs);
+    var zoomPct = spineZoomPct(ui, plan.elapsedMs);
+    var doneN = plan.doneCount, total = plan.total;
+    qs(node, ".crd-spine-count").textContent = doneN + " of " + total +
+      (plan.elapsedMs != null ? " · " + fmtDurMs(plan.elapsedMs) + " elapsed" : "") +
+      (zoomPct > 100 ? " · zoomed " + Math.round(zoomPct / 100) + "x · scroll or drag" : "");
+
+    renderSpineSpans(node, plan, ui, zoomPct);
+
+    var scroll = qs(node, ".crd-spine-scroll");
+    var track = qs(node, ".crd-spine-track");
+    if (track) track.style.width = zoomPct.toFixed(2) + "%";
+    if (scroll) {
+      scroll.classList.toggle("is-scrollable", zoomPct > 100);
+      // When the user PICKS a different zoom, jump to the live edge: the detail
+      // they just asked for is almost always at the recent end, and keeping the
+      // old pixel offset would strand them somewhere arbitrary.
+      //
+      // Keyed on ui.spineZoomMs (the chip they clicked), NOT on zoomPct. zoomPct
+      // is elapsedMs/span, and elapsedMs grows on every 2s poll of a live session
+      // -- keying on it re-anchored the scroll roughly every two seconds and tore
+      // the view out from under any drag in progress. The drag guard is belt and
+      // braces on top of that.
+      if (ui && !ui.spineDragging && ui._spineZoomKey !== ui.spineZoomMs) {
+        ui._spineZoomKey = ui.spineZoomMs;
+        scroll.scrollLeft = scroll.scrollWidth; // clamps itself to the max
+      }
+    }
+
+    var bar = qs(node, ".crd-spine-bar");
+    bar.innerHTML = plan.segments.map(function (s, i) {
+      var isFirst = i === 0, isLast = i === plan.segments.length - 1;
+      var radiusCls = (isFirst ? " crd-seg-first" : "") + (isLast ? " crd-seg-last" : "");
+      var title = s.kind === "grouped" ? s.label :
+        (s.todo ? (s.todo.content || s.todo.activeForm || "") + " · " +
+          (s.kind === "pending" ? "not started" : (s.elapsedMs != null ? fmtDurMs(s.elapsedMs) : s.kind)) : "");
+      var inner = "";
+      if (s.kind === "done" && s.widthPct >= 7 && s.elapsedMs != null) {
+        inner = '<span class="crd-seg-elapsed mono">' + esc(fmtDurMs(s.elapsedMs)) + "</span>";
+      } else if (s.kind === "running") {
+        // FIX (design-audit drift 7): 5b lays the running segment out
+        // space-between — dot+"running" on the LEFT, elapsed time on the RIGHT —
+        // not one centred, concatenated string.
+        inner = '<span class="crd-seg-running-label"><span class="crd-seg-dot"></span>' +
+          '<span class="crd-seg-running-word mono">running</span></span>' +
+          (s.elapsedMs != null ? '<span class="crd-seg-running-elapsed mono">' + esc(fmtDurMs(s.elapsedMs)) + "</span>" : "") +
+          '<span class="crd-seg-edge"></span>';
+      } else if (s.kind === "grouped") {
+        inner = '<span class="crd-seg-grouped mono">' + esc(s.label) + "</span>";
+      }
+      return '<button class="crd-seg crd-seg-' + s.kind + radiusCls + '" style="flex-basis:' + s.widthPct.toFixed(3) +
+        '%" data-act="spine-segment" data-idx="' + s.idx + '" title="' + esc(title) + '">' + inner + "</button>";
+    }).join("");
+
+    var gutter = qs(node, ".crd-spine-gutter");
+    gutter.innerHTML = plan.markers.map(function (m) {
+      var cls = "crd-mark crd-mark-" + m.kind;
+      // Doc 01 icon table: hourglass (ask) -> tn-emo-a, agent/chat (agent/prompt) -> base tn-emo.
+      var glyphCls = m.kind === "ask" ? "tn-emo-a" : "tn-emo";
+      var content = m.kind === "fail" ? '<span class="crd-mark-word mono">FAIL</span>' :
+        (m.kind === "now" ? '<span class="crd-mark-word mono">NOW</span>' :
+        (m.glyph ? '<span class="crd-mark-emoji ' + glyphCls + '" aria-hidden="true">' + svgIcon(ctx, m.glyph) + "</span>" : ""));
+      return '<span class="' + cls + '" style="left:' + m.pct.toFixed(3) + '%" title="' + esc(m.title) + '">' +
+        '<span class="crd-mark-tick"></span>' + content + "</span>";
+    }).join("");
+
+    qs(node, ".crd-spine-first").textContent = plan.firstMs != null ? fmtClock(plan.firstMs) + " first prompt" : "—";
+    qs(node, ".crd-spine-mid").textContent = plan.doneCount + " done · " + plan.runningCount +
+      " running · " + plan.pendingCount + " to go";
+    // FIX (design-audit drift 7): 5b's footer right cell is the literal word "now",
+    // no clock time (the clock already appears on the NOW spine marker above it).
+    qs(node, ".crd-spine-now").textContent = "now";
+
+    // Check if spine is showing time-proportional segments (not equal-width fallback)
+    var hasTimedSegments = plan.segments.some(function (s) { return s.elapsedMs !== null; });
+    // Check if timings are approximate (from name matching, not exact id join)
+    var isApproximate = session.todo_times_approximate === true;
+
+    // Update hint text if showing approximate timings
+    var hintEl = qs(node, ".crd-spine-hint");
+    if (hintEl) {
+      if (isApproximate && hasTimedSegments) {
+        hintEl.textContent = "segment width = inferred time · click to jump the chat there";
+      } else {
+        hintEl.textContent = "segment width = time actually spent · click to jump the chat there";
+      }
+    }
+
+    // Entry animation is gated on the segment set ACTUALLY changing. Without this
+    // the 2s poll re-runs the animation on every render and the whole spine
+    // strobes -- the difference between "alive" and "unusable".
+    var sig = plan.segments.map(function (x) { return x.kind + ":" + x.idx; }).join("|") +
+      "#" + plan.markers.length;
+    if (bar.getAttribute("data-sig") !== sig) {
+      bar.setAttribute("data-sig", sig);
+      bar.classList.remove("is-fresh");
+      void bar.offsetWidth; // reflow, so the animation restarts rather than no-ops
+      bar.classList.add("is-fresh");
+    }
+
+    // With the zoom model there is exactly ONE way the bar can be empty: the
+    // session recorded no todos at all (Claude prunes its task files after a
+    // couple of days, so most older sessions look like this). Say that plainly
+    // instead of leaving a blank strip that reads as broken -- and note the bar
+    // keeps its full height either way, so the spine never appears to vanish.
+    var spineEl = qs(node, ".crd-spine");
+    spineEl.classList.toggle("is-empty-bar", !plan.segments.length);
+
+    var finalAriaLabel = plan.ariaLabel;
+    if (isApproximate && hasTimedSegments) {
+      finalAriaLabel += " Timings are inferred.";
+    }
+    if (zoomPct > 100) {
+      finalAriaLabel += " Zoomed " + Math.round(zoomPct / 100) +
+        " times; scroll horizontally to move through the session.";
+    }
+    // The summary lands in a visually-hidden live region instead of an aria-label
+    // on the container: the container is a role="group" so that the segment
+    // buttons and the window chips inside it stay reachable, and a role="img"
+    // (what this used to be) would have hidden every one of them.
+    var srEl = qs(node, ".crd-spine-sr");
+    if (srEl && srEl.textContent !== finalAriaLabel) srEl.textContent = finalAriaLabel;
+  }
+
+  // The window chips: "All" plus every ladder span shorter than the session, and
+  // a "now" reset that only appears once the view has been panned off the live
+  // edge. Rewritten only when the row actually changes, so a 2s poll cannot steal
+  // focus from a chip the user is tabbed onto.
+  function renderSpineSpans(node, plan, ui, zoomPct) {
+    var el = qs(node, ".crd-spine-spans");
+    if (!el) return;
+    var choices = spineSpanChoices(plan.elapsedMs);
+    var cur = ui && ui.spineZoomMs ? ui.spineZoomMs : null;
+    var zoomed = (zoomPct || 100) > 100;
+    var sig = choices.map(function (c) { return c.key; }).join(",") + "|" + cur + "|" + zoomed;
+    if (el.getAttribute("data-sig") === sig) return;
+    el.setAttribute("data-sig", sig);
+    if (!choices.length) { el.innerHTML = ""; return; }
+    var html = '<button type="button" class="crd-spine-span' + (cur == null ? " is-on" : "") +
+      '" data-act="spine-span" data-span="all" aria-pressed="' + (cur == null) +
+      '" title="Fit the whole session in view">All</button>';
+    choices.forEach(function (c) {
+      html += '<button type="button" class="crd-spine-span' + (cur === c.ms ? " is-on" : "") +
+        '" data-act="spine-span" data-span="' + c.ms + '" aria-pressed="' + (cur === c.ms) +
+        '" title="Zoom in so ' + c.key + ' fills the view · then scroll or drag sideways">' +
+        c.key + "</button>";
+    });
+    if (zoomed) {
+      html += '<button type="button" class="crd-spine-span crd-spine-live" data-act="spine-now"' +
+        ' title="Scroll to the live edge">now</button>';
+    }
+    el.innerHTML = html;
+  }
+
+  // ---- State column panels ----
+
+  function renderDecisions(wrap, session) {
+    var decisions = session.decisions || [];
+    var open = decisions.filter(function (d) { return d.open; });
+    var closed = decisions.filter(function (d) { return !d.open; });
+    setPanelCount(wrap, open.length ? open.length + " open" : (decisions.length ? "0 open" : "—"));
+    wrap.classList.toggle("crd-tint-awaiting", open.length > 0);
+
+    function renderQ(d, isOpen) {
+      var q0 = (d.questions && d.questions[0]) || { q: "", options: [] };
+      var opts = (q0.options || []).map(function (o) {
+        return '<div class="crd-decision-opt">' + esc(o) + "</div>";
+      }).join("");
+      var answer = !isOpen && d.answer ? '<div class="crd-decision-answer">Decided: ' + esc(d.answer) + "</div>" : "";
+      return '<div class="crd-decision' + (isOpen ? " is-open" : "") + '">' +
+        '<div class="crd-decision-q">' + esc(q0.q) + "</div>" +
+        (isOpen ? opts : "") + answer + "</div>";
+    }
+
+    var html = "";
+    if (open.length) html += open.map(function (d) { return renderQ(d, true); }).join("");
+    if (open.length) {
+      html += '<div class="crd-decision-footrule">View-only — answer in the session itself. ' +
+        "The tracker never writes to it.</div>";
+    }
+    if (closed.length) {
+      html += '<div class="crd-decision-divider">Decided earlier</div>' +
+        closed.map(function (d) { return renderQ(d, false); }).join("");
+    }
+    if (!open.length && !closed.length) html = emptyHtml("No decisions recorded yet", "This session hasn't raised any questions. It will fill in as it works.");
+    setPanelBody(wrap, html);
+  }
+
+  function renderPRs(wrap, session) {
+    // FIX 9c: the doc says PRs merely *referenced* are excluded — only ones this
+    // session CREATED are listed. deriveLinks() right below already uses `p.created`
+    // for exactly this distinction; this panel just wasn't applying the same filter.
+    var prs = (session.prs || []).filter(function (p) { return p.created; });
+    setPanelCount(wrap, prs.length || "—");
+    if (!prs.length) { setPanelBody(wrap, emptyHtml("No pull requests yet", "This session hasn't opened any. It will fill in as it works.")); return; }
+    setPanelBody(wrap, prs.map(function (p) {
+      var state = p.state === "merged" ? "merged" : (p.state === "closed" ? "closed" : "open");
+      // FIX (drift A12/capability #43): doc 03's PR row anatomy is "number + title" —
+      // the parser never captures a real PR title (util.py:collect_prs is a regex-only
+      // URL scan; the `prs[]` shape carries url/repo/num only, confirmed against
+      // util.py:162-220 and providers/claude.py:994/auggie.py). Previously repo/num
+      // silently stood in FOR the title with no signal that it wasn't one — this file's
+      // own missing-data convention (the "—" used by renderSummary/renderTerminalPanel
+      // above for a value that could exist but doesn't) now marks the title honestly,
+      // with repo kept alongside as a real, clearly separate identifier instead of a
+      // masquerading title.
+      var title = p.title ? esc(p.title) : "—";
+      var titleAttr = p.title ? "" : ' title="PR title isn’t captured by the parser yet"';
+      return '<a class="crd-pr-row" href="' + esc(p.url) + '" target="_blank" rel="noopener">' +
+        '<span class="crd-pr-title"' + titleAttr + '>#' + esc(p.num || "?") + " · " + title + "</span>" +
+        (p.repo ? '<span class="crd-agent-wf mono">' + esc(p.repo) + "</span>" : "") +
+        (p.agent ? '<span class="crd-tag-agent">agent</span>' : "") +
+        '<span class="crd-pr-state crd-pr-' + state + '">' + state + "</span>" +
+        "</a>";
+    }).join(""));
+  }
+
+  function renderLinks(wrap, session) {
+    var links = deriveLinks(session);
+    setPanelCount(wrap, links.total || "—");
+    if (!links.total) { setPanelBody(wrap, emptyHtml("No links recorded yet", "Nothing generated or referenced yet. It will fill in as it works.")); return; }
+    function row(e) {
+      return '<div class="crd-link-row"><a href="' + esc(e.url) + '" target="_blank" rel="noopener" class="crd-link-url mono">' +
+        esc(e.url) + "</a>" + (e.agent ? '<span class="crd-tag-agent">agent</span>' : "") +
+        '<span class="crd-link-verb">' + esc(e.verb) + "</span></div>";
+    }
+    var html = "";
+    if (links.generated.length) {
+      html += '<div class="crd-link-group crd-link-generated"><span>GENERATED HERE</span><span>' +
+        links.generated.length + "</span></div>" + links.generated.map(row).join("");
+    }
+    if (links.worked.length) {
+      html += '<div class="crd-link-group crd-link-worked"><span>WORKED ON</span><span>' +
+        links.worked.length + " · referenced or fetched</span></div>" + links.worked.map(row).join("");
+    }
+    html += '<div class="crd-link-footnote">Generated = the session created it. Worked on = it ' +
+      "appeared in a tool result or the narration.</div>";
+    setPanelBody(wrap, html);
+  }
+
+  function renderSummary(wrap, ctx, session) {
+    var ov = session.overview || {};
+    setPanelCount(wrap, "");
+    // GAP CLOSE: the classic sidebar already renders these three fields through
+    // md() (app.js:1439-1441, `#osumbody md(ov.goal)` etc) -- this panel was still
+    // on plain esc(), the exact same-data-two-renderings asymmetry mdHtml()'s own
+    // comment above now calls out. mdHtml(ctx, ...) is the shared seam both use.
+    setPanelBody(wrap,
+      '<div class="crd-summary-field"><div class="crd-summary-label">Goal</div>' +
+      '<div class="crd-summary-body">' + mdHtml(ctx, ov.goal || "—") + "</div></div>" +
+      '<div class="crd-summary-field"><div class="crd-summary-label">Now</div>' +
+      '<div class="crd-summary-body crd-summary-now">' + mdHtml(ctx, ov.now || "—") + "</div></div>" +
+      '<div class="crd-summary-field"><div class="crd-summary-label">So far</div>' +
+      '<div class="crd-summary-body">' + mdHtml(ctx, ov.sofar || "—") + "</div></div>"
+    );
+  }
+
+  function renderPlan(wrap, ctx, session) {
+    var notes = session.notes || [];
+    setPanelCount(wrap, notes.length || "—");
+    var pushWhen = session.push_when || "none";
+    var chip = pushWhen === "turn" ? { text: "queued · lands at turn-end", cls: "crd-chip-quiet" } :
+      pushWhen === "wake" ? { text: "queued · on wake", cls: "crd-chip-sunken" } :
+      { text: "queued · copy it", cls: "crd-chip-sunken" };
+    var rows = notes.map(function (n, i) {
+      // FIX 1 (capability #31: markdown rendering names "notes" explicitly).
+      return '<div class="crd-note-row"><div class="crd-note-body">' + mdHtml(ctx, n.text) + "</div>" +
+        '<span class="crd-note-chip ' + chip.cls + '">' + chip.text + "</span>" +
+        '<span class="crd-note-actions">' +
+          '<button data-act="note-copy" data-idx="' + i + '">copy</button>' +
+          '<button data-act="note-remove" data-idx="' + i + '">remove</button>' +
+        "</span></div>";
+    }).join("");
+    var body = '<div class="crd-plan-head"><span class="tn-emo-n" aria-hidden="true">' + svgIcon(ctx, "note") + '</span> PLAN ON THE GO · ' + notes.length + " notes</div>" +
+      (rows || emptyHtml("No notes queued", "Jot one below — it'll queue for delivery.")) +
+      '<div class="crd-plan-footer">' +
+        '<input class="crd-plan-input" type="text" placeholder="Jot the next thing…">' +
+        '<button class="crd-btn crd-btn-solid" data-act="note-push">push</button>' +
+      "</div>";
+    setPanelBody(wrap, body);
+  }
+
+  // ---- Evidence column panels ----
+
+  function renderFiles(wrap, session) {
+    var files = session.files || [];
+    setPanelCount(wrap, files.length || "—");
+    if (!files.length) { setPanelBody(wrap, emptyHtml("No files touched yet", "This session hasn't created or edited any. It will fill in as it works.")); return; }
+    var rows = files.map(function (f) {
+      var isMd = /\.md$/i.test(f.path || "");
+      // f.alive === false: the path no longer exists on disk (annotate_liveness(),
+      // util.py). The row still renders -- this IS the session's real history -- just
+      // dimmed, reusing the same `opacity: .5` "honestly not current" convention this
+      // stylesheet already uses for crd-btn:disabled, rather than inventing a new class.
+      var dead = f.alive === false;
+      return '<div class="crd-file-row' + (f.agent ? " crd-agent-row" : "") + '" data-act="file-row" data-path="' +
+        esc(f.path) + '"' + (dead ? ' style="opacity:.5" title="No longer on disk"' : "") + '>' +
+        '<span class="crd-file-path mono">' + esc(f.path) + "</span>" +
+        (f.created ? '<span class="crd-file-created">+' + (f.ops || 1) + "</span>" :
+          '<span class="crd-file-edited">−' + (f.ops || 1) + "</span>") +
+        (f.agent ? '<span class="crd-tag-agent">agent</span>' : "") +
+        (isMd ? '<span class="crd-tag-md">md</span>' : "") +
+        "</div>";
+    }).join("");
+    setPanelBody(wrap, rows + '<div class="crd-panel-footnote">click for the diff · context expands up/down</div>');
+  }
+
+  function renderCommands(wrap, session) {
+    var cmds = session.commands || [];
+    var failing = cmds.filter(function (c) { return c.ok === false; }).length;
+    // FIX (drift A12/capability #41): doc 03's header text for a provider whose
+    // commands carry no real exit status is "N · status not recorded" — never
+    // implemented anywhere (grep confirmed zero hits). NOT hardcoded to a provider
+    // name: the drift report's own finding is that the doc's Auggie premise is stale
+    // — auggie.py:499/680 (same as claude.py:1173) always computes a real ok/fail
+    // boolean, so hardcoding "Auggie" here would be a NEW lie, not a fix. This checks
+    // the actual per-command signal instead: `typeof c.ok !== "boolean"` is the
+    // honest "absent" case for whichever provider/session actually lacks it. Today
+    // that's zero real commands (both providers always set a boolean), so this stays
+    // dormant for real data — same forward-compatible shape as the term_attached gate.
+    var unknown = cmds.filter(function (c) { return typeof c.ok !== "boolean"; }).length;
+    var countText = cmds.length ? String(cmds.length) : "—";
+    if (cmds.length) {
+      if (unknown === cmds.length) countText += " · status not recorded";
+      else if (failing) countText += " · " + failing + " failing";
+    }
+    setPanelCount(wrap, countText);
+    // FIX (design-audit drift 5): 5b keeps the Commands panel on its normal neutral
+    // background and colours only the count text ("1 failing") — no full-panel red
+    // tint. Toggle the tint on the count element alone, not the whole panel.
+    qs(wrap, ".crd-panel-count").classList.toggle("crd-count-failing", failing > 0);
+    if (!cmds.length) { setPanelBody(wrap, emptyHtml("No commands yet", "This session hasn't run any. It will fill in as it works.")); return; }
+    setPanelBody(wrap, cmds.map(function (c) {
+      var known = typeof c.ok === "boolean";
+      // FIX (drift: unrecorded status rendered as a green "ok"): `ok = known ? c.ok
+      // : true` asserted success the data never recorded, with the only disclaimer
+      // buried in a tooltip. Reuses this same panel's existing "unknown" convention
+      // (the header's "status not recorded" text a few lines up, and STAT_CHIP_MISSING's
+      // "--" marker) instead of inventing a third one: an unrecorded row shows "--",
+      // styled neutral (no crd-cmd-ok/crd-cmd-fail), never a success affordance.
+      var statusCls = known ? (c.ok ? "crd-cmd-ok" : "crd-cmd-fail") : "crd-cmd-unknown";
+      var statusText = known ? (c.ok ? "ok" : "fail") : STAT_CHIP_MISSING;
+      return '<div class="crd-cmd-row" data-act="command-row" data-id="' + esc(c.id) + '">' +
+        '<span class="crd-cmd-status ' + statusCls + '"' +
+          (known ? "" : ' title="Status not recorded for this command"') + '>' + statusText + "</span>" +
+        '<span class="crd-cmd-text mono">' + esc(c.cmd) + "</span></div>";
+    }).join(""));
+  }
+
+  // FIX 9d: "Re-runs of an identical task collapse into one row tagged ×N, opening
+  // the latest." Grouping key is the task text — the one field agents_bg entries
+  // (not shells, whose shape is opaque here, see the NOTE below) carry that
+  // identifies "the same task" across dispatches. Only agents_bg is grouped;
+  // shells render individually as before.
+  function groupAgentReruns(list) {
+    var order = [], byKey = {};
+    list.forEach(function (a) {
+      var key = (a.task || "").trim() || ("#" + (a.aid || a.id || order.length));
+      var g = byKey[key];
+      if (!g) { g = { items: [] }; byKey[key] = g; order.push(g); }
+      g.items.push(a);
+    });
+    return order.map(function (g) {
+      var items = g.items.slice().sort(function (x, y) { return (parseT(y.ts) || 0) - (parseT(x.ts) || 0); });
+      var runningItem = items.filter(function (x) { return x.running; })[0];
+      var latest = runningItem || items[0];
+      return { latest: latest, count: items.length, running: !!runningItem };
+    });
+  }
+
+  function renderAgentsPanel(wrap, ctx, ui, session) {
+    if (!wrap || !session) return;
+    var agentsBg = session.agents_bg || [];
+    var shells = session.shells || [];
+    var grouped = groupAgentReruns(agentsBg);
+    var runningGroups = grouped.filter(function (g) { return g.running; });
+    var finishedGroups = grouped.filter(function (g) { return !g.running; });
+    var runningShells = Array.isArray(shells) ? shells.filter(function (s) { return s && s.running; }) : [];
+    var finishedShells = Array.isArray(shells) ? shells.filter(function (s) { return s && !s.running; }) : [];
+    setPanelCount(wrap, (agentsBg.length + (Array.isArray(shells) ? shells.length : 0)) || "—");
+
+    function agentRow(g) {
+      var a = g.latest;
+      // doc: "worktree (wt/wc-audit) or ×N" — one slot, mutually exclusive.
+      var tag = g.count > 1 ? '<span class="crd-agent-wf mono">×' + g.count + "</span>" :
+        (a.wf ? '<span class="crd-agent-wf mono">' + esc(a.wf) + "</span>" : "");
+      // This background agent's OWN model (its own separate transcript —
+      // parse_agents() in providers/claude.py — genuinely can and does differ
+      // from the parent session's meta.model, which is exactly why the owner
+      // called this surface out specifically). Empty -> no chip at all.
+      var modelTag = a.model ? '<span class="crd-agent-model mono" title="' + esc(a.model) + '">' +
+        esc(shortModel(a.model)) + "</span>" : "";
+      // GAP CLOSE: a.task is the session-authored free text (the "shells and
+      // everything" the owner named) -- mdHtmlSafe() only when it's actually present;
+      // the a.aid/"background agent" fallbacks are an id or a literal label, never
+      // markdown-authored, so they stay on plain esc() same as before. mdHtmlSafe(),
+      // not mdHtml(): a task label is machine/agent-authored (can read "delete the
+      // stray *.pyc"), so single-asterisk italics must not fire on it.
+      var titleHtml = a.task ? mdHtmlSafe(a.task) : esc(a.aid || "background agent");
+      return '<div class="crd-agent-row-item"><span class="crd-state-dot ' + (g.running ? "is-working" : "is-done") +
+        '"></span><span class="crd-agent-title">' + titleHtml + "</span>" +
+        tag + modelTag + '<button class="crd-open-link" data-act="agent-open" data-id="' + esc(a.aid) + '">open ›</button></div>'; // "opening the latest"
+    }
+    function shellRow(s) {
+      var label = (s && (s.cmd || s.id)) || "shell";
+      return '<div class="crd-agent-row-item"><span class="crd-state-dot ' + (s.running ? "is-working" : "is-done") +
+        '"></span><span class="crd-agent-title mono">' + esc(label) + "</span>" +
+        '<button class="crd-open-link" data-act="shell-open" data-id="' + esc(s.id || s.cmd) + '">open ›</button></div>';
+    }
+
+    var runningHtml = runningGroups.map(agentRow).join("") + runningShells.map(shellRow).join("");
+    var finishedList = finishedGroups.concat(finishedShells);
+
+    var html = runningHtml || "";
+    if (finishedList.length) {
+      if (ui.agentsShowFinished) {
+        html += finishedList.map(function (x) { return x.latest ? agentRow(x) : shellRow(x); }).join("");
+      } else {
+        html += '<button class="crd-show-finished" data-act="agents-show-finished">Show ' + finishedList.length + " finished</button>";
+      }
+    }
+    if (!html) {
+      // FIX 5: Auggie's PROVIDER_NOTES.degraded IS about this panel specifically
+      // ("No background-work model — capability 48 shows empty-because-it-cannot-
+      // exist, not broken") — an honest-degradation card, not the generic "nothing
+      // yet" empty state Claude Code (which DOES have this feature) gets.
+      var note = providerNote(session);
+      html = (note && note.name === "Auggie" && note.degraded) ?
+        sharedStateHtml("degraded", {
+          panelLabel: "AGENTS & SHELLS",
+          providerLabel: note.name,
+          message: note.degraded,
+          readable: "What IS readable is shown in full: todos, files, and commands for this session.",
+          footer: "Empty because it cannot exist — not because something broke."
+        }, note.degraded) :
+        emptyHtml("No agents or shells this session", "Background work will show up here once it starts.");
+    }
+    setPanelBody(wrap, html);
+  }
+
+  function renderRunPanel(wrap, session) {
+    setPanelCount(wrap, "");
+    setPanelBody(wrap,
+      '<div class="crd-run-row"><input class="crd-run-input mono" type="text" placeholder="command…">' +
+      '<button class="crd-btn crd-btn-solid" data-act="run-submit">run</button></div>' +
+      '<div class="crd-panel-footnote">No shell — argv only, against an allowlist. Runs in this session’s directory.</div>'
+    );
+  }
+
+  // ===== model / effort / stop — the SAME /api/term/inject and /api/term/close routes
+  // ext_cr_term.js's toolbar drives (_openModelDialog/_openEffortDialog/_injectSlash and
+  // _killCurrent, ext_cr_term.js:770-850), reached here via registry.py's NEW term_tty
+  // (parse_any()) rather than a second implementation (conventions.md rule 4). Ladders
+  // mirror ext_cr_term.js's own hard-coded MODEL_LADDER/EFFORT_LADDER exactly (which itself
+  // mirrors ext_vt.js's) — a third copy of the same small constant, not a fork of behaviour.
+  var MODEL_LADDER = ["haiku", "sonnet", "opus", "fable"];
+  var EFFORT_LADDER = ["low", "medium", "high", "xhigh", "max"];
+
+  function _termPost(url, body) {
+    return fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {})
+    });
+  }
+  function _termJson(r) {
+    return r.json().catch(function () { return {}; }).then(function (body) {
+      return { ok: r.ok, status: r.status, j: body };
+    });
+  }
+  // Failure always surfaces a real message via the file's existing notice bus
+  // (ctx.emit("notify", …) — see the "Note copied" callsite above); success gives a
+  // WORD ("Switched."), never colour alone. Never a silent no-op, never a false positive.
+  function _injectToTerminal(ctx, tty, text, failLabel) {
+    if (!tty) { ctx.emit("notify", { text: failLabel + ": no terminal attached" }); return; }
+    _termPost("/api/term/inject", { tty: tty, text: text, submit: true, clear_first: true })
+      .then(_termJson).then(function (res) {
+        if (res.ok && res.j && res.j.ok === true) { ctx.emit("notify", { text: "Switched." }); return; }
+        var reason = (res.j && res.j.error) ||
+          (res.status === 404 ? "that route isn’t available in this build yet" :
+           res.status === 400 ? "the terminal rejected that request" :
+           "the terminal didn’t confirm the switch");
+        ctx.emit("notify", { text: failLabel + " — " + reason });
+      }).catch(function () { ctx.emit("notify", { text: "Couldn’t reach the server — the switch wasn’t sent" }); });
+  }
+  function _killTerminal(ctx, tty) {
+    if (!tty) { ctx.emit("notify", { text: "No terminal attached." }); return; }
+    _termPost("/api/term/close", { tty: tty }).then(function (r) {
+      if (!r.ok) { ctx.emit("notify", { text: "Failed to kill terminal." }); return; }
+      ctx.emit("notify", { text: "Terminal killed." });
+    }).catch(function () { ctx.emit("notify", { text: "Couldn’t reach the server — the terminal wasn’t killed." }); });
+  }
+
+  function renderTerminalPanel(wrap, session) {
+    // FIX (drift A4): session.term_attached used to be set by no provider or route
+    // anywhere in the Python tree, so this gate was permanently false and the panel was
+    // dead code. The shared seam now populates it on the per-session detail dict (it
+    // arrives on the SAME 2s /api/session poll every other field here rides — no new
+    // fetch, no per-panel round-trip to GET /api/term/attached). The gate itself was
+    // already correct and stays unchanged: falsy (missing, false, or any other provider
+    // that never sets it) hides the WHOLE panel, per the doc's own instruction — never a
+    // blank/half-rendered card.
+    var attached = session.term_attached;
+    if (!attached) { wrap.style.display = "none"; return; }
+    wrap.style.display = "";
+    var meta = session.meta || {};
+    var ctxWin = session.context || {};
+    setPanelCount(wrap, "");
+    // FIX 2 (design-audit HIGH), now closed: registry.py's term_tty (parse_any(), NEW)
+    // threads the attached pty's own id onto this SAME polled detail dict — the id every
+    // /api/term/{inject,close,attached} route expects as `tty`. These buttons are enabled
+    // ONLY when it's a real non-null string (the delegated click handler below does the
+    // actual inject/close); term_attached alone is never trusted for the gate, so a
+    // theoretical race between the two never leaves a clickable button with nothing to
+    // target. Still rendered honestly DISABLED, with the same copy as before, whenever
+    // term_tty is null — never a clickable control that cannot work.
+    var tty = typeof session.term_tty === "string" && session.term_tty ? session.term_tty : null;
+    var noRoute = "Not reachable from here yet — there’s no way to find this session’s terminal from the Evidence panel.";
+    var modelAttrs = tty ? 'data-act="terminal-model" title="Switch this session’s model"' :
+      'data-act="terminal-model" disabled aria-disabled="true" title="' + esc(noRoute) + '"';
+    var effortAttrs = tty ? 'data-act="terminal-effort" title="Switch this session’s effort"' :
+      'data-act="terminal-effort" disabled aria-disabled="true" title="' + esc(noRoute) + '"';
+    setPanelBody(wrap,
+      '<div class="crd-term-row">' +
+        '<button class="crd-btn crd-btn-solid" ' + modelAttrs + '>model · ' + esc(shortModel(meta.model) || "—") + "</button>" +
+        '<button class="crd-btn crd-btn-outline" ' + effortAttrs + '>effort · ' + esc(meta.effort || "—") + "</button>" +
+        '<span class="crd-term-ctx mono">' + (ctxWin.current != null ? fmtK(ctxWin.current) : "—") + " / " +
+          (ctxWin.limit != null ? fmtK(ctxWin.limit) : "—") + "</span>" +
+      "</div>" +
+      '<div class="crd-panel-footnote">Shown only while a Claude CLI is actually in the pty’s foreground.</div>'
+    );
+  }
+
+  // ---- Conversation timeline ----
+
+  // FIX 5: session -> the matching ext_cr_dialogs.js PROVIDER_NOTES row, via that
+  // module's OWN public `providerNoteFor(source)` (exported at window.CR.dialogs —
+  // read, not forked). `source` is meta.source/meta.entrypoint, same field the old
+  // ad-hoc isDegradedTranscript() sniffed — see providerNoteFor's own doc comment
+  // in ext_cr_dialogs.js confirming that's the expected input.
+  function providerNote(session) {
+    try {
+      var fn = window.CR && window.CR.dialogs && window.CR.dialogs.providerNoteFor;
+      if (typeof fn !== "function") return null;
+      var meta = session.meta || {};
+      return fn(meta.source || meta.entrypoint || "");
+    } catch (e) { return null; }
+  }
+
+  // FIX 9 (design-audit HIGH): doc 04's "Two different empties" table, the
+  // "Something broke" row, verbatim: "Couldn't read this session — The
+  // transcript exists but a line failed to parse. Everything before it is
+  // shown." Server-side parsing behaviour is unchanged (bad lines/records were
+  // already silently skipped) — this only tells the reader their view is
+  // incomplete. `session.parse_error` is always present (registry.py
+  // setdefault): null when the transcript parsed cleanly (render nothing), or
+  // `{line, parsed_before}` on the first failure. `line` is an integer for
+  // Claude (1-based JSONL line) but null for Auggie (no single-file line
+  // concept) — handled without ever printing "line null". Reuses the SAME
+  // errorState() shared component "Couldn't load older turns" already calls
+  // (loadOlderNarration above), not a second implementation.
+  function renderParseErrorNotice(wrap, session) {
+    var box = qs(wrap, ".crd-timeline-parse-error");
+    if (!box) return;
+    var pe = session && session.parse_error;
+    if (!pe) { box.hidden = true; box.innerHTML = ""; return; }
+    var detail = pe.line != null ?
+      ("Failed at line " + pe.line + (pe.parsed_before != null ? " · " + pe.parsed_before + " parsed before it." : ".")) :
+      (pe.parsed_before != null ? pe.parsed_before + " record" + (pe.parsed_before === 1 ? "" : "s") + " parsed before it." : "");
+    box.hidden = false;
+    box.innerHTML = errorHtml("Couldn't read this session",
+      "The transcript exists but a line failed to parse. Everything before it is shown." + (detail ? " " + detail : ""));
+  }
+
+  function renderTimeline(node, ui, session, ctx) {
+    var wrap = ui.panels.timeline;
+    var scrollEl = qs(wrap, ".crd-timeline-scroll");
+    var filterEl = qs(wrap, ".crd-timeline-filters");
+    renderParseErrorNotice(wrap, session);
+    var note = providerNote(session);
+    // FIX 5: Auggie's PROVIDER_NOTES.degraded is about capability 48 (background
+    // agents — handled in renderAgentsPanel below), NOT narration: its own `ok` field
+    // says "Full narration/todos/files/commands." Only the two Augment-extension
+    // rows are narration-degraded — excluded explicitly rather than by sniffing text.
+    var narrDegraded = !!(note && note.degraded && note.name !== "Auggie");
+    filterEl.style.display = narrDegraded ? "none" : "";
+    if (narrDegraded) {
+      setPanelCount(wrap, "");
+      scrollEl.innerHTML = sharedStateHtml("degraded", {
+        panelLabel: "NARRATION",
+        providerLabel: note.name,
+        message: note.degraded,
+        readable: "What IS readable is shown in full: todos and files touched. Nothing is being hidden or approximated.",
+        footer: "Empty because it cannot exist — not because something broke."
+      }, note.degraded);
+      return;
+    }
+    renderTimelineEntries(scrollEl, ui, session, false, ctx);
+  }
+
+  // FIX (defect 3): every entry is clickable to pop out — the SAME data-act
+  // delegation the rest of this file uses, just naming this entry's merge key so
+  // the click handler can find it in ui.timelineEntries (the current filtered,
+  // newest-first list) and hand it to openTimelineEntry(). Nested data-act
+  // elements (e.g. the diagram "expand" button) still win on their own click
+  // since Element.closest() returns the nearest match, not this outer one.
+  function entryOpenAttrs(e) {
+    return ' data-act="timeline-entry-open" data-key="' + esc(e.key) + '"';
+  }
+
+  function entryHtml(e, ctx, diagram) {
+    if (e.kind === "prompt") {
+      return '<div class="crd-entry crd-entry-prompt"' + entryOpenAttrs(e) + '><span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
+        '<div class="crd-bubble crd-bubble-prompt">' + mdHtml(ctx, e.text) + "</div></div>";
+    }
+    if (e.kind === "narration") {
+      if (diagram) {
+        // FIX 2 + mermaid vendoring: prose around the fence still renders as markdown;
+        // the fence itself becomes the doc's diagram card. The card's own render slot
+        // (`.mmd-slot`) shows the node-pill row INSTANTLY (same as before), then
+        // app.js's shared renderMermaid() — called from renderTimelineEntries() below,
+        // right after this HTML lands in the DOM — upgrades it in place to the real
+        // mermaid.js SVG. If that upgrade never happens (asset still loading, load
+        // failed, or mermaid throws on this source) the pill row is exactly what stays:
+        // it is the FALLBACK now, not a second permanent renderer. The "expand" button
+        // still opens the SAME dialog ext_cr_dialogs.js already ships
+        // (narration-diagram) — see openNarrationDiagram()'s own comment for what that
+        // pop-out would need to draw the real diagram too.
+        var pre = diagram.prefix && diagram.prefix.trim() ? '<div class="crd-narration-text">' + mdHtml(ctx, diagram.prefix) + "</div>" : "";
+        var suf = diagram.suffix && diagram.suffix.trim() ? '<div class="crd-narration-text">' + mdHtml(ctx, diagram.suffix) + "</div>" : "";
+        var pills = diagram.nodes.map(function (n) {
+          return '<span class="cr-diagram-pill' + (n.active ? " is-active" : "") + '">' + esc(n.label) + "</span>";
+        }).join("");
+        var b64 = _mmdEncodeSrc(diagram.src || "");
+        return '<div class="crd-entry crd-entry-narration crd-entry-diagram"' + entryOpenAttrs(e) + '>' +
+          '<span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
+          '<div class="crd-narration-body">' + pre +
+          '<div class="cr-diagram-card crd-diagram-inline">' +
+            '<div class="cr-diagram-render mmd-slot" data-mmd-src="' + b64 + '">' +
+              '<div class="cr-diagram-row">' + pills + "</div>" +
+            "</div>" +
+            '<div class="cr-diagram-caption">' + esc(diagram.family) +
+              '<button class="crd-open-link crd-diagram-expand" data-act="narration-diagram" data-key="' + esc(e.key) + '">expand ›</button>' +
+            "</div></div>" + suf + "</div></div>";
+      }
+      return '<div class="crd-entry crd-entry-narration"' + entryOpenAttrs(e) + '>' +
+        '<span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
+        '<div class="crd-narration-text">' + mdHtml(ctx, e.text) + "</div></div>";
+    }
+    if (e.kind === "ask") {
+      var d = e.decision;
+      var q0 = (d.questions && d.questions[0]) || { q: "", options: [] };
+      // GAP CLOSE: the question and its options are session-authored free text
+      // same as narration/prompts -- mdHtml(ctx, ...), not esc(). See the mdHtml()
+      // comment above for why this was the one asymmetry capability #31 missed.
+      var opts = (q0.options || []).map(function (o) { return '<span class="crd-ask-pill">' + mdHtml(ctx, o) + "</span>"; }).join("");
+      // FIX (design-audit drift 6): 5b's ask bubble carries a mini-header
+      // ("hourglass It asked you · still open") above the question — only while it's
+      // still open; a closed decision doesn't claim to still be open. 5b's
+      // view-only copy also drops "itself" and adds the "never writes" clause.
+      var miniHead = d.open ? '<div class="crd-ask-minihead"><span class="tn-emo-a" aria-hidden="true">' + svgIcon(ctx, "hourglass") + '</span>' +
+        '<span class="crd-ask-minihead-label">It asked you · still open</span></div>' : "";
+      return '<div class="crd-entry crd-entry-ask"' + entryOpenAttrs(e) + '><span class="crd-entry-ts mono crd-ts-ask">' + fmtClock(e.t) + "</span>" +
+        '<div class="crd-bubble crd-bubble-ask">' + miniHead + '<div class="crd-ask-q">' + mdHtml(ctx, q0.q) + "</div>" +
+        '<div class="crd-ask-opts">' + opts + "</div>" +
+        '<div class="crd-ask-note">View-only — answer in the session. The tracker never writes to it.</div></div></div>';
+    }
+    if (e.kind === "command" || e.kind === "command-fail") {
+      var c = e.cmd;
+      return '<div class="crd-entry crd-entry-tool' + (e.kind === "command-fail" ? " is-fail" : "") + '"' + entryOpenAttrs(e) + '>' +
+        '<span class="crd-entry-ts mono ' + (e.kind === "command-fail" ? "crd-ts-fail" : "") + '">' + fmtClock(e.t) + "</span>" +
+        '<div class="crd-toolrow">' + (e.kind === "command-fail" ? '<span class="crd-tool-fail">fail</span>' : "") +
+        '<span class="crd-tool-name mono">' + esc(c.cmd) + "</span></div></div>";
+    }
+    // FIX (design-audit drift 8): a generic tool-call row — file edit/write/read or a
+    // Task-tool dispatch (see mergeTimeline's own comment for exactly which fields
+    // are real vs. unavailable). NOTE: no duration and no diff line-count (+/-) exist
+    // anywhere on the detail dict for these — only `verb` (Write/Edit/Read/Task),
+    // `target` (the full path or task desc) and, for a file row, `count` (an edit-op
+    // TALLY, not a line diff) are ever rendered; a session with the design's exact
+    // "0.4s · +118 −31" duration/diff pair would need the parser to start recording
+    // per-op timestamps and line counts, which it does not today.
+    if (e.kind === "tool") {
+      return '<div class="crd-entry crd-entry-tool"' + entryOpenAttrs(e) + '>' +
+        '<span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
+        '<div class="crd-toolrow"><span class="crd-tool-verb mono">' + esc(e.verb) + "</span>" +
+        '<span class="crd-tool-name mono">' + esc(e.target) + "</span>" +
+        (e.agent ? '<span class="crd-tag-agent">agent</span>' : "") +
+        (e.count ? '<span class="crd-tool-count mono">' + esc(e.count) + "</span>" : "") +
+        "</div></div>";
+    }
+    return "";
+  }
+
+  // FIX 4a: accumulates narration past the server's NARR_PAGE=60 cap on /api/session,
+  // the same shape classic app.js's own narrState does (app.js:1446 + 1255-1271, read
+  // not edited): `fresh` is the newest-first page /api/session ships every poll;
+  // `total` is `session.narrative_total` (server.py:309, ALREADY emitted, just unread
+  // by this file before now). New arrivals since the last poll are detected as
+  // `total - acc.total` and prepended from `fresh` (still newest-first); older pages
+  // only ever come from loadOlderNarration()'s explicit fetch, never re-derived here.
+  function ensureNarrAccumulator(ui, session) {
+    var sid = ui.sid;
+    var fresh = session.narrative || [];
+    var total = session.narrative_total != null ? session.narrative_total : fresh.length;
+    var acc = ui.narrAcc;
+    if (!acc || acc.sid !== sid) {
+      acc = ui.narrAcc = { sid: sid, items: fresh.slice(), total: total, loading: false, error: null };
+    } else {
+      var delta = total - acc.total;
+      if (delta > 0) acc.items = fresh.slice(0, delta).concat(acc.items);
+      else if (!acc.items.length) acc.items = fresh.slice();
+      acc.total = total;
+    }
+    acc.exhausted = acc.items.length >= acc.total;
+    return acc;
+  }
+
+  // FIX 4a: real paging — fetches the EXISTING `/api/narration?id=&offset=&limit=`
+  // route (server.py:313-333) for the next 60 older entries, exactly the route+shape
+  // classic app.js's own narrState.more() already calls (app.js:1264-1271, read not
+  // edited). This is the only network call this module makes (see the file-header
+  // note) — everything else stays derived from the /api/session payload the
+  // bootstrap already fetched.
+  function loadOlderNarration(ctx, ui, node) {
+    var acc = ui.narrAcc;
+    if (!acc || acc.loading || acc.exhausted) return;
+    var sid = ui.sid;
+    var scrollEl = qs(node, ".crd-timeline-scroll");
+    acc.loading = true;
+    acc.error = null;
+    renderOlderStatus(node, acc);
+    fetch("/api/narration?id=" + encodeURIComponent(sid) + "&offset=" + acc.items.length + "&limit=60")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (ui.sid !== sid || ui.narrAcc !== acc) return; // navigated away mid-fetch
+        acc.loading = false;
+        if (!j) { acc.error = "Couldn't load older turns — try scrolling again."; renderOlderStatus(node, acc); return; }
+        acc.items = acc.items.concat(j.items || []);
+        if (j.total != null) acc.total = j.total;
+        acc.exhausted = acc.items.length >= acc.total || !(j.items && j.items.length);
+        renderOlderStatus(node, acc);
+        // FIX (defect 1): older entries now sort to the BOTTOM of the newest-first
+        // list (smaller t = further down), i.e. strictly AFTER whatever the reader
+        // was already looking at — nothing above the viewport moves, so (unlike the
+        // old oldest-first order, where older pages used to be prepended above the
+        // reader and needed the scrollTop compensation that used to live here)
+        // no adjustment is needed; { noTopGrowth: true } tells the render path not
+        // to apply its usual "new content landed above" compensation either.
+        renderTimelineEntries(scrollEl, ui, ui.lastSession, true, ctx, { noTopGrowth: true });
+      })
+      .catch(function () {
+        if (ui.sid !== sid || ui.narrAcc !== acc) return;
+        acc.loading = false;
+        acc.error = "Couldn't load older turns — try scrolling again.";
+        renderOlderStatus(node, acc);
+      });
+  }
+
+  // FIX 6: a genuinely-detectable failure (the /api/narration fetch above failing)
+  // gets the "something broke" treatment (CR.dialogs.errorState), not silence.
+  function renderOlderStatus(node, acc) {
+    var wrap = ui_findTimelineOlderEl(node);
+    if (!wrap) return;
+    if (acc.error) { wrap.hidden = false; wrap.innerHTML = errorHtml("Couldn't load older turns", acc.error); return; }
+    if (acc.loading) { wrap.hidden = false; wrap.innerHTML = '<div class="crd-timeline-loading mono">loading older turns…</div>'; return; }
+    wrap.hidden = true; wrap.innerHTML = "";
+  }
+  function ui_findTimelineOlderEl(node) {
+    var scrollEl = qs(node, ".crd-timeline-scroll");
+    if (!scrollEl) return null;
+    var el2 = scrollEl.querySelector(".crd-timeline-older");
+    if (!el2) {
+      el2 = document.createElement("div");
+      el2.className = "crd-timeline-older";
+      el2.hidden = true;
+      // FIX (defect 1): older history now lives at the BOTTOM of the newest-first
+      // list (was the top, back when the list was oldest-first) — append, don't
+      // insertBefore(firstChild).
+      scrollEl.appendChild(el2);
+    }
+    return el2;
+  }
+
+  // ---- FIX (defect 2): the four legend words are individually-selectable, additive
+  // filter chips now, layered on top of the existing all/talk preset. ----
+  var TIMELINE_KIND_KEYS = ["prompts", "narration", "tools", "results"];
+  var TIMELINE_KIND_MAP = {
+    prompts: ["prompt"],
+    narration: ["narration"],
+    tools: ["tool"],
+    // "results" = the outcome of something the session ran — both a passing and a
+    // failing command are "a result".
+    results: ["command", "command-fail"]
+  };
+  // NOTE (defect 2, ask's home): `ask` (a decision/open question) deliberately maps
+  // to NONE of the four chips. It's arguably conversational, but "talk only" is
+  // shipped, tested behaviour that excludes ask today (:kind==="prompt"||"narration"
+  // only) — folding it into the narration or prompts bucket would make toggling
+  // that chip silently start showing decisions under "talk only", changing behaviour
+  // the owner explicitly said not to touch. So ask stays exactly where it already
+  // was: visible only under the "all" preset (no chips active), same as before this
+  // fix. A fifth "questions" chip would be the clean way to make it independently
+  // selectable, if that's ever wanted — not invented here since it wasn't asked for.
+
+  function timelineActiveKinds(ui) {
+    return TIMELINE_KIND_KEYS.filter(function (k) { return ui.timelineKindsOn && ui.timelineKindsOn[k]; });
+  }
+
+  // Pure predicate: (entry, ui) -> visible? Exposed via _internal for testing.
+  function timelineEntryVisible(e, ui) {
+    var active = timelineActiveKinds(ui);
+    if (active.length) {
+      for (var i = 0; i < active.length; i++) {
+        if (TIMELINE_KIND_MAP[active[i]].indexOf(e.kind) >= 0) return true;
+      }
+      return false;
+    }
+    // No chip active — defer to the existing, unchanged all/talk preset.
+    return ui.timelineFilter === "talk" ? (e.kind === "prompt" || e.kind === "narration") : true;
+  }
+
+  function updateTimelineFilterButtons(wrap, ui) {
+    var active = timelineActiveKinds(ui);
+    qsa(wrap, ".crd-timeline-filters button[data-mode]").forEach(function (b) {
+      var mode = b.getAttribute("data-mode");
+      if (mode === "kind") {
+        b.classList.toggle("is-active", active.indexOf(b.getAttribute("data-kind")) >= 0);
+      } else {
+        b.classList.toggle("is-active", !active.length && ui.timelineFilter === mode);
+      }
+    });
+  }
+
+  // Parity (Auggie / augment-*): names what's actually missing instead of a bare
+  // "nothing recorded yet" — the owner's own complaint about the old degraded-state
+  // handling elsewhere in this file (renderAgentsPanel's providerNote branch).
+  var TIMELINE_KIND_NOUN = { prompts: "prompts", narration: "narration", tools: "tool activity", results: "command results" };
+  function timelineEmptyMessage(ui) {
+    var active = timelineActiveKinds(ui);
+    if (active.length) {
+      var nouns = active.map(function (k) { return TIMELINE_KIND_NOUN[k] || k; });
+      return emptyHtml("No " + nouns.join(" or ") + " recorded",
+        "This session hasn't produced any yet — some providers (Auggie, Augment) never will, since they carry no commands/tools data.");
+    }
+    if (ui.timelineFilter === "talk") return emptyHtml("No prompts or narration recorded yet", "Talk-only shows just what was said.");
+    return emptyHtml("Nothing recorded yet", "The first prompt starts the conversation.");
+  }
+
+  function renderTimelineEntries(scrollEl, ui, session, force, ctx, opts) {
+    if (!session) return;
+    ensureNarrAccumulator(ui, session);
+    var sessionForTimeline = Object.assign({}, session, { narrative: ui.narrAcc.items });
+    var all = mergeTimeline(sessionForTimeline); // newest-first (defect 1)
+
+    // FIX 2: index every diagram-bearing narration entry. Sorted ASCENDING here,
+    // independent of `all`'s own (now newest-first, defect 1) order — this list's
+    // consumer, openNarrationDiagram()/ext_cr_dialogs.js's narration-diagram
+    // pop-out, assumes onLatest = the LAST index and onNext steps toward newer;
+    // re-sorting keeps that contract true regardless of which order the timeline
+    // itself renders in.
+    var diagramEntries = [], diagramByKey = {};
+    all.forEach(function (e) {
+      if (e.kind !== "narration") return;
+      var d = extractDiagram(e.text);
+      if (!d) return;
+      diagramByKey[e.key] = d;
+      // `src` (the raw mermaid source) rides along here too, unused by THIS module's own
+      // pill dialog today, but harmless -- it's what ext_cr_dialogs.js's narration-diagram
+      // pop-out owner needs to draw the real diagram there as well (see
+      // openNarrationDiagram()'s own comment).
+      diagramEntries.push({ key: e.key, t: e.t, family: d.family, nodes: d.nodes, src: d.src });
+    });
+    diagramEntries.sort(function (a, b) { return a.t - b.t; });
+    ui.diagramEntries = diagramEntries;
+
+    // FIX (defect 2): the four chips (additive) win over the all/talk preset when
+    // any is active; otherwise the preset behaves exactly as it did before.
+    var filtered = all.filter(function (e) { return timelineEntryVisible(e, ui); });
+    // FIX (defect 3): the pop-out/nav path reads this — always the current
+    // filtered, newest-first list, so index 0 is "the newest visible entry".
+    ui.timelineEntries = filtered;
+
+    if (force || filtered.length !== ui.timelineSeen || !scrollEl.childNodes.length) {
+      var wasStuck = ui.timelineStuckLatest;
+      var prevScrollTop = scrollEl.scrollTop;
+      var heightBefore = scrollEl.scrollHeight;
+      var olderEl = scrollEl.querySelector(".crd-timeline-older"); // preserved across the repaint below
+      scrollEl.innerHTML = filtered.length ?
+        filtered.map(function (e) { return entryHtml(e, ctx, diagramByKey[e.key]); }).join("") :
+        "";
+      if (!filtered.length) scrollEl.innerHTML = timelineEmptyMessage(ui);
+      if (olderEl) scrollEl.appendChild(olderEl); // FIX (defect 1): older status lives at the bottom now
+      // FIX (drift: toolrow overflow) — the CSS fix above lets the row shrink and
+      // ellipsize a long command/path, but the untruncated text must stay
+      // recoverable. `.crd-tool-name`'s own textContent is already the exact
+      // decoded string entryHtml() esc()'d in (tool-authored, e.g. a shell
+      // command or file path) — copying element.textContent -> element.title is
+      // a DOM property-to-property assignment, never a second pass through
+      // innerHTML/string concat, so there's no way for this text to be
+      // reinterpreted as markup.
+      qsa(scrollEl, ".crd-toolrow .crd-tool-name").forEach(function (nameEl) {
+        if (!nameEl.title) nameEl.title = nameEl.textContent;
+      });
+      // Upgrade every diagram card just painted from its instant node-pill fallback to
+      // the real mermaid.js render -- app.js's shared upgradeMermaidIn()/renderMermaid(),
+      // the SAME function the classic UI's markdown modals call (app.js is concatenated
+      // ahead of this file into one <script> tag by page.py's build_page(), so it's a
+      // reachable global here, not a re-implementation).
+      if (typeof upgradeMermaidIn === "function") upgradeMermaidIn(scrollEl);
+      ui.timelineSeen = filtered.length;
+      // FIX (defect 1): newest-first means fresh entries are prepended at the TOP
+      // now, not appended at the bottom — so a reader who isn't stuck-to-latest
+      // needs the opposite compensation the old oldest-first code never needed.
+      // Callers that instead grew the BOTTOM (paging older history in) pass
+      // {noTopGrowth:true} so this doesn't double-compensate — see loadOlderNarration.
+      if (wasStuck) scrollEl.scrollTop = 0;
+      else if (opts && opts.noTopGrowth) scrollEl.scrollTop = prevScrollTop;
+      else scrollEl.scrollTop = prevScrollTop + (scrollEl.scrollHeight - heightBefore);
+    }
+  }
+
+  // FIX (defect 3): "the timeline doesn't pop out like it is used to pop out for
+  // the narration." Builds the {title, when, text} the classic modal expects from
+  // whatever kind of merged-timeline entry was clicked; no new markdown renderer —
+  // openText() below still does mdBlock() itself, same as openMsg()/openReq().
+  function timelineEntryModalPayload(e) {
+    var when = (typeof ago === "function" && e.t) ? ago(Math.max(0, (Date.now() - e.t) / 1000)) : fmtClock(e.t);
+    if (e.kind === "prompt") return { title: "Prompt", when: when, text: e.text || "" };
+    if (e.kind === "narration") return { title: "Narration", when: when, text: e.text || "" };
+    if (e.kind === "ask") {
+      var d = e.decision || {};
+      var q0 = (d.questions && d.questions[0]) || { q: "", options: [] };
+      var lines = [];
+      if (q0.q) lines.push("**" + q0.q + "**");
+      (q0.options || []).forEach(function (o) { lines.push("- " + o); });
+      if (!d.open && d.answer) lines.push("\n**Decided:** " + d.answer);
+      else if (d.open) lines.push("\n_View-only — answer in the session itself; the tracker never writes to it._");
+      return { title: "Decision", when: when, text: lines.join("\n") };
+    }
+    if (e.kind === "command" || e.kind === "command-fail") {
+      var c = e.cmd || {};
+      return { title: "Command", when: when, text: "```\n" + (c.cmd || "") + "\n```\n\n" + (c.ok ? "✓ ok" : "✗ failed") };
+    }
+    // "tool": file edit/write/read or a Task-tool dispatch (mergeTimeline's own
+    // comment names exactly which fields are real for these — no duration/diff
+    // exists to show, same honesty rule as entryHtml's own tool row).
+    var parts = ["**" + esc(e.verb || "Tool") + "** " + esc(e.target || "")];
+    if (e.count) parts.push(e.count);
+    if (e.agent) parts.push("via agent");
+    return { title: e.verb || "Tool", when: when, text: parts.join(" · ") };
+  }
+
+  // Copies openMsg()'s own shape exactly (app.js:1618) — _setNav registers the
+  // SAME prev/next/latest nav the classic modal already drives, over
+  // ui.timelineEntries (the CURRENT filtered, newest-first list), not a second
+  // navigation mechanism; openText is the SAME generic modal opener narration/
+  // prompts/todos already use, not a Control-Room-native dialog.
+  function openTimelineEntry(ui, idx) {
+    if (typeof openText !== "function" || typeof _setNav !== "function") return;
+    var list = ui.timelineEntries || [];
+    var e = list[idx];
+    if (!e) return;
+    _setNav(function (i) { openTimelineEntry(ui, i); }, idx, list.length,
+      { len: function () { return (ui.timelineEntries || []).length; }, live: true });
+    var payload = timelineEntryModalPayload(e);
+    openText(payload.title, payload.when, payload.text);
+  }
+
+  function openTimelineEntryByKey(ui, key) {
+    var list = ui.timelineEntries || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].key === key) { openTimelineEntry(ui, i); return; }
+    }
+  }
+
+  function openLatestTimelineEntry(ui) {
+    var list = ui.timelineEntries || [];
+    if (list.length) openTimelineEntry(ui, 0); // index 0 = newest (defect 1)
+  }
+
+  // FIX 2: opens ext_cr_dialogs.js's existing narration-diagram pop-out (read, not
+  // edited -- it is owned by another agent right now) with the payload shape its
+  // renderNarrationDiagram expects — {time, nodes:[{label,active}], edges, family,
+  // onPrev, onNext, onLatest} — PLUS one extra field, `src` (the raw mermaid source),
+  // which that function does not read today. It's included anyway, harmlessly, for
+  // whoever next wires the pop-out to the real mermaid.js render: as things stand the
+  // pop-out only ever draws the node-pill approximation (renderNarrationDiagram builds
+  // its `.cr-diagram-card` straight from `nodes`, never calls app.js's shared
+  // renderMermaid()/upgradeMermaidIn()) — see this module's own report for exactly
+  // what that owner would need to change. `edges` stays omitted: renderNarrationDiagram
+  // never reads it either.
+  function openNarrationDiagram(ctx, ui, idx) {
+    var list = ui.diagramEntries || [];
+    var entry = list[idx];
+    if (!entry || !ctx || typeof ctx.dialog !== "function") return;
+    ctx.dialog("narration-diagram", {
+      time: fmtClock(entry.t),
+      nodes: entry.nodes,
+      family: entry.family,
+      src: entry.src,
+      onPrev: idx > 0 ? function () { openNarrationDiagram(ctx, ui, idx - 1); } : null,
+      onNext: idx < list.length - 1 ? function () { openNarrationDiagram(ctx, ui, idx + 1); } : null,
+      onLatest: list.length ? function () { openNarrationDiagram(ctx, ui, list.length - 1); } : null
+    });
+  }
+
+  // FIX 3 (job 2 relocation, owner correction: ABOVE the spine): the live "Now"
+  // card. "live" is derived from data that actually exists on the detail dict —
+  // idle age vs LIVE_WINDOW (the same constant/threshold every other liveness
+  // check in this file uses) and session.overview.now (overview.py's own
+  // synthesis of "what it's doing right now": a running background agent, an
+  // in-progress todo, or the latest narration line — overview.py:20-38).
+  // Originally rendered inside the timeline panel, below the scrolling history;
+  // now rendered into `.crd-now`, directly ABOVE the progress spine in the main
+  // session view (ext_cr_detail.js SKELETON, right before `.crd-spine`) so
+  // current state is the very first thing visible, no scrolling into the
+  // conversation required. Still ONE renderer / ONE call site — moved, not
+  // duplicated — and repainting it on every poll never reflows the timeline or
+  // anything else on the page.
+  function renderLiveEntry(node, session, nowSec) {
+    var wrap = ui_findLiveEl(node);
+    if (!wrap) return;
+    var idle = nowSec - (session.mtime || 0);
+    var ov = session.overview || {};
+    var live = idle < LIVE_WINDOW && !!ov.now;
+    wrap.hidden = !live;
+    if (!live) { wrap.innerHTML = ""; return; }
+    // FIX (design-audit drift 4): 5b's live entry reads "Now · <clock>" (the real,
+    // ticking wall-clock time) instead of the literal word "LIVE", plus a small
+    // active-file tag top-right. REQUIRED ADDITION: there's no "file it's touching
+    // right now" field on the detail dict — session.files[] (already sorted
+    // newest-`last`-first by the parser) is the closest honest proxy, shown only
+    // while that top file's OWN `last` is itself inside LIVE_WINDOW, never a stale one.
+    var topFile = (session.files || [])[0];
+    var fileTag = "";
+    if (topFile) {
+      var fileMs = parseT(topFile.last);
+      if (fileMs != null && (nowSec - fileMs / 1000) < LIVE_WINDOW) fileTag = basename(topFile.path);
+    }
+    // NOTE: ov.now isn't in FIX 1's markdown list (that names "narration", the
+    // narrative[].text field in the timeline — ov.now is a synthesized status string
+    // that sometimes embeds a glyph prefix "⚙"/"▶" ahead of a narration snippet), so
+    // it stays on plain esc() here, matching the same call already made for the
+    // Session summary panel's "Now" field below.
+    wrap.innerHTML =
+      '<div class="crd-live-head">' +
+        '<span class="crd-seg-dot" aria-hidden="true"></span>' + // reuses the spine's own pulsing-dot style (incl. its reduced-motion variant)
+        '<span class="crd-live-badge mono">' + esc("Now · " + fmtClock(nowSec * 1000)) + "</span>" +
+        (fileTag ? '<span class="crd-live-file mono">' + esc(fileTag) + "</span>" : "") +
+      "</div>" +
+      '<div class="crd-live-text">' + esc(ov.now) + "</div>";
+  }
+  function ui_findLiveEl(node) { return qs(node, ".crd-now"); }
+
+  function renderSearchResults(node, ui, query) {
+    var box = qs(node, ".crd-search-results");
+    var q = (query || "").trim().toLowerCase();
+    if (!q) { box.innerHTML = ""; return; }
+    var session = ui.lastSession || {};
+    var terms = q.split(/\s+/);
+    function matches(s) { return terms.every(function (t) { return s.toLowerCase().indexOf(t) >= 0; }); }
+    var hits = [];
+    (session.narrative || []).forEach(function (n) { if (n.text && matches(n.text)) hits.push({ kind: "narration", text: n.text, t: n.t }); });
+    (session.requests || []).forEach(function (r) { if (r.text && matches(r.text)) hits.push({ kind: "prompt", text: r.text, t: r.t }); });
+    (session.files || []).forEach(function (f) { if (f.path && matches(f.path)) hits.push({ kind: "file", text: f.path, t: f.last }); });
+    (session.commands || []).forEach(function (c) { if (c.cmd && matches(c.cmd)) hits.push({ kind: "command", text: c.cmd, t: c.t }); });
+    (session.todos || []).forEach(function (t) { if (t.content && matches(t.content)) hits.push({ kind: "todo", text: t.content }); });
+    // NOTE: this is client-side only (no fetch, per contract) and therefore limited to
+    // the currently-loaded page of narration (server caps /api/session's narrative to
+    // NARR_PAGE=60 entries — aitracker/config.py:66, server.py:308-310). Full-history
+    // search would need ctx to expose a search call or /api/narration paging — flagged
+    // as a REQUIRED ADDITION in the module report.
+    if (!hits.length) { box.innerHTML = '<div class="crd-empty">No matches in the loaded window.</div>'; return; }
+    box.innerHTML = hits.slice(0, 40).map(function (h) {
+      return '<div class="crd-search-hit"><span class="crd-search-kind">' + esc(h.kind) + "</span>" +
+        '<span class="crd-search-text">' + esc(h.text.slice(0, 160)) + "</span></div>";
+    }).join("");
+  }
+
+  // Expose pure functions for testability / reuse by a future self-check.
+  window.CR.detail._internal = {
+    spineSegments: spineSegments,
+    spineSpanChoices: spineSpanChoices,
+    spineZoomPct: spineZoomPct,
+    SPINE_SPANS: SPINE_SPANS,
+    mergeTimeline: mergeTimeline,
+    deriveLinks: deriveLinks,
+    stateOf: stateOf,
+    detailIsWorking: detailIsWorking,
+    renderLiveEntry: renderLiveEntry,
+    firstEventTime: firstEventTime,
+    extractDiagram: extractDiagram,
+    groupAgentReruns: groupAgentReruns,
+    // defect 2 / defect 3 additions, exposed the same way as everything above:
+    timelineEntryVisible: timelineEntryVisible,
+    TIMELINE_KIND_MAP: TIMELINE_KIND_MAP,
+    timelineEntryModalPayload: timelineEntryModalPayload,
+    openTimelineEntry: openTimelineEntry
+  };
+})();

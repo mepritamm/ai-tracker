@@ -1,7 +1,7 @@
 import glob, json, os, re, time
 from ..config import LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified, safe_path_component, context_window
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase
 from ..overview import build_overview
 from ..store import load_titles, load_tasks, load_notes
 from .base import Provider
@@ -10,7 +10,8 @@ from .base import Provider
 def _augment_dirs():
     """Auggie's indexed workspace roots, longest (most specific) first."""
     try:
-        s = json.load(open(os.path.join(config.AUGMENT_DIR, "settings.json"), encoding="utf-8"))
+        with open(os.path.join(config.AUGMENT_DIR, "settings.json"), encoding="utf-8") as fh:
+            s = json.load(fh)
         return sorted([d for d in (s.get("indexingAllowDirs") or []) if isinstance(d, str)],
                       key=len, reverse=True)
     except (OSError, ValueError):
@@ -55,37 +56,74 @@ _ASTATE = {"COMPLETE": "completed", "COMPLETED": "completed", "DONE": "completed
 
 
 def _auggie_all():
-    """uuid -> task dict for every task file (roots + sub-tasks), with _mtime."""
+    """(uuid -> task dict for every task file (roots + sub-tasks), with _mtime; count of
+    task files that existed but failed to parse). Auggie's equivalent of a truncated Claude
+    JSONL line: this reads a whole JSON file per task, so a corrupt one used to just vanish
+    from the todo tree with no trace -- `failed` lets parse_auggie (the detail path, via
+    _auggie_todos_for below) report that honestly instead."""
     m = {}
+    failed = 0
     for f in glob.glob(os.path.join(config.AUGMENT_DIR, "task-storage", "tasks", "*")):
         try:
-            t = json.load(open(f, encoding="utf-8"))
+            with open(f, encoding="utf-8") as fh:
+                t = json.load(fh)
         except (OSError, ValueError):
+            failed += 1
             continue
         if isinstance(t, dict) and t.get("uuid"):
             t["_mtime"] = os.path.getmtime(f)
             m[t["uuid"]] = t
-    return m
+    return m, failed
 
 
-def _auggie_resolve(root, allmap, seen=None):
+def _auggie_resolve(root, get, seen=None):
     """A root's subTasks are UUID references to other task files — flatten them
-    (depth-first, cycle-safe) into todo dicts."""
+    (depth-first, cycle-safe) into todo dicts. `get(uuid)` fetches one task dict
+    (or None); the two callers below differ only in how they fetch — a preloaded
+    map for the full detail parse vs. a direct per-uuid file read for the list
+    view — so this tree-walk/normalize logic exists exactly once."""
     seen = seen if seen is not None else set()
     out = []
     for ref in root.get("subTasks") or []:
         if not isinstance(ref, str) or ref in seen:
             continue
         seen.add(ref)
-        st = allmap.get(ref)
+        st = get(ref)
         if not st:
             continue
         name = st.get("name") or st.get("description") or ""
         out.append({"content": name,
                     "status": _ASTATE.get((st.get("state") or "").upper(), "pending"),
-                    "activeForm": name})
-        out.extend(_auggie_resolve(st, allmap, seen))
+                    "activeForm": name,
+                    # No EXACT started_at/ended_at here (unlike Claude): the task-storage
+                    # file's own "lastUpdated" is a single last-write instant, not a start/end
+                    # pair, and the update_tasks/add_tasks tool calls in the session's own
+                    # chatHistory key each task by a short per-call id that does NOT match this
+                    # file's uuid (confirmed against a real session: update_tasks used ids like
+                    # "63a4cp3bxdwD2oqwQ1pWLZ" while task-storage files are named by uuid) — so
+                    # there is no reliable ID join back to THIS todo. Default to null, same shape
+                    # as Claude's todos; parse_auggie (the detail path, via _auggie_todos_for)
+                    # backfills these APPROXIMATELY by NAME afterward, off its own single
+                    # chatHistory pass — see _TASK_LINE_RE above and the join loop right after
+                    # `todos = _auggie_todos_for(...)` in parse_auggie. The list path
+                    # (_auggie_todos_for_list) does not, so these two stay null there.
+                    "started_at": None, "ended_at": None})
+        out.extend(_auggie_resolve(st, get, seen))
     return out
+
+
+def _load_task_file(uuid):
+    """One task-storage file by its uuid (== its filename, confirmed against real
+    files on disk). Used for the list-time cheap path below — NOT _auggie_all()'s
+    glob-everything, which is fine once per detail parse but far too much (223
+    files on this machine) to redo per session on every /api/list poll."""
+    if not uuid:
+        return None
+    try:
+        with open(os.path.join(config.AUGMENT_DIR, "task-storage", "tasks", uuid), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
 
 
 _AUGGIE_LIST_CACHE = {}
@@ -97,6 +135,111 @@ def _auggie_first_request(chat):
         if isinstance(r, str) and r.strip() and not r.lstrip().startswith("<"):
             return " ".join(r.split())[:200]
     return ""
+
+
+def _auggie_last_narration(chat):
+    """Most recent assistant reply text in the transcript — cheap because list_auggie()'s
+    cache-miss path already loads the FULL session JSON (unlike Claude, which only tails),
+    so this reads no extra bytes; it just picks the last non-empty response_text out of what
+    is already in memory. Feeds the session-list `now_line` field's narration fallback —
+    parity with Claude's tail-derived last_text (see providers/claude.py's _tail_scan)."""
+    for m in reversed(chat or []):
+        if not isinstance(m, dict):
+            continue
+        ex = m.get("exchange")
+        resp = ex.get("response_text") if isinstance(ex, dict) else None
+        if isinstance(resp, str) and resp.strip():
+            return resp.strip()[:200]
+    return ""
+
+
+def _auggie_current_model(chat):
+    """Latest model_id off this session's chatHistory -- scans backward for the last exchange
+    that actually carries one (a later exchange can be a bare pending request with no
+    model_id yet), same "what's true right now" framing as now_line/last_text (a session can
+    switch models mid-run, same as Claude). Shared by list_auggie's session-LIST `model` field
+    and parse_auggie's detail `meta.model` so there is exactly one derivation, not two."""
+    for m in reversed(chat or []):
+        if not isinstance(m, dict):
+            continue
+        ex = m.get("exchange")
+        mid = ex.get("model_id") if isinstance(ex, dict) else None
+        if isinstance(mid, str) and mid:
+            return mid
+    return ""
+
+
+# Fixed prefixes Auggie's OWN pre-exec guards write into a launch-process tool_result's
+# `content` when they refuse to run a command at all -- the Auggie equivalent of Claude's
+# `_BASH_REFUSAL_PREFIXES` (providers/claude.py), same reasoning: a command Auggie itself
+# never ran can't be what broke the user's work. Confirmed against every launch-process
+# is_error result on this machine's real corpus (reports/drift/): the one framework-refusal
+# pattern found there is a pre-exec shell-syntax guard; "Tool use rejected with user
+# message:" (an explicit user rejection, seen on other Auggie tool types in this same
+# corpus) is included defensively even though it wasn't observed on launch-process here.
+_AUGGIE_REFUSAL_PREFIXES = (
+    "Error: Backticks are not allowed in shell commands",  # pre-exec shell-syntax guard
+    "Tool use rejected with user message:",                 # explicit user rejection
+)
+
+
+def _auggie_is_real_launch_error(text):
+    """True iff a launch-process tool_result's content (already known `is_error`)
+    reflects the command actually RUNNING and exiting nonzero -- not one of Auggie's
+    own never-ran-at-all refusals (see `_AUGGIE_REFUSAL_PREFIXES` above). Non-string/
+    empty content (Auggie's tool_result_node doesn't always carry `content` at all)
+    can't be classified either way -- treated as real (True) so an is_error result is
+    never silently hidden just because its content couldn't be read.
+
+    # ponytail: textual match on Auggie's own fixed refusal strings, same ceiling as
+    # Claude's _is_real_bash_error -- if a future Auggie version rewords one, this
+    # silently stops catching it. Upgrade path: re-grep a fresh ~/.augment/sessions/
+    # *.json corpus for launch-process is_error content and extend the tuple above.
+    """
+    if not isinstance(text, str) or not text:
+        return True
+    return not text.startswith(_AUGGIE_REFUSAL_PREFIXES)
+
+
+def _auggie_fail_cmd(chat):
+    """Board "failing" tile signal (~ Claude's _tail_scan `fail_cmd`) — zero extra I/O:
+    list_auggie()'s cache-miss path already loads the FULL session JSON (see
+    _auggie_last_narration above), so this just reads what's already in memory. Tracks
+    each `launch-process` (~Bash) tool_use's id -> command text as it's seen, then the
+    matching tool_result_node's `is_error` (Auggie DOES store exit status — same join
+    parse_auggie's `errors_by_id` does over the whole file, per _auggie_todos_for's
+    sibling comment above) decides pass/fail. Auggie files a tool result under the
+    NEXT exchange's request_nodes (see the module note near errors_by_id below), so
+    results are seen strictly after their call in this single forward pass. Latest REAL
+    launch-process result wins — a later PASS clears an earlier FAIL, same "what's
+    true right now" rule as _auggie_current_model — so this is None unless the most
+    recently completed command actually RAN and errored (see _auggie_is_real_launch_error:
+    a command Auggie's own guard refused to run at all is not a real failure)."""
+    bash_cmds = {}   # tool_use_id -> command text[:60]
+    fail_cmd = None
+    for m in chat or []:
+        ex = m.get("exchange") or {}
+        for rn in ex.get("request_nodes") or []:
+            trn = rn.get("tool_result_node") if isinstance(rn, dict) else None
+            if not isinstance(trn, dict):
+                continue
+            tid = trn.get("tool_use_id")
+            if tid in bash_cmds:
+                if trn.get("is_error"):
+                    content = trn.get("content")
+                    text = content if isinstance(content, str) else (json.dumps(content) if content else "")
+                    if _auggie_is_real_launch_error(text):
+                        fail_cmd = bash_cmds[tid]
+                    # else: Auggie's own pre-exec guard blocked it -- not a real failure
+                else:
+                    fail_cmd = None
+        for rn in ex.get("response_nodes") or []:
+            call = rn.get("tool_use")
+            if isinstance(call, dict) and call.get("tool_name") == "launch-process":
+                c = _tool_input(call).get("command")
+                if isinstance(c, str) and c and call.get("tool_use_id"):
+                    bash_cmds[call["tool_use_id"]] = c[:60]
+    return fail_cmd
 
 
 def _auggie_state(chat):
@@ -122,11 +265,50 @@ def _auggie_state(chat):
 
 
 def _auggie_todos_for(root_uuid):
+    """(todos, parse_error) -- parse_error is parse_auggie's detail-dict signal (same
+    contract as Claude's, see providers/claude.py's parse_session), None unless at least
+    one task-storage file existed but failed to parse. No exact "line" for a family of
+    separate files, so `line` stays None; `parsed_before` is how many todos were still
+    recovered despite the failure -- everything _auggie_resolve could reach stays shown,
+    unchanged, same as Claude's per-line skip."""
+    if not root_uuid:
+        return [], None
+    allmap, failed = _auggie_all()
+    root = allmap.get(root_uuid)
+    todos = _auggie_resolve(root, allmap.get) if root else []
+    parse_error = {"line": None, "parsed_before": len(todos)} if failed else None
+    return todos, parse_error
+
+
+# Fallback for the gap _auggie_resolve documents above: add_tasks/update_tasks key each
+# task by a short per-call id (e.g. "63a4cp3bxdwD2oqwQ1pWLZ") that does NOT match the
+# task-storage file's uuid, so there is no reliable ID join for started_at/ended_at. But
+# every add_tasks/update_tasks tool_result_node echoes that id alongside the task's own
+# NAME text ("[x] UUID:<id> NAME:<name> DESCRIPTION:…" — confirmed against real sessions),
+# and update_tasks' own tool_use input carries (id, state) transitions in that SAME id
+# space — both collected in parse_auggie's own single chatHistory pass below, right beside
+# everything else it already reads off request_nodes/response_nodes (no second traversal).
+# A todo (built from task-storage, which carries the real "name" text too — confirmed
+# identical, character for character, on this machine) is matched back by NORMALISED NAME,
+# not id, same conservative rule as _auggie_resolve's: refuse to guess whenever a name
+# doesn't pin down exactly one chat-side id.
+_TASK_LINE_RE = re.compile(r"^\[.\]\s*UUID:(\S+)\s+NAME:(.*?)\s+DESCRIPTION:", re.M)
+
+
+def _norm_task_name(s):
+    """trim + collapse whitespace + casefold — the normalisation the name join uses on
+    both sides (a todo's content and a chatHistory task's NAME)."""
+    return " ".join((s or "").split()).casefold()
+
+
+def _auggie_todos_for_list(root_uuid):
+    """List-time equivalent of _auggie_todos_for: reads only the task files this
+    session's own tree references (root + descendants, by direct uuid path) —
+    bounded by that session's todo count, not by every task file on disk."""
     if not root_uuid:
         return []
-    allmap = _auggie_all()
-    root = allmap.get(root_uuid)
-    return _auggie_resolve(root, allmap) if root else []
+    root = _load_task_file(root_uuid)
+    return _auggie_resolve(root, _load_task_file) if root else []
 
 
 def list_auggie():
@@ -144,7 +326,8 @@ def list_auggie():
             e = hit[1]
         else:
             try:
-                d = json.load(open(f, encoding="utf-8"))
+                with open(f, encoding="utf-8") as fh:
+                    d = json.load(fh)
             except (OSError, ValueError):
                 continue
             sid = d.get("sessionId") or os.path.basename(f)[:-5]
@@ -155,16 +338,50 @@ def list_auggie():
                  "prompt": req,
                  "cwd": _auggie_ide_cwd(d),   # real per-session working dir (like Claude)
                  "waiting": waiting, "ended": ended,
+                 "root": d.get("rootTaskUuid"),
+                 # narration fallback for now_line -- free here, see _auggie_last_narration
+                 "last_text": _auggie_last_narration(d.get("chatHistory")),
+                 "model": _auggie_current_model(d.get("chatHistory")),
+                 # board "failing" tile signal -- free here too, see _auggie_fail_cmd
+                 "fail_cmd": _auggie_fail_cmd(d.get("chatHistory")),
                  "mtime": _iso_epoch(d.get("modified")) or mt}
             _AUGGIE_LIST_CACHE[f] = (mt, e)
         gid = "auggie:" + e["sid"]
         cwd = e.get("cwd") or default_cwd
+        # Recomputed every call (not cached alongside `e`): a task's status can change without
+        # touching this session's own file, so gating it on the session file's mtime would go stale.
+        # _auggie_todos_for_list only reads this session's own task-tree files, so it's still cheap.
+        todo_total, todo_done, todo_current, todo_current_index = todo_summary(_auggie_todos_for_list(e.get("root")))
+        # now_line: parity with Claude's (providers/claude.py, list_sessions) -- LIVE only
+        # (inside LIVE_WINDOW, not ended), same priority (waiting > in-progress todo >
+        # narration), off data already in hand: `todo_current` just computed above, and
+        # e["waiting"]/e["last_text"] cached alongside everything else in _AUGGIE_LIST_CACHE
+        # (no extra file access -- the whole session JSON was already loaded to build `e`).
+        # No background-agent concept for Auggie (see the "bg": 0 field below), so that
+        # branch is skipped entirely rather than faked.
+        now_line = ""
+        if (time.time() - e["mtime"]) < LIVE_WINDOW and not e.get("ended"):
+            if e.get("waiting"):
+                now_line = "⧖ waiting for your answer"
+            elif todo_current:
+                now_line = "▶ " + now_phrase(todo_current)
+            elif e.get("last_text"):
+                now_line = now_phrase(e["last_text"])
         out.append({
             "id": gid, "project": os.path.basename(cwd) if cwd else "Augment", "cwd": cwd,
             "title": titles.get(gid) or e["title"],
             "prompt": e["prompt"], "source": "auggie", "mtime": e["mtime"],
             "agent": False, "group": "", "groupLabel": "", "parentId": "", "bg": 0, "first": 0,   # Auggie has no background-agent/SDK model
+            "shells_running": 0,   # Auggie has no background-shell concept either -- honest 0, not omitted
             "waiting": e.get("waiting", False), "ended": e.get("ended", False),
+            "todo_total": todo_total, "todo_done": todo_done, "todo_current": todo_current,
+            "todo_current_index": todo_current_index,
+            "pr_num": None, "pr_url": None, "pr_repo": None, "pr_state": "",  # Auggie has no PR extraction
+            "now_line": now_line,
+            "model": e.get("model") or "",
+            # board "failing" tile signal (ext_cr_board.js's sessionState()) — honestly
+            # None when nothing failed, never omitted. See _auggie_fail_cmd.
+            "fail_cmd": e.get("fail_cmd"),
         })
     return out
 
@@ -225,6 +442,12 @@ def _safe_session_id(session_id):
 
 
 def _load_auggie(session_id):
+    """(session dict, path). (None, None) means no such session file exists at all
+    (bad/unsafe id, or nothing on disk for it) -- parse_auggie's genuinely-missing
+    case. (None, f) with f the real path means the file EXISTS but failed to parse
+    (corrupt/truncated JSON) -- parse_auggie's degraded case (see FIX 2): the two
+    are deliberately distinguishable by whether the second element is None, not
+    just whether the first is."""
     session_id = _safe_session_id(session_id)
     if session_id is None:
         return None, None
@@ -232,9 +455,10 @@ def _load_auggie(session_id):
     if not os.path.isfile(f):
         return None, None
     try:
-        return json.load(open(f, encoding="utf-8")), f
+        with open(f, encoding="utf-8") as fh:
+            return json.load(fh), f
     except (OSError, ValueError):
-        return None, None
+        return None, f
 
 
 def _auggie_results(d):
@@ -251,19 +475,78 @@ def _auggie_results(d):
     return out
 
 
+def _degraded_auggie_detail(session_id, f):
+    """Minimal but VALID detail dict for a session whose file exists on disk but
+    failed to parse (see FIX 2): every key the shared shape requires, honest
+    empty lists/zeros, and `parse_error` populated so the client's existing
+    degraded banner fires -- same {"line", "parsed_before"} contract as every
+    other provider's parse_error (see _auggie_todos_for above). `line` is always
+    None here (a whole-file JSON parse failure has no single line to point at,
+    unlike a truncated JSONL line); `parsed_before` is 0 because nothing at all
+    could be recovered from an unparseable file. Only reached from parse_auggie
+    when `_load_auggie` reports the file EXISTS (f is not None) -- a session id
+    with no file at all still returns None outright, unchanged."""
+    gid = "auggie:" + session_id
+    title = load_titles().get(gid) or "Auggie session (unreadable)"
+    try:
+        mt = os.path.getmtime(f)
+    except OSError:
+        mt = time.time()
+    return {
+        "meta": {"cwd": "", "title": title, "source": "auggie", "entrypoint": "auggie",
+                 "gitBranch": "", "model": ""},
+        "todos": [],
+        "todo_times_approximate": todo_times_approximate("auggie"),
+        "files": [], "reads": [], "commands": [], "commits": [], "tests": [],
+        "requests": [], "agents": [], "agents_bg": [], "agent_sessions": [], "shells": [],
+        "decisions": [], "waiting": False,
+        "fail_cmd": None,
+        "parse_error": {"line": None, "parsed_before": 0},
+        "prs": [],
+        "narrative": [],
+        "message": "This session's file exists but could not be read (corrupt or truncated JSON).",
+        "tokens": {"in": 0, "out": 0},
+        "context": context_window(None, None),
+        "counts": {"done": 0, "todos": 0, "created": 0, "edited": 0,
+                   "read": 0, "commits": 0, "tests": 0,
+                   "tests_failed": 0, "errors": 0, "agents": 0, "searches": 0},
+        "overview": {
+            "where": "Augment", "goal": "", "now": "", "now_kind": "",
+            "sofar": "Session file could not be read.",
+            "commits": [],
+        },
+        "mtime": mt,
+        "now": time.time(),
+        "notes": load_notes().get(gid, []),
+        "push_when": push_when(False, 0, 0),
+    }
+
+
 def parse_auggie(session_id):
     d, f = _load_auggie(session_id)
     if d is None:
-        return None
+        if f is None:
+            return None   # genuinely no such session -- no file at all
+        return _degraded_auggie_detail(os.path.basename(f)[:-5], f)  # exists, unreadable
     requests, narrative, files, cmds, reads, commits = [], [], {}, [], {}, []
     agents = []       # sub-agent-* dispatches (~ Claude's Task) — {t, type, desc}
     errors_by_id = {} # tool_use_id -> True, from tool_result_node.is_error (~ Claude's map)
+    bash_cmd_text = {} # tool_use_id -> command text[:60], launch-process calls seen so far -- the
+                        # SAME id->text tracking _auggie_fail_cmd keeps, kept here over the whole
+                        # session (this function already walks it in full) so the detail dict's
+                        # `fail_cmd` (below) is the whole-transcript version of the same field
+    fail_cmd = None     # detail dict's `fail_cmd` -- same field, same filter
+                        # (_auggie_is_real_launch_error) as list_auggie()'s _auggie_fail_cmd
     ide_cwd = _auggie_ide_cwd(d)   # needed inside the loop to anchor relative edit paths
     asks = {}         # tool_use_id -> ask-user decision {t, open, answer, questions} (parity with Claude)
     prs = {}          # url -> entry : PR/MR links touched this session (parity with Claude)
     pr_states = {}    # num -> "merged"/"closed" : state signals seen in logs (overlaid at the end)
     pr_creates = []   # exchange indices where a PR-create ran — Auggie logs no output URL, so we
     pr_first_ex = {}  # url -> exchange it first appeared in → attribute "created" by order, below
+    name_to_ids = {}  # normalised task NAME -> set of chat-side task ids seen with that name —
+                       # from add_tasks/update_tasks tool_result_node text (see _TASK_LINE_RE above)
+    task_times = {}   # chat-side task id -> {"started","ended"} (ISO), from update_tasks' own
+                       # tool_use input — the name-matched fallback for started_at/ended_at (~ Claude's task_times)
     tok_in = tok_out = 0
     ctx_current = ctx_limit = None  # LATEST turn's occupancy + the session's own context-window size
     def _cprs(text, narr=False):  # collect PRs + note which exchange each URL first showed up in
@@ -282,10 +565,26 @@ def parse_auggie(session_id):
                 continue
             if trn.get("is_error"):                           # Auggie DOES store exit status
                 errors_by_id[trn.get("tool_use_id")] = True
+            _tid = trn.get("tool_use_id")
+            if _tid in bash_cmd_text:                         # latest REAL launch-process result wins
+                if trn.get("is_error"):
+                    _c = trn.get("content")
+                    _text = _c if isinstance(_c, str) else (json.dumps(_c) if _c else "")
+                    if _auggie_is_real_launch_error(_text):
+                        fail_cmd = bash_cmd_text[_tid]
+                    # else: Auggie's own pre-exec guard blocked it -- not a real failure
+                else:
+                    fail_cmd = None
             if trn.get("tool_use_id") in asks:                # the user's answer to a prior ask-user
                 c = trn.get("content") or ""
                 asks[trn["tool_use_id"]]["answer"] = re.sub(r"^User responded:\s*", "", c).strip()[:2000]
                 asks[trn["tool_use_id"]]["open"] = False
+            content = trn.get("content")                      # add_tasks/update_tasks echo id<->NAME here
+            if isinstance(content, str) and "UUID:" in content:
+                for tid, tname in _TASK_LINE_RE.findall(content):
+                    n = _norm_task_name(tname)
+                    if n:
+                        name_to_ids.setdefault(n, set()).add(tid)
         for rn in ex.get("response_nodes") or []:
             tu = rn.get("token_usage")
             if isinstance(tu, dict):                # tokens: mirror Claude (input + cache)
@@ -315,6 +614,8 @@ def parse_auggie(session_id):
                     k = cmd_kind(c)
                     cmds.append({"id": call.get("tool_use_id"), "t": ts, "cmd": c[:200],
                                  "kind": k})    # `ok` joined from tool_result_node.is_error below
+                    if call.get("tool_use_id"):
+                        bash_cmd_text[call["tool_use_id"]] = c[:60]  # for fail_cmd above
                     if PR_CREATE_RE.search(c):
                         pr_creates.append(i)
                     _cprs(c)                              # a command's PR ref alone isn't "worked on"
@@ -331,7 +632,11 @@ def parse_auggie(session_id):
                             _touch(files, _abs(p, ide_cwd), ts)
                 elif name and name.startswith("sub-agent-"):   # ~ Claude's Task
                     agents.append({"t": ts, "type": (name[len("sub-agent-"):] or "agent"),
-                                   "desc": (inp.get("name") or inp.get("instruction") or "")[:80]})
+                                   "desc": (inp.get("name") or inp.get("instruction") or "")[:80],
+                                   # a dispatch record only -- no separate transcript to read a
+                                   # model off, and its own input carries no model key either
+                                   # (confirmed against real sessions) -- honestly "".
+                                   "model": ""})
                 elif name == "view" and inp.get("path") and inp.get("type") != "directory":
                     reads[_abs(inp["path"], ide_cwd)] = ts   # ~ Claude's Read, anchored like `files`
                 elif name == "ask-user":              # Auggie's user-question tool (~ Claude's AskUserQuestion)
@@ -339,6 +644,19 @@ def parse_auggie(session_id):
                     asks[call.get("tool_use_id")] = {"t": ts, "open": True, "answer": "",
                                                      "questions": [{"q": (inp.get("question") or "")[:500],
                                                                     "header": "", "options": opts}]}
+                elif name == "update_tasks":           # ~ Claude's TaskUpdate -- state transitions, by chat-side id
+                    for tsk in (inp.get("tasks") or []):
+                        if not isinstance(tsk, dict):
+                            continue
+                        tid = tsk.get("task_id")
+                        stnorm = _ASTATE.get((tsk.get("state") or "").upper())
+                        if not tid or not stnorm:
+                            continue
+                        tt = task_times.setdefault(tid, {"started": None, "ended": None})
+                        if stnorm == "in_progress" and tt["started"] is None:
+                            tt["started"] = ts             # first activation only
+                        elif stnorm == "completed":
+                            tt["ended"] = ts                # latest completion wins
         r = ex.get("request_message")
         if isinstance(r, str) and r.strip() and not r.lstrip().startswith("<"):
             requests.append({"t": ts, "text": " ".join(r.split())[:300]})
@@ -360,7 +678,26 @@ def parse_auggie(session_id):
     cwd = ide_cwd or _auggie_cwd(list(files.keys()))   # real cwd, like Claude's
     branch = _git_branch(cwd)
     tests = [c for c in cmds if c["kind"] == "test"]
-    todos = _auggie_todos_for(d.get("rootTaskUuid"))
+    todos, parse_error = _auggie_todos_for(d.get("rootTaskUuid"))
+    # Approximate per-todo timings, joined by NAME (not id — see the comment above
+    # _TASK_LINE_RE) against name_to_ids/task_times, both collected in the single
+    # chatHistory pass above — mirrors parse_session()'s own todos/task_times join exactly,
+    # except a name matching zero or MORE THAN ONE chat-side id is ambiguous and is left
+    # None,None (the default _auggie_resolve already set), same as data that would put
+    # ended_at before started_at (never trusted — distrust both rather than show a
+    # contradictory timeline).
+    for t in todos:
+        ids = name_to_ids.get(_norm_task_name(t.get("content")))
+        if not ids or len(ids) != 1:
+            continue
+        tt = task_times.get(next(iter(ids)))
+        if not tt:
+            continue
+        started = _ts_epoch(tt["started"]) if tt["started"] and t.get("status") in ("in_progress", "completed") else None
+        ended = _ts_epoch(tt["ended"]) if tt["ended"] and t.get("status") == "completed" else None
+        if started is not None and ended is not None and ended < started:
+            continue          # contradictory transitions -> distrust both, stay None
+        t["started_at"], t["ended_at"] = started, ended
     done = sum(1 for x in todos if x["status"] == "completed")
     ip = next((x for x in todos if x["status"] == "in_progress"), None)
     gid = "auggie:" + session_id
@@ -381,8 +718,22 @@ def parse_auggie(session_id):
     return {
         "meta": {"cwd": cwd, "title": title, "source": "auggie", "entrypoint": "auggie",
                  "gitBranch": branch,
-                 "model": ((d.get("chatHistory") or [{}])[-1].get("exchange") or {}).get("model_id") or ""},
+                 "model": _auggie_current_model(d.get("chatHistory")),
+                 # SAME derivation as list_auggie()'s list-dict `ended` (both call
+                 # _auggie_state on this session's own chatHistory) -- so the detail view's
+                 # working/landed predicate (ext_cr_detail.js's detailIsWorking()) can read
+                 # a real, provider-parity `ended` instead of falling back to a todo-derived
+                 # guess. Not reusing the `waiting`/`asks` values computed above: those are a
+                 # deeper full-transcript pass (parity with Claude's decisions panel), while
+                 # `ended` here intentionally matches the SAME rule the board/rail already show
+                 # for this session, not a second, independently-invented one.
+                 "ended": _auggie_state(d.get("chatHistory"))[1]},
+                 # no "effort" key here: Auggie logs have no reasoning-effort concept
+                 # (unlike model, which Auggie has but may be empty) — omit rather than fake
         "todos": todos,
+        # todo timings above (when not None) came from a NAME match, not an exact id join
+        # like Claude's — the UI uses this to mark the progress spine approximate.
+        "todo_times_approximate": todo_times_approximate("auggie"),
         "files": sorted(files.values(), key=lambda x: x.get("last") or "", reverse=True),
         "reads": [{"path": p, "t": t} for p, t in
                   sorted(reads.items(), key=lambda kv: kv[1] or "", reverse=True)],
@@ -393,6 +744,17 @@ def parse_auggie(session_id):
         # open decisions first, then most-recent — parity with Claude's AskUserQuestion panel
         "decisions": sorted(asks.values(), key=lambda a: (a["open"], a["t"] or ""), reverse=True),
         "waiting": any(a["open"] for a in asks.values()),   # unanswered ask-user -> blocked on the user, not idle
+        # board "failing" tile signal, SAME field name as Claude's detail dict and as
+        # list_auggie()'s list dict (see _auggie_fail_cmd) -- off the whole session here
+        # instead of a tail (Auggie has no tail-only fast path; this function always reads
+        # the full session). Honestly None when nothing really failed, never omitted.
+        "fail_cmd": fail_cmd,
+        # Degraded-transcript signal, SAME field/shape contract as Claude's detail dict (see
+        # parse_session's parse_error) -- off _auggie_todos_for above (task-storage files are
+        # this provider's "whole JSON file per record"; a corrupt one is the analogue of a
+        # truncated JSONL line). Honestly None when every task file this session's tree
+        # touches parsed cleanly.
+        "parse_error": parse_error,
 
         "prs": [p for p in prs_sorted(prs, pr_states) if pr_worked(p, cwd)],   # created or worked-on, not prompt-only references
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
@@ -460,7 +822,8 @@ def search_auggie(q, limit=500):
     out = []
     for f in glob.glob(os.path.join(config.AUGGIE_SESSIONS, "*.json"))[:limit]:
         try:
-            d = json.load(open(f, encoding="utf-8"))
+            with open(f, encoding="utf-8") as fh:
+                d = json.load(fh)
         except (OSError, ValueError):
             continue
         sid = d.get("sessionId") or os.path.basename(f)[:-5]

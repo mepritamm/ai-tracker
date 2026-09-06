@@ -1,0 +1,1138 @@
+// ext_cr_boot.js — Control Room bootstrap: opt-in entry, UI-mode switch, theme
+// resolution, the ctx surface every CR.* module receives, and data plumbing.
+//
+// Concatenated into the SAME top-level <script> as app.js and every other
+// web/ext_*.js (see aitracker/page.py's build_page(): app.js first, then every
+// ext_*.css/js sorted by filename, glued into one <style>/<script>). That means:
+//   - `cur`, `sessions`, `listNow`, `termCount`, `flags`, `soundOn`, `$`, `esc`,
+//     `ago`, `md`, `pick`, `track`, `poll`, `loadSide`, `toggleSound`,
+//     `resolveFlag`/`delFlag`/`flagAction`, `EXT`, `SIDE_EXT` are app.js's REAL
+//     globals, reachable here via the shared script scope — not a guess at
+//     their shape (same note ext_launch.js/ext_run.js/ext_vt.js already carry).
+//   - Everything below lives in an IIFE so a bare `const`/`let` here can't
+//     collide with app.js's or another ext_*.js's top-level bindings.
+//   - page.py globs files alphabetically: ext_cr_board.js sorts BEFORE this
+//     file, but ext_cr_boot.js sorts BEFORE ext_cr_detail.js / ext_cr_dialogs.js
+//     / ext_cr_term.js. So this file cannot assume any window.CR.* module is
+//     attached yet at its own top-level execution time, in EITHER direction.
+//     Fix: every module-touching action (mounting, wiring) is deferred with
+//     `setTimeout(fn, 0)`, which always runs after the entire concatenated
+//     <script> — every sibling file included — has finished executing.
+//
+// Recon note: the sibling view/dialog/terminal modules already exist on disk
+// (as cr_board.js / cr_dialogs.js / cr_term.js / cr.css, pending the
+// orchestrator's rename to ext_cr_*) and were read before writing this file,
+// so the ctx surface below is wired to the REAL events/methods those files
+// already call — not just the abstract contract in this task's brief. See the
+// end-of-task report for the concrete list of mismatches found between them.
+
+window.CR = window.CR || {};
+
+(function () {
+  'use strict';
+
+  // ----------------------------------------------------------------------
+  // Tiny event bus — ctx.on / ctx.emit
+  // ----------------------------------------------------------------------
+  var bus = {};
+  var currentJob = null;  // Track running command job id for cr:stop
+  function on(name, fn) {
+    if (typeof fn !== 'function') return;
+    (bus[name] = bus[name] || []).push(fn);
+  }
+  function emit(name, payload) {
+    var fns = bus[name];
+    if (!fns) return;
+    fns.slice().forEach(function (fn) {
+      try { fn(payload); } catch (e) { console.error('[CR] listener for', name, 'threw', e); }
+    });
+  }
+
+  // ----------------------------------------------------------------------
+  // Glyphs — Icon drawings now live once as <symbol id="i-*"> entries in
+  // index.html's shared SVG sprite (the same sprite that already holds
+  // #brandMark). Both the control room and classic dashboard draw from one
+  // set, so they cannot drift. Stroke and fill come from the symbol,
+  // colour from currentColor.
+  // ----------------------------------------------------------------------
+  function icon(name) {
+    // ponytail: no class here on purpose. The pre-sprite icon() emitted a bare
+    // <svg>, and every call site's layout was tuned against that; `.cr .cr-glyph`
+    // sets display:block, which would silently turn inline icons into block ones.
+    // Style-aware (app.js's ICON_STYLE, via its window.icoChar(name) accessor): "icons" keeps the
+    // bare <svg> byte-identical to what this always emitted; "emoji"/"text" swaps in a glyph span
+    // instead, tagged with data-ico so refreshIcons() below can find and re-swap it later.
+    var g = (typeof window.icoChar === 'function') ? window.icoChar(name) : null;
+    if (g) return '<span class="ico-glyph" data-ico="' + name + '" aria-hidden="true">' + g + '</span>';
+    return '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">' +
+      '<use href="#i-' + name + '"/></svg>';
+  }
+  // Re-render every icon already on the page under `root` (control room builds its DOM once and
+  // keeps it) after an iconstylechange. Two shapes to find: a previously-swapped glyph span
+  // (tagged data-ico above) and this file's own untagged icons-style <svg> — untagged is the
+  // "icons" style's byte-identical contract above, so its NAME is read back off the <use href>
+  // instead of a data attribute.
+  function refreshIcons(root) {
+    if (!root || !root.querySelectorAll) return;
+    root.querySelectorAll('span.ico-glyph[data-ico]').forEach(function (el) {
+      var name = el.getAttribute('data-ico');
+      if (name) { try { el.outerHTML = icon(name); } catch (e) {} }
+    });
+    root.querySelectorAll('svg[focusable="false"] > use[href^="#i-"]').forEach(function (u) {
+      var svg = u.parentNode;
+      var href = u.getAttribute('href') || '';
+      if (!svg || svg.hasAttribute('data-ico')) return;
+      try { svg.outerHTML = icon(href.slice(3)); } catch (e) {}
+    });
+  }
+  document.addEventListener('iconstylechange', function () {
+    if (!mounted) return;
+    var root = document.getElementById('nextRoot');
+    if (root) refreshIcons(root);
+  });
+
+  // ----------------------------------------------------------------------
+  // Theme resolution (01-foundations.md "Theme resolution (decision 3)")
+  // localStorage key/values match the doc EXACTLY: 'tracker.theme' =
+  // 'auto' | 'light' | 'dark' (default 'auto'). NOTE: the task brief that
+  // commissioned this file described the key as tracker.theme with values
+  // light|dark|"system"; 01-foundations.md's own fenced code block (and the
+  // sibling cr.css already on disk, which documents the same reasoning)
+  // names the third value 'auto', not 'system' — reproducing the doc + the
+  // real token file over the paraphrase, per this project's own
+  // "where they disagree, the doc wins" rule.
+  // ----------------------------------------------------------------------
+  function getThemePref() {
+    try { return localStorage.getItem('tracker.theme') || 'auto'; } catch (e) { return 'auto'; }
+  }
+  function setThemePref(v) {
+    if (v !== 'light' && v !== 'dark' && v !== 'auto') v = 'auto';
+    try { localStorage.setItem('tracker.theme', v); } catch (e) {}
+    applyTheme();
+  }
+  function systemPrefersDark() {
+    return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  }
+  function resolveTheme() {
+    var pref = getThemePref();
+    return (pref === 'dark' || (pref === 'auto' && systemPrefersDark())) ? 'dark' : 'light';
+  }
+
+  // Re-entrancy guard for the two-way classic<->Control Room theme sync below.
+  var _syncingClassicTheme = false;
+
+  // Pushes the resolved light/dark theme into the CLASSIC dashboard via its
+  // OWN setTheme() (app.js:3) — never reimplemented here (conventions.md rule
+  // 4: land a capability once, at the real function, not a second fork of it).
+  // setTheme() already dispatches the 'themechange' CustomEvent ext_vt.js's
+  // live xterm re-theme listener depends on, so this call replaces (not
+  // duplicates) what used to be a manual `document.dispatchEvent(...)` here.
+  // Guarded so the 'themechange' listener a few lines down — which exists so
+  // a change made in CLASSIC also updates Control Room's own preference —
+  // never re-enters this same call.
+  function syncClassicTheme(resolved) {
+    if (typeof setTheme !== 'function') return false;
+    _syncingClassicTheme = true;
+    try { setTheme(resolved); } finally { _syncingClassicTheme = false; }
+    return true;
+  }
+
+  function applyTheme() {
+    var resolved = resolveTheme();
+    var dark = resolved === 'dark';
+    // Defensive (found via a real theme-shadowing bug: `#cr-shell` briefly
+    // carried a redundant bare `tracker-next` class alongside #nextRoot,
+    // re-declaring ext_cr.css's LIGHT token block directly on itself and
+    // shadowing every dark value it should have inherited — see
+    // ext_cr_board.js's buildShell() for the actual fix). ext_cr.css's dark
+    // override only wins over the bare `.tracker-next` rule on an element
+    // that ALSO carries `is-dark` itself (`.tracker-next.is-dark` has higher
+    // specificity than `.tracker-next` alone) — inheritance of the CSS
+    // *custom properties* is not enough once something re-declares them.
+    // Toggling `is-dark` on EVERY element carrying `.tracker-next`, not just
+    // #nextRoot, means a future stray `tracker-next` class (anywhere, for
+    // any reason) can never again silently render half the app in the wrong
+    // theme: whatever picks up the scope class also and always gets `is-dark`
+    // kept in sync with it. The first-run scrim (buildFirstRun() below) is a
+    // deliberate SECOND, independent scope root — it lives outside #nextRoot
+    // entirely and already manages its own `is-dark` via a live
+    // 'theme:changed' listener; this sweep also covers it once it exists,
+    // redundantly but harmlessly (classList.toggle(_, dark) is idempotent).
+    var scopes = document.querySelectorAll('.tracker-next');
+    for (var i = 0; i < scopes.length; i++) scopes[i].classList.toggle('is-dark', dark);
+    if (!syncClassicTheme(resolved)) {
+      // Defensive fallback only — should be unreachable, since app.js (and
+      // its setTheme) is always concatenated before this file (page.py's
+      // build_page(): app.js first, then every ext_*.js sorted by filename).
+      document.dispatchEvent(new CustomEvent('themechange', { detail: { theme: resolved } }));
+    }
+    // Internal ctx bus uses ONE name, 'theme:changed' (cr_board.js's original
+    // name — cr_term.js's listener was updated to match, see ext_cr_term.js's
+    // _wireThemeReactivity). The document-level 'themechange' CustomEvent
+    // dispatched by setTheme() above is a SEPARATE, classic-facing signal.
+    emit('theme:changed', { theme: resolved });
+  }
+  if (window.matchMedia) {
+    var mql = window.matchMedia('(prefers-color-scheme: dark)');
+    var onSystemChange = function () { if (getThemePref() === 'auto') applyTheme(); };
+    if (mql.addEventListener) mql.addEventListener('change', onSystemChange);
+    else if (mql.addListener) mql.addListener(onSystemChange); // Safari <14 fallback
+  }
+
+  // Classic's OWN toggle button (toggleTheme(), app.js) can change the theme
+  // independently of Control Room's control. React to its 'themechange' the
+  // same way an OS scheme flip is reacted to above, so a change made in
+  // EITHER UI leaves the other consistent: an explicit classic choice becomes
+  // Control Room's explicit override too. `_syncingClassicTheme` stops this
+  // from re-entering syncClassicTheme()'s own call to setTheme() above —
+  // without it, applyTheme() -> syncClassicTheme() -> setTheme() ->
+  // 'themechange' -> this listener -> applyTheme() -> ... would loop forever.
+  document.addEventListener('themechange', function (e) {
+    if (_syncingClassicTheme) return;
+    var t = e && e.detail && e.detail.theme;
+    if (t !== 'light' && t !== 'dark') return;
+    if (getThemePref() === t) return;   // already in sync (e.g. a redundant re-dispatch)
+    setThemePref(t);   // persists + calls applyTheme(), which re-syncs classic
+                        // (a guarded no-op since it's already `t`) and repaints
+                        // the theme control + #nextRoot.
+  });
+
+  // First-paint sync, run SYNCHRONOUSLY at script-eval time (not deferred via
+  // setTimeout like init() below). index.html's own pre-paint inline script
+  // (its own file, not this one — see the report) only knows classic's binary
+  // `localStorage.theme` key: it can't resolve `tracker.theme`'s 'auto' value
+  // or consult matchMedia, so classic can start a page in the wrong theme
+  // whenever the stored `tracker.theme` preference disagrees with whatever
+  // classic last painted. index.html's one big concatenated script tag is the
+  // very last thing before the closing body/html tags (page.py's build_page()), so every
+  // element this touches already exists and nothing has painted yet —
+  // correcting classic here means the brief window where classic is the only
+  // thing visible (before this file's own deferred init() unhides #nextRoot)
+  // already shows the resolved theme, eliminating the flash without touching
+  // index.html.
+  syncClassicTheme(resolveTheme());
+
+  // ----------------------------------------------------------------------
+  // UI-mode switch (02-shell-and-board.md "Mode switching")
+  // localStorage key: 'tracker.ui' = 'classic' | 'next' (default 'classic').
+  // No reload: both roots stay in the DOM, `hidden` toggles which is shown —
+  // a reload would drop the terminal's open PTY streams.
+  // ----------------------------------------------------------------------
+  // #diffmodal/#msgmodal are NOT listed here: they're shared overlays (already
+  // invisible by default via `.overlay { display: none }`, made visible only
+  // by their own openers setting an inline display), not classic-only chrome.
+  // Force-hiding them by `[hidden]` (CSS below has `!important`) would beat
+  // that inline display and permanently break their reuse from Control Room —
+  // see the report. The CSS rule for them is left in place (harmless once the
+  // attribute is no longer set here) in case anything else ever sets it.
+  var CLASSIC_SIBLINGS = ['.app', 'footer.foot', '#toasts'];
+  function getUiMode() {
+    try { return localStorage.getItem('tracker.ui') || 'classic'; } catch (e) { return 'classic'; }
+  }
+  function setUiMode(mode) {
+    mode = (mode === 'next') ? 'next' : 'classic';
+    try { localStorage.setItem('tracker.ui', mode); } catch (e) {}
+    var nextRoot = document.getElementById('nextRoot');
+    var isNext = mode === 'next';
+    if (nextRoot) nextRoot.hidden = !isNext;
+    CLASSIC_SIBLINGS.forEach(function (sel) {
+      var el = document.querySelector(sel);
+      if (el) el.hidden = isNext;
+    });
+    if (isNext) {
+      // Edge case the removal above introduces: a modal left open in classic
+      // when the user switches to Control Room would now stay on screen (it's
+      // no longer force-hidden by attribute). Close it via the classic UI's
+      // own closers rather than inventing new hide logic here.
+      if (typeof closeMsg === 'function') closeMsg();
+      if (typeof closeDiff === 'function') closeDiff();
+      ensureMounted();
+      applyTheme();
+      // "immediately triggers a data refresh rather than waiting for the next
+      // poll tick" — reuse app.js's OWN fetch functions (same pollBusy/sideBusy
+      // guards) instead of a second fetch loop; see the data-plumbing note below.
+      if (typeof loadSide === 'function') loadSide();
+      if (typeof cur !== 'undefined' && cur && typeof poll === 'function') poll();
+      showView(state.view);
+    }
+    emit('ui:modeChanged', { mode: mode });
+  }
+
+  // ----------------------------------------------------------------------
+  // View containers + navigation — ctx.go('board' | 'detail', sessionId)
+  // ----------------------------------------------------------------------
+  var state = { view: 'board', sid: '' };
+  var els = {};
+
+  // STRUCTURAL FIX (app shell disappearing in detail): `els.shell` is the ONE
+  // element handed to CR.board.mount() — board now builds the rail + top bar
+  // (persistent, never hidden) plus all three content slots inside it. This
+  // file no longer builds #cr-view-board/#cr-view-detail itself; it fetches
+  // the real slot nodes back from CR.board.viewSlots() in ensureMounted()
+  // below, once board has actually mounted. `els.shell` carries the `cr-view`
+  // class so it gets the SAME flex:1 sizing (ext_cr_boot.css) the old
+  // top-level view slots relied on — board.mount() only adds its OWN
+  // `tracker-next cr-app` classes on top, it never clears existing ones.
+  function buildRoots() {
+    var root = document.getElementById('nextRoot');
+    if (!root || els.shell) return;
+    els.shell = document.createElement('div');
+    els.shell.id = 'cr-shell';
+    els.shell.className = 'cr-view';
+    els.dialogsRoot = document.createElement('div');
+    els.dialogsRoot.id = 'cr-dialogs-root';
+    els.termRoot = document.createElement('div');
+    els.termRoot.id = 'cr-term-root';
+    root.appendChild(els.shell);
+    root.appendChild(els.dialogsRoot);
+    root.appendChild(els.termRoot);
+  }
+
+  // Unchanged logic — still just toggles `hidden` on the two/three view slots
+  // for the current view. What changed is WHICH elements els.viewBoard /
+  // els.viewSessions / els.viewDetail refer to: they're now the inner content
+  // slots CR.board built inside the persistent shell (see ensureMounted),
+  // never the shell itself — so the rail + top bar are never touched here.
+  function showView(view) {
+    view = (view === 'detail') ? 'detail' : (view === 'sessions') ? 'sessions' : 'board';
+    state.view = view;
+    if (els.viewBoard) els.viewBoard.hidden = (view !== 'board');
+    if (els.viewSessions) els.viewSessions.hidden = (view !== 'sessions');
+    if (els.viewDetail) els.viewDetail.hidden = (view !== 'detail');
+  }
+
+  function go(view, sessionId) {
+    if (sessionId) {
+      state.sid = sessionId;
+      // Reuses app.js's own pick(): sets #sid, restarts the shared 2s poll
+      // (`track()`), persists localStorage.sid — the SAME session tracking
+      // classic uses, so switching UI mode never loses "what am I looking at".
+      if (typeof pick === 'function') pick(sessionId);
+      emit('session:selected', { id: sessionId });
+    }
+    showView(view);
+    if (view === 'board' || view === 'sessions') {
+      if (typeof loadSide === 'function') loadSide();
+    } else if (state.sid && typeof poll === 'function') {
+      poll();
+    }
+    emit('view:changed', { view: view, id: state.sid });
+  }
+
+  // ----------------------------------------------------------------------
+  // ctx.terminals.count() — REQUIRED by cr_board.js's Terminals pill (its own
+  // comment: "ctx has no terminal-count accessor ... left blank rather than
+  // fabricated"). `open` rides the EXISTING X-Server-Now-style header
+  // (X-Term-Count, already parsed into app.js's `termCount` global on every
+  // 5s /api/list poll — zero extra cost). `total` is config.MAX_TERMS, which
+  // has no header exposure; the only place it's served is GET /api/term/list's
+  // body (an EXISTING endpoint ext_vt.js/ext_launch.js/cr_term.js already
+  // call the same way). NOTE: this is the one deliberate exception to "no new
+  // round-trips" in this file — a SINGLE one-time fetch of an existing route
+  // to learn a static config value, cached forever after, never a poll.
+  // ----------------------------------------------------------------------
+  var termsMax = null;
+  // Fix 2e — Config's "Terminal enabled" row hardcoded `restartFlag(true)`, showing a
+  // confident "on" no matter the real TRACKER_TERMINAL value. There is no dedicated
+  // route for this, but term_gate.guard() (the SAME gate GET /api/term/list already runs
+  // first) 403s with a distinguishable error when config.TERMINAL is off ("...unset
+  // TRACKER_TERMINAL or set it to anything other than 0" — term_gate.py) versus when
+  // terminal IS enabled but this server needs TRACKER_AUTH to use it off-loopback
+  // ("...needs TRACKER_AUTH"). So this SAME one-shot probe also resolves terminalEnabled:
+  // true on 200, false when the error names TRACKER_TERMINAL, else 'unknown' (a network
+  // failure, an auth-gate 403, or anything not confidently one of the first two) — never
+  // a guessed true/false. No new request is added; this reuses the max-terms probe.
+  var termEnabled = null; // null (not yet resolved) | true | false | 'unknown'
+  function fetchTermsMax() {
+    if (termsMax !== null || typeof fetch !== 'function') return;
+    fetch('/api/term/list').then(function (r) {
+      return r.json().catch(function () { return null; }).then(function (j) { return { ok: r.ok, j: j }; });
+    }).then(function (res) {
+      if (res.ok && res.j) {
+        if (typeof res.j.max === 'number') termsMax = res.j.max;
+        termEnabled = true;
+      } else {
+        var errText = (res.j && res.j.error) || '';
+        termEnabled = /TRACKER_TERMINAL/.test(errText) ? false : 'unknown';
+      }
+    }).catch(function () { termEnabled = 'unknown'; });
+  }
+
+  // ----------------------------------------------------------------------
+  // Fix 2b — Config's "Poll interval" row (1s / 2s / 5s) wrote `cr.pollIntervalMs`
+  // but nothing read it. This is the SAME `poll()`/`timer` loop app.js's track()
+  // already runs for the open session's /api/session detail poll (2s default) — the
+  // project's hard rule keeps 2s the default, so readPollMs() falls back to it for
+  // anything unset or outside the doc's allowed values. Re-arming the existing
+  // `timer` at the chosen cadence (instead of adding a second loop) satisfies "no new
+  // round-trips": still exactly one interval alive. This does NOT touch the separate
+  // 5s /api/list (board/rail) poll — that interval is armed once, at startup, with no
+  // seam to change it without editing app.js.
+  // ----------------------------------------------------------------------
+  function readPollMs() {
+    var v;
+    try { v = JSON.parse(localStorage.getItem('cr.pollIntervalMs') || 'null'); } catch (e) { v = null; }
+    return (v === 1000 || v === 5000) ? v : 2000;
+  }
+  function applyPollPref() {
+    if (typeof timer === 'undefined' || !timer || typeof poll !== 'function') return;
+    clearInterval(timer);
+    timer = setInterval(poll, readPollMs());
+  }
+  // track() (app.js) always re-arms `timer` at its own hardcoded 2000ms — reused
+  // as-is (not forked) and just re-applied afterward, so a chosen cadence survives a
+  // session switch instead of resetting to the default every time you pick a session.
+  var _origTrack = (typeof track === 'function') ? track : null;
+  if (_origTrack) {
+    track = function () {
+      _origTrack();
+      applyPollPref();
+    };
+  }
+  on('cr:pref', function (payload) {
+    if (payload && payload.key === 'cr.pollIntervalMs') applyPollPref();
+  });
+
+  // ----------------------------------------------------------------------
+  // ctx.dialog(name, payload) — cr_term.js calls this as a plain ctx method
+  // (`ctx.dialog("config", {})`); cr_dialogs.js listens for it as a BUS event
+  // (`ctx.on('dialog:open', ...)`). Bridge both: the method just emits.
+  // ----------------------------------------------------------------------
+  function dialog(name, payload) {
+    emit('dialog:open', { name: name, data: payload });
+  }
+
+  // ----------------------------------------------------------------------
+  // ctx.fmt — thin formatting reuse, never a re-derived threshold (LIVE stays
+  // server-owned; this only reuses app.js's existing "N ago" string builder).
+  // ----------------------------------------------------------------------
+  var fmt = {
+    relTime: function (sec) {
+      return (typeof ago === 'function') ? ago(sec) : Math.max(0, Math.round(sec)) + 's ago';
+    }
+  };
+  // ctx.markdown — dialogs.js's own comment names this as a REQUIRED ADDITION
+  // ("ctx.markdown(text) -> HTMLElement ... every consumer should call the
+  // SAME implementation rather than fork a second one"); it is not actually
+  // called anywhere yet, but wiring it now means the detail module (doc 03,
+  // not yet on disk) gets it for free instead of a second markdown-lite fork.
+  // Reuses app.js's OWN `md()` (the narration/prompt renderer), not a new one.
+  function markdown(text) {
+    var d = document.createElement('div');
+    d.innerHTML = (typeof md === 'function') ? md(text || '') : esc(text || '');
+    return d;
+  }
+
+  // ----------------------------------------------------------------------
+  // The ctx object every CR.* module's mount(rootEl, ctx) receives.
+  // ----------------------------------------------------------------------
+  var ctx = {
+    on: on,
+    emit: emit,
+    go: go,
+    // `resolved` reuses boot.js's OWN resolveTheme() (live matchMedia read,
+    // never a stale snapshot) — cr_board.js's theme control calls this rather
+    // than forking a second resolution formula (see the report).
+    theme: { get: getThemePref, set: setThemePref, resolved: resolveTheme },
+    icon: icon,
+    dialog: dialog,
+    markdown: markdown,
+    fmt: fmt,
+    terminals: {
+      count: function () {
+        return {
+          open: (typeof termCount === 'number') ? termCount : 0,
+          total: (termsMax !== null) ? termsMax : (typeof sessions !== 'undefined' ? sessions.length : 0)
+        };
+      }
+    }
+  };
+
+  // ----------------------------------------------------------------------
+  // Cross-module bridge events. These are the ACTUAL events cr_board.js /
+  // cr_term.js emit (verified by reading both files, not guessed from the
+  // abstract brief) that nothing else in the codebase currently handles.
+  // ----------------------------------------------------------------------
+  on('ui:backToClassic', function () { setUiMode('classic'); });
+
+  on('open:help', function () { dialog('help', {}); });
+  // Fix 2e: Config's payload contract (cr_dialogs.js's own doc-comment on renderConfig)
+  // says the caller supplies `payload.server` from data it already has — this used to
+  // pass {} always, so every server-backed row silently fell to its hardcoded fallback.
+  // Only pass what this file has genuinely already learned (via fetchTermsMax's single
+  // /api/term/list probe); every other field is left undefined on purpose so its row
+  // renders its own honest fallback instead of a second guess made here.
+  on('open:config', function () { dialog('config', { server: { terminalEnabled: termEnabled, maxTerms: termsMax } }); });
+
+  on('open:flags', function () {
+    dialog('flags', buildFlagsPayload());
+  });
+
+  on('toggle:notifications', function () {
+    // Reuses the SAME `soundOff` localStorage key + toggleSound()/checkCompletions()
+    // machinery classic's bell already drives — one notification setting for the
+    // whole app, not a second parallel on/off no code actually reads.
+    if (typeof toggleSound === 'function') {
+      toggleSound();
+      emit('notify', { text: 'Notification sound: ' + (typeof soundOn !== 'undefined' && soundOn ? 'on' : 'off') });
+    }
+  });
+
+  on('terminal:open', function (payload) {
+    var id = payload && payload.id;
+    if (id && window.CR.term && typeof window.CR.term.open === 'function') {
+      window.CR.term.open(id, { mode: 'cwd' });
+    } else {
+      emit('notify', { text: 'Terminal isn’t available right now.' });
+    }
+  });
+
+  on('nav:terminals', function () {
+    // cr_term.js exports openManage() on CR.term for exactly this bridge (see
+    // ext_cr_term.js's public module surface) — guarded in case term failed to
+    // mount, so this degrades honestly instead of throwing.
+    var term = window.CR.term;
+    if (term && typeof term.openManage === 'function') { term.openManage(); }
+    else { emit('notify', { text: 'Managing terminals from here isn’t wired up yet.' }); }
+  });
+
+  on('session:new', function () {
+    // cr_term.js exports openPicker(mode) on CR.term for exactly this bridge
+    // (see ext_cr_term.js's public module surface).
+    var term = window.CR.term;
+    if (term && typeof term.openPicker === 'function') { term.openPicker('new'); }
+    else { emit('notify', { text: 'Starting a new session from here isn’t wired up yet — use the classic dashboard’s "+ New Claude session" for now.' }); }
+  });
+
+  // ----------------------------------------------------------------------
+  // Drill-down pop-outs — cr_detail.js opens 'file-diff'/'command-output'/
+  // 'agent-transcript'/'shell-tail' with only an id (no content); cr_dialogs.js
+  // renders a loading state and emits 'cr:drill-request' ({kind, sessionId,
+  // arg}) asking someone to fetch the real content and re-open the SAME dialog
+  // name (its open() upgrades a same-name dialog in place via the builder's
+  // own `update`). This is the "someone" — using the EXISTING drill routes,
+  // no new endpoints. Response shapes reverse-engineered from app.js's own
+  // classic modals (openDiff/openCmd/openShell/openAgent), which already
+  // consume these same routes successfully.
+  // ----------------------------------------------------------------------
+  var DRILL_DIALOG_NAME = { diff: 'file-diff', output: 'command-output', agent: 'agent-transcript', shell: 'shell-tail' };
+  var DRILL_URL = {
+    diff: function (sid, arg) { return '/api/diff?id=' + encodeURIComponent(sid) + '&file=' + encodeURIComponent(arg || ''); },
+    output: function (sid, arg) { return '/api/output?id=' + encodeURIComponent(sid) + '&cmd=' + encodeURIComponent(arg || ''); },
+    agent: function (sid, arg) { return '/api/agent?id=' + encodeURIComponent(sid) + '&agent=' + encodeURIComponent(arg || ''); },
+    shell: function (sid, arg) { return '/api/shell?id=' + encodeURIComponent(sid) + '&shell=' + encodeURIComponent(arg || ''); },
+  };
+  // Turns one edit-op's unified-diff text (op.diff, e.g. "+foo\n-bar\n baz") into
+  // the {type:'add'|'del'|null, no, text}[] shape cr_dialogs.js's diffLineRow()
+  // renders. Hunk/file headers (@@, +++, ---) are dropped, matching app.js's own
+  // _afterLines() filter for the same raw text.
+  function parseDiffOpLines(diffText) {
+    var out = [];
+    (diffText || '').split('\n').forEach(function (l) {
+      if (/^(@@|\+\+\+|---)/.test(l)) return;
+      var type = null, text = l;
+      if (l.charAt(0) === '+') { type = 'add'; text = l.slice(1); }
+      else if (l.charAt(0) === '-') { type = 'del'; text = l.slice(1); }
+      else if (l.charAt(0) === ' ') { text = l.slice(1); }
+      out.push({ type: type, no: out.length + 1, text: text });
+    });
+    return out;
+  }
+  on('cr:drill-request', function (payload) {
+    var kind = payload && payload.kind;
+    var name = DRILL_DIALOG_NAME[kind];
+    var urlFn = DRILL_URL[kind];
+    if (!name || !urlFn || typeof fetch !== 'function') return;
+    var sid = payload.sessionId, arg = payload.arg;
+    fetch(urlFn(sid, arg)).then(function (r) {
+      if (!r.ok) throw new Error('http ' + r.status);
+      return r.json();
+    }).then(function (d) {
+      if (!d || d.error) { dialog(name, { error: (d && d.error) || 'not found' }); return; }
+      if (kind === 'diff') {
+        var ops = d.ops || [];
+        var lastOp = ops.length ? ops[ops.length - 1] : null;
+        var lines = lastOp ? parseDiffOpLines(lastOp.diff) : [];
+        var adds = 0, dels = 0;
+        lines.forEach(function (l) { if (l.type === 'add') adds++; else if (l.type === 'del') dels++; });
+        dialog(name, {
+          path: d.file || arg, lines: lines, additions: adds, deletions: dels,
+          expandAboveLabel: false, belowCount: 0,
+        });
+      } else if (kind === 'output' || kind === 'shell') {
+        dialog(name, { text: d.out || '(no output captured)' });
+      } else { // agent
+        dialog(name, { text: d.narration || '(no narration recorded)' });
+      }
+    }).catch(function () {
+      dialog(name, { error: 'couldn’t reach the server' });
+    });
+  });
+
+  // ----------------------------------------------------------------------
+  // Rename — the ONLY write cr_dialogs.js's rename dialog performs is emitting
+  // 'cr:rename' on the bus (per its own "NOTE" comment); this bridges it to the
+  // EXISTING POST /api/title route, the same one classic's renameSession()
+  // already uses, then refreshes via the shared poll loops (no second fetch
+  // loop introduced).
+  // ----------------------------------------------------------------------
+  on('cr:rename', function (payload) {
+    var sid = payload && payload.sessionId;
+    if (!sid || typeof fetch !== 'function') return;
+    fetch('/api/title', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sid, title: payload.title || '' }),
+    }).then(function (r) { return r.ok; }).then(function (ok) {
+      emit('notify', { text: ok ? 'Renamed.' : 'Couldn’t rename that session.' });
+      if (typeof loadSide === 'function') loadSide();
+      if (ok && typeof cur !== 'undefined' && sid === cur && typeof poll === 'function') poll();
+    }).catch(function () {
+      emit('notify', { text: 'Couldn’t reach the server — the rename wasn’t saved.' });
+    });
+  });
+
+  // ----------------------------------------------------------------------
+  // Detail-view actions — cr_detail.js only ever emits an intent + a payload,
+  // never touches fetch()/DOM itself (its own contract rule); this is where
+  // each of those intents meets an EXISTING route or classic helper, per the
+  // same "server owns the write, this file bridges it" pattern as cr:rename
+  // and cr:drill-request above. No second poll loop: every branch refreshes
+  // through loadSide()/poll(), the same two loops app.js already runs.
+  // ----------------------------------------------------------------------
+
+  // Pin / unpin from the detail view — cr_detail.js's own "toggle-pin" click
+  // case already flips its local session.pinned optimistically (its own
+  // paintPinButton) and never calls fetch() itself (this file's own
+  // "cr_detail.js only ever emits an intent" contract, same as cr:rename just
+  // above); this bridges it to the SAME POST /api/pin route classic's
+  // togglePin() (app.js) and the rail's toggleSessionPin() (ext_cr_board.js,
+  // not ours to edit) already write through -- a third caller of one route,
+  // not a second pin store. loadSide() refreshes the sidebar's own pinned
+  // section and (via SIDE_EXT.push) the rail; poll() refreshes this exact
+  // session's own detail dict so a failed write self-corrects on the header
+  // instead of leaving the optimistic flip stuck.
+  on('cr:pin-toggle', function (payload) {
+    var sid = payload && payload.sessionId;
+    if (!sid || typeof fetch !== 'function') return;
+    var pinned = !!(payload && payload.pinned);
+    fetch('/api/pin', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sid, pinned: pinned }),
+    }).then(function (r) { return r.ok; }).then(function (ok) {
+      emit('notify', { text: ok ? (pinned ? 'Pinned.' : 'Unpinned.') : 'Couldn’t update the pin.' });
+      if (typeof loadSide === 'function') loadSide();
+      if (ok && typeof cur !== 'undefined' && sid === cur && typeof poll === 'function') poll();
+    }).catch(function () {
+      emit('notify', { text: 'Couldn’t reach the server — the pin wasn’t saved.' });
+    });
+  });
+
+  // Flag an issue — same POST /api/flags body shape as classic's addFlag(),
+  // just sourced from the payload's sessionId instead of the global `cur`
+  // (the detail view can flag a session that isn't the currently-tracked
+  // one). `project` is looked up from the SAME `sessions` list addFlag()
+  // reads from, not re-derived.
+  on('cr:flag-create', function (payload) {
+    var sid = payload && payload.sessionId;
+    var note = ((payload && payload.note) || '').trim();
+    if (!sid || !note || typeof fetch !== 'function') return;
+    var sess = (typeof sessions !== 'undefined' && Array.isArray(sessions)) ? sessions : [];
+    var s = null;
+    for (var i = 0; i < sess.length; i++) { if (sess[i].id === sid) { s = sess[i]; break; } }
+    fetch('/api/flags', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sid, project: (s && s.project) || '', note: note, context: payload.context || '' }),
+    }).then(function (r) { return r.ok; }).then(function (ok) {
+      emit('notify', { text: ok ? 'Flag added.' : 'Couldn’t add that flag.' });
+      if (typeof loadFlags === 'function') loadFlags();
+    }).catch(function () {
+      emit('notify', { text: 'Couldn’t reach the server — the flag wasn’t saved.' });
+    });
+  });
+
+  // Queue a note — same POST /api/notes body shape as classic's addNote();
+  // the payload always carries fresh text (never an index into an existing
+  // queued note), so this is the create route, not /api/notes/push.
+  on('cr:note-push', function (payload) {
+    var sid = payload && payload.sessionId;
+    var text = ((payload && payload.text) || '').trim();
+    if (!sid || !text || typeof fetch !== 'function') return;
+    fetch('/api/notes', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sid, text: text }),
+    }).then(function (r) { return r.ok; }).then(function (ok) {
+      emit('notify', { text: ok ? 'Note added.' : 'Couldn’t add that note.' });
+      if (typeof loadSide === 'function') loadSide();
+      if (ok && typeof cur !== 'undefined' && sid === cur && typeof poll === 'function') poll();
+    }).catch(function () {
+      emit('notify', { text: 'Couldn’t reach the server — the note wasn’t saved.' });
+    });
+  });
+
+  // Remove a queued note — same POST /api/notes/delete body shape as
+  // classic's removeNote().
+  on('cr:note-remove', function (payload) {
+    var sid = payload && payload.sessionId;
+    var idx = payload && payload.index;
+    if (!sid || typeof idx !== 'number' || typeof fetch !== 'function') return;
+    fetch('/api/notes/delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sid, index: idx }),
+    }).then(function (r) { return r.ok; }).then(function (ok) {
+      emit('notify', { text: ok ? 'Note removed.' : 'Couldn’t remove that note.' });
+      if (typeof loadSide === 'function') loadSide();
+      if (ok && typeof cur !== 'undefined' && sid === cur && typeof poll === 'function') poll();
+    }).catch(function () {
+      emit('notify', { text: 'Couldn’t reach the server — the note wasn’t removed.' });
+    });
+  });
+
+  // Run a command — the SAME POST /api/term/run + GET /api/term/stream (SSE)
+  // pair ext_run.js's own embedded runner already drives from the classic
+  // sidebar; this is not a second implementation of that runner, just a second
+  // CALLER of the same route. cr_detail.js's "Run a command" panel has no
+  // output pane of its own (a REQUIRED ADDITION, not invented here — see the
+  // report), so progress/result surfaces through the existing toast/notify
+  // path instead of a fabricated inline stream view.
+  on('cr:run-command', function (payload) {
+    var sid = payload && payload.sessionId;
+    var argv = ((payload && payload.argv) || '').trim();
+    if (!sid || !argv || typeof fetch !== 'function') return;
+    fetch('/api/term/run', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sid, cmd: argv }),
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
+    }).then(function (res) {
+      if (!res.ok || !res.j || !res.j.job) {
+        emit('notify', {
+          text: (res.j && res.j.error) ||
+            (res.status === 404 ? 'Running commands isn’t available on this server.' :
+              res.status === 403 ? 'Running commands is disabled.' : 'Couldn’t start that command.')
+        });
+        return;
+      }
+      emit('notify', { text: 'Running: ' + argv });
+      currentJob = res.j.job;
+      dialog('run-output', { sessionId: sid, cmd: argv, jobId: res.j.job });
+      if (typeof EventSource !== 'function') return;
+      var es = new EventSource('/api/term/stream?job=' + encodeURIComponent(res.j.job));
+      es.addEventListener('end', function (ev) {
+        var d = {};
+        try { d = JSON.parse(ev.data); } catch (e) {}
+        es.close();
+        currentJob = null;
+        emit('notify', { text: argv + (d.rc === 0 ? ' — done' : ' — exit ' + d.rc) });
+        if (typeof cur !== 'undefined' && sid === cur && typeof poll === 'function') poll();
+      });
+      es.onerror = function () { es.close(); currentJob = null; };
+    }).catch(function () {
+      emit('notify', { text: 'Couldn’t reach the server to run that command.' });
+    });
+  });
+
+  // Resume this session in a terminal — the SAME window.CR.term.open(id, opts)
+  // entry point 'terminal:open' already bridges to above, just with mode
+  // 'resume' instead of 'cwd' (open()'s own opts.mode branch already handles
+  // both — see ext_cr_term.js).
+  on('session:resume', function (payload) {
+    var id = payload && payload.id;
+    if (id && window.CR.term && typeof window.CR.term.open === 'function') {
+      window.CR.term.open(id, { mode: 'resume' });
+    } else {
+      emit('notify', { text: 'Terminal isn’t available right now.' });
+    }
+  });
+
+  // Open externally — the SAME POST /api/term/open route (and the SAME
+  // request shape) ext_launch.js's own openTerm()/ext_cr_term.js's own
+  // _openExternal() already call for their "↗ External …" buttons — not a
+  // new endpoint, just a third caller of an existing one. Resume when the
+  // session is Claude's own (mirrors ext_launch.js's isClaudeId check),
+  // otherwise a plain cwd shell.
+  on('session:openExternal', function (payload) {
+    var id = payload && payload.id;
+    if (!id || typeof fetch !== 'function') return;
+    var resumable = !/^(auggie|augment-vscode|augment-cursor):/.test(id);
+    fetch('/api/term/open', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: id, mode: resumable ? 'resume' : 'cwd' }),
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
+    }).then(function (res) {
+      if (!res.ok || (res.j && res.j.error)) {
+        emit('notify', { text: (res.j && res.j.error) || 'Couldn’t open an external terminal.' });
+        return;
+      }
+      emit('notify', { text: (resumable ? 'Resuming' : 'Terminal opened') + ' in an external window — this machine only.' });
+    }).catch(function () {
+      emit('notify', { text: 'Couldn’t reach the server to open an external terminal.' });
+    });
+  });
+
+  // Terminal model/effort controls from the detail view — REQUIRED ADDITION,
+  // not wired here: cr_term.js's own model/effort switch (_openModelDialog/
+  // _openEffortDialog) only knows about whichever pty its OWN overlay
+  // currently has open (st.tty/st.sessionId), and nothing in the shared
+  // session-detail dict says whether some OTHER, already-attached terminal
+  // exists for this session id to target instead. There is no existing route
+  // that answers "find the terminal attached to session X" — attached-ness is
+  // only checked by tty (GET /api/term/attached?tty=), and a tty id is never
+  // part of the session detail dict. Until that seam exists, this stays an
+  // honest no-op notice rather than a fabricated lookup. (In practice this is
+  // unreachable today: cr_detail.js's renderTerminalPanel keeps the whole
+  // panel hidden — `session.term_attached` is never set anywhere in the
+  // codebase — so the button this would fire from is never on screen.)
+  on('cr:term-controls-request', function () {
+    emit('notify', { text: 'Model/effort switching needs an already-open terminal for this session — there’s no way to find one from here yet.' });
+  });
+
+  // cr:model-pick / cr:effort-pick — the Defect 3 re-grep turned these up: cr_dialogs.js's own
+  // model/effort picker (ctx.dialog("model"|"effort", …)) falls back to emitting these on the bus
+  // ONLY when its payload carries no `onPick` (see cr_dialogs.js's renderLadderPicker "pick()").
+  // Today nothing calls it that way — cr_term.js's _openModelDialog/_openEffortDialog are the only
+  // callers of ctx.dialog("model"|"effort", …), and both always supply a real onPick — so this is
+  // unreachable in practice, exactly like cr:term-controls-request just above. Wired to the same
+  // honest notice anyway, for the same reason: a currently-dead branch is still a REAL bus event
+  // with no listener, and closing that gap costs nothing once the pattern already exists.
+  on('cr:model-pick', function () {
+    emit('notify', { text: 'Switching the model needs an already-open terminal for this session — there’s no way to find one from here yet.' });
+  });
+  on('cr:effort-pick', function () {
+    emit('notify', { text: 'Switching effort needs an already-open terminal for this session — there’s no way to find one from here yet.' });
+  });
+
+  // Stop — stops the currently-running command (via the same /api/term/kill
+  // endpoint ext_run.js's stop() already uses). Mirrors ext_run.js's behaviour:
+  // only executes if a job is actually running; silently returns otherwise.
+  on('cr:stop', function (payload) {
+    if (!currentJob) return;
+    fetch('/api/term/kill', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job: currentJob })
+    }).catch(function () { });
+  });
+
+  // ----------------------------------------------------------------------
+  // Cross-session flags payload — adapts app.js's OWN `flags`/`sessions`
+  // globals (already kept fresh every 5s by loadSide()'s trailing
+  // loadFlags() call) into cr_dialogs.js's renderFlagsList(payload) shape:
+  // {flags:[{id, session, sessionTitle, text, resolved}], onOpen, onResolve,
+  // onReopen, onDelete}. Deliberately calls the lower-level `flagAction(path,
+  // id)` for resolve/delete rather than classic's `delFlag()` — that one
+  // wraps a native confirm(), which this task's hard rules forbid adding and
+  // which would look completely out of place popping over the new UI.
+  // ----------------------------------------------------------------------
+  function buildFlagsPayload() {
+    var list = (typeof flags !== 'undefined' && Array.isArray(flags)) ? flags : [];
+    var sess = (typeof sessions !== 'undefined' && Array.isArray(sessions)) ? sessions : [];
+    return {
+      flags: list.map(function (f) {
+        var s = null;
+        for (var i = 0; i < sess.length; i++) { if (sess[i].id === f.session) { s = sess[i]; break; } }
+        return {
+          id: f.id,
+          session: f.session,
+          sessionTitle: (s && (s.title || s.project)) || f.project || (f.session || '').slice(0, 8),
+          text: f.note,
+          resolved: f.resolved
+        };
+      }),
+      onOpen: function (f) { go('detail', f.session); },
+      onResolve: function (f) { if (typeof flagAction === 'function') flagAction('/api/flags/resolve', f.id); },
+      onReopen: function (f) { if (typeof flagAction === 'function') flagAction('/api/flags/resolve', f.id); },
+      onDelete: function (f) { if (typeof flagAction === 'function') flagAction('/api/flags/delete', f.id); }
+    };
+  }
+
+  // ----------------------------------------------------------------------
+  // Mounting — LAZY, on first entry into 'next' mode (not at page load).
+  //
+  // NOTE: cr_board.js's bindKeyboard() attaches a `document`-level keydown
+  // listener the moment CR.board.mount() runs, and that listener is gated
+  // only on `root.isConnected` — never on whether #nextRoot is actually
+  // visible or which UI mode is active. Mounting eagerly at page load would
+  // mean j/k/t/?/Ctrl+K get captured (silently, against an invisible board)
+  // even for a user who never opens Control Room at all. Lazy mount confines
+  // that exposure to "has opened Control Room at least once this page load" —
+  // it does not fully fix it (there's no unmount path back to classic-only
+  // capture), which is flagged in the report as cr_board.js's gap, not
+  // patched here since that file is out of this task's scope.
+  // ----------------------------------------------------------------------
+  var mounted = false;
+  function placeholder(rootEl, label) {
+    if (!rootEl) return;
+    var box = document.createElement('div');
+    box.className = 'cr-placeholder';
+    box.textContent = 'The ' + label + ' view isn’t available in this build yet.';
+    rootEl.appendChild(box);
+  }
+  function safeMount(name, rootEl) {
+    var mod = window.CR && window.CR[name];
+    if (mod && typeof mod.mount === 'function') {
+      try { mod.mount(rootEl, ctx); return; } catch (e) { console.error('[CR] mount', name, 'threw', e); }
+    }
+    placeholder(rootEl, name);
+  }
+  function ensureMounted() {
+    if (mounted) return;
+    mounted = true;
+    buildRoots();
+    safeMount('dialogs', els.dialogsRoot);
+    safeMount('term', els.termRoot);
+    // board.mount() builds the persistent rail/top bar AND all three content
+    // slots inside els.shell (see ext_cr_board.js's buildShell()). Fetch the
+    // real slot nodes back out via viewSlots() — same "expose internals for
+    // the bootstrap" pattern boardTiles()/sessionState() already use, not a
+    // new mount contract.
+    safeMount('board', els.shell);
+    var slots = (window.CR.board && typeof window.CR.board.viewSlots === 'function') ? window.CR.board.viewSlots() : null;
+    els.viewBoard = slots && slots.board;
+    els.viewSessions = slots && slots.sessions;
+    els.viewDetail = slots && slots.detail;
+    if (!els.viewDetail) {
+      // CR.board is missing or its own mount() threw before building the view
+      // slots — fall back to a bare slot inside the shell so CR.detail still
+      // has somewhere honest to mount, instead of silently losing the detail
+      // view entirely.
+      els.viewDetail = document.createElement('div');
+      els.viewDetail.id = 'cr-view-detail';
+      els.viewDetail.className = 'cr-view';
+      els.viewDetail.hidden = (state.view !== 'detail');
+      if (els.shell) els.shell.appendChild(els.viewDetail);
+    }
+    safeMount('detail', els.viewDetail);
+    fetchTermsMax();
+    applyPollPref(); // pick up a previously-chosen cadence for a `timer` that predates this mount
+  }
+
+  // ----------------------------------------------------------------------
+  // Data plumbing — reuse app.js's OWN poll loops instead of a second one.
+  //
+  // NOTE (deliberate reinterpretation of the brief): app.js already exposes
+  // exactly the extension seam this task's "no new round-trips" rule wants —
+  // EXT (pushed fn(d), called at the end of every 2s render(d)) and SIDE_EXT
+  // (pushed fn(), called at the end of every 5s loadSide()) — the SAME hooks
+  // ext_launch.js/ext_run.js/ext_vt.js already use. Pushing into them means
+  // CR.board/CR.detail get updated on the classic poll's own results with
+  // ZERO extra fetches, rather than a parallel loop that merely matches
+  // cadence while doubling requests. This also trivially satisfies "only
+  // poll for whichever UI mode is visible": there is only ever one loop.
+  // ----------------------------------------------------------------------
+  if (typeof SIDE_EXT !== 'undefined' && SIDE_EXT && SIDE_EXT.push) {
+    SIDE_EXT.push(function () {
+      if (getUiMode() !== 'next' || !mounted) return;
+      var now = (typeof listNow === 'number') ? listNow : Date.now() / 1000;
+      var list = (typeof sessions !== 'undefined' && Array.isArray(sessions)) ? sessions : [];
+      if (window.CR.board && typeof window.CR.board.update === 'function') {
+        try { window.CR.board.update({ sessions: list, now: now }); } catch (e) { console.error('[CR] board.update threw', e); }
+      }
+      if (window.CR.dialogs && typeof window.CR.dialogs.update === 'function') {
+        // kind:'poll' tags this as the generic poll broadcast (not a dialog's own
+        // re-open with a richer payload) — CR.dialogs.update()'s seam refuses to
+        // forward a poll-tagged payload to any dialog that hasn't opted in via
+        // `wantsPoll: true` (today: only the flags dialog), so a dialog that never
+        // asked for poll data can no longer have its real payload clobbered by it.
+        try { window.CR.dialogs.update({ kind: 'poll', flags: buildFlagsPayload().flags, sessions: list, now: now }); } catch (e) { console.error('[CR] dialogs.update threw', e); }
+      }
+      if (window.CR.term && typeof window.CR.term.update === 'function') {
+        try { window.CR.term.update({ sessions: list }); } catch (e) { console.error('[CR] term.update threw', e); }
+      }
+    });
+  }
+  // A9 fix (control-room-drift-analysis.md finding A9): the back-line hint "N of M
+  // needing attention · j/k to move between them" (doc 03) is real code in
+  // ext_cr_detail.js's renderBackline() — it already reads `state.triage.index`/
+  // `.total` — but nothing ever supplied `state.triage`, so it stayed permanently
+  // hidden. `sessions`/`listNow` are the SAME top-level globals this file already
+  // reads elsewhere (buildFlagsPayload, the ctx.terminals.count fallback), kept
+  // fresh by app.js's own 5s loadSide() poll — no new round-trip. The ranking is
+  // CR.board's own public `boardTiles(sessions, now)` (the exact list "needing
+  // attention" ranks over, idle sessions already excluded), the SAME public surface
+  // ext_cr_detail.js's own stepSession() (j/k navigation) already calls for the
+  // identical purpose — not a second ranking invented here.
+  function computeTriage(d) {
+    if (!window.CR.board || typeof window.CR.board.boardTiles !== 'function') return null;
+    var list = (typeof sessions !== 'undefined' && Array.isArray(sessions)) ? sessions : [];
+    if (!list.length) return null;
+    var nowSec = (typeof listNow === 'number') ? listNow : Math.floor(Date.now() / 1000);
+    var tiles = window.CR.board.boardTiles(list, nowSec).filter(function (t) { return t.kind === 'session'; });
+    if (!tiles.length) return null;
+    var sid = (d.meta && d.meta.sessionId) || d.id;
+    var idx = -1;
+    tiles.forEach(function (t, i) { if (t.session.id === sid) idx = i; });
+    if (idx < 0) return null; // this session isn't in the triage-ranked set (e.g. idle) — honestly hidden, not fabricated
+    return { index: idx + 1, total: tiles.length };
+  }
+  if (typeof EXT !== 'undefined' && EXT && EXT.push) {
+    EXT.push(function (d) {
+      if (getUiMode() !== 'next' || !mounted) return;
+      if (!d || d.error) return;
+      if (window.CR.detail && typeof window.CR.detail.update === 'function') {
+        try { window.CR.detail.update({ session: d, now: d.now, triage: computeTriage(d) }); } catch (e) { console.error('[CR] detail.update threw', e); }
+      }
+    });
+  }
+
+  // ----------------------------------------------------------------------
+  // Completion notifications — REUSE app.js's real detector, don't fork one.
+  //
+  // BUG (reported with a screenshot, fixed here): the previous version of
+  // this block built its OWN completion detector — watching `ended` flip
+  // false->true across EVERY session in the /api/list payload (~950 sessions
+  // on a real machine), with a baseline (`_completionInited`) that only ever
+  // ran ONCE, on the very first tick, and was never reset. Any session id not
+  // in that one-time snapshot forever reads as `was === false` — so a
+  // machine with hundreds of already-finished sessions kept re-announcing
+  // them, with sound, on every later poll. Deleted entirely, along with
+  // `_priorEnded`/`_completionInited`/checkSessionCompletions()/
+  // fireCompletionNotice() and their SIDE_EXT registration.
+  //
+  // The CORRECT existing pattern is app.js's own checkCompletions(d) (~line
+  // 1156 there): it watches exactly ONE session — `cur`, the one actually
+  // open — and only ITS `agents_bg`/`shells`, keyed by "a:"+id / "s:"+id,
+  // firing only on that item's running -> not-running transition, and it
+  // silently re-baselines (no notify) on a session switch OR the very first
+  // poll: `if(notifSession!==cur||notifRunning===null){...return;}`. Verified
+  // by reading it, not assumed: poll() (app.js) already calls it — `render(d)
+  // ... checkCompletions(d)` — on EVERY 2s tick, unconditionally, regardless
+  // of which UI mode is visible. So the detection itself is not missing for
+  // Control Room; it already runs.
+  //
+  // checkCompletions() is deliberately NOT called a second time from here.
+  // poll()'s own order is `render(d)` (which drives EXT — this file's own
+  // detail-update hook above) THEN `checkCompletions(d)`. Calling it again
+  // from an EXT hook would run BEFORE app.js's real call for the same tick,
+  // racing ahead of (and corrupting) `notifRunning`'s baseline, and would
+  // double-fire notifyDone() outright once both calls have run a few ticks.
+  //
+  // notifyDone(title,sub) is the ONE place a real completion actually
+  // surfaces — checkCompletions() calls nothing else. It already beeps
+  // (gated on soundOn) and, only while the tab is hidden, raises a desktop
+  // Notification (also gated on soundOn) — both exactly as classic does,
+  // unchanged, and already firing regardless of UI mode. Its own toast()
+  // call writes into the classic `#toasts` div, which setUiMode('next')
+  // hides — invisible in Control Room. So the one thing missing here is a
+  // VISIBLE toast, added by wrapping notifyDone exactly like `track()` a
+  // few lines up (call the real implementation, then do the CR-specific
+  // extra) — reuse, not a second implementation of the detector.
+  //
+  // Double-notification guard: skip the CR toast while `document.hidden` is
+  // true. At that point `_origNotifyDone` above already raised the (soundOn-
+  // gated) desktop Notification; cr_dialogs.js's own toast() ALSO raises its
+  // own separate Notification() whenever `document.hidden`, UNGATED by
+  // soundOn (verified by reading that function) — emitting 'notify' here too
+  // would double THAT desktop alert. Nobody is looking at either toast stack
+  // while the tab is hidden anyway, so skipping the CR one costs nothing.
+  var _origNotifyDone = (typeof notifyDone === 'function') ? notifyDone : null;
+  if (_origNotifyDone) {
+    notifyDone = function (title, sub) {
+      _origNotifyDone(title, sub);   // unchanged: classic toast (hidden here) + soundOn-gated beep/Notification
+      if (getUiMode() !== 'next' || !mounted) return;
+      if (!document.hidden) emit('notify', { title: title, meta: sub || '' });
+      if (window.CR.dialogs && typeof window.CR.dialogs.showNudgeIfNeeded === 'function') {
+        window.CR.dialogs.showNudgeIfNeeded();
+      }
+    };
+  }
+
+  // ----------------------------------------------------------------------
+  // Keyboard.
+  //
+  // NOTE: cr_board.js already binds ⌘K/Ctrl+K (focus rail search), j/k (tile
+  // focus), t (open terminal for the focused tile), ? (ctx.emit('open:help')),
+  // and Escape (clear the active triage filter) globally on `document` inside
+  // its own mount() — verified by reading that file, not assumed. Binding the
+  // SAME keys again here would double-fire them (e.g. two stacked Help
+  // dialogs from one `?` press). So this file deliberately does NOT rebind
+  // them; '?' already reaches Help through the 'open:help' bridge above. The
+  // one shortcut genuinely uncovered by any module is Esc-closes-a-dialog,
+  // which cr_dialogs.js's own mount() also already binds on `document`. There
+  // is therefore nothing left for this file to bind without duplicating a
+  // sibling's own listener.
+  // ----------------------------------------------------------------------
+
+  // ----------------------------------------------------------------------
+  // The classic entry button + first-run panel (02-shell-and-board.md
+  // "The opt-in entry"). Copy reproduced verbatim from the doc.
+  // ----------------------------------------------------------------------
+  var frScrim = null;
+  function buildFirstRun() {
+    if (frScrim) return;
+    frScrim = document.createElement('div');
+    // `tracker-next` (+ live `is-dark`) directly on this element: it is
+    // appended to <body>, not inside #nextRoot (which is still hidden here —
+    // classic mode hasn't switched yet), so it needs its own token scope
+    // rather than inheriting one from a hidden ancestor.
+    frScrim.className = 'cr-scrim tracker-next' + (resolveTheme() === 'dark' ? ' is-dark' : '');
+    frScrim.hidden = true;
+    frScrim.innerHTML =
+      '<div class="cr-firstrun" role="dialog" aria-modal="true" aria-labelledby="crFrHeading">' +
+        '<div class="cr-firstrun-preview" aria-hidden="true">' +
+          '<div class="cr-firstrun-tiles">' +
+            '<div class="cr-firstrun-tile is-wide"></div>' +
+            '<div class="cr-firstrun-tile"></div>' +
+            '<div class="cr-firstrun-tile"></div>' +
+            '<div class="cr-firstrun-tile"></div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="cr-firstrun-copy">' +
+          '<h2 id="crFrHeading">A board that answers one question first: who needs you?</h2>' +
+          '<p>Same data, same 2-second poll, same read-only promise. Sessions become tiles ranked by their claim on your attention, and the session view keeps a collapsed rail so switching stays one click.</p>' +
+          '<ul class="cr-firstrun-checks">' +
+            '<li>' + icon('check') + '<span>Every panel you use today is still here — nothing was removed.</span></li>' +
+            '<li>' + icon('check') + '<span>Follows your system theme, and you can flip it any time.</span></li>' +
+            '<li>' + icon('check') + '<span>One click back to the classic dashboard, any time, no reload.</span></li>' +
+          '</ul>' +
+          '<div class="cr-firstrun-actions">' +
+            '<button type="button" class="cr-firstrun-open" id="crFrOpen">Open the board</button>' +
+            '<button type="button" class="cr-firstrun-skip" id="crFrSkip">Not now</button>' +
+          '</div>' +
+          '<p class="cr-firstrun-foot">Inside the new experience the header carries ← Classic dashboard.</p>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(frScrim);
+    frScrim.addEventListener('click', function (e) { if (e.target === frScrim) hideFirstRun(); });
+    document.getElementById('crFrOpen').addEventListener('click', function () { hideFirstRun(); setUiMode('next'); });
+    document.getElementById('crFrSkip').addEventListener('click', function () { hideFirstRun(); });
+    on('theme:changed', function (payload) {
+      frScrim.classList.toggle('is-dark', payload && payload.theme === 'dark');
+    });
+  }
+  function hideFirstRun() { if (frScrim) frScrim.hidden = true; }
+  function markSeen() { try { localStorage.setItem('tracker.next.seen', '1'); } catch (e) {} }
+  function seenFirstRun() { try { return localStorage.getItem('tracker.next.seen') === '1'; } catch (e) { return false; } }
+
+  function wireEntryButton() {
+    var btn = document.getElementById('tryNext');
+    if (!btn) return;
+    btn.addEventListener('click', function () {
+      if (seenFirstRun()) { setUiMode('next'); return; }
+      buildFirstRun();
+      markSeen(); // "Show once" (doc) — never reappears after the first click, either button.
+      frScrim.hidden = false;
+    });
+  }
+
+  // ----------------------------------------------------------------------
+  // One-shot ?ui=next / ?ui=classic query override (persists thereafter).
+  // ----------------------------------------------------------------------
+  function applyQueryOverride() {
+    try {
+      var qp = new URLSearchParams(location.search).get('ui');
+      if (qp === 'next' || qp === 'classic') localStorage.setItem('tracker.ui', qp);
+    } catch (e) {}
+  }
+
+  // ----------------------------------------------------------------------
+  // Init — deferred past the end of the whole concatenated <script> (see the
+  // file-order note at the top) so every sibling ext_cr_*.js has already run.
+  // ----------------------------------------------------------------------
+  function init() {
+    buildRoots();
+    wireEntryButton();
+    applyQueryOverride();
+    if (getUiMode() === 'next') setUiMode('next'); // mounts, themes, refreshes, shows
+  }
+  setTimeout(init, 0);
+})();

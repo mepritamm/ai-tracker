@@ -1,0 +1,2079 @@
+/* cr_dialogs.js — Control Room dialog system: the modal host, Help, Config, the
+ * file-diff/output/text pop-out, the narration-diagram pop-out, the cross-session
+ * flag list, the terminals-at-cap dialog, toast notifications + the desktop-permission
+ * nudge, and the three shared state components (emptyState/errorState/degraded) that
+ * sibling modules (board, detail, terminal) reuse instead of forking their own.
+ *
+ * Doc: design_handoff_control_room/04-coverage-and-help.md (source of truth for every
+ * string, colour and layout below). NO FETCHING, with ONE narrow exception: every dialog
+ * is fed by the payload its opener passes to CR.dialogs.open(name, payload) and none of
+ * them call fetch() — except the Config dialog's Board/Terminal/Server rows, which are now
+ * real, writable server settings (POST /api/config) and so read their own live state via
+ * GET /api/config the moment they open, entirely inside renderConfig()/its own helpers
+ * (fetchServerConfig/postConfigValue below). Every other dialog in this file is still fed
+ * purely by its opener's payload.
+ *
+ * NOTE: foundations doc 01 writes tokens as `--surface-raised` etc. The shared contract
+ * for this build renames that layer `--ads-*` (confirmed against the prototype's own
+ * `.ads-label` / `--ads-line-default` naming, which this file's author independently
+ * grepped for — never read as a design source). Every colour/shadow/font rule below
+ * reads `var(--ads-<name>, <doc-01 light value>)` — the fallback keeps this module
+ * legible before aitracker/web/cr.css finishes defining the real tokens, it is not a
+ * substitute for them.
+ */
+(function () {
+  'use strict';
+  window.CR = window.CR || {};
+
+  var _ctx = null;
+  var _root = null;      // the `.cr` root element passed to mount()
+  var _layer = null;     // dialog-layer host, appended once inside _root
+  var _toastHost = null;
+  var _stack = [];        // [{name, el, backdrop, opener, trapCleanup, onClose}]
+  var _idSeq = 0;
+
+  // ---------------------------------------------------------------------------
+  // small utilities
+  // ---------------------------------------------------------------------------
+
+  function h(tag, attrs, children) {
+    var el = document.createElement(tag);
+    attrs = attrs || {};
+    for (var k in attrs) {
+      if (!Object.prototype.hasOwnProperty.call(attrs, k)) continue;
+      var v = attrs[k];
+      if (v == null || v === false) continue;
+      if (k === 'class') el.className = v;
+      else if (k === 'html') el.innerHTML = v;
+      else if (k === 'text') el.textContent = v;
+      else if (k.indexOf('on') === 0 && typeof v === 'function') el.addEventListener(k.slice(2), v);
+      else if (k === 'aria-hidden' || k.indexOf('aria-') === 0 || k.indexOf('data-') === 0 || k === 'role' || k === 'for' || k === 'tabindex') el.setAttribute(k, v);
+      else el.setAttribute(k, v);
+    }
+    (children || []).forEach(function (c) {
+      if (c == null) return;
+      el.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    });
+    return el;
+  }
+
+  // FIX 4: this used to redeclare its own esc() here — an exact second copy of
+  // ext_cr_detail.js's, itself a copy of app.js's global `esc()` (app.js:7) plus quote
+  // escaping. The only call site below (a plain digit count, ~line 700) doesn't
+  // interpolate into an HTML attribute, so nothing here actually needs the quote
+  // handling — this file now falls through to app.js's own top-level `esc()`, reachable
+  // by bare name like every other app.js top-level declaration (no local shadow left to
+  // block it). ext_cr_detail.js keeps the one quote-escaping esc() Control Room still
+  // needs (its attribute-interpolation call sites genuinely require it); REQUIRED
+  // ADDITION: app.js's `esc()` should absorb `"`/`'` escaping so even that copy can go.
+
+  // Strips terminal escape sequences for the plain-text `renderRunOutput` pane below.
+  // This is NOT ext_run.js's ansiHtml() (SGR -> <span class="aNN">, HTML-escaped) — that
+  // renderer earns real colour by building markup, which this pane deliberately does not
+  // do (textContent only, per this pass's brief). Dropping the codes instead of leaving
+  // them as literal garbage bytes is the cheaper honest middle ground: plain, readable
+  // text, still zero HTML risk since nothing here is ever parsed as markup.
+  function stripAnsi(s) {
+    return (s || '')
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')   // OSC ... BEL/ST
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')               // CSI (incl. SGR colour)
+      .replace(/\x1b[@-Z\\-_]/g, '')                        // two-char escapes
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');        // stray control bytes (keep \r\n)
+  }
+
+  function icon(name, cls) {
+    if (_ctx && typeof _ctx.icon === 'function') {
+      // ctx.icon(name) returns an SVG STRING, not a DOM node (see ext_cr_boot.js's
+      // icon()) — wrap it to get a real element, matching cr_board.js's icon().
+      var svg = _ctx.icon(name);
+      if (svg) {
+        var wrap = document.createElement('span');
+        wrap.innerHTML = svg;
+        var node = wrap.firstElementChild;
+        if (node) { if (cls) node.classList.add(cls); return node; }
+      }
+    }
+    return fallbackGlyph(name, cls);
+  }
+
+  // FIX 5: this table used to carry all 13 of ext_cr_boot.js's GLYPHS entries (pixel-
+  // identical, verified by reading that file) just to add one extra key, 'close', that
+  // boot's table lacks. icon() above already tries ctx.icon(name) — backed by boot's
+  // table — FIRST for every name, so the duplicated entries were only ever reached as a
+  // fallback for 'close' itself, or in the (untested-in-practice) case ctx is missing
+  // entirely, in which case nothing beyond 'close' had a real local path to fall to
+  // anyway. Trimmed to the one key this file actually owns. REQUIRED ADDITION: boot's
+  // GLYPHS/icon() should absorb 'close' so this fallback table can go away completely.
+  var GLYPH_PATHS = {
+    close: 'M6 6l12 12M18 6L6 18'
+  };
+  function fallbackGlyph(name, cls) {
+    var d = GLYPH_PATHS[name] || GLYPH_PATHS.close;
+    var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('width', '16');
+    svg.setAttribute('height', '16');
+    svg.setAttribute('aria-hidden', 'true');
+    svg.setAttribute('class', 'cr-glyph' + (cls ? ' ' + cls : ''));
+    var p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    p.setAttribute('d', d);
+    p.setAttribute('fill', 'none');
+    p.setAttribute('stroke', 'currentColor');
+    p.setAttribute('stroke-width', '1.75');
+    p.setAttribute('stroke-linecap', 'round');
+    p.setAttribute('stroke-linejoin', 'round');
+    svg.appendChild(p);
+    return svg;
+  }
+
+  function copyBtn(getText) {
+    var btn = h('button', { class: 'cr-copybtn', type: 'button', 'aria-label': 'Copy' },
+      [icon('panel'), h('span', { text: 'Copy' })]);
+    btn.addEventListener('click', function () {
+      var text = getText();
+      var done = function () {
+        btn.classList.add('is-done');
+        btn.querySelector('span').textContent = 'Copied';
+        setTimeout(function () {
+          btn.classList.remove('is-done');
+          btn.querySelector('span').textContent = 'Copy';
+        }, 1400);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, done);
+      } else {
+        var ta = document.createElement('textarea');
+        ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); } catch (e) {}
+        document.body.removeChild(ta);
+        done();
+      }
+    });
+    return btn;
+  }
+
+  function glyph(name, cls, label) {
+    var span = h('span', { class: 'cr-emo tn-emo' + (cls ? ' ' + cls : ''), 'aria-hidden': 'true', title: label || null });
+    var iconEl = icon(name);
+    if (iconEl) span.appendChild(iconEl);
+    return span;
+  }
+
+  // ---------------------------------------------------------------------------
+  // shared state components — exported so board/detail/terminal reuse rather than fork
+  // ---------------------------------------------------------------------------
+
+  // CR.dialogs.emptyState({title, body, icon}) -> HTMLElement
+  // Doc 04 "Two different empties" — the "nothing yet" case: dashed --ads-line-default box.
+  function emptyState(opts) {
+    opts = opts || {};
+    return h('div', { class: 'cr-state cr-state-empty', role: 'note' }, [
+      h('div', { class: 'cr-state-title' }, [opts.title || 'Nothing here yet']),
+      h('div', { class: 'cr-state-body' }, [opts.body || 'It will fill in as it works.']),
+    ]);
+  }
+
+  // CR.dialogs.errorState({title, body}) -> HTMLElement
+  // Doc 04 "Two different empties" — the "something broke" case: --ads-surface-failed + line-failed.
+  function errorState(opts) {
+    opts = opts || {};
+    return h('div', { class: 'cr-state cr-state-error', role: 'alert' }, [
+      h('div', { class: 'cr-state-title' }, [glyph('alert', 'tn-emo-f'), ' ', opts.title || "Couldn't read this"]),
+      h('div', { class: 'cr-state-body' }, [opts.body || 'Everything before the failure is shown.']),
+    ]);
+  }
+
+  // CR.dialogs.degraded({panelLabel, providerLabel, pill, message, readable, footer}) -> HTMLElement
+  // Doc 04 "Degraded provider" card — an explanation, not an empty panel.
+  function degraded(opts) {
+    opts = opts || {};
+    var panelLabel = opts.panelLabel || 'NARRATION';
+    var providerLabel = opts.providerLabel || '';
+    var pill = opts.pill || 'NOT ON DISK';
+    var message = opts.message ||
+      "This tool's chat transcript isn't stored anywhere the tracker can read. The tracker " +
+      "is stdlib-only, so it can't decode a proprietary/binary store.";
+    var readable = opts.readable ||
+      'What IS readable is shown in full: todos and files touched. Nothing is being hidden ' +
+      'or approximated.';
+    var footer = opts.footer || 'Empty because it cannot exist — not because something broke.';
+    return h('div', { class: 'cr-degraded', role: 'note' }, [
+      h('div', { class: 'cr-degraded-head' }, [
+        h('span', { class: 'cr-degraded-label' }, [panelLabel]),
+        h('span', { class: 'cr-degraded-provider' }, [providerLabel]),
+      ]),
+      h('div', { class: 'cr-degraded-rule' }),
+      h('div', { class: 'cr-degraded-pill' }, [pill]),
+      h('div', { class: 'cr-degraded-msg' }, [message]),
+      h('div', { class: 'cr-degraded-readable' }, [readable]),
+      h('div', { class: 'cr-degraded-footer' }, [footer]),
+    ]);
+  }
+
+  // A dashed, dismissible "turn on desktop alerts" row. Callers (board's top bar owns
+  // placement) mount the returned element wherever they like; shown once, ever, unless
+  // localStorage is cleared. Never call this on first paint — wait for the first
+  // notify-worthy event.
+  function notificationNudge() {
+    if (localStorage.getItem('cr.notif.nudgeDismissed') === '1') return null;
+    if (!('Notification' in window) || Notification.permission !== 'default') return null;
+    var row = h('div', { class: 'cr-nudge', role: 'note' }, [
+      glyph('bell', 'tn-emo'),
+      h('span', { class: 'cr-nudge-text' }, [
+        'Desktop alerts are off. Turn them on to hear about finished agents while this tab is in the background.',
+      ]),
+      h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Allow' }),
+      h('button', { class: 'cr-nudge-x', type: 'button', 'aria-label': 'Dismiss', html: '&times;' }),
+    ]);
+    row.querySelector('.cr-btn').addEventListener('click', function () {
+      Notification.requestPermission().then(function () {
+        localStorage.setItem('cr.notif.nudgeDismissed', '1');
+        row.remove();
+      });
+    });
+    row.querySelector('.cr-nudge-x').addEventListener('click', function () {
+      localStorage.setItem('cr.notif.nudgeDismissed', '1');
+      row.remove();
+    });
+    return row;
+  }
+
+  // CR.dialogs.showNudgeIfNeeded() — Fix 1c: notificationNudge() was fully built to
+  // spec but had ZERO call sites, so it never appeared. This mounts it (floating,
+  // bottom-left, clear of the toast stack at bottom-right) the first time this module
+  // is asked to — the
+  // caller (ext_cr_boot.js) calls it right when it has a real notify-worthy event
+  // (a session landing), satisfying "never on first paint". Idempotent per page life:
+  // notificationNudge() itself already returns null once dismissed/granted/denied, and
+  // _nudgeAttempted stops this from re-querying/re-inserting on every later completion.
+  var _nudgeAttempted = false;
+  function showNudgeIfNeeded() {
+    if (_nudgeAttempted || !_root) return;
+    _nudgeAttempted = true;
+    var el = notificationNudge();
+    if (!el) return;
+    el.classList.add('cr-nudge-float');
+    _root.appendChild(el);
+  }
+
+  // ---------------------------------------------------------------------------
+  // toast notifications (capability #51) — a stack in the corner, plus a real
+  // Notification() when the tab is backgrounded.
+  // ---------------------------------------------------------------------------
+
+  // toast(opts) — opts is EITHER a bare string (used as the title) OR an object.
+  // NOTE (Fix 1a — payload contract): ext_cr_boot.js's ~20 confirmation emitters
+  // (rename/note/flag/etc.) call `ctx.emit('notify', {text: "..."})`; this function
+  // used to read only `opts.title`/`opts.meta`, so every one of those rendered as a
+  // blank-bodied generic "Finished" toast. `opts.text` is now accepted as an alias for
+  // `opts.title` — the ONE shape going forward is {title, meta} (meta optional, mono
+  // submeta line per doc 04's Toast spec), with `text` kept only for that existing
+  // caller population and a bare string tolerated too.
+  function toast(opts) {
+    if (typeof opts === 'string') opts = { title: opts };
+    opts = opts || {};
+    if (!_toastHost) return;
+    var title = opts.title || opts.text || 'Finished';
+    var dismissed = false;
+    var timer = null;
+    var el = h('div', { class: 'cr-toast', role: 'status' }, [
+      glyph(opts.icon || 'check', opts.iconClass || 'tn-emo-d'),
+      h('div', { class: 'cr-toast-body' }, [
+        h('div', { class: 'cr-toast-title' }, [title]),
+        opts.meta ? h('div', { class: 'cr-toast-meta' }, [opts.meta]) : null,
+      ]),
+      opts.actionLabel ? h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: opts.actionLabel }) : null,
+      h('button', { class: 'cr-toast-x', type: 'button', 'aria-label': 'Dismiss', html: '&times;' }),
+    ]);
+    function dismiss() { if (dismissed) return; dismissed = true; clearTimeout(timer); el.remove(); }
+    var actionBtn = el.querySelector('.cr-btn');
+    if (actionBtn) actionBtn.addEventListener('click', function () { if (opts.onAction) opts.onAction(); dismiss(); });
+    el.querySelector('.cr-toast-x').addEventListener('click', dismiss);
+    function arm() { timer = setTimeout(dismiss, opts.duration || 8000); }
+    function disarm() { clearTimeout(timer); }
+    el.addEventListener('mouseenter', disarm);
+    el.addEventListener('mouseleave', function () { if (!document.hidden) arm(); });
+    el.addEventListener('focusin', disarm);
+    el.addEventListener('focusout', function () { if (!document.hidden) arm(); });
+    _toastHost.appendChild(el);
+    if (!document.hidden) arm(); // "never auto-dismiss while [the tab is] focused" — see NOTE below
+
+    // FIX 3 (real bug, reported twice): this used to also raise `new Notification(...)`
+    // here whenever the tab was hidden (soundOn-gated as of FIX 2 above) — but this
+    // function is the SAME toast() called for every routine confirmation on the bus
+    // (rename/note/flag/run-command/etc., ~20 call sites in ext_cr_boot.js), not just
+    // real completions. A desktop Notification carries the OS's own notification sound
+    // by default, so backgrounding the tab and, say, renaming a session or resolving a
+    // flag popped an audible alert — exactly the "sound every time" complaint, and
+    // exactly the classic dashboard's app.js toast() (~app.js:1139) never does this: it
+    // is purely a visual banner, full stop. The ONE place a real completion is allowed
+    // to raise a desktop Notification is app.js's own notifyDone() (app.js ~1152,
+    // soundOn-gated, called unchanged via ext_cr_boot.js's wrapper for every genuine
+    // running->done transition) — already independent of this function entirely, so
+    // deleting this block loses no real-completion alert, only the spurious ones this
+    // function was never supposed to raise.
+    return dismiss;
+  }
+  // NOTE: doc 04 reads "Auto-dismiss 8s; pause on hover; never auto-dismiss while
+  // focused." The most consistent reading with "Desktop notification — only when the
+  // tab is backgrounded" (the very next bullet) is PAGE focus, not element focus — a
+  // toast should sit still while you're actively looking at the tab. Implemented that
+  // way: the arm()/disarm() pair above also keys off document.hidden.
+
+  // ---------------------------------------------------------------------------
+  // focus trap + dialog host
+  // ---------------------------------------------------------------------------
+
+  var FOCUSABLE = 'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
+
+  function trapFocus(container) {
+    function within(list) { return Array.prototype.slice.call(container.querySelectorAll(FOCUSABLE)).filter(function (n) { return n.offsetParent !== null || n === document.activeElement; }); }
+    function onKeydown(e) {
+      if (e.key !== 'Tab') return;
+      var f = within();
+      if (!f.length) { e.preventDefault(); return; }
+      var first = f[0], last = f[f.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+    container.addEventListener('keydown', onKeydown);
+    return function () { container.removeEventListener('keydown', onKeydown); };
+  }
+
+  function topEntry() { return _stack[_stack.length - 1] || null; }
+
+  function onDocKeydown(e) {
+    if (e.key !== 'Escape') return;
+    var top = topEntry();
+    if (!top) return;
+    e.preventDefault();
+    close();
+  }
+
+  // CR.dialogs.mount(rootEl, ctx)
+  function mount(rootEl, ctx) {
+    _ctx = ctx;
+    _root = rootEl;
+    _layer = h('div', { class: 'cr-dialog-layer', 'aria-hidden': 'true' });
+    _toastHost = h('div', { class: 'cr-toast-host', 'aria-live': 'polite' });
+    _root.appendChild(_layer);
+    _root.appendChild(_toastHost);
+    document.addEventListener('keydown', onDocKeydown);
+    if (ctx && typeof ctx.on === 'function') {
+      // Shared bus convention (documented in the handoff report): any module can raise
+      // a toast without depending on this module directly by emitting 'notify'.
+      ctx.on('notify', function (payload) { toast(payload || {}); });
+      ctx.on('dialog:open', function (payload) { open((payload && payload.name) || '', payload && payload.data); });
+      ctx.on('dialog:close', function () { close(); });
+    }
+  }
+
+  function buildChrome(name, title, emo, contextStr, wide, emoCls) {
+    var titleId = 'cr-dlg-title-' + (++_idSeq);
+    var backdrop = h('div', { class: 'cr-backdrop' });
+    var panel = h('div', {
+      class: 'cr-dialog' + (wide ? ' cr-dialog-wide' : ''),
+      role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': titleId,
+      'data-cr-dialog': name,
+    });
+    var head = h('div', { class: 'cr-dialog-head' }, [
+      h('div', { class: 'cr-dialog-heading' }, [
+        // emo: an icon NAME (see the sprite symbol list); emoCls: role-tint
+        // class for it (e.g. 'tn-emo-f' for the flags dialog) — defaults to
+        // the base tint when omitted.
+        emo ? glyph(emo, emoCls || null) : null,
+        h('h2', { id: titleId, class: 'cr-dialog-title' }, [title]),
+      ]),
+      h('div', { class: 'cr-dialog-context' }, [contextStr || '']),
+      h('button', { class: 'cr-dialog-close', type: 'button', 'aria-label': 'Close (Esc)' }, [icon('close')]),
+    ]);
+    var body = h('div', { class: 'cr-dialog-body' });
+    panel.appendChild(head);
+    panel.appendChild(body);
+    head.querySelector('.cr-dialog-close').addEventListener('click', close);
+    backdrop.addEventListener('mousedown', function (e) { if (e.target === backdrop) close(); });
+    return { backdrop: backdrop, panel: panel, body: body };
+  }
+
+  // CR.dialogs.open(name, payload)
+  //
+  // Ground-truth check against the sibling modules already on disk (cr_detail.js,
+  // cr_term.js) found several dialogs opened MORE THAN ONCE for the same name in
+  // quick succession, with progressively richer payloads — e.g. "directory-picker"
+  // opens immediately with {loading:true}, then again once GET /api/term/cwds
+  // resolves; "manage-terminals" opens with an empty list then again with real
+  // data or an error. Re-opening the same name while it's already the topmost
+  // dialog updates it in place (via the builder's own `update`) instead of
+  // stacking a second copy on top of itself.
+  function open(name, payload) {
+    var top = topEntry();
+    if (top && top.name === name && typeof top.update === 'function') {
+      top.update(payload || {});
+      return;
+    }
+    var builder = REGISTRY[name];
+    if (!builder) { return; }
+    var opener = document.activeElement;
+    var built = builder(payload || {});
+    if (!built) return;
+    var wrap = h('div', { class: 'cr-dialog-wrap' }, [built.backdrop, built.panel]);
+    _layer.appendChild(wrap);
+    _layer.setAttribute('aria-hidden', 'false');
+    var untrap = trapFocus(built.panel);
+    // wantsPoll: an opt-in flag a dialog's builder sets on the object it returns
+    // (alongside backdrop/panel/update) to declare "feed me the poll broadcast".
+    // update() below refuses to forward a poll-tagged payload to any dialog that
+    // didn't opt in — see update()'s own comment for why this lives at the seam.
+    var entry = { name: name, wrap: wrap, panel: built.panel, opener: opener, untrap: untrap, update: built.update, wantsPoll: !!built.wantsPoll };
+    _stack.push(entry);
+    // Focus the first focusable control, else the panel itself.
+    var f = built.panel.querySelector(FOCUSABLE);
+    (f || built.panel).focus({ preventScroll: true });
+    if (!f) built.panel.setAttribute('tabindex', '-1');
+    if (_ctx && typeof _ctx.emit === 'function') _ctx.emit('dialog:opened', { name: name });
+  }
+
+  // CR.dialogs.close() — closes the topmost dialog only.
+  function close() {
+    var entry = _stack.pop();
+    if (!entry) return;
+    entry.untrap();
+    entry.wrap.remove();
+    if (!_stack.length) _layer.setAttribute('aria-hidden', 'true');
+    if (entry.opener && typeof entry.opener.focus === 'function') {
+      try { entry.opener.focus({ preventScroll: true }); } catch (e) {}
+    }
+    if (_ctx && typeof _ctx.emit === 'function') _ctx.emit('dialog:closed', { name: entry.name });
+  }
+
+  // CR.dialogs.update(state) — forwarded to the topmost dialog's own updater, if any.
+  //
+  // SEAM FIX: this is the ONLY caller ext_cr_boot.js's SIDE_EXT poll hook uses (it
+  // broadcasts {kind:'poll', flags, sessions, now} on every ~5s poll tick so the
+  // Flags dialog stays live without a second fetch loop) — and it used to forward
+  // that blob to WHICHEVER dialog happened to be topmost, unconditionally. A dialog
+  // that never asked for poll data (e.g. the directory picker, mid "+ New terminal"
+  // flow) would have its real payload clobbered the moment a poll tick landed while
+  // it was on screen. Fixing this per-dialog (as manage-terminals's own `update`
+  // closure below does, belt-and-braces) only protects the dialogs someone
+  // remembered to guard — the next dialog anyone adds inherits the bug by default.
+  // Fixing it HERE instead flips that default: a poll-tagged payload is refused
+  // unless the dialog's own builder opted in (`wantsPoll: true` on the object it
+  // returns from open()/REGISTRY[name](...) — see renderFlagsList, the one real
+  // consumer). Every other update() caller (a dialog's own re-open with a richer
+  // payload, via open()'s same-name dedupe path above) never carries `kind:'poll'`
+  // and is unaffected.
+  function update(state) {
+    var top = topEntry();
+    if (!top || typeof top.update !== 'function') return;
+    if (state && state.kind === 'poll' && !top.wantsPoll) return;
+    top.update(state);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Help dialog
+  // ---------------------------------------------------------------------------
+
+  // The 60-item capability map (doc 04). This is the data structure Help's Per-tool
+  // tab renders FROM — see the REQUIRED ADDITION in the report: ideally a Python
+  // self-check asserts against this same list so Help can never drift from what
+  // actually shipped; today only this JS copy exists.
+  var CAPABILITIES = [
+    [1, 'Every session, all tools, newest first', 'board'], [2, 'Source badge (7 sources)', 'board'],
+    [3, 'Live dot + 5-minute live window', 'board'], [4, 'Waiting-on-answer end-state', 'board'],
+    [5, 'Just-completed end-state', 'board'], [6, '"N live" filter', 'board'],
+    [7, 'Flag count badge + red edge', 'board'], [8, 'Notes count badge', 'board'],
+    [9, 'Cross-session flag list', 'dialogs'], [10, 'Search sessions, name matches first', 'board'],
+    [11, 'Rename a session', 'detail'], [12, 'Pin above recency', 'board'],
+    [13, 'Agents · repo collapsible group', 'board'], [14, 'In-transcript agents running badge', 'board+detail'],
+    [15, 'New terminal / new Claude session', 'terminal'], [16, 'Manage terminals + live count', 'terminal'],
+    [17, 'Notification bell', 'board'], [18, 'Theme toggle', 'board+dialogs+terminal'],
+    [19, "Idle sessions don't bury live ones", 'board'], [20, 'Progress ring -> progress spine', 'detail'],
+    [21, 'Stat chips (7)', 'detail'], [22, 'State / Activity split', 'detail'],
+    [23, 'Panels collapse to header, persisted', 'detail'], [24, 'Waiting-on-you header state', 'detail'],
+    [25, 'Summary Goal / Now / So far', 'detail'], [26, 'Decisions & open questions', 'detail'],
+    [27, "Narration, its own words", 'detail'], [28, 'Narration prev/next + jump-to-latest', 'detail'],
+    [29, 'Live follow / hold your place', 'detail'], [30, 'Unbounded history, page on scroll', 'detail'],
+    [31, 'Markdown rendering', 'detail'], [32, 'Mermaid -> SVG, 8 families', 'detail'],
+    [33, 'Copy per code block', 'detail'], [34, 'Prompts, incl. slash commands', 'detail'],
+    [35, 'Files + diff per edit', 'detail+dialogs'], [36, 'Up/down context expansion', 'dialogs'],
+    [37, 'Expand all', 'dialogs'], [38, 'Diff <> Rendered markdown', 'dialogs'],
+    [39, 'Open in new tab', 'dialogs'], [40, 'Files written by agents, tagged', 'detail'],
+    [41, 'Commands with pass/fail', 'detail'], [42, 'Pull requests, created only', 'detail'],
+    [43, 'merged/closed badges', 'detail'], [44, 'Agent-opened PRs attributed', 'detail'],
+    [45, 'Links, generated vs worked on (new panel)', 'detail'], [46, 'Plan on the go: add/copy/push/remove', 'detail'],
+    [47, 'Delivery chips (turn-end / on wake / copy it)', 'detail'], [48, 'Background agents & shells', 'detail'],
+    [49, 'Re-run collapse', 'detail'], [50, 'Show N finished', 'detail'],
+    [51, 'Toast + sound + desktop notification', 'dialogs'], [52, 'Fork lineage banner + back-link', 'detail'],
+    [53, 'Search within the session', 'detail'], [54, 'Command runner + constraint stated', 'detail'],
+    [55, 'Model / effort switchers', 'terminal+detail'], [56, 'Context readout', 'terminal+detail'],
+    [57, 'Open / resume / external terminal', 'detail+terminal'], [58, 'Degraded provider messaging', 'dialogs'],
+    [59, 'Config dialog (new)', 'dialogs'], [60, 'Progress spine (new)', 'detail'],
+  ];
+  var OWNER_LABEL = { board: 'Board', detail: 'Detail', terminal: 'Terminal', dialogs: 'Dialogs' };
+
+  var STATE_ROWS = [
+    ['Waiting on you', 'orange', 'Waiting on you · <age>', 'none'],
+    ['Working', 'wheat', 'Working', 'dot pulse, 2.4s'],
+    ['Flagged', 'rust', 'N flags open', 'none'],
+    ['Failing', 'brick', 'fail + command name', 'none'],
+    ['Landed', 'forest', 'Landed', 'none'],
+    ['Idle', 'grey', 'counted, not listed', 'none'],
+  ];
+
+  // Coverage tab's colour legend — round 5's final artboard (`5c`, the authoritative
+  // one per the owner's ruling; the docs were written from round 4 and never caught
+  // up). 5c draws exactly five rows: Waiting on you/orange, Working now/wheat, Your
+  // flags/rust, Evidence/dusk, Failures/brick. This is a COLOUR legend, not a literal
+  // board-state reference — "Evidence" is the detail view's own Evidence column
+  // (ext_cr_detail.js's "Evidence" eyebrow), tinted with --text-dusk, not a session
+  // status word — which is why it's a separate list from STATE_ROWS above (that one
+  // stays a real per-state reference for the States tab: When/Word shown/Motion,
+  // none of which "Evidence" has an honest answer for).
+  //
+  // Judgement call: Landed and Idle are genuine states the board renders (see
+  // ext_cr_board.css's .cr-rail-dot.is-landed / default idle grey, and STATE_ROWS
+  // above) but 5c's five rows don't mention them. Dropping them here would make this
+  // legend incomplete versus what the UI actually shows a viewer, so they're kept as
+  // two extra rows AFTER 5c's five, rather than silently carrying over the previous
+  // (wrong) wording for them.
+  var LEGEND_ROWS = [
+    ['Waiting on you', 'orange', 'Waiting on you · <age>'],
+    ['Working now', 'wheat', 'Working'],
+    ['Your flags', 'rust', 'N flags open'],
+    ['Evidence', 'dusk', 'Evidence'],
+    ['Failures', 'brick', 'fail + command name'],
+    ['Landed', 'forest', 'Landed'],
+    ['Idle', 'grey', 'counted, not listed'],
+  ];
+
+  // Providers actually registered in aitracker/registry.py (4, matching "4 tools" in
+  // the stat block) and where each is known — from the project README — to degrade.
+  //
+  // Fix 3: each entry now also carries `ids` — the REAL source/provider identifier(s)
+  // a session can carry (aitracker/web/app.js's own SRC map: "auggie", "augment-vscode",
+  // "augment-cursor", plus Claude's own cli/claude-desktop/sdk-cli/claude-vscode/"" —
+  // registry.py's unprefixed provider is the fallback). The audit's "live path silently
+  // skipped Auggie" finding was a caller pattern-matching a display NAME (or a fuzzy
+  // /augment/i.test() that a literal "auggie" string never trips, so it fell through to
+  // a default) instead of the real value — providerNoteFor() below is the single correct
+  // lookup so every consumer (this dialog's Per-tool tab, ext_cr_detail.js's degraded()
+  // callers) shares one answer instead of re-deriving it.
+  var PROVIDER_NOTES = [
+    { name: 'Claude Code', ids: ['', 'cli', 'claude-desktop', 'sdk-cli', 'claude-vscode'], ok: 'Full support, incl. background agents & shells and PR attribution.' },
+    { name: 'Auggie', ids: ['auggie'], ok: 'Full narration/todos/files/commands.', degraded: 'No background-work model — capability 48 shows empty-because-it-cannot-exist, not broken.' },
+    { name: 'Augment (VS Code)', ids: ['augment-vscode'], degraded: 'Chat transcript lives in a per-workspace LevelDB the tracker cannot decode — narration degrades honestly; todos and files still read in full.' },
+    { name: 'Augment (Cursor)', ids: ['augment-cursor'], degraded: 'Same LevelDB limitation as Augment (VS Code).' },
+  ];
+
+  // CR.dialogs.providerNoteFor(source) -> the matching PROVIDER_NOTES entry, or null if
+  // `source` isn't one of the four known providers. `source` is the session's real
+  // meta.source/source value (case-insensitive) — never a display name.
+  function providerNoteFor(source) {
+    var key = String(source == null ? '' : source).toLowerCase();
+    for (var i = 0; i < PROVIDER_NOTES.length; i++) {
+      if (PROVIDER_NOTES[i].ids.indexOf(key) !== -1) return PROVIDER_NOTES[i];
+    }
+    return null;
+  }
+
+  var HELP_SHORTCUTS = [
+    ['?', 'Open Help'], ['Esc', 'Close the topmost dialog'], ['⌘K / Ctrl+K', 'Search sessions'],
+  ];
+  // Sibling modules can add their own rows (e.g. terminal's PTY key bindings, board's
+  // rail shortcuts) without reaching into this file — see CR.dialogs.addHelpShortcuts.
+  function addHelpShortcuts(rows) {
+    (rows || []).forEach(function (r) { HELP_SHORTCUTS.push(r); });
+  }
+
+  var TERMINAL_REFERENCE = [
+    ['Scrollback', 'Mouse wheel; full-screen programs get arrow keys instead.'],
+    ['Copy', 'Cmd+C / Ctrl+Shift+C — plain Ctrl+C always sends SIGINT.'],
+    ['Native selection', 'Hold Shift to force a browser selection even under mouse tracking.'],
+    ['Modified keys', 'Ctrl/Shift/Alt/Meta + arrows, Home/End, Insert/Delete/PgUp/PgDn, F1–F12.'],
+    ['Alt+Enter', 'Sends newline-without-submit, not a submit.'],
+    ['Ctrl+Space', 'Sends NUL.'],
+    ['Mouse reporting', 'Press/drag/release/wheel forwarded to any program that asks for it.'],
+    ['Renderer switch', 'Toolbar theme toggle and a renderer control — xterm (default) or grid, per terminal.'],
+    ['Model / effort', '/model <name> and /effort <level> typed into the CLI when it is in the foreground.'],
+  ];
+
+  function helpCoverageTab() {
+    var wrap = h('div', { class: 'cr-help-tab' });
+    wrap.appendChild(h('h3', { class: 'cr-serif-h3' }, ['What this app can see, and what it can’t.']));
+    wrap.appendChild(h('p', { class: 'cr-lede' }, [
+      'It reads the session logs your tools already write. Nothing is sent anywhere, and it never writes into a session.',
+    ]));
+    wrap.appendChild(h('div', { class: 'cr-stat-row' }, [
+      h('div', { class: 'cr-stat cr-stat-forest' }, [h('div', { class: 'cr-stat-num' }, [String(CAPABILITIES.length)]), h('div', { class: 'cr-stat-label' }, ['capabilities'])]),
+      h('div', { class: 'cr-stat cr-stat-neutral' }, [h('div', { class: 'cr-stat-num' }, [String(PROVIDER_NOTES.length)]), h('div', { class: 'cr-stat-label' }, ['tools'])]),
+      h('div', { class: 'cr-stat cr-stat-dusk' }, [h('div', { class: 'cr-stat-num' }, ['0']), h('div', { class: 'cr-stat-label' }, ['bytes leaving'])]),
+    ]));
+    // NOTE (Fix 5, supersedes a prior NOTE here): doc 04's Coverage-tab copy literally
+    // said "58 capabilities" while the capability map below it enumerates 60 rows (2
+    // marked New: the Config dialog and the progress spine, both genuinely shipped —
+    // see docs 03/04) — an audit caught Help disagreeing with what shipped, which is
+    // exactly the drift "Generate the capability table from the same data structure the
+    // tests assert against" (doc 04) exists to prevent. Reconciled by deriving the stat
+    // from CAPABILITIES.length (60) instead of repeating the doc's stale literal;
+    // tests/test_capability_table.py pins this number so the two can't drift again.
+    var table = h('table', { class: 'cr-state-table' });
+    table.appendChild(h('thead', {}, [h('tr', {}, [h('th', {}, ['State']), h('th', {}, ['Colour']), h('th', {}, ['Word shown'])])]));
+    var tbody = h('tbody');
+    LEGEND_ROWS.forEach(function (r) {
+      tbody.appendChild(h('tr', {}, [
+        h('td', {}, [r[0]]),
+        h('td', {}, [h('span', { class: 'cr-swatch cr-swatch-' + r[1] }), ' ' + r[1]]),
+        h('td', { class: 'cr-mono' }, [r[2]]),
+      ]));
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+
+    wrap.appendChild(h('div', { class: 'cr-seccards' }, [
+      h('div', { class: 'cr-seccard cr-seccard-brick' }, [
+        h('div', { class: 'cr-seccard-title' }, [glyph('alert', 'tn-emo-f'), ' Read this before you expose the server']),
+        h('ul', {}, [
+          h('li', {}, ['The in-browser terminal is an unrestricted shell, reachable wherever the server is — no allowlist applies to it.']),
+          h('li', {}, ['Treat TRACKER_AUTH with the seriousness you’d give a root password, and rotate it if you expose it publicly.']),
+          h('li', {}, ['"Local only" on the external-terminal buttons is best-effort, not a guarantee — a tunnel terminates locally too.']),
+        ]),
+      ]),
+      h('div', { class: 'cr-seccard cr-seccard-forest' }, [
+        h('div', { class: 'cr-seccard-title' }, [glyph('check', 'tn-emo-d'), ' What is actually confined']),
+        h('ul', {}, [
+          h('li', {}, ['cat and ls in the command runner are confined to the session’s own directory — they can’t read your keys.']),
+          h('li', {}, ['The command runner has no shell: argv is shlex.split and execvp’d, so shell metacharacters are never operators.']),
+          h('li', {}, ['git’s known config-driven exec vectors (external diff/textconv, fsmonitor, hooksPath, pager, editor) are neutralised.']),
+        ]),
+      ]),
+    ]));
+    // NOTE (fixes a prior wrong claim here): that prior note said no section titled
+    // "Read this before you expose the server" exists anywhere in the source material —
+    // true of the docs (README/doc 04), but FALSE of the actual prototype: the sentence
+    // is verbatim in the design file's `4e` artboard (the discarded full-page-Help
+    // exploration) as the eyebrow over this exact pair of cards, and the owner's
+    // ruling makes the artboards authoritative over the docs. `5c` (the final, in-scope
+    // Help/Config-as-dialogs artboard) doesn't redraw this heading itself, so `4e` fills
+    // in the detail per the ruling's own allowance for that. Adopted verbatim above as
+    // the brick card's title, replacing the old "If you expose this beyond localhost"
+    // wording. The list content itself still has no verbatim doc/prototype source, so
+    // it stays the README-derived copy ("What these features do and don't guarantee",
+    // README.md:104-108) it always was.
+
+    wrap.appendChild(h('div', { class: 'cr-help-footer' }, [
+      glyph('puzzle', 'tn-emo'),
+      h('span', {}, ['Your tool isn’t listed? A provider is two functions.']),
+      h('a', { class: 'cr-link', href: '#', text: 'Read' }),
+    ]));
+    return wrap;
+  }
+
+  function helpStatesTab() {
+    var wrap = h('div', { class: 'cr-help-tab' });
+    wrap.appendChild(h('h3', { class: 'cr-serif-h3' }, ['Six states, one word each.']));
+    var table = h('table', { class: 'cr-state-table' });
+    table.appendChild(h('thead', {}, [h('tr', {}, [h('th', {}, ['State']), h('th', {}, ['When']), h('th', {}, ['Word shown']), h('th', {}, ['Motion'])])]));
+    var tbody = h('tbody');
+    var WHEN = ['Unanswered AskUserQuestion / ask-user', 'Active within the live window', 'You raised a flag',
+      'A command/test returned non-zero', 'Last turn completed inside the live window', 'Untouched 5+ minutes'];
+    STATE_ROWS.forEach(function (r, i) {
+      tbody.appendChild(h('tr', {}, [
+        h('td', {}, [h('span', { class: 'cr-swatch cr-swatch-' + r[1] }), ' ' + r[0]]),
+        h('td', {}, [WHEN[i]]),
+        h('td', { class: 'cr-mono' }, [r[2]]),
+        h('td', {}, [r[3]]),
+      ]));
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    wrap.appendChild(h('p', { class: 'cr-lede' }, ['Waiting outranks everything, including recency.']));
+    return wrap;
+  }
+
+  function helpKeyboardTab() {
+    var wrap = h('div', { class: 'cr-help-tab' });
+    wrap.appendChild(h('h3', { class: 'cr-serif-h3' }, ['Keyboard']));
+    var table = h('table', { class: 'cr-kbd-table' });
+    HELP_SHORTCUTS.forEach(function (r) {
+      table.appendChild(h('tr', {}, [h('td', {}, [h('kbd', { class: 'cr-kbd' }, [r[0]])]), h('td', {}, [r[1]])]));
+    });
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  function helpTerminalTab() {
+    var wrap = h('div', { class: 'cr-help-tab' });
+    wrap.appendChild(h('h3', { class: 'cr-serif-h3' }, ['Terminal reference']));
+    var table = h('table', { class: 'cr-kbd-table' });
+    TERMINAL_REFERENCE.forEach(function (r) {
+      table.appendChild(h('tr', {}, [h('td', { class: 'cr-mono' }, [r[0]]), h('td', {}, [r[1]])]));
+    });
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  function helpPerToolTab() {
+    var wrap = h('div', { class: 'cr-help-tab' });
+    wrap.appendChild(h('h3', { class: 'cr-serif-h3' }, ['Per-tool coverage']));
+    PROVIDER_NOTES.forEach(function (p) {
+      var card = h('div', { class: 'cr-provider-card' + (p.degraded ? ' is-degraded' : '') }, [
+        h('div', { class: 'cr-provider-name' }, [p.name]),
+        p.ok ? h('div', { class: 'cr-provider-note' }, [glyph('check', 'tn-emo-d'), ' ' + p.ok]) : null,
+        p.degraded ? h('div', { class: 'cr-provider-note cr-provider-degraded' }, [glyph('hourglass', 'tn-emo-a'), ' ' + p.degraded]) : null,
+      ]);
+      wrap.appendChild(card);
+    });
+    wrap.appendChild(h('p', { class: 'cr-help-note' }, [
+      esc(CAPABILITIES.length) + ' capabilities tracked across ' + PROVIDER_NOTES.length + ' providers — generated from the same list this dialog’s Coverage tab counts from.',
+    ]));
+    return wrap;
+  }
+
+  var HELP_TABS = [
+    ['coverage', 'Coverage', helpCoverageTab],
+    ['states', 'States', helpStatesTab],
+    ['keyboard', 'Keyboard', helpKeyboardTab],
+    ['terminal', 'Terminal', helpTerminalTab],
+    ['per-tool', 'Per-tool', helpPerToolTab],
+  ];
+
+  function renderHelp(payload) {
+    // Header subtitle: 5c gives Help a bare "?" (not "ai-tracker" — that was never
+    // this dialog's real subtitle, just a placeholder left over before the artboard
+    // was consulted).
+    var chrome = buildChrome('help', 'Help', 'help', '?', false);
+    chrome.panel.classList.add('cr-dialog-help');
+    var tabs = h('div', { class: 'cr-tabpills', role: 'tablist' });
+    var pane = h('div', { class: 'cr-tabpane' });
+    var active = (payload && payload.tab) || 'coverage';
+    function renderActive() {
+      pane.innerHTML = '';
+      var entry = HELP_TABS.filter(function (t) { return t[0] === active; })[0] || HELP_TABS[0];
+      pane.appendChild(entry[2]());
+      Array.prototype.forEach.call(tabs.children, function (btn) {
+        var on = btn.getAttribute('data-tab') === active;
+        btn.classList.toggle('is-active', on);
+        btn.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+    }
+    HELP_TABS.forEach(function (t) {
+      var btn = h('button', { class: 'cr-tabpill', type: 'button', role: 'tab', 'data-tab': t[0], text: t[1] });
+      btn.addEventListener('click', function () { active = t[0]; renderActive(); });
+      tabs.appendChild(btn);
+    });
+    chrome.body.appendChild(tabs);
+    chrome.body.appendChild(pane);
+    renderActive();
+    return { backdrop: chrome.backdrop, panel: chrome.panel };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Config dialog — real parameters only (aitracker/config.py)
+  // ---------------------------------------------------------------------------
+
+  var CFG_PREF_KEYS = {
+    theme: null, // routed through ctx.theme, not localStorage, to avoid a second source of truth
+    // Fix 2a: the rail's REAL key is 'tracker.rail.mode' (a raw string
+    // 'auto'|'open'|'collapsed' — see readRailPref/writeRailPref below), not a JSON
+    // boolean under 'cr.railOpen'. Reset to defaults must clear the key the rail
+    // actually reads, or it silently resets everything EXCEPT the rail. The two dead
+    // predecessors are listed after it so a stray value from an earlier build still
+    // gets cleared.
+    railMode: 'tracker.rail.mode',
+    railLegacy: 'tracker.rail',
+    railOpen: 'cr.railOpen',
+    cardsFolded: 'cr.cardsFolded',
+    // Owner ruling: doc 04's board-tiles row is the authoritative spec — a 3–12 slider,
+    // default 8 — superseding doc 02's "never more than 8" cap. ext_cr_board.js's
+    // enforcement ceiling was raised to 12 in lockstep; the two MUST agree on both the
+    // key name and the value shape: a bare JSON-encoded integer (`JSON.stringify(n)`,
+    // i.e. the string "3".."12"), read back with `JSON.parse(localStorage.getItem(key))`.
+    // Client-side preference ONLY (never a server config.json key). Unset -> the board's
+    // own default (8) applies.
+    boardTiles: 'cr.boardTileCount',
+    pollMs: 'cr.pollIntervalMs',
+    desktopNotif: 'cr.notif.enabled',
+    sound: 'cr.notif.sound',
+  };
+
+  // Env-var chip text for each server config.json key (config.py's EDITABLE/VALIDATORS
+  // universe, plus AUTH which is displayed but never posted) — purely cosmetic labelling,
+  // matches the exact env var name each key falls back to per config.py's own _ENV_NAME.
+  var _ENVCHIP = {
+    LIVE_WINDOW: null,   // never had an env var of its own — config.json > built-in default
+    ICON_STYLE: null,    // ditto — no env var, config.json > built-in default
+    ICON_SCALE: null,    // ditto — no env var, config.json > built-in default
+    TERM_RENDERER: 'TRACKER_TERM_RENDERER',
+    MAX_TERMS: 'TRACKER_MAX_TERMS',
+    TERMINAL: 'TRACKER_TERMINAL',
+    TERM_APP: 'TRACKER_TERM_APP',
+    TERM_ALLOW: 'TRACKER_TERM_ALLOW',
+    PORT: 'PORT',
+    HOST: 'HOST',
+  };
+
+  function readPref(key, dflt) {
+    try {
+      var raw = localStorage.getItem(key);
+      if (raw == null) return dflt;
+      return JSON.parse(raw);
+    } catch (e) { return dflt; }
+  }
+  function writePref(key, val) {
+    try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {}
+    if (_ctx && typeof _ctx.emit === 'function') _ctx.emit('cr:pref', { key: key, value: val });
+  }
+
+  // Fix 2a — the session rail (ext_cr_board.js) reads/writes the RAW STRING key
+  // 'tracker.rail.mode' (never JSON, never a boolean). Config must write that SAME
+  // key/vocabulary, not a parallel 'cr.railOpen' boolean nothing reads.
+  // The vocabulary is TRI-state — 'auto' | 'open' | 'collapsed', default 'auto'
+  // — and must stay in lockstep with applyRailMode() in ext_cr_board.js. 'auto'
+  // defers to the view/breakpoint rules (collapsed in the detail view and on the
+  // board at 1025-1279px, open otherwise); 'open'/'collapsed' are an explicit
+  // user choice that overrides them. Two-stating it here would silently destroy
+  // 'auto' the first time anyone touched this row.
+  function readRailPref() {
+    try {
+      var v = localStorage.getItem('tracker.rail.mode');
+      return (v === 'open' || v === 'collapsed') ? v : 'auto';
+    } catch (e) { return 'auto'; }
+  }
+  function writeRailPref(mode) {
+    if (mode !== 'open' && mode !== 'collapsed') mode = 'auto';
+    try { localStorage.setItem('tracker.rail.mode', mode); } catch (e) {}
+    if (_ctx && typeof _ctx.emit === 'function') _ctx.emit('cr:pref', { key: 'tracker.rail.mode', value: mode });
+  }
+
+
+  function cfgRow(label, envVar, sub, control, restart) {
+    // `control` may be a single element or an array (e.g. [control, statusBadge()]) --
+    // [].concat() flattens either shape into a flat child list without treating a bare
+    // DOM node as iterable.
+    return h('div', { class: 'cr-cfg-row' }, [
+      h('div', { class: 'cr-cfg-row-label' }, [
+        h('div', { class: 'cr-cfg-row-name' }, [label, envVar ? h('code', { class: 'cr-envchip' }, [envVar]) : null]),
+        h('div', { class: 'cr-cfg-row-sub' }, [
+          sub,
+          restart ? h('span', { class: 'cr-restart-note' }, [' — takes effect on restart']) : null,
+        ]),
+      ]),
+      h('div', { class: 'cr-cfg-row-control' }, [].concat(control)),
+    ]);
+  }
+
+  function segmented(options, value, onChange) {
+    var wrap = h('div', { class: 'cr-segmented', role: 'radiogroup' });
+    options.forEach(function (opt) {
+      var btn = h('button', {
+        class: 'cr-seg-btn' + (opt[0] === value ? ' is-active' : ''),
+        type: 'button', role: 'radio', 'aria-checked': opt[0] === value ? 'true' : 'false', text: opt[1],
+      });
+      btn.addEventListener('click', function () {
+        Array.prototype.forEach.call(wrap.children, function (b) { b.classList.remove('is-active'); b.setAttribute('aria-checked', 'false'); });
+        btn.classList.add('is-active'); btn.setAttribute('aria-checked', 'true');
+        onChange(opt[0]);
+      });
+      wrap.appendChild(btn);
+    });
+    return wrap;
+  }
+
+  function toggleCtl(value, onChange) {
+    var btn = h('button', { class: 'cr-toggle' + (value ? ' is-on' : ''), type: 'button', role: 'switch', 'aria-checked': value ? 'true' : 'false' }, [h('span', { class: 'cr-toggle-knob' })]);
+    btn.addEventListener('click', function () {
+      var v = !btn.classList.contains('is-on');
+      btn.classList.toggle('is-on', v);
+      btn.setAttribute('aria-checked', v ? 'true' : 'false');
+      onChange(v);
+    });
+    return btn;
+  }
+
+  function sliderCtl(min, max, value, onChange, suffix) {
+    var out = h('span', { class: 'cr-slider-val cr-mono' }, [String(value) + (suffix || '')]);
+    var input = h('input', { class: 'cr-slider', type: 'range', min: min, max: max, value: value });
+    input.addEventListener('input', function () {
+      out.textContent = input.value + (suffix || '');
+      onChange(Number(input.value));
+    });
+    return h('div', { class: 'cr-slider-wrap' }, [input, out]);
+  }
+
+  function readonlyField(text) {
+    return h('span', { class: 'cr-readonly cr-mono' }, [text]);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Config dialog: server-backed controls (POST /api/config). This is the ONE
+  // exception to this module's own "no fetch()" rule stated at the top of the file —
+  // that rule predates a write route existing at all (Fix 2f's own comment below
+  // verified there was NO /api/config route when it was written). A dialog that can
+  // now WRITE a server setting has to read the value it's editing live too, both to
+  // show the real current state on open and to reflect what the server actually
+  // accepted after a save (never just echo back what the user typed) -- kept
+  // entirely local to renderConfig()/its helpers, every other dialog in this file
+  // is still fed purely by its opener's payload.
+  // ---------------------------------------------------------------------------
+
+  function fetchServerConfig(cb) {
+    fetch('/api/config').then(function (r) { return r.json(); })
+      .then(function (d) { cb(d || {}); })
+      .catch(function () { cb(null); });
+  }
+
+  function postConfigValue(key, value, cb) {
+    fetch('/api/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: key, value: value }),
+    }).then(function (r) { return r.json().then(function (d) { cb(r.ok, d); }); })
+      .catch(function (e) { cb(false, { error: String((e && e.message) || e) }); });
+  }
+
+  // Tunnel section (aitracker/config.py's "Tunnel management" -- see its module comment for
+  // the full design). Three routes, deliberately separate from the config.json ones above:
+  // GET /api/tunnel never carries the raw user/pass, only whether each is set -- so a plain
+  // dialog-open fetch (same "read live the moment it opens" pattern as fetchServerConfig)
+  // can't leak a credential just by happening. The raw value only ever comes back from GET
+  // /api/tunnel/reveal, called exactly once per explicit "Show" click (see renderConfig's
+  // Tunnel section below) -- never on open, never cached past that click.
+  function fetchTunnelPublic(cb) {
+    fetch('/api/tunnel').then(function (r) { return r.json(); })
+      .then(function (d) { cb(d || null); })
+      .catch(function () { cb(null); });
+  }
+
+  function fetchTunnelReveal(cb) {
+    fetch('/api/tunnel/reveal').then(function (r) { return r.json(); })
+      .then(function (d) { cb(d || null); })
+      .catch(function () { cb(null); });
+  }
+
+  function postTunnelValue(key, value, cb) {
+    fetch('/api/tunnel', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: key, value: value }),
+    }).then(function (r) { return r.json().then(function (d) { cb(r.ok, d); }); })
+      .catch(function (e) { cb(false, { error: String((e && e.message) || e) }); });
+  }
+
+  // A visible, honest saved/failed state next to the control it belongs to -- mirrors
+  // this file's existing Copy/Copied transient-state pattern (see copyBtn above).
+  function statusBadge() {
+    return h('span', { class: 'cr-cfg-status', 'aria-live': 'polite' });
+  }
+  function showStatus(el, ok, msg) {
+    clearTimeout(el._crStatusT);
+    el.textContent = ok ? 'Saved' : ('Failed' + (msg ? ' — ' + msg : ''));
+    el.classList.toggle('is-saved', ok);
+    el.classList.toggle('is-failed', !ok);
+    el._crStatusT = setTimeout(function () {
+      el.textContent = '';
+      el.classList.remove('is-saved', 'is-failed');
+    }, ok ? 1800 : 5000);
+  }
+
+  // A slider whose LABEL updates continuously while dragging (so the number tracks the
+  // thumb) but whose onCommit only fires once the drag/keystroke is committed ('change') --
+  // unlike sliderCtl (used for pure client-side prefs), this one is meant to sit in front
+  // of a POST /api/config call and must not fire one per drag tick.
+  function sliderCtlCommit(min, max, value, onCommit, suffix) {
+    var out = h('span', { class: 'cr-slider-val cr-mono' }, [String(value) + (suffix || '')]);
+    var input = h('input', { class: 'cr-slider', type: 'range', min: min, max: max, value: value });
+    input.addEventListener('input', function () { out.textContent = input.value + (suffix || ''); });
+    input.addEventListener('change', function () { onCommit(Number(input.value)); });
+    return h('div', { class: 'cr-slider-wrap' }, [input, out]);
+  }
+
+  // Same shape as sliderCtlCommit (label tracks the thumb, onCommit fires once on
+  // 'change') but also takes `onInput`, fired on every 'input' tick while dragging --
+  // for a control that needs an instant, non-persisted visual preview during the drag
+  // itself (icon-size live preview) on top of the debounced server commit on release.
+  // sliderCtlCommit is left untouched above; MAX_TERMS keeps using that one as-is.
+  function sliderCtlLive(min, max, value, onCommit, onInput, suffix) {
+    var out = h('span', { class: 'cr-slider-val cr-mono' }, [String(value) + (suffix || '')]);
+    var input = h('input', { class: 'cr-slider', type: 'range', min: min, max: max, value: value });
+    input.addEventListener('input', function () {
+      out.textContent = input.value + (suffix || '');
+      onInput(Number(input.value));
+    });
+    input.addEventListener('change', function () { onCommit(Number(input.value)); });
+    return h('div', { class: 'cr-slider-wrap' }, [input, out]);
+  }
+
+  function textFieldCtl(value, onCommit, opts) {
+    opts = opts || {};
+    var inp = h('input', {
+      class: 'cr-textfield cr-cfg-textfield', type: opts.type || 'text',
+      min: opts.min != null ? opts.min : null, max: opts.max != null ? opts.max : null,
+    });
+    inp.value = value == null ? '' : String(value);
+    inp.addEventListener('change', function () {
+      onCommit(opts.type === 'number' ? Number(inp.value) : inp.value);
+    });
+    return inp;
+  }
+
+  function textareaCtl(value, onCommit, placeholder) {
+    var ta = h('textarea', { class: 'cr-textfield cr-cfg-textarea cr-mono', rows: 4, placeholder: placeholder || '' });
+    ta.value = value || '';
+    ta.addEventListener('change', function () { onCommit(ta.value); });
+    return ta;
+  }
+
+  // Config's payload contract (documented in the handoff report): the caller (bootstrap)
+  // supplies `payload.server` with values it already had lying around (GET /api/term/list's
+  // maxTerms/terminalEnabled) — used here ONLY as an instant, no-flash first paint. The
+  // real, current, WRITABLE state for every config.json-backed row comes from GET
+  // /api/config, fetched the moment this dialog opens (see the "one exception to no
+  // fetch()" note above fetchServerConfig) and merged over the payload defaults the instant
+  // it lands — `srv` below is reassigned in place, never a fresh object, so closures that
+  // already captured it keep seeing the latest merge.
+  function renderConfig(payload) {
+    var srv = (payload && payload.server) || {};
+    // Header subtitle: 5c gives Config the real server address (its mock shows
+    // "localhost:8790") — not "ai-tracker". The honest source for that on THIS page
+    // is the page's own location, not a guessed/invented config field or a request:
+    // this dialog is always served BY the tracker it's showing settings for, so
+    // location.host already IS that address.
+    var subtitle = (window.location && window.location.host) || '';
+    var chrome = buildChrome('config', 'Config', 'gear', subtitle, true);
+    chrome.panel.classList.add('cr-dialog-config');
+
+    var sections = ['Interface', 'Board', 'Terminal', 'Notifications', 'Server', 'Tunnel', 'Data files'];
+    var nav = h('div', { class: 'cr-cfg-nav' });
+    var body = h('div', { class: 'cr-cfg-body' });
+    var active = 'Interface';
+    // Tunnel section's own state -- local to THIS renderConfig() call, so it starts fresh
+    // every time the dialog opens. `tunnel` is the masked snapshot (GET /api/tunnel);
+    // `tunnelRevealed` is null until "Show" is clicked and is never written back to
+    // anything that outlives this dialog instance -- closing/reopening always starts
+    // masked again, satisfying "the revealed value must not persist across dialog
+    // close/reopen" (the security requirement this feature was built under).
+    var tunnel = {};
+    var tunnelRevealed = null;
+
+    // A generic editable row for a server config.json key: renders whatever `ctlFn(value,
+    // onCommit)` builds, POSTs on commit, shows an honest Saved/Failed badge, and rolls the
+    // control back to the server's last-known-good value on failure (never leaves the UI
+    // showing a value the server rejected as if it had been accepted).
+    // `onFail`, if given, runs BEFORE the section re-render on a rejected save -- for a
+    // row whose control has side effects beyond its own DOM (icon style/size apply live
+    // to the whole page instantly, not just to this control), the re-render alone snaps
+    // the control back but leaves that outside effect showing the rejected value. Optional
+    // and additive: existing callers that don't pass it behave exactly as before.
+    function serverRow(label, key, sub, ctlFn, onFail) {
+      var meta = srv.cfg && srv.cfg[key];
+      var value = meta ? meta.value : undefined;
+      var status = statusBadge();
+      var restart = (meta && meta.restart) || false;
+      var ctl = ctlFn(value, function (newVal) {
+        postConfigValue(key, newVal, function (ok, resp) {
+          if (ok) {
+            if (srv.cfg && srv.cfg[key]) srv.cfg[key].value = resp.value;
+            showStatus(status, true);
+          } else {
+            showStatus(status, false, (resp && resp.error) || 'request failed');
+            if (typeof onFail === 'function') onFail();
+            renderSection();   // snap every control in this section back to last-known-good
+          }
+        });
+      });
+      return cfgRow(label, _ENVCHIP[key] || null, sub, [ctl, status], restart);
+    }
+
+    function renderSection() {
+      body.innerHTML = '';
+      Array.prototype.forEach.call(nav.children, function (b) { b.classList.toggle('is-active', b.textContent === active); });
+      if (active === 'Interface') {
+        var themeVal = (_ctx && _ctx.theme && _ctx.theme.get) ? _ctx.theme.get() : 'auto';
+        body.appendChild(cfgRow('Theme', null, 'Follows prefers-color-scheme unless overridden.',
+          segmented([['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']], themeVal, function (v) {
+            if (_ctx && _ctx.theme && _ctx.theme.set) _ctx.theme.set(v);
+          })));
+        // Re-applies the last server-known-good icon style/scale -- used to snap the
+        // LIVE preview (applyIconStyle, applied instantly by the two rows below, ahead
+        // of any server round-trip) back if a save is rejected. serverRow's own
+        // renderSection() already rebuilds the controls themselves; this covers the
+        // page-wide visual effect those controls also trigger, which a DOM re-render
+        // alone doesn't touch.
+        function revertIconPreview() {
+          if (typeof window.applyIconStyle !== 'function') return;
+          var styleVal = (srv.cfg && srv.cfg.ICON_STYLE) ? srv.cfg.ICON_STYLE.value : 'icons';
+          var scaleVal = (srv.cfg && srv.cfg.ICON_SCALE) ? srv.cfg.ICON_SCALE.value : 100;
+          window.applyIconStyle(styleVal || 'icons', scaleVal != null ? scaleVal : 100);
+        }
+        body.appendChild(serverRow('Icon style', 'ICON_STYLE',
+          'Icons draws the built-in symbol set; Emoji uses colour emoji; Text uses plain typographic glyphs.',
+          function (value, onCommit) {
+            return segmented([['icons', 'Icons'], ['emoji', 'Emoji'], ['text', 'Text']], value || 'icons', function (v) {
+              if (typeof window.applyIconStyle === 'function') {
+                var scaleVal = (srv.cfg && srv.cfg.ICON_SCALE) ? srv.cfg.ICON_SCALE.value : 100;
+                window.applyIconStyle(v, scaleVal != null ? scaleVal : 100);
+              }
+              onCommit(v);
+            });
+          }, revertIconPreview));
+        body.appendChild(serverRow('Icon size', 'ICON_SCALE',
+          'Scales icons/emoji across the app. Drag for a live preview; releases the slider to save.',
+          function (value, onCommit) {
+            return sliderCtlLive(75, 200, value != null ? value : 100, onCommit, function (v) {
+              if (typeof window.applyIconStyle === 'function') {
+                var styleVal = (srv.cfg && srv.cfg.ICON_STYLE) ? srv.cfg.ICON_STYLE.value : 'icons';
+                window.applyIconStyle(styleVal || 'icons', v);
+              }
+            }, '%');
+          }, revertIconPreview));
+        // Tri-state, drawn with the same `segmented` control as Theme above: a
+        // two-state switch cannot express 'auto' and would collapse it away on
+        // first touch, leaving no way back to the default.
+        body.appendChild(cfgRow('Session rail', null, 'Auto collapses it inside a session and on narrow screens; Open and Collapsed override that.',
+          segmented([['auto', 'Auto'], ['open', 'Open'], ['collapsed', 'Collapsed']], readRailPref(), function (v) { writeRailPref(v); })));
+        body.appendChild(cfgRow('Cards start folded', null, 'Every detail-view panel starts collapsed except Conversation.',
+          toggleCtl(readPref(CFG_PREF_KEYS.cardsFolded, true), function (v) { writePref(CFG_PREF_KEYS.cardsFolded, v); })));
+        // Fix (drift 4): 5c draws this as ONE row — "Desktop notifications + sound" —
+        // not two separate toggles. Combined here, but both underlying preferences
+        // still get set on every flip: `desktopNotif` (this dialog's own pref, read by
+        // the permission-nudge logic) AND the REAL sound switch. That real switch is
+        // `soundOn`/`toggleSound()` (app.js globals, same `soundOff` localStorage key
+        // the classic bell and ext_cr_boot.js's `toggle:notifications` handler already
+        // share) -- NOT the disconnected `cr.notif.sound` pref this row used to write
+        // only to itself, which nothing else ever read. That was a real gap, not a
+        // deliberate second source of truth: fixed by routing through the same global
+        // toggleSound() so this control now drives the one real sound switch the rest
+        // of the app already has, instead of a shadow copy of it.
+        body.appendChild(cfgRow('Desktop notifications + sound', null, 'Only while the tab is in the background.',
+          toggleCtl(
+            (typeof soundOn !== 'undefined') ? soundOn : readPref(CFG_PREF_KEYS.sound, true),
+            function (v) {
+              writePref(CFG_PREF_KEYS.desktopNotif, v);
+              writePref(CFG_PREF_KEYS.sound, v);
+              if (typeof soundOn !== 'undefined' && soundOn !== v && typeof toggleSound === 'function') toggleSound();
+            }
+          )));
+      } else if (active === 'Board') {
+        // Owner ruling: doc 04's board-tiles row wins — a 3–12 slider, default 8 —
+        // superseding doc 02's "never more than 8" cap. Client-side preference ONLY
+        // (localStorage, NOT config.json) — ext_cr_board.js reads this same key and
+        // clamps to 3..12 itself; the two ceilings must agree.
+        body.appendChild(cfgRow('Board tiles', null, 'How many session tiles the board shows before "+N more".',
+          sliderCtl(3, 12, readPref(CFG_PREF_KEYS.boardTiles, 8), function (v) { writePref(CFG_PREF_KEYS.boardTiles, v); })));
+        // Fix 2b — this is the SAME poll() /api/session timer app.js's track() already
+        // runs (2s by default, and the project's hard rule keeps that the default) —
+        // ext_cr_boot.js re-arms that one timer at the chosen cadence instead of adding a
+        // second loop. It does not touch the separate 5s /api/list (board/rail) poll.
+        body.appendChild(cfgRow('Poll interval', null, 'How often the open session’s detail view re-polls the server. (The board/rail list poll stays fixed at 5s.)',
+          segmented([[1000, '1s'], [2000, '2s'], [5000, '5s']], readPref(CFG_PREF_KEYS.pollMs, 2000), function (v) { writePref(CFG_PREF_KEYS.pollMs, v); })));
+        body.appendChild(serverRow('Live window', 'LIVE_WINDOW',
+          'How long a session with no new activity still counts as "live" before it shows as done.',
+          function (value, onCommit) {
+            return sliderCtlCommit(30, 1800, value != null ? value : 300, onCommit, 's');
+          }));
+      } else if (active === 'Terminal') {
+        body.appendChild(serverRow('Terminal renderer', 'TERM_RENDERER',
+          'Default for newly-opened terminals — already switchable live per-terminal from its own toolbar.',
+          function (value, onCommit) {
+            return segmented([['xterm', 'xterm'], ['grid', 'grid']], value || 'xterm', onCommit);
+          }));
+        body.appendChild(serverRow('Max terminals', 'MAX_TERMS', 'Clamped to 1–64.',
+          function (value, onCommit) {
+            return sliderCtlCommit(1, 64, value != null ? value : 12, onCommit, '');
+          }));
+        body.appendChild(serverRow('Terminal enabled', 'TERMINAL',
+          'The kill-switch. ON means the tracker can start real shell processes on this machine, not just read logs — turn it OFF if you only want the read-only dashboard.',
+          function (value, onCommit) {
+            return toggleCtl(value !== false, onCommit);
+          }));
+        body.appendChild(serverRow('External terminal app', 'TERM_APP', 'Terminal or iTerm, for the external-terminal buttons.',
+          function (value, onCommit) {
+            return segmented([['Terminal', 'Terminal'], ['iTerm', 'iTerm']], value || 'Terminal', onCommit);
+          }));
+        body.appendChild(serverRow('Command allowlist', 'TERM_ALLOW',
+          'One argv prefix per line; replaces the default set outright. Leave empty to use the built-in default set.',
+          function (value, onCommit) {
+            return textareaCtl(value || '', function (text) { onCommit(text); }, 'default set (leave empty)');
+          }));
+      } else if (active === 'Notifications') {
+        // Fix (drift 4): this tab used to carry its own second copy of the two toggles
+        // now combined into the Interface tab's single "Desktop notifications + sound"
+        // row -- a real, functioning duplicate control, not just repeated copy. Removed
+        // rather than mirrored; the tab itself stays (5c's own Config nav still lists
+        // it) since nothing here calls for deleting the nav entry, only the duplication.
+        body.appendChild(h('p', { class: 'cr-help-note' }, [
+          'Desktop notifications + sound now lives on the Interface tab — one row, one setting.',
+        ]));
+      } else if (active === 'Server') {
+        body.appendChild(cfgRow('Auth', 'TRACKER_AUTH',
+          'Never displayed — only whether it is set. Env-only, deliberately not editable here: writing a password typed into a browser into a plaintext file on a server that may be tunneled is a real security regression, not a convenience. Set TRACKER_AUTH and restart to change it.',
+          readonlyField(srv.authSet ? 'set' : 'not set'), true));
+        // Doc 04 (§ Config → Server) specs Port/Host as "mono fields, read-only display" —
+        // no POST /api/config path for either. Rebinding a live listening socket's bind
+        // host/port from a dashboard field is a write surface the spec never sanctioned,
+        // so these render via the same readonlyField() helper the Auth row above uses,
+        // never textFieldCtl()/serverRow() (which would wire them to postConfigValue()).
+        body.appendChild(cfgRow('Port', 'PORT', 'Rebinding a live listening socket isn’t attempted — this reflects what the server is running with now.',
+          readonlyField(String((srv.cfg && srv.cfg.PORT && srv.cfg.PORT.value != null) ? srv.cfg.PORT.value : 8790)), true));
+        body.appendChild(cfgRow('Host', 'HOST', 'Same as Port — read-only.',
+          readonlyField(String((srv.cfg && srv.cfg.HOST && srv.cfg.HOST.value) || '127.0.0.1')), true));
+      } else if (active === 'Tunnel') {
+        // The one-line, always-visible disclosure the security review this feature was
+        // built under calls for: never hidden behind the reveal action, never a lecture.
+        body.appendChild(h('p', { class: 'cr-help-note cr-tunnel-disclosure' }, [
+          'Stored in plain text on this machine (', h('code', {}, ['config.json']),
+          ', permissions locked to you only) — the share URL below carries it too. Treat both like a password.',
+        ]));
+
+        body.appendChild(cfgRow('Tunnel URL', null,
+          'Not discoverable from here — a Cloudflare quick tunnel (`make tunnel`) mints a new address every run. Paste the one it printed.',
+          (function () {
+            var status = statusBadge();
+            var ctl = textFieldCtl(tunnel.url || '', function (v) {
+              postTunnelValue('TUNNEL_URL', v, function (ok, resp) {
+                if (ok) { tunnel.url = resp.value; if (tunnelRevealed) tunnelRevealed = null; showStatus(status, true); renderSection(); }
+                else { showStatus(status, false, (resp && resp.error) || 'request failed'); renderSection(); }
+              });
+            }, { type: 'text' });
+            ctl.classList.add('cr-cfg-textfield-wide');
+            return [ctl, status];
+          })()));
+
+        var shown = !!tunnelRevealed;
+        function maskedRow(label, key, sub) {
+          var setFlag = key === 'user' ? tunnel.user_set : tunnel.pass_set;
+          if (!shown) {
+            return cfgRow(label, null, sub, readonlyField(setFlag ? '••••••••' : 'not set'), true);
+          }
+          var status = statusBadge();
+          var ctl = textFieldCtl(tunnelRevealed[key] || '', function (v) {
+            postTunnelValue(key === 'user' ? 'TUNNEL_USER' : 'TUNNEL_PASS', v, function (ok, resp) {
+              if (ok) {
+                tunnelRevealed[key] = v;
+                if (key === 'user') tunnel.user_set = !!v; else tunnel.pass_set = !!v;
+                // the restart command / share URL below embed this value -- keep them
+                // in sync with what was just saved, not the pre-edit reveal snapshot.
+                tunnelRevealed.restart_cmd = (resp && resp.restart_cmd) || tunnelRevealed.restart_cmd;
+                showStatus(status, true, 'restart required to apply');
+                renderSection();
+              } else {
+                showStatus(status, false, (resp && resp.error) || 'request failed');
+              }
+            });
+          }, { type: 'text' });
+          return cfgRow(label, null, sub, [ctl, status], true);
+        }
+        body.appendChild(maskedRow('Username', 'user', 'Same credential as TRACKER_AUTH — masked until you click Show.'));
+        body.appendChild(maskedRow('Password', 'pass', 'Editing here only stages the value — it takes effect once you restart with the command below.'));
+
+        var showBtn = h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: shown ? 'Hide' : 'Show' });
+        showBtn.addEventListener('click', function () {
+          if (tunnelRevealed) { tunnelRevealed = null; renderSection(); return; }
+          fetchTunnelReveal(function (rev) {
+            if (!rev) return;
+            tunnelRevealed = rev;
+            renderSection();
+          });
+        });
+        body.appendChild(h('div', { class: 'cr-tunnel-showrow' }, [showBtn]));
+
+        // Both blocks below embed the raw credential (the restart command needs it to be
+        // useful; the share URL IS it, in userinfo form) -- gated behind the SAME reveal
+        // action as the fields above, never computed or shown before "Show" is clicked.
+        if (tunnelRevealed) {
+          body.appendChild(h('div', { class: 'cr-tunnel-block' }, [
+            h('div', { class: 'cr-tunnel-block-label' }, ['Restart command — required for a new username/password to take effect']),
+            h('div', { class: 'cr-tunnel-cmdrow' }, [
+              h('code', { class: 'cr-mono cr-tunnel-cmd' }, [tunnelRevealed.restart_cmd || '']),
+              copyBtn(function () { return tunnelRevealed.restart_cmd || ''; }),
+            ]),
+            h('div', { class: 'cr-tunnel-block-note' }, [
+              'Started the server directly instead of via ', h('code', {}, ['make tunnel']), '? The equivalent is ',
+              h('code', {}, ['TRACKER_AUTH="user:pass" python3 -m aitracker']), '.',
+            ]),
+          ]));
+          body.appendChild(h('div', { class: 'cr-tunnel-block' }, [
+            h('div', { class: 'cr-tunnel-block-label' }, ['Share URL — for your own notes; the credential rides in the URL’s user:pass@host form, never a query string']),
+            h('div', { class: 'cr-tunnel-cmdrow' }, [
+              h('code', { class: 'cr-mono cr-tunnel-cmd' }, [tunnelRevealed.share_url || '(set a Tunnel URL above first)']),
+              copyBtn(function () { return tunnelRevealed.share_url || ''; }),
+            ]),
+          ]));
+        }
+      } else if (active === 'Data files') {
+        var df = srv.dataFiles || {};
+        ['flags', 'titles', 'pins', 'notes'].forEach(function (k) {
+          body.appendChild(cfgRow(k[0].toUpperCase() + k.slice(1), null, 'Read live — edits outside the app are picked up on the next poll.',
+            readonlyField(df[k] || (k + '.json'))));
+        });
+      }
+    }
+    sections.forEach(function (s) {
+      var btn = h('button', { class: 'cr-cfg-nav-btn' + (s === active ? ' is-active' : ''), type: 'button', text: s });
+      btn.addEventListener('click', function () { active = s; renderSection(); });
+      nav.appendChild(btn);
+    });
+    renderSection();
+
+    // The live read: merges GET /api/config's per-key {value, overridden, restart} onto
+    // `srv.cfg` and re-renders whichever section is showing once it lands. A failed fetch
+    // (offline, a 401 race) leaves `srv.cfg` unset -- serverRow's controls then render with
+    // `value` undefined, which every ctlFn above already treats as "use the built-in
+    // default", same honest degrade this dialog already used before this feature existed.
+    fetchServerConfig(function (cfg) {
+      if (!cfg) return;
+      srv.cfg = cfg;
+      srv.authSet = !!cfg.AUTH_SET;
+      renderSection();
+    });
+    // Tunnel section's own live read -- see fetchTunnelPublic's comment for why this is
+    // the masked snapshot only, never the raw credential.
+    fetchTunnelPublic(function (t) {
+      if (!t) return;
+      tunnel = t;
+      if (active === 'Tunnel') renderSection();
+    });
+
+    var main = h('div', { class: 'cr-cfg-main' }, [nav, body]);
+    chrome.body.appendChild(main);
+    chrome.body.appendChild(h('div', { class: 'cr-cfg-footer' }, [
+      // Rows without an env-var chip are plain browser preferences — saved to this browser
+      // the moment you change them. Rows WITH an env-var chip are now REAL server settings
+      // (config.json > env var > built-in default — see config.py): a change here saves
+      // immediately and, for everything except Port/Host, applies live, no restart. Auth
+      // stays the one exception — env-only, never writable from here (see its own row).
+      h('p', { class: 'cr-cfg-footer-note' }, [
+        'Rows without an env-var chip are plain browser preferences — saved to this browser the moment you change them. Rows with an env-var chip are real server settings: saving writes ',
+        h('code', {}, ['config.json']),
+        ' and applies immediately — except Port and Host, which only take effect on the next ',
+        h('code', {}, ['make serve']),
+        '. The Server tab’s Auth row stays env-only and is never writable from here — the Tunnel tab is the one deliberate exception, since it edits that same credential and always requires a restart to take effect (see its own disclosure line).',
+      ]),
+      h('div', { class: 'cr-cfg-actions' }, [
+        h('button', {
+          // "Reset to defaults" clears only the browser preferences it always has (there is
+          // no bulk-clear route for server keys — each is reset individually via its own
+          // control if you dial it back to the built-in value shown when unoverridden).
+          class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Reset to defaults', onclick: function () {
+            Object.keys(CFG_PREF_KEYS).forEach(function (k) { var key = CFG_PREF_KEYS[k]; if (key) { try { localStorage.removeItem(key); } catch (e) {} } });
+            renderSection();
+          },
+        }),
+        h('button', { class: 'cr-btn cr-btn-solid', type: 'button', text: 'Apply', onclick: close }),
+      ]),
+    ]));
+    return { backdrop: chrome.backdrop, panel: chrome.panel };
+  }
+
+  // ---------------------------------------------------------------------------
+  // File-diff / command-output / narration-text pop-out (one component, three modes)
+  // ---------------------------------------------------------------------------
+
+  function diffLineRow(line) {
+    var cls = 'cr-diffline';
+    var prefix = ' ';
+    if (line.type === 'add') { cls += ' is-add'; prefix = '+'; }
+    else if (line.type === 'del') { cls += ' is-del'; prefix = '−'; }
+    return h('div', { class: cls }, [
+      h('span', { class: 'cr-diffline-no' }, [line.no != null ? String(line.no) : '']),
+      h('span', { class: 'cr-diffline-prefix' }, [prefix]),
+      h('span', { class: 'cr-diffline-text' }, [line.text || '']),
+    ]);
+  }
+
+  function renderDiffPopout(payload) {
+    payload = payload || {};
+    var mode = payload.mode || 'diff'; // 'diff' | 'output' | 'text'
+    var title = mode === 'diff' ? (payload.path || 'diff') : mode === 'output' ? (payload.title || 'output') : (payload.title || 'narration');
+    var chrome = buildChrome('diff', title, null, payload.contextStr || '', true);
+    chrome.panel.classList.add('cr-dialog-popout');
+
+    var toolbar = h('div', { class: 'cr-popout-toolbar' });
+    if (mode === 'diff') {
+      var base = (payload.path || '').split('/');
+      toolbar.appendChild(h('span', { class: 'cr-popout-path cr-mono' }, [
+        base.slice(0, -1).join('/') + (base.length > 1 ? '/' : ''), h('strong', {}, [base[base.length - 1] || '']),
+      ]));
+      toolbar.appendChild(h('span', { class: 'cr-popout-stat cr-mono cr-plus' }, ['+' + (payload.additions || 0)]));
+      toolbar.appendChild(h('span', { class: 'cr-popout-stat cr-mono cr-minus' }, ['−' + (payload.deletions || 0)]));
+    }
+    var viewMode = 'diff'; // vs 'rendered'
+    var body = h('div', { class: 'cr-popout-body cr-mono' });
+    function paintBody() {
+      body.innerHTML = '';
+      if (mode === 'diff' && viewMode === 'diff') {
+        if (payload.expandAboveLabel !== false) {
+          body.appendChild(h('div', { class: 'cr-context-bar', onclick: function () { if (payload.onExpandAbove) payload.onExpandAbove(); } }, [icon('arrow-up'), ' expand ' + (payload.aboveCount || 0) + ' lines above']));
+        }
+        (payload.lines || []).forEach(function (l) { body.appendChild(diffLineRow(l)); });
+        if (payload.belowCount) {
+          body.appendChild(h('div', { class: 'cr-context-bar', onclick: function () { if (payload.onExpandBelow) payload.onExpandBelow(); } }, [icon('arrow-down'), ' expand ' + payload.belowCount + ' lines below']));
+        }
+      } else if (mode === 'diff' && viewMode === 'rendered') {
+        // "Rendered" needs to be faithful for a .md file's diff — full document markup
+        // (headings/lists/tables/fences), not just inline spans — so this calls app.js's
+        // OWN block-level renderer, `mdBlock` (global — app.js is concatenated ahead of
+        // every ext_cr_*.js file into one <script> tag by page.py's build_page(), the
+        // same reachable-global pattern ext_cr_detail.js's mdHtml() already relies on).
+        // This used to fall back to this module's own local markdown-lite fork (since
+        // deleted) that silently dropped italics/links/headings/lists/tables/fences —
+        // same text, worse rendering, purely because of which dialog showed it.
+        var pre = h('div', { class: 'cr-rendered-md' });
+        pre.innerHTML = mdBlock((payload.lines || []).map(function (l) { return l.text; }).join('\n'));
+        body.appendChild(pre);
+      } else if (mode === 'output') {
+        var pre2 = h('pre', { class: 'cr-outputtext' }, [payload.text || '']);
+        body.appendChild(pre2);
+      } else {
+        // 'text' mode is the narration/prompt full-text pop-out (capability 27/34) —
+        // the same document-shaped, potentially multi-paragraph content app.js's own
+        // openText() renders with mdBlock() (app.js ~1690). Same renderer, same reason.
+        var textWrap = h('div', { class: 'cr-rendered-md' });
+        textWrap.innerHTML = mdBlock(payload.text || '');
+        body.appendChild(textWrap);
+      }
+    }
+    if (mode === 'diff') {
+      toolbar.appendChild(segmented([['diff', 'Diff'], ['rendered', 'Rendered']], viewMode, function (v) { viewMode = v; paintBody(); }));
+    }
+    toolbar.appendChild(h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Expand all', onclick: function () { if (payload.onExpandAll) payload.onExpandAll(); } }));
+    toolbar.appendChild(h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'New tab', onclick: function () {
+      if (payload.onNewTab) { payload.onNewTab(); return; }
+      var w = window.open('', '_blank');
+      if (w) { w.document.title = title; w.document.body.style.cssText = 'font-family:monospace;white-space:pre-wrap;padding:16px'; w.document.body.textContent = payload.text || (payload.lines || []).map(function (l) { return l.text; }).join('\n'); }
+    } }));
+    if (payload.index != null && payload.total != null) {
+      toolbar.appendChild(h('span', { class: 'cr-popout-nav cr-mono' }, [
+        h('button', { class: 'cr-navbtn', type: 'button', 'aria-label': 'Previous', onclick: function () { if (payload.onPrev) payload.onPrev(); } }, [icon('chevron', 'cr-rot-180')]),
+        '‹ ' + payload.index + ' of ' + payload.total + ' ›',
+        h('button', { class: 'cr-navbtn', type: 'button', 'aria-label': 'Next', onclick: function () { if (payload.onNext) payload.onNext(); } }, [icon('chevron')]),
+      ]));
+    }
+    chrome.body.appendChild(toolbar);
+    chrome.body.appendChild(body);
+    paintBody();
+    return { backdrop: chrome.backdrop, panel: chrome.panel };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Live "Run a command" output pop-out (doc 04 capability #54 — "Command runner
+  // + constraint stated", Evidence column). Was toast-only: the panel started a
+  // job over POST /api/term/run and reported "Running: <cmd>" / "<cmd> — done"
+  // via ctx.emit('notify', ...) with no way to see what the command actually
+  // printed. This is the missing output pane, sharing the SAME pop-out chrome
+  // and .cr-popout-body/.cr-outputtext styling as the file-diff/command-output
+  // pop-out above (doc 04: "The same pop-out serves command output and full
+  // narration text; only the toolbar differs") rather than a new modal shape.
+  //
+  // NO NEW ENDPOINT, NO NEW STREAM. This attaches its OWN EventSource straight
+  // to the EXISTING GET /api/term/stream?job=<id> route (aitracker/term_run.py)
+  // that a run already opens — term_run.py's stream() explicitly supports
+  // multiple simultaneous viewers of one job (job.viewers is a refcount; the
+  // child is killed only once the LAST viewer disconnects, so a second reader
+  // here cannot end the job early for anyone else watching, and starts no
+  // second child process). This is a second VIEWER of one stream, not a second
+  // stream, and not a per-panel poll — the SSE connection itself pushes.
+  //
+  // payload: {sessionId, cmd, cwd, jobId} — jobId is the id POST /api/term/run
+  // already returned to whoever started the job.
+  //
+  // REQUIRED ADDITION (outside this file's ownership for this pass — cr_boot.js
+  // is not in this task's file list): cr_boot.js's own `on('cr:run-command', …)`
+  // handler (the sole caller of POST /api/term/run) needs ONE new line, right
+  // after it sets `currentJob = res.j.job;`:
+  //   ctx.dialog('run-output', { sessionId: sid, cmd: argv, jobId: res.j.job });
+  // Nothing else there needs to change — this dialog reads the job's output and
+  // its `end` event (rc/truncated) directly off its own stream connection, so
+  // cr_boot.js's existing toast-only notify()s can stay exactly as they are (a
+  // toast AND a pane are not mutually exclusive). Verified by hand: opening this
+  // dialog directly with a real job id (started via a raw POST /api/term/run)
+  // renders the live output; see the module report for the exact command run.
+  function renderRunOutput(payload) {
+    payload = payload || {};
+    var cmd = payload.cmd || '';
+    var jobId = payload.jobId || null;
+    var chrome = buildChrome('run-output', cmd || 'command', null, payload.cwd || '', true);
+    chrome.panel.classList.add('cr-dialog-popout');
+
+    var stateEl = h('span', { class: 'cr-runstate cr-mono' }, ['starting…']);
+    var killBtn = h('button', { class: 'cr-btn cr-btn-quiet cr-btn-danger', type: 'button' },
+      [icon('stop'), ' Kill']);
+    var toolbar = h('div', { class: 'cr-popout-toolbar' }, [
+      h('span', { class: 'cr-popout-path cr-mono' }, [cmd]),
+      stateEl,
+      killBtn,
+      h('button', {
+        class: 'cr-btn cr-btn-quiet', type: 'button', text: 'New tab',
+        onclick: function () {
+          var w = window.open('', '_blank');
+          if (w) {
+            w.document.title = cmd || 'command output';
+            w.document.body.style.cssText = 'font-family:monospace;white-space:pre-wrap;padding:16px';
+            w.document.body.textContent = buf;
+          }
+        },
+      }),
+    ]);
+
+    // The pane scrolls INSIDE .cr-popout-body (max-height:60vh; overflow:auto,
+    // already defined for the diff/output pop-out above) — never the page body.
+    var pre = h('pre', { class: 'cr-outputtext cr-popout-body' });
+    var empty = h('div', { class: 'cr-runoutput-empty' }, ['No output yet.']);
+
+    var buf = '';
+    var es = null;
+    var ended = false;
+    // "Preserve scroll position sensibly across updates": stick to the bottom
+    // only while the viewer was already at (or near) the bottom; a reader who
+    // has scrolled up to read earlier output is left alone by later writes.
+    var stickBottom = true;
+    pre.addEventListener('scroll', function () {
+      stickBottom = (pre.scrollHeight - pre.scrollTop - pre.clientHeight) < 24;
+    });
+
+    function setState(text, cls) {
+      stateEl.textContent = text;               // textContent only — never HTML
+      stateEl.className = 'cr-runstate cr-mono' + (cls ? ' ' + cls : '');
+    }
+    function paint() {
+      empty.hidden = !!buf;
+      pre.hidden = !buf;
+      if (buf) {
+        pre.textContent = buf;                   // textContent — output is untrusted text
+        if (stickBottom) pre.scrollTop = pre.scrollHeight;
+      }
+    }
+
+    function attach(jid) {
+      if (es) { try { es.close(); } catch (e) {} es = null; }
+      ended = false;
+      killBtn.disabled = !jid;
+      if (!jid) { setState('failed to start', 'is-fail'); return; }
+      setState('running', 'is-run');
+      es = new EventSource('/api/term/stream?job=' + encodeURIComponent(jid));
+      es.onmessage = function (ev) {
+        try {
+          var d = JSON.parse(ev.data);
+          if (d && typeof d.b === 'string') { buf += stripAnsi(d.b); paint(); }
+        } catch (e) {}
+      };
+      es.addEventListener('end', function (ev) {
+        var d = {};
+        try { d = JSON.parse(ev.data); } catch (e) {}
+        ended = true;
+        if (es) { try { es.close(); } catch (e) {} es = null; }
+        if (d.truncated) buf += '\n… output truncated';
+        var rc = d.rc;
+        if (rc === 0) setState('finished — exit 0', 'is-ok');
+        else if (typeof rc === 'number') setState('finished — exit ' + rc, 'is-fail');
+        else setState('failed', 'is-fail');
+        killBtn.disabled = true;
+        paint();
+      });
+      es.onerror = function () {
+        if (ended) return;
+        setState('connection lost', 'is-fail');
+      };
+    }
+    killBtn.addEventListener('click', function () {
+      if (!jobId || killBtn.disabled) return;
+      fetch('/api/term/kill', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job: jobId }),
+      }).catch(function () {});
+    });
+
+    paint();
+    attach(jobId);
+    chrome.body.appendChild(toolbar);
+    chrome.body.appendChild(empty);
+    chrome.body.appendChild(pre);
+
+    // No per-dialog destroy hook exists in this module's own close()/_stack
+    // (see that function above — it only removes the wrap element), so this
+    // watches THIS module's own `_layer` (same closure, not a new mechanism)
+    // for the panel's removal to stop the EventSource instead of leaking it.
+    // Closing the dialog only detaches this VIEWER — same "detach, don't kill"
+    // rule doc 05 states for the terminal — it does not touch the job itself.
+    var mo = new MutationObserver(function () {
+      if (!document.body.contains(chrome.panel)) {
+        if (es) { try { es.close(); } catch (e) {} es = null; }
+        mo.disconnect();
+      }
+    });
+    if (_layer) mo.observe(_layer, { childList: true });
+
+    return {
+      backdrop: chrome.backdrop, panel: chrome.panel,
+      // Re-opening with a fresh jobId (another "run" click while this pop-out
+      // is already the topmost dialog) attaches to the new job instead of
+      // stacking a second copy — same convention open()'s own dedupe uses.
+      update: function (next) {
+        next = next || {};
+        if (next.cmd) { cmd = next.cmd; toolbar.querySelector('.cr-popout-path').textContent = cmd; }
+        if (next.jobId && next.jobId !== jobId) { jobId = next.jobId; buf = ''; paint(); attach(jobId); }
+      },
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Narration pop-out with a rendered diagram
+  // ---------------------------------------------------------------------------
+
+  // payload: {time, nodes:[{label, active}], edges:[[fromIdx,toIdx]], family, onPrev, onNext, onLatest}
+  function renderNarrationDiagram(payload) {
+    payload = payload || {};
+    var chrome = buildChrome('narration-diagram', (payload.time || '') + ' · narration', null, '', true);
+    chrome.panel.classList.add('cr-dialog-popout');
+    var toolbar = h('div', { class: 'cr-popout-toolbar' }, [
+      h('button', { class: 'cr-navbtn', type: 'button', 'aria-label': 'Previous', onclick: function () { if (payload.onPrev) payload.onPrev(); } }, [icon('chevron', 'cr-rot-180')]),
+      h('button', { class: 'cr-navbtn', type: 'button', 'aria-label': 'Next', onclick: function () { if (payload.onNext) payload.onNext(); } }, [icon('chevron')]),
+      h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Jump to latest', onclick: function () { if (payload.onLatest) payload.onLatest(); } }),
+    ]);
+    var card = h('div', { class: 'cr-diagram-card' });
+    var nodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+    // Fix 4: a missing/short `nodes` array degrades to an honest empty state instead of
+    // an empty (and confusing-looking) diagram card — nothing here can throw either way,
+    // since a node missing `.label` already renders as a blank pill (h()'s child-append
+    // skips a null/undefined child), but zero nodes deserves a real message.
+    if (!nodes.length) {
+      card.appendChild(emptyState({ title: 'No narration steps to diagram', body: 'This entry has nothing to draw yet.' }));
+    } else {
+      var row = h('div', { class: 'cr-diagram-row' });
+      nodes.forEach(function (n) {
+        n = n || {};
+        row.appendChild(h('span', { class: 'cr-diagram-pill' + (n.active ? ' is-active' : '') }, [n.label || '']));
+      });
+      card.appendChild(row);
+    }
+    var caption = h('div', { class: 'cr-diagram-caption' }, [
+      (payload.family || 'stateDiagram-v2') + ' · drawn locally in plain SVG, no mermaid.js',
+    ]);
+    chrome.body.appendChild(toolbar);
+    chrome.body.appendChild(card);
+    chrome.body.appendChild(h('div', { class: 'cr-divider' }));
+    chrome.body.appendChild(caption);
+    return { backdrop: chrome.backdrop, panel: chrome.panel };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Cross-session flag list
+  // ---------------------------------------------------------------------------
+
+  // payload: {flags:[{id, session, sessionTitle, text, resolved}], onOpen, onResolve, onReopen, onDelete}
+  function renderFlagsList(payload) {
+    payload = payload || {};
+    var chrome = buildChrome('flags', 'Flags', 'flag', (payload.flags || []).length + ' total', false, 'tn-emo-f');
+    var list = h('div', { class: 'cr-flag-list' });
+    function paint() {
+      list.innerHTML = '';
+      var flags = payload.flags || [];
+      if (!flags.length) { list.appendChild(emptyState({ title: 'No flags raised', body: 'Flag anything from a session’s header to see it here.' })); return; }
+      flags.forEach(function (f) {
+        var row = h('div', { class: 'cr-flag-row' + (f.resolved ? ' is-resolved' : '') }, [
+          h('button', { class: 'cr-flag-session', type: 'button', onclick: function () { if (payload.onOpen) payload.onOpen(f); } }, [f.sessionTitle || f.session]),
+          h('div', { class: 'cr-flag-text' }, [f.text]),
+          h('div', { class: 'cr-flag-actions' }, [
+            f.resolved
+              ? h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Reopen', onclick: function () { if (payload.onReopen) payload.onReopen(f); paint(); } })
+              : h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Resolve', onclick: function () { if (payload.onResolve) payload.onResolve(f); paint(); } }),
+            h('button', { class: 'cr-btn cr-btn-quiet cr-btn-danger', type: 'button', text: 'Delete', onclick: function () { if (payload.onDelete) payload.onDelete(f); paint(); } }),
+          ]),
+        ]);
+        list.appendChild(row);
+      });
+    }
+    paint();
+    chrome.body.appendChild(list);
+    // wantsPoll: true — this is the one dialog that legitimately consumes the
+    // {kind:'poll', flags, sessions, now} broadcast ext_cr_boot.js's SIDE_EXT hook
+    // sends on every poll tick (see CR.dialogs.update()'s own comment for why the
+    // opt-in lives here instead of every OTHER dialog needing to guard itself).
+    return { backdrop: chrome.backdrop, panel: chrome.panel, wantsPoll: true, update: function (state) { if (state && state.flags) { payload.flags = state.flags; paint(); } } };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Manage terminals / terminals-at-the-cap (doc 04's "Terminals at the cap" spec)
+  //
+  // Ground truth: cr_term.js's real "☰ Manage terminals" button and its cap-hit
+  // path both call `ctx.dialog("manage-terminals", {...})` — NOT the "terminals-
+  // cap" name this file originally guessed from the doc's section title alone.
+  // It calls with the RAW `/api/term/list` shape ({tty, cmd, cwd, started,
+  // session, mode} per row, config.py/term_vt.py), not the {title, project, age}
+  // shape this file assumed — so title/project/age are derived here instead.
+  // It's also opened multiple times in a row (loading -> data, or -> error) for
+  // the SAME name, which open()'s same-name update path (above) now folds into
+  // one dialog rather than stacking duplicates.
+  // ---------------------------------------------------------------------------
+
+  function timeAgo(unixSeconds) {
+    if (!unixSeconds) return '';
+    var s = Math.max(0, Math.floor(Date.now() / 1000 - unixSeconds));
+    if (s < 60) return s + 's';
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + 'm';
+    var hr = Math.floor(m / 60);
+    if (hr < 24) return hr + 'h';
+    return Math.floor(hr / 24) + 'd';
+  }
+  function cwdTail(cwd) {
+    if (!cwd) return '';
+    var parts = String(cwd).replace(/\/+$/, '').split('/');
+    return parts[parts.length - 1] || String(cwd);
+  }
+
+  // FIX 2: resolve a session id to its human title, the SAME pattern ext_vt.js's
+  // buildTermRow (~line 2500) and ext_cr_boot.js's buildFlagsPayload (~line 792) already
+  // use -- `sessions` is app.js's own global array (concatenated into the same top-level
+  // <script>, kept fresh by its 2s poll), looked up by id, falling back to title||project.
+  // The server's terminal rows never carry a `title` (only the raw `session` uuid), so
+  // every caller that wants a human name resolves it client-side against this same list
+  // rather than inventing a second lookup.
+  function sessionTitleFor(sid) {
+    if (!sid) return null;
+    var list = (typeof sessions !== 'undefined' && sessions) || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].id === sid) return list[i].title || list[i].project || null;
+    }
+    return null;
+  }
+
+  // payload: {terminals:[{tty,cmd,cwd,started,session,mode}], max, onPeek(t), onKill(t), onCloseAll(), error}
+  function renderManageTerminals(payload) {
+    payload = payload || {};
+    var chrome = buildChrome('manage-terminals', 'Manage terminals', null, '', false);
+    var titleEl = chrome.panel.querySelector('.cr-dialog-title');
+    function paint() {
+      chrome.body.innerHTML = '';
+      if (payload.error) {
+        chrome.body.appendChild(errorState({ title: "Couldn't list terminals", body: payload.error }));
+        return;
+      }
+      var terms = payload.terminals || [];
+      var max = payload.max || terms.length;
+      var atCap = !!(max && terms.length >= max);
+      chrome.panel.classList.toggle('cr-dialog-cap', atCap);
+      titleEl.textContent = atCap
+        ? (terms.length + ' of ' + max + ' running — free a slot')
+        : ('Manage terminals — ' + terms.length + ' of ' + max + ' running');
+      if (!terms.length) {
+        chrome.body.appendChild(emptyState({ title: 'No terminals running', body: 'Open one from the top bar’s + New terminal / + New Claude session.' }));
+        return;
+      }
+      var list = h('div', { class: 'cr-termcap-list' });
+      terms.forEach(function (t) {
+        // FIX 2: t.title never arrives from the server (term_vt.py's terminal rows carry
+        // only the raw `session` uuid) -- resolve a human name via sessionTitleFor(), same
+        // as ext_vt.js/ext_cr_boot.js, and fall back to a truncated id rather than the full
+        // 36-char uuid (never "undefined": t.session is "" for a plain shell, never unset).
+        var identity = t.session ? (sessionTitleFor(t.session) || t.session.slice(0, 8)) : null;
+        list.appendChild(h('div', { class: 'cr-termcap-row' }, [
+          h('div', {}, [
+            h('div', { class: 'cr-termcap-title' }, [identity || cwdTail(t.cwd) || t.tty]),
+            h('div', { class: 'cr-termcap-meta cr-mono' }, [cwdTail(t.cwd) + ' · ' + timeAgo(t.started)]),
+          ]),
+          h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'peek', onclick: function () { if (payload.onPeek) payload.onPeek(t); } }),
+          h('button', { class: 'cr-btn cr-btn-quiet cr-btn-danger', type: 'button', onclick: function () { if (payload.onKill) payload.onKill(t); } }, [icon('close'), ' kill']),
+        ]));
+      });
+      chrome.body.appendChild(list);
+      var confirmRow = h('div', { class: 'cr-inline-confirm', hidden: true }, [
+        h('span', {}, ['Kill every running terminal? This cannot be undone.']),
+        h('button', { class: 'cr-btn cr-btn-solid cr-btn-danger', type: 'button', text: 'Close all', onclick: function () { if (payload.onCloseAll) payload.onCloseAll(); } }),
+        h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Cancel', onclick: function () { confirmRow.hidden = true; closeAllBtn.hidden = false; } }),
+      ]);
+      var closeAllBtn = h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Close all', onclick: function () { closeAllBtn.hidden = true; confirmRow.hidden = false; } });
+      chrome.body.appendChild(h('div', { class: 'cr-cfg-footer' }, [
+        h('p', { class: 'cr-cfg-footer-note' }, ['Closing this dialog detaches; the kill button stops it.']),
+        closeAllBtn,
+        confirmRow,
+      ]));
+    }
+    paint();
+    // FIX: CR.dialogs.update(state) (dialogs.js's generic forwarder) hands its state blob
+    // to WHICHEVER dialog is topmost, unconditionally — it's ext_cr_boot.js's SIDE_EXT hook
+    // broadcasting {flags, sessions, now} on every poll round so the flags dialog stays live.
+    // This dialog's own re-open calls (_openManageDialog/_openCapDialog in ext_cr_term.js)
+    // always carry `terminals` (or `error`); the broadcast carries neither. A blind
+    // `payload = p || {}` replace was clobbering a real {terminals,max,...} payload with the
+    // broadcast's unrelated shape on the very next poll, so `terms.length`/`max` both read 0
+    // and the dialog fell to the empty state a couple seconds after opening. Ignore any update
+    // that isn't actually meant for this dialog instead of accepting whatever lands on top.
+    return {
+      backdrop: chrome.backdrop, panel: chrome.panel,
+      update: function (p) {
+        p = p || {};
+        if (!('terminals' in p) && !('error' in p)) return;
+        payload = p;
+        paint();
+      },
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Directory picker — cr_term.js's "+ New terminal" / "+ New Claude session".
+  // Opened first with {loading:true}, then again with {cwds, note} once GET
+  // /api/term/cwds resolves — folded via the same-name update path.
+  // payload: {mode, title, loading, cwds:[{path,label,mtime},...], note, onPick(path)}
+  // FIX 1: GET /api/term/cwds (term_vt.py's term_cwds()) returns OBJECTS shaped
+  // {path, label, mtime} -- `label` is the project/basename to display, `path` is the
+  // absolute directory to actually POST as `cwd`. Confirmed against term_vt.py:2469
+  // (`out = [{"path": p, "label": label_for[p], "mtime": m} ...]`).
+  // ---------------------------------------------------------------------------
+
+  function renderDirectoryPicker(payload) {
+    payload = payload || {};
+    var chrome = buildChrome('directory-picker', payload.title || 'Choose a directory', null, '', false);
+    var titleEl = chrome.panel.querySelector('.cr-dialog-title');
+    function paint() {
+      titleEl.textContent = payload.title || 'Choose a directory';
+      chrome.body.innerHTML = '';
+      if (payload.loading) chrome.body.appendChild(emptyState({ title: 'Loading recent directories…', body: '' }));
+      if (payload.note) chrome.body.appendChild(h('p', { class: 'cr-help-note' }, [payload.note]));
+      var cwds = payload.cwds || [];
+      if (cwds.length) {
+        var list = h('div', { class: 'cr-flag-list' });
+        cwds.forEach(function (entry) {
+          var path = (entry && entry.path) || '';
+          if (!path) return;
+          var label = (entry && entry.label) || path;
+          list.appendChild(h('button', {
+            // `text:` assigns via el.textContent (h()'s own DOM-property path, line ~48) --
+            // never innerHTML -- so an untrusted label/path can't break markup here.
+            class: 'cr-btn cr-btn-quiet cr-fullrow', type: 'button', text: label,
+            title: path,
+            onclick: function () { if (payload.onPick) payload.onPick(path); close(); },
+          }));
+        });
+        chrome.body.appendChild(list);
+      } else if (!payload.loading && !payload.note) {
+        // Honest empty state (doc 04's "two different empties" -- "nothing yet" case)
+        // instead of silently showing only the free-text field with no explanation.
+        chrome.body.appendChild(emptyState({ title: 'No recent directories', body: 'Type a path below to start.' }));
+      }
+      var input = h('input', { class: 'cr-textfield', type: 'text', placeholder: '/path/to/project' });
+      var go = h('button', {
+        class: 'cr-btn cr-btn-solid', type: 'button', text: 'Start',
+        onclick: function () { if (input.value.trim() && payload.onPick) payload.onPick(input.value.trim()); close(); },
+      });
+      chrome.body.appendChild(h('div', { class: 'cr-textfield-row' }, [input, go]));
+    }
+    paint();
+    return { backdrop: chrome.backdrop, panel: chrome.panel, update: function (p) { payload = p || {}; paint(); } };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Model / effort switchers (capability #55).
+  //
+  // Two call shapes exist in the sibling modules today: cr_term.js's own toolbar
+  // calls `ctx.dialog("model"|"effort", {current, ladder, onPick})` — everything
+  // this dialog needs. cr_detail.js's Evidence-panel mirror calls
+  // `ctx.dialog("modelSwitcher"|"effortPicker", {sessionId})` — no ladder, no
+  // onPick, because picking a model/effort means POSTing /api/term/inject, which
+  // only cr_term.js is wired to do. Per "NO FETCHING", this dialog cannot make
+  // that call itself, so the sessionId-only shape falls back to emitting
+  // 'cr:model-pick' / 'cr:effort-pick' on the bus — see REQUIRED ADDITION in the
+  // report: something needs to listen and perform the actual inject.
+  // ---------------------------------------------------------------------------
+
+  var DEFAULT_EFFORT_LADDER = ['low', 'medium', 'high', 'xhigh', 'max']; // README.md:95 — the CLI's own set
+
+  function renderLadderPicker(kind) {
+    return function (payload) {
+      payload = payload || {};
+      var ladder = payload.ladder || (kind === 'effort' ? DEFAULT_EFFORT_LADDER : null);
+      var chrome = buildChrome(kind, kind === 'effort' ? 'Effort' : 'Model', null, payload.current || '', false);
+      function pick(val) {
+        if (payload.onPick) { payload.onPick(val); close(); return; }
+        if (_ctx && typeof _ctx.emit === 'function') {
+          _ctx.emit(kind === 'effort' ? 'cr:effort-pick' : 'cr:model-pick', { sessionId: payload.sessionId, value: val });
+        }
+        close();
+      }
+      if (ladder) {
+        var list = h('div', { class: 'cr-flag-list' });
+        ladder.forEach(function (v) {
+          list.appendChild(h('button', {
+            class: 'cr-btn cr-fullrow' + (v === payload.current ? ' cr-btn-solid' : ' cr-btn-quiet'),
+            type: 'button', text: v, onclick: function () { pick(v); },
+          }));
+        });
+        chrome.body.appendChild(list);
+      } else {
+        var input = h('input', { class: 'cr-textfield', type: 'text', placeholder: 'model name' });
+        chrome.body.appendChild(h('div', { class: 'cr-textfield-row' }, [
+          input,
+          h('button', { class: 'cr-btn cr-btn-solid', type: 'button', text: 'Switch', onclick: function () { if (input.value.trim()) pick(input.value.trim()); } }),
+        ]));
+        chrome.body.appendChild(h('p', { class: 'cr-help-note' }, ['No fixed model list is known client-side — type the exact name /model accepts.']));
+      }
+      return { backdrop: chrome.backdrop, panel: chrome.panel };
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Fork lineage (capability #52) — cr_term.js's real payload: {sid, continuedAs,
+  // continuedFrom, onOpen(targetSid)}, read off the shared session-detail dict's
+  // continued_as/continued_from fields (registry.py — every provider).
+  // ---------------------------------------------------------------------------
+
+  function renderForkLineage(payload) {
+    payload = payload || {};
+    var chrome = buildChrome('fork-lineage', 'Fork lineage', 'branch', payload.sid || '', false);
+    var body = chrome.body;
+    // FIX 5: the header subtitle is only the raw id (buildChrome's 4th arg) -- colour/id
+    // never carries meaning alone (doc 04's own rule), so say in words which session this
+    // is, resolving a human title the same way every other identity lookup in this file
+    // does (sessionTitleFor, added above for FIX 2).
+    if (payload.sid) {
+      var here = sessionTitleFor(payload.sid) || payload.sid.slice(0, 8);
+      body.appendChild(h('p', { class: 'cr-help-note' }, ['You are currently on ', h('strong', {}, [here]), '.']));
+    }
+    function linkRow(label, targetSid) {
+      body.appendChild(h('p', {}, [
+        label + ' ',
+        h('button', { class: 'cr-link cr-linklike', type: 'button', text: targetSid, onclick: function () { if (payload.onOpen) payload.onOpen(targetSid); close(); } }),
+        '.',
+      ]));
+    }
+    if (payload.continuedAs) linkRow('This session continues as', payload.continuedAs);
+    if (payload.continuedFrom) linkRow('Continued from', payload.continuedFrom);
+    if (!payload.continuedAs && !payload.continuedFrom) {
+      body.appendChild(emptyState({ title: 'No fork lineage', body: 'This session was not forked and has no known continuation.' }));
+    }
+    return { backdrop: chrome.backdrop, panel: chrome.panel };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Rename session (capability #11) — cr_detail.js payload: {sessionId, currentTitle}.
+  // POST /api/title already exists (server.py) but per "NO FETCHING" this dialog
+  // emits 'cr:rename' on the bus rather than writing it itself — see the report.
+  // ---------------------------------------------------------------------------
+
+  function renderRenameSession(payload) {
+    payload = payload || {};
+    var chrome = buildChrome('rename', 'Rename session', 'edit', payload.sessionId || '', false);
+    var input = h('input', { class: 'cr-textfield', type: 'text', value: payload.currentTitle || '' });
+    chrome.body.appendChild(input);
+    chrome.body.appendChild(h('div', { class: 'cr-cfg-actions', style: 'margin-top:12px' }, [
+      h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Cancel', onclick: close }),
+      h('button', {
+        class: 'cr-btn cr-btn-solid', type: 'button', text: 'Save',
+        onclick: function () {
+          var title = input.value.trim();
+          if (_ctx && typeof _ctx.emit === 'function') _ctx.emit('cr:rename', { sessionId: payload.sessionId, title: title });
+          close();
+        },
+      }),
+    ]));
+    return { backdrop: chrome.backdrop, panel: chrome.panel };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Drill-down pop-outs opened with only an id — cr_detail.js's real payloads for
+  // fileDiff/commandOutput/agentTranscript/shellTail are {sessionId, path|cmdId|
+  // agentId|shellId} with NO content. registry.py's own drill() vocabulary
+  // ("output","diff","shell","agent") names exactly what each needs fetched from
+  // /api/diff | /api/output | /api/shell | /api/agent — routes that already
+  // exist. Per "NO FETCHING" this module cannot call them itself, so it renders a
+  // loading placeholder and asks for the content over the bus as 'cr:drill-
+  // request'; whoever owns the fetch re-opens the SAME dialog name with the
+  // content filled in ({lines,...} for diff, {text} for the rest), which
+  // open()'s same-name update path upgrades in place. See REQUIRED ADDITION.
+  // ---------------------------------------------------------------------------
+
+  var DRILL_ID_KEY = { diff: 'path', output: 'cmdId', agent: 'agentId', shell: 'shellId' };
+  var DRILL_TITLE = { diff: 'diff', output: 'output', agent: 'agent transcript', shell: 'shell' };
+
+  function renderDrillPopout(kind) {
+    return function (payload) {
+      payload = payload || {};
+      var hasContent = kind === 'diff' ? Array.isArray(payload.lines) : (typeof payload.text === 'string');
+      if (hasContent) {
+        var mode = kind === 'diff' ? 'diff' : 'output';
+        var merged = {}; for (var k in payload) merged[k] = payload[k]; merged.mode = mode;
+        return renderDiffPopout(merged);
+      }
+      var idVal = payload[DRILL_ID_KEY[kind]];
+      var chrome = buildChrome(kind, DRILL_TITLE[kind] + (idVal ? ': ' + idVal : ''), null, payload.sessionId || '', true);
+      chrome.panel.classList.add('cr-dialog-popout');
+      chrome.body.appendChild(emptyState({
+        title: 'Loading ' + DRILL_TITLE[kind] + '…',
+        body: 'Fetching the content for this pop-out.',
+      }));
+      if (_ctx && typeof _ctx.emit === 'function') {
+        _ctx.emit('cr:drill-request', { kind: kind, sessionId: payload.sessionId, arg: idVal });
+      }
+      return {
+        backdrop: chrome.backdrop, panel: chrome.panel,
+        update: function (richer) {
+          richer = richer || {};
+          if (richer.error) {
+            var oldBodyErr = chrome.panel.querySelector('.cr-dialog-body');
+            oldBodyErr.innerHTML = '';
+            oldBodyErr.appendChild(errorState({
+              title: "Couldn't load this " + DRILL_TITLE[kind],
+              body: String(richer.error),
+            }));
+            return;
+          }
+          var richHas = kind === 'diff' ? Array.isArray(richer.lines) : (typeof richer.text === 'string');
+          if (!richHas) return;
+          var mode2 = kind === 'diff' ? 'diff' : 'output';
+          var merged2 = {}; for (var k2 in richer) merged2[k2] = richer[k2]; merged2.mode = mode2;
+          var rebuilt = renderDiffPopout(merged2);
+          var newBody = rebuilt.panel.querySelector('.cr-dialog-body');
+          var oldBody = chrome.panel.querySelector('.cr-dialog-body');
+          oldBody.innerHTML = '';
+          while (newBody.firstChild) oldBody.appendChild(newBody.firstChild);
+        },
+      };
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // registry + public API
+  // ---------------------------------------------------------------------------
+
+  var REGISTRY = {
+    help: renderHelp,
+    config: renderConfig,
+    flags: renderFlagsList,
+    'manage-terminals': renderManageTerminals,
+    'terminals-cap': renderManageTerminals, // alias: doc 04's own section title for this dialog
+    'directory-picker': renderDirectoryPicker,
+    model: renderLadderPicker('model'),
+    effort: renderLadderPicker('effort'),
+    'fork-lineage': renderForkLineage,
+    rename: renderRenameSession,
+    'file-diff': renderDrillPopout('diff'),
+    'command-output': renderDrillPopout('output'),
+    'agent-transcript': renderDrillPopout('agent'),
+    'shell-tail': renderDrillPopout('shell'),
+    diff: renderDiffPopout,       // generic rich pop-out for a caller that already holds full content
+    'run-output': renderRunOutput, // live "Run a command" pane (doc 04 #54) — see REQUIRED ADDITION above
+    'narration-diagram': renderNarrationDiagram,
+  };
+
+  window.CR.dialogs = {
+    mount: mount,
+    open: open,
+    close: close,
+    update: update,
+    emptyState: emptyState,
+    errorState: errorState,
+    degraded: degraded,
+    toast: toast,
+    notificationNudge: notificationNudge,
+    showNudgeIfNeeded: showNudgeIfNeeded,
+    providerNoteFor: providerNoteFor,
+    addHelpShortcuts: addHelpShortcuts,
+    // Exposed so a role="dialog" surface built outside this module's own open()/close()
+    // (currently: ext_cr_term.js's terminal overlay) can wire the SAME Tab-cycling focus
+    // trap every dialog built via open() already gets — instead of forking a second
+    // implementation. Returns the untrap cleanup fn, exactly like the internal call site
+    // above (open()) uses it.
+    trapFocus: trapFocus,
+    CAPABILITIES: CAPABILITIES, // exposed read-only — tests/test_capability_table.py asserts against this directly
+  };
+})();

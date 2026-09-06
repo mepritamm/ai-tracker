@@ -4,8 +4,9 @@ import urllib.parse
 from ..config import LIVE_WINDOW, NARRATION_CAP
 from .. import config
 from ..util import (_short_title, _git_branch, cmd_kind, COMMIT_MSG_RE,
-                    collect_prs, note_pr_states, prs_sorted, pr_worked, push_when,
-                    PR_CREATE_RE, unified, context_window)
+                    collect_prs, note_pr_states, prs_sorted, pr_worked, pr_summary, push_when,
+                    PR_CREATE_RE, unified, context_window, todo_summary, todo_times_approximate,
+                    now_phrase)
 from ..overview import build_overview
 from ..store import load_titles, load_notes
 from .base import Provider
@@ -146,7 +147,7 @@ def _real_text(part, msg=None):
 
 
 _SESSION_COLS = ("id, parent_id, directory, title, agent, model, time_created, time_updated, "
-                 "tokens_input, tokens_output, tokens_cache_read, tokens_cache_write")
+                 "tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, version")
 
 
 def _transcript(conn, sid):
@@ -192,8 +193,23 @@ _LIST_CACHE = {}   # (db_path, sid) -> (cache_key, entry) — the per-poll cache
                    # silently return the first db's cached entry.
 
 
+def _last_message_ended(conn, sid):
+    """True iff this session's LAST message (by time_created/id — not by part) is an
+    assistant turn that reached time.completed. Factored out of _list_state so
+    parse_opencode's meta["ended"] can share this EXACT rule instead of a second,
+    possibly-drifting re-derivation."""
+    last = _rows(conn, "SELECT data FROM message WHERE session_id = ? "
+                       "ORDER BY time_created DESC, id DESC LIMIT 1", (sid,))
+    m = _json(last[0][0]) if last else {}
+    return (m.get("role") == "assistant") and bool(_d(m.get("time")).get("completed"))
+
+
 def _list_state(conn, sid):
-    """(prompt, waiting, ended) for the sidebar — the opencode analog of _auggie_state.
+    """(prompt, waiting, ended, last_text, fail_cmd, pr_num, pr_url, pr_repo, pr_state) for
+    the sidebar — the opencode analog of _auggie_state / claude.py's _tail_scan, all folded
+    into ONE pass over the session's parts. This function only ever runs on a cache miss (see
+    _LIST_CACHE below), so the extra work below only lands on a session whose activity
+    actually moved since the last poll — never on every poll of every session.
 
     `waiting`: ANY `question` tool call is still unresolved (opencode's ask-user; a resolved
     one lands on status completed/error) → blocked on the human, not idle. Tracked per callID,
@@ -202,25 +218,59 @@ def _list_state(conn, sid):
     THE BUG this replaced: the old loop kept only the LAST question part seen and overwrote
     `waiting` on every iteration, so q1-unresolved-then-q2-answered read as waiting=False here
     while parse_opencode's detail view (any-of semantics) read the same session as waiting=True.
-    `ended`: the session's last message is an assistant turn that reached time.completed."""
+    `ended`: see _last_message_ended.
+    `last_text`: the most recent ASSISTANT narration snippet seen in this same scan — feeds
+    the board tile's now_line narration fallback (list_opencode, below); same "what's true
+    right now, latest wins" rule claude.py's _tail_scan uses for its own `last_text`.
+    `fail_cmd`: the latest `bash` tool call's command (<=60 chars) if it errored, else None —
+    same latest-wins rule. opencode has no Claude-Code-style "the harness refused to even run
+    this" wrapper to filter out (see claude.py's _is_real_bash_error) — every bash tool part
+    here genuinely ran, so status=="error" is always a real failure.
+    `pr_num`/`pr_url`/`pr_repo`/`pr_state`: the one representative CREATED PR (util.pr_summary),
+    scanned off each bash command + its already-captured output in this SAME pass — no extra
+    query, unlike claude.py's budgeted _fill_pr (that budget exists because Claude's list-level
+    tail read runs UNCONDITIONALLY every poll; this scan only runs on a cache miss, so it is
+    already bounded to sessions whose transcript actually changed)."""
     prompt = ""
+    last_text = ""
+    fail_cmd = None
     open_asks = {}   # callID -> still open?
+    prs, pr_states = {}, {}
     for part, msg in _transcript(conn, sid):
-        if part.get("type") == "tool" and part.get("tool") == "question":
+        ptype = part.get("type")
+        if ptype == "tool" and part.get("tool") == "question":
             open_asks[part.get("callID")] = _d(part.get("state")).get("status") not in (
                 "completed", "error")
             continue
-        if prompt or msg.get("role") != "user":
+        if ptype == "tool" and part.get("tool") == "bash":
+            st = _d(part.get("state"))
+            inp = st.get("input") if isinstance(st.get("input"), dict) else {}
+            c = inp.get("command")
+            if isinstance(c, str) and c:
+                ts = _iso(part.get("time_created") or _d(msg.get("time")).get("created"))
+                fail_cmd = c[:60] if st.get("status") == "error" else None
+                collect_prs(prs, c, ts)
+                note_pr_states(pr_states, c)
+                out = st.get("output")
+                if isinstance(out, str) and out:
+                    collect_prs(prs, out[:20000], ts, created=bool(PR_CREATE_RE.search(c)))
+                    note_pr_states(pr_states, out[:20000])
             continue
-        t = _real_text(part)
-        if t:
-            prompt = " ".join(t.split())[:200]
+        role = msg.get("role")
+        if role == "user":
+            if prompt:
+                continue
+            t = _real_text(part)
+            if t:
+                prompt = " ".join(t.split())[:200]
+        elif role == "assistant":
+            t = _real_text(part)
+            if t:
+                last_text = " ".join(t.split())[:200]     # latest wins
     waiting = any(open_asks.values())
-    last = _rows(conn, "SELECT data FROM message WHERE session_id = ? "
-                       "ORDER BY time_created DESC, id DESC LIMIT 1", (sid,))
-    m = _json(last[0][0]) if last else {}
-    ended = (m.get("role") == "assistant") and bool(_d(m.get("time")).get("completed"))
-    return prompt, waiting, (not waiting) and ended
+    ended = (not waiting) and _last_message_ended(conn, sid)
+    pr_num, pr_url, pr_repo, pr_state = pr_summary(prs, pr_states)
+    return prompt, waiting, ended, last_text, fail_cmd, pr_num, pr_url, pr_repo, pr_state
 
 
 def _activity(conn):
@@ -240,10 +290,43 @@ def _activity(conn):
     return latest
 
 
+def _todo_batch(conn):
+    """sid -> [{"content","status","activeForm"}] for EVERY session's todos, one query for the
+    whole list-poll instead of an N+1 SELECT per session — this is the gap that left
+    todo_total/todo_done/todo_current/todo_current_index unset on the list dict: _todos()
+    (below) exists but used to only ever be called from the (per-session, on-demand) detail
+    path. Shape is the minimal one util.todo_summary() actually reads; the detail dict's
+    fuller contract (desc/id/started_at/ended_at) lives on _todos() instead."""
+    out = {}
+    for sid, c, s in _rows(conn, "SELECT session_id, content, status FROM todo "
+                                 "ORDER BY session_id, position ASC"):
+        out.setdefault(sid, []).append({"content": c or "", "status": s or "pending",
+                                        "activeForm": c or ""})
+    return out
+
+
+def _bg_batch(conn):
+    """parent_id -> # of that parent's `task`-dispatch child sessions still running
+    (LIVE_WINDOW) — the list dict's `bg` field (was hardcoded 0). One query for the whole
+    list-poll instead of an N+1 SELECT per session, mirroring _todo_batch above: this used
+    to be _bg_count(conn, sid), called once per session in the list_opencode loop below —
+    77 individual parent_id lookups on this machine's corpus, the same N+1 shape _todo_batch
+    was written to eliminate for todos."""
+    now = time.time()
+    out = {}
+    for parent, tu in _rows(conn, "SELECT parent_id, time_updated FROM session "
+                                  "WHERE parent_id IS NOT NULL"):
+        if (now - _epoch(tu)) < LIVE_WINDOW:
+            out[parent] = out.get(parent, 0) + 1
+    return out
+
+
 def list_opencode():
     """One query for the session rows plus one activity query each over `part` and `message`;
-    the transcript scan (prompt/waiting/ended) runs only for sessions whose real activity
-    (not just the session row) moved since the last poll."""
+    the transcript scan (prompt/waiting/ended/last_text/fail_cmd/PRs, in _list_state) runs
+    only for sessions whose real activity (not just the session row) moved since the last
+    poll. Todos are read once for ALL sessions via _todo_batch (one query, not N+1); `bg` is
+    read once for ALL sessions via _bg_batch (one query, not N+1)."""
     conn = _open()
     if conn is None:
         return []
@@ -251,28 +334,66 @@ def list_opencode():
         db = config.OPENCODE_DB
         titles = load_titles()
         activity = _activity(conn)
+        todos_by_sid = _todo_batch(conn)
+        bg_by_sid = _bg_batch(conn)
         out = []
-        for (sid, parent, cwd, title, _agent, _model_raw, _tc, tu, *_tok) in _rows(
+        for (sid, parent, cwd, title, _agent, model_raw, _tc, tu, *_tok) in _rows(
                 conn, "SELECT " + _SESSION_COLS + " FROM session ORDER BY time_updated DESC"):
             key = max(tu or 0, activity.get(sid, 0))
             cache_id = (db, sid)
             hit = _LIST_CACHE.get(cache_id)
             if hit and hit[0] == key:
-                prompt, waiting, ended = hit[1]
+                (prompt, waiting, ended, last_text, fail_cmd,
+                 pr_num, pr_url, pr_repo, pr_state) = hit[1]
             else:
-                prompt, waiting, ended = _list_state(conn, sid)
-                _LIST_CACHE[cache_id] = (key, (prompt, waiting, ended))
+                (prompt, waiting, ended, last_text, fail_cmd,
+                 pr_num, pr_url, pr_repo, pr_state) = _list_state(conn, sid)
+                _LIST_CACHE[cache_id] = (key, (prompt, waiting, ended, last_text, fail_cmd,
+                                                pr_num, pr_url, pr_repo, pr_state))
             gid = "opencode:" + sid
             cwd = cwd or ""
+            mt = _epoch(tu)
+            bg = bg_by_sid.get(sid, 0)
+            todo_total, todo_done, todo_current, todo_current_index = todo_summary(
+                todos_by_sid.get(sid, []))
+            # "what's happening now" board-tile phrase — LIVE sessions only, mirroring
+            # claude.py's list_sessions priority (waiting > running agents > in-progress todo >
+            # latest narration). opencode has no background-shell concept at all, so that rung
+            # of Claude's ladder is skipped outright (shells_running is always 0 below).
+            now_line = ""
+            if (time.time() - mt) < LIVE_WINDOW:
+                if not ended and waiting:
+                    now_line = "⧖ waiting for your answer"
+                elif bg:
+                    now_line = "⚙ %d background agent%s" % (bg, "" if bg == 1 else "s")
+                elif not ended and todo_current:
+                    now_line = "▶ " + now_phrase(todo_current)
+                elif not ended and last_text:
+                    now_line = now_phrase(last_text)
             out.append({
                 "id": gid, "project": os.path.basename(cwd) if cwd else "opencode", "cwd": cwd,
                 "title": titles.get(gid) or title or _short_title(prompt) or "opencode session",
-                "prompt": prompt, "source": "opencode", "mtime": _epoch(tu),
+                "prompt": prompt, "source": "opencode", "mtime": mt,
                 # a session with a parent IS a sub-agent run (opencode's `task` tool spawns one),
                 # so it nests under its parent in the sidebar exactly like Claude's sdk-cli sessions.
                 "agent": bool(parent), "group": "", "groupLabel": "",
-                "parentId": ("opencode:" + parent) if parent else "", "bg": 0, "first": 0,
+                "parentId": ("opencode:" + parent) if parent else "",
+                "bg": bg, "first": 0,
                 "waiting": waiting, "ended": ended,
+                "todo_total": todo_total, "todo_done": todo_done, "todo_current": todo_current,
+                "todo_current_index": todo_current_index,
+                # the ONE representative PR this session CREATED (util.pr_summary) — None/""
+                # while genuinely absent, never a guess.
+                "pr_num": pr_num, "pr_url": pr_url, "pr_repo": pr_repo, "pr_state": pr_state or "",
+                "now_line": now_line,
+                # current model id, straight off session.model — verified in sync with the
+                # session's own last assistant message on this machine's whole corpus (0/77
+                # mismatches; see parse_opencode's meta["model"] for the same read).
+                "model": _model(model_raw),
+                "fail_cmd": fail_cmd,
+                # opencode has no background-shell concept at all — genuinely, always 0,
+                # never omitted (see the `shells: []` note in parse_opencode below).
+                "shells_running": 0,
             })
         return out
     finally:
@@ -297,10 +418,29 @@ def _session_row(conn, sid):
 
 def _todos(conn, sid):
     """opencode's todo table already speaks the tracker's own vocabulary
-    (completed/in_progress/pending) — no state mapping needed, unlike Auggie's."""
-    return [{"content": c or "", "status": s or "pending", "activeForm": c or ""}
-            for (c, s) in _rows(conn, "SELECT content, status FROM todo WHERE session_id = ? "
-                                      "ORDER BY position ASC", (sid,))]
+    (completed/in_progress/pending) — no state mapping needed, unlike Auggie's.
+
+    `id`: the row's own `position` (stringified) — a stable, real per-session ordinal, not a
+    guessed index. `desc`: opencode's todo table has no description column — honest "".
+    `started_at`/`ended_at`: EPOCH SECONDS (the table stores MILLIseconds — via `_epoch`) off
+    the row's OWN `time_created`/`time_updated` — REAL per-row timestamps, unlike Auggie's
+    name-matched approximation (see the `todo_times_approximate` key on the result dict,
+    below, in parse_opencode). Gated the same way Claude's task-store join gates
+    started_at/ended_at: only a row that has actually reached in_progress/completed gets a
+    started_at, and only one currently completed gets an ended_at — a stray content-only edit
+    that merely bumped time_updated on a still-pending row must not read as "ended"."""
+    out = []
+    for c, s, tc, tu, pos in _rows(
+            conn, "SELECT content, status, time_created, time_updated, position "
+                 "FROM todo WHERE session_id = ? ORDER BY position ASC", (sid,)):
+        status = s or "pending"
+        out.append({
+            "content": c or "", "status": status, "activeForm": c or "", "desc": "",
+            "id": str(pos),
+            "started_at": _epoch(tc) if status in ("in_progress", "completed") else None,
+            "ended_at": _epoch(tu) if status == "completed" else None,
+        })
+    return out
 
 
 def _child_sessions(conn, sid, parent_cwd):
@@ -331,7 +471,7 @@ def parse_opencode(session_id):
         if row is None:
             return None
         (sid, parent, cwd, s_title, _agent, model_raw, t_created, t_updated,
-         tok_in, tok_out, tok_cr, tok_cw) = row
+         tok_in, tok_out, tok_cr, tok_cw, s_version) = row
         cwd = cwd or ""
         requests, narrative, files, cmds, reads, commits = [], [], {}, [], {}, []
         agents = []       # `task` dispatches (~ Claude's Task / Auggie's sub-agent-*)
@@ -411,6 +551,11 @@ def parse_opencode(session_id):
                     "answer": "; ".join(flat)[:2000], "questions": qs}
         branch = _git_branch(cwd)
         tests = [c for c in cmds if c["kind"] == "test"]
+        # last failing command's text (<=60 chars) — mirrors claude.py's detail-dict `fail_cmd`
+        # (parse_session, ~1475): the most recent `ok=False` command in this session, honestly
+        # None when nothing failed. `cmds` already carries `ok` per-entry (opencode's tool part
+        # carries its own status directly — no separate tool_result join needed, unlike Claude).
+        fail_cmd = next((c["cmd"][:60] for c in reversed(cmds) if not c["ok"]), None)
         todos = _todos(conn, sid)
         done = sum(1 for x in todos if x["status"] == "completed")
         gid = "opencode:" + sid
@@ -423,8 +568,34 @@ def parse_opencode(session_id):
         mtime = _epoch(t_updated) or _epoch(t_created)
         result = {
             "meta": {"cwd": cwd, "title": title, "source": "opencode", "entrypoint": "opencode",
-                     "model": _model(model_raw), "gitBranch": branch},
+                     # session.model verified in sync with the session's own last assistant
+                     # message across this machine's whole corpus (0/77 mismatches) — trusted
+                     # unconditionally, same "last wins" intent as Claude's per-message read.
+                     "model": _model(model_raw), "gitBranch": branch,
+                     "sessionId": sid,
+                     # exact same rule the sidebar's ✅ uses (_last_message_ended) — last
+                     # message is an assistant turn that reached time.completed.
+                     "ended": _last_message_ended(conn, sid),
+                     "aiTitle": s_title or "",
+                     # opencode's message rows carry no per-message model/variant/effort field
+                     # at all — verified across every message on this machine (2000/2000, 0
+                     # hits for "variant"/"effort"/"reasoningEffort"). Honest empty, not a guess.
+                     "effort": "",
+                     # session.version IS the real, non-guessed field here — session.metadata
+                     # (the field the audit named) is empty JSON on every session on this
+                     # machine (0/77 non-empty); the schema's separate `version` COLUMN carries
+                     # the actual opencode app version (e.g. "1.18.18") and is the honest parity
+                     # match for Claude's meta["version"] (also an app/CLI version).
+                     "version": s_version or "",
+                     # opencode has no second title slot — the session row's only title IS
+                     # aiTitle/s_title above. Honest empty.
+                     "customTitle": ""},
             "todos": todos,
+            # opencode's todo table has REAL per-row time_created/time_updated (see _todos), not
+            # a name-matched guess — so, unlike Auggie/Augment, this is EXACT (False). The shared
+            # seam (util.todo_times_approximate) now knows this too, so it's called like every
+            # other provider does rather than re-deriving the policy here.
+            "todo_times_approximate": todo_times_approximate("opencode"),
             "files": sorted(files.values(), key=lambda x: x.get("last") or "", reverse=True),
             "reads": [{"path": p, "t": t} for p, t in
                       sorted(reads.items(), key=lambda kv: kv[1] or "", reverse=True)],
@@ -443,6 +614,9 @@ def parse_opencode(session_id):
             # open decisions first, then most-recent — parity with Claude's AskUserQuestion panel
             "decisions": sorted(asks.values(), key=lambda a: (a["open"], a["t"] or ""), reverse=True),
             "waiting": any(a["open"] for a in asks.values()),
+            # board "failing" tile signal, SAME field name as the list dict — see fail_cmd's
+            # computation above. Honestly None when nothing failed, never omitted.
+            "fail_cmd": fail_cmd,
             "prs": [p for p in prs_sorted(prs, pr_states) if pr_worked(p, cwd)],
             "narrative": narrative[::-1],   # full, newest-first; /api/session pages it
             "message": latest[:2000],
@@ -489,8 +663,13 @@ def search_opencode(q, limit=500):
         return []
     try:
         meta = {}
+        # THE TRAP this fixes: with no SQL LIMIT, this fetched EVERY session row (and every
+        # column _SESSION_COLS names) before the Python-side `break` below could ever bound
+        # it — the break only stopped the loop, not the query's own cost. Push the bound into
+        # the SQL itself so the two can't drift apart again.
         for (sid, parent, cwd, title, _a, _m, _tc, tu, *_tok) in _rows(
-                conn, "SELECT " + _SESSION_COLS + " FROM session ORDER BY time_updated DESC"):
+                conn, "SELECT " + _SESSION_COLS + " FROM session ORDER BY time_updated DESC "
+                      "LIMIT ?", (limit,)):
             meta[sid] = (parent, cwd or "", title or "", _epoch(tu))
             if len(meta) >= limit:
                 break

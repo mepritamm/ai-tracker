@@ -227,8 +227,17 @@ class TestList(_OpencodeEnv):
 
     def test_list_returns_the_exact_key_set(self):
         main = self._by_id()["opencode:ses_main"]
+        # parity with claude.py's list_sessions() dict (registry.py's shared list shape):
+        # todo_total/todo_done/todo_current/todo_current_index (todo_summary), pr_num/pr_url/
+        # pr_repo/pr_state (the one representative PR), now_line (board-tile phrase), model
+        # (current model id), fail_cmd (board "failing" tile signal, off the bounded tail),
+        # and shells_running (opencode has none, always 0 but never omitted — see aitracker/
+        # providers/opencode.py's list_opencode()).
         expected = {"id", "project", "cwd", "title", "prompt", "source", "mtime", "agent",
-                    "group", "groupLabel", "parentId", "bg", "first", "waiting", "ended"}
+                    "group", "groupLabel", "parentId", "bg", "first", "waiting", "ended",
+                    "todo_total", "todo_done", "todo_current", "todo_current_index",
+                    "pr_num", "pr_url", "pr_repo", "pr_state", "now_line", "model",
+                    "fail_cmd", "shells_running"}
         self.assertEqual(set(main.keys()), expected)
 
     def test_ids_are_prefixed_and_source_is_opencode(self):
@@ -274,8 +283,16 @@ class TestParseDetailContract(_OpencodeEnv):
         self.d = self.provider.parse("opencode:ses_main")
 
     def test_every_contract_key_present(self):
-        expected = {"meta", "todos", "files", "reads", "commands", "commits", "tests", "requests",
-                    "agents", "agents_bg", "agent_sessions", "shells", "decisions", "waiting", "prs",
+        # fail_cmd and todo_times_approximate are legitimate DETAIL-dict keys — claude.py's
+        # parse_session() emits both on its return dict (aitracker/providers/claude.py:1453
+        # "todo_times_approximate": todo_times_approximate("claude"), and :1475 "fail_cmd":
+        # fail_cmd), so opencode.py's parse_opencode() emitting them too is parity, not a bug.
+        # todo_done/pr_url/now_line/pr_state belong to the SESSION-LIST dict instead (claude.py's
+        # list_sessions(), ~line 602-611) — covered by TestList.test_list_returns_the_exact_key_set,
+        # not here.
+        expected = {"meta", "todos", "todo_times_approximate", "files", "reads", "commands",
+                    "commits", "tests", "requests", "agents", "agents_bg", "agent_sessions",
+                    "shells", "decisions", "waiting", "prs", "fail_cmd",
                     "narrative", "message", "tokens", "context", "counts", "overview", "mtime",
                     "now", "notes", "push_when"}
         self.assertEqual(set(self.d.keys()), expected)

@@ -121,14 +121,16 @@ def build_script(cwd: str, sid: str, mode: str, app: str, resume_argv=None) -> s
     sees the spawned Terminal/iTerm tab again, so there is nothing here to retry AFTER the fact.
     The fallback is built into the command ITSELF instead: when `resume_argv` does not already
     include `--fork-session` (today: always -- see term_gate.resume_argv's docstring for why the
-    fast path stopped guessing), the inner shell command becomes
-    `(<resume> || <resume> --fork-session)` -- if the plain resume is refused (exits non-zero),
-    the shell's own `||` retries with the flag, with no ai-tracker process involved at all. If
-    `resume_argv` ever forks up front again, there would be nothing to fall back to, so the plain
-    single command would be used unchanged -- that branch is kept for exactly that case. There is no
-    Tier-1 equivalent of the missing-transcript notice (term_vt.Screen) -- an external Terminal/
-    iTerm tab is opaque to this server once launched, so that case is left to the CLI's own
-    already-observed behaviour (silently starts a fresh conversation; see
+    fast path stopped guessing), the inner shell command becomes a chain of fallbacks:
+    `(<resume> || [<attach>] || <resume> --fork-session)`, where [<attach>] is included when
+    available. On refusal of the plain resume, the shell tries `claude attach` first to return to
+    the REAL session (resumes in place), and only if that also fails does it fall back to forking
+    a copy with `--fork-session`. All retry logic runs in the shell with no ai-tracker involvement.
+    If `resume_argv` ever forks up front again, there would be nothing to fall back to, so the
+    plain single command would be used unchanged -- that branch is kept for exactly that case.
+    There is no Tier-1 equivalent of the missing-transcript notice (term_vt.Screen) -- an external
+    Terminal/iTerm tab is opaque to this server once launched, so that case is left to the CLI's
+    own already-observed behaviour (silently starts a fresh conversation; see
     docs/claude-resume-command-matrix.md) with no warning surfaced here.
     """
     inner = "cd %s" % shlex.quote(cwd)
@@ -138,8 +140,26 @@ def build_script(cwd: str, sid: str, mode: str, app: str, resume_argv=None) -> s
         if "--fork-session" in argv:
             inner += " && " + primary
         else:
-            fallback = " ".join(shlex.quote(a) for a in argv + ["--fork-session"])
-            inner += " && (%s || %s)" % (primary, fallback)
+            # Build fallback chain: (<resume> || [<attach>] || <resume> --fork-session)
+            # attach returns the REAL session (resumes in place); fork-session only ever makes a copy.
+            # attach is inserted first so we try to return to the real session before falling back to a copy.
+            fallback_parts = [primary]
+
+            # Add attach as the first fallback, if available
+            if sid:
+                short_id = sid[:8]
+                attach_argv_list = term_gate.attach_argv(short_id)
+                if attach_argv_list:
+                    attach_cmd = " ".join(shlex.quote(a) for a in attach_argv_list)
+                    fallback_parts.append(attach_cmd)
+
+            # Add fork-session as the final fallback
+            fork_fallback = " ".join(shlex.quote(a) for a in argv + ["--fork-session"])
+            fallback_parts.append(fork_fallback)
+
+            # Join all fallbacks with || and wrap in parens
+            chain = " || ".join(fallback_parts)
+            inner += " && (%s)" % chain
     escaped = inner.replace("\\", "\\\\").replace('"', '\\"')
     if app == "iTerm":
         return (

@@ -1,0 +1,2457 @@
+"""Pins the client-side DERIVED VALUES the Control Room UI computes in JavaScript.
+
+Every one of these encodes actual product design (board ranking + the 8-tile cap,
+session-state derivation, the progress spine's time-proportional widths, the merged
+timeline, triage counts) and, unlike the server-side derived values (todo counts, PR
+fields, todo timings, config precedence — all covered in tests/test_selfcheck.py),
+had NO assertion anywhere before this file.
+
+Idiom copied from tests/test_page_bundle.py: build the REAL assembled page
+(aitracker.page.build_page()), extract the inlined <script> bundle, execute it under
+a minimal stub DOM in Node, then reach into window.CR for the exported pure
+derivations. Skips cleanly (not a failure) when node is unavailable — same as
+test_page_bundle.py.
+
+Exported surface exercised here (verified by reading the source, not guessed):
+  window.CR.board  (aitracker/web/ext_cr_board.js, createBoard()'s return object):
+    boardTiles, sessionState, railOrder, agentGroups, triageCounts, activityHistogram
+  window.CR.detail._internal  (aitracker/web/ext_cr_detail.js, end of file):
+    spineSegments, mergeTimeline, deriveLinks, stateOf, firstEventTime,
+    extractDiagram, groupAgentReruns
+
+Only boardTiles/sessionState/railOrder/agentGroups/triageCounts (board) and
+spineSegments/mergeTimeline (detail) are pinned below, per the assignment. See the
+bottom of this file for what was deliberately left unpinned and why.
+"""
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_TESTS_DIR)
+_AITRACKER = os.path.join(_ROOT, "aitracker")
+_HAS_NODE = shutil.which("node") is not None
+
+sys.path.insert(0, _ROOT)
+from aitracker import config  # noqa: E402  (LIVE_WINDOW pinned against this, never a second literal)
+
+LIVE_WINDOW = config.LIVE_WINDOW  # 300s as of writing; read live so a config change is caught, not silently outdated
+
+
+# ---------------------------------------------------------------------------
+# Idiom copied from test_page_bundle.py: read the real page, pull out the bundle,
+# run it in node under a stub DOM.
+# ---------------------------------------------------------------------------
+
+def _read_page():
+    from aitracker import page
+    return page.build_page()
+
+
+def _extract_script_content(html):
+    script_pattern = re.compile(r'<script[^>]*>(.*?)</script>', re.DOTALL)
+    matches = list(script_pattern.finditer(html))
+    if not matches:
+        raise ValueError("No <script> tag found in assembled page")
+    return matches[-1].group(1)
+
+
+def _run_node(js_source, timeout=30):
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "harness.js")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(js_source)
+        proc = subprocess.run(["node", path], capture_output=True, text=True, timeout=timeout)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+_JS_PREAMBLE = r"""
+// Minimal browser environment for bundle execution (same stub as test_page_bundle.py).
+globalThis.window = globalThis;
+
+function makeEl() {
+  var self = {
+    classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    style: {}, dataset: {}, setAttribute() {}, getAttribute() { return null; },
+    appendChild() {}, append() {}, remove() {}, insertBefore() {},
+    addEventListener() {}, removeEventListener() {},
+    querySelector: function() { return self; }, querySelectorAll: () => [self],
+    closest: function() { return self; }, firstElementChild: self, children: [self],
+    innerHTML: "", textContent: "", hidden: false, focus() {}, click() {}
+  };
+  return self;
+}
+
+var stubEl = makeEl();
+window.document = {
+  createElement: () => makeEl(), createTextNode: () => makeEl(),
+  getElementById: () => stubEl, querySelector: () => stubEl, querySelectorAll: () => [stubEl],
+  addEventListener() {}, dispatchEvent() {},
+  documentElement: stubEl, body: stubEl, head: stubEl, readyState: "complete"
+};
+
+const _localStorage = {};
+window.localStorage = {
+  getItem: (k) => (k in _localStorage) ? _localStorage[k] : null,
+  setItem: (k, v) => { _localStorage[k] = v; },
+  removeItem: (k) => { delete _localStorage[k]; }
+};
+
+window.matchMedia = () => ({ matches: false, addEventListener() {}, addListener() {}, removeEventListener() {} });
+window.fetch = () => Promise.resolve({ ok: true, json: () => Promise.resolve({}), text: () => Promise.resolve(""), headers: { get: () => null } });
+window.setInterval = () => 0; window.setTimeout = () => 0; window.clearInterval = () => {}; window.clearTimeout = () => {};
+window.location = { href: "", search: "", pathname: "/" };
+window.navigator = { userAgent: "node", clipboard: { writeText: () => Promise.resolve() } };
+window.CustomEvent = class { constructor(type, opts) { this.type = type; this.detail = opts && opts.detail; } };
+window.Event = window.CustomEvent;
+window.requestAnimationFrame = () => 0;
+window.getComputedStyle = () => ({ getPropertyValue: () => "" });
+window.getSelection = () => ({ toString: () => "" });
+window.addEventListener = () => {}; window.removeEventListener = () => {}; window.dispatchEvent = () => {};
+process.on("unhandledRejection", () => {});
+
+try {
+"""
+
+_JS_MID = r"""
+} catch (e) {
+  console.error("BUNDLE-THREW: " + (e && e.stack || e));
+  process.exit(1);
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Fixture builders — real list-dict / detail-dict shapes, read from the source
+# (aitracker/providers/claude.py:list_sessions / :parse_session, aitracker/registry.py),
+# not guessed.
+# ---------------------------------------------------------------------------
+
+def make_session(id, mtime, **overrides):
+    s = {
+        "id": id, "project": "proj", "cwd": "/tmp/proj", "title": "t", "prompt": "p",
+        "source": "claude",
+        "agent": False, "group": "", "groupLabel": "", "parentId": "",
+        "bg": 0, "waiting": False, "ended": False, "mtime": mtime,
+        "todo_total": 0, "todo_done": 0, "todo_current": None, "todo_current_index": None,
+        "pr_num": None, "pr_url": None, "pr_repo": None, "pr_state": "",
+        "now_line": "",
+        # registry.all_sessions() additions
+        "pinned": False, "note_count": 0, "open_flags": 0,
+        "continued_as": "", "continued_from": "",
+        # board "failing" tile signal (registry.py:89's setdefault guarantees this key on
+        # every provider's row; None means nothing failed).
+        "fail_cmd": None,
+    }
+    s.update(overrides)
+    return s
+
+
+def make_detail(**overrides):
+    d = {
+        "meta": {"cwd": "/tmp/proj", "gitBranch": "main", "version": "1.0", "sessionId": "sid",
+                  "entrypoint": "cli", "aiTitle": "", "customTitle": "", "model": "", "effort": "", "title": "t"},
+        "todos": [], "files": [], "reads": [], "commands": [], "commits": [], "tests": [],
+        "requests": [], "agents": [], "agents_bg": [], "shells": [],
+        "decisions": [], "waiting": False, "prs": [], "narrative": [],
+        "tokens": {"in": 0, "out": 0}, "context": {"current": 0, "limit": 0, "pct": 0},
+        "counts": {"done": 0, "todos": 0, "created": 0, "edited": 0, "read": 0, "commits": 0,
+                   "tests": 0, "tests_failed": 0, "errors": 0, "agents": 0, "searches": 0},
+        "mtime": 0, "now": 0, "notes": [], "push_when": "turn",
+        "overview": {"where": "", "goal": "", "now": "", "now_kind": "", "sofar": "", "commits": []},
+        "continued_as": "", "continued_from": "",
+    }
+    d.update(overrides)
+    return d
+
+
+def iso_ms(ms):
+    """Epoch milliseconds -> ISO string parseable by JS Date.parse, matching the
+    'requests[].t' / 'narrative[].t' / etc. ISO-string shape claude.py actually emits."""
+    dt = datetime.datetime.fromtimestamp(ms / 1000.0, datetime.timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + "{:03d}Z".format(dt.microsecond // 1000)
+
+
+# ---------------------------------------------------------------------------
+# Board fixtures (epoch SECONDS — the list-dict's mtime unit).
+# ---------------------------------------------------------------------------
+
+NOW = 1_700_000_000  # fixed epoch seconds
+
+
+def _board_driver_js():
+    # 1) Rank ordering must dominate recency: mtime is DELIBERATELY reversed vs. rank
+    #    (the landed session is the most recent, the awaiting one the oldest) so a
+    #    recency-only sort would get this backwards. 'failing' (fail_cmd set) slots
+    #    between flagged and working per ext_cr_board.js's RANK table.
+    rank_sessions = [
+        make_session("land", NOW - 10, ended=True),
+        make_session("work", NOW - 20, ended=False),
+        make_session("fail", NOW - 30, ended=False, fail_cmd="pytest -q"),
+        make_session("flag", NOW - 9999, open_flags=1),
+        make_session("wait", NOW - 40, waiting=True),
+    ]
+
+    # 2) Pinned beats recency within the same rank ('working').
+    pin_sessions = [
+        make_session("new_unpinned", NOW - 10, ended=False, pinned=False),
+        make_session("old_pinned", NOW - 200, ended=False, pinned=True),
+    ]
+
+    # 3) An idle session (older than LIVE_WINDOW, not waiting/flagged) never gets a tile.
+    idle_sessions = [
+        make_session("stale", NOW - (LIVE_WINDOW + 1), ended=False, waiting=False, open_flags=0),
+        make_session("fresh", NOW - 5, ended=False),
+    ]
+
+    # 4) The cap: default 8, configurable 3..12 via localStorage cr.boardTileCount,
+    #    always clamped (doc 04 "Board tiles | slider 3-12, default 8" -- the owner
+    #    ruled doc 04's 3-12 wins over doc 02's superseded "never more than 8").
+    #    12 sessions here so a clamp of exactly 12 (and the passthrough at 10/12)
+    #    can be told apart from "ran out of sessions to show".
+    cap_sessions = [make_session("s%d" % i, NOW - i, waiting=True) for i in range(12)]
+
+    # 5) Regression: agent:true, group:"" must still get an individual tile (the "950
+    #    sessions, 0 tiles" bug — excluded from BOTH the individual and the group path).
+    #    A properly-grouped agent session (group:"repoA") must NOT get an individual tile.
+    agent_sessions = [
+        make_session("orphan_agent", NOW - 5, agent=True, group="", groupLabel="", ended=False),
+        make_session("grouped_agent", NOW - 3, agent=True, group="repoA", groupLabel="repoA", ended=False),
+    ]
+
+    # 6) sessionState: every state, plus the LIVE_WINDOW boundary (pinned against
+    #    aitracker.config.LIVE_WINDOW, not a second hardcoded "300").
+    state_probe = {
+        "awaiting": make_session("a", NOW - 1, waiting=True),
+        "flagged": make_session("b", NOW - 99999, open_flags=2),
+        "working": make_session("c", NOW - 5, ended=False),
+        "landed": make_session("d", NOW - 5, ended=True),
+        "idle": make_session("e", NOW - 99999, ended=False),
+        "boundary_live": make_session("f", NOW - (LIVE_WINDOW - 1), ended=False),
+        "boundary_idle": make_session("g", NOW - LIVE_WINDOW, ended=False),
+        "failing": make_session("h", NOW - 5, ended=False, fail_cmd="pytest -q"),
+        # precedence: waiting > open_flags > fail_cmd -- a session that is BOTH
+        # waiting AND failing must still read as 'awaiting' (claim on attention first).
+        "waiting_beats_failing": make_session("i", NOW - 5, waiting=True, fail_cmd="pytest -q"),
+        "flagged_beats_failing": make_session("j", NOW - 5, open_flags=1, fail_cmd="pytest -q"),
+        # an idle (outside LIVE_WINDOW) session with a stale fail_cmd must NOT read as
+        # 'failing' -- sessionState() checks fail_cmd before the live/idle branch, so
+        # this pins that a genuinely idle session still reports 'idle', not 'failing'.
+        # THE DEFECT THIS PINS (measured on the real 957-session corpus, reports/
+        # drift/): the pre-fix `if (s.fail_cmd) return 'failing'` had no liveness
+        # check at all, so this exact shape -- a long-dead session that merely
+        # HAPPENS to carry a stale fail_cmd from whenever it last ran -- turned the
+        # board from 2 tiles into 118, 116 of them 'failing' with a median age of 7
+        # days (max 48). mtime is placed a week past LIVE_WINDOW, not just 1s past
+        # it, to match that real-world shape rather than only the boundary.
+        "idle_stale_failing": make_session("k", NOW - (LIVE_WINDOW + 7 * 86400),
+                                            ended=False, waiting=False, open_flags=0,
+                                            fail_cmd="pytest -q"),
+        # THE BOARD-TAB BUG (reports/control-room-refinements.md): a session whose
+        # foreground turn closed (ended=True, providers/claude.py's _tail_scan reads
+        # only the main transcript) while it still has background agents running
+        # right now (bg=3, mtime fresh -- providers/claude.py's _mtime_and_bg folds
+        # background-agent mtimes into the session's own mtime) must read 'working',
+        # never 'landed'. This is the REAL field combination production emits, not a
+        # hand-picked ended=False that assumes the bug away -- see
+        # tests/test_cr_board_working_bg.py for proof list_sessions() actually
+        # produces it off an on-disk transcript.
+        "working_ended_with_running_bg": make_session("l", NOW - 5, ended=True, bg=3),
+    }
+    # 6b) 8-tile cap holds with a mix of states, failing included -- and RANK still
+    #     orders failing tiles ahead of plain working ones within the cap.
+    mixed_cap_sessions = (
+        [make_session("cap_wait%d" % i, NOW - i, waiting=True) for i in range(2)] +
+        [make_session("cap_fail%d" % i, NOW - i, ended=False, fail_cmd="pytest -q") for i in range(4)] +
+        [make_session("cap_work%d" % i, NOW - i, ended=False) for i in range(6)]
+    )
+
+    # 6c) THE EVICTION GUARD -- the highest-value regression, closest to the actual
+    # defect (reports/drift/): the real corpus had 957 sessions, 1 genuinely working,
+    # and 116 carrying a week-plus-stale fail_cmd. The pre-fix RANK gave 'failing' a
+    # higher claim on the board than plain 'working', with NO liveness gate, so those
+    # 116 dead sessions outranked (and, under the 8-tile hard cap, EVICTED) the one
+    # session that actually needed attention. Mirrored here at smaller scale: 5
+    # genuinely live 'working' sessions (recent mtime, no fail_cmd) plus 20 long-dead
+    # sessions (mtime well outside LIVE_WINDOW) each carrying a stale fail_cmd --
+    # enough stale sessions to fill (and overflow) the default 8-tile cap on their
+    # own if the bug were still present. The fixed sessionState() reads every one of
+    # the 20 as 'idle' (gated on liveness before fail_cmd), so boardTiles() must
+    # filter all of them out entirely and seat every one of the 5 live sessions.
+    live_working_sessions = [make_session("evict_live%d" % i, NOW - i, ended=False)
+                              for i in range(5)]
+    stale_failing_sessions = [make_session("evict_stale%d" % i, NOW - (LIVE_WINDOW + 86400 + i),
+                                            ended=False, fail_cmd="pytest -q")
+                               for i in range(20)]
+    eviction_sessions = live_working_sessions + stale_failing_sessions
+
+    # 6d) THE BOARD-TABS BUG (reports/board-tabs.md): boardTiles() used to (1)
+    # exclude every idle session before the cap and (2) apply the cap BEFORE a
+    # triage-cell filter ran -- so a corpus that is entirely idle (the live
+    # screenshot's exact 957-sessions/0-tiles shape) rendered an empty board,
+    # and clicking a triage cell (e.g. PINNED, count 4) filtered an
+    # already-capped, already-idle-stripped list down to nothing even though 4
+    # matching sessions existed. Fixed shape (owner ruling, supersedes doc 02's
+    # "idle sessions never get a tile"): the DEFAULT (unfiltered) view backfills
+    # with idle sessions once live/working/etc. run out (RANK already sorts
+    # idle last, so this falls out of the existing sort + cap with NO exclusion
+    # filter); a FILTERED view (`boardTiles(sessions, now, key)`) matches over
+    # the FULL session set -- idle included -- and only caps AFTER filtering.
+
+    # (a) All-idle corpus, count > cap: exactly boardTileCap() (8, default)
+    # tiles must render, all of them idle -- this is the literal 957-idle/
+    # 0-tiles screenshot bug, scaled down. Newest-mtime idle sessions win the
+    # backfill slots (RANK ties break on mtime desc, same as any other tier).
+    all_idle_sessions = [make_session("allidle%d" % i, NOW - (LIVE_WINDOW + 100 + i), ended=False)
+                         for i in range(15)]
+
+    # (a2) All-idle corpus, count < cap: exactly that count of tiles (min(cap,
+    # sessions)) -- not zero, not the cap padded with anything that isn't there.
+    few_idle_sessions = [make_session("fewidle%d" % i, NOW - (LIVE_WINDOW + 100 + i), ended=False)
+                         for i in range(3)]
+
+    # (b) Filtering by 'pinned': 4 pinned IDLE sessions among a pile of
+    # non-pinned idle noise -- the filter must match over the FULL set (idle
+    # included) and return exactly the 4 pinned ones, regardless of the cap.
+    # mtime must sit OUTSIDE LIVE_WINDOW (like every other idle fixture here) --
+    # `ended=False` alone does not make a session idle if its mtime is still
+    # live; `sessionState()` reads a live `ended=False` session as 'working'.
+    pinned_idle_sessions = (
+        [make_session("pinidle%d" % i, NOW - (LIVE_WINDOW + 100 + i), ended=False, pinned=True) for i in range(4)]
+        + [make_session("noise%d" % i, NOW - (LIVE_WINDOW + 100 + i), ended=False, pinned=False) for i in range(10)]
+    )
+
+    # (c) A filter whose matches EXCEED the cap: 10 pinned idle sessions, cap
+    # stays at the default 8 -- exactly 8 tiles must render (the filtered list
+    # is capped too, just AFTER matching, not before).
+    pinned_over_cap_sessions = [make_session("pinover%d" % i, NOW - (LIVE_WINDOW + 100 + i),
+                                              ended=False, pinned=True)
+                                for i in range(10)]
+
+    # (d) Non-idle sessions must still sort ahead of idle backfill in the
+    # unfiltered view: 2 genuinely LIVE 'working' sessions (mtime inside
+    # LIVE_WINDOW) plus 5 idle sessions (mtime well outside it) all seat on an
+    # 8-tile board with the 2 working ones FIRST -- RANK (working=3 ahead of
+    # idle=5), not merely "happens to also be newer" (idle mtimes here are, by
+    # construction of what "idle" even means, always older than any live mtime,
+    # so this pins the RANK-driven ordering, whatever the recency would say).
+    order_sessions = (
+        [make_session("ordwork%d" % i, NOW - 5 - i, ended=False) for i in range(2)]
+        + [make_session("ordidle%d" % i, NOW - (LIVE_WINDOW + 100 + i), ended=False) for i in range(5)]
+    )
+
+    # 7) railOrder: pinned/unpinned partition, each newest-first.
+    rail_sessions = [
+        make_session("p_old", NOW - 500, pinned=True),
+        make_session("p_new", NOW - 10, pinned=True),
+        make_session("u_old", NOW - 400, pinned=False),
+        make_session("u_new", NOW - 20, pinned=False),
+    ]
+
+    # 8) agentGroups: bucketed by group, idle sessions excluded from their bucket,
+    #    buckets ordered newest-first by max mtime.
+    group_sessions = [
+        make_session("ga1", NOW - 5, agent=True, group="A", groupLabel="Repo A", ended=False),
+        make_session("ga2_idle", NOW - 99999, agent=True, group="A", groupLabel="Repo A", ended=False),
+        make_session("gb1", NOW - 3, agent=True, group="B", groupLabel="Repo B", ended=False),
+    ]
+
+    # 13) triageCounts: not mutually exclusive.
+    triage_sessions = [
+        make_session("await1", NOW - 1, waiting=True),
+        make_session("both", NOW - 5, ended=False, waiting=False, open_flags=3),
+    ]
+
+    # 14) BUG 2: pr_num/pr_url/pr_repo/pr_state reached the SPA (registry.py's shared
+    #     list dict, Claude-only) but had zero render call sites — prInfo() is the pure
+    #     decision behind the fix. A Landed session with pr_num renders it (linked when
+    #     pr_url is present); one without renders nothing.
+    pr_sessions = {
+        "with_pr": make_session("has_pr", NOW - 5, ended=True,
+                                 pr_num=42, pr_url="https://example.com/pr/42",
+                                 pr_repo="acme/widgets", pr_state="merged"),
+        "without_pr": make_session("no_pr", NOW - 5, ended=True),
+        "not_landed": make_session("working_with_pr", NOW - 5, ended=False,
+                                    pr_num=7, pr_url="https://example.com/pr/7"),
+    }
+
+    def tiles_summary(var_name):
+        return (
+            "(function(){ var tiles = window.CR.board.boardTiles(%s, NOW);"
+            " return tiles.map(function(t){"
+            "   return t.kind === 'session' ? {kind:'session', id:t.session.id, state:t.state}"
+            "                                : {kind:'agent-group', group:t.group};"
+            " }); })()" % var_name
+        )
+
+    js = []
+    js.append("var NOW = %d;" % NOW)
+    js.append("var OUT = {};")
+
+    js.append("var rankSessions = %s;" % json.dumps(rank_sessions))
+    js.append("OUT.rank_order = %s;" % tiles_summary("rankSessions"))
+
+    js.append("var pinSessions = %s;" % json.dumps(pin_sessions))
+    js.append("OUT.pin_order = %s;" % tiles_summary("pinSessions"))
+
+    js.append("var idleSessions = %s;" % json.dumps(idle_sessions))
+    js.append("OUT.idle_tiles = %s;" % tiles_summary("idleSessions"))
+    js.append("OUT.idle_state_direct = window.CR.board.sessionState(idleSessions[0], NOW);")
+
+    js.append("var capSessions = %s;" % json.dumps(cap_sessions))
+    js.append("OUT.cap_default = window.CR.board.boardTiles(capSessions, NOW).length;")
+    js.append("window.localStorage.setItem('cr.boardTileCount', JSON.stringify(5));")
+    js.append("OUT.cap_five = window.CR.board.boardTiles(capSessions, NOW).length;")
+    js.append("window.localStorage.setItem('cr.boardTileCount', JSON.stringify(10));")
+    js.append("OUT.cap_mid_ten = window.CR.board.boardTiles(capSessions, NOW).length;")
+    js.append("window.localStorage.setItem('cr.boardTileCount', JSON.stringify(12));")
+    js.append("OUT.cap_twelve = window.CR.board.boardTiles(capSessions, NOW).length;")
+    js.append("window.localStorage.setItem('cr.boardTileCount', JSON.stringify(13));")
+    js.append("OUT.cap_thirteen = window.CR.board.boardTiles(capSessions, NOW).length;")
+    js.append("window.localStorage.setItem('cr.boardTileCount', JSON.stringify(20));")
+    js.append("OUT.cap_clamp_high = window.CR.board.boardTiles(capSessions, NOW).length;")
+    js.append("window.localStorage.setItem('cr.boardTileCount', JSON.stringify(1));")
+    js.append("OUT.cap_clamp_low = window.CR.board.boardTiles(capSessions, NOW).length;")
+    js.append("window.localStorage.removeItem('cr.boardTileCount');")
+
+    js.append("var agentSessions = %s;" % json.dumps(agent_sessions))
+    js.append("OUT.agent_tiles = %s;" % tiles_summary("agentSessions"))
+    js.append("OUT.agent_groups_of_agent_sessions = window.CR.board.agentGroups(agentSessions, NOW)"
+               ".map(function(g){ return g.group; });")
+
+    js.append("var stateProbe = %s;" % json.dumps(state_probe))
+    js.append("OUT.states = {};")
+    js.append("Object.keys(stateProbe).forEach(function(k){"
+              " OUT.states[k] = window.CR.board.sessionState(stateProbe[k], NOW); });")
+
+    # Board/detail agreement (conventions rule 4: one derivation, never two forked
+    # ones): the SAME session objects fed to both the board's sessionState() and the
+    # detail panel's stateOf() (ext_cr_detail.js's window.CR.detail._internal) must
+    # never disagree about whether a session is failing. stateOf() only reads
+    # mtime/fail_cmd/waiting/open_flags/agents_bg/todos off its argument -- the same
+    # list-dict session shape sessionState() already takes -- so no separate detail
+    # fixture is needed; agents_bg/todos default to [] when absent (see stateOf's
+    # own `(session.agents_bg || [])` / `(session.todos || [])`).
+    js.append("OUT.detail_agreement = {};")
+    js.append("['failing', 'idle_stale_failing', 'working', 'awaiting', 'flagged'].forEach(function(k){"
+              " var s = stateProbe[k];"
+              " var boardState = window.CR.board.sessionState(s, NOW);"
+              " var detailState = window.CR.detail._internal.stateOf(s, NOW);"
+              " OUT.detail_agreement[k] = { board: boardState, detailCls: detailState.cls, detailWord: detailState.word }; });")
+
+    js.append("var mixedCapSessions = %s;" % json.dumps(mixed_cap_sessions))
+    js.append("OUT.mixed_cap_tiles = %s;" % tiles_summary("mixedCapSessions"))
+
+    # 6c) The eviction guard: run the REAL boardTiles() over the mixed live/stale
+    # corpus and report everything the test needs to prove no eviction happened.
+    js.append("var evictionSessions = %s;" % json.dumps(eviction_sessions))
+    js.append("OUT.eviction_tiles = %s;" % tiles_summary("evictionSessions"))
+
+    # 6d) THE BOARD-TABS BUG: unfiltered idle-backfill + filter-before-cap.
+    js.append("var allIdleSessions = %s;" % json.dumps(all_idle_sessions))
+    js.append("OUT.all_idle_tiles = %s;" % tiles_summary("allIdleSessions"))
+
+    js.append("var fewIdleSessions = %s;" % json.dumps(few_idle_sessions))
+    js.append("OUT.few_idle_tiles = %s;" % tiles_summary("fewIdleSessions"))
+
+    js.append("var pinnedIdleSessions = %s;" % json.dumps(pinned_idle_sessions))
+    js.append("OUT.pinned_idle_tiles = (function(){"
+              " var tiles = window.CR.board.boardTiles(pinnedIdleSessions, NOW, 'pinned');"
+              " return tiles.map(function(t){ return { id: t.session.id, state: t.state }; }); })();")
+    js.append("OUT.pinned_idle_total = (function(){"
+              " return window.CR.board.boardTiles(pinnedIdleSessions, NOW, 'pinned').total; })();")
+
+    js.append("var pinnedOverCapSessions = %s;" % json.dumps(pinned_over_cap_sessions))
+    js.append("OUT.pinned_over_cap_tiles = (function(){"
+              " var tiles = window.CR.board.boardTiles(pinnedOverCapSessions, NOW, 'pinned');"
+              " return tiles.map(function(t){ return t.session.id; }); })();")
+    js.append("OUT.pinned_over_cap_total = (function(){"
+              " return window.CR.board.boardTiles(pinnedOverCapSessions, NOW, 'pinned').total; })();")
+    # Sanity control: the SAME sessions with NO filter must still hit the plain
+    # unfiltered cap (8) -- proves the filtered-vs-unfiltered cap distinction
+    # isn't accidental (e.g. a filter that silently never applied).
+    js.append("OUT.pinned_over_cap_unfiltered_len = window.CR.board.boardTiles(pinnedOverCapSessions, NOW).length;")
+
+    js.append("var orderSessions = %s;" % json.dumps(order_sessions))
+    js.append("OUT.order_tiles = %s;" % tiles_summary("orderSessions"))
+
+    js.append("var railSessions = %s;" % json.dumps(rail_sessions))
+    js.append("(function(){ var r = window.CR.board.railOrder(railSessions);"
+              " OUT.rail_pinned = r.pinned.map(function(s){ return s.id; });"
+              " OUT.rail_unpinned = r.unpinned.map(function(s){ return s.id; }); })();")
+
+    js.append("var groupSessions = %s;" % json.dumps(group_sessions))
+    js.append("OUT.agent_groups = window.CR.board.agentGroups(groupSessions, NOW).map(function(g){"
+              " return { group: g.group, label: g.label, mtime: g.mtime,"
+              "          ids: g.sessions.map(function(s){ return s.id; }) }; });")
+
+    js.append("var triageSessions = %s;" % json.dumps(triage_sessions))
+    js.append("OUT.triage = window.CR.board.triageCounts(triageSessions, NOW);")
+
+    js.append("var prSessions = %s;" % json.dumps(pr_sessions))
+    js.append("OUT.pr_with = window.CR.board.prInfo(prSessions.with_pr, 'landed');")
+    js.append("OUT.pr_without = window.CR.board.prInfo(prSessions.without_pr, 'landed');")
+    js.append("OUT.pr_not_landed = window.CR.board.prInfo(prSessions.not_landed, 'working');")
+
+    return "\n".join(js)
+
+
+# ---------------------------------------------------------------------------
+# Detail fixtures (epoch MILLISECONDS + ISO strings — the detail-dict's time unit
+# via parseT()/Date.parse() — EXCEPT todos[].started_at/ended_at, which are epoch
+# SECONDS (a number), the same convention as session.mtime/now, per
+# aitracker/util.py:_ts_epoch and providers/claude.py:1209-1210. Confirmed against a
+# live /api/session payload (curl'd during Bug 1 verification): a real todo looks like
+# {"started_at": None, "ended_at": 1787654030.205} — started_at only gets a value when
+# the transcript recorded an explicit TaskUpdate to "in_progress", which many real
+# sessions never do.
+# ---------------------------------------------------------------------------
+
+BASE_MS = 1_700_000_000_000
+
+
+def epoch_sec(ms):
+    """Epoch milliseconds -> epoch SECONDS float, matching util._ts_epoch's own output
+    shape for todos[].started_at/ended_at (never an ISO string, unlike the `.t` fields)."""
+    return ms / 1000.0
+
+
+def _detail_driver_js():
+    # 9) spineSegments fallback: no todos[].started_at anywhere -> equal-width split,
+    #    never a nonsensical (NaN/negative) width.
+    fallback_detail = make_detail(
+        todos=[
+            {"content": "a", "status": "completed", "activeForm": ""},
+            {"content": "b", "status": "in_progress", "activeForm": ""},
+            {"content": "c", "status": "pending", "activeForm": ""},
+            {"content": "d", "status": "pending", "activeForm": ""},
+        ],
+        requests=[{"t": iso_ms(BASE_MS - 100_000), "text": "go"}],
+    )
+
+    # 9b) BUG 1 REGRESSION: the exact real-world shape confirmed live — every todo
+    #     carries started_at/ended_at keys (claude.py always sets both), but started_at
+    #     is None throughout (no in_progress TaskUpdate ever recorded) even though
+    #     ended_at IS populated for the completed todo. Must still fall back honestly,
+    #     never mistake a lone ended_at for real timing.
+    only_ended_detail = make_detail(
+        todos=[
+            {"content": "a", "status": "completed", "activeForm": "",
+             "started_at": None, "ended_at": epoch_sec(BASE_MS - 190_000)},
+            {"content": "b", "status": "in_progress", "activeForm": "",
+             "started_at": None, "ended_at": None},
+            {"content": "c", "status": "pending", "activeForm": "",
+             "started_at": None, "ended_at": None},
+        ],
+        requests=[{"t": iso_ms(BASE_MS - 200_000), "text": "go"}],
+    )
+
+    # 10) spineSegments time-proportional: THE FIELD NAMES /api/session REALLY EMITS —
+    #     snake_case, epoch-seconds numbers (see epoch_sec() above), not the camelCase
+    #     ISO-string shape a prior version of this fixture wrongly assumed (that
+    #     fixture passed while Bug 1 shipped: production read camelCase, so this test's
+    #     own made-up camelCase fixture "worked" without ever exercising the real
+    #     payload shape). Widths must still track actual elapsed time, not todo count:
+    #     done=10s spent, running=190s spent (so far), 1 pending. Numbers chosen so the
+    #     expected percentages are exact (see the test for the by-hand derivation):
+    #     done 4.4%, running 83.6%, pending 12%.
+    t0_start = BASE_MS - 200_000
+    t0_end = BASE_MS - 190_000
+    t1_start = BASE_MS - 190_000
+    now_ms_for_timed = BASE_MS
+    timed_detail = make_detail(
+        todos=[
+            {"content": "done-task", "status": "completed", "activeForm": "",
+             "started_at": epoch_sec(t0_start), "ended_at": epoch_sec(t0_end)},
+            {"content": "running-task", "status": "in_progress", "activeForm": "",
+             "started_at": epoch_sec(t1_start), "ended_at": None},
+            {"content": "pending-task", "status": "pending", "activeForm": "",
+             "started_at": None, "ended_at": None},
+        ],
+        requests=[{"t": iso_ms(t0_start), "text": "go"}],
+    )
+
+    # 11) spineSegments with zero todos: honest "no tasks recorded", no fabricated segments.
+    empty_detail = make_detail(todos=[])
+
+    # 12) mergeTimeline: prompts + narration + decisions + commands merge into ONE
+    #     chronologically-ordered list.
+    merge_detail = make_detail(
+        requests=[{"t": iso_ms(BASE_MS + 10_000), "text": "prompt"}],
+        narrative=[{"t": iso_ms(BASE_MS + 5_000), "text": "narration"}],
+        decisions=[{"t": iso_ms(BASE_MS + 15_000), "questions": [{"q": "Q?"}]}],
+        commands=[{"t": iso_ms(BASE_MS + 0), "cmd": "ls", "ok": True, "kind": "shell"}],
+    )
+
+    js = []
+    js.append("var OUT2 = {};")
+
+    js.append("var fallbackDetail = %s;" % json.dumps(fallback_detail))
+    js.append("OUT2.fallback = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(fallbackDetail, %d);"
+              " return { timeAccurate: r.timeAccurate, total: r.total,"
+              "          widths: r.segments.map(function(s){ return s.widthPct; }),"
+              "          sum: r.segments.reduce(function(a,s){ return a+s.widthPct; }, 0) };"
+              " })();" % now_ms_for_timed)
+
+    js.append("var timedDetail = %s;" % json.dumps(timed_detail))
+    js.append("OUT2.timed = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(timedDetail, %d);"
+              " return { timeAccurate: r.timeAccurate,"
+              "          widths: r.segments.map(function(s){ return { kind: s.kind, widthPct: s.widthPct }; }),"
+              "          sum: r.segments.reduce(function(a,s){ return a+s.widthPct; }, 0) };"
+              " })();" % now_ms_for_timed)
+
+    js.append("var onlyEndedDetail = %s;" % json.dumps(only_ended_detail))
+    js.append("OUT2.only_ended = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(onlyEndedDetail, %d);"
+              " return { timeAccurate: r.timeAccurate, total: r.total,"
+              "          widths: r.segments.map(function(s){ return s.widthPct; }) };"
+              " })();" % now_ms_for_timed)
+
+    js.append("var emptyDetail = %s;" % json.dumps(empty_detail))
+    js.append("OUT2.empty = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(emptyDetail, %d);"
+              " return { total: r.total, segCount: r.segments.length, ariaLabel: r.ariaLabel };"
+              " })();" % now_ms_for_timed)
+
+    js.append("var mergeDetail = %s;" % json.dumps(merge_detail))
+    js.append("OUT2.merged = window.CR.detail._internal.mergeTimeline(mergeDetail)"
+              ".map(function(e){ return { kind: e.kind, t: e.t }; });")
+
+    # -----------------------------------------------------------------------
+    # 13) THE PROGRESS-SPINE TIME WINDOW.
+    #
+    # The reported defect, reproduced exactly: a 192h session whose real events
+    # all land in its first quarter-hour. Marker pct is (t - t0) / span, so
+    # un-windowed every one of them is crushed into the left few percent of the
+    # gutter and the 2%-collision nudge stacks them into an illegible pile. A
+    # window re-bases the axis onto [winT0, winT1] and drops what falls outside.
+    # -----------------------------------------------------------------------
+    MIN_MS = 60 * 1000
+    HOUR_MS = 60 * MIN_MS
+
+    long_first = BASE_MS - 192 * HOUR_MS
+    long_detail = make_detail(
+        todos=[],
+        requests=[{"t": iso_ms(long_first + k * 5 * MIN_MS), "text": "p%d" % k} for k in range(4)]
+        + [{"t": iso_ms(BASE_MS - 10 * MIN_MS), "text": "recent"}],
+    )
+
+    # Window CLIPPING of the bar: A falls entirely outside a trailing 1h window,
+    # B only overlaps it (60m long, 30m of it visible), C is running inside it.
+    clip_detail = make_detail(
+        todos=[
+            {"content": "A", "status": "completed", "activeForm": "",
+             "started_at": epoch_sec(BASE_MS - 4 * HOUR_MS), "ended_at": epoch_sec(BASE_MS - 3 * HOUR_MS)},
+            {"content": "B", "status": "completed", "activeForm": "",
+             "started_at": epoch_sec(BASE_MS - 90 * MIN_MS), "ended_at": epoch_sec(BASE_MS - 30 * MIN_MS)},
+            {"content": "C", "status": "in_progress", "activeForm": "",
+             "started_at": epoch_sec(BASE_MS - 20 * MIN_MS), "ended_at": None},
+        ],
+        requests=[{"t": iso_ms(BASE_MS - 4 * HOUR_MS), "text": "go"}],
+    )
+
+    # Panning off the live edge: "to go" is a claim about the FUTURE, so a window
+    # dragged into the past must not assert what was pending back then.
+    pan_detail = make_detail(
+        todos=[
+            {"content": "A", "status": "completed", "activeForm": "",
+             "started_at": epoch_sec(BASE_MS - 4 * HOUR_MS), "ended_at": epoch_sec(BASE_MS - 150 * MIN_MS)},
+            {"content": "P", "status": "pending", "activeForm": "",
+             "started_at": None, "ended_at": None},
+        ],
+        requests=[{"t": iso_ms(BASE_MS - 4 * HOUR_MS), "text": "go"}],
+    )
+
+    js.append("var longDetail = %s;" % json.dumps(long_detail))
+    js.append("OUT2.long_all = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(longDetail, %d);"
+              " return { windowed: r.windowed, total: r.total,"
+              "          marks: r.markers.map(function(m){ return { kind: m.kind, pct: m.pct }; }) };"
+              " })();" % BASE_MS)
+    js.append("OUT2.long_win = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(longDetail, %d,"
+              "   { spanMs: %d, endMs: %d });"
+              " return { windowed: r.windowed, atLiveEdge: r.atLiveEdge, winSpanMs: r.winSpanMs,"
+              "          realMarkers: r.realMarkers,"
+              "          marks: r.markers.map(function(m){ return { kind: m.kind, pct: m.pct }; }) };"
+              " })();" % (BASE_MS, HOUR_MS, BASE_MS))
+
+    # A long-IDLE session: 2192h elapsed with nothing in the last hour. Confirmed
+    # against a real session on this machine (63f5fe77, 2192.2h, 0 todos), where
+    # a trailing window legitimately contains no recorded event at all.
+    idle_detail = make_detail(
+        todos=[],
+        requests=[{"t": iso_ms(BASE_MS - 2192 * HOUR_MS + k * 5 * MIN_MS), "text": "p%d" % k}
+                  for k in range(3)],
+    )
+    js.append("var idleDetail = %s;" % json.dumps(idle_detail))
+    js.append("OUT2.idle_all = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(idleDetail, %d);"
+              " return { realMarkers: r.realMarkers, n: r.markers.length };"
+              " })();" % BASE_MS)
+    js.append("OUT2.idle_win = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(idleDetail, %d,"
+              "   { spanMs: %d, endMs: %d });"
+              " return { realMarkers: r.realMarkers, n: r.markers.length,"
+              "          kinds: r.markers.map(function(m){ return m.kind; }) };"
+              " })();" % (BASE_MS, HOUR_MS, BASE_MS))
+
+    # A todo whose ended_at is PRESENT but corrupt. hasTimes only requires a
+    # parseable started_at, so this really does reach the time-proportional
+    # branch. It must contribute nothing rather than a duration invented from
+    # garbage — the regression an adversarial review caught in the first cut.
+    corrupt_detail = make_detail(
+        todos=[
+            {"content": "good", "status": "completed", "activeForm": "",
+             "started_at": epoch_sec(BASE_MS - 60 * MIN_MS), "ended_at": epoch_sec(BASE_MS - 30 * MIN_MS)},
+            {"content": "corrupt", "status": "completed", "activeForm": "",
+             "started_at": epoch_sec(BASE_MS - 90 * MIN_MS), "ended_at": "not-a-timestamp"},
+        ],
+        requests=[{"t": iso_ms(BASE_MS - 90 * MIN_MS), "text": "go"}],
+    )
+    js.append("var corruptDetail = %s;" % json.dumps(corrupt_detail))
+    js.append("OUT2.corrupt = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(corruptDetail, %d);"
+              " return { timeAccurate: r.timeAccurate,"
+              "          segs: r.segments.map(function(s){ return { idx: s.idx, ms: s.elapsedMs, w: s.widthPct }; }),"
+              "          finite: r.segments.every(function(s){ return isFinite(s.widthPct); }) };"
+              " })();" % BASE_MS)
+
+    js.append("var clipDetail = %s;" % json.dumps(clip_detail))
+    js.append("OUT2.clip_all = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(clipDetail, %d);"
+              " return { windowed: r.windowed, barWindowed: r.barWindowed, timeAccurate: r.timeAccurate,"
+              "          segs: r.segments.map(function(s){ return { idx: s.idx, kind: s.kind, widthPct: s.widthPct }; }),"
+              "          sum: r.segments.reduce(function(a,s){ return a+s.widthPct; }, 0) };"
+              " })();" % BASE_MS)
+    js.append("OUT2.clip_win = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(clipDetail, %d,"
+              "   { spanMs: %d, endMs: %d });"
+              " return { windowed: r.windowed, barWindowed: r.barWindowed,"
+              "          segs: r.segments.map(function(s){ return { idx: s.idx, kind: s.kind, widthPct: s.widthPct }; }),"
+              "          sum: r.segments.reduce(function(a,s){ return a+s.widthPct; }, 0) };"
+              " })();" % (BASE_MS, HOUR_MS, BASE_MS))
+
+    js.append("var panDetail = %s;" % json.dumps(pan_detail))
+    js.append("OUT2.pan_live = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(panDetail, %d,"
+              "   { spanMs: %d, endMs: %d });"
+              " return { atLiveEdge: r.atLiveEdge,"
+              "          kinds: r.segments.map(function(s){ return s.kind; }) };"
+              " })();" % (BASE_MS, HOUR_MS, BASE_MS))
+    js.append("OUT2.pan_back = (function(){"
+              " var r = window.CR.detail._internal.spineSegments(panDetail, %d,"
+              "   { spanMs: %d, endMs: %d });"
+              " return { atLiveEdge: r.atLiveEdge,"
+              "          kinds: r.segments.map(function(s){ return s.kind; }) };"
+              " })();" % (BASE_MS, HOUR_MS, BASE_MS - 2 * HOUR_MS))
+
+    # 14) which chips are offered, and the window clamps behind the drag-pan
+    js.append("OUT2.span_choices = {"
+              " long: window.CR.detail._internal.spineSpanChoices(%d).map(function(c){ return c.key; }),"
+              " short: window.CR.detail._internal.spineSpanChoices(%d).map(function(c){ return c.key; }),"
+              " twoh: window.CR.detail._internal.spineSpanChoices(%d).map(function(c){ return c.key; }),"
+              " zero: window.CR.detail._internal.spineSpanChoices(0).map(function(c){ return c.key; }),"
+              " nul: window.CR.detail._internal.spineSpanChoices(null).map(function(c){ return c.key; })"
+              " };" % (192 * HOUR_MS, 10 * MIN_MS, 2 * HOUR_MS))
+
+    # The spine is a ZOOM now, not a window: chips widen the strip and the
+    # viewport's own scrollLeft does the panning (and the clamping). What needs
+    # pinning is the width arithmetic -- above all its cap, because an uncapped
+    # zoom on the real 2192h session here would ask for 8,768,000%.
+    js.append("OUT2.zoom = (function(){"
+              " var Z = window.CR.detail._internal.spineZoomPct;"
+              " return {"
+              "   all: Z({ spineZoomMs: null }, %d),"
+              "   no_ui: Z(null, %d),"
+              "   six_h_of_14h39: Z({ spineZoomMs: %d }, %d),"
+              "   span_longer_than_session: Z({ spineZoomMs: %d }, %d),"
+              "   zero_elapsed: Z({ spineZoomMs: %d }, 0),"
+              "   pathological: Z({ spineZoomMs: %d }, %d)"
+              " }; })();" % (14 * HOUR_MS, 14 * HOUR_MS,
+                             6 * HOUR_MS, (14 * HOUR_MS + 39 * MIN_MS),
+                             24 * HOUR_MS, 4 * HOUR_MS,
+                             HOUR_MS,
+                             15 * MIN_MS, 2192 * HOUR_MS))
+
+    return "\n".join(js)
+
+
+def _full_driver_js():
+    bundle_html = _read_page()
+    bundle_js = _extract_script_content(bundle_html)
+    parts = [
+        _JS_PREAMBLE,
+        bundle_js,
+        _JS_MID,
+        _board_driver_js(),
+        _detail_driver_js(),
+        r"""
+console.log("===CR_LOGIC_JSON_START===");
+console.log(JSON.stringify(Object.assign({}, OUT, OUT2)));
+""",
+    ]
+    return "\n".join(parts)
+
+
+def _extract_json(stdout):
+    marker = "===CR_LOGIC_JSON_START==="
+    idx = stdout.find(marker)
+    if idx < 0:
+        raise ValueError("marker not found in node output:\n" + stdout)
+    payload = stdout[idx + len(marker):].strip()
+    return json.loads(payload)
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestCRLogic(unittest.TestCase):
+    """Pins the client-side derived values that ARE the Control Room design."""
+
+    @classmethod
+    def setUpClass(cls):
+        js = _full_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Driver script failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_json(stdout)
+
+    # -- boardTiles: ranking + cap -----------------------------------------
+
+    def test_board_tiles_rank_order(self):
+        """awaiting < flagged < failing < working < landed, REGARDLESS of recency
+        (mtime is deliberately reversed vs. rank in the fixture)."""
+        got = [t["state"] for t in self.OUT["rank_order"]]
+        self.assertEqual(got, ["awaiting", "flagged", "failing", "working", "landed"])
+
+    def test_board_tiles_recency_beats_pinned(self):
+        """Within the same rank, the NEWER session leads -- pinned no longer hoists.
+
+        INVERTED by owner ruling, not loosened. This asserted the opposite
+        ("a pinned session outranks a strictly newer unpinned one") until the
+        board's comparator dropped `pinned` as a sort key. The reason it changed:
+        almost every session derives to 'idle' most of the time, so the pinned
+        tiebreak was in practice the thing deciding the whole board -- four pinned
+        sessions aged 22h/3d/7d/8d sat above one touched 8 MINUTES earlier, which
+        reads as a sorting bug rather than a feature. Pinned is still a marker
+        (pin glyph, --state-pinned accent, cr-tile--pinned) and still a triage
+        filter; it just no longer reorders the board. The RAIL keeps its pinned
+        section, because that one is captioned and explains itself.
+        """
+        got = [t["id"] for t in self.OUT["pin_order"]]
+        self.assertEqual(got, ["new_unpinned", "old_pinned"])
+
+    def test_board_tiles_idle_sessions_still_derive_idle_state(self):
+        """sessionState() itself is unchanged: an idle session still reads 'idle'
+        directly. (Whether it gets a board TILE is a separate question -- see the
+        backfill tests below, which supersede the old "idle never gets a tile"
+        rule per the owner's ruling.)"""
+        self.assertEqual(self.OUT["idle_state_direct"], "idle")
+        ids = [t["id"] for t in self.OUT["idle_tiles"]]
+        self.assertIn("fresh", ids)
+        self.assertIn("stale", ids)   # now backfilled, not excluded
+        # and 'fresh' (working, RANK 3) still sorts strictly ahead of the idle
+        # backfill ('stale', RANK 5) -- attention-claim before backfill.
+        self.assertEqual(ids, ["fresh", "stale"])
+
+    def test_board_tiles_default_view_backfills_idle_when_corpus_exceeds_cap(self):
+        """THE 957-idle/0-tiles SCREENSHOT BUG. Root cause A: boardTiles() used to
+        drop every idle session before the sort/cap ever ran, so an all-idle
+        corpus rendered zero tiles no matter its size. Fixed: idle is simply not
+        excluded any more (RANK's own 'idle': 5 puts it last), so the unfiltered
+        board still returns exactly boardTileCap() (8) tiles out of 15 all-idle
+        sessions -- non-zero, and capped at the newest 8 by mtime."""
+        tiles = self.OUT["all_idle_tiles"]
+        self.assertEqual(len(tiles), 8, "the all-idle corpus must still fill the board, not empty it")
+        self.assertTrue(all(t["state"] == "idle" for t in tiles))
+        ids = [t["id"] for t in tiles]
+        self.assertEqual(ids, ["allidle%d" % i for i in range(8)], "newest-mtime idle sessions win the backfill")
+
+    def test_board_tiles_default_view_never_pads_past_available_sessions(self):
+        """The mirror case: fewer idle sessions than the cap must render exactly
+        that many tiles (min(cap, sessions)), never zero and never a phantom pad
+        up to the cap."""
+        tiles = self.OUT["few_idle_tiles"]
+        self.assertEqual(len(tiles), 3)
+        self.assertEqual([t["id"] for t in tiles], ["fewidle0", "fewidle1", "fewidle2"])
+
+    def test_board_tiles_filter_matches_full_corpus_before_capping(self):
+        """THE 4-PINNED/0-TILES SCREENSHOT BUG. Root cause B: the triage-cell
+        filter used to run AFTER boardTiles' own cap slice, so it could only ever
+        surface matches that happened to survive the unfiltered top-N -- with
+        idle sessions excluded outright (cause A), that top-N was often empty,
+        so PINNED (count 4) rendered 'Nothing matches that filter right now.'
+        Fixed: `boardTiles(sessions, now, 'pinned')` matches over the FULL
+        session set -- 4 pinned IDLE sessions among 10 non-pinned idle noise
+        sessions -- and only caps after. All 4 pinned sessions must render,
+        none of the noise."""
+        tiles = self.OUT["pinned_idle_tiles"]
+        self.assertEqual(len(tiles), 4)
+        ids = {t["id"] for t in tiles}
+        self.assertEqual(ids, {"pinidle0", "pinidle1", "pinidle2", "pinidle3"})
+        self.assertTrue(all(t["state"] == "idle" for t in tiles), "pinned sessions here are idle, not live")
+        # the cell count and the rendered tile count must agree exactly (4 <= cap).
+        self.assertEqual(self.OUT["pinned_idle_total"], 4)
+
+    def test_board_tiles_filter_still_caps_when_matches_exceed_it(self):
+        """Requirement 3's other half: when a filter matches MORE than the cap,
+        the board still shows exactly boardTileCap() (8) tiles -- capping happens
+        AFTER the filter, not "no cap at all" -- while the footer's pre-cap total
+        (`.total`) reports the true 10, so the overflow is visible, not silently
+        dropped. A sanity control proves the filter is doing real work: the SAME
+        10 sessions with NO filter hit the identical plain 8-tile cap (this isn't
+        "the filter never ran")."""
+        ids = self.OUT["pinned_over_cap_tiles"]
+        self.assertEqual(len(ids), 8)
+        self.assertEqual(self.OUT["pinned_over_cap_total"], 10)
+        self.assertEqual(self.OUT["pinned_over_cap_unfiltered_len"], 8)
+
+    def test_board_tiles_non_idle_still_ranked_ahead_of_idle_backfill(self):
+        """Requirement 1's other half: backfill never lets idle sessions crowd out
+        or rank ahead of a genuinely non-idle one -- RANK (working=3 ahead of
+        idle=5) governs the order, and the 2 live 'working' sessions here occupy
+        the first 2 board positions ahead of all 5 idle backfill sessions."""
+        tiles = self.OUT["order_tiles"]
+        states = [t["state"] for t in tiles]
+        self.assertEqual(states, ["working", "working", "idle", "idle", "idle", "idle", "idle"])
+        ids = [t["id"] for t in tiles]
+        self.assertEqual(ids[:2], ["ordwork0", "ordwork1"])
+
+    def test_board_tile_cap(self):
+        """Default cap is 8; cr.boardTileCount (localStorage) can move it, always
+        clamped to [3, 12] -- the ceiling was raised 8 -> 12 per doc 04
+        ("Board tiles | slider 3-12, default 8"), an owner ruling that doc 04 wins
+        over doc 02's now-superseded "hard cap 8" (ext_cr_board.js's boardTileCap(),
+        ~line 198). Full clamp behaviour pinned: below the floor clamps up to 3, a
+        mid-range value (10) and the new ceiling itself (12) both pass through
+        unchanged, and one past the ceiling (13) clamps back down to 12."""
+        self.assertEqual(self.OUT["cap_default"], 8)
+        self.assertEqual(self.OUT["cap_five"], 5)
+        self.assertEqual(self.OUT["cap_mid_ten"], 10)     # 10 passes through unchanged
+        self.assertEqual(self.OUT["cap_twelve"], 12)      # 12 (the new ceiling) passes through
+        self.assertEqual(self.OUT["cap_thirteen"], 12)    # 13 clamps down to 12
+        self.assertEqual(self.OUT["cap_clamp_high"], 12)  # 20 clamps down to 12
+        self.assertEqual(self.OUT["cap_clamp_low"], 3)    # 1 clamps up to 3
+
+    def test_board_tile_cap_holds_with_failing_tiles_present(self):
+        """12 sessions (2 awaiting + 4 failing + 6 working) at the default cap must
+        still cut off at 8, and the failing tiles must be ranked ahead of the plain
+        working ones within that cap (RANK: awaiting < failing < working)."""
+        tiles = self.OUT["mixed_cap_tiles"]
+        self.assertEqual(len(tiles), 8)
+        states = [t["state"] for t in tiles]
+        self.assertEqual(states, sorted(states, key=lambda s: {"awaiting": 0, "failing": 1, "working": 2}[s]))
+        self.assertEqual(states.count("awaiting"), 2)   # both awaiting sessions made the cut
+        self.assertEqual(states.count("failing"), 4)    # all 4 failing sessions made the cut
+        self.assertEqual(states.count("working"), 2)    # only 2 of 6 working sessions fit in what's left
+
+    def test_board_tiles_eviction_guard_stale_failing_never_displaces_live_sessions(self):
+        """THE regression test for the shipped-then-caught defect (reports/drift/):
+        pre-fix, `if (s.fail_cmd) return 'failing'` carried no liveness check, so a
+        corpus with a handful of genuinely live sessions and a pile of long-dead ones
+        that merely carry a stale fail_cmd let the dead ones outrank ('failing' > RANK
+        > 'working') and EVICT the live ones under the 8-tile hard cap -- on the real
+        957-session corpus, 2 tiles became 118, 116 of them week-plus-stale 'failing'
+        tiles, and the one live session got bumped off the board entirely.
+
+        Fixture: 5 genuinely live 'working' sessions + 20 long-dead sessions each
+        carrying a stale fail_cmd, i.e. 20 idle sessions (fixture builder above).
+        Asserts the guard's real invariant -- RANK alone (working=3 ahead of
+        idle=5) guarantees a live session can never be bumped by an idle one,
+        regardless of how many idle sessions exist or how the remaining slots
+        get backfilled. Per the board-tabs fix (idle backfill, this file's
+        "board-tabs bug" section above), the 3 leftover slots under the 8-tile
+        cap ARE now legitimately backfilled with the 3 most-recently-modified
+        stale/idle sessions -- that is the intended behaviour, not a second
+        eviction bug -- so this only asserts the two live-session invariants
+        that still matter: every live session got a tile, in the first 5
+        (highest-ranked) positions, and none of the OLDER 17 stale sessions
+        (evict_stale3..19) displaced them or a backfill slot."""
+        tiles = self.OUT["eviction_tiles"]
+        self.assertEqual(len(tiles), 8, "the hard cap must still hold and be filled (5 live + 3 idle backfill)")
+        ids = [t["id"] for t in tiles if t["kind"] == "session"]
+        states = {t["id"]: t["state"] for t in tiles if t["kind"] == "session"}
+        for i in range(5):
+            self.assertIn("evict_live%d" % i, ids,
+                          "a genuinely live session was evicted from the board")
+            self.assertEqual(states["evict_live%d" % i], "working")
+        # the 5 live sessions occupy the first 5 (highest-ranked) positions --
+        # RANK put them ahead of every idle session, never merely "somewhere".
+        self.assertEqual(ids[:5], ["evict_live%d" % i for i in range(5)])
+        # only the 3 MOST RECENT stale sessions may occupy the leftover
+        # backfill slots (newest-mtime-first tiebreak, same as any other tier);
+        # the 17 older ones must never occupy a board slot.
+        for i in range(3, 20):
+            self.assertNotIn("evict_stale%d" % i, ids,
+                             "an older stale session occupied a board slot ahead of a newer one")
+        self.assertEqual(ids[5:], ["evict_stale%d" % i for i in range(3)])
+        for i in range(3):
+            self.assertEqual(states["evict_stale%d" % i], "idle")
+
+    def test_board_tiles_agent_no_group_regression(self):
+        """Regression for the '950 sessions, 0 tiles' bug: agent:true, group:"" must
+        still surface as an individual tile (it falls through both the individual
+        exclusion and the group bucketing otherwise). A properly-grouped agent
+        session must NOT also get an individual tile."""
+        tiles = self.OUT["agent_tiles"]
+        session_ids = [t["id"] for t in tiles if t["kind"] == "session"]
+        self.assertIn("orphan_agent", session_ids)
+        self.assertNotIn("grouped_agent", session_ids)
+        group_kinds = [t for t in tiles if t["kind"] == "agent-group"]
+        self.assertEqual([g["group"] for g in group_kinds], ["repoA"])
+        # and agentGroups() itself never buckets the group-less agent session
+        self.assertEqual(self.OUT["agent_groups_of_agent_sessions"], ["repoA"])
+
+    # -- sessionState: every state, boundary pinned to config.LIVE_WINDOW --
+
+    def test_session_state_every_value(self):
+        self.assertEqual(self.OUT["states"]["awaiting"], "awaiting")
+        self.assertEqual(self.OUT["states"]["flagged"], "flagged")
+        self.assertEqual(self.OUT["states"]["working"], "working")
+        self.assertEqual(self.OUT["states"]["landed"], "landed")
+        self.assertEqual(self.OUT["states"]["idle"], "idle")
+        self.assertEqual(self.OUT["states"]["failing"], "failing")
+
+    def test_session_state_failing_precedence(self):
+        """sessionState()'s check order is waiting > open_flags > fail_cmd > live/ended
+        -- a session that is BOTH waiting/flagged AND carries a fail_cmd must still
+        read as the higher-precedence state, never 'failing'."""
+        self.assertEqual(self.OUT["states"]["waiting_beats_failing"], "awaiting")
+        self.assertEqual(self.OUT["states"]["flagged_beats_failing"], "flagged")
+
+    def test_session_state_live_window_boundary_matches_server_constant(self):
+        """The 'live' cutoff is exactly aitracker.config.LIVE_WINDOW seconds — read from
+        config, never a second hardcoded '300' in this test — so a change to the
+        server constant that the JS literal doesn't follow would be caught here."""
+        self.assertEqual(self.OUT["states"]["boundary_live"], "working")
+        self.assertEqual(self.OUT["states"]["boundary_idle"], "idle")
+
+    def test_session_state_working_wins_over_ended_when_bg_agents_are_running(self):
+        """THE BOARD-TAB BUG: `ended=True` alone must never resolve to 'landed' when
+        `bg>0` -- a session with running background agents is still WORKING even
+        though its own foreground transcript already closed. Pins the real
+        production shape (ended=True, bg=3, fresh mtime), not the vacuous
+        ended=False fixture the old test used."""
+        self.assertEqual(self.OUT["states"]["working_ended_with_running_bg"], "working")
+
+    def test_session_state_stale_fail_cmd_does_not_read_as_failing(self):
+        """THE CORE REGRESSION (the defect that nearly shipped, reports/drift/): a
+        session that is NOT live (mtime well outside LIVE_WINDOW -- 7 days past it
+        here, matching the real corpus's median stale age) but still carries a
+        fail_cmd from whenever it last ran must NOT resolve to 'failing'.
+        sessionState()'s fix gates the fail_cmd check on liveness
+        (`if (live && s.fail_cmd) return 'failing';`, ext_cr_board.js:64) -- pre-fix
+        this read 'failing' unconditionally the instant fail_cmd was truthy,
+        regardless of age, which is exactly what turned a 957-session corpus's 2
+        genuinely-live tiles into 118, 116 of them week-plus-stale 'failing' ones."""
+        self.assertEqual(self.OUT["states"]["idle_stale_failing"], "idle")
+
+    # -- board/detail agreement: one derivation, not two forked ones ---------
+
+    def test_board_and_detail_agree_on_failing(self):
+        """Pins the conventions rule-4 violation that was just fixed: the board tile's
+        sessionState() (ext_cr_board.js) and the detail header's stateOf()
+        (ext_cr_detail.js) used to derive 'failing' independently -- the board off
+        `fail_cmd`, the detail off `counts.errors`/`counts.tests_failed` -- so a
+        session could read 'fail: pytest' on the board and 'Landed' in its own detail
+        header. Both now gate on the SAME `live && fail_cmd` predicate. Checked over
+        the same session objects sessionState()'s own state_probe fixture already
+        uses, across both the failing case and the stale-fail_cmd regression case."""
+        agree = self.OUT["detail_agreement"]
+        # genuinely live + fail_cmd: board says 'failing', detail says 'failed', and
+        # the detail word carries the actual command, matching the board's own word.
+        self.assertEqual(agree["failing"]["board"], "failing")
+        self.assertEqual(agree["failing"]["detailCls"], "failed")
+        self.assertEqual(agree["failing"]["detailWord"], "fail: pytest -q")
+        # the exact regression: a long-dead session with a stale fail_cmd must read
+        # as NOT failing on BOTH sides -- never 'failing'/'fail: ...' on the detail
+        # side while the board correctly says 'idle'.
+        self.assertEqual(agree["idle_stale_failing"]["board"], "idle")
+        self.assertNotEqual(agree["idle_stale_failing"]["detailCls"], "failed")
+        self.assertNotIn("fail:", agree["idle_stale_failing"]["detailWord"])
+        # sanity control: unrelated states still agree they are NOT failing on either
+        # side, so this isn't vacuously true for every session.
+        for k in ("working", "awaiting", "flagged"):
+            self.assertNotEqual(agree[k]["board"], "failing", k)
+            self.assertNotEqual(agree[k]["detailCls"], "failed", k)
+
+    # -- railOrder / agentGroups --------------------------------------------
+
+    def test_rail_order_pinned_partition_and_recency(self):
+        self.assertEqual(self.OUT["rail_pinned"], ["p_new", "p_old"])
+        self.assertEqual(self.OUT["rail_unpinned"], ["u_new", "u_old"])
+
+    def test_agent_groups_bucketing_and_idle_exclusion(self):
+        groups = {g["group"]: g for g in self.OUT["agent_groups"]}
+        self.assertEqual(set(groups.keys()), {"A", "B"})
+        # idle session excluded from its own bucket
+        self.assertEqual(groups["A"]["ids"], ["ga1"])
+        self.assertEqual(groups["B"]["ids"], ["gb1"])
+        self.assertEqual(groups["A"]["label"], "Repo A")
+        # newest bucket (B, mtime NOW-3) sorts before A (mtime NOW-5)
+        order = [g["group"] for g in self.OUT["agent_groups"]]
+        self.assertEqual(order, ["B", "A"])
+
+    # -- triageCounts: not mutually exclusive --------------------------------
+
+    def test_triage_counts_not_mutually_exclusive(self):
+        counts = self.OUT["triage"]
+        self.assertEqual(counts["awaiting"], 1)
+        self.assertEqual(counts["working"], 1)
+        self.assertEqual(counts["flagged"], 1)
+        # 2 sessions, 3 total count-contributions -> at least one session counted twice
+        self.assertGreater(counts["awaiting"] + counts["working"] + counts["flagged"], 2)
+
+    # -- spineSegments: time-proportional widths + the honest fallback ------
+
+    def test_spine_segments_fallback_equal_width_when_no_timings(self):
+        r = self.OUT["fallback"]
+        self.assertFalse(r["timeAccurate"])
+        self.assertEqual(r["total"], 4)
+        self.assertAlmostEqual(r["sum"], 100.0, places=2)
+        for w in r["widths"]:
+            self.assertGreaterEqual(w, 3.0)   # FLOOR — never a vanishing sliver
+            self.assertLessEqual(w, 100.0)    # never a nonsensical width
+        # 2 active (1 done + 1 running) + 2 pending, evenly split -> all four ~25%
+        for w in r["widths"]:
+            self.assertAlmostEqual(w, 25.0, delta=0.5)
+
+    def test_spine_segments_time_proportional_when_timings_exist(self):
+        """BUG 1 pin: fixture uses the REAL keys /api/session emits — snake_case
+        started_at/ended_at, epoch-seconds numbers (epoch_sec() above) — not the
+        camelCase ISO-string shape a prior version of this fixture assumed. That
+        wrong fixture is exactly what let Bug 1 ship: production read camelCase, so
+        the old fixture's own made-up camelCase fields "worked" without ever
+        exercising the real payload shape, and the spine never went time-proportional
+        for any real session."""
+        r = self.OUT["timed"]
+        self.assertTrue(r["timeAccurate"])
+        self.assertAlmostEqual(r["sum"], 100.0, places=2)
+        by_kind = {w["kind"]: w["widthPct"] for w in r["widths"]}
+        # done spent 10s, running has spent 190s (so far) of a 200s elapsed window:
+        # done ~4.4%, running ~83.6%, pending gets the 12% remainder.
+        self.assertAlmostEqual(by_kind["done"], 4.4, delta=0.5)
+        self.assertAlmostEqual(by_kind["running"], 83.6, delta=0.5)
+        self.assertAlmostEqual(by_kind["pending"], 12.0, delta=0.5)
+        # the running (more time spent) segment must be visibly wider than the done one
+        self.assertGreater(by_kind["running"], by_kind["done"])
+        for w in r["widths"]:
+            self.assertGreaterEqual(w["widthPct"], 0.0)
+            self.assertLessEqual(w["widthPct"], 100.0)
+
+    def test_spine_segments_no_todos_is_honest_not_fabricated(self):
+        r = self.OUT["empty"]
+        self.assertEqual(r["total"], 0)
+        self.assertEqual(r["segCount"], 0)
+        self.assertEqual(r["ariaLabel"], "Progress: no tasks recorded.")
+
+    # -- the spine's TIME WINDOW: chips + drag-pan --------------------------
+
+    def test_spine_window_omitted_is_the_whole_session_unchanged(self):
+        """Backward compatibility is the whole reason `win` is a third, optional
+        argument: every pre-existing caller and test passes two, and must keep
+        getting the un-windowed spine.
+
+        This asserts the NUMBERS, not just the flags. An earlier version of this
+        test checked only `windowed is False` — which an adversarial review
+        correctly called out as unable to catch broken segment math."""
+        self.assertFalse(self.OUT["long_all"]["windowed"])
+        self.assertFalse(self.OUT["clip_all"]["windowed"])
+        self.assertFalse(self.OUT["clip_all"]["barWindowed"])
+
+        # clipDetail un-windowed: A spent 60m, B 60m, C 20m (running, to now) of a
+        # 4h session. Proportions are of the 140m actually spent: 42.86/42.86/14.29.
+        segs = {s["idx"]: s["widthPct"] for s in self.OUT["clip_all"]["segs"]}
+        self.assertEqual(sorted(segs), [0, 1, 2])
+        self.assertAlmostEqual(segs[0], 42.86, delta=0.5)
+        self.assertAlmostEqual(segs[1], 42.86, delta=0.5)
+        self.assertAlmostEqual(segs[2], 14.29, delta=0.5)
+
+    def test_unparseable_ended_at_contributes_nothing_not_a_bogus_duration(self):
+        """Found by adversarial review. `ended_at` absent means "still running"
+        (-> now); `ended_at` PRESENT but corrupt must stay null and contribute 0.
+        Collapsing the two would turn garbage into a live-looking duration, and
+        the todo would swell to fill the bar."""
+        r = self.OUT["corrupt"]
+        self.assertTrue(r["timeAccurate"], "a parseable started_at still counts")
+        self.assertTrue(r["finite"], "no NaN/Infinity widths")
+        by_idx = {s["idx"]: s for s in r["segs"]}
+        self.assertEqual(by_idx[1]["ms"], 0, "corrupt ended_at must yield 0ms")
+        # the good todo therefore takes the whole bar, and the corrupt one only
+        # the 3% FLOOR that keeps every segment clickable
+        self.assertGreater(by_idx[0]["w"], by_idx[1]["w"])
+
+    def test_spine_unwindowed_long_session_crushes_markers_into_the_left_edge(self):
+        """Pins the DEFECT, so the fix below has something to be a fix OF: over a
+        192h session every real event lands in the left few percent of the gutter."""
+        marks = self.OUT["long_all"]["marks"]
+        real = [m for m in marks if m["kind"] != "now"]
+        self.assertGreaterEqual(len(real), 4)
+        # the four early prompts are 5 minutes apart in a 192-hour session: even
+        # after the 2%-collision nudge they are all still jammed against the left
+        early = sorted(m["pct"] for m in real)[:4]
+        self.assertLess(max(early), 8.0, "expected the crowding this window fixes")
+
+    def test_spine_window_rebases_markers_onto_the_visible_span(self):
+        """The fix: a trailing 1h window drops the 192h-old events entirely and
+        positions what remains against the WINDOW, not the session."""
+        w = self.OUT["long_win"]
+        self.assertTrue(w["windowed"])
+        self.assertTrue(w["atLiveEdge"])
+        self.assertEqual(w["winSpanMs"], 60 * 60 * 1000)
+        kinds = sorted(m["kind"] for m in w["marks"])
+        # only the 10-minutes-ago prompt and NOW survive a trailing 1h window
+        self.assertEqual(kinds, ["now", "prompt"])
+        prompt = [m for m in w["marks"] if m["kind"] == "prompt"][0]
+        # 10 minutes before the end of a 60-minute window -> 50/60 == 83.3%
+        self.assertAlmostEqual(prompt["pct"], 83.3, delta=1.0)
+
+    def test_empty_window_is_detected_past_the_synthetic_now_marker(self):
+        """`now` is pushed onto the marker list on EVERY render, so it is never
+        evidence that anything happened in view. Counting it would have meant the
+        "nothing in this window" message never fired on precisely the sessions
+        that need it — a long-idle one windowed to its last hour. Pinned against
+        a real 2192h session on this machine (63f5fe77) that behaves this way."""
+        self.assertEqual(self.OUT["idle_all"]["realMarkers"], 3)
+        w = self.OUT["idle_win"]
+        self.assertEqual(w["kinds"], ["now"], "only the synthetic marker survives")
+        self.assertEqual(w["n"], 1)
+        self.assertEqual(w["realMarkers"], 0, "an empty window must read as empty")
+        # and the live-edge window over a session that IS active still has content
+        self.assertEqual(self.OUT["long_win"]["realMarkers"], 1)
+
+    def test_spine_window_clips_bar_segments_to_the_visible_range(self):
+        """A todo outside the window is dropped, and one that merely OVERLAPS it
+        contributes only its visible part -- never its whole duration."""
+        allw = self.OUT["clip_all"]
+        self.assertTrue(allw["timeAccurate"])
+        self.assertEqual([s["idx"] for s in allw["segs"]], [0, 1, 2])
+        self.assertAlmostEqual(allw["sum"], 100.0, places=2)
+
+        win = self.OUT["clip_win"]
+        self.assertTrue(win["barWindowed"])
+        # A (ended 3h ago) is gone; B contributes its visible 30m, C its 20m
+        self.assertEqual([s["idx"] for s in win["segs"]], [1, 2])
+        by_idx = {s["idx"]: s["widthPct"] for s in win["segs"]}
+        self.assertAlmostEqual(by_idx[1], 60.0, delta=0.5)   # 30m of 50m visible
+        self.assertAlmostEqual(by_idx[2], 40.0, delta=0.5)   # 20m of 50m visible
+        self.assertAlmostEqual(win["sum"], 100.0, places=2)
+
+    def test_spine_window_panned_into_the_past_drops_pending_todos(self):
+        """'to go' is a claim about the future. Anchored at the live edge the
+        pending todo shows; dragged back two hours it must not, because what was
+        still pending at that moment is not something the log records."""
+        live = self.OUT["pan_live"]
+        self.assertTrue(live["atLiveEdge"])
+        self.assertIn("pending", live["kinds"])
+
+        back = self.OUT["pan_back"]
+        self.assertFalse(back["atLiveEdge"])
+        self.assertNotIn("pending", back["kinds"])
+        self.assertEqual(back["kinds"], ["done"])
+
+    def test_spine_span_choices_only_offers_spans_shorter_than_the_session(self):
+        """A no-op chip is worse than no chip: a 10-minute session gets none."""
+        c = self.OUT["span_choices"]
+        self.assertEqual(c["long"], ["15m", "1h", "6h", "24h"])
+        self.assertEqual(c["twoh"], ["15m", "1h"])
+        self.assertEqual(c["short"], [])
+        self.assertEqual(c["zero"], [])
+        self.assertEqual(c["nul"], [])
+
+    def test_spine_zoom_width_and_its_cap(self):
+        """The chips are a ZOOM: they set how wide the strip is drawn, and the
+        viewport scrolls. Nothing is ever filtered out, which is why clicking one
+        can no longer empty the bar.
+
+        The cap is the load-bearing part. The real 2192h session on this machine
+        at a 15m zoom would want 8,768,000% -- tens of millions of pixels -- so it
+        clamps to 6000% (60x), still a dramatic spread."""
+        z = self.OUT["zoom"]
+        self.assertEqual(z["all"], 100, "All == fits the panel, exactly as before")
+        self.assertEqual(z["no_ui"], 100, "no ui object must not throw")
+        # 14h39m shown at a 6h zoom -> 14.65/6 == ~244%
+        self.assertAlmostEqual(z["six_h_of_14h39"], 244.2, delta=1.0)
+        self.assertEqual(z["span_longer_than_session"], 100,
+                         "a zoom wider than the session can only ever be 'fits'")
+        self.assertEqual(z["zero_elapsed"], 100, "no elapsed time -> nothing to zoom")
+        self.assertEqual(z["pathological"], 6000, "capped, not 8,768,000%")
+
+    def test_spine_segments_ended_at_alone_is_not_mistaken_for_real_timing(self):
+        """Regression for the exact real-world shape confirmed live: a completed
+        todo can carry a populated ended_at with started_at still None (no in_progress
+        TaskUpdate was ever recorded). Must still take the honest equal-width
+        fallback, never treat the lone ended_at as real timing."""
+        r = self.OUT["only_ended"]
+        self.assertFalse(r["timeAccurate"])
+        self.assertEqual(r["total"], 3)
+        for w in r["widths"]:
+            self.assertGreaterEqual(w, 3.0)
+            self.assertLessEqual(w, 100.0)
+
+    # -- prInfo: Landed tile PR metadata (Bug 2) ------------------------------
+
+    def test_pr_info_renders_pr_number_on_landed_tile(self):
+        info = self.OUT["pr_with"]
+        self.assertIsNotNone(info)
+        self.assertEqual(info["label"], "#42")
+        self.assertEqual(info["url"], "https://example.com/pr/42")
+
+    def test_pr_info_renders_nothing_without_pr_num(self):
+        self.assertIsNone(self.OUT["pr_without"])
+
+    def test_pr_info_renders_nothing_off_landed_state(self):
+        """A session that happens to carry pr_num but isn't in the 'landed' state
+        (still working) shows no PR metadata — it's a Landed-tile-only affordance."""
+        self.assertIsNone(self.OUT["pr_not_landed"])
+
+    # -- mergeTimeline: one chronological list, NEWEST FIRST ------------------
+
+    def test_merge_timeline_is_one_chronological_list(self):
+        # Newest-first, so index 0 is the newest entry. That is the whole app's
+        # convention -- the server already emits narration newest-first, and
+        # app.js's navFirst() documents "index 0 = newest". The timeline used to
+        # sort ascending, which silently inverted the panel against every other
+        # surface; the owner reported it.
+        merged = self.OUT["merged"]
+        kinds = [e["kind"] for e in merged]
+        self.assertEqual(kinds, ["ask", "prompt", "narration", "command"])
+        times = [e["t"] for e in merged]
+        self.assertEqual(times, sorted(times, reverse=True))
+        self.assertGreater(times[0], times[-1])
+
+
+# ---------------------------------------------------------------------------
+# Theme-scope regression: "selecting Dark leaves the whole app light".
+#
+# Root cause (measured live): ext_cr.css's dark tokens are declared as
+# `.tracker-next.is-dark`, and the light tokens as a BARE `.tracker-next`.
+# `#cr-shell` used to carry its own bare `tracker-next` class in addition to
+# `#nextRoot` (its ancestor) — so it re-declared the light token block
+# directly on itself, shadowing every dark value it should have inherited.
+# The invariant that must hold from now on: once the theme has resolved to
+# dark, EVERY element carrying `.tracker-next` also carries `.is-dark`.
+#
+# This exercises the REAL init -> ensureMounted -> CR.board.mount ->
+# applyTheme flow (not just the pure derivations TestCRLogic reaches into
+# above), under a purpose-built DOM stub with an actual element tree + real
+# classList tracking — the generic stub used above returns ONE shared dummy
+# node for every query, which can't express "this specific element carries
+# this specific class", so it can't see this bug at all.
+# ---------------------------------------------------------------------------
+
+_THEME_JS_PREAMBLE = r"""
+globalThis.window = globalThis;
+
+function makeDummy() {
+  var self = {
+    classList: { add: function () {}, remove: function () {}, toggle: function () { return false; }, contains: function () { return false; } },
+    style: {}, dataset: {},
+    setAttribute: function () {}, getAttribute: function () { return null; }, removeAttribute: function () {},
+    appendChild: function (c) { return c; }, append: function () {}, remove: function () {}, insertBefore: function (c) { return c; },
+    addEventListener: function () {}, removeEventListener: function () {},
+    querySelector: function () { return self; }, querySelectorAll: function () { return [self]; },
+    closest: function () { return self; }, firstElementChild: null, children: [],
+    innerHTML: "", textContent: "", value: "", hidden: false,
+    focus: function () {}, click: function () {}, scrollIntoView: function () {}
+  };
+  return self;
+}
+var dummy = makeDummy();
+
+var _idRegistry = {};
+
+// Walks REAL descendants only (never the root itself) collecting elements
+// whose real classList (a Set, see makeReal below) contains `sel`'s class.
+// Used for BOTH document.querySelectorAll(...) (root = the fake <body>) and
+// a real element's own .querySelectorAll(...) (root = that element) — real
+// DOM semantics never include the calling node itself either way.
+function queryAllReal(root, sel) {
+  var out = [];
+  if (!sel || sel.charAt(0) !== '.') return out;
+  var cls = sel.slice(1);
+  (function walk(node) {
+    (node._children || []).forEach(function (c) {
+      if (c && c._classes && c._classes.has(cls)) out.push(c);
+      walk(c);
+    });
+  })(root);
+  return out;
+}
+
+function makeReal(tag) {
+  var el = {
+    tagName: String(tag || 'div').toUpperCase(),
+    _classes: new Set(),
+    _children: [],
+    _attrs: {},
+    _id: '',
+    style: {}, dataset: {},
+    hidden: false, innerHTML: '', textContent: '', value: '',
+    parentNode: null
+  };
+  el.classList = {
+    add: function () { for (var i = 0; i < arguments.length; i++) if (arguments[i]) el._classes.add(arguments[i]); },
+    remove: function () { for (var i = 0; i < arguments.length; i++) el._classes.delete(arguments[i]); },
+    toggle: function (c, force) {
+      var has = el._classes.has(c);
+      var want = (force === undefined) ? !has : !!force;
+      if (want) el._classes.add(c); else el._classes.delete(c);
+      return want;
+    },
+    contains: function (c) { return el._classes.has(c); }
+  };
+  Object.defineProperty(el, 'className', {
+    get: function () { return Array.from(el._classes).join(' '); },
+    set: function (v) { el._classes = new Set(String(v == null ? '' : v).split(/\s+/).filter(Boolean)); }
+  });
+  Object.defineProperty(el, 'id', {
+    get: function () { return el._id; },
+    set: function (v) { el._id = v; if (v) _idRegistry[v] = el; }
+  });
+  el.setAttribute = function (k, v) { el._attrs[k] = v; if (k === 'class') el.className = v; if (k === 'id') el.id = v; };
+  el.getAttribute = function (k) { return (k in el._attrs) ? el._attrs[k] : null; };
+  el.removeAttribute = function (k) { delete el._attrs[k]; };
+  el.appendChild = function (c) { if (c) { el._children.push(c); c.parentNode = el; } return c; };
+  el.append = function () { for (var i = 0; i < arguments.length; i++) el.appendChild(arguments[i]); };
+  el.insertBefore = function (c) { if (c) { el._children.push(c); c.parentNode = el; } return c; };
+  el.removeChild = function (c) { var idx = el._children.indexOf(c); if (idx >= 0) el._children.splice(idx, 1); return c; };
+  el.remove = function () { if (el.parentNode) el.parentNode.removeChild(el); };
+  el.addEventListener = function () {}; el.removeEventListener = function () {};
+  el.focus = function () {}; el.click = function () {}; el.scrollIntoView = function () {};
+  el.querySelectorAll = function (sel) { return queryAllReal(el, sel); };
+  el.querySelector = function (sel) { return queryAllReal(el, sel)[0] || null; };
+  el.closest = function () { return null; };
+  Object.defineProperty(el, 'firstElementChild', { get: function () { return el._children[0] || null; } });
+  Object.defineProperty(el, 'children', { get: function () { return el._children.slice(); } });
+  return el;
+}
+
+var docBody = makeReal('body');
+var nextRoot = makeReal('div');
+nextRoot.id = 'nextRoot';
+nextRoot.className = 'tracker-next cr';
+nextRoot.hidden = true;
+docBody.appendChild(nextRoot);
+
+window.document = {
+  createElement: function (tag) { return makeReal(tag); },
+  createElementNS: function (ns, tag) { return makeReal(tag); },
+  createTextNode: function (text) { var t = makeReal('#text'); t.textContent = text; return t; },
+  getElementById: function (id) { return _idRegistry[id] || dummy; },
+  querySelector: function (sel) { return queryAllReal(docBody, sel)[0] || null; },
+  querySelectorAll: function (sel) { return queryAllReal(docBody, sel); },
+  addEventListener: function () {}, removeEventListener: function () {}, dispatchEvent: function () {},
+  documentElement: dummy, body: docBody, head: dummy, readyState: "complete"
+};
+
+var _THEME_STORAGE = {};
+window.localStorage = {
+  getItem: function (k) { return (k in _THEME_STORAGE) ? _THEME_STORAGE[k] : null; },
+  setItem: function (k, v) { _THEME_STORAGE[k] = String(v); },
+  removeItem: function (k) { delete _THEME_STORAGE[k]; }
+};
+// Seeded BEFORE the bundle runs -- the exact live scenario: preference already
+// 'dark', UI already 'next' (a returning user with Dark selected), so init()
+// actually mounts Control Room and calls applyTheme() for real.
+window.localStorage.setItem('tracker.theme', 'dark');
+window.localStorage.setItem('tracker.ui', 'next');
+
+window.matchMedia = function () { return { matches: false, addEventListener: function () {}, addListener: function () {}, removeEventListener: function () {} }; };
+window.fetch = function () { return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); }, text: function () { return Promise.resolve(""); }, headers: { get: function () { return null; } } }); };
+// setTimeout runs its callback IMMEDIATELY (still inside the current
+// synchronous script). ext_cr_boot.js's whole init() flow (buildRoots ->
+// wireEntryButton -> setUiMode('next') -> ensureMounted -> CR.board.mount ->
+// applyTheme) is queued via exactly one `setTimeout(init, 0)` at the end of
+// its own IIFE (deferred there only so every OTHER concatenated ext_*.js
+// file has finished defining window.CR.* first) -- running it synchronously
+// here is safe for what this test exercises: CR.board is already defined
+// (board.js sorts before boot.js), so its mount() runs for real; CR.detail/
+// dialogs/term are not yet defined at that point, so their mounts fall back
+// to safeMount()'s own try/catch placeholder path -- exactly what already
+// happens if any of them ever throws for real.
+window.setTimeout = function (fn) { if (typeof fn === 'function') fn(); return 0; };
+window.setInterval = function () { return 0; };
+window.clearInterval = function () {}; window.clearTimeout = function () {};
+window.location = { href: "", search: "", pathname: "/", host: "localhost" };
+window.navigator = { userAgent: "node", clipboard: { writeText: function () { return Promise.resolve(); } } };
+window.CustomEvent = function (type, opts) { this.type = type; this.detail = opts && opts.detail; };
+window.Event = window.CustomEvent;
+window.requestAnimationFrame = function () { return 0; };
+window.getComputedStyle = function () { return { getPropertyValue: function () { return ""; } }; };
+window.getSelection = function () { return { toString: function () { return ""; } }; };
+window.addEventListener = function () {}; window.removeEventListener = function () {}; window.dispatchEvent = function () {};
+window.URLSearchParams = function () { return { get: function () { return null; } }; };
+process.on("unhandledRejection", function () {});
+
+try {
+"""
+
+_THEME_JS_MID = r"""
+} catch (e) {
+  console.error("BUNDLE-THREW: " + (e && e.stack || e));
+  process.exit(1);
+}
+"""
+
+_THEME_JS_TAIL = r"""
+var out = { scopes: [], mountedIds: Object.keys(_idRegistry) };
+queryAllReal(docBody, '.tracker-next').forEach(function (el) {
+  out.scopes.push({ id: el.id || null, classes: Array.from(el._classes).sort() });
+});
+out.nextRootIsDark = nextRoot.classList.contains('is-dark');
+console.log("===CR_THEME_JSON_START===");
+console.log(JSON.stringify(out));
+"""
+
+
+def _theme_scope_driver_js():
+    bundle_html = _read_page()
+    bundle_js = _extract_script_content(bundle_html)
+    return "\n".join([_THEME_JS_PREAMBLE, bundle_js, _THEME_JS_MID, _THEME_JS_TAIL])
+
+
+def _extract_theme_json(stdout):
+    marker = "===CR_THEME_JSON_START==="
+    idx = stdout.find(marker)
+    if idx < 0:
+        raise ValueError("marker not found in node output:\n" + stdout)
+    return json.loads(stdout[idx + len(marker):].strip())
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestCRThemeScope(unittest.TestCase):
+    """Regression for the '#cr-shell renders light under a dark #nextRoot' bug.
+
+    Runs the REAL init -> ensureMounted -> CR.board.mount -> applyTheme flow
+    (not just the pure derivations TestCRLogic reaches into above) with
+    tracker.theme=dark and tracker.ui=next already seeded in localStorage --
+    the exact state a returning user with Dark selected loads into.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        js = _theme_scope_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Theme-scope driver failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_theme_json(stdout)
+
+    def test_nextroot_resolves_dark(self):
+        self.assertTrue(self.OUT["nextRootIsDark"], "resolved theme should be dark per seeded localStorage")
+
+    def test_shell_actually_mounted(self):
+        """Sanity check so the invariant below can't pass VACUOUSLY on an empty
+        tree: if CR.board.mount() silently failed to run under this stub,
+        #cr-shell would never have been built (and registered) at all. (It is
+        correctly ABSENT from the tracker-next scope list itself -- that is
+        the fix: the shell no longer carries the class.)"""
+        self.assertIn("cr-shell", self.OUT["mountedIds"],
+                      "CR.board.mount() should have built #cr-shell; ids seen: %r" % self.OUT["mountedIds"])
+
+    def test_every_tracker_next_element_also_carries_is_dark(self):
+        """The actual regression guard: no element carrying `.tracker-next` may
+        lack `is-dark` once the theme has resolved to dark -- otherwise that
+        element's own bare `.tracker-next {...}` rule (ext_cr.css) re-declares
+        the LIGHT token block directly on itself, shadowing the dark values it
+        should inherit from its #nextRoot ancestor (the live bug this pins:
+        `#cr-shell` used to carry a redundant bare `tracker-next` class)."""
+        offenders = [s for s in self.OUT["scopes"] if "is-dark" not in s["classes"]]
+        self.assertEqual(offenders, [], "these elements carry tracker-next without is-dark: %r" % offenders)
+
+
+# ---------------------------------------------------------------------------
+# Sound-notification regression: "notifies with sound every time" (reported
+# twice against Control Room).
+#
+# Round 1 (fixed by commit 8fe15ca, still correct, re-pinned by the first three
+# assertions below): a parallel completion detector scanned `ended` across
+# every /api/list session with a baseline that only ran once, so a machine
+# with hundreds of already-finished sessions kept re-announcing them, with
+# sound, on every later poll. The fix reuses app.js's own checkCompletions(d) —
+# it watches only the CURRENTLY VIEWED session's `agents_bg`/`shells`, keyed
+# by id, and silently re-baselines (no notify) on the first poll and on a
+# session switch, notifying only a real running -> not-running transition.
+#
+# Round 2 (fixed here): ext_cr_dialogs.js's toast() — the function every
+# routine Control Room confirmation reaches (rename/flag/note/run-command/etc.,
+# ~20 call sites in ext_cr_boot.js, ALL bare visual confirmations in the
+# classic dashboard) — ALSO raised its own `new Notification(...)` whenever the
+# tab was hidden, soundOn-gated but otherwise unconditional. A desktop
+# Notification carries the OS's own alert sound by default, so backgrounding
+# the tab and doing something as routine as renaming a session played an
+# audible alert though nothing had "finished" — exactly the reported "sound
+# every time" behaviour, and something the classic dashboard's own toast()
+# (app.js ~1139) never does at all: it is a pure visual banner. Deleted the
+# block; a real completion still gets its (unchanged) desktop alert from
+# app.js's own notifyDone(), which toast() was never the only path for.
+#
+# Exercises the REAL exported functions (app.js's checkCompletions/notifyDone/
+# beep, reached bare because this driver runs INSIDE the bundle's own try{}
+# block scope -- not window.CR.* -- and ext_cr_dialogs.js's real
+# window.CR.dialogs.toast(), after a real mount()) rather than re-deriving the
+# logic in Python.
+# ---------------------------------------------------------------------------
+
+_SOUND_JS_PREAMBLE = r"""
+globalThis.window = globalThis;
+
+function makeEl() {
+  var self = {
+    classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    style: {}, dataset: {}, setAttribute() {}, getAttribute() { return null; },
+    appendChild() {}, append() {}, remove() {}, insertBefore() {},
+    addEventListener() {}, removeEventListener() {},
+    querySelector: function() { return self; }, querySelectorAll: () => [self],
+    closest: function() { return self; }, firstElementChild: self, children: [self],
+    innerHTML: "", textContent: "", hidden: false, focus() {}, click() {}
+  };
+  return self;
+}
+
+var stubEl = makeEl();
+window.document = {
+  createElement: () => makeEl(), createElementNS: (ns, tag) => makeEl(), createTextNode: () => makeEl(),
+  getElementById: () => stubEl, querySelector: () => stubEl, querySelectorAll: () => [stubEl],
+  addEventListener() {}, dispatchEvent() {},
+  documentElement: stubEl, body: stubEl, head: stubEl, readyState: "complete",
+  hidden: false
+};
+
+const _localStorage = {};
+window.localStorage = {
+  getItem: (k) => (k in _localStorage) ? _localStorage[k] : null,
+  setItem: (k, v) => { _localStorage[k] = v; },
+  removeItem: (k) => { delete _localStorage[k]; }
+};
+
+window.matchMedia = () => ({ matches: false, addEventListener() {}, addListener() {}, removeEventListener() {} });
+window.fetch = () => Promise.resolve({ ok: true, json: () => Promise.resolve({}), text: () => Promise.resolve(""), headers: { get: () => null } });
+window.setInterval = () => 0; window.setTimeout = () => 0; window.clearInterval = () => {}; window.clearTimeout = () => {};
+window.location = { href: "", search: "", pathname: "/" };
+window.navigator = { userAgent: "node", clipboard: { writeText: () => Promise.resolve() } };
+window.CustomEvent = class { constructor(type, opts) { this.type = type; this.detail = opts && opts.detail; } };
+window.Event = window.CustomEvent;
+window.requestAnimationFrame = () => 0;
+window.getComputedStyle = () => ({ getPropertyValue: () => "" });
+window.getSelection = () => ({ toString: () => "" });
+window.addEventListener = () => {}; window.removeEventListener = () => {}; window.dispatchEvent = () => {};
+// beep() (app.js) needs a WebAudio stub; notifyDone()'s desktop-alert branch
+// (app.js + ext_cr_dialogs.js's toast(), pre-fix) needs a Notification stub.
+window.AudioContext = function () {
+  return { state: "running", resume() {}, currentTime: 0,
+    createOscillator() { return { type: "", frequency: { value: 0 }, connect() {}, start() {}, stop() {} }; },
+    createGain() { return { gain: { setValueAtTime() {}, linearRampToValueAtTime() {}, exponentialRampToValueAtTime() {} }, connect() {} }; },
+    destination: {} };
+};
+window.Notification = function (title, opts) { this.title = title; this.body = opts && opts.body; this.onclick = null; };
+window.Notification.permission = "granted";
+window.Notification.requestPermission = () => Promise.resolve("granted");
+process.on("unhandledRejection", () => {});
+
+try {
+"""
+
+_SOUND_JS_DRIVER = r"""
+// Still inside the bundle's own try{} block: `cur`/`soundOn`/`notifSession`/
+// `notifRunning` are app.js's real top-level `let` bindings (block-scoped —
+// NOT reachable once the enclosing try{} closes), and `beep`/`checkCompletions`/
+// `notifyDone` are its real top-level functions, reached bare by design (same
+// note ext_cr_boot.js's own header carries about this shared script scope).
+var beepCount = 0;
+var origBeep = beep;
+beep = function () { beepCount++; return origBeep.apply(this, arguments); };
+
+function mkAgent(id, running) { return { id: id, task: "task-" + id, running: running }; }
+function mkShell(id, running) { return { id: id, desc: "shell-" + id, cmd: "echo", running: running }; }
+
+var results = {};
+
+// 1) First poll ever, session already has several FINISHED agents/shells ->
+//    baseline only, ZERO sound (the exact "hundreds of already-finished
+//    sessions" shape round 1's bug mishandled).
+cur = "sessA";
+notifSession = null; notifRunning = null;
+beepCount = 0;
+checkCompletions({ agents_bg: [mkAgent("a1", false), mkAgent("a2", false)], shells: [mkShell("s1", false)] });
+results.firstPoll = beepCount;
+checkCompletions({ agents_bg: [mkAgent("a1", false), mkAgent("a2", false)], shells: [mkShell("s1", false)] });
+results.firstPollSecondTick = beepCount;   // nothing changed on a later tick either
+
+// 2) Session switch -> silent re-baseline, ZERO sound, even though the new
+//    session's items are already running=false.
+cur = "sessB";
+beepCount = 0;
+checkCompletions({ agents_bg: [mkAgent("b1", false)], shells: [] });
+results.sessionSwitch = beepCount;
+
+// 3) A genuine running -> finished transition on the session actually being
+//    viewed, sound ON -> EXACTLY one beep.
+soundOn = true;
+cur = "sessC";
+notifSession = null; notifRunning = null;
+checkCompletions({ agents_bg: [mkAgent("c1", true)], shells: [] });   // baseline: c1 running
+beepCount = 0;
+checkCompletions({ agents_bg: [mkAgent("c1", false)], shells: [] }); // c1 finished
+results.realTransitionSoundOn = beepCount;
+
+// 4) Same genuine transition, sound OFF -> zero.
+soundOn = false;
+cur = "sessD";
+notifSession = null; notifRunning = null;
+checkCompletions({ agents_bg: [mkAgent("d1", true)], shells: [] });
+beepCount = 0;
+checkCompletions({ agents_bg: [mkAgent("d1", false)], shells: [] });
+results.realTransitionSoundOff = beepCount;
+soundOn = true;
+
+// 5) Round 2's actual bug: a MUNDANE confirmation (rename/flag/note/etc.) must
+//    NOT raise a desktop Notification while the tab is hidden — only a real
+//    notifyDone() completion may. Exercise the REAL exported toast() the same
+//    way every ext_cr_boot.js confirmation reaches it (ctx.on('notify', ...)
+//    -> toast(payload)), after mount()ing it for real.
+var notifyCtorCalls = 0;
+var RealNotification = window.Notification;
+window.Notification = function (title, opts) { notifyCtorCalls++; return new RealNotification(title, opts); };
+window.Notification.permission = "granted";
+window.CR.dialogs.mount(makeEl(), {});
+document.hidden = true;
+window.CR.dialogs.toast({ text: "Renamed." });          // a mundane confirmation, NOT a completion
+results.mundaneConfirmationRaisedNotification = notifyCtorCalls;
+
+// Sanity check in the SAME harness: a real completion still gets its
+// (unchanged, soundOn-gated) desktop alert straight from app.js's own
+// notifyDone() -- proving the fix removed only the spurious path.
+notifyCtorCalls = 0;
+soundOn = true;
+notifyDone("Background agent finished", "some task");
+results.realCompletionStillRaisesNotification = notifyCtorCalls;
+document.hidden = false;
+window.Notification = RealNotification;
+
+console.log("===CR_SOUND_JSON_START===");
+console.log(JSON.stringify(results));
+"""
+
+_SOUND_JS_CLOSER = r"""
+} catch (e) {
+  console.error("BUNDLE-THREW: " + (e && e.stack || e));
+  process.exit(1);
+}
+"""
+
+
+def _sound_driver_js():
+    bundle_html = _read_page()
+    bundle_js = _extract_script_content(bundle_html)
+    return "\n".join([_SOUND_JS_PREAMBLE, bundle_js, _SOUND_JS_DRIVER, _SOUND_JS_CLOSER])
+
+
+def _extract_sound_json(stdout):
+    marker = "===CR_SOUND_JSON_START==="
+    idx = stdout.find(marker)
+    if idx < 0:
+        raise ValueError("marker not found in node output:\n" + stdout)
+    return json.loads(stdout[idx + len(marker):].strip())
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestCRSoundNotifications(unittest.TestCase):
+    """Pins the sound/desktop-notification behaviour to the classic dashboard's own
+    (same trigger, same soundOn gate, same code path) -- regression for both rounds
+    of the "notifies with sound every time" complaint."""
+
+    @classmethod
+    def setUpClass(cls):
+        js = _sound_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Sound driver failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_sound_json(stdout)
+
+    def test_first_poll_with_already_finished_items_is_silent(self):
+        """Round 1's exact bug shape: a first look at a session whose background
+        agents/shells are already done must never beep -- only baseline."""
+        self.assertEqual(self.OUT["firstPoll"], 0)
+        self.assertEqual(self.OUT["firstPollSecondTick"], 0)
+
+    def test_session_switch_is_silent(self):
+        self.assertEqual(self.OUT["sessionSwitch"], 0)
+
+    def test_real_completion_beeps_exactly_once_when_sound_on(self):
+        self.assertEqual(self.OUT["realTransitionSoundOn"], 1)
+
+    def test_real_completion_is_silent_when_sound_off(self):
+        self.assertEqual(self.OUT["realTransitionSoundOff"], 0)
+
+    def test_mundane_confirmation_never_raises_a_desktop_notification(self):
+        """Round 2's actual bug: ext_cr_dialogs.js's toast() -- reached by every
+        routine confirmation (rename/flag/note/run-command/...) -- used to also pop
+        a desktop Notification (with the OS's own alert sound) whenever the tab was
+        hidden. The classic dashboard's own toast() never does this for anything;
+        only a real completion (notifyDone(), pinned above) is allowed to."""
+        self.assertEqual(self.OUT["mundaneConfirmationRaisedNotification"], 0)
+
+    def test_real_completion_still_raises_a_desktop_notification(self):
+        """Sanity check alongside the assertion above: the fix must not have also
+        silenced the legitimate desktop alert for a genuine completion."""
+        self.assertEqual(self.OUT["realCompletionStillRaisesNotification"], 1)
+
+
+# ---------------------------------------------------------------------------
+# Board "failing" tile render: stateWord(state, s) (ext_cr_board.js) is an
+# UNEXPORTED closure function -- window.CR.board only exposes the pure
+# derivations (boardTiles/sessionState/...), not this one, because it is a
+# render-time helper, not a standalone derivation. sessionState() (exported,
+# pinned above) already proves 'failing' is DERIVED correctly and RANKED
+# correctly; this section proves the remaining piece -- that a failing tile's
+# rendered DOM text is actually "fail: <command>" -- by driving the REAL
+# CR.board.mount()/update() render path against a real (tracked) DOM stub,
+# the same technique TestCRThemeScope uses above for the same reason (the
+# thing under test only exists inside a render, not a pure function).
+# ---------------------------------------------------------------------------
+
+_FAILTILE_JS_PREAMBLE = r"""
+globalThis.window = globalThis;
+
+function makeDummy() {
+  var self = {
+    classList: { add: function () {}, remove: function () {}, toggle: function () { return false; }, contains: function () { return false; } },
+    style: {}, dataset: {},
+    setAttribute: function () {}, getAttribute: function () { return null; }, removeAttribute: function () {},
+    appendChild: function (c) { return c; }, append: function () {}, remove: function () {}, insertBefore: function (c) { return c; },
+    addEventListener: function () {}, removeEventListener: function () {},
+    querySelector: function () { return self; }, querySelectorAll: function () { return [self]; },
+    closest: function () { return self; }, firstElementChild: null, children: [],
+    innerHTML: "", textContent: "", value: "", hidden: false,
+    focus: function () {}, click: function () {}, scrollIntoView: function () {}
+  };
+  return self;
+}
+var dummy = makeDummy();
+
+function queryAllReal(root, sel) {
+  var out = [];
+  if (!sel || sel.charAt(0) !== '.') return out;
+  var cls = sel.slice(1);
+  (function walk(node) {
+    (node._children || []).forEach(function (c) {
+      if (c && c._classes && c._classes.has(cls)) out.push(c);
+      walk(c);
+    });
+  })(root);
+  return out;
+}
+
+function makeReal(tag) {
+  var el = {
+    tagName: String(tag || 'div').toUpperCase(),
+    _classes: new Set(),
+    _children: [],
+    _attrs: {},
+    _id: '',
+    style: {}, dataset: {},
+    hidden: false, innerHTML: '', textContent: '', value: '',
+    parentNode: null
+  };
+  el.classList = {
+    add: function () { for (var i = 0; i < arguments.length; i++) if (arguments[i]) el._classes.add(arguments[i]); },
+    remove: function () { for (var i = 0; i < arguments.length; i++) el._classes.delete(arguments[i]); },
+    toggle: function (c, force) {
+      var has = el._classes.has(c);
+      var want = (force === undefined) ? !has : !!force;
+      if (want) el._classes.add(c); else el._classes.delete(c);
+      return want;
+    },
+    contains: function (c) { return el._classes.has(c); }
+  };
+  Object.defineProperty(el, 'className', {
+    get: function () { return Array.from(el._classes).join(' '); },
+    set: function (v) { el._classes = new Set(String(v == null ? '' : v).split(/\s+/).filter(Boolean)); }
+  });
+  Object.defineProperty(el, 'id', {
+    get: function () { return el._id; },
+    set: function (v) { el._id = v; if (v) _idRegistry[v] = el; }
+  });
+  el.setAttribute = function (k, v) { el._attrs[k] = v; if (k === 'class') el.className = v; if (k === 'id') el.id = v; };
+  el.getAttribute = function (k) { return (k in el._attrs) ? el._attrs[k] : null; };
+  el.removeAttribute = function (k) { delete el._attrs[k]; };
+  el.appendChild = function (c) { if (c) { el._children.push(c); c.parentNode = el; } return c; };
+  el.append = function () { for (var i = 0; i < arguments.length; i++) el.appendChild(arguments[i]); };
+  el.insertBefore = function (c) { if (c) { el._children.push(c); c.parentNode = el; } return c; };
+  el.removeChild = function (c) { var idx = el._children.indexOf(c); if (idx >= 0) el._children.splice(idx, 1); return c; };
+  el.remove = function () { if (el.parentNode) el.parentNode.removeChild(el); };
+  el.addEventListener = function () {}; el.removeEventListener = function () {};
+  el.focus = function () {}; el.click = function () {}; el.scrollIntoView = function () {};
+  el.querySelectorAll = function (sel) { return queryAllReal(el, sel); };
+  el.querySelector = function (sel) { return queryAllReal(el, sel)[0] || null; };
+  el.closest = function () { return null; };
+  Object.defineProperty(el, 'firstElementChild', { get: function () { return el._children[0] || null; } });
+  Object.defineProperty(el, 'lastChild', { get: function () { return el._children[el._children.length - 1] || null; } });
+  Object.defineProperty(el, 'children', { get: function () { return el._children.slice(); } });
+  return el;
+}
+
+var _idRegistry = {};
+var docBody = makeReal('body');
+
+window.document = {
+  createElement: function (tag) { return makeReal(tag); },
+  createElementNS: function (ns, tag) { return makeReal(tag); },
+  createTextNode: function (text) { var t = makeReal('#text'); t.textContent = text; return t; },
+  getElementById: function (id) { return _idRegistry[id] || dummy; },
+  querySelector: function (sel) { return queryAllReal(docBody, sel)[0] || null; },
+  querySelectorAll: function (sel) { return queryAllReal(docBody, sel); },
+  addEventListener: function () {}, removeEventListener: function () {}, dispatchEvent: function () {},
+  documentElement: dummy, body: docBody, head: dummy, readyState: "complete"
+};
+
+var _FT_STORAGE = {};
+window.localStorage = {
+  getItem: function (k) { return (k in _FT_STORAGE) ? _FT_STORAGE[k] : null; },
+  setItem: function (k, v) { _FT_STORAGE[k] = String(v); },
+  removeItem: function (k) { delete _FT_STORAGE[k]; }
+};
+window.matchMedia = function () { return { matches: false, addEventListener: function () {}, addListener: function () {}, removeEventListener: function () {} }; };
+window.fetch = function () { return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); }, text: function () { return Promise.resolve(""); }, headers: { get: function () { return null; } } }); };
+// setTimeout is a NO-OP (never invokes its callback) -- ext_cr_boot.js's queued
+// setTimeout(init, 0) must NOT auto-run here: this driver calls
+// CR.board.mount()/update() directly, against its own hand-built root, once per
+// scenario, so nothing else may mount first.
+window.setTimeout = function () { return 0; };
+window.setInterval = function () { return 0; };
+window.clearInterval = function () {}; window.clearTimeout = function () {};
+window.location = { href: "", search: "", pathname: "/", host: "localhost" };
+window.navigator = { userAgent: "node", clipboard: { writeText: function () { return Promise.resolve(); } } };
+window.CustomEvent = function (type, opts) { this.type = type; this.detail = opts && opts.detail; };
+window.Event = window.CustomEvent;
+window.requestAnimationFrame = function () { return 0; };
+window.getComputedStyle = function () { return { getPropertyValue: function () { return ""; } }; };
+window.getSelection = function () { return { toString: function () { return ""; } }; };
+window.addEventListener = function () {}; window.removeEventListener = function () {}; window.dispatchEvent = function () {};
+window.URLSearchParams = function () { return { get: function () { return null; } }; };
+process.on("unhandledRejection", function () {});
+
+try {
+"""
+
+_FAILTILE_JS_MID = r"""
+} catch (e) {
+  console.error("BUNDLE-THREW: " + (e && e.stack || e));
+  process.exit(1);
+}
+"""
+
+_FAILTILE_JS_TAIL = r"""
+// Every scenario gets its OWN fresh root (a real mount() call rebuilds the whole
+// shell from scratch), so tiles from an earlier scenario can never leak into a
+// later one's query, even though old roots stay attached to docBody.
+function renderOneTile(session) {
+  var root = makeReal('div');
+  docBody.appendChild(root);
+  window.CR.board.mount(root, {});
+  window.CR.board.update({ sessions: [session], now: NOW });
+  var stateEls = queryAllReal(root, '.cr-tile-state');
+  if (!stateEls.length) return null;
+  var textNode = stateEls[0]._children[0];
+  return textNode ? textNode.textContent : '';
+}
+
+var NOW = %(now)d;
+var out = {};
+out.failing = renderOneTile(%(failing)s);
+out.awaiting = renderOneTile(%(awaiting)s);
+out.flagged = renderOneTile(%(flagged)s);
+
+console.log("===CR_FAILTILE_JSON_START===");
+console.log(JSON.stringify(out));
+"""
+
+
+def _failtile_driver_js():
+    bundle_html = _read_page()
+    bundle_js = _extract_script_content(bundle_html)
+    now = NOW
+    failing = make_session("ft_fail", now - 5, ended=False, fail_cmd="pytest -q --maxfail=1")
+    awaiting = make_session("ft_wait", now - 5, waiting=True)
+    flagged = make_session("ft_flag", now - 5, open_flags=3)
+    tail = _FAILTILE_JS_TAIL % {
+        "now": now,
+        "failing": json.dumps(failing),
+        "awaiting": json.dumps(awaiting),
+        "flagged": json.dumps(flagged),
+    }
+    return "\n".join([_FAILTILE_JS_PREAMBLE, bundle_js, _FAILTILE_JS_MID, tail])
+
+
+def _extract_failtile_json(stdout):
+    marker = "===CR_FAILTILE_JSON_START==="
+    idx = stdout.find(marker)
+    if idx < 0:
+        raise ValueError("marker not found in node output:\n" + stdout)
+    return json.loads(stdout[idx + len(marker):].strip())
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestCRFailingTileRender(unittest.TestCase):
+    """Drives the REAL CR.board.mount()/update() render path (not just the pure
+    sessionState() derivation, pinned separately above in TestCRLogic) to prove the
+    unexported stateWord(state, s) helper actually renders "fail: <command>" onto
+    the failing tile's .cr-tile-state DOM node -- ext_cr_board.js line ~1559."""
+
+    @classmethod
+    def setUpClass(cls):
+        js = _failtile_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Failing-tile driver failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_failtile_json(stdout)
+
+    def test_failing_tile_renders_fail_colon_command(self):
+        self.assertEqual(self.OUT["failing"], "fail: pytest -q --maxfail=1")
+
+    def test_awaiting_tile_renders_its_own_word_not_failing(self):
+        """Sanity control: the render pipeline actually distinguishes states -- it
+        isn't just always emitting the same static string."""
+        self.assertTrue(self.OUT["awaiting"].startswith("Waiting on you"))
+
+    def test_flagged_tile_renders_its_flag_count_not_failing(self):
+        self.assertEqual(self.OUT["flagged"], "3 flags open")
+
+
+# ---------------------------------------------------------------------------
+# Triage strip (WAITING ON YOU / WORKING / FLAGGED / PINNED) — the "board tab
+# counters are dead" report: a user saw the first three permanently read 0
+# while PINNED was correct. triageCounts() (the pure function, already pinned
+# in TestCRLogic's "13) triageCounts" case above) computes correctly in
+# isolation -- this section instead drives the REAL CR.board.mount()/update()
+# render path (same technique as TestCRFailingTileRender above) so a
+# regression in the WIRING between triageCounts() and the DOM -- a dropped
+# `now`, a renamed key, an exception thrown earlier in update() that aborts
+# before renderTriage() ever runs (leaving cells frozen at their build-time
+# "0", which is indistinguishable from "the count really is 0" without a test
+# like this one) -- fails loudly instead of shipping silently.
+# ---------------------------------------------------------------------------
+
+_TRIAGE_JS_TAIL = r"""
+var root = makeReal('div');
+docBody.appendChild(root);
+window.CR.board.mount(root, {});
+window.CR.board.update({ sessions: %(sessions)s, now: %(now)d });
+
+function cellCount(key) {
+  var cells = queryAllReal(root, '.cr-triage-cell--' + key);
+  if (!cells.length) return null;
+  var counts = queryAllReal(cells[0], '.cr-triage-count');
+  if (!counts.length) return null;
+  // renderTriage() updates this span with a direct `.textContent =`
+  // assignment (never rebuilds it via h()), so this reads the SAME plain
+  // property the real code writes -- unlike TestCRFailingTileRender's
+  // `_children[0].textContent`, which only works for text set once at
+  // construction time via h()'s children array.
+  return counts[0].textContent;
+}
+
+var out = {
+  rendered: { awaiting: cellCount('awaiting'), working: cellCount('working'),
+              flagged: cellCount('flagged'), pinned: cellCount('pinned') },
+  pure: window.CR.board.triageCounts(%(sessions)s, %(now)d),
+  // tr_work carries ended:true, bg:3 (the real production shape) -- prove
+  // sessionState() agrees with the WORKING count instead of drifting into
+  // 'landed', which is exactly the two-derivations trap this fix closes.
+  tr_work_state: window.CR.board.sessionState(%(sessions)s[1], %(now)d)
+};
+
+console.log("===CR_TRIAGE_JSON_START===");
+console.log(JSON.stringify(out));
+"""
+
+
+def _triage_driver_js():
+    bundle_html = _read_page()
+    bundle_js = _extract_script_content(bundle_html)
+    now = NOW
+    sessions = [
+        make_session("tr_wait", now - 5, waiting=True),
+        # THE REAL BUG SHAPE, not the vacuous one this fixture used to hand-pick
+        # (ended=False, which is exactly the field production gets WRONG --
+        # a fixture that assumes the bug's own symptom away proves nothing).
+        # A real Claude session with running background agents reads
+        # ended=True (providers/claude.py's _tail_scan only looks at the main
+        # transcript) while bg>0 and mtime is fresh (providers/claude.py's
+        # _mtime_and_bg folds background-agent activity into mtime) -- see
+        # tests/test_cr_board_working_bg.py for proof list_sessions() really
+        # emits this combination from an on-disk transcript, not just this
+        # hand-built dict. triageCounts() must still count it WORKING.
+        make_session("tr_work", now - 5, waiting=False, ended=True, bg=3),
+        # flagged/pinned count across ALL sessions regardless of liveness
+        # (triageCounts()'s own doc comment) -- mtime pushed well outside
+        # LIVE_WINDOW to prove that.
+        make_session("tr_flag", now - 5000, ended=True, open_flags=2),
+        make_session("tr_pin", now - 5000, ended=True, pinned=True),
+        # a plain idle session must not be miscounted into any of the four.
+        make_session("tr_idle", now - 5000, ended=True),
+    ]
+    tail = _TRIAGE_JS_TAIL % {"sessions": json.dumps(sessions), "now": now}
+    return "\n".join([_FAILTILE_JS_PREAMBLE, bundle_js, _FAILTILE_JS_MID, tail])
+
+
+def _extract_triage_json(stdout):
+    marker = "===CR_TRIAGE_JSON_START==="
+    idx = stdout.find(marker)
+    if idx < 0:
+        raise ValueError("marker not found in node output:\n" + stdout)
+    return json.loads(stdout[idx + len(marker):].strip())
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestCRTriageStripRendersLiveCounts(unittest.TestCase):
+    """Drives the REAL mount()/update() render path so the triage strip's four
+    DOM cells are proven to reflect triageCounts()'s output, not just that the
+    pure function itself is correct.
+
+    FIX (was vacuous): `tr_work` used to be built with `ended=False` -- the
+    exact field production gets WRONG (providers/claude.py's `ended` only
+    looks at the main transcript, so a session with live background agents
+    reads `ended=True`). A fixture that hand-picks the field's correct value
+    proves the renderer can count a session that was never actually broken;
+    it stayed green with the real bug fully present. `tr_work` now carries
+    the REAL shape (`ended=True, bg=3`, fresh mtime) that production emits
+    for a session whose foreground turn closed while its background agents
+    keep running -- see tests/test_cr_board_working_bg.py for proof
+    list_sessions() really emits this combination off an on-disk transcript."""
+
+    @classmethod
+    def setUpClass(cls):
+        js = _triage_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Triage-strip driver failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_triage_json(stdout)
+
+    def test_pure_counts_are_one_each(self):
+        self.assertEqual(self.OUT["pure"], {"awaiting": 1, "working": 1, "flagged": 1, "pinned": 1})
+
+    def test_rendered_awaiting_cell_matches_the_pure_count(self):
+        self.assertEqual(self.OUT["rendered"]["awaiting"], "1")
+
+    def test_rendered_working_cell_matches_the_pure_count(self):
+        """THE BUG this pins against: WORKING reading 0 forever while a live
+        session with running background agents exists (ended=True, bg=3) --
+        proven here through the actual DOM, not just triageCounts() in
+        isolation, and against the REAL production field combination, not a
+        hand-picked ended=False that assumes the bug away."""
+        self.assertEqual(self.OUT["rendered"]["working"], "1")
+
+    def test_rendered_flagged_cell_matches_the_pure_count(self):
+        self.assertEqual(self.OUT["rendered"]["flagged"], "1")
+
+    def test_rendered_pinned_cell_matches_the_pure_count(self):
+        self.assertEqual(self.OUT["rendered"]["pinned"], "1")
+
+    def test_ended_true_with_running_bg_agents_is_working_not_landed(self):
+        """sessionState() must agree with the counter -- the exact two-derivations
+        trap the fix closes. tr_work (ended=True, bg=3) must read 'working',
+        never 'landed'."""
+        self.assertEqual(self.OUT["tr_work_state"], "working")
+
+
+# ---------------------------------------------------------------------------
+# Stat-chip row (ext_cr_detail.js's statChipsHtml(), doc 03 Row 3 / doc 04
+# capability #21): the row is now PERMANENT -- statChipsOn(), the
+# "tracker.next.statchips" localStorage key, the `cr:statchips` listener and
+# the Config toggle were ALL removed (owner ruling: docs 03/04 win over the
+# round-5 prototype that gated this behind a preference). There is no
+# predicate left to pin; this instead pins the actual 7-chip output --
+# doc order (files/commands/reads/commits/tests/tokens/branch), the "--"
+# missing-data marker for a null/absent datum, and a genuine zero rendering
+# "0" (never coerced to "--").
+#
+# statChipsHtml() is a pure function of a session dict -- no DOM, no
+# localStorage read at all now -- but it is still an UNEXPORTED closure
+# (window.CR.detail._internal exposes spineSegments/mergeTimeline/etc. but not
+# this one). Same technique the old statChipsOn probe used: splice one extra
+# line onto _internal's own literal export object in the IN-MEMORY copy of the
+# bundle text used only for this Node subprocess (aitracker/web/*.js on disk
+# is never touched), naming the same real `statChipsHtml` binding its
+# neighbours in that object already close over.
+# ---------------------------------------------------------------------------
+
+def _expose_stat_chips_html(bundle_js):
+    anchor = "spineSegments: spineSegments,"
+    assert bundle_js.count(anchor) == 1, "ext_cr_detail.js's _internal export shape changed"
+    return bundle_js.replace(anchor, "spineSegments: spineSegments,\n    statChipsHtml: statChipsHtml,", 1)
+
+
+_STAT_CHIP_LABEL_VAL_RE = re.compile(
+    r'<span class="crd-statchip-label">([^<]*)</span> '
+    r'<span class="crd-statchip-val">([^<]*)</span>'
+)
+
+
+def _parse_stat_chips(html):
+    """(label, value) pairs in the order they appear in the rendered row."""
+    return _STAT_CHIP_LABEL_VAL_RE.findall(html)
+
+
+_STATCHIPS_JS_TAIL = r"""
+var out = {};
+var fn = window.CR.detail._internal.statChipsHtml;
+
+// The whole point of the change: NEVER touches localStorage, and the row still
+// renders in full -- no preference key gates it any more.
+out.full_html = fn(%(full)s);
+out.missing_html = fn(%(missing)s);
+out.zero_html = fn(%(zero)s);
+
+// Defensive: even an unreadable localStorage (private mode / sandboxed iframe)
+// must not stop the row from rendering, since nothing in it reads localStorage
+// at all any more.
+var _realGetItem = localStorage.getItem;
+localStorage.getItem = function () { throw new Error("storage blocked"); };
+out.full_html_with_storage_blocked = fn(%(full)s);
+localStorage.getItem = _realGetItem;
+
+console.log("===CR_STATCHIPS_JSON_START===");
+console.log(JSON.stringify(out));
+"""
+
+
+def _statchips_driver_js():
+    bundle_html = _read_page()
+    bundle_js = _expose_stat_chips_html(_extract_script_content(bundle_html))
+    full_detail = make_detail(
+        files=[{"path": "a"}, {"path": "b"}, {"path": "c"}],
+        commands=[{"cmd": "x"} for _ in range(5)],
+        counts={"done": 0, "todos": 0, "created": 0, "edited": 0, "read": 10,
+                "commits": 2, "tests": 4, "tests_failed": 0, "errors": 0,
+                "agents": 0, "searches": 0},
+        tokens={"in": 100, "out": 28412},
+        meta={"cwd": "/tmp/proj", "gitBranch": "term-tiers", "version": "1.0",
+              "sessionId": "sid", "entrypoint": "cli", "aiTitle": "",
+              "customTitle": "", "model": "", "effort": "", "title": "t"},
+    )
+    # Every datum null/absent -- must render "--" for all seven chips, never
+    # fall back to a stray truthy default the fixture happens to carry.
+    missing_detail = make_detail(files=None, commands=None, reads=None, commits=None,
+                                  counts=None, tokens=None, meta={})
+    # make_detail()'s own defaults are already all genuine zeros/empties (files=[],
+    # commands=[], counts.read/commits/tests/tests_failed=0, tokens={in:0,out:0})
+    # -- a real answer, not a missing one, so every one of those chips must read
+    # "0", never "--".
+    zero_detail = make_detail()
+    tail = _STATCHIPS_JS_TAIL % {
+        "full": json.dumps(full_detail),
+        "missing": json.dumps(missing_detail),
+        "zero": json.dumps(zero_detail),
+    }
+    return "\n".join([_JS_PREAMBLE, bundle_js, _JS_MID, tail])
+
+
+def _extract_statchips_json(stdout):
+    marker = "===CR_STATCHIPS_JSON_START==="
+    idx = stdout.find(marker)
+    if idx < 0:
+        raise ValueError("marker not found in node output:\n" + stdout)
+    return json.loads(stdout[idx + len(marker):].strip())
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestCRStatChips(unittest.TestCase):
+    """Replaces TestCRStatChipsPreference -- there is no preference left to pin.
+    Covers the new permanent-row behaviour instead (doc 03 Row 3 / doc 04
+    capability #21)."""
+
+    @classmethod
+    def setUpClass(cls):
+        js = _statchips_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Stat-chips driver failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_statchips_json(stdout)
+
+    def test_renders_with_no_localstorage_preference_present(self):
+        """The whole point of the change: statChipsHtml() produced real chip
+        markup even though this driver never once sets or reads any localStorage
+        key -- there is no preference gating it any more."""
+        chips = _parse_stat_chips(self.OUT["full_html"])
+        self.assertEqual(len(chips), 7)
+
+    def test_renders_even_with_localstorage_unreadable(self):
+        """EDGE CASE carried over from the old statChipsOn probe: even a
+        localStorage.getItem that throws (private mode / sandboxed iframe) must
+        not stop the row rendering -- proof nothing in it depends on storage."""
+        chips = _parse_stat_chips(self.OUT["full_html_with_storage_blocked"])
+        self.assertEqual(len(chips), 7)
+
+    def test_seven_chips_in_the_docs_order(self):
+        chips = _parse_stat_chips(self.OUT["full_html"])
+        labels = [label for label, _ in chips]
+        self.assertEqual(labels, ["files", "commands", "reads", "commits", "tests", "tokens", "branch"])
+
+    def test_seven_chips_render_the_correct_values(self):
+        values = dict(_parse_stat_chips(self.OUT["full_html"]))
+        self.assertEqual(values["files"], "3")
+        self.assertEqual(values["commands"], "5")
+        self.assertEqual(values["reads"], "10")
+        self.assertEqual(values["commits"], "2")
+        self.assertEqual(values["tests"], "4")
+        self.assertEqual(values["tokens"], "28,512")
+        self.assertEqual(values["branch"], "term-tiers")
+
+    def test_missing_datum_renders_the_dash_dash_marker(self):
+        """Every chip is null/absent in this fixture -- all seven must show the
+        doc's literal "--" marker, never a fabricated 0 or an empty string."""
+        values = dict(_parse_stat_chips(self.OUT["missing_html"]))
+        for label in ("files", "commands", "reads", "commits", "tests", "tokens", "branch"):
+            self.assertEqual(values[label], "--", label)
+
+    def test_genuine_zero_renders_zero_not_the_missing_marker(self):
+        """A real zero count (no files touched yet, no commits, etc.) is a real
+        answer, not a missing one -- must render "0", never coerced to "--"."""
+        values = dict(_parse_stat_chips(self.OUT["zero_html"]))
+        for label in ("files", "commands", "reads", "commits", "tests", "tokens"):
+            self.assertEqual(values[label], "0", label)
+
+
+# ---------------------------------------------------------------------------
+# Two more just-landed doc-win changes on the board tile itself (ext_cr_board.js),
+# both reversing a prior conditional back to the doc's "every tile" rule. Driven
+# through the REAL mount()/update() render path (same stub DOM as
+# TestCRFailingTileRender above), not just a pure derivation, since both of these
+# are markup/class decisions made inline in sessionTile().
+# ---------------------------------------------------------------------------
+
+_TILECLASS_JS_TAIL = r"""
+function renderOneTileFull(session) {
+  var root = makeReal('div');
+  docBody.appendChild(root);
+  window.CR.board.mount(root, {});
+  window.CR.board.update({ sessions: [session], now: NOW });
+  var tiles = queryAllReal(root, '.cr-tile');
+  if (!tiles.length) return null;
+  var tile = tiles[0];
+  var subs = queryAllReal(tile, '.cr-tile-sub');
+  var subText = null;
+  if (subs.length) {
+    var t = subs[0]._children[0];
+    subText = t ? t.textContent : '';
+  }
+  return { classes: Array.from(tile._classes), hasSub: subs.length > 0, subText: subText };
+}
+
+var NOW = %(now)d;
+var out = {};
+out.working_bg0 = renderOneTileFull(%(working_bg0)s);
+out.non_hero = renderOneTileFull(%(non_hero)s);
+
+console.log("===CR_TILECLASS_JSON_START===");
+console.log(JSON.stringify(out));
+"""
+
+
+def _tileclass_driver_js():
+    bundle_html = _read_page()
+    bundle_js = _extract_script_content(bundle_html)
+    now = NOW
+    # bg:0 (make_session's own default) -- a working tile with NO live background
+    # agent. Pre-fix this got no glow at all (`cr-tile--agent-glow` was only added
+    # when s.bg > 0); the border+glow now lives unconditionally on the base
+    # `.cr-tile--working` rule (ext_cr_board.css ~851), so this must carry it too.
+    working_bg0 = make_session("tc_work", now - 5, ended=False, bg=0)
+    # A plain non-hero tile (none of these fixtures are ever ranked/marked hero) --
+    # pre-fix the "project · tool" sub-line was hero-only.
+    non_hero = make_session("tc_sub", now - 5, ended=False, project="widgets", source="claude")
+    tail = _TILECLASS_JS_TAIL % {
+        "now": now,
+        "working_bg0": json.dumps(working_bg0),
+        "non_hero": json.dumps(non_hero),
+    }
+    return "\n".join([_FAILTILE_JS_PREAMBLE, bundle_js, _FAILTILE_JS_MID, tail])
+
+
+def _extract_tileclass_json(stdout):
+    marker = "===CR_TILECLASS_JSON_START==="
+    idx = stdout.find(marker)
+    if idx < 0:
+        raise ValueError("marker not found in node output:\n" + stdout)
+    return json.loads(stdout[idx + len(marker):].strip())
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestCRTileBorderGlowAndSubline(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        js = _tileclass_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Tile-class driver failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_tileclass_json(stdout)
+
+    def test_working_tile_with_bg_zero_still_gets_the_working_class(self):
+        """Every working tile carries `.cr-tile--working`, which now carries the
+        border-color: var(--line-agent) + glow unconditionally (ext_cr_board.css
+        ~851) -- a bg:0 session (no live background agent) must not be excluded."""
+        tile = self.OUT["working_bg0"]
+        self.assertIsNotNone(tile)
+        self.assertIn("cr-tile--working", tile["classes"])
+
+    def test_the_old_conditional_agent_glow_modifier_is_gone(self):
+        """The prior `cr-tile--agent-glow` modifier (added only when s.bg > 0) is
+        superseded -- it must never appear, even implicitly, now that the border+
+        glow lives directly on `.cr-tile--working`."""
+        tile = self.OUT["working_bg0"]
+        self.assertNotIn("cr-tile--agent-glow", tile["classes"])
+
+    def test_working_tile_css_rule_carries_border_and_glow_unconditionally(self):
+        """Static check on the actual stylesheet (ext_cr_board.css): the
+        `.cr-tile--working` rule itself -- not a separate opt-in modifier -- must
+        declare the agent border-color and the glow box-shadow."""
+        css_path = os.path.join(_AITRACKER, "web", "ext_cr_board.css")
+        with open(css_path, encoding="utf-8") as fh:
+            css = fh.read()
+        m = re.search(r"\.tracker-next \.cr-tile--working\s*\{([^}]*)\}", css)
+        self.assertIsNotNone(m, "no unconditional .cr-tile--working rule found")
+        rule_body = m.group(1)
+        self.assertIn("border-color: var(--line-agent)", rule_body)
+        self.assertIn("--glow-agent-soft", rule_body)
+
+    def test_non_hero_tile_renders_the_project_tool_sub_line(self):
+        """Doc 02 tile-anatomy table: EVERY tile gets a "project · tool" sub-line,
+        not just the hero -- the owner reversed the round-5 "hero only" drift."""
+        tile = self.OUT["non_hero"]
+        self.assertIsNotNone(tile)
+        self.assertTrue(tile["hasSub"])
+        self.assertIn("widgets", tile["subText"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -7,8 +7,9 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 
-from aitracker import config
+from aitracker import config, term_vt
 from aitracker.config import LIVE_WINDOW
 from aitracker.util import _short_title, _window, _git_branch, push_when
 from aitracker.store import load_flags, save_flags, load_titles, load_tasks, load_notes, save_notes, _save_json
@@ -17,9 +18,10 @@ from aitracker.providers.claude import (
     parse_session, parse_agents, parse_shells, _match_content, _active_mtime,
     file_diffs, command_output, shell_output, agent_detail, _redirect_log,
     list_sessions, child_agent_sessions, _agent_group, _pick_parent, _mtime_and_bg, _tail_fields,
-    _is_bg_agent)
+    _is_bg_agent, _tail_scan)
 from aitracker.providers.auggie import (
-    list_auggie, parse_auggie, search_auggie, _AUGGIE_LIST_CACHE, _auggie_state)
+    list_auggie, parse_auggie, search_auggie, _AUGGIE_LIST_CACHE, _auggie_state, _auggie_fail_cmd)
+from aitracker.providers.augment_ext import AugmentVscodeProvider
 
 
 def _run():
@@ -43,7 +45,9 @@ def _run():
         # isMeta system notices arrive as a plain STRING too (skill reload, /context) → NOT a prompt
         {"type": "user", "isMeta": True,
          "message": {"role": "user", "content": "Skill /foo is already loaded above; instructions unchanged."}},
-        {"type": "assistant", "timestamp": "2026-06-22T10:00:00.000Z",
+        # "effort" is a TOP-LEVEL field of the record, a sibling of "message" -- never nested
+        # inside it (confirmed against a real ~/.claude/projects/*/*.jsonl transcript).
+        {"type": "assistant", "timestamp": "2026-06-22T10:00:00.000Z", "effort": "high",
          "message": {"usage": {"input_tokens": 100, "output_tokens": 20},
                      "content": [
                          {"type": "text", "text": "starting"},
@@ -58,6 +62,10 @@ def _run():
                           "input": {"command": "pytest -q"}},
                          {"type": "tool_use", "id": "t2", "name": "Bash",
                           "input": {"command": "git commit -m \"add foo\""}}]}},
+        # a second assistant turn with a DIFFERENT top-level effort -- proves last-value-wins,
+        # same as "model". Empty usage/content so it doesn't disturb any other assertion below.
+        {"type": "assistant", "timestamp": "2026-06-22T10:00:05.000Z", "effort": "low",
+         "message": {}},
         {"type": "user", "message": {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "t1", "is_error": True, "content": "boom"}]}},
     ]
@@ -98,6 +106,9 @@ def _run():
     assert "ran 2 command(s)" in ov["sofar"] and "1 commit" in ov["sofar"], ov
     assert ov["commits"] == ["add foo"], ov
     assert d["meta"]["title"] == "Build the thing", d["meta"].get("title")
+    # reasoning effort: last non-empty top-level "effort" wins, exactly like "model" —
+    # the fixture's two assistant turns carry "high" then "low".
+    assert d["meta"]["effort"] == "low", d["meta"].get("effort")
 
     # short-title derivation: strips filler, shortens, keeps it readable
     assert _short_title("Can you create a HTML tracker where I paste the session id and track it") \
@@ -134,6 +145,9 @@ def _run():
     mt_bg, bg_n = _mtime_and_bg(spath)
     assert bg_n == 1 and mt_bg == _active_mtime(spath), (bg_n, mt_bg)
     ds = parse_session(spath)
+    # no assistant record in THIS session's own transcript carries "effort" at all (only its
+    # subagent file does, and that's a separate transcript) -- absent, not a crash or a fake "".
+    assert "effort" not in ds["meta"], ds["meta"]
     assert len(ds["agents_bg"]) == 1 and "background agent" in ds["overview"]["now"], ds["overview"]["now"]
     afile = next((x for x in ds["files"] if x["path"] == "/x/.worktrees/wt/auth.py"), None)
     assert afile and afile.get("agent"), "agent-edited file must surface in files, tagged"  # the gap
@@ -408,6 +422,11 @@ def _run():
     assert len(al) == 1 and al[0]["id"] == "auggie:sess1", al
     # real IDE cwd wins over the indexed-root/changed-file fallback (matches Claude's per-session cwd)
     assert al[0]["source"] == "auggie" and al[0]["project"] == "dw-stack" and al[0]["cwd"] == "/work/dw-stack", al
+    # the todo summary rides the session-LIST shape too (todo_total/todo_done/todo_current) — a
+    # compact progress tick for the sidebar, off root1/s1(completed)/s2(in_progress) above, without
+    # a full detail parse. (Claude's half of this is asserted below, once the task store is set up.)
+    assert (al[0]["todo_total"], al[0]["todo_done"], al[0]["todo_current"], al[0]["todo_current_index"]) == \
+        (2, 1, "step two", 1), al[0]  # s2 is in_progress at index 1, not 0 -- pins the index, not just the label
     assert al[0]["title"] == "List Home Dir", al                       # customTitle wins
     pa = parse_auggie("sess1")
     assert pa and pa["counts"]["done"] == 1 and pa["counts"]["todos"] == 2, pa   # todos via rootTaskUuid
@@ -447,6 +466,9 @@ def _run():
     assert drill("auggie:missing", "output", "c1") is None, "unknown session -> the route 404s"
     assert drill("auggie:sess1", "shell", "x") == {"cmd": "", "out": "", "running": False}  # safe default
     assert "gitBranch" in pa["meta"], "auggie meta must carry gitBranch like Claude"
+    # reasoning effort is a Claude-only concept -- Auggie degrades by OMITTING the key
+    # entirely (unlike "model", which Auggie has but may report as ""), never faking a value.
+    assert "effort" not in pa["meta"], "auggie meta must not fake a reasoning-effort field"
     assert pa["waiting"] is False, "no open ask-user -> not waiting"
     assert parse_auggie("missing") is None
 
@@ -476,6 +498,26 @@ def _run():
     os.unlink(config.FLAGS_FILE)
     config.FLAGS_FILE = _flag_snap
     assert all_sessions()[0].get("open_flags") == 0, "no flags file -> every session still reports 0"
+    _AUGGIE_LIST_CACHE.clear()
+
+    # pinned/open_flags/note_count must ALSO reach the DETAIL dict (registry.parse_any), not just
+    # the list (all_sessions above) -- same store.py helpers, same shared seam, one implementation
+    # covering every provider (the detail header's pinned pill / 🚩 count silently hid without this).
+    _pins_snap, _notes_snap, _flags_snap2 = config.PINS_FILE, config.NOTES_FILE, config.FLAGS_FILE
+    config.PINS_FILE = tempfile.mktemp(suffix=".json")
+    config.NOTES_FILE = tempfile.mktemp(suffix=".json")
+    config.FLAGS_FILE = tempfile.mktemp(suffix=".json")
+    _save_json(config.PINS_FILE, ["s_wait", "auggie:sess1"])
+    save_notes({"s_wait": [{"text": "a note", "pushed": False}]})
+    save_flags([{"id": 1, "session": "s_wait", "note": "open one", "resolved": False},
+                {"id": 2, "session": "auggie:sess1", "note": "auggie gap", "resolved": False},
+                {"id": 3, "session": "auggie:sess1", "note": "old", "resolved": True}])
+    dw = parse_any("s_wait")
+    assert (dw["pinned"], dw["open_flags"], dw["note_count"]) == (True, 1, 1), dw
+    da = parse_any("auggie:sess1")
+    assert (da["pinned"], da["open_flags"], da["note_count"]) == (True, 1, 0), da
+    os.unlink(config.PINS_FILE); os.unlink(config.NOTES_FILE); os.unlink(config.FLAGS_FILE)
+    config.PINS_FILE, config.NOTES_FILE, config.FLAGS_FILE = _pins_snap, _notes_snap, _flags_snap2
     _AUGGIE_LIST_CACHE.clear()
 
     # _git_branch reads a normal repo and a worktree (Auggie's git branch source)
@@ -521,6 +563,123 @@ def _run():
     assert tl[0]["status"] == "completed" and tl[1]["status"] == "in_progress", tl
     assert tl[1]["desc"] == "do it", tl
     assert load_tasks("missing") == []
+    # ...and it rides the session-LIST shape too (todo_total/todo_done/todo_current), read via the
+    # SAME cheap load_tasks() call above — not a full transcript re-parse — for a sidebar progress
+    # tick. (Auggie's half of this capability is asserted above, off root1/s1/s2.)
+    d5 = os.path.join(pdir, "-x-sess-x"); os.makedirs(d5)
+    _mk(d5, "sess-x.jsonl", "/x", "cli", "2026-06-01T09:00:00Z", "do the thing")
+    lst = {s["id"]: s for s in list_sessions()}
+    assert (lst["sess-x"]["todo_total"], lst["sess-x"]["todo_done"], lst["sess-x"]["todo_current"], lst["sess-x"]["todo_current_index"]) == \
+        (2, 1, "Second", 1), lst["sess-x"]  # Second is in_progress at index 1, not 0
+
+    # time-proportional progress-spine segments: started_at/ended_at per todo (epoch seconds),
+    # reconstructed from TaskUpdate tool calls already being walked in parse_session's one
+    # transcript pass — no extra file I/O. Joined onto load_tasks()'s todos above (sess-x's
+    # "1.json"/"2.json") by taskId <-> the task-store file's own stem, confirmed against a real
+    # ~/.claude/tasks/<sid>/<n>.json + its owning transcript on this machine.
+    with open(os.path.join(d5, "sess-x.jsonl"), "a") as fh:
+        for r in [
+            {"type": "assistant", "timestamp": "2026-06-01T09:10:00.000Z", "message": {"content": [
+                {"type": "tool_use", "name": "TaskUpdate", "input": {"taskId": "1", "status": "in_progress"}}]}},
+            {"type": "assistant", "timestamp": "2026-06-01T09:20:00.000Z", "message": {"content": [
+                {"type": "tool_use", "name": "TaskUpdate", "input": {"taskId": "1", "status": "completed"}}]}},
+            {"type": "assistant", "timestamp": "2026-06-01T09:25:00.000Z", "message": {"content": [
+                {"type": "tool_use", "name": "TaskUpdate", "input": {"taskId": "2", "status": "in_progress"}}]}},
+        ]:
+            fh.write(json.dumps(r) + "\n")
+    dtb = parse_session(os.path.join(d5, "sess-x.jsonl"))
+    by_id = {t["id"]: t for t in dtb["todos"]}
+    assert by_id["1"]["status"] == "completed", by_id["1"]
+    assert by_id["1"]["started_at"] == _ts_epoch("2026-06-01T09:10:00.000Z"), by_id["1"]
+    assert by_id["1"]["ended_at"] == _ts_epoch("2026-06-01T09:20:00.000Z"), by_id["1"]
+    assert by_id["2"]["status"] == "in_progress", by_id["2"]
+    assert by_id["2"]["started_at"] == _ts_epoch("2026-06-01T09:25:00.000Z"), by_id["2"]
+    assert by_id["2"]["ended_at"] is None, "still in_progress -> no fabricated ended_at"
+    # Auggie/Augment-ext have no reliable join key for this (their in-session task ids don't
+    # match the task-storage file's uuid — see auggie.py's _auggie_resolve) -- they emit the
+    # SAME two keys, honestly null, never a guess. (`pa` == parse_auggie("sess1") from above.)
+    assert all(t["started_at"] is None and t["ended_at"] is None for t in pa["todos"]), pa["todos"]
+
+    # task store PRUNED (Claude Code deletes ~/.claude/tasks/<sid>/*.json after ~2 days): the
+    # transcript's own TaskCreate/TaskUpdate history must be replayed instead of coming back
+    # empty. sess-recon gets no directory at all under config.TASKS_DIR (load_tasks -> []),
+    # so parse_session has nothing but the transcript to work with.
+    d6 = os.path.join(pdir, "-x-sess-recon"); os.makedirs(d6)
+    _mk(d6, "sess-recon.jsonl", "/x", "cli", "2026-06-01T09:00:00Z", "do three things")
+    with open(os.path.join(d6, "sess-recon.jsonl"), "a") as fh:
+        for r in [
+            {"type": "assistant", "timestamp": "2026-06-01T09:01:00.000Z", "message": {"content": [
+                {"type": "tool_use", "id": "tc1", "name": "TaskCreate",
+                 "input": {"subject": "First reconstructed", "description": "do it"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tc1",
+                 "content": "Task #1 created successfully: First reconstructed"}]}},
+            {"type": "assistant", "timestamp": "2026-06-01T09:02:00.000Z", "message": {"content": [
+                {"type": "tool_use", "id": "tc2", "name": "TaskCreate",
+                 "input": {"subject": "Second reconstructed"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tc2",
+                 "content": "Task #2 created successfully: Second reconstructed"}]}},
+            {"type": "assistant", "timestamp": "2026-06-01T09:03:00.000Z", "message": {"content": [
+                {"type": "tool_use", "id": "tc3", "name": "TaskCreate",
+                 "input": {"subject": "Third reconstructed"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tc3",
+                 "content": "Task #3 created successfully: Third reconstructed"}]}},
+            {"type": "assistant", "timestamp": "2026-06-01T09:10:00.000Z", "message": {"content": [
+                {"type": "tool_use", "name": "TaskUpdate", "input": {"taskId": "1", "status": "in_progress"}}]}},
+            {"type": "assistant", "timestamp": "2026-06-01T09:20:00.000Z", "message": {"content": [
+                {"type": "tool_use", "name": "TaskUpdate", "input": {"taskId": "1", "status": "completed"}}]}},
+            # task 2 goes in_progress and stays there (never completed) -- lands at index 1, not 0
+            {"type": "assistant", "timestamp": "2026-06-01T09:25:00.000Z", "message": {"content": [
+                {"type": "tool_use", "name": "TaskUpdate", "input": {"taskId": "2", "status": "in_progress"}}]}},
+            # task 3 never updated at all -- stays "pending"
+        ]:
+            fh.write(json.dumps(r) + "\n")
+    assert load_tasks("sess-recon") == [], "no task-store dir at all -- the pruned-history case"
+    drec = parse_session(os.path.join(d6, "sess-recon.jsonl"))
+    assert [t["content"] for t in drec["todos"]] == \
+        ["First reconstructed", "Second reconstructed", "Third reconstructed"], drec["todos"]
+    assert [t["status"] for t in drec["todos"]] == ["completed", "in_progress", "pending"], drec["todos"]
+    assert drec["counts"]["todos"] == 3 and drec["counts"]["done"] == 1, drec["counts"]
+    by_rid = {t["id"]: t for t in drec["todos"]}
+    assert by_rid["1"]["desc"] == "do it", by_rid["1"]
+    assert by_rid["1"]["started_at"] == _ts_epoch("2026-06-01T09:10:00.000Z"), by_rid["1"]
+    assert by_rid["1"]["ended_at"] == _ts_epoch("2026-06-01T09:20:00.000Z"), by_rid["1"]
+    assert by_rid["2"]["started_at"] == _ts_epoch("2026-06-01T09:25:00.000Z"), by_rid["2"]
+    assert by_rid["2"]["ended_at"] is None, "still in_progress -> no fabricated ended_at"
+    assert by_rid["3"]["started_at"] is None and by_rid["3"]["ended_at"] is None, "never touched"
+    # ...but the session-LIST surface (/api/list) does NOT recover this: it reads load_tasks()
+    # only, never a transcript, on purpose (950 sessions polled every ~5s -- a per-session
+    # transcript read there would be the slow-dashboard regression, not a fix).
+    lst6 = {s["id"]: s for s in list_sessions()}
+    assert (lst6["sess-recon"]["todo_total"], lst6["sess-recon"]["todo_done"]) == (0, 0), \
+        lst6["sess-recon"]  # deliberately NOT reconstructed -- see the comment above
+
+    # Augment-ext (VSCode/Cursor extension) rides the SAME todo_total/todo_done/todo_current
+    # session-list capability as Claude/Auggie above, off its own task-storage subTasks tree --
+    # and, like Auggie, has no reliable join key for started_at/ended_at, so both come back
+    # honestly None rather than a guess (see augment_ext.py's _resolve_subtasks).
+    from aitracker.providers.augment_ext import AugmentVscodeProvider
+    config.VSCODE_WS_ROOT = tempfile.mkdtemp()
+    ext_ws = os.path.join(config.VSCODE_WS_ROOT, "wshash-ext")
+    ext_tasks = os.path.join(ext_ws, "Augment.vscode-augment", "augment-user-assets", "task-storage", "tasks")
+    os.makedirs(ext_tasks)
+    with open(os.path.join(ext_ws, "workspace.json"), "w") as fh:
+        json.dump({"folder": "file:///x/ext-proj"}, fh)
+    def _etask(u, **kw):
+        with open(os.path.join(ext_tasks, u + ".json"), "w") as fh:
+            json.dump({"uuid": u, **kw}, fh)
+    _etask("root", name="Current Task List", subTasks=["a", "b"])
+    _etask("a", name="add helper", state="COMPLETE")
+    _etask("b", name="wire tests", state="IN_PROGRESS")
+    ep = AugmentVscodeProvider()
+    erows = {r["id"]: r for r in ep.list()}
+    eroot = erows["augment-vscode:wshash-ext:root"]
+    assert (eroot["todo_total"], eroot["todo_done"], eroot["todo_current"], eroot["todo_current_index"]) == \
+        (2, 1, "wire tests", 1), eroot  # "wire tests" (b) is in_progress at index 1, not 0
+    ed = ep.parse("augment-vscode:wshash-ext:root")
+    assert ed["todos"] and all(t["started_at"] is None and t["ended_at"] is None for t in ed["todos"]), ed["todos"]
 
     # flags persistence round-trip
     config.FLAGS_FILE = tempfile.mktemp(suffix=".json")
@@ -629,5 +788,504 @@ def _run():
     finally:
         config.OPENCODE_DB = _oc_snap
         os.unlink(_oc_path)
+
+    # opencode provider, take two: full Claude-parity field coverage. The provider just
+    # gained todo_total/todo_done/todo_current/todo_current_index/pr_num/pr_url/pr_repo/
+    # pr_state/now_line/model/bg/fail_cmd/shells_running on the LIST dict, and sessionId/
+    # ended/aiTitle/version/effort/customTitle on the DETAIL dict's meta. Prove every one of
+    # them is REAL, not merely present: a real todo table (pending + in_progress + completed,
+    # each with its own ms timestamps), a real session.model JSON blob to parse, a real
+    # `gh pr create` transcript to summarize into pr_num/pr_repo, and id-namespacing checked
+    # in BOTH directions (list `id` prefixed "opencode:", meta `sessionId` bare).
+    _oc_path2 = tempfile.mktemp(suffix=".db")
+    _oc_conn2 = _sqlite3.connect(_oc_path2)
+    _oc_conn2.executescript("""
+        CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, workspace_id TEXT, parent_id TEXT,
+            slug TEXT, directory TEXT NOT NULL, path TEXT, title TEXT NOT NULL, version TEXT,
+            share_url TEXT, summary_additions INT, summary_deletions INT, summary_files INT,
+            summary_diffs INT, metadata TEXT, cost REAL, tokens_input INT, tokens_output INT,
+            tokens_reasoning INT, tokens_cache_read INT, tokens_cache_write INT, revert TEXT,
+            permission TEXT, agent TEXT, model TEXT, time_created INT, time_updated INT,
+            time_compacting INT, time_archived INT);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INT, time_updated INT, data TEXT);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INT,
+            time_updated INT, data TEXT);
+        CREATE TABLE todo (session_id TEXT, content TEXT, status TEXT, priority TEXT, position INT,
+            time_created INT, time_updated INT, PRIMARY KEY (session_id, position));
+        CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, vcs TEXT, name TEXT,
+            icon_url TEXT, time_created INT, time_updated INT, sandboxes TEXT, commands TEXT);
+    """)
+    _oc_now2 = int(time.time() * 1000)
+    _oc_conn2.execute(
+        "INSERT INTO session (id, parent_id, directory, title, agent, model, version, tokens_input, "
+        "tokens_output, tokens_cache_read, tokens_cache_write, time_created, time_updated) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("ses_full", "", "/work/full", "opencode full parity session", "build",
+         json.dumps({"id": "big-pickle", "providerID": "opencode"}), "1.18.18",
+         20, 10, 0, 0, _oc_now2 - 10000, _oc_now2 - 1000))
+    # one `gh pr create` bash call whose own output carries the PR URL -- `created` on the PR
+    # entry is set from PR_CREATE_RE matching the COMMAND text, not the output (see
+    # util.collect_prs / opencode.py's _list_state), so this is the only shape that lights
+    # up pr_num/pr_url/pr_repo on the list dict at all.
+    _oc_conn2.execute("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?)",
+                      ("msg_full1", "ses_full", _oc_now2 - 8000, _oc_now2 - 8000,
+                       json.dumps({"role": "assistant"})))
+    _oc_conn2.execute(
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?,?)",
+        ("part_full1", "msg_full1", "ses_full", _oc_now2 - 7000, _oc_now2 - 7000,
+         json.dumps({"type": "tool", "tool": "bash", "callID": "c_pr",
+                     "state": {"status": "completed",
+                               "input": {"command": "gh pr create --title 'Add opencode parity'"},
+                               "output": "Created PR: https://github.com/acme/widgets/pull/42\n"}})))
+    # a later, part-less message whose OWN time_created is the largest in the session --
+    # pins down _last_message_ended's answer deterministically (it reads the last MESSAGE
+    # row by time_created, not the last part).
+    _oc_conn2.execute("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?)",
+                      ("msg_full2", "ses_full", _oc_now2 - 500, _oc_now2 - 500,
+                       json.dumps({"role": "assistant", "time": {"completed": _oc_now2 - 400}})))
+    # 3 todos, one of each status, at KNOWN per-row ms timestamps -- the ms-vs-seconds bug is
+    # exactly what this block exists to catch (see _todos' docstring: real per-row timing,
+    # unlike Auggie's name-matched approximation).
+    _oc_conn2.executemany(
+        "INSERT INTO todo (session_id, content, status, position, time_created, time_updated) "
+        "VALUES (?,?,?,?,?,?)",
+        [("ses_full", "Ship docs", "pending", 0, _oc_now2 - 300000, _oc_now2 - 300000),
+         ("ses_full", "Wire the parser", "in_progress", 1, _oc_now2 - 200000, _oc_now2 - 200000),
+         ("ses_full", "Set up scaffolding", "completed", 2, _oc_now2 - 100000, _oc_now2 - 50000)])
+    _oc_conn2.commit()
+    _oc_conn2.close()
+    _oc_snap2 = config.OPENCODE_DB
+    config.OPENCODE_DB = _oc_path2
+    try:
+        _oc_full_items = {s["id"]: s for s in _OpencodeProvider().list()}
+        item = _oc_full_items["opencode:ses_full"]
+        for _k in ("todo_total", "todo_done", "todo_current", "todo_current_index", "pr_num",
+                   "pr_url", "pr_repo", "pr_state", "now_line", "model", "bg", "fail_cmd",
+                   "shells_running"):
+            assert _k in item, "opencode list dict missing %r: %r" % (_k, item)
+        assert item["id"] == "opencode:ses_full", \
+            "list dict id must be namespaced with opencode:: %r" % item["id"]
+        assert item["todo_total"] == 3, item["todo_total"]
+        assert item["todo_done"] == 1, item["todo_done"]
+        assert item["todo_current"] == "Wire the parser", \
+            "todo_current must be the in-progress todo's own content: %r" % item["todo_current"]
+        assert item["todo_current_index"] == 1, item["todo_current_index"]
+        assert item["model"] == "big-pickle", \
+            "opencode model must be the parsed id out of session.model's JSON, not the raw blob: %r" % item["model"]
+        assert item["shells_running"] == 0, \
+            "opencode has no background-shell concept -- shells_running must always be 0"
+        assert item["bg"] == 0, item["bg"]
+        assert item["pr_num"] == "42", item["pr_num"]
+        assert item["pr_repo"] == "acme/widgets", item["pr_repo"]
+        assert item["pr_url"] and item["pr_url"].endswith("/pull/42"), item["pr_url"]
+
+        detail = _OpencodeProvider().parse("opencode:ses_full")
+        meta = detail["meta"]
+        assert meta["sessionId"] == "ses_full", \
+            "meta.sessionId must be the BARE id, no opencode: prefix: %r" % meta["sessionId"]
+        assert meta["ended"] is True, meta["ended"]
+        assert meta["aiTitle"] == "opencode full parity session", meta["aiTitle"]
+        assert meta["version"] == "1.18.18", meta["version"]
+        assert meta["effort"] == "", meta["effort"]
+        assert meta["customTitle"] == "", meta["customTitle"]
+        assert detail["todo_times_approximate"] is False, \
+            "opencode's todo rows carry real per-row timestamps -- must NOT be flagged approximate"
+
+        todos = detail["todos"]
+        assert len(todos) == 3, todos
+        for _t in todos:
+            assert "id" in _t and "desc" in _t and "started_at" in _t and "ended_at" in _t, _t
+        t_pending, t_inprog, t_done = todos
+        assert t_pending["id"] == "0" and t_pending["desc"] == "", t_pending
+        assert t_pending["started_at"] is None and t_pending["ended_at"] is None, \
+            "a pending todo must have no timing at all: %r" % (t_pending,)
+        assert t_inprog["id"] == "1"
+        assert t_inprog["started_at"] == (_oc_now2 - 200000) / 1000.0, \
+            "todo started_at must be its OWN row's time_created / 1000 (db stores ms): %r" % t_inprog["started_at"]
+        assert 1e9 < t_inprog["started_at"] < 2e9, \
+            "a 1000x ms/seconds bug must fail loudly here: %r" % t_inprog["started_at"]
+        assert t_inprog["ended_at"] is None, "an in-progress todo has no ended_at yet"
+        assert t_done["id"] == "2"
+        assert t_done["started_at"] == (_oc_now2 - 100000) / 1000.0, t_done["started_at"]
+        assert t_done["ended_at"] == (_oc_now2 - 50000) / 1000.0, \
+            "completed todo's ended_at must be its OWN row's time_updated / 1000: %r" % t_done["ended_at"]
+        assert 1e9 < t_done["ended_at"] < 2e9, t_done["ended_at"]
+    finally:
+        config.OPENCODE_DB = _oc_snap2
+        os.unlink(_oc_path2)
+
+    # Auggie: approximate per-todo timings recovered by NAME, not id -- add_tasks/update_tasks
+    # key a task by a short per-call id that does NOT match the task-storage file's uuid (see
+    # _auggie_resolve's docstring), so a todo's timing is recovered by matching its NAME back to
+    # that chat-side id space via every add_tasks/update_tasks tool_result_node's echoed
+    # "UUID:<id> NAME:<name> DESCRIPTION:…" text. A name pinning down exactly one chat-side id
+    # gets real timings from that id's update_tasks transitions; a name that collides across TWO
+    # different chat-side ids ("Dup Task" below, from two unrelated tasks that happen to share a
+    # title) is ambiguous and MUST come back null rather than guessing either one's timing.
+    _wtask("root2", name="Current Task List", description="Root task for conversation Y",
+           subTasks=["tu1", "tdup"])
+    _wtask("tu1", name="Unique Task", state="COMPLETE", subTasks=[])
+    _wtask("tdup", name="Dup Task", state="COMPLETE", subTasks=[])
+
+    def _utcall(cid, task_id, state):
+        return {"tool_use": {"tool_name": "update_tasks", "tool_use_id": cid,
+                             "input_json": json.dumps({"tasks": [{"task_id": task_id, "state": state}]})}}
+
+    def _utresult(cid, task_id, name, marker):
+        return {"tool_result_node": {"tool_use_id": cid,
+                "content": ("Task list updated successfully. Created: 0, Updated: 1, Deleted: 0.\n\n"
+                            "# Task Changes\n\n## Updated Tasks\n\n%s UUID:%s NAME:%s DESCRIPTION:desc"
+                            % (marker, task_id, name))}}
+    T1, T2, T3, T4 = ("2026-07-01T10:00:00.000Z", "2026-07-01T10:05:00.000Z",
+                      "2026-07-01T10:10:00.000Z", "2026-07-01T10:15:00.000Z")
+    chat2 = [
+        {"finishedAt": T1, "exchange": {"response_nodes": [_utcall("ut1", "u1chat", "IN_PROGRESS")]}},
+        {"finishedAt": T1, "exchange": {"request_nodes": [_utresult("ut1", "u1chat", "Unique Task", "[/]")]}},
+        {"finishedAt": T2, "exchange": {"response_nodes": [_utcall("ut2", "u1chat", "COMPLETE")]}},
+        {"finishedAt": T2, "exchange": {"request_nodes": [_utresult("ut2", "u1chat", "Unique Task", "[x]")]}},
+        {"finishedAt": T3, "exchange": {"response_nodes": [_utcall("ut3", "dupA", "COMPLETE")]}},
+        {"finishedAt": T3, "exchange": {"request_nodes": [_utresult("ut3", "dupA", "Dup Task", "[x]")]}},
+        {"finishedAt": T4, "exchange": {"response_nodes": [_utcall("ut4", "dupB", "COMPLETE")]}},
+        {"finishedAt": T4, "exchange": {"request_nodes": [_utresult("ut4", "dupB", "Dup Task", "[x]")]}},
+    ]
+    with open(os.path.join(config.AUGGIE_SESSIONS, "sess2.json"), "w") as fh:
+        json.dump({"sessionId": "sess2", "modified": "2026-07-01T10:20:00Z",
+                   "customTitle": "Timings test", "rootTaskUuid": "root2",
+                   "chatHistory": chat2}, fh)
+    pa2 = parse_auggie("sess2")
+    assert pa2["todo_times_approximate"] is True, "Auggie's name-matched timings must be flagged approximate"
+    by_content = {t["content"]: t for t in pa2["todos"]}
+    assert by_content["Unique Task"]["started_at"] == _ts_epoch(T1), by_content["Unique Task"]
+    assert by_content["Unique Task"]["ended_at"] == _ts_epoch(T2), by_content["Unique Task"]
+    assert by_content["Dup Task"]["started_at"] is None and by_content["Dup Task"]["ended_at"] is None, \
+        "a name colliding across two different chat-side ids must stay null, never a guess: %r" % by_content["Dup Task"]
+
+    # PR data on the session-LIST dict (control-room board tile "PR number if any"): only a
+    # `gh pr create` the session itself ran counts -- a PR merely mentioned in narration must
+    # not light up a tile. Cached in _META_CACHE alongside the rest of the session's meta and
+    # resolved via claude.py's _fill_pr (both fixtures below are ended AND freshly-written, so
+    # their mtime is "now" -- inside LIVE_WINDOW, the only sessions a Landed tile could ever be).
+    dpr = os.path.join(pdir, "-repo-x-pr"); os.makedirs(dpr)
+    def _mkpr(fn, rows):
+        p = os.path.join(dpr, fn + ".jsonl")
+        with open(p, "w") as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+        return p
+    def _prhead(cwd):
+        return {"cwd": cwd, "entrypoint": "cli", "timestamp": "2026-08-01T09:00:00Z",
+                "type": "user", "message": {"role": "user", "content": "ship it"}}
+    PR_CREATE_CALL = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "c1", "name": "Bash", "input": {"command": "gh pr create --fill"}}]}}
+    PR_CREATE_RESULT = {"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "c1",
+         "content": "https://github.com/acme/widget/pull/101 created"}]}}
+    PR_DONE = {"type": "assistant", "message": {"content": [{"type": "text", "text": "Opened the PR, all done."}]}}
+    _mkpr("sess_pr_created", [_prhead("/repo/x/pr"), PR_CREATE_CALL, PR_CREATE_RESULT, PR_DONE])
+    # a PR only NARRATED about (never created) must not surface -- the list-path scan never
+    # calls collect_prs on plain assistant text at all, matching parse_session's own
+    # created=False default for narration (see collect_prs's narr-only calls at claude.py:900).
+    PR_MENTION = {"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "see https://github.com/acme/other/pull/55 for context"}]}}
+    _mkpr("sess_pr_mentioned", [_prhead("/repo/x/pr2"), PR_MENTION, PR_DONE])
+    ls3 = {s["id"]: s for s in list_sessions()}
+    assert ls3["sess_pr_created"]["pr_num"] == "101", ls3["sess_pr_created"]
+    assert ls3["sess_pr_created"]["pr_url"] == "https://github.com/acme/widget/pull/101", ls3["sess_pr_created"]
+    assert not ls3["sess_pr_mentioned"]["pr_num"] and not ls3["sess_pr_mentioned"]["pr_url"], \
+        "a PR only narrated about, never created, must not surface on the list dict: %r" % ls3["sess_pr_mentioned"]
+
+    # config.json override precedence for the browser-editable runtime settings (Config
+    # dialog -> POST /api/config -> server.py, which writes config.json; config.py itself
+    # never touches the file, see its module comment -- these resolve functions are pure,
+    # taking the already-loaded overrides dict as an argument). MAX_TERMS has all three
+    # layers (an env var AND a built-in default), so one key pins down the whole chain:
+    # config.json > env var > built-in default.
+    os.environ["TRACKER_MAX_TERMS"] = "20"
+    try:
+        assert config.resolve_max_terms({}) == 20, "env var must beat the built-in default"
+        assert config.resolve_max_terms({"MAX_TERMS": 30}) == 30, "config.json override must beat the env var"
+    finally:
+        del os.environ["TRACKER_MAX_TERMS"]
+    assert config.resolve_max_terms({}) == 12, "built-in default once neither override nor env is set"
+    # The allowlist: POST /api/config's real gate is `key not in config.EDITABLE`
+    # (server.py) -- a bogus key must never validate, and TRACKER_AUTH must never be a
+    # member on purpose (writing a password from a browser into a plaintext file is a
+    # security regression, not a convenience -- see config.py's AUTH comment).
+    assert "MAX_TERMS" in config.EDITABLE
+    assert "TRACKER_AUTH" not in config.EDITABLE, "TRACKER_AUTH must never be browser-writable"
+    assert "NOT_A_REAL_KEY" not in config.EDITABLE, "a non-allowlisted key must never validate"
+
+    # session-LIST `now_line` (a short "what's it doing right now" board-tile phrase) and
+    # `model` (its current model id) -- both ride the SAME bounded tail read _tail_scan
+    # already does for waiting/ended (providers/claude.py), cached in the same mtime-keyed
+    # _META_CACHE entry as pr_num/pr_url/etc, no second read or cache. `now_line` is
+    # LIVE-gated (idle/ended sessions get "" for free); `model` is NOT -- a session still
+    # reports its last known model whether live or idle.
+    NOW_TXT = {"type": "assistant", "message": {"model": "claude-opus-9-test", "content": [
+        {"type": "text", "text": "Working through the retry-backoff edge cases in the client now"}]}}
+    NOW_TOOL = {"type": "assistant", "message": {"model": "claude-opus-9-test", "content": [
+        {"type": "tool_use", "id": "nt1", "name": "Bash", "input": {"command": "pytest -q"}}]}}
+    p_now_live = _mklines("s_now_live", [UMSG, NOW_TXT, NOW_TOOL])
+    p_now_idle = _mklines("s_now_idle", [UMSG, NOW_TXT, NOW_TOOL])
+    os.utime(p_now_live, (time.time(), time.time()))
+    os.utime(p_now_idle, (time.time() - LIVE_WINDOW - 100, time.time() - LIVE_WINDOW - 100))
+    ls_now = {s["id"]: s for s in list_sessions()}
+    assert ls_now["s_now_live"]["now_line"].startswith("Working through the retry-backoff"), \
+        "live session, last block a tool_use (not ended) -> narration fallback surfaces: %r" % ls_now["s_now_live"]
+    assert ls_now["s_now_live"]["model"] == "claude-opus-9-test", ls_now["s_now_live"]
+    assert ls_now["s_now_idle"]["now_line"] == "", \
+        "idle session must get \"\" even with the exact same narration sitting in its tail"
+    assert ls_now["s_now_idle"]["model"] == "claude-opus-9-test", \
+        "model is NOT liveness-gated -- an idle session still reports its last known model: %r" % ls_now["s_now_idle"]
+
+    # same two fields on Auggie's session-LIST dict -- one shared shape, not a second mechanism.
+    with open(os.path.join(config.AUGGIE_SESSIONS, "sess_now.json"), "w") as fh:
+        json.dump({"sessionId": "sess_now", "modified": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                   "chatHistory": [
+                       {"finishedAt": "2026-06-27T05:47:50Z",
+                        "exchange": {"request_message": "start", "response_text": "Refactoring the retry queue now",
+                                     "model_id": "claude-sonnet-9-test"}},
+                       # a later, still-pending exchange with no model_id yet -- must not blank out
+                       # the last KNOWN model (see _auggie_current_model's backward scan)
+                       {"finishedAt": "2026-06-27T05:48:00Z", "exchange": {"request_message": "continue"}},
+                   ]}, fh)
+    _AUGGIE_LIST_CACHE.clear()
+    al_now = {s["id"]: s for s in list_auggie()}
+    assert al_now["auggie:sess_now"]["now_line"] == "Refactoring the retry queue now", al_now["auggie:sess_now"]
+    assert al_now["auggie:sess_now"]["model"] == "claude-sonnet-9-test", al_now["auggie:sess_now"]
+
+    # Augment-ext (VSCode/Cursor extension): no chat transcript at all -> `model` is honestly
+    # "" always; `now_line` still works off the todo tree alone (see augment_ext.py's _list).
+    ext_ws2 = os.path.join(config.VSCODE_WS_ROOT, "wshash-now")
+    ext_tasks2 = os.path.join(ext_ws2, "Augment.vscode-augment", "augment-user-assets", "task-storage", "tasks")
+    os.makedirs(ext_tasks2)
+    with open(os.path.join(ext_ws2, "workspace.json"), "w") as fh:
+        json.dump({"folder": "file:///x/now-proj"}, fh)
+    with open(os.path.join(ext_tasks2, "root.json"), "w") as fh:
+        json.dump({"uuid": "root", "name": "Current Task List", "subTasks": ["t1"]}, fh)
+    with open(os.path.join(ext_tasks2, "t1.json"), "w") as fh:
+        json.dump({"uuid": "t1", "name": "wire up retries", "state": "IN_PROGRESS"}, fh)
+    now_ep = AugmentVscodeProvider()
+    now_erow = next(r for r in now_ep.list() if r["id"] == "augment-vscode:wshash-now:root")
+    assert now_erow["now_line"] == "▶ wire up retries", now_erow
+    assert now_erow["model"] == "", "augment-ext has no chat transcript -- model must be \"\", never a guess"
+
+    # ---- fail_cmd: board "failing" tile signal -- session-LIST dict only, every provider ----
+    # Claude: providers/claude.py's _tail_scan tracks a Bash tool_use's id -> command text, then
+    # a later tool_result's is_error flag decides pass/fail; "latest wins", like model/last_text.
+    FAIL_BASH = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "fb1", "name": "Bash", "input": {"command": "pytest -q --maxfail=1"}}]}}
+    def _fail_result(is_error):
+        return {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "fb1", "is_error": is_error, "content": "x"}]}}
+    fc_dir = tempfile.mkdtemp()
+    def _fc_write(fn, rows):
+        p = os.path.join(fc_dir, fn)
+        with open(p, "w") as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+        return p
+    p_failed = _fc_write("failed.jsonl", [FAIL_BASH, _fail_result(True)])
+    p_passed = _fc_write("passed.jsonl", [FAIL_BASH, _fail_result(False)])
+    p_norun = _fc_write("norun.jsonl", [{"type": "user", "message": {"role": "user", "content": "hi"}}])
+    assert _tail_scan(p_failed)["fail_cmd"] == "pytest -q --maxfail=1", _tail_scan(p_failed)
+    assert _tail_scan(p_passed)["fail_cmd"] is None, "a later PASS clears an earlier FAIL"
+    assert _tail_scan(p_norun)["fail_cmd"] is None, "no Bash tool_use at all -> honestly None, not a crash"
+    # EDGE CASE: a truncated/malformed trailing line must not blow up the tail scan, and a
+    # valid Bash failure seen before the garbage still counts.
+    p_trunc = _fc_write("trunc.jsonl", [])
+    with open(p_trunc, "w") as fh:
+        fh.write(json.dumps(FAIL_BASH) + "\n")
+        fh.write(json.dumps(_fail_result(True)) + "\n")
+        fh.write('{"type": "user", "message": {"content": [{"type": "tool_resu\n')   # cut mid-line
+    assert _tail_scan(p_trunc)["fail_cmd"] == "pytest -q --maxfail=1", _tail_scan(p_trunc)
+
+    # wired onto the real session-LIST dict (list_sessions()), not just _tail_scan in isolation
+    dfc = os.path.join(pdir, "-x-failcmd"); os.makedirs(dfc)
+    _mk(dfc, "s_fail.jsonl", "/x", "cli", "2026-06-02T09:00:00Z", "run the suite")
+    with open(os.path.join(dfc, "s_fail.jsonl"), "a") as fh:
+        fh.write(json.dumps(FAIL_BASH) + "\n")
+        fh.write(json.dumps(_fail_result(True)) + "\n")
+    _mk(dfc, "s_pass.jsonl", "/x", "cli", "2026-06-02T09:00:00Z", "run the suite")
+    with open(os.path.join(dfc, "s_pass.jsonl"), "a") as fh:
+        fh.write(json.dumps(FAIL_BASH) + "\n")
+        fh.write(json.dumps(_fail_result(False)) + "\n")
+    # EDGE CASE: no "cwd" field on any line -- must not crash, must fall back to "".
+    with open(os.path.join(dfc, "s_nocwd.jsonl"), "w") as fh:
+        fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": "go, no cwd anywhere"}}) + "\n")
+    ls_fc = {s["id"]: s for s in list_sessions()}
+    assert ls_fc["s_fail"]["fail_cmd"] == "pytest -q --maxfail=1", ls_fc["s_fail"]
+    assert ls_fc["s_fail"]["todo_total"] == 0, "the new field coexists fine with a session that has no todos"
+    assert "fail_cmd" in ls_fc["s_pass"] and ls_fc["s_pass"]["fail_cmd"] is None, ls_fc["s_pass"]
+    assert ls_fc["s_nocwd"]["cwd"] == "", "missing cwd field -> empty string, not a crash"
+    assert "fail_cmd" in ls_fc["s_nocwd"] and ls_fc["s_nocwd"]["fail_cmd"] is None, ls_fc["s_nocwd"]
+
+    # Auggie: same signal off launch-process tool_use / tool_result_node pairs (zero extra I/O --
+    # the chatHistory is already loaded), same "latest wins" rule.
+    assert _auggie_fail_cmd(None) is None, "no chatHistory at all -> honestly None"
+    assert _auggie_fail_cmd([]) is None
+    err_chat = [
+        {"exchange": {"response_nodes": [{"tool_use": {"tool_name": "launch-process", "tool_use_id": "lp1",
+                                                         "input_json": json.dumps({"command": "npm test"})}}]}},
+        {"exchange": {"request_nodes": [{"tool_result_node": {"tool_use_id": "lp1", "is_error": True}}]}},
+    ]
+    assert _auggie_fail_cmd(err_chat) == "npm test", _auggie_fail_cmd(err_chat)
+    ok_chat = [
+        {"exchange": {"response_nodes": [{"tool_use": {"tool_name": "launch-process", "tool_use_id": "lp2",
+                                                         "input_json": json.dumps({"command": "npm test"})}}]}},
+        {"exchange": {"request_nodes": [{"tool_result_node": {"tool_use_id": "lp2", "is_error": False}}]}},
+    ]
+    assert _auggie_fail_cmd(ok_chat) is None
+    # EDGE CASE: a launch-process call with no matching result at all (still running) -> None.
+    pending_chat = [
+        {"exchange": {"response_nodes": [{"tool_use": {"tool_name": "launch-process", "tool_use_id": "lp3",
+                                                         "input_json": json.dumps({"command": "npm test"})}}]}},
+    ]
+    assert _auggie_fail_cmd(pending_chat) is None
+    # already wired onto sess1's real fixture above (c1 "git commit" ok, c2 "pytest -q" errored,
+    # request_nodes processed in that order) -- the LATEST result (c2, failed) wins.
+    assert al[0]["fail_cmd"] == "pytest -q", al[0]
+    # EDGE CASE: an Auggie session lacking the field entirely (no "chatHistory" key at all in
+    # the on-disk JSON, not merely an empty list) -- must not crash, must come back None.
+    with open(os.path.join(config.AUGGIE_SESSIONS, "sess_nofield.json"), "w") as fh:
+        json.dump({"sessionId": "sess_nofield", "modified": "2026-06-27T05:48:03Z"}, fh)
+    _AUGGIE_LIST_CACHE.clear()
+    al_nf = {s["id"]: s for s in list_auggie()}
+    assert al_nf["auggie:sess_nofield"]["fail_cmd"] is None, al_nf["auggie:sess_nofield"]
+    _AUGGIE_LIST_CACHE.clear()
+
+    # Augment-ext (VSCode/Cursor extension): no command/tool-result stream at all -> honestly
+    # None, always -- never a guess, never omitted (augment_ext.py's _list()).
+    assert now_erow["fail_cmd"] is None and "fail_cmd" in now_erow, now_erow
+
+    # registry.all_sessions() guarantees the key on EVERY session regardless of provider
+    # (registry.py:89's setdefault) -- spot-check across every source populated above.
+    by_all = {s["id"]: s for s in all_sessions()}
+    for _sid in ("s_fail", "s_pass", "auggie:sess1", "augment-vscode:wshash-now:root"):
+        assert "fail_cmd" in by_all[_sid], "%s missing fail_cmd on the list dict" % _sid
+    assert by_all["s_fail"]["fail_cmd"] == "pytest -q --maxfail=1", by_all["s_fail"]
+
+    # a provider that FORGETS to set fail_cmd at all must still get it defaulted to None by the
+    # shared seam's setdefault -- never a KeyError reaching the client.
+    class _NoFailCmdProvider:
+        prefix = "nofc:"
+        def available(self):
+            return True
+        def list(self):
+            return [{"id": "nofc:x", "mtime": time.time()}]   # no "fail_cmd" key at all
+    import aitracker.registry as _registry_mod
+    _orig_providers = _registry_mod.PROVIDERS
+    _registry_mod.PROVIDERS = _orig_providers + [_NoFailCmdProvider()]
+    try:
+        row = next(s for s in all_sessions() if s["id"] == "nofc:x")
+        assert row["fail_cmd"] is None, "setdefault must backfill a missing fail_cmd as None: %r" % row
+    finally:
+        _registry_mod.PROVIDERS = _orig_providers
+
+    # ---- flag_text: the flag badge's text -- list dict AND detail dict, both providers ----
+    config.FLAGS_FILE = tempfile.mktemp(suffix=".json")
+    save_flags([
+        {"id": 1, "session": "s_wait", "note": "first note", "resolved": False},
+        {"id": 2, "session": "s_wait", "note": "latest note wins", "resolved": False},
+        {"id": 3, "session": "auggie:sess1", "note": "auggie flag text", "resolved": False},
+        {"id": 4, "session": "s_done", "note": "resolved, must not count", "resolved": True},
+    ])
+    by_ft = {s["id"]: s for s in all_sessions()}
+    assert by_ft["s_wait"]["flag_text"] == "latest note wins", by_ft["s_wait"]   # append-only -> last unresolved wins
+    assert by_ft["auggie:sess1"]["flag_text"] == "auggie flag text", by_ft["auggie:sess1"]
+    assert by_ft["s_done"]["flag_text"] is None, "no OPEN flag -> None, never omitted or stale"
+    assert "flag_text" in by_ft["augment-vscode:wshash-now:root"], "key always present, even unflagged"
+    assert by_ft["augment-vscode:wshash-now:root"]["flag_text"] is None
+
+    dft_wait = parse_any("s_wait")
+    assert dft_wait["flag_text"] == "latest note wins", dft_wait["flag_text"]
+    dft_auggie = parse_any("auggie:sess1")
+    assert dft_auggie["flag_text"] == "auggie flag text", dft_auggie["flag_text"]
+    dft_done = parse_any("s_done")
+    assert dft_done["flag_text"] is None, "detail dict: no open flag -> honestly None"
+    os.unlink(config.FLAGS_FILE)
+
+    # ---- term_attached (detail dict only) + pinned (detail dict, true AND false) ----
+    _pins_snap3 = config.PINS_FILE
+    config.PINS_FILE = tempfile.mktemp(suffix=".json")
+    _save_json(config.PINS_FILE, [])   # nothing pinned yet
+    assert parse_any("s_done")["term_attached"] is False, "no open terminal at all -> not attached"
+    assert parse_any("auggie:sess1")["term_attached"] is False
+    assert parse_any("s_done")["pinned"] is False, "not in pins.json -> False, never merely absent"
+
+    _ptys_snapshot = dict(term_vt.PTYS)
+    term_vt.PTYS.clear()
+    try:
+        pt = term_vt.Pty(tid="fake-term-1")
+        pt.session = "s_done"
+        pt.done = False
+        term_vt.PTYS[pt.id] = pt
+        with mock.patch("aitracker.term_vt._foreground_is_claude", return_value=True):
+            assert parse_any("s_done")["term_attached"] is True, \
+                "an open pty for this session with claude in the foreground -> attached"
+        with mock.patch("aitracker.term_vt._foreground_is_claude", return_value=False):
+            assert parse_any("s_done")["term_attached"] is False, \
+                "an open pty exists but claude isn't the foreground process -> not attached"
+        # a FINISHED pty (done=True) for this session must not count as attached
+        pt.done = True
+        with mock.patch("aitracker.term_vt._foreground_is_claude", return_value=True):
+            assert parse_any("s_done")["term_attached"] is False, "a done pty must not count as attached"
+        # a live pty against a DIFFERENT session must not leak onto this one (both providers)
+        pt2 = term_vt.Pty(tid="fake-term-2")
+        pt2.session = "auggie:sess1"
+        pt2.done = False
+        term_vt.PTYS[pt2.id] = pt2
+        with mock.patch("aitracker.term_vt._foreground_is_claude", return_value=True):
+            assert parse_any("s_done")["term_attached"] is False, "another session's pty must not attach here"
+            assert parse_any("auggie:sess1")["term_attached"] is True, "...but it does attach to ITS OWN session"
+    finally:
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(_ptys_snapshot)
+
+    _save_json(config.PINS_FILE, ["s_done", "auggie:sess1"])
+    assert parse_any("s_done")["pinned"] is True, "pinned session -> detail dict must say so"
+    assert parse_any("auggie:sess1")["pinned"] is True
+    assert parse_any("s_wait")["pinned"] is False, "un-pinned session -> False, not merely absent"
+    os.unlink(config.PINS_FILE)
+    config.PINS_FILE = _pins_snap3
+
+    # ---- brand mark ---------------------------------------------------------------
+    # The logo is ONE shared #brandMark symbol (index.html) that both dashboards
+    # <use>; its colours come from --brand-plate/--brand-dot + currentColor, set per
+    # theme by each shell. Before this, the control-room rail drew a generic outlined
+    # sparkle and the classic mark hardcoded the dark-theme palette (broken in light).
+    import aitracker as _ait
+    _WEB = os.path.join(os.path.dirname(_ait.__file__), "web")
+    def _read(n):
+        with open(os.path.join(_WEB, n), encoding="utf-8") as _fh:
+            return _fh.read()
+    _idx, _appcss = _read("index.html"), _read("app.css")
+    _brdjs, _brdcss = _read("ext_cr_board.js"), _read("ext_cr_board.css")
+
+    assert _idx.count("id=brandMark") == 1, "brand symbol must be defined exactly once -- shared seam, not forked"
+    # fallbacks matter: a consumer that forgets the tokens must degrade to the
+    # outline form, not an opaque black plate.
+    for _tok in ("var(--brand-plate, transparent)", "var(--brand-dot, currentColor)", "currentColor"):
+        assert _tok in _idx, "the brand symbol must take %s from the theme, not a literal" % _tok
+
+    # ...scoped to the MARK itself: unrelated chrome (the agent/shell count badges) is
+    # free to use a literal hex, but the logo must take every colour from a token.
+    import re as _re
+    _sprite = _idx.split("<svg class=brandsprite", 1)[1].split("</svg>", 1)[0]
+    _logospan = _re.search(r"<span class=logo\b.*?</span>", _idx, _re.S).group(0)
+    for _where, _frag in (("brand symbol", _sprite), ("classic logo span", _logospan)):
+        for _hex in ("#f5b443", "#29d398", "#11161f"):
+            assert _hex not in _frag, "%s must not hardcode the dark-theme hex %s" % (_where, _hex)
+
+    # both shells render the same symbol ...
+    assert 'use href="#brandMark"' in _idx, "classic sidebar logo must <use> the shared symbol"
+    assert 'use href="#brandMark"' in _brdjs, "control-room rail must <use> the shared symbol"
+    _railline = next(l for l in _brdjs.splitlines() if "class: 'cr-rail-brand'" in l)
+    assert "icon('spark'" not in _railline, "the rail brand must be the product mark, not the generic spark glyph"
+
+    # ... and each defines the tint tokens for its own theme scope
+    for _name, _css in (("app.css", _appcss), ("ext_cr_board.css", _brdcss)):
+        for _v in ("--brand-plate", "--brand-dot"):
+            assert _v in _css, "%s must define %s so the mark tints in both themes" % (_name, _v)
 
     print("selfcheck ok")

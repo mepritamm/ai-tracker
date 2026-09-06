@@ -1,0 +1,489 @@
+/* Control Room — foundations. Design tokens from 01-foundations.md. */
+
+/*
+ * Scope root: .tracker-next (named explicitly by the doc's "Scoping" section —
+ * NOT the generic `.cr` fallback). The classic dashboard's bare `:root` is left
+ * untouched; nothing in this file styles bare `body`, a bare element selector,
+ * or unscoped `:root`.
+ *
+ * Theme mechanism: the doc prescribes a JS-driven CLASS TOGGLE, not a
+ * `prefers-color-scheme` media query or a `[data-theme]` attribute:
+ *   - `.tracker-next`            → light tokens (also the default/fallback)
+ *   - `.tracker-next.is-dark`    → dark token overrides
+ * `resolveTheme()`/`applyTheme()` (doc "Theme resolution (decision 3)") read
+ * `localStorage['tracker.theme']` ('auto' | 'light' | 'dark') and
+ * `matchMedia('(prefers-color-scheme: dark)')`, then toggle `.is-dark` on the
+ * `.tracker-next` root — including live, on a `change` listener, with no
+ * reload. That JS is out of scope for this foundations file (component/app
+ * wiring); this file only needs to define what each class sets.
+ * NOTE: no `@media (prefers-color-scheme: dark)` block and no `[data-theme]`
+ * selector are used here — the doc's own mechanism supersedes the generic
+ * fallback shape, per "if it prescribes a specific mechanism, follow the doc."
+ *
+ * NOTE: the brief asked for an `--ads-*` custom-property layer. 01-foundations.md
+ * does not use an `--ads-` prefix anywhere — every token is named plainly
+ * (`--surface-*`, `--text-*`, `--line-*`, `--state-*`, `--fill-*`, `--shadow-*`,
+ * `--glow-*`, `--font-*`). Reproducing the doc exactly (per this task's own
+ * "reproduce exact values, don't invent" rule) means keeping the doc's real
+ * names rather than inventing an `--ads-` prefix that appears nowhere in the
+ * source of truth. New tokens added below for the type/spacing/radii/motion
+ * scales (which the doc gives as prose/tables, not as a fenced `--token` list)
+ * follow the doc's own naming style (`--fs-*`, `--lh-*`, `--fw-*`, `--ls-*`,
+ * `--space-*`, `--gap-*`, `--radius-*`, `--motion-*`) for consistency.
+ */
+
+/* ============================================================
+   LIGHT THEME — color / material tokens (default on .tracker-next)
+   ============================================================ */
+.tracker-next {
+  /* ============================================================
+   * LIGHT TOKENS BELOW ARE A DERIVATION, NOT A MEASUREMENT.
+   * The prototype export (AI Tracker Redesign_v2.dc.html) embeds only ONE
+   * real color rule: `.dv-dark .ads-ui{...}` — the dark ("Ink") block, ~55
+   * hex values, copied verbatim into the .is-dark block below. There is NO
+   * light/base `.ads-ui{...}` rule anywhere in either export checked; light
+   * ("Cream") values live in an external `_ds/green-theme-ads-…/styles.css`
+   * stylesheet that was never shipped with either .dc.html. So every value
+   * in THIS block was derived — not measured — from the dark block's own
+   * relationships (which surfaces read as distinct, how far apart the ink
+   * steps sit, how saturated each accent is relative to its neighbors),
+   * re-targeted at a warm-cream key and checked against WCAG 2.2 AA
+   * (4.5:1 body text / 3:1 large text & non-text, per 01-foundations.md).
+   * If `_ds/green-theme-ads-…/styles.css` ever surfaces, replace this
+   * entire block verbatim from it — do not assume these are ground truth.
+   * ============================================================ */
+  /* surfaces (15) */
+  --surface-page: linear-gradient(180deg, #F1EEE0, #DFEAEC);
+  --surface-raised: #FFFFFF;
+  --surface-top: #FBFAF7;
+  --surface-sunken: #F4F1E8;
+  --surface-trace: #F4F1E8;
+  /* --surface-note/-provenance/-agent-quiet/-awaiting/-failed/-done/-flagged:
+     restored to 01-foundations.md's exact light-theme hex (doc lines 45-53).
+     THE DOCS WIN: an earlier pass re-saturated these away from the doc to
+     chase a WCAG contrast target; that rationale is superseded — the doc's
+     literal values are the source of truth here, full stop. */
+  --surface-note: #F7F4EA;
+  --surface-provenance: #EDF2F3;
+  --surface-inverse: #1E1B17;
+  --surface-agent-quiet: #FBF3DC;
+  --surface-agent-active: linear-gradient(160deg, #FBF3DC, #FFFFFF 55%, #EDF2F3);
+  --surface-awaiting: #FDF0E4;
+  --surface-failed: #FBEAE5;
+  --surface-done: #EDF3EE;
+  --surface-flagged: #FBEEE7;
+  --surface-signal-fill: #F5DE9B;
+
+  /* ink (13) */
+  --text-primary: #1E1B17;
+  --text-secondary: #4A4237;
+  /* --text-muted: restored to doc's exact value (doc line 59). THE DOCS WIN. */
+  --text-muted: #877866;
+  --text-link: #3B5747;
+  /* --text-thinking: restored to doc's exact value (doc line 61). THE DOCS WIN. */
+  --text-thinking: #8A6D14;
+  --text-awaiting: #9A4F19;
+  --text-failed: #8A2F1B;
+  --text-flagged: #7D3A28;
+  --text-agent: #6F6455;
+  --text-on-action: #FBFAF7;
+  --text-on-signal: #1E1B17;
+  /* --text-dusk: the third ink accent (provenance / "your own words"), missing
+     from the shipped layer entirely — see the dark block for the measured
+     values and the FINDING-1 note on this derivation. */
+  --text-dusk: #395D6A;
+  /* --text-eyebrow: eyebrow/section-label ink. Its dark value is identical to
+     --text-link's dark value (both #8FB187 in the prototype), so this light
+     value mirrors --text-link's light value rather than being independently
+     invented — same relationship --line-focus already has to --text-link. */
+  --text-eyebrow: #3B5747;
+
+  /* lines (11) */
+  --line-subtle: #E7E2D5;
+  --line-default: #CFC7B7;
+  /* --line-strong: restored to doc's exact value (doc line 72). THE DOCS
+     WIN — it is identical to --state-idle in the doc's own light block;
+     that collision is the doc's, not a bug to correct here. */
+  --line-strong: #A89C8B;
+  /* --line-agent: restored to doc's exact value (doc line 73). THE DOCS
+     WIN — it is identical to --state-thinking in the doc's own light block;
+     that collision is the doc's, not a bug to correct here. */
+  --line-agent: #D9B855;
+  --line-awaiting: #E8B98A;
+  --line-failed: #E0A491;
+  --line-done: #B9CBBF;
+  --line-flagged: #E0B49F;
+  --line-focus: #3B5747;
+  /* --line-dusk: border use of the dusk accent (fork-lineage banner).
+     DERIVED, not measured — see dark block. Re-checked after
+     --surface-provenance moved (3.14:1, was 3.29:1 on the old surface —
+     still clears the 3:1 floor dark itself holds here, 4.46:1). */
+  --line-dusk: #668A99;
+  /* --line-note: sage "note" accent border (Plan-on-the-go callouts). Only one
+     value exists in the prototype (dark block only); reused unchanged here —
+     it already clears the 3:1 non-text floor against both light and dark
+     --surface-note, so no separate light value was invented. */
+  --line-note: #6E8A75;
+
+  /* state dots (6) */
+  /* --state-thinking/--state-awaiting/--state-flagged: restored to doc's
+     exact light-theme values (doc lines 81,82,85). THE DOCS WIN — the doc
+     reuses --state-thinking/--line-agent (#D9B855) and matches dark for
+     --state-awaiting/--state-flagged verbatim; that is the doc's own
+     design, not a drift to correct. */
+  --state-thinking: #D9B855;
+  --state-awaiting: #E58F3C;
+  --state-done: #3B5747;
+  --state-failed: #C0553A;
+  --state-flagged: #C27950;
+  /* --state-working: canonical "session is working" colour, consumed by the classic
+     dashboard's own --st-working (app.css) for cross-view parity. Per the owner's
+     explicit, repeated ask for a GREEN working indicator, this deliberately departs
+     from 01-foundations.md's own state table (which gives Working "wheat" and reserves
+     forest/green for Landed) — the owner overrides the doc here, and forest green is
+     actively wrong for this slot since it would collide with --state-done. No LONGER
+     aliases --state-thinking. Value STARTED as classic's own historical live-dot green
+     (app.css --green, light value: #1f9d6b) — the only green the whole design-handoff
+     bundle ever attaches to a live/working dot at all (the "Today, recreated" mockup
+     section, reproducing the current app's own #29d398/#1f9d6b). Vivid/saturated so it
+     reads apart from the muted, desaturated --state-done green (#3B5747 light /
+     #8FB187 dark) at a 7px dot.
+     DARKENED to #1c9163 (from #1f9d6b): #1f9d6b measured only 2.82:1 against the light
+     --surface-page-ish warm-stone ground this dot sits on in classic's equivalent (--side,
+     #efe8d8) — below the WCAG 1.4.11 non-text 3:1 floor for a state indicator. #1c9163 keeps
+     the same hue (~156°, still the same emerald) and measures 3.26:1 against #efe8d8 (WCAG
+     relative-luminance formula), clearing the floor with a small margin, while staying
+     clearly distinct from --state-done's light value #3B5747 (2.0:1 between the two colours
+     — not a WCAG requirement, just a visual-separation check). Kept identical to app.css's
+     --st-working light value — that IS the cross-view parity this token exists for; the two
+     must be edited together. */
+  --state-working: #1c9163;
+  /* --state-idle: restored to doc's exact value (doc line 86). THE DOCS
+     WIN — it is identical to --line-strong in the doc's own light block;
+     that collision is the doc's, not a bug to correct here. */
+  --state-idle: #A89C8B;
+  /* --state-pinned: PINNED is not one of 01-foundations.md's six state-
+     vocabulary rows (see the .cr-triage-cell--pinned comment in
+     ext_cr_board.css) — the doc's own hue ramps have no "blue" family at
+     all (orange/wheat/rust/brick/forest/grey only). Per the owner's explicit
+     ask ("pin — blue"), this is mapped onto --text-dusk, the ONE blue-
+     leaning accent this app's token set actually defines (the "provenance /
+     fork-lineage" ink, already dual-themed above/below and already used for
+     a triage-count-like number at .cr-stat-dusk .cr-stat-num in
+     ext_cr_dialogs.css). Aliased via var(), not a new hex, so there is
+     exactly one source of truth for this colour. Supersedes the prior
+     "pinned gets no hued colour, reuse --text-agent" ruling in
+     ext_cr_board.css — that ruling predates this explicit colour request. */
+  --state-pinned: var(--text-dusk);
+
+  /* fills (2) */
+  --fill-action: linear-gradient(180deg, #3B5747, #2E4438);
+  --fill-row-hover: rgba(0,0,0,.04);
+
+  /* material: shadow + glow (4) */
+  --shadow-raised: 1px 2px 5px rgba(30,27,23,.10);
+  --shadow-overlay: 2px 10px 30px rgba(30,27,23,.18);
+  --glow-agent: 0 0 0 1px rgba(217,184,85,.35), 0 2px 14px rgba(217,184,85,.28);
+  --glow-agent-soft: 0 0 10px rgba(217,184,85,.20);
+  /* --glow-working: always-on "lit" glow for a working session, in the canonical working
+     colour (rgba of --state-working/#1c9163 — RGB 28,145,99; kept in step with the
+     --state-working contrast fix above, was 31,157,107 for the old #1f9d6b). Modeled on
+     --glow-agent-soft directly above, turned up (wider spread + higher alpha) so it reads as
+     persistently lit rather than the soft ambient hint --glow-agent-soft provides. Same
+     geometry/opacity as before (14px blur, .32 alpha) — only the RGB changed, per the
+     owner's green ruling (and now again for the contrast fix). */
+  --glow-working: 0 0 14px rgba(28,145,99,.32);
+  /* --scrim: NEW (not from 01-foundations.md — an audit found three backdrop/scrim
+     colours hardcoded with no light/dark handling at all: ext_cr_dialogs.css's
+     .cr-backdrop, ext_cr_boot.css's .cr-scrim, ext_cr_board.css's .cr-rail-scrim,
+     each rgba(20-ish, 18-ish, 10-ish, .35-.45) — all in the same warm-stone hue
+     family already, just never theme-varying and never a token. Softer/lighter
+     here (light theme sits under a light page, so a lighter, less opaque tint
+     reads as a scrim rather than a slab); --surface-inverse's own RGB (#1E1B17)
+     supplies the hue so this stays in-family rather than inventing a new one. */
+  --scrim: rgba(30, 27, 23, .38);
+
+  /* ---- typography stacks (3) ---- */
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-serif: 'Newsreader', ui-serif, Georgia, serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, Menlo, monospace;
+
+  /*
+   * ---- type scale ----
+   * The doc gives each role as a RANGE ("Scale as used" table), not a single
+   * fixed value. Per "don't invent values," both range endpoints are exposed
+   * verbatim as -min/-max tokens rather than fabricating a midpoint; a
+   * component can clamp() between them or just pick one end.
+   */
+
+  /* page title (detail): 29–32px / 1.15 / 400 serif, letter-spacing -.02em */
+  --fs-page-title-min: 29px;
+  --fs-page-title-max: 32px;
+  --lh-page-title: 1.15;
+  --fw-page-title: 400;
+  --ls-page-title: -.02em;
+
+  /* triage count: 33–40px / 1 / 400 serif, tabular nums, letter-spacing -.03em */
+  --fs-triage-count-min: 33px;
+  --fs-triage-count-max: 40px;
+  --lh-triage-count: 1;
+  --fw-triage-count: 400;
+  --ls-triage-count: -.03em;
+
+  /* section head (h2): 25–28px / 1.2 / 400 serif */
+  --fs-h2-min: 25px;
+  --fs-h2-max: 28px;
+  --lh-h2: 1.2;
+  --fw-h2: 400;
+
+  /* tile title: 14–16px / 1.3 / 600 sans */
+  --fs-tile-title-min: 14px;
+  --fs-tile-title-max: 16px;
+  --lh-tile-title: 1.3;
+  --fw-tile-title: 600;
+
+  /* body: 13–14px / 1.5–1.6 / 400 sans */
+  --fs-body-min: 13px;
+  --fs-body-max: 14px;
+  --lh-body-min: 1.5;
+  --lh-body-max: 1.6;
+  --fw-body: 400;
+
+  /* row / control: 12–12.5px / 1.25–1.4 / 400–600 sans */
+  --fs-row-min: 12px;
+  --fs-row-max: 12.5px;
+  --lh-row-min: 1.25;
+  --lh-row-max: 1.4;
+  --fw-row-min: 400;
+  --fw-row-max: 600;
+
+  /* eyebrow / label: 9.5–11px / 1 / 600 sans, letter-spacing .06–.14em, uppercase */
+  --fs-eyebrow-min: 9.5px;
+  --fs-eyebrow-max: 11px;
+  --lh-eyebrow: 1;
+  --fw-eyebrow: 600;
+  --ls-eyebrow-min: .06em;
+  --ls-eyebrow-max: .14em;
+
+  /* machine trace: 10–12px / 1.5 / 400 mono, tabular nums */
+  --fs-trace-min: 10px;
+  --fs-trace-max: 12px;
+  --lh-trace: 1.5;
+  --fw-trace: 400;
+
+  /* absolute floor — 10px, mono metadata only */
+  --fs-floor: 10px;
+
+  /* ---- spacing scale (component-scoped, not a utility scale) ---- */
+  --space-page-x-min: 22px;
+  --space-page-x-max: 34px;
+  --space-page-y-min: 16px;
+  --space-page-y-max: 30px;
+  --space-panel-min: 12px;
+  --space-panel-max: 16px;
+  --gap-rail: 3px;              /* rail rows */
+  --gap-row-min: 6px;           /* inside a row */
+  --gap-row-max: 8px;
+  --gap-panel-min: 11px;        /* between panels */
+  --gap-panel-max: 16px;
+  --gap-section-min: 20px;      /* between columns/sections */
+  --gap-section-max: 26px;
+
+  /* ---- radii ---- */
+  --radius-sm: 4px;             /* small chips and rows */
+  --radius-md-min: 8px;         /* panels and tiles */
+  --radius-md-max: 10px;
+  --radius-pill: 999px;
+  --radius-none: 0;             /* never used here — kept for completeness per doc */
+
+  /* ---- motion ---- */
+  /* The only motion value the doc specifies: the working-dot pulse duration.
+     No named easing curve is given beyond the keyframe's own 0%/70%/100%
+     stops (default timing-function applies); the actual @keyframes/.tn-dot
+     rule is component CSS, not a foundations token, and is left for later. */
+  --motion-pulse-duration: 2.4s;
+}
+
+/* ============================================================
+   DARK THEME — color / material token overrides
+   Applied via JS-toggled class per "Theme resolution (decision 3)".
+   Same token names, re-pointed at the dark end of the same ramps.
+   This is not an inversion and not a filter.
+   ============================================================ */
+.tracker-next.is-dark {
+  /* surfaces (15) */
+  --surface-page: linear-gradient(180deg, #1E1B17, #24211C);
+  --surface-raised: #2A251F;
+  --surface-top: #231F1A;
+  --surface-sunken: #1A1714;
+  --surface-trace: #1A1714;
+  --surface-note: #262B22;
+  --surface-provenance: #222E31;
+  --surface-inverse: #100E0C;
+  --surface-agent-quiet: #322A16;
+  --surface-agent-active: linear-gradient(160deg, #3D3218, #2A251F 58%, #24302B);
+  --surface-awaiting: #3A2A18;
+  --surface-failed: #3A211A;
+  --surface-done: #22322A;
+  --surface-flagged: #38241B;
+  --surface-signal-fill: #C9A33C;
+
+  /* ink (13) */
+  --text-primary: #FBFAF7;
+  --text-secondary: #D8CFC2;
+  --text-muted: #A89C8B;
+  --text-link: #8FB187;
+  --text-thinking: #E5CB79;
+  --text-awaiting: #F5C98E;
+  --text-failed: #E0A491;
+  --text-flagged: #E5BFA5;
+  /* --text-agent: the doc's dark block does NOT redefine this token, which
+     would mean inheriting light's #6F6455. Checked and NOT restored to
+     inherit: #6F6455 on the dark surfaces --text-agent actually paints
+     against (.cr-rail-agentrow/.cr-tile-agentexpand in ext_cr_board.css,
+     confirmed via repo-wide grep) measures ~2.6:1 against --surface-raised
+     #2A251F — well under the doc's own 4.5:1 body-text floor ("Contrast
+     floor" section) and a visible regression (muddy near-invisible label
+     text on every agent row/tile in dark mode). Kept as an explicit
+     dark-only override rather than silently failing the doc's own bar. */
+  --text-agent: #C6B29B;
+  --text-on-action: #1E1B17;
+  --text-on-signal: #1E1B17;
+  /* --text-dusk (source: ads-dusk-7) and --text-eyebrow (source: ads-eyebrow-ink)
+     are measured verbatim from the prototype's dark block. The light theme has
+     no equivalent block to measure from — its values in the light .tracker-next
+     rule above are derived, not measured; see the comments there. */
+  --text-dusk: #A8C0C9;
+  --text-eyebrow: #8FB187;
+
+  /* lines (11) */
+  --line-subtle: #403A31;
+  --line-default: #6E6354;
+  --line-strong: #7A6E5D;
+  --line-agent: #A9862C;
+  --line-awaiting: #B4712C;
+  --line-failed: #B85A3F;
+  --line-done: #6E9478;
+  --line-flagged: #A9714E;
+  --line-focus: #8FB187;
+  --line-dusk: #7E9AA6;
+  --line-note: #6E8A75;
+
+  /* state dots (6) */
+  --state-thinking: #D9B855;
+  --state-awaiting: #E58F3C;
+  --state-done: #8FB187;
+  --state-failed: #D2735A;
+  --state-flagged: #C27950;
+  /* --state-working: dark counterpart of the light block's own comment above — same
+     owner-directed green departure from the doc's "wheat" state table. Value is classic's
+     historical live-dot green, dark value (app.css --green: #29d398). Matches app.css's
+     own pulseDot keyframe halo colour (rgba(41,211,152,.55) = #29d398) exactly in this
+     (dark, default) theme. */
+  --state-working: #29d398;
+  --state-idle: #877866;
+  /* --state-pinned: see the light block's own comment above for why this
+     token exists at all. Same alias here — --text-dusk's dark-theme value
+     (#A8C0C9, already measured/used for --cr-stat-dusk and the fork-lineage
+     ink), never a separately-invented dark hex. */
+  --state-pinned: var(--text-dusk);
+
+  /* fills (2 + solid) */
+  --fill-action: linear-gradient(180deg, #8FB187, #6E8A75);
+  /* --fill-action-solid: was missing entirely (doc line 166). Added. */
+  --fill-action-solid: #8FB187;
+  /* --fill-row-hover: restored to doc's exact value (doc line 167). THE DOCS WIN. */
+  --fill-row-hover: rgba(251,250,247,.06);
+
+  /* material (4 of 4 — doc DOES redefine glow for dark, with different
+     alpha/blur than light (doc lines 170-171). Restored below; the prior
+     comment claiming the glow was "deliberately theme-invariant" was wrong
+     — the doc gives distinct dark values and they were never applied. */
+  --shadow-raised: 1px 2px 5px rgba(0,0,0,.5);
+  --shadow-overlay: 2px 10px 30px rgba(0,0,0,.66);
+  --glow-agent: 0 0 0 1px rgba(217,184,85,.4), 0 2px 16px rgba(217,184,85,.3);
+  --glow-agent-soft: 0 0 12px rgba(217,184,85,.22);
+  /* --glow-working: dark counterpart of the light block's own comment above — wider spread
+     and higher alpha than --glow-agent-soft, same relationship the light block keeps. Same
+     geometry/opacity as before (16px blur, .36 alpha) — only the RGB changed, to
+     --state-working's dark value #29d398 (RGB 41,211,152), per the owner's green ruling. */
+  --glow-working: 0 0 16px rgba(41,211,152,.36);
+  /* --scrim: NEW, see the light block's own comment for why this token exists.
+     Deeper here — --surface-inverse's dark-block RGB (#100E0C) at a higher
+     opacity, so the backdrop reads as genuinely behind the (also dark) page
+     rather than nearly blending into it. Same warm-stone family as light,
+     never pure black. */
+  --scrim: rgba(16, 14, 12, .58);
+}
+
+/* ============================================================
+   BASE / RESET — minimal, scoped only under .tracker-next
+   Grounded directly in the doc: surfaces/ink tokens and the three type
+   stacks need somewhere to actually apply for the root to render correctly;
+   nothing here is invented beyond that minimum.
+   ============================================================ */
+.tracker-next {
+  background: var(--surface-page);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  box-sizing: border-box;
+}
+.tracker-next *,
+.tracker-next *::before,
+.tracker-next *::after {
+  box-sizing: inherit;
+}
+
+/* `hidden` must actually hide. The UA rule `[hidden]{display:none}` has
+   specificity (0,1,0), so ANY component rule that sets `display` via a class —
+   which is most of them — silently outranks it and the element keeps rendering.
+   Found twice in a real browser: the classic `.app` root stayed painted and
+   clickable underneath Control Room, and `.crd-forkbanner` drew an empty 38px
+   strip. A hidden-but-`display:flex` element is still a flex item, so it can
+   also consume a parent's `gap` while showing nothing. One blanket rule ends
+   the whole class of bug — never fix these one selector at a time. */
+.tracker-next [hidden] { display: none !important; }
+
+/* Contrast floor / keyboard focus (doc "Contrast floor"): a 2px solid
+   --line-focus outline, 2px offset, visible on every surface — this is a
+   universal a11y default, not any one component's concern. */
+.tracker-next :focus-visible {
+  outline: 2px solid var(--line-focus);
+  outline-offset: 2px;
+}
+
+/* ============================================================
+   EMOJI TINTING (owner override, supersedes decision 4) — reusable
+   utility classes. One `filter` declaration per rule: a second one
+   overrides rather than composes (this file has already been bitten
+   by that mistake once — don't repeat it).
+
+   TRANSITION TO INLINE SVG (this pass):
+   Glyphs are now inline SVG elements using `stroke="currentColor"` instead
+   of emoji. The old filter-based approach (grayscale → sepia → hue-rotate)
+   is incompatible with stroked SVG. Each role is now tinted directly by a
+   plain `color:` CSS token. Token choices are deliberately muted to
+   preserve the owner's design intent: faint role differentiation with
+   theme harmony winning over glyph identity. Five roles per theme (neutral,
+   awaiting, flagged, done, note) — each role's color token stays uniform
+   across both light and dark contexts, with the theme providing the
+   override (e.g., text-secondary in light, text-agent in dark). Both
+   copies (this one and the sibling in ext_cr_dialogs.css) must be edited
+   together; a mismatch is a bug. */
+.tracker-next .tn-emo   { color: var(--text-secondary); font-style: normal; }
+.tracker-next .tn-emo-a { color: var(--text-awaiting); font-style: normal; }
+.tracker-next .tn-emo-f { color: var(--text-flagged); font-style: normal; }
+.tracker-next .tn-emo-d { color: var(--state-done); font-style: normal; }
+.tracker-next .tn-emo-n { color: var(--text-thinking); font-style: normal; }
+
+/* Dark theme: override tokens to the light-accent range for contrast on
+   a dark surface, while preserving role semantics (awaiting, flagged, etc).
+   Same role differentiation logic: color hue varies by role, but intensity
+   is uniform within theme, keeping roles tied to a common family rather
+   than reads as separate foreign objects. */
+.tracker-next.is-dark .tn-emo   { color: var(--text-agent); }
+.tracker-next.is-dark .tn-emo-a { color: var(--text-awaiting); }
+.tracker-next.is-dark .tn-emo-f { color: var(--text-failed); }
+.tracker-next.is-dark .tn-emo-d { color: var(--state-done); }
+.tracker-next.is-dark .tn-emo-n { color: var(--text-thinking); }
+.tracker-next .tn-emo svg { width: calc(1em * var(--ico-scale)); height: calc(1em * var(--ico-scale)); display: inline-block; vertical-align: -0.15em; flex-shrink: 0; }

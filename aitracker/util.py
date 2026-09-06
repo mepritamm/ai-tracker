@@ -1,4 +1,5 @@
 import datetime, difflib, os, re, subprocess
+from urllib.parse import unquote, urlparse
 
 from .config import LIVE_WINDOW
 
@@ -94,11 +95,13 @@ def _git_branch(cwd):
     try:
         gitpath = os.path.join(cwd, ".git")
         if os.path.isfile(gitpath):                       # worktree: "gitdir: <path>"
-            line = open(gitpath, encoding="utf-8").read().strip()
+            with open(gitpath, encoding="utf-8") as fh:
+                line = fh.read().strip()
             head = os.path.join(line[7:].strip(), "HEAD") if line.startswith("gitdir:") else ""
         else:
             head = os.path.join(gitpath, "HEAD")
-        ref = open(head, encoding="utf-8").read().strip()
+        with open(head, encoding="utf-8") as fh:
+            ref = fh.read().strip()
         if ref.startswith("ref: refs/heads/"):
             return ref[len("ref: refs/heads/"):]
         return ref[:12]                                   # detached HEAD -> short sha
@@ -208,6 +211,131 @@ def pr_worked(e, cwd):
     return bool(name) and any(s == name or s.startswith(name + "-") for s in cwd.split("/"))
 
 
+def _local_path(value, cwd=None):
+    """The filesystem path a `files`-shape entry's `path` refers to, or None if it isn't
+    one we can confidently judge. `http(s)://` is never local -- kept unconditionally by
+    the caller, no existence check, no network request. A `file://` URI is resolved to
+    the plain path it names. A leading `~` is expanded (os.path.expanduser) -- that one
+    is unambiguous regardless of cwd. A RELATIVE path (Claude stores the model's raw
+    `file_path` with no cwd anchoring -- providers/claude.py's Write/Edit handlers --
+    unlike Auggie, which anchors via `_abs()` before this ever runs) is joined onto
+    `cwd` when the caller has one (registry.parse_any() passes the session's own
+    `meta.cwd`, which is strictly better than guessing); with no `cwd` available, an
+    unanchored relative path cannot be judged one way or the other -- returning None
+    here makes the caller treat it exactly like an http(s) link: kept, alive
+    unconditionally, no existence check. Hiding a real link is worse than showing a
+    stale one, so we never guess a relative path against the SERVER PROCESS's cwd."""
+    if value.startswith(("http://", "https://")):
+        return None
+    if value.startswith("file://"):
+        return unquote(urlparse(value).path) or None
+    if value.startswith("~"):
+        return os.path.expanduser(value)
+    if not os.path.isabs(value):
+        return os.path.join(cwd, value) if cwd else None
+    return value
+
+
+def annotate_liveness(files, cwd=None):
+    """Annotate one detail dict's `files` list ({path, ops, created, last, agent, ...})
+    -- the same shape every provider (Claude, Auggie, the Augment ext bridge) builds --
+    with a boolean `alive` marker, and de-dupe by the path's normalized form. Does NOT
+    drop anything: a dead entry stays in the list with `alive: False` so the Files
+    panel and `counts.created`/`counts.edited` keep reporting the session's true,
+    complete history (a file created then later cleaned up is still a file the session
+    created). `alive` is the one new fact layered on top, for a consumer that wants to
+    hide/mute dead rows -- currently ext_cr_detail.js's deriveLinks(), which skips
+    `alive === false` entries so the Links panel stops surfacing ephemeral subagent-
+    transcript paths and deleted project files as if they were live.
+
+    `cwd`, when given, is the session's own working directory (registry.parse_any()
+    passes `d["meta"]["cwd"]`) -- used only to anchor a RELATIVE `path` before judging
+    it (see _local_path). Without it, a relative path is left unjudged (treated as
+    alive/unknown) rather than resolved against this SERVER PROCESS's cwd, which would
+    be silently wrong in both directions.
+
+    A `path` that isn't even a string (a malformed model-authored `file_path` -- a
+    list, dict, or number -- reaching here through providers/claude.py's truthiness-
+    only guard) is never local-or-remote-judged: it is passed through untouched and
+    marked alive, the same treatment as an unresolvable link, rather than raising.
+
+    Called from registry.parse_any(), NOT from inside each provider's own parse(): that
+    is the one shared seam every provider's detail dict already passes through on its
+    way out (continued_as/continued_from, term_attached, pinned, ... all get bolted on
+    right there), and it's the one place BOTH the classic dashboard and the control
+    room actually receive their data from (both poll the same /api/session route) --
+    so annotating here reaches every provider and every view with no per-provider
+    duplicate and no client change beyond deriveLinks() reading the new key. It
+    deliberately does NOT run inside providers/claude.py's parse_session or
+    providers/auggie.py's parse_auggie: their unit tests build synthetic transcripts
+    that reference file paths which were never actually written to disk, and asserting
+    on the raw shape there is the correct contract for what those tests are checking
+    (did the transcript's Write/Edit calls get recorded at all) -- liveness is a
+    presentation-layer concern layered on top in parse_any(), not a fact those parsers
+    themselves should have an opinion on.
+
+    Read-only and LOCAL-ONLY: os.path.exists on a path already known to live on this
+    machine. Never a network call, and must never become one -- an http(s)/file(s) URL
+    (a PR link, a link cited in narration) is never even considered a local path (see
+    _local_path) and is marked alive unconditionally, no existence check, no socket.
+
+    Performance: one os.path.exists per UNIQUE path, not per entry -- a session can
+    carry on the order of 100 file entries with plenty of repeats across main-session
+    and background-agent activity, and this runs on every ~2s detail poll. Also
+    de-dupes by the path's normalized form: two entries that resolve to the same
+    filesystem path collapse into one row (e.g. `./x` and `x`, or -- when `cwd` is
+    given -- a `cwd`-relative path and its absolute equivalent), merging ops/last/
+    created/agent onto the surviving entry -- most-recent `last` wins, sticky created/
+    agent flags, same "sticky flag, latest timestamp" precedent as collect_prs()
+    above. `alive` itself never needs merging: every duplicate of the same normalized
+    path shares the same local-path answer by construction. A relative path with no
+    `cwd` to anchor it is deduped only by its own literal (unresolved) text, same as
+    an http(s) link -- it is never assumed to match some absolute path by guesswork.
+    """
+    exists_cache = {}
+    merged = {}
+    order = []
+    for f in files:
+        p = f.get("path")
+        if not p:
+            continue
+        if not isinstance(p, str):
+            # Not a string at all -- can't be local- or remote-judged. Pass through
+            # untouched and call it alive rather than raising (see _local_path's
+            # docstring on non-string `file_path` values). repr() gives a hashable,
+            # deterministic dedupe key even when `p` itself (a list/dict) isn't hashable.
+            alive = True
+            key = ("_nonstr", repr(p))
+        else:
+            local = _local_path(p, cwd)
+            if local is not None:
+                alive = exists_cache.get(local)
+                if alive is None:
+                    alive = os.path.exists(local)
+                    exists_cache[local] = alive
+                key = os.path.normpath(local)
+            else:
+                alive = True  # not a local path (http/https/etc.), or an unanchored
+                               # relative path we can't judge -- kept unconditionally,
+                               # never probed; deduped by literal value
+                key = p
+        cur = merged.get(key)
+        if cur is None:
+            entry = dict(f)
+            entry["alive"] = alive
+            merged[key] = entry
+            order.append(key)
+        else:
+            cur["ops"] = cur.get("ops", 0) + f.get("ops", 0)
+            if f.get("last") and (not cur.get("last") or f["last"] > cur["last"]):
+                cur["last"] = f["last"]
+            if f.get("created"):
+                cur["created"] = True
+            if f.get("agent"):
+                cur["agent"] = True
+    return [merged[k] for k in order]
+
+
 def prs_sorted(acc, states=None):
     """Created PRs first, then most-recently-seen — the shared shape's `prs` list. Overlays merged/
     closed state from `states` (num -> state) captured this session. ponytail: matched by num alone;
@@ -218,6 +346,22 @@ def prs_sorted(acc, states=None):
             if st:
                 e["state"] = st
     return sorted(acc.values(), key=lambda p: (p["created"], p["t"] or ""), reverse=True)
+
+
+def pr_summary(prs, states=None):
+    """(num, url, repo, state) for the session-LIST dict's one representative CREATED pull
+    request — reuses prs_sorted's created-first/most-recent ordering and state overlay (the
+    same primitives the detail path's `prs` panel is built from) rather than re-deriving
+    either. Only entries with created=True count: a PR the session merely referenced or
+    narrated about (pr_worked's broader detail-only semantics) must not light up a board
+    tile. Returns (None, None, None, "") when the session created no PR, so the list dict's
+    fields come back falsy rather than a stale or spurious entry. The one place this gets
+    computed — same precedent as todo_summary below (total/done/current derived once, shared
+    by every provider's list function)."""
+    top = next((p for p in prs_sorted(prs, states) if p["created"]), None)
+    if not top:
+        return None, None, None, ""
+    return top.get("num") or None, top.get("url") or None, top.get("repo") or None, top.get("state") or ""
 
 
 def context_window(current, limit):
@@ -264,6 +408,51 @@ def cmd_kind(c):
     if re.match(r"\s*git\b", c):
         return "git"
     return "cmd"
+
+
+def todo_summary(todos):
+    """(total, done, current-label-or-None, current-index-or-None) from a list of
+    normalized todo dicts ({"content"/"activeForm"/"status"} — the shape both
+    providers already emit: Claude's store.load_tasks() and Auggie's task-tree
+    resolver). The one place this gets computed, so the session-list dict's
+    todo_total/todo_done/todo_current/todo_current_index (registry.py's shared
+    seam) aren't derived twice, once per provider. current_index is the same
+    todo's 0-based position in `todos` that current was picked from (the FIRST
+    in_progress one) — kept in lockstep so a tick-highlighter can point at the
+    exact row the label came from."""
+    total = len(todos)
+    done = sum(1 for t in todos if t.get("status") == "completed")
+    current_index = next((i for i, t in enumerate(todos) if t.get("status") == "in_progress"), None)
+    cur = todos[current_index] if current_index is not None else None
+    current = (cur.get("activeForm") or cur.get("content") or None) if cur else None
+    return total, done, current, current_index
+
+
+def now_phrase(s, maxc=60):
+    """A short board-tile "now" phrase: one line, truncated with an ellipsis rather than
+    wrapped. Shared by every provider's session-list `now_line` field (providers/claude.py,
+    auggie.py, augment_ext.py) so the truncation rule lives in exactly one place, not
+    forked per provider. `s` is already a short, pre-selected signal (an in-progress todo's
+    label, or a tail-read narration snippet) -- this only bounds its on-screen length."""
+    s = _first_line(s or "", 400)
+    if len(s) > maxc:
+        cut = s[:maxc].rsplit(" ", 1)[0].rstrip(" ,.;:-")
+        s = (cut or s[:maxc]) + "…"
+    return s
+
+
+def todo_times_approximate(provider_type):
+    """Whether this provider's todo start/end times are approximate (name-matched or unavailable)
+    rather than exact. Always a bool on the detail dict, even with no todos at all, so the UI
+    never has to special-case a provider.
+    - "claude": False (exact ID join from task-store file stem == TaskUpdate's taskId)
+    - "opencode": False (its `todo` table carries real per-row time_created/time_updated,
+      not a name-matched guess -- exact, same as Claude, just via a different source)
+    - "auggie": True (name-matched against chatHistory task ids from add_tasks/update_tasks echoes)
+    - "augment": True (no timing source available; chat transcript in LevelDB unreadable stdlib-only)
+    This is the ONE definition point shared by all providers; it lives here so the semantics
+    stay consistent if the rule ever changes."""
+    return provider_type not in ("claude", "opencode")
 
 
 def unified(old, new, cap=20000):

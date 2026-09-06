@@ -81,17 +81,41 @@ def session_cwd(sid):
 
 
 REFUSAL_MARKER = "is currently running as a background agent (bg)"
-"""Substring of the CLI's verbatim refusal (docs/claude-resume-command-matrix.md):
+"""Substring of the CLI's OLD verbatim refusal (docs/claude-resume-command-matrix.md), kept
+for backward compat -- existing tests reference this name directly, and an older `claude`
+binary on another machine may still emit exactly this wording:
 
     Session <id> is currently running as a background agent (bg). Use `claude agents`
     to find and attach to it, or add --fork-session to branch off a copy.
 
 Deliberately just this phrase, not the whole message: it never contains the resumed
 `<id>` (which the caller doesn't have handy to interpolate) and isn't a plausible line-
-wrap boundary, so it's safe to match on its own -- see looks_like_bg_refusal(). This is
-the ONE seam that owns the exact wording; a test pins it against the matrix's verbatim
-capture so a future CLI wording change fails the suite loudly instead of silently
-disabling the Option-C backstop term_vt.py builds on top of it."""
+wrap boundary, so it's safe to match on its own -- see looks_like_bg_refusal(). This was
+the ONE seam that owned the exact wording -- see BG_REFUSAL_MARKERS below for why it's
+no longer the only one."""
+
+BG_REFUSAL_MARKERS = (
+    REFUSAL_MARKER,
+    "is running as a background session",
+)
+"""Every wording of the CLI's "still running elsewhere" refusal that `looks_like_bg_refusal()`
+matches. REFUSAL_MARKER (above) is the LEGACY wording; the CURRENT `claude` CLI instead prints
+(verbatim, from a real capture):
+
+    Session <id> is running as a background session (<short-id>). Run `claude attach
+    <short-id>` to open it, or `claude stop <short-id>` first to resume it here. Add
+    --fork-session to branch off a copy instead.
+
+This is not a cosmetic rewrite -- the two messages describe DIFFERENT recoveries. The legacy
+CLI only offered `claude agents` (an interactive picker, no scriptable argv) or
+`--fork-session`; the current CLI instead names a `claude attach <id>` command we CAN drive
+non-interactively -- see attach_target()/attach_argv() below. Both strings are kept in this
+tuple, not just swapped, because a wording change silently disables whichever backstop keyed
+off the old string -- looks_like_bg_refusal()'s docstring predicted exactly this ("degrades to
+no retry at all"), and that prediction came true (the backstop went silently dead) before it
+was caught here. Matching a tuple of known wordings, instead of one pinned string, is the
+mitigation: a NEXT wording change still degrades gracefully (no match, no retry, no crash),
+but this file no longer bets its only recovery path on one exact sentence."""
 
 MISSING_TRANSCRIPT_MARKER = "No conversation found with session ID:"
 """Verbatim prefix of the CLI's message when `--resume <sid>` can't find ANY transcript
@@ -158,6 +182,12 @@ def _normalize_output(output) -> str:
     escape sequences replaced by spaces, so neither the terminal's own line-wrapping nor
     Ink's column-jump rendering (see _ANSI_RE) can hide a REFUSAL_MARKER/
     MISSING_TRANSCRIPT_MARKER match."""
+    # None/absent output normalizes to "" rather than raising. Every caller here is a
+    # `looks_like_*`/`attach_target` predicate on a best-effort read of a child's pty, and a
+    # predicate that throws on "nothing arrived yet" would take down the backstop thread that
+    # is the ONLY thing rescuing a refused resume -- the exact failure this seam exists to fix.
+    if output is None:
+        return ""
     if isinstance(output, bytes):
         output = output.decode("utf-8", "replace")
     # Drop a trailing half-arrived escape FIRST -- see _ANSI_PARTIAL_TAIL_RE. Doing it after
@@ -169,13 +199,18 @@ def _normalize_output(output) -> str:
 
 def looks_like_bg_refusal(output) -> bool:
     """True if `output` (raw bytes/str captured from a `claude --resume` child) contains
-    the "currently running as a background agent" refusal -- the ONE signal Option C's
-    backstop (term_vt.py) uses to retry once with --fork-session. resume_argv() no longer
-    guesses proactively at all (see its docstring), so this is now the ONLY thing that
-    decides a fork for the in-browser PTY tier, not a safety net for a fast path that
-    missed. A future wording change makes this stop matching, which degrades to no retry
-    at all (a bare refusal shown to the user) rather than breaking anything."""
-    return REFUSAL_MARKER in _normalize_output(output)
+    ANY of BG_REFUSAL_MARKERS -- the ONE signal Option C's backstop (term_vt.py) uses to
+    retry once with --fork-session. resume_argv() no longer guesses proactively at all
+    (see its docstring), so this is now the ONLY thing that decides a fork for the
+    in-browser PTY tier, not a safety net for a fast path that missed. This USED to match
+    a single pinned string, and a CLI wording change silently degraded that to no retry at
+    all -- that prediction came true (see BG_REFUSAL_MARKERS): the CLI switched from
+    "is currently running as a background agent (bg)" to "is running as a background
+    session", and the single-string match went silently dead. Matching the tuple is the
+    mitigation, not a fix that rules out recurrence -- a THIRD wording still degrades the
+    same way (a bare refusal shown to the user, no retry) rather than raising."""
+    normalized = _normalize_output(output)
+    return any(marker in normalized for marker in BG_REFUSAL_MARKERS)
 
 
 def looks_like_missing_transcript(output) -> bool:
@@ -231,3 +266,81 @@ def resume_argv(sid):
     deliberate copy", this picks the copy -- and callers should say so where they surface
     the result (a fork was the trade-off, not a mistake)."""
     return ["claude", "--resume", sid]
+
+
+_ATTACH_HINT_RE = re.compile(r"claude attach ([0-9a-fA-F]{4,})")
+"""Pulls candidate short session ids out of the CURRENT CLI's own refusal hint (see
+BG_REFUSAL_MARKERS) -- e.g. "Run `claude attach e30d3b6a` to open it" normalizes (per
+_normalize_output(), which leaves backticks untouched -- they aren't an escape sequence,
+so `claude attach e30d3b6a` survives normalization character-for-character; verified by
+calling _normalize_output() on a real capture rather than assumed) to a plain substring
+containing "claude attach e30d3b6a", which this matches directly.
+
+Constrained to `[0-9a-fA-F]{4,}` -- hex only -- because real session ids (confirmed
+against actual filenames under `~/.claude/projects/*/*.jsonl`, e.g.
+"e30d3b6a-046e-483b-b0f5-e0a1d692abfa.jsonl") are lowercase-hex UUIDs, and their short
+form is just a hex prefix. A looser `[0-9a-zA-Z_-]*` class previously let this regex
+absorb ANY word after "claude attach" -- e.g. "Run claude attach my-session-name-here
+now" parsed out "my-session-name-here" as if it were a real id. Hex-only closes that.
+
+This regex alone does NOT decide the attach target any more -- a MATCH here is only a
+CANDIDATE. See attach_target()'s cross-check: the pane this is scraped from is a
+terminal replaying a live Claude session, and that session's own transcript can itself
+contain text that QUOTES a refusal for a totally different session (e.g. a prior
+attach attempt shown in scrollback, or the assistant discussing this very feature).
+Trusting the first hex token found after "claude attach" -- with no check against what
+the user actually clicked -- let a replayed/quoted refusal for session A silently attach
+the user into session B's live agent while the UI showed no signal anything was
+wrong (no `⑂` chip on the attach path). The fix is entirely in attach_target(): only a
+token that is a genuine prefix of the clicked `sid` is ever accepted."""
+
+
+def attach_target(output, sid="") -> str:
+    """The short session id to hand to `claude attach`, or "" if none can be determined
+    or verified.
+
+    SECURITY: `output` is scraped from a pane showing a live terminal, which is a Claude
+    session that can itself print or replay text quoting a `claude attach <token>` hint
+    for a DIFFERENT session (scrollback, a pasted transcript, the assistant discussing
+    this feature, ...). A scraped token is therefore never trusted on its own -- it is
+    accepted ONLY when it cross-checks against `sid`, the session id the user actually
+    clicked:
+
+      1. If `sid` is non-empty, scan ALL `_ATTACH_HINT_RE` matches in the normalized
+         `output` (not just the first -- a later match can be the CORRECT one when an
+         earlier one is a stale/unrelated hint) and return the first token that is a
+         case-insensitive prefix of `sid` (`sid.lower().startswith(token.lower())`;
+         session ids are hex-ish UUIDs whose short form is a hex prefix of the full id,
+         so this is exactly the relationship a genuine hint has to its session).
+      2. If no candidate passes that check, fall back to `sid[:8]` -- the same short
+         form the CLI itself prints alongside the full id in a genuine refusal for THIS
+         session, e.g. "(e30d3b6a)" for full id "e30d3b6a-046e-...".
+      3. If `sid` is empty/None, there is nothing to cross-check a scraped token
+         against, so an unverifiable hint is REFUSED rather than trusted -- return "".
+         The caller falls back to plain --fork-session in that case, which is safe (it
+         only ever produces a copy of the session the user asked for, never someone
+         else's live agent); attaching to an unverified scraped id is not.
+
+    Returns "" -- never raises -- when nothing can be verified (e.g. `output` is the
+    LEGACY refusal, which carries no attach hint at all, and no `sid` was supplied
+    either)."""
+    normalized = _normalize_output(output)
+    if sid:
+        sid_lower = sid.lower()
+        for match in _ATTACH_HINT_RE.finditer(normalized):
+            token = match.group(1)
+            if sid_lower.startswith(token.lower()):
+                return token
+        return sid[:8]
+    return ""
+
+
+def attach_argv(target):
+    """The argv for `claude attach <target>`, mirroring resume_argv() above -- both are
+    bare `"claude"` (no resolved-binary helper exists in this file for resume_argv() to
+    share, so there's nothing to reuse here either). Returns [] if `target` is falsy, so
+    a caller that got "" from attach_target() can check truthiness of ONE thing (the argv)
+    rather than re-checking the target it already asked for."""
+    if not target:
+        return []
+    return ["claude", "attach", target]

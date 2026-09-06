@@ -15,7 +15,7 @@ the source badge distinguishes the IDE — mirrors Claude's per-surface
 import glob, json, os, time, urllib.parse
 from .. import config
 from ..store import load_titles, load_notes, _load_json
-from ..util import _first_line, push_when, _window, _git_branch, safe_path_component, context_window
+from ..util import _first_line, push_when, _window, _git_branch, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase
 from .base import Provider
 
 
@@ -51,7 +51,8 @@ def _scan_workspaces(kind):
         folder = ""
         if os.path.isfile(ws_json):
             try:
-                folder = _decode_folder(json.load(open(ws_json, encoding="utf-8")).get("folder", ""))
+                with open(ws_json, encoding="utf-8") as fh:
+                    folder = _decode_folder(json.load(fh).get("folder", ""))
             except (OSError, ValueError):
                 folder = ""
         yield ws, aug_dir, folder
@@ -74,7 +75,8 @@ def _iter_tasks(aug_dir):
         p = os.path.join(d, fn)
         try:
             mt = os.path.getmtime(p)
-            t = json.load(open(p, encoding="utf-8"))
+            with open(p, encoding="utf-8") as fh:
+                t = json.load(fh)
         except (OSError, ValueError):
             continue
         yield t.get("uuid") or fn, t, mt
@@ -90,7 +92,8 @@ def _files_touched(aug_dir):
     for fn in os.listdir(sd):
         p = os.path.join(sd, fn)
         try:
-            shard = json.load(open(p, encoding="utf-8"))
+            with open(p, encoding="utf-8") as fh:
+                shard = json.load(fh)
         except (OSError, ValueError):
             continue
         mt = ((shard.get("metadata") or {}).get("lastModified") or 0) / 1000.0
@@ -121,7 +124,12 @@ def _resolve_subtasks(root, allmap, seen=None):
         t = allmap[uu]
         out.append({"content": t.get("name") or t.get("description") or "",
                     "status": _STATE_TO_TODO.get((t.get("state") or "").upper(), "pending"),
-                    "t": ""})
+                    "t": "",
+                    # Same shape as Claude's todos, but honestly null: see auggie.py's
+                    # _auggie_resolve for why this task-storage family can't join a real
+                    # start/end pair onto a todo (task-storage's own lastUpdated is one
+                    # instant, not a range, and the extension has no separate event log).
+                    "started_at": None, "ended_at": None})
         out += _resolve_subtasks(t, allmap, seen)
     return out
 
@@ -159,18 +167,44 @@ def _list(kind, prefix, src_label):
     titles = load_titles()
     out = []
     for ws, aug_dir, folder in _scan_workspaces(kind):
-        allmap = {u: t for u, t, _ in _iter_tasks(aug_dir)}
-        for uu, task, mt_file in _iter_tasks(aug_dir):
+        # ONE pass over the task files, materialized so the todo-tree lookup below can
+        # share it. There used to be a SEPARATE `allmap` built from a second _iter_tasks()
+        # pass here — it just opened and json-parsed every task file a second time on
+        # every /api/list. Measured on real data: 665 Augment tasks read as 1330 opens,
+        # ~0.12s of a 0.40s warm /api/list (~30%). Building allmap from THIS SAME pass
+        # (already fully in memory) costs nothing extra — no second read, same list.
+        tasks = list(_iter_tasks(aug_dir))
+        allmap = {u: t for u, t, _ in tasks}
+        for uu, task, mt_file in tasks:
             gid = "%s%s:%s" % (prefix, ws, uu)
             mt = _mtime_of(task, aug_dir) or mt_file
             title = _title_for(task, folder)
+            todo_total, todo_done, todo_current, todo_current_index = todo_summary(_todos_from(task, allmap))
+            ended = (task.get("state") or "").upper() in ("COMPLETE", "COMPLETED", "DONE")
+            # now_line: parity with Claude/Auggie, LIVE only (inside LIVE_WINDOW, not ended).
+            # This provider has NO narration source at all (chat transcript lives in the
+            # extension's LevelDB kv-store, unreadable stdlib-only -- see the module
+            # docstring), so the in-progress todo is the only signal it can honestly offer;
+            # with none, this stays "" rather than fabricating something from files-touched.
+            now_line = ""
+            if not ended and (time.time() - mt) < config.LIVE_WINDOW and todo_current:
+                now_line = "▶ " + now_phrase(todo_current)
             out.append({
                 "id": gid, "project": os.path.basename(folder) if folder else "Augment", "cwd": folder,
                 "title": titles.get(gid) or title,
                 "prompt": (task.get("description") or "")[:200],
                 "source": src_label, "mtime": mt,
                 "agent": False, "group": "", "groupLabel": "", "parentId": "", "bg": 0, "first": 0,
-                "waiting": False, "ended": (task.get("state") or "").upper() in ("COMPLETE", "COMPLETED", "DONE"),
+                "waiting": False, "ended": ended,
+                "todo_total": todo_total, "todo_done": todo_done, "todo_current": todo_current,
+                "todo_current_index": todo_current_index,
+                "pr_num": None, "pr_url": None, "pr_repo": None, "pr_state": "",  # Augment Ext has no PR extraction
+                "now_line": now_line,
+                "model": "",  # no chat transcript at all (LevelDB, unreadable stdlib-only) -- honestly unknown
+                # board "failing" tile signal -- same LevelDB gap as `model` above: no
+                # command/tool-result stream to read a pass/fail off, so honestly None
+                # rather than a guess (see ext_cr_board.js's sessionState()).
+                "fail_cmd": None,
             })
     return out
 
@@ -204,7 +238,8 @@ def _parse(kind, prefix, src_label, sid):
     folder = ""
     if os.path.isfile(ws_json):
         try:
-            folder = _decode_folder(json.load(open(ws_json, encoding="utf-8")).get("folder", ""))
+            with open(ws_json, encoding="utf-8") as fh:
+                folder = _decode_folder(json.load(fh).get("folder", ""))
         except (OSError, ValueError):
             folder = ""
 
@@ -228,9 +263,23 @@ def _parse(kind, prefix, src_label, sid):
         "meta": {"cwd": folder, "title": title, "source": src_label, "entrypoint": src_label,
                  "gitBranch": _git_branch(folder), "model": ""},
         "todos": todos,
+        # Same shared-shape field Auggie CLI reports (see auggie.py's parse_auggie): this
+        # family never does Claude's exact id join. Unlike Auggie CLI, this provider has no
+        # chatHistory-equivalent AT ALL to name-match against either (the chat transcript
+        # lives in the extension's augment-kv-store LevelDB — unreadable stdlib-only, per
+        # the module docstring above), so started_at/ended_at above stay null, not just
+        # approximate. True here still means "don't trust this as an exact join" — the
+        # honest, conservative value given the provider has no timing source of any kind.
+        "todo_times_approximate": todo_times_approximate("augment"),
         "files": files, "reads": [], "commands": [], "commits": [], "tests": [],
         "requests": [], "agents": [], "agents_bg": [], "agent_sessions": [], "shells": [],
         "decisions": [], "waiting": False,
+        # Same field/shape contract as Claude/Auggie's detail dict (see parse_session's
+        # parse_error), honestly None here always: this provider has no chat transcript to
+        # parse at all (per the LevelDB gap in the module docstring above) -- "can't know",
+        # not "nothing failed", but the two read the same to the client, which is correct:
+        # there's no line/record for it to point at either way.
+        "parse_error": None,
         "prs": [],
         "narrative": narrative,
         "message": NOTE[:2000],

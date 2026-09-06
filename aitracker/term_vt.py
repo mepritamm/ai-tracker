@@ -15,6 +15,18 @@ agent adds on top of it is mechanical.
         "alt": bool,                 # True while the alternate screen buffer is active
         "cursor_visible": bool,      # DECTCEM (`?25`) -- always current, regardless of `since`
         "bracketed_paste": bool,     # DEC private mode `?2004` -- always current, regardless of `since`
+        "mouse": {"mode": int, "sgr": bool},  # mouse-reporting REQUEST state -- always current,
+                                      # regardless of `since`. `mode` is 0 (no tracking) or the DEC
+                                      # private mode number of whichever tracking mode is currently
+                                      # in effect (1000/1002/1003, most inclusive wins -- see
+                                      # `_dispatch_private`). `sgr` reflects `?1006` independently.
+                                      # The emulator only TRACKS the request; it generates no mouse
+                                      # events itself -- that is the client's job.
+        "focus_events": bool,        # DEC private mode `?1004` -- always current, regardless of
+                                      # `since`. Tracked exactly like `bracketed_paste`/`mouse`: the
+                                      # emulator only records that a program asked for focus in/out
+                                      # reports (`ESC[I`/`ESC[O`); generating those from actual
+                                      # browser focus/blur events is the client's job.
         "bell": int,                 # monotonic count of BEL (\\x07) bytes fed so far, never reset
     }
 
@@ -82,8 +94,20 @@ buffer is capped at `MAX_REPLIES`.
 These are parsed just far enough to find their terminator and are then silently discarded; they
 never reach the grid and never leave dangling bytes for the next character to inherit:
 
-- **Mouse reporting** (private CSI modes `?1000`-`?1006`): consumed as unknown private DEC modes
-  (no-op set/reset).
+- **Mouse reporting**: private CSI modes `?1000` (press/release), `?1002` (press/release + drag),
+  `?1003` (any motion) and `?1006` (SGR extended coordinates) are TRACKED and published via
+  `snapshot()`'s `mouse` field -- the emulator records which mode a program asked for, nothing
+  more. It does not encode or emit mouse events itself; generating those from actual mouse input
+  is the client's job. `?1005` and `?1015` (the utf8 and urxvt coordinate encodings) remain
+  genuinely out of scope: consumed as no-op private-mode set/reset, same as any unrecognized code.
+- **Focus reporting** (`?1004`): TRACKED and published via `snapshot()`'s `focus_events` field,
+  exactly like `bracketed_paste` and `mouse` above -- the emulator records that a program asked
+  for `ESC[I`/`ESC[O` focus in/out reports, nothing more; generating those from actual browser
+  focus/blur events is the client's job.
+- **`?2031`**: Claude Code sets this at startup (confirmed by a raw pty capture -- see this
+  session's ground truth). What it MEANS was not determined, and no meaning is guessed here: it
+  is consumed as an unrecognized private mode set/reset, same as any other unknown code -- a
+  harmless no-op, not a tracked field.
 - **Sixel / other graphics** (DCS `ESC P ... ST`, and the sibling string types SOS `ESC X`, PM
   `ESC ^`, APC `ESC _`): the whole string is scanned for its terminator (`ESC \\` or `BEL`) and
   thrown away as one unit, so binary payload inside it (which can legitimately contain bytes
@@ -156,11 +180,12 @@ import select
 import signal
 import socket
 import struct
+import subprocess
 import threading
 import time
 import uuid
 
-from . import config, server, term_gate, term_run
+from . import config, server, store, term_gate, term_run
 # Circular by design, exactly like term_run's own import of `server` -- see that module's
 # docstring comment. server.py's bottom-of-file loader imports this module by name, and this
 # module registers its routes back into server.EXTRA_GET/EXTRA_POST. Safe because those two dicts
@@ -240,6 +265,18 @@ class Screen:
         self.cursor_visible = True
         self.bracketed_paste = False   # DEC private mode `?2004` -- reported in snapshot(), the
                                         # actual ESC[200~/201~ wrapping is the client's job
+        self.focus_events = False      # DEC private mode `?1004` -- reported in snapshot(), the
+                                        # actual ESC[I/ESC[O focus in/out reports are the client's
+                                        # job (mirrors bracketed_paste/mouse exactly)
+        self._mouse_1000 = False       # DEC private modes `?1000`/`?1002`/`?1003` -- tracked
+        self._mouse_1002 = False       # independently so that layering (e.g. disabling 1003
+        self._mouse_1003 = False       # while 1002 is still on) falls back correctly; see
+                                        # `_update_mouse_mode`
+        self.mouse_mode = 0            # computed from the three flags above -- 0, or the DEC
+                                        # number of the most inclusive mode currently enabled;
+                                        # reported in snapshot(), no events generated here
+        self.mouse_sgr = False         # DEC private mode `?1006` (SGR extended coordinates) --
+                                        # independent of mouse_mode, reported in snapshot()
         self.origin_mode = False    # DECOM (`?6`): row params are relative to the scroll region
 
         self.title = ""
@@ -320,9 +357,10 @@ class Screen:
             self.pending_replies += data
 
     def snapshot(self, since):
-        """Rows changed since version `since`, plus cursor/alt/cursor_visible/bracketed_paste/bell.
+        """Rows changed since version `since`, plus
+        cursor/alt/cursor_visible/bracketed_paste/mouse/focus_events/bell.
 
-        The last four are screen (or client-event) STATE, not row diffs -- like `cursor` and
+        The last six are screen (or client-event) STATE, not row diffs -- like `cursor` and
         `alt`, they are always the CURRENT value regardless of `since`, never filtered by it.
         """
         rows_out = []
@@ -332,6 +370,8 @@ class Screen:
         return {
             "v": self.v, "rows": rows_out, "cursor": [self.cur_r, self.cur_c], "alt": self.alt,
             "cursor_visible": self.cursor_visible, "bracketed_paste": self.bracketed_paste,
+            "mouse": {"mode": self.mouse_mode, "sgr": self.mouse_sgr},
+            "focus_events": self.focus_events,
             "bell": self.bell,
         }
 
@@ -796,7 +836,39 @@ class Screen:
                 self.cursor_visible = set_
             elif code == 2004:
                 self.bracketed_paste = set_
-            # 1000-1006 (mouse) and any other private mode: no-op
+            elif code == 1000:
+                self._mouse_1000 = set_
+                self._update_mouse_mode()
+            elif code == 1002:
+                self._mouse_1002 = set_
+                self._update_mouse_mode()
+            elif code == 1003:
+                self._mouse_1003 = set_
+                self._update_mouse_mode()
+            elif code == 1006:
+                self.mouse_sgr = set_
+            elif code == 1004:
+                self.focus_events = set_
+            # 1005/1015 (mouse utf8/urxvt coordinate encodings), 2031 (Claude Code sets it,
+            # meaning undetermined -- see module docstring) and any other private mode: no-op --
+            # see module docstring's "Explicitly out of scope" section
+
+    def _update_mouse_mode(self):
+        """Recompute `self.mouse_mode` from the three independent 1000/1002/1003 flags.
+
+        Most inclusive wins (1003 > 1002 > 1000), and each flag is tracked on its own so that
+        turning 1003 off while 1002 is still on falls back to 1002, not to 0 -- real programs do
+        enable and disable these in layers (e.g. vim raising 1002 then briefly promoting to 1003
+        for a drag-select mode, then dropping back).
+        """
+        if self._mouse_1003:
+            self.mouse_mode = 1003
+        elif self._mouse_1002:
+            self.mouse_mode = 1002
+        elif self._mouse_1000:
+            self.mouse_mode = 1000
+        else:
+            self.mouse_mode = 0
 
     # -- erase -----------------------------------------------------------
 
@@ -1144,11 +1216,13 @@ class Screen:
         Scrollback survives too, for the same real-xterm-behaviour reason documented in the
         module docstring's "Scrollback" section: RIS clears the visible grid, not your history.
 
-        `cursor_visible` and `bracketed_paste` are SCREEN state, so RIS resets them like real
-        xterm does -- `__init__` below already sets them back to (True, False), nothing extra to
-        preserve. `bell` is the opposite: it is a client-side EVENT counter, not screen state
-        (see its own field comment), so it survives the reinit exactly like `v` does, for the
-        same reason -- a viewer's `since`-style comparison against it must never appear to rewind.
+        `cursor_visible`, `bracketed_paste`, `focus_events` and the mouse-tracking state
+        (`mouse_mode`, `mouse_sgr`) are SCREEN state, so RIS resets them like real xterm does --
+        `__init__` below already sets them back to their power-on defaults (`True`, `False`,
+        `False`, `0`, `False`), nothing extra to preserve. `bell` is the opposite: it is a
+        client-side EVENT counter, not screen state (see its own field comment), so it survives
+        the reinit exactly like `v` does, for the same reason -- a viewer's `since`-style
+        comparison against it must never appear to rewind.
         """
         cols, rows, v, replies, scrollback, bell = (
             self.cols, self.rows, self.v, self.pending_replies, self.scrollback, self.bell)
@@ -1210,6 +1284,17 @@ PTYS = {}                # id -> Pty
 _STREAMS = 0              # open SSE connections across all PTYs; guarded by _LOCK
 _LOCK = threading.Lock()
 
+FG_CACHE_TTL = 5          # seconds a resolved pgid -> comm mapping is trusted before the next
+                          # `ps` fork -- see `_foreground_is_claude()`'s docstring for why this is
+                          # keyed on pgid (the exit-detection signal) and what this TTL actually
+                          # bounds (pid-recycle exposure), not exit-detection latency.
+FG_CACHE_MAX = 128        # hard cap on distinct pgids remembered at once -- generous headroom
+                          # over config.MAX_TERMS's ceiling of 64 (each open terminal contributes
+                          # at most one live entry at a time; a churn of many short-lived foreground
+                          # commands in one terminal must still not grow this without bound).
+_FG_CACHE = {}            # pgid -> (comm, expires_at monotonic); guarded by _FG_CACHE_LOCK
+_FG_CACHE_LOCK = threading.Lock()
+
 
 def _clamp_int(v, lo, hi, default):
     """`int(v)` clamped to [lo, hi], or `default` if `v` isn't an int-like value at all. Used for
@@ -1269,6 +1354,16 @@ class Pty:
         self.screen = screen
         self.cwd = cwd
         self.cmd = cmd
+        self.session = ""          # the session id this pty was opened against, or "" for a
+                                    # session-less `cwd` open (see open_pty()'s "Two ways in").
+                                    # Set once, right after construction, by open_pty() -- never
+                                    # by spawn() itself, which knows nothing of the request body.
+                                    # Exposed by _live_list() so a "peek into this terminal" link
+                                    # built from that list can carry `sid` and get the full
+                                    # ContextBar, not a degraded view. Write-once, read under
+                                    # _LOCK like every other PTYS-dict-visible field here.
+        self.mode = ""              # "cwd" | "resume" | "new", set alongside `session` above for
+                                    # the same reason (the standalone view's `?mode=` param).
         self.viewers = 0           # open SSE /api/term/screen connections; guarded by _LOCK
         self.raw_queues = []       # queue.Queue per open /api/term/raw viewer -- see raw_stream()
                                     # and the TRACKER_TERM_RENDERER switch comment below. Mutated
@@ -1518,8 +1613,18 @@ def _live_count():
 
 def _live_list():
     """The live PTYs as plain dicts, oldest first -- what `open_pty()`'s 429 hands back so the
-    client can show WHICH terminals hold the slots and close one. Call under `_LOCK`."""
-    return [{"tty": p.id, "cmd": p.cmd, "cwd": p.cwd, "started": p.started}
+    client can show WHICH terminals hold the slots and close one, and what `GET /api/term/list`
+    (below) hands back on demand for the same purpose. Call under `_LOCK`.
+
+    `session`/`mode` are always present, even when empty (a plain `cwd` shell has no session) --
+    the client must see `""`, never `undefined`, so a "peek into this terminal" link can always
+    be built the same way. `forked` rides along for the same reason: it is the LIVE value of
+    `Pty.forked`, so it reflects a LATE backstop retry too (unlike the POST /api/term/pty
+    response, which necessarily went out before `_resume_backstop` could flip it). Without it a
+    peeked terminal silently loses its `⑂ fork` chip, because the peek URL can only carry what
+    this row exposes."""
+    return [{"tty": p.id, "cmd": p.cmd, "cwd": p.cwd, "started": p.started,
+             "session": p.session, "mode": p.mode, "forked": p.forked}
             for p in sorted(PTYS.values(), key=lambda p: p.started) if not p.done]
 
 
@@ -1616,6 +1721,33 @@ refusal is still completely silent -- `text` stays empty, `first_output_at` stay
 clear never fires for it. An ordinary resume, by contrast, starts painting well inside 0.5s, so
 its `starting` placeholder clears promptly instead of sitting through the full BACKSTOP_WINDOW."""
 
+ATTACH_SETTLE = 4.0
+"""How long `_resume_backstop` watches a swapped-in `claude attach` child (see
+`_retry_with_attach`) before concluding the recovery worked -- at which point it RETURNS, and its
+`finally` clears `Pty.starting` on the way out. The sibling of BACKSTOP_SETTLE for the one child
+that constant cannot judge.
+
+**ANCHORED ON THE SWAP, NOT ON OUTPUT -- and that is the whole point of it being a separate
+constant.** The obvious implementation is to re-arm BACKSTOP_SETTLE's own machinery for the
+replacement child (reset `first_output_at`, drop `buf`) and let "first printable output + 0.5s"
+decide again. That was tried and it DOES NOT WORK, for a reason nothing about the constants
+suggests: `_retry_with_attach` calls `_feed_note`, and `_feed_note` pushes its line through
+`_tee_raw` onto every `pt.raw_queues` entry -- INCLUDING this watcher's own queue. So the
+re-armed clock anchors on OUR OWN injected note, roughly at the swap, and fires ~0.5s later no
+matter what the attach child is doing; measured, the churn came straight back at attach
+lifetimes past 0.5s. Any future output-anchored scheme hits the same wall. Don't re-try it.
+
+**WHY 4.0.** What must NOT happen is the settle firing while a failing attach is still on its way
+to dying -- that hands the user a dead pane instead of the fork fallback, which is the original
+bug. The measured death of the analogous child (a refused `claude --resume`, same binary, same
+cold start dominating) is 2.61s: prints at 2.05s, exits at 2.61s (see BACKSTOP_WINDOW). Add
+BACKSTOP_POLL of observation lag and the number to beat is ~2.7s. 4.0 leaves ~1.3s of margin,
+about 50% over measured, and is deliberately biased LONG: the two failure directions are not
+symmetric -- too short costs the user a dead terminal, too long costs them a slightly longer
+"starting…". It is also exactly half of BACKSTOP_WINDOW, which is the placeholder the pane would
+otherwise sit through, and it stays well clear of that outer bound so the deadline never
+pre-empts this."""
+
 
 def _feed_note(pt, text):
     """Record a LATE-firing Option-C event (see the section docstring above) on EVERY channel a
@@ -1642,12 +1774,16 @@ def _feed_note(pt, text):
        **Never write `line` to `pt.fd`** -- these bytes are a synthesized notice for viewers, not
        input to the child process; writing them to the pty would send them to the running program
        as keystrokes.
-    3. `pt.add_notice(text)` -- the structured, per-viewer-tracked queue `_screen_stream_body()`
-       delivers as the SSE frame's `notices` key (added alongside `screen.snapshot()`'s own
-       fields, never inside `Screen` itself -- the queue lives on `Pty`, `Screen` has no notion of
-       it). Only a `screen_stream()` viewer ever sees this key: `raw_stream()` carries no JSON
-       envelope at all, so there is no channel through which an xterm.js viewer could receive a
-       structured notice either -- (1)/(2) above are the only way that renderer learns anything.
+    3. `pt.add_notice(text)` -- the structured, per-viewer-tracked queue BOTH stream routes now
+       deliver from: `_screen_stream_body()` merges it into the SSE frame's `notices` key (added
+       alongside `screen.snapshot()`'s own fields, never inside `Screen` itself -- the queue lives
+       on `Pty`, `Screen` has no notion of it), and `_raw_stream_body()` walks the SAME queue to
+       emit a named `event: notice\\ndata: <json>\\n\\n` frame on the raw byte SSE connection --
+       see that function's own docstring for the mechanism. This is what gives a `raw_stream()`/
+       xterm.js viewer a REPLAY channel despite (2) above being live-only-by-construction: a raw
+       viewer that attaches or reconnects AFTER this fires still receives the notice from this
+       queue, even though it never saw the tee'd bytes (2) pushed to viewers already attached at
+       the time.
 
     All three happen under ONE `pt.lock` acquisition -- the same lock `_tee_raw`'s other caller
     (`_reader`) and every other mutator of `pt.screen`/`pt.raw_queues` already holds -- so a
@@ -1675,6 +1811,30 @@ def _retry_with_fork(pt, sid, cols, rows):
     # EXPECTED path for those, not a failure detector any more.
     print("[ai-tracker] terminal %s: resume refusal backstop fired for session %s -- "
           "retrying with --fork-session" % (pt.id, sid))
+    # Captured HERE, BEFORE _fork_child's execvp below -- not after, and not folded into the
+    # record_fork() call further down. store.record_fork's whole fork-lineage design (see
+    # store.py's "fork lineage" module comment) depends on `pre_existing` naming every session id
+    # that existed BEFORE the child could possibly have written its own transcript. Captured after
+    # the exec, a fast-writing child could land IN this very listing and get permanently excluded
+    # as "pre-existing" -- exactly the ordering bug store.py's defect-2 fix closes. A bookkeeping
+    # failure here must never turn the user-visible recovery (the fork retry itself) into a crash,
+    # so it's swallowed exactly like the record_fork() call below already is -- but see the
+    # `except` branch just below for why `fork_snapshot` must NOT simply come back `None` on
+    # that path.
+    try:
+        fork_snapshot = store.capture_fork_snapshot(sid)
+    except Exception as exc:
+        print("[ai-tracker] terminal %s: capture_fork_snapshot failed for session %s: %r"
+              % (pt.id, sid, exc))
+        # NOT `None` -- to record_fork(), `snapshot=None` means "no snapshot was
+        # supplied, please self-capture", and a self-capture here would run AFTER
+        # _fork_child's execvp below, reopening the exact pre-exec-vs-post-exec race
+        # this whole capture-before-exec dance exists to close. Passing an explicit,
+        # unusable snapshot instead makes record_fork() use it as given: `pre_existing:
+        # None` trips resolve_fork_child's refuse-gate, so the fork honestly stays
+        # unresolved (and is retried, then abandoned) rather than silently swallowing
+        # the child forever.
+        fork_snapshot = {"parent_uuids": [], "parent_dir": "", "pre_existing": None, "parent_ct": None}
     pid, fd = _fork_child(pt.cwd, argv, cols, rows)
     screen = Screen(cols=cols, rows=rows)     # allocate before the lock; it touches nothing shared
     # MUTUAL EXCLUSION, not another re-check. `close_pty` and this swap are two check-then-act
@@ -1716,6 +1876,19 @@ def _retry_with_fork(pt, sid, cols, rows):
             pass
         print("[ai-tracker] terminal %s: retry abandoned -- closed while forking" % pt.id)
         return
+    # This is the ONLY moment the parent/child fork link is knowable: Claude Code writes the
+    # fork to a brand-new session id and never reports it back (see store.py's "fork lineage"
+    # section), so `sid` (the parent) and `pt.cwd` (the terminal's cwd -- verbatim, matching what
+    # the parent's own transcript's first `cwd` line recorded, since `term_gate.session_cwd` reads
+    # it straight off that transcript with no path normalization) have to be captured right here,
+    # right now, or the association is gone for good. `fork_snapshot` itself was captured EARLIER
+    # still -- before _fork_child's execvp above, see that call site's own comment -- and is simply
+    # handed along here; record_fork never re-derives it. A failure to record must never turn a
+    # successful fork retry -- the user-visible recovery -- into a crash, so it's swallowed.
+    try:
+        store.record_fork(sid, pt.cwd, time.time(), fork_snapshot)
+    except Exception as exc:
+        print("[ai-tracker] terminal %s: record_fork failed for session %s: %r" % (pt.id, sid, exc))
     _feed_note(pt, "[ai-tracker] note: the resume was refused as a running background agent; "
                    "retried automatically with --fork-session -- this is now a COPY under a "
                    "new session id, not the live agent")
@@ -1728,6 +1901,129 @@ def _retry_with_fork(pt, sid, cols, rows):
         pt.starting = False
 
 
+def _retry_with_attach(pt, sid, target, cols, rows):
+    """The PREFERRED one-shot retry for a bg-agent refusal: re-exec `claude attach <target>`
+    and swap THAT child into this same `Pty` -- same tty id the client already holds, fresh
+    `Screen`, a new `_reader` thread. Deliberately modelled line-for-line on `_retry_with_fork`
+    above and reusing its swap machinery (the `_LOCK` mutual exclusion against `close_pty`, the
+    abandoned-swap cleanup, the replacement reader thread) -- see that function's long comments
+    for WHY each of those pieces is shaped the way it is. A second, subtly-different swap
+    mechanism next to it would be the next bug. The ONE piece deliberately NOT copied is that
+    function's `pt.starting = False`: the fork retry is terminal and this one is not, so clearing
+    it here would advertise "settled" mid-recovery -- see the comment at the end of this function,
+    and do not "restore the symmetry" without reading it.
+
+    **WHY THIS RUNS BEFORE THE FORK.** Both retries answer the same refusal, but they hand the
+    user two very different things. `--fork-session` branches a COPY off the transcript under a
+    brand-new session id: the live agent keeps running in the background, untouched, and the
+    pane the user is looking at is a duplicate that will diverge from it -- which is why the
+    fork retry, though it always "worked", never actually resumed anything from the user's point
+    of view. `claude attach <short-id>` re-enters the REAL, still-running session: same id, same
+    agent, the thing the user asked for when they clicked resume. So attach is the answer and
+    the fork is the consolation prize -- tried only if attach cannot be attempted or its own
+    child dies (see `_resume_backstop`'s fallback branch), because a copy still beats a dead
+    terminal.
+
+    THREE things this deliberately does NOT do, all for one reason -- **an attach re-enters an
+    EXISTING session, it does not create one**:
+      * no `store.capture_fork_snapshot` / no `store.record_fork` -- there is no parent/child
+        lineage to record. The id the user is now talking to IS `sid`; inventing a fork edge
+        for it would poison store.py's fork lineage with a child that never existed.
+      * no `pt.forked = True` -- the `⑂ fork` chip means "this pane is a copy". On an attach it
+        would be a lie in the one direction that matters to the user.
+      * no `--fork-session` anywhere in `argv`.
+
+    Returns True when a replacement child was installed -- and also on the `abandoned` path,
+    where one was spawned and then deliberately reaped because the user closed the pty
+    underneath us (there is nothing to fall back TO once the pane is gone). Returns False only
+    when no attach could be ATTEMPTED at all: an empty `target`, or a fork that raised. False is
+    the caller's signal to fall back to `_retry_with_fork`.
+    """
+    argv = term_gate.attach_argv(target)
+    if not argv:
+        # term_gate.attach_target() yielded "" -- no `claude attach <id>` hint in the refusal
+        # (the LEGACY wording carries none) and no `sid` to shorten. Nothing to attach TO.
+        print("[ai-tracker] terminal %s: no attach target for session %s -- "
+              "falling back to --fork-session" % (pt.id, sid))
+        return False
+    print("[ai-tracker] terminal %s: resume refusal backstop fired for session %s -- "
+          "retrying with `claude attach %s`" % (pt.id, sid, target))
+    try:
+        pid, fd = _fork_child(pt.cwd, argv, cols, rows)
+    except Exception as exc:
+        # Only the PARENT-side failures land here (pty.fork() out of ptys/fds, the winsize
+        # ioctl). A failed execvp does NOT: _fork_child's child exits 127 instead, which the
+        # caller's continued watch sees as "the attach child died non-zero" and falls back on
+        # exactly like a stale bg session would.
+        print("[ai-tracker] terminal %s: attach retry could not spawn for session %s: %r"
+              % (pt.id, sid, exc))
+        return False
+    screen = Screen(cols=cols, rows=rows)     # allocate before the lock; it touches nothing shared
+    # The SAME mutual exclusion as _retry_with_fork's swap, for the same reason and in the same
+    # lock order (`pt.lock` nests inside `_LOCK`; nothing in this module takes them the other way
+    # round) -- read that function's comment, this is the identical check-then-act race against
+    # `close_pty`, not a second design of it.
+    with _LOCK:
+        abandoned = pt.closing
+        if not abandoned:
+            with pt.lock:
+                pt.screen = screen
+            pt.pid, pt.fd = pid, fd
+            pt.cmd = " ".join(argv)
+            pt.done, pt.rc, pt.ended = False, None, 0.0
+            # NO `pt.forked = True` -- see the docstring. This pane is the real session.
+    if abandoned:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except (ChildProcessError, OSError):
+            pass
+        print("[ai-tracker] terminal %s: attach retry abandoned -- closed while attaching" % pt.id)
+        # True, NOT False. The pty is gone because the user clicked ✕. Reporting failure here
+        # would send the caller into `_retry_with_fork`, which would resurrect the very pane
+        # they just told us to destroy -- the exact bug the `closing` guards exist to prevent.
+        return True
+    _feed_note(pt, "[ai-tracker] note: this session was already running in the background -- "
+                   "attached to the live session with `claude attach %s`" % target)
+    threading.Thread(target=_reader, args=(pt,), daemon=True).start()
+    # **NO `pt.starting = False` HERE, and that asymmetry with `_retry_with_fork` is deliberate.**
+    # `_retry_with_fork` is TERMINAL -- every path that reaches it returns immediately after, so
+    # nothing can retry past it and "a replacement child is installed" really is the final answer
+    # to the readiness question. This function is NOT: `_resume_backstop` keeps watching the child
+    # installed above and still falls back to `_retry_with_fork` if it dies non-zero. Clearing
+    # here advertises "settled" while recovery is still in flight, and `_screen_stream_body`'s
+    # terminating condition -- `done and not starting` (see its comment, which explains that the
+    # flag exists precisely to hold the SSE stream open across a child's death) -- then fires in
+    # the gap between the attach child's exit and the fork retry reviving the pty, closing the
+    # EventSource mid-recovery. That is the reconnect churn `starting` was introduced to
+    # eliminate; a viewer copying that condition verbatim at its real 0.05s cadence closed early
+    # in 12 of 12 attach->fail->fork trials before this clear was removed.
+    #
+    # Nothing is left stuck, and there is no second clearing site to keep in sync: from here the
+    # flag is owned SOLELY by `_resume_backstop` -- this function's only caller -- whose `finally`
+    # clears it unconditionally on every exit path, including the abandoned one below and
+    # including plain window expiry. Its settle-clear stands itself down for the rest of the watch
+    # (`not attach_tried`, see there), so "recovery concluded" and "`starting` cleared" become the
+    # same instant instead of two instants with a fork retry in between.
+    #
+    # THE PRICE, stated plainly so nobody re-derives it as a bug: a SUCCESSFUL attach shows the
+    # client's "starting…" placeholder for ATTACH_SETTLE past the swap instead of painting rows
+    # immediately. That is not an oversight to optimise away in isolation -- it is the same
+    # interval during which `_resume_backstop` can still yank this child out and fork, and a pane
+    # cannot honestly claim to be settled while that is true. The earlier code made the opposite
+    # trade (clear now, accept the churn) and the churn is the symptom users actually reported.
+    # ATTACH_SETTLE exists to keep that honest interval as short as the measurements allow rather
+    # than letting it run to BACKSTOP_WINDOW; read its docstring before shortening it further.
+    return True
+
+
 def _resume_backstop(pt, sid, already_forked, cols, rows):
     """Watches a just-spawned `mode="resume"` child's raw output for up to BACKSTOP_WINDOW
     seconds, via the SAME tee `raw_stream()` uses (`pt.raw_queues`) -- not a second read of the
@@ -1737,7 +2033,13 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
        False -- a session the fast path already forked can't ALSO hit this refusal (that's
        exactly what --fork-session avoids), so there is nothing to retry. On a match (and the
        child having actually exited non-zero -- the refusal exits immediately, per the matrix),
-       retries EXACTLY ONCE via `_retry_with_fork` and returns; this function never loops.
+       it retries ONCE with `_retry_with_attach` (`claude attach <short-id>`, which gives the
+       user back the REAL live session -- see that function for why it goes first) and keeps
+       watching the replacement child in this same loop. If the attach could not be attempted,
+       or its own child then dies non-zero (a bg session that ended in the meantime, a stale
+       short id, a failed execvp), it falls back ONCE to `_retry_with_fork` and returns. Each
+       retry is one-shot: `attach_tried` gates the first and returning gates the second, so this
+       function still never loops.
     2. **The missing-transcript message** (term_gate.looks_like_missing_transcript) -- not a
        retry trigger (the CLI already recovered on its own), just records `pt.notice` and feeds
        a note so the terminal doesn't silently pretend the resumed transcript is the one shown.
@@ -1749,6 +2051,20 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
     `finally`, REGARDLESS of which way this function exits -- window expiry, an unrelated child
     exit, anything -- so a pty can never be left stuck in `starting` because this watcher gave up
     without either of the two conditions above ever resolving. Fail-open, not fail-stuck.
+
+    That settle-clear covers the ATTACH child too, and has to: `_retry_with_attach` deliberately
+    does not clear `starting` itself, because the pane must keep advertising "still settling"
+    across the WHOLE attach->(maybe fork) recovery -- fork is still fork-able right up until this
+    function returns, and a viewer told "settled" in between closes its stream mid-recovery (see
+    that function's closing comment). So once the attach branch below fires, the settle-clear
+    stands itself down (`not attach_tried`) and this `finally` becomes the SOLE owner of the flag
+    -- which also covers `_retry_with_attach`'s ABANDONED return, where a child is spawned, reaped
+    and nothing else changes. The cost of that is a successful attach sitting in the client's
+    "starting…" placeholder until this watch ends; see `_retry_with_attach` for why that is the
+    right side of the trade, and ATTACH_SETTLE for the settle-RETURN that ends the watch as soon
+    as the attach child has proved itself, so "as long as the watch runs" is ~4s and not the full
+    BACKSTOP_WINDOW. Every exit from that watch -- settled, forked, expired, abandoned -- leaves
+    through this one `finally`; there is no second clearing site to keep in sync.
     """
     q = queue.Queue(maxsize=256)
     with pt.lock:
@@ -1758,6 +2074,13 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
     first_output_at = None   # time.time() of the first non-empty `text` seen -- see BACKSTOP_SETTLE
     deadline = time.time() + BACKSTOP_WINDOW
     grace_until = None      # set once pt.done is first observed -- see BACKSTOP_DONE_GRACE
+    attach_settle_at = None  # set once, at the attach swap -- see ATTACH_SETTLE
+    attach_tried = False    # one-shot latch: at most ONE `claude attach` retry per run, and once
+                            # it is set the refusal branch below can never re-enter (`buf` still
+                            # holds the refusal text, so looks_like_bg_refusal() keeps matching --
+                            # this flag, not the matcher, is what makes the retry one-shot). The
+                            # fork retry is one-shot by construction: every path that reaches it
+                            # returns immediately after.
     try:
         while True:
             now = time.time()
@@ -1785,7 +2108,19 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
             # here is fail-open.
             if first_output_at is None and term_gate._normalize_output(text):
                 first_output_at = now
-            if (pt.starting and first_output_at is not None
+            # `not attach_tried` STANDS THIS CLAUSE DOWN once an attach is in flight, and it is
+            # load-bearing rather than belt-and-braces. This clause answers "is the ORIGINAL
+            # resume ordinary?"; after a refusal that question is settled (it wasn't) and the only
+            # open question is the attach child's fate, which this clause is not equipped to
+            # judge -- an attach failure prints no marker at all (see the fallback branch below),
+            # so `not looks_like_bg_refusal(text)` says nothing about it. Left un-gated it would
+            # also fire ACCIDENTALLY: `buf` keeps only the last BACKSTOP_SCAN_BYTES, so a chatty
+            # attach child (a long transcript replaying into the pane -- the good case!) pushes
+            # the refusal text out of the scanned tail, the refusal clause goes true, and
+            # `starting` clears while a fork fallback is still possible. That is exactly the
+            # premature clear removed from `_retry_with_attach` -- read its closing comment --
+            # arriving by a second route. From here the `finally` owns the flag.
+            if (pt.starting and not attach_tried and first_output_at is not None
                     and now - first_output_at >= BACKSTOP_SETTLE
                     and not pt.done and not term_gate.looks_like_bg_refusal(text)):
                 with pt.lock:
@@ -1797,7 +2132,7 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
                 _feed_note(pt, "[ai-tracker] note: " + pt.notice)
                 print("[ai-tracker] terminal %s: missing-transcript notice fired for session %s"
                       % (pt.id, sid))
-            if (not already_forked and pt.done and pt.rc not in (0, None)
+            if (not already_forked and not attach_tried and pt.done and pt.rc not in (0, None)
                     and not pt.closing and pt.rc != -signal.SIGKILL
                     and term_gate.looks_like_bg_refusal(text)):
                 # Two guards, because they catch different actors, and the intent one is the
@@ -1813,7 +2148,84 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
                 # RESURRECTS the pty it was just told to destroy: _retry_with_fork resets `done`
                 # back to False and forks a --fork-session child nobody asked for, so close
                 # returns 200 while the slot never frees.
+                #
+                # ATTACH FIRST, FORK ONLY IF ATTACH ISN'T POSSIBLE. The refusal itself tells us
+                # the command that works -- "Run `claude attach e30d3b6a` to open it" -- and that
+                # command hands the user back the LIVE session they clicked resume on.
+                # `--fork-session` only ever hands them a COPY that diverges from the agent still
+                # running in the background, which is why this recovery "worked" for a year while
+                # the user's actual complaint ("it never really resumed") stayed true. So the fork
+                # is demoted to the fallback: it is still strictly better than a dead pane, and
+                # nothing else here changes. See `_retry_with_attach`'s docstring.
+                target = term_gate.attach_target(text, sid)
+                if target and _retry_with_attach(pt, sid, target, cols, rows):
+                    attach_tried = True
+                    # Keep watching the REPLACEMENT child in THIS loop rather than starting a
+                    # second watcher thread -- the attach can itself fail (the bg session ended
+                    # between the refusal printing and us attaching, or the short id is stale),
+                    # and a terminal left dead is exactly what this backstop exists to prevent.
+                    # Three resets are what make that continued watch real rather than nominal:
+                    #   `grace_until` -- already armed by the REFUSED child's own exit on an
+                    #     earlier tick, it would end this loop within BACKSTOP_DONE_GRACE and the
+                    #     attach child's fate would never be observed. It belonged to a process
+                    #     that no longer exists.
+                    #   `deadline` -- the original is measured from the ORIGINAL spawn and a
+                    #     refusal burns ~2.6s of it (see BACKSTOP_WINDOW), leaving too little for
+                    #     an attach's own ~2s cold start to fail inside. A just-spawned child gets
+                    #     a full BACKSTOP_WINDOW; that is what the constant means, and this is the
+                    #     same kind of watch over the same kind of child.
+                    #   `attach_settle_at` -- ARMS the settle-return below, the one thing that
+                    #     ends this continued watch on success rather than on expiry. See
+                    #     ATTACH_SETTLE, and note it is anchored HERE, on the swap, not on any
+                    #     output.
+                    # `pt.starting` is deliberately NOT among them: it stays SET for the whole of
+                    # this continued watch, because a fork fallback is still possible for the
+                    # whole of this continued watch. Neither `_retry_with_attach` nor the
+                    # settle-clear above will touch it now (see both) -- the `finally` clears it
+                    # when this watch genuinely ends, and that is the point.
+                    grace_until = None
+                    deadline = time.time() + BACKSTOP_WINDOW
+                    attach_settle_at = time.time() + ATTACH_SETTLE
+                    continue
                 _retry_with_fork(pt, sid, cols, rows)
+                return
+            if (attach_tried and pt.done and pt.rc not in (0, None)
+                    and not pt.closing and pt.rc != -signal.SIGKILL):
+                # The attach child ITSELF died non-zero: a stale short id, a bg session that
+                # ended in the seconds since the refusal printed, or _fork_child's own exit 127
+                # from a failed execvp. No marker match is required -- an attach that exits
+                # non-zero has already said everything there is to say -- but the same two
+                # "did WE kill it" guards as the branch above still apply verbatim, and for the
+                # identical reasons: without them a ✕ landing during the attach watch would be
+                # read as an attach failure and fork a child nobody asked for.
+                # Reachable at most once: `attach_tried` can only be set by the branch above
+                # (itself one-shot), and this branch returns.
+                print("[ai-tracker] terminal %s: `claude attach` retry exited rc=%r for session "
+                      "%s -- falling back to --fork-session" % (pt.id, pt.rc, sid))
+                _retry_with_fork(pt, sid, cols, rows)
+                return
+            if (attach_settle_at is not None and now >= attach_settle_at and not pt.done):
+                # THE ATTACH WORKED. The replacement child has been alive for ATTACH_SETTLE --
+                # comfortably past the point a failing one would have died and been caught by the
+                # branch directly above, which is checked FIRST on every tick precisely so a dead
+                # child is never mistaken for a settled one.
+                #
+                # This RETURNS rather than clearing `pt.starting` in place, and that distinction
+                # is the entire reason this is safe. Clearing here and watching on would recreate
+                # the very hole removed from `_retry_with_attach`, just narrower: a window in
+                # which the pane says "settled" while a fork fallback is still armed. Returning
+                # instead retires the fallback and clears the flag in the SAME breath -- the
+                # `finally` below does the clearing -- so "recovery concluded" and "`starting`
+                # cleared" remain one instant with nothing in between, exactly as they are on the
+                # expiry path. The invariant is preserved; only the wait gets shorter.
+                #
+                # What it costs: an attach that dies LATER than ATTACH_SETTLE no longer gets the
+                # fork fallback. That is a deliberate, bounded trade -- see ATTACH_SETTLE for the
+                # measured margin behind the number -- and it degrades to ordinary end-of-life
+                # (the child died, the stream closes, which is correct once recovery is over),
+                # not to the stuck pane this backstop exists to prevent.
+                print("[ai-tracker] terminal %s: `claude attach` retry settled for session %s"
+                      % (pt.id, sid))
                 return
             if pt.done and grace_until is None:
                 grace_until = time.time() + BACKSTOP_DONE_GRACE
@@ -1821,7 +2233,8 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
         # Fail-open, unconditional: however this function is exiting (window expiry, an
         # already_forked resume with nothing to detect, an unrelated done -- anything), a pty
         # must never be left stuck in `starting` just because neither the settle-clear above nor
-        # `_retry_with_fork` happened to run. See this function's own docstring.
+        # `_retry_with_attach`/`_retry_with_fork` happened to run. See this function's own
+        # docstring.
         with pt.lock:
             pt.starting = False
             if q in pt.raw_queues:
@@ -1955,6 +2368,8 @@ def open_pty(handler, parsed, body):
         pt = spawn(cwd, argv, cols, rows)
     except OSError as e:
         return handler._json({"error": "spawn failed: %s" % e}, 500)
+    pt.session = sid    # "" for a session-less `cwd` open -- see Pty.__init__'s comment
+    pt.mode = mode
     pt.forked = forked
     starting = mode == "resume"
     if starting:
@@ -2122,6 +2537,25 @@ def close_pty(handler, parsed, body):
     handler._json({"ok": True, "closed": True})
 
 
+def term_list(handler, parsed):
+    """GET /api/term/list -> {"terminals": [{tty, cmd, cwd, started, session, mode}, ...], "max": <int>}.
+
+    The on-demand counterpart to `open_pty()`'s 429 body: today a user can only see/manage their
+    running terminals once they hit the cap and get refused. A "Manage terminals" panel needs the
+    same list available any time, not just as a side effect of a rejection -- so this is a thin
+    wrapper around the SAME `_live_list()` the 429 path already builds (conventions rule 4: one
+    enumeration, not two). `max` is `config.MAX_TERMS`, read late-bound here exactly like the 429
+    check above reads it (never copied into a client-side constant -- conventions rule 5, server
+    owns policy; see `test_cap_is_read_late_bound_from_config` for the discipline this mirrors).
+    """
+    if not term_gate.guard(handler):
+        return
+    with _LOCK:
+        _reap()
+        terminals = _live_list()
+    handler._json({"terminals": terminals, "max": config.MAX_TERMS})
+
+
 def resize_pty(handler, parsed, body):
     """POST /api/term/resize {tty, cols, rows} -> {ok: true}.
 
@@ -2146,6 +2580,92 @@ def resize_pty(handler, parsed, body):
     with pt.lock:
         pt.screen.resize(cols, rows)
     handler._json({"ok": True})
+
+
+def _foreground_is_claude(fd):
+    """Best-effort: is a Claude CLI actually sitting in the foreground of this pty right now?
+
+    `mode` (how the terminal was opened -- "cwd"/"resume"/"new") is only a PROXY for this. A
+    `cwd`-mode plain shell where the user later typed `claude` themselves is running one with no
+    way to tell from `mode` alone; a `resume`/`new` pane whose `claude` process already exited is
+    the mirror-image false positive. `os.tcgetpgrp(fd)` (stdlib, POSIX -- macOS and Linux both)
+    gives the terminal's foreground process GROUP; when a shell launches a foreground command it
+    normally becomes that group's own leader, so its pid equals the pgid, and `ps -o comm= -p
+    <pgid>` reads back that process's command name.
+
+    Deliberately conservative: ANY failure here (pty already dead, platform without
+    `tcgetpgrp`/`ps`, the process racing to exit between the two calls, `ps` missing) reports
+    False rather than raising or guessing True. Hiding the model-switcher button is the harmless
+    failure; showing it when nothing is listening for "/model ..." would type a slash command
+    into a bash prompt instead -- the harmful one. This is POLICY the server decides once here;
+    callers must not re-derive it (conventions rule 5).
+
+    ## The pgid->comm cache
+
+    The client polls `attached()` every ~2s per open terminal; at the terminal cap that is a
+    sustained fork-per-poll just to read a command name that essentially never changes between
+    polls. `tcgetpgrp` is a cheap syscall and runs on EVERY call, unconditionally -- it is also
+    the exit-detection signal (see below), so it must never be skipped. Only the `ps` fork that
+    resolves a pgid to a command name is cached, keyed on the pgid itself, not on `fd`/tty.
+
+    That keying is what makes this safe to cache at all: when the user quits Claude, the pty's
+    foreground process GROUP changes synchronously, in-kernel, the instant control returns to the
+    shell -- `tcgetpgrp` reflects that on the very next call, before any cache is even consulted.
+    So a cache miss on the new (shell's) pgid happens immediately; there is no TTL-shaped delay in
+    detecting the exit. `FG_CACHE_TTL` (5s, roughly 2 poll intervals) instead bounds a different,
+    much rarer risk: a pid/pgid getting reused by an unrelated process while a stale "claude"
+    entry for that same number is still cached, which would need the OS to hand out that exact
+    recently-freed pgid again AND that new process to become this same pty's foreground within the
+    TTL window -- pids are allocated ~monotonically with wraparound over tens of thousands, so an
+    immediate exact-number reuse is already unlikely; the TTL just puts a hard ceiling (a few
+    seconds) on how long a coincidence like that could show a stale True. A cache MISS or any `ps`
+    failure is never cached -- only a resolved comm is stored, so "unknown" can never calcify into
+    a stale True (fail-closed holds with or without a hit). `FG_CACHE_MAX` bounds the dict itself
+    against unbounded growth from a terminal that churns through many distinct foreground pgids.
+    """
+    try:
+        pgid = os.tcgetpgrp(fd)
+    except OSError:
+        return False
+    now = time.monotonic()
+    with _FG_CACHE_LOCK:
+        hit = _FG_CACHE.get(pgid)
+        if hit is not None and hit[1] > now:
+            return hit[0] == "claude"
+    try:
+        out = subprocess.run(["ps", "-o", "comm=", "-p", str(pgid)],
+                              capture_output=True, text=True, timeout=1)
+    except Exception:
+        return False
+    if out.returncode != 0:
+        return False
+    comm = os.path.basename((out.stdout or "").strip()).lower()
+    with _FG_CACHE_LOCK:
+        if pgid not in _FG_CACHE and len(_FG_CACHE) >= FG_CACHE_MAX:
+            _FG_CACHE.pop(next(iter(_FG_CACHE)), None)  # oldest entry -- bound growth, not precise LRU
+        _FG_CACHE[pgid] = (comm, now + FG_CACHE_TTL)
+    return comm == "claude"
+
+
+def attached(handler, parsed):
+    """GET /api/term/attached?tty=<id> -> {"claude_attached": bool}.
+
+    The server-owned answer to "is a Claude CLI listening on this pty" -- see
+    `_foreground_is_claude()` above for why `mode` alone can't answer this and why a failure here
+    reports False. Same guard/lookup/404 shape as every other `/api/term/*` route (`resize_pty`
+    just above is the closest analogue): no weaker auth than a route that can already write bytes
+    to this same pty via `/api/term/keys`.
+    """
+    if not term_gate.guard(handler):
+        return
+    from urllib.parse import parse_qs
+    tid = parse_qs(parsed.query).get("tty", [""])[0]
+    with _LOCK:
+        _reap()
+        pt = PTYS.get(tid)
+    if pt is None or pt.done:
+        return handler._json({"error": "no such terminal"}, 404)
+    handler._json({"claude_attached": _foreground_is_claude(pt.fd)})
 
 
 def screen_stream(handler, parsed):
@@ -2206,13 +2726,18 @@ def _screen_stream_body(handler, pt):
     * Every data frame is a PLAIN, UNNAMED `data: <json>\\n\\n` line -- never `event: <name>`.
       The client's `EventSource.onmessage` only fires for unnamed events; one named `event:`
       frame and the terminal goes permanently, silently dark. (Tier 2's `term_run.stream()` right
-      next door DOES send `event: end` -- that pattern is Tier 2-only, deliberately not mirrored
+      next door DOES send `event: end` -- that pattern is deliberately not mirrored on THIS route.
+      `raw_stream()`'s `_raw_stream_body()`, by contrast, DOES now mirror it: it sends named
+      `event: notice` frames on its own connection, for the reason given in that function's own
+      docstring -- unlike this route, it has no JSON envelope for an unnamed frame to carry a
+      structured notice inside, so a named event is the only channel it has. That divergence is
+      real and scoped to the raw stream; this route's own wire format stays exactly as documented
       here.) The `: ping\\n\\n` heartbeat is a comment line, not a `data:`/`event:` frame, so
       EventSource ignores it for free -- that one is safe as-is.
     * The JSON object carries EXACTLY the keys `Screen.snapshot()` returns -- `v`, `rows`,
-      `cursor`, `alt`, `cursor_visible`, `bracketed_paste`, `bell` -- verbatim, unpadded, PLUS two
-      keys this function adds itself: `notices` (see below) and `starting` (see next). No other
-      wrapping, no other extra keys, ever.
+      `cursor`, `alt`, `cursor_visible`, `bracketed_paste`, `mouse`, `focus_events`, `bell` --
+      verbatim, unpadded, PLUS two keys this function adds itself: `notices` (see below) and
+      `starting` (see next). No other wrapping, no other extra keys, ever.
     * `starting` is `Pty.starting`, read under the SAME lock acquisition as the snapshot, on
       EVERY frame (not just while True) -- see `open_pty()`'s readiness-state section for what
       sets/clears it. While it is True, `rows` in the OUTGOING frame is forced to `[]` regardless
@@ -2223,8 +2748,9 @@ def _screen_stream_body(handler, pt):
       common case of a viewer attaching before the flag clears), so `Screen.snapshot()` naturally
       returns a FULL, complete-so-far grid on the very first non-suppressed frame -- a real replay
       of everything withheld, with no second code path and no separate buffer to keep in sync.
-      Cursor, `alt`, `cursor_visible`, `bracketed_paste`, `bell` and `notices` are UNAFFECTED by
-      `starting` and keep flowing normally throughout -- only row content is withheld.
+      Cursor, `alt`, `cursor_visible`, `bracketed_paste`, `mouse`, `focus_events`, `bell` and
+      `notices` are UNAFFECTED by `starting` and keep flowing normally throughout -- only row
+      content is withheld.
     * `notices` is `[{"seq": <int>, "text": <str>}, ...]`, only entries THIS VIEWER has not yet
       been sent -- `[]` when there are none. Tracked with a local `since_notice`, exactly the way
       `since` already tracks the row diff per-viewer (see the very next bullet): two viewers on
@@ -2264,7 +2790,8 @@ def _screen_stream_body(handler, pt):
     since_notice = 0    # this viewer's own delivery position into pt.notices -- see docstring's
                          # `notices` bullet. 0 is safe as "nothing delivered yet" because
                          # Pty.add_notice's seq starts at 1 and only ever increases.
-    last_cursor, last_alt, last_cv, last_bp, last_bell = None, None, None, None, None
+    last_cursor, last_alt, last_cv, last_bp, last_mouse, last_focus_events, last_bell = (
+        None, None, None, None, None, None, None)
     quiet = time.time()
     while True:
         with pt.lock:
@@ -2280,15 +2807,18 @@ def _screen_stream_body(handler, pt):
             pending_notices = [n for n in pt.notices if n["seq"] > since_notice]
             done = pt.done
         cursor = tuple(snap["cursor"])
-        # cursor_visible/bracketed_paste/bell are screen (or client-event) state, not row content
-        # -- exactly like cursor/alt, a change in any of them alone (no row, no cursor move) must
-        # still trigger a frame, or a bare `\a` with no other output would never reach the client.
-        # `pending_notices` joins that same list for the identical reason -- see the docstring's
-        # `notices` bullet: a notice with nothing else changed must still trigger a frame.
+        # cursor_visible/bracketed_paste/mouse/focus_events/bell are screen (or client-event)
+        # state, not row content -- exactly like cursor/alt, a change in any of them alone (no
+        # row, no cursor move) must still trigger a frame, or a bare `\a` with no other output
+        # would never reach the client. `pending_notices` joins that same list for the identical
+        # reason -- see the docstring's `notices` bullet: a notice with nothing else changed must
+        # still trigger a frame.
         changed = (
             snap["rows"] or (since == -1 and not starting)
             or cursor != last_cursor or snap["alt"] != last_alt
             or snap["cursor_visible"] != last_cv or snap["bracketed_paste"] != last_bp
+            or snap["mouse"] != last_mouse
+            or snap["focus_events"] != last_focus_events
             or snap["bell"] != last_bell
             or pending_notices
         )
@@ -2301,7 +2831,9 @@ def _screen_stream_body(handler, pt):
             else:
                 since = snap["v"]
             last_cursor, last_alt = cursor, snap["alt"]
-            last_cv, last_bp, last_bell = snap["cursor_visible"], snap["bracketed_paste"], snap["bell"]
+            last_cv, last_bp = snap["cursor_visible"], snap["bracketed_paste"]
+            last_mouse, last_focus_events = snap["mouse"], snap["focus_events"]
+            last_bell = snap["bell"]
             if pending_notices:
                 since_notice = pending_notices[-1]["seq"]
             snap["notices"] = pending_notices   # merged in here, NOT part of Screen.snapshot()
@@ -2592,7 +3124,7 @@ def inject(handler, parsed, body):
 # SAME viewer-refcount/`_STREAMS` accounting and the SAME `term_gate.guard()` perimeter -- the
 # only thing duplicated is the row-vs-byte INTERPRETATION, not the session/PTY plumbing.
 #
-# The switch is `config.TERM_RENDERER` (env `TRACKER_TERM_RENDERER=grid|xterm`, default "grid" --
+# The switch is `config.TERM_RENDERER` (env `TRACKER_TERM_RENDERER=grid|xterm`, default "xterm" --
 # see config.py's own comment on that constant). It is resolved ONCE, server-side, at read time
 # here -- `open_pty()` above hands it to the client in its response (`renderer` key) and
 # `renderer_info()` just below serves it standalone (for a reconnecting `?tty=` tab, which never
@@ -2626,12 +3158,23 @@ def raw_stream(handler, parsed):
     its own VT100 interpretation, so unlike `screen_stream()` there is no JSON envelope and no
     `since`/versioning concept here at all: this is a plain byte tee, not a diffed snapshot.
 
-    KNOWN GAP (see the module docstring's "raw byte tee" section above and the build report this
-    shipped with): there is no raw-byte scrollback. `screen_stream()` can always answer a fresh
-    viewer with a full `since=-1` repaint because `Screen` retains the interpreted grid; this
-    route only tees bytes emitted AFTER the connection opens, so a second tab (or a reconnect)
-    opened against a PTY that already has content on screen starts on a BLANK xterm.js buffer
-    until the next write -- there is nothing here to replay.
+    Byte replay is a KNOWN GAP (see the module docstring's "raw byte tee" section above and the
+    build report this shipped with): there is no raw-byte scrollback. `screen_stream()` can always
+    answer a fresh viewer with a full `since=-1` repaint because `Screen` retains the interpreted
+    grid; this route only tees bytes emitted AFTER the connection opens, so a second tab (or a
+    reconnect) opened against a PTY that already has content on screen starts on a BLANK xterm.js
+    buffer until the next write -- there is nothing here to replay.
+
+    NOTICES are the one deliberate exception to that gap: `Pty.notices` (see `_feed_note()`/
+    `Pty.add_notice`) is retained independently of the raw byte tee, so `_raw_stream_body()` below
+    also walks that queue on every loop tick and replays any entry a given viewer has not yet
+    seen -- including one that fired before this viewer ever attached -- as a named
+    `event: notice\\ndata: <json>\\n\\n` SSE frame on this SAME connection (no second route, no
+    second EventSource, no new server state; see that function's own docstring for the mechanism
+    and why the event must be NAMED, never a bare `data:` frame). This closes what used to be a
+    standing gap for the xterm renderer: a viewer that attaches or reconnects after a notice fired
+    now sees it, exactly like the grid renderer's `notices` field already provides via
+    `_screen_stream_body()`.
     """
     global _STREAMS
     if not term_gate.guard(handler):
@@ -2670,6 +3213,37 @@ def _raw_stream_body(handler, pt, q):
     `_reader()`'s tee, see `Pty.raw_queues`) rather than polling `Screen` like
     `_screen_stream_body()` does -- there is no shared version counter to diff against here, just
     bytes arriving in order. Mirrors that function's peer-gone check and 10s ping heartbeat.
+
+    Also delivers/replays `Pty.notices` as named `event: notice\\ndata: <json>\\n\\n` frames on
+    this SAME connection -- no new route, no second `EventSource` (a second one would double-count
+    `pt.viewers`, whose leak was a real bug here before), no new timer, no new server state. This
+    MUST be a named event, never folded into a bare `data:` frame: the client's default
+    `onmessage` handler runs every unnamed frame through `_b64ToBytes()` and writes the result
+    straight into xterm.js as terminal bytes, so a JSON notice sent unnamed would render as
+    garbage on screen. A named event is inert to a plain `onmessage` listener and requires its own
+    `addEventListener("notice", ...)` to be seen at all -- exactly the precedent `term_run.stream`
+    already sets with its own `event: end` frame (see `aitracker/term_run.py`'s `stream()`),
+    consumed the same way by `ext_run.js`'s `addEventListener("end", ...)` alongside its
+    `onmessage`.
+
+    Per-viewer delivery cursor `since_notice` mirrors `_screen_stream_body()`'s own local of the
+    same name for the identical reason: `seq` is monotonic and never reused (`Pty.add_notice`), so
+    each independently-attached raw viewer tracks its own position into `pt.notices` and one
+    viewer consuming a notice can never starve another.
+
+    Checked BEFORE the `pt.done` branch below, deliberately: a viewer attaching to an
+    already-finished pty sees an immediately-empty byte queue, and returning on that alone (the
+    ORIGINAL bug this guards against) would exit before ever giving a still-unreplayed notice a
+    chance to go out -- a finished pty with queued notices must still replay them.
+
+    The `pt._notice_seq` read that gates the `with pt.lock` block below is deliberately UNLOCKED --
+    a plain, cheap int comparison safe to make every 0.2s tick even while the child is silent (and
+    exactly the informal "no lock needed for a monotonic single-writer int" style `last_output`
+    already uses elsewhere in this file). `_raw_stream_body()` otherwise never takes `pt.lock` at
+    all; when the child is chatty, `q.get()` above returns instantly and this loop spins hot, so
+    taking the lock unconditionally on every iteration would put new, frequent lock traffic on a
+    path that would then contend with `_reader()`'s own `feed()` -- only take it, to build the
+    actual pending list, once the cheap peek says there is something new to send.
     """
     try:
         handler.send_response(200)
@@ -2679,6 +3253,9 @@ def _raw_stream_body(handler, pt, q):
         handler.end_headers()
     except (BrokenPipeError, ConnectionResetError):
         return
+    since_notice = 0    # this viewer's own delivery position into pt.notices -- 0 is safe as
+                         # "nothing delivered yet" because Pty.add_notice's seq starts at 1 and
+                         # only ever increases (mirrors _screen_stream_body()'s own local).
     quiet = time.time()
     while True:
         try:
@@ -2690,7 +3267,16 @@ def _raw_stream_body(handler, pt, q):
             if not _write(handler, "data: %s\n\n" % b64):
                 return
             quiet = time.time()
-        elif pt.done:                                    # nothing left queued and the pty is gone
+        if pt._notice_seq > since_notice:      # cheap unlocked peek -- see docstring's lock note
+            with pt.lock:
+                pending = [n for n in pt.notices if n["seq"] > since_notice]
+            for n in pending:
+                since_notice = n["seq"]
+                if not _write(handler, "event: notice\ndata: %s\n\n" % json.dumps(n)):
+                    return
+            quiet = time.time()
+        if not data and pt.done:                # nothing left queued and the pty is gone -- but
+                                                  # only after the notice check above (trap 1)
             return
         if _peer_gone(handler):                           # instant: the tab closed
             return
@@ -2700,12 +3286,14 @@ def _raw_stream_body(handler, pt, q):
                 return
 
 
-# ---- vendored xterm.js static assets --------------------------------------------------------
+# ---- vendored static assets (xterm.js, mermaid.js) --------------------------------------------
 # Served as plain files, NOT inlined into the baked page (unlike ext_vt.js/css -- see page.py's
-# read_ext()): xterm.js alone is ~480KB minified, and the default renderer is "grid" (config.
-# TERM_RENDERER), so every page load paying for it unconditionally would be dead weight for
-# anyone who never opts into TRACKER_TERM_RENDERER=xterm. ext_vt.js's `_loadXtermAssets()` fetches
-# these lazily, exactly once, only the first time an xterm-rendered terminal is actually opened.
+# read_ext()): xterm.js alone is ~480KB minified, mermaid.min.js ~3.4MB. Even though the default
+# terminal renderer is "xterm" (config.TERM_RENDERER), lazy-loading these assets ensures users who
+# never open a terminal / never view a diagram don't pay for them. ext_vt.js's
+# `_loadXtermAssets()` and app.js's `_loadMermaidAssets()` each fetch their own asset lazily,
+# exactly once, only the first time the feature that needs it actually activates (see conventions
+# rule 2 for lazy loading as the binding invariant for vendored front-end assets).
 # Gated by the SAME `_authok()` every other non-`/api` path already goes through in
 # `Handler.do_GET` (see server.py) -- no separate check needed here.
 _VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "vendor")
@@ -2713,6 +3301,11 @@ _VENDOR_FILES = {
     "/vendor/xterm.js": ("xterm.js", "application/javascript; charset=utf-8"),
     "/vendor/xterm.css": ("xterm.css", "text/css; charset=utf-8"),
     "/vendor/addon-fit.js": ("addon-fit.js", "application/javascript; charset=utf-8"),
+    # mermaid.js (~3.4MB minified) -- same lazy-load-only story as xterm.js above, but
+    # for diagram rendering (app.js's renderMermaid()/_loadMermaidAssets(), called from
+    # both the classic SPA and ext_cr_detail.js's Control Room narration timeline). Never
+    # fetched unless a diagram actually renders.
+    "/vendor/mermaid.min.js": ("mermaid.min.js", "application/javascript; charset=utf-8"),
 }
 
 
@@ -2743,10 +3336,12 @@ server.EXTRA_POST["/api/term/keys"] = keys
 server.EXTRA_POST["/api/term/resize"] = resize_pty
 server.EXTRA_POST["/api/term/inject"] = inject
 server.EXTRA_POST["/api/term/close"] = close_pty
+server.EXTRA_GET["/api/term/attached"] = attached
 server.EXTRA_GET["/api/term/screen"] = screen_stream
 server.EXTRA_GET["/api/term/scrollback"] = term_scrollback
 server.EXTRA_GET["/api/term/renderer"] = renderer_info
 server.EXTRA_GET["/api/term/raw"] = raw_stream
 server.EXTRA_GET["/api/term/cwds"] = term_cwds
+server.EXTRA_GET["/api/term/list"] = term_list
 for _path, (_fname, _ctype) in _VENDOR_FILES.items():
     server.EXTRA_GET[_path] = (lambda h, p, fn=_fname, ct=_ctype: _serve_vendor(h, p, fn, ct))

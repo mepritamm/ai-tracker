@@ -5,8 +5,10 @@ The renderer is client-side JS, so these run the *real* app.js under node with a
 stub DOM and assert on what mermaidSvg()/mdBlock() actually produce. node isn't a
 project dependency — if it's absent the module skips (the page-level assertions in
 test_integration.py still pin that the renderer is served)."""
+import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import unittest
@@ -20,7 +22,8 @@ _HARNESS = r"""
 const fs=require("fs");
 const stub=()=>new Proxy(function(){},{get:(t,k)=>k===Symbol.toPrimitive?()=>"":stub(),set:()=>true,apply:()=>stub()});
 globalThis.document={documentElement:{classList:{contains:()=>false,toggle:()=>{}}},
-  getElementById:()=>stub(),addEventListener:()=>{},querySelectorAll:()=>[],querySelector:()=>stub()};
+  getElementById:()=>stub(),addEventListener:()=>{},removeEventListener:()=>{},dispatchEvent:()=>true,
+  querySelectorAll:()=>[],querySelector:()=>stub()};
 globalThis.localStorage={getItem:()=>null,setItem:()=>{}};
 globalThis.location={host:"localhost:8790",href:"http://localhost:8790/"};
 globalThis.addEventListener=()=>{};
@@ -147,6 +150,46 @@ class TestMdBlockFences(unittest.TestCase):
         self.assertIn("<p class=mdp>intro</p>", h)      # surrounding markdown still renders
         self.assertIn("after", h)
 
+    def test_mermaid_fence_gets_a_data_mmd_src_slot_for_the_async_upgrade(self):
+        # mdBlock() still renders the hand-rolled SVG SYNCHRONOUSLY (asserted above), but
+        # now wraps it in a `.mmd-slot[data-mmd-src=...]` holding the raw source, base64'd
+        # UTF-8-safe -- app.js's own renderMermaid()/upgradeMermaidIn() (the ONE renderer
+        # both the classic UI and the Control Room call, see their own comments) read this
+        # attribute back off the DOM to upgrade the fallback in place to a real mermaid.js
+        # render, without a second markdown pass over the original text.
+        src = "flowchart TD\n  A[one] --> B[two]"
+        h = _js("```mermaid\n%s\n```" % src, fn="mdBlock")
+        self.assertIn('class="mmd-slot"', h)
+        m = re.search(r'data-mmd-src="([^"]+)"', h)
+        self.assertIsNotNone(m, h)
+        self.assertEqual(base64.b64decode(m.group(1)).decode("utf-8"), src)
+
+    def test_unsupported_diagram_still_gets_a_slot_so_mermaid_js_can_try(self):
+        # A `gantt` fence has no hand-rolled renderer (falls back to a labelled code
+        # block — see test_unsupported_mermaid_falls_back_to_the_source_with_a_tag), but
+        # mermaid.js itself DOES understand gantt — so this fence still gets a
+        # `data-mmd-src` slot, not just the families the hand-rolled renderer covers.
+        src = "gantt\n  title x\n  section A\n    a : a1, 2014-01-01, 30d"
+        h = _js("```mermaid\n%s\n```" % src, fn="mdBlock")
+        self.assertIn('class="mmd-slot"', h)
+        m = re.search(r'data-mmd-src="([^"]+)"', h)
+        self.assertIsNotNone(m, h)
+        self.assertEqual(base64.b64decode(m.group(1)).decode("utf-8"), src)
+
+
+class TestMermaidVendorLoader(unittest.TestCase):
+    """The lazy-load target must be the committed vendor file, never a CDN URL at runtime
+    (conventions rule 2/6 — no outbound network calls; mirrors
+    test_term_vt_client.py's test_lazy_asset_loader_targets_the_vendored_paths_not_a_cdn
+    for xterm.js's own vendor loader)."""
+
+    def test_loader_targets_the_vendored_path_not_a_cdn(self):
+        with open(APP_JS) as f:
+            js = f.read()
+        self.assertIn('"/vendor/mermaid.min.js"', js)
+        for host in ("cdn.jsdelivr.net", "cdnjs.cloudflare.com", "unpkg.com", "esm.sh"):
+            self.assertNotIn(host, js)
+
     def test_other_fences_are_untouched_code_blocks(self):
         h = _js("```python\nprint('hi')\n```", fn="mdBlock")
         self.assertIn("class=mdpre", h)
@@ -157,7 +200,13 @@ class TestMdBlockFences(unittest.TestCase):
         # `gantt` still has no renderer; the fence stays a readable code block but is
         # tagged so the reader sees the intent (a diagram, not a mislabelled code fence).
         h = _js("```mermaid\ngantt\n  title x\n  section A\n    a : a1, 2014-01-01, 30d\n```", fn="mdBlock")
-        self.assertNotIn("<svg", h)
+        # A bare `'<svg' not in h` check is WRONG here: the fallback tag itself carries an
+        # icon (`ico("diagram")` -> `<svg class="ico">...<use href="#i-diagram"/></svg>`), so
+        # a genuine fallback legitimately contains an <svg>. Test the real markers instead —
+        # a rendered diagram wraps its svg in `<div class=mmd>` with `class=mmdsvg` on the svg
+        # itself (see test_mermaid_fence_renders_a_diagram); neither appears on a fallback.
+        self.assertNotIn("class=mmd>", h)
+        self.assertNotIn("mmdsvg", h)
         self.assertIn("class=mdpre", h)                 # you still get to read the diagram source
         self.assertIn("gantt", h)
         # …and the diagram-type tag is present, so the intent is visible without rendering
@@ -501,10 +550,19 @@ class TestJourneyDiagram(unittest.TestCase):
         for task in ("Make tea", "Go upstairs", "Do work", "Go downstairs", "Sit down"):
             self.assertIn(task, s)
 
-    def test_happiness_score_becomes_a_face_and_number(self):
+    def test_happiness_score_becomes_a_meter_and_number(self):
         s = _js(JOURNEY)
-        # score 5 → 😊, score 3 → 😐, score 1 → 😞 — all three appear at least once
-        self.assertIn("😊", s); self.assertIn("😐", s); self.assertIn("😞", s)
+        # Happiness scores render as a dot meter (● = filled, ○ = empty) plus the numeric score.
+        # Score 5 → ●●●●●, score 3 → ●●●○○, score 1 → ●○○○○. This cannot be an SVG icon
+        # because the string is interpolated into mermaid's ["..."] quoted-label syntax, and
+        # an SVG's double quotes would terminate the label and corrupt the diagram source.
+        # All three scores from JOURNEY appear at least once, both as meters and numbers.
+        self.assertIn("●●●●●", s)  # score 5 meter
+        self.assertIn("●●●○○", s)  # score 3 meter
+        self.assertIn("●○○○○", s)  # score 1 meter
+        self.assertIn("5", s)       # score 5 number
+        self.assertIn("3", s)       # score 3 number
+        self.assertIn("1", s)       # score 1 number
 
     def test_userJourney_alias_also_matches(self):
         s = _js("userJourney\n section S\n  Task: 4: Me")
