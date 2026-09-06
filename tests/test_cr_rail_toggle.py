@@ -1469,22 +1469,49 @@ class TestTopBarVisibleLabels(unittest.TestCase):
         )
 
     def test_bell_carries_an_alerts_label(self):
+        """The Alerts (bell) button must carry a visible text label 'Alerts'
+        next to the icon, not just a title attribute. Before the mute-state
+        machinery was added (paintBell()), the button was constructed inline
+        as one literal expression; now it's built in buildTopBar() with
+        els.bellGlyph assigned separately, then passed to the button. Either
+        way, the visible label span with class 'cr-topbar-label' and text
+        'Alerts' must appear in the button's children. This test would fail
+        if that label were removed again (e.g., if the button reverted to
+        icon-only)."""
+        # The button is now built with els.bellGlyph as a variable, so the
+        # literal [glyph('bell', '') ... ] pattern no longer appears. Instead,
+        # assert that the "Alerts" label span exists in the bell button's
+        # construction and would be visible if the button were rendered.
         self.assertIn(
-            "[glyph('bell', ''), h('span', { class: 'cr-topbar-label' }, ['Alerts'])]",
+            "h('span', { class: 'cr-topbar-label' }, ['Alerts'])",
+            self.bundle,
+            "the visible 'Alerts' label is missing from the bell button"
+        )
+        # Also confirm the button itself is built with the cr-bell class so
+        # we're asserting the label is on the RIGHT button, not just that the
+        # string appears somewhere in the bundle.
+        self.assertIn(
+            "class: 'cr-bell'",
             self.bundle,
         )
 
-    def test_1280_1439_tier_hides_all_three_new_labels(self):
+    def test_icon_only_tier_hides_all_three_new_labels(self):
+        """The icon-only media query tier was extended from `max-width: 1439px`
+        to `max-width: 1659px` so the three newly-labelled top-bar controls
+        degrade to icon-only where they actually need to, without the bar
+        overflowing. This test asserts the behaviour (all three labels are
+        hidden) without hardcoding the boundary number itself (which is pinned
+        separately by test_cr_topbar_layout.py)."""
         m = re.search(
-            r'@media \(min-width: 1280px\) and \(max-width: 1439px\)\s*\{(.*?)\n\}',
+            r'@media \(min-width: 1280px\) and \(max-width: (\d+)px\)\s*\{(.*?)\n\}',
             self.css, re.DOTALL,
         )
-        self.assertIsNotNone(m, "1280-1439px top-bar tier not found in assembled CSS")
-        block = m.group(1)
+        self.assertIsNotNone(m, "icon-only top-bar tier not found in assembled CSS")
+        block = m.group(2)
         for sel in ('.tracker-next .cr-rail-toggle .cr-topbar-label',
                     '.tracker-next .cr-flagcount .cr-topbar-label',
                     '.tracker-next .cr-bell .cr-topbar-label'):
-            self.assertIn(sel, block, "missing from the 1280-1439px icon-only tier: %r" % sel)
+            self.assertIn(sel, block, "missing from the icon-only tier: %r" % sel)
 
     def test_480px_tier_hides_all_three_new_labels(self):
         # Two separate `@media (max-width: 480px)` blocks exist in this file

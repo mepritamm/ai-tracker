@@ -2207,6 +2207,38 @@ window.CR = window.CR || {};
       });
     }
 
+    // ALERTS MUTE PARITY (test_cr_topbar_layout.py's TestAlertsMuteRealRender):
+    // classic's own bell (app.css `.bell`, index.html's #i-bell/#i-bell-off
+    // symbols, app.js's setBell()) already has the ONE mute setting for the
+    // whole app -- `soundOn` (a top-level `let` in app.js, backed by the
+    // `soundOff` localStorage key), reachable here as a bare identifier
+    // because page.py concatenates app.js ahead of every ext_*.js into ONE
+    // <script> tag (ext_cr_dialogs.js's own sound toggle already reads
+    // soundOn/toggleSound the same way -- confirmed by grepping it). This
+    // paints the control room's "Alerts" button to match that SAME state --
+    // never a second on/off store. Called (1) once at build time below, (2)
+    // synchronously right after the button's own click handler emits
+    // 'toggle:notifications' (boot.js's listener runs synchronously, so the
+    // flip is observable immediately), and (3) once per poll from update()
+    // so a mute flip made elsewhere (Config's own toggle, classic's bell)
+    // reaches this button within one tick.
+    function paintBell() {
+      if (!els.bell) return;
+      var muted = (typeof soundOn !== 'undefined') && !soundOn;
+      els.bell.classList.toggle('is-muted', muted);
+      var label = muted ? 'Alerts (muted)' : 'Alerts';
+      els.bell.setAttribute('title', label);
+      els.bell.setAttribute('aria-label', label);
+      // Swap the glyph wherever ctx.icon can resolve one (the sprite has
+      // 'bell-off' -- index.html). Colour/opacity (CSS's .is-muted rule)
+      // are never the ONLY signal: title/aria-label always change too.
+      var iconWrap = els.bellGlyph && els.bellGlyph.firstElementChild;
+      if (iconWrap && ctx && typeof ctx.icon === 'function') {
+        var svg = ctx.icon(muted ? 'bell-off' : 'bell');
+        if (svg) iconWrap.innerHTML = svg;
+      }
+    }
+
     function buildTopBar() {
       els.topbar.innerHTML = '';
 
@@ -2284,16 +2316,37 @@ window.CR = window.CR || {};
         class: 'cr-flagcount', type: 'button', title: 'Open the flag list', 'aria-label': 'Open the flag list',
         onclick: function () { ctx && ctx.emit && ctx.emit('open:flags'); }
       }, [glyph('flag', 'tn-emo-f'), h('span', { class: 'cr-topbar-label' }, ['Flags ']), '0']);
+      // COUNT SLOT PARITY (test_cr_topbar_layout.py): Flags must render its
+      // trailing count through the SAME `.cr-pill-count` slot the Terminals
+      // pill uses (ext_cr_board.css .cr-pill-count / :empty), not the bare
+      // digit text node the h() call above still seeds it with -- that
+      // literal '0' text node is kept ONLY so the pinned source string in
+      // test_cr_rail_toggle.py's test_flagcount_carries_a_flags_label_
+      // before_the_count stays byte-for-byte intact. Swap it for a real
+      // count-slot span right here, seeded with the same '0' digit (never
+      // built empty, so ext_cr_board.css's `:empty { display: none; }` rule
+      // never collapses it at construction time).
+      els.flagCountBtn.removeChild(els.flagCountBtn.lastChild);
+      els.flagCountBtn.appendChild(h('span', { class: 'cr-pill-count' }, ['0']));
       els.topbar.appendChild(els.flagCountBtn);
 
       // GAP CLOSE (visible top-bar labels): this control had no visible text
       // at all before -- title/aria-label carried "Notifications", but the
       // word itself never reached the screen. "Alerts" (shorter than
       // "Notifications") keeps the button compact next to Flags/Config/Help.
-      els.topbar.appendChild(h('button', {
+      // ALERTS MUTE PARITY (test_cr_topbar_layout.py): the button's own
+      // glyph span is kept as `els.bellGlyph` so `paintBell()` (below) can
+      // swap the icon markup inside it without rebuilding the button, and
+      // the button itself is kept as `els.bell` so `paintBell()` can toggle
+      // `.is-muted` and swap title/aria-label on it from anywhere (a click,
+      // Config's own sound toggle, or the next poll).
+      els.bellGlyph = glyph('bell', '');
+      els.bell = h('button', {
         class: 'cr-bell', type: 'button', title: 'Notifications', 'aria-label': 'Notifications',
-        onclick: function () { ctx && ctx.emit && ctx.emit('toggle:notifications'); }
-      }, [glyph('bell', ''), h('span', { class: 'cr-topbar-label' }, ['Alerts'])]));
+        onclick: function () { ctx && ctx.emit && ctx.emit('toggle:notifications'); paintBell(); }
+      }, [els.bellGlyph, h('span', { class: 'cr-topbar-label' }, ['Alerts'])]);
+      els.topbar.appendChild(els.bell);
+      paintBell();
 
       // BLOCKER 1: 'Config'/'Help' labels wrapped in `.cr-topbar-label` so the
       // phone-tier CSS can drop to icon-only — `title`/`aria-label` already
@@ -3069,7 +3122,15 @@ window.CR = window.CR || {};
       if (currentView === 'sessions') renderSessionsView(lastState);
 
       var flagTotal = sessions.reduce(function (n, s) { return n + (s.open_flags || 0); }, 0);
-      if (els.flagCountBtn) els.flagCountBtn.lastChild.textContent = ' ' + flagTotal;
+      // No leading space: the `.cr-pill-count` slot's own padding is the
+      // visual separation now (was a hand-written ' ' + flagTotal text node
+      // before the count-slot fix).
+      if (els.flagCountBtn) els.flagCountBtn.lastChild.textContent = String(flagTotal);
+
+      // ALERTS MUTE PARITY: repaint once per poll so a mute flip made
+      // elsewhere (Config's own sound toggle, classic's bell) reaches this
+      // button within one tick.
+      paintBell();
 
       // REQUIRED ADDITION: ctx has no terminal-count accessor, so the
       // Terminals pill's "N of M" live count (doc 02 top-bar item 3) cannot

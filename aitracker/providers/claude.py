@@ -1385,6 +1385,15 @@ def parse_session(path):
     shells = parse_shells(path)
     meta["title"] = (load_titles().get(sid) or meta.get("customTitle") or meta.get("aiTitle")
                      or (_short_title(requests[0]["text"]) if requests else ""))
+    # Anti-drift: the detail view's "is this session working" glow must agree with the
+    # board/rail's, which reads list_sessions()'s `ended` (sidebar ✅). That field comes
+    # from _session_meta -> _tail_scan's tail-based rule (last real turn was the assistant
+    # finishing, and no question is left open) -- reuse that SAME cached-by-mtime call here
+    # instead of a second, divergent guess (the client used to infer it from todo status,
+    # which is wrong for both a live session with no todos and an ended one with a stale
+    # in_progress todo). Never throws: _session_meta/_tail_scan both guard OSError and
+    # always return a bool.
+    meta["ended"] = _session_meta(path)["ended"]
     st = os.stat(path)
     result = {
         "meta": meta,

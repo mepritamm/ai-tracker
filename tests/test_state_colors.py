@@ -19,17 +19,59 @@ def _style_block(html):
     return m.group(1)
 
 
+def _extract_selector_blocks(css, selector):
+    """Return the concatenated body text of every top-level `<selector> { ... }`
+    rule, found by BRACE COUNTING rather than `css[:idx]`/a fixed-length slice.
+
+    The previous version of this helper (`css[:idx]` for light, a flat
+    `css[idx:idx+4000]` slice for dark) was vacuous: the light "block" was
+    actually the ENTIRE assembled CSS up to `.tracker-next.is-dark {` -- all of
+    app.css plus everything in ext_cr.css before that point -- so
+    `assertIn(tok + ":", self.light)` only proved the token appeared SOMEWHERE
+    in that huge span, not that it was declared inside `.tracker-next{}` itself.
+    A declaration moved out of `.tracker-next{}` into any other selector ahead
+    of the dark marker would have kept every existing assertion green.
+
+    `selector` must match literally, immediately followed by optional
+    whitespace then `{` -- this deliberately does NOT match `.tracker-next` as
+    a prefix of `.tracker-next.is-dark` (next char is `.`, not `{`) nor of a
+    descendant selector like `.tracker-next .tn-emo` (next non-space char is
+    `.`, not `{`). Same technique as
+    tests/test_classic_reduced_motion.py's `_extract_reduced_motion_block` and
+    tests/test_state_color_parity_app.py's `_extract_declarations` -- both use
+    a brace counter instead of a `[^}]*` regex, which stops at the first
+    nested `}` and truncates.
+
+    `.tracker-next { ... }` appears as a top-level rule TWICE in ext_cr.css
+    (the foundations token block, and a separate base/reset rule later in the
+    file) -- both are included so nothing is silently dropped.
+    """
+    pattern = re.compile(re.escape(selector) + r"\s*\{")
+    out = []
+    pos = 0
+    while True:
+        m = pattern.search(css, pos)
+        if not m:
+            break
+        start = m.end()
+        depth = 1
+        i = start
+        while depth > 0:
+            if css[i] == "{":
+                depth += 1
+            elif css[i] == "}":
+                depth -= 1
+            i += 1
+        out.append(css[start:i - 1])
+        pos = i
+    return "\n".join(out)
+
+
 def _theme_block(css, dark):
-    # Same light-block-then-dark-block split every other pass over this file
-    # uses: light tokens live in the bare `.tracker-next { ... }` rule, dark
-    # overrides in the `.tracker-next.is-dark { ... }` rule right after it.
-    marker = ".tracker-next.is-dark {"
-    idx = css.index(marker)
-    if dark:
-        # from the dark marker to the NEXT top-level rule close — good enough
-        # since nothing else redeclares --state-pinned/--text-dusk after it.
-        return css[idx: idx + 4000]
-    return css[:idx]
+    # Light tokens live in the bare `.tracker-next { ... }` rule(s); dark
+    # overrides in the `.tracker-next.is-dark { ... }` rule.
+    selector = ".tracker-next.is-dark" if dark else ".tracker-next"
+    return _extract_selector_blocks(css, selector)
 
 
 class StateColorTokensTest(unittest.TestCase):
