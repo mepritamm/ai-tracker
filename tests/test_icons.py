@@ -515,5 +515,58 @@ class TestBuiltPageCarriesIconConfig(unittest.TestCase):
                       "assembled page lost the pre-paint restore of the cached icon style")
 
 
+# ============================================================================
+# 10. SRC_ICON's values are icon NAMES, but they're only ever consumed through
+#     a variable -- `ico(SRC_ICON[k])` in app.js -- never as a literal string.
+#     Section 1's `test_every_referenced_icon_is_defined` scans for literal
+#     `ico("name")` calls only, by its own documented limitation, so it cannot
+#     see these at all. A bad value here (as actually shipped once: "opencode"
+#     -> "triangle-fill", which existed in neither ICO_EMOJI, ICO_TEXT, nor the
+#     sprite) renders a blank source badge -- no exception, no console
+#     warning, no layout shift -- exactly the bug class this whole file exists
+#     to catch.
+# ============================================================================
+
+class TestSrcIconValuesAreDefined(unittest.TestCase):
+    def test_every_src_icon_value_is_a_defined_icon(self):
+        js = _read("app.js")
+        src_icon = _parse_icon_glyph_map(js, "SRC_ICON")
+        self.assertIsNotNone(src_icon, "no `const SRC_ICON={...};` object literal found in app.js")
+        self.assertGreater(len(src_icon), 0, "SRC_ICON parsed empty -- check the extraction")
+
+        # Same authoritative set section 5 holds ICO_EMOJI/ICO_TEXT to: every
+        # `id=i-NAME` symbol actually defined in index.html's sprite.
+        defined = _sprite_icon_names()
+        offenders = [(src, name) for src, name in src_icon.items() if name not in defined]
+        self.assertEqual(
+            offenders, [],
+            "SRC_ICON value is not a defined icon -- ico(SRC_ICON[k]) renders "
+            "nothing at runtime, with no error and no console warning:\n" + "\n".join(
+                "  %s -> %s is not a defined icon" % (src, name) for src, name in offenders
+            )
+        )
+
+    def test_src_icon_and_src_text_have_matching_keys(self):
+        """Same class of gap one step over: a source key present in one map
+        but not the other silently falls back to a raw key/empty label (or
+        `undefined`) for whichever map lacks it."""
+        js = _read("app.js")
+        src_icon = _parse_icon_glyph_map(js, "SRC_ICON") or {}
+        src_text = _parse_icon_glyph_map(js, "SRC_TEXT") or {}
+        self.assertGreater(len(src_icon), 0, "SRC_ICON parsed empty -- check the extraction")
+        self.assertGreater(len(src_text), 0, "SRC_TEXT parsed empty -- check the extraction")
+
+        missing_in_text = sorted(set(src_icon) - set(src_text))
+        missing_in_icon = sorted(set(src_text) - set(src_icon))
+        self.assertEqual(
+            missing_in_text, [],
+            "Source key(s) in SRC_ICON with no matching SRC_TEXT entry: %s" % ", ".join(missing_in_text)
+        )
+        self.assertEqual(
+            missing_in_icon, [],
+            "Source key(s) in SRC_TEXT with no matching SRC_ICON entry: %s" % ", ".join(missing_in_icon)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
