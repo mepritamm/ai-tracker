@@ -89,6 +89,24 @@
   padding: 0 22px;
   background: var(--surface-top);
   border-bottom: 1px solid var(--line-subtle);
+  /* TOP-BAR OVERFLOW SAFETY NET (owner: real ~1900px screenshot showing "New"
+   * hard-clipped at the viewport edge): every child here is `flex: 0 0 auto`
+   * (rigid, never shrinks) and the >=1280px tiers below deliberately keep the
+   * bar to ONE row (doc 02 line 93) via icon-only compaction rather than
+   * wrapping -- so if actual content width ever exceeds the bar's own width
+   * for a reason the icon-only compaction doesn't cover (a large
+   * `--ico-scale` icon-size preference inflating every glyph, an unusually
+   * long session-source label, a future control), the ancestor chain's
+   * `overflow: hidden` (.cr-app/.cr-main/.cr-content, all set above) turns
+   * that into exactly the reported bug: the tail of the row silently
+   * vanishes off-screen with no scrollbar and no way to reach it. `overflow-x:
+   * auto` on the bar itself converts that failure mode into a horizontally
+   * scrollable row instead -- New session stays reachable by scrolling this
+   * one element, rather than disappearing outright. In the common case
+   * (content actually fits, which the tiers below are tuned for) this is a
+   * no-op: no scrollbar appears, nothing about the bar's appearance changes. */
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 /* GAP CLOSE (visible top-bar labels): was a fixed 28x28 icon-only square --
@@ -137,16 +155,28 @@
 
 .tracker-next .cr-dest-pills { display: flex; align-items: center; gap: 6px; }
 
+/* TOP-BAR SIZING FIX (owner: real ~1900px screenshot -- "the controls have
+ * inconsistent widths and padding... Terminals 0 of 10 and Flags 0 append a
+ * count that makes those items much wider than their neighbours"): the three
+ * destination pills (Board / Sessions / Terminals) previously sized purely to
+ * their own text content, so "Board" (4 chars) and "Terminals 0 of 10" (17
+ * chars incl. count) rendered as wildly different widths in the same row --
+ * NOT a second responsive system, just a shared floor added to the ONE rule
+ * all three already share. `justify-content:center` centres the shorter
+ * labels (Board/Sessions) inside that floor instead of leaving them
+ * left-hugged and visually off-balance next to Terminals' wider content. */
 .tracker-next .cr-pill {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
   border: 1px solid transparent;
   background: transparent;
   color: var(--text-secondary);
   font: var(--fw-row-max) var(--fs-row-max)/var(--lh-row-max) var(--font-sans);
   padding: 6px 12px;
+  min-width: 88px;
   border-radius: var(--radius-pill);
   cursor: pointer;
   white-space: nowrap;
@@ -157,11 +187,53 @@
   box-shadow: var(--shadow-raised);
   color: var(--text-primary);
 }
+/* COUNT SLOT (same top-bar sizing fix): the appended count used to be bare
+ * text riding directly on the pill's own font/padding, so "Terminals 0 of 10"
+ * read as one long uninterrupted string rather than a label plus a distinct
+ * badge, and its width swung with digit count. Now a self-contained pill-
+ * shaped chip: `min-width` (tabular-nums, so "0 of 10" and "10 of 10" don't
+ * visibly resize the chip) plus its own padding/background caps how much
+ * horizontal room the count can claim regardless of the label next to it.
+ * Reused verbatim (not a new class) by the Flags control below, which used
+ * to append its digit as a bare trailing text node with no visual separation
+ * at all -- same "count slot" contract, one definition. */
 .tracker-next .cr-pill-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 3.4ch;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--fill-row-hover);
   font: var(--fw-trace) var(--fs-trace-min)/var(--lh-trace) var(--font-mono);
   font-variant-numeric: tabular-nums;
   color: var(--text-muted);
 }
+/* ADVERSARIAL REVIEW FIX (empty count slot renders as a visible grey blob):
+ * buildTopBar() (ext_cr_board.js) builds the Terminals pill's count slot as
+ * `h('span', {class:'cr-pill-count'}, [''])` -- an empty text node -- and
+ * `update()` only overwrites it once `ctx.terminals.count()` exists; with
+ * terminals disabled/absent the span stays empty, but the rule above still
+ * gives it `min-width: 3.4ch`, padding and a `--fill-row-hover` background,
+ * which rendered as a ~20px grey pill glued to "Terminals" with no content
+ * and no purpose -- pre-change that same empty span was a bare zero-width
+ * text node, so this is a genuine regression the count-slot chip introduced.
+ * Same idiom this codebase already uses for an empty optional slot
+ * (`.mnav .mpos:empty`/app.css, `.runout:empty`/ext_run.css,
+ * `#ext_vt:empty`/ext_vt.css): no footprint until the slot actually has
+ * content. Applies via `:empty` alone, verified in a real browser (Chromium,
+ * via Playwright) against BOTH the states that matter: buildTopBar's initial
+ * `h('span', {class:'cr-pill-count'}, [''])` (a single Text node whose data
+ * length is zero -- `:empty` matches a zero-length Text child exactly as it
+ * matches no children at all) AND `update()` later writing a real count
+ * (`.textContent = '0 of 10'`, un-collapses it) and then reverting to none
+ * (`.textContent = ''`, which the DOM spec's "string replace all" defines as
+ * removing all children outright when the new value is the empty string --
+ * re-collapses it). Both measured `display: none` after the fix; the Flags
+ * slot (buildTopBar seeds it with a real `'0'` digit, never empty by
+ * construction) measured unaffected (`display: flex`, per its normal
+ * `inline-flex` rule above). */
+.tracker-next .cr-pill-count:empty { display: none; }
 
 .tracker-next .cr-topbar-spacer { margin-left: auto; }
 
@@ -184,6 +256,30 @@
 .tracker-next .cr-bell:hover,
 .tracker-next .cr-icon-btn:hover { background: var(--fill-row-hover); }
 .tracker-next .cr-flagcount { color: var(--state-flagged); }
+
+/* MUTE PARITY FIX: classic's own bell (app.css `.bell`, index.html #bell)
+ * signals "muted" by swapping to the #i-bell-off symbol -- a bell glyph with
+ * a diagonal slash baked in. ext_cr_board.js's paintBell() does the same
+ * glyph swap wherever `ctx.icon` can resolve one, but that swap alone isn't
+ * guaranteed visible in every icon style (the emoji/text styles' glyphs
+ * differ only subtly, and the no-ctx.icon fallback SVG in this file draws an
+ * identical generic circle for every name). This overlay is the visible,
+ * icon-style-independent "struck-through" cue: a diagonal line drawn across
+ * whatever glyph is inside `.tn-emo`, on by class alone, so it renders
+ * regardless of which icon style or fallback rendered the glyph underneath.
+ * Colour/icon are never the ONLY signal here either -- paintBell() always
+ * pairs this with a title/aria-label change ("Alerts" -> "Alerts (muted)"). */
+.tracker-next .cr-bell.is-muted { opacity: .6; }
+.tracker-next .cr-bell.is-muted .tn-emo { position: relative; }
+.tracker-next .cr-bell.is-muted .tn-emo::after {
+  content: "";
+  position: absolute;
+  left: -1px;
+  right: -1px;
+  top: 50%;
+  border-top: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+}
 
 .tracker-next .cr-theme {
   display: inline-flex;
@@ -325,8 +421,56 @@
        no touch-target requirement at this width, so buttons just shrink to
        icon + existing padding, which is what buys back the ~68px deficit the
        rail-open cliff costs (measured: content 1004px available vs ~1072px
-       needed at 1280 nowrap with full labels). Verified single 54px row at
-       1280/1300/1350/1439/1440, no clipped label, no overflow (see report).
+       needed at 1280 nowrap with full labels).
+
+   ADVERSARIAL REVIEW FIX (Playwright, real assembled page, viewport 1440x900,
+   tracker.ui=next, natural session/flag/terminal-count content — the previous
+   "Verified single 54px row at 1280/1300/1350/1439/1440" claim directly above
+   was FALSE and has been deleted): the bar sits BESIDE the 300px-open rail
+   (the rail is open, not collapsed, for every viewport >=1280 — see
+   applyRailMode()'s `window.innerWidth < 1280` threshold in ext_cr_board.js),
+   so its own client width at 1440 is ~1140px, NOT the 1440px viewport the
+   deleted claim was silently measured against. The >=1440px "labelled" tier
+   below (full Board/Sessions/Terminals text plus the fixed-width count chip)
+   never fit in that ~1140px box:
+     measured    : scrollWidth 1270 / clientWidth 1140 -> 130px OVER at 1440
+                   (167px over with a live "Terminals — 0 of 10" count).
+                   58px / 92px over at 1512 (MacBook Pro 14" default).
+                   0px / 4-7px over at 1600. Fits cleanly by 1920.
+   `overflow-x: auto` (the bar's own last-resort net, above) did NOT rescue
+   this in practice: macOS renders overlay scrollbars, so there is no visible
+   scrollbar at all — the user only sees the bar's tail silently gone, the
+   exact symptom the net exists to prevent.
+   FIX CHOSEN: extend this SAME icon-only compaction tier upward, from
+   `max-width: 1439px` to `max-width: 1659px`, rather than (a) dropping
+   `.cr-pill`'s `min-width: 88px` — that only claws back part of the deficit
+   (measured 62px of the 130px) and would also revert the earlier, unrelated
+   "inconsistent pill widths" visual fix that rule exists for, or (b) letting
+   the flexible middle shrink — every child here is deliberately `flex: 0 0
+   auto` (rigid) so no control's text silently truncates; turning that off
+   trades one clipping bug for another. Extending the existing tier instead
+   changes nothing else about its (already-working, already-verified-at-0-
+   overflow) mechanism, just moves where it stops applying.
+   ARITHMETIC for the new boundary: with every child `flex: 0 0 auto`, the
+   labelled bar's own required content width is independent of viewport
+   width. Measured directly (Playwright, real assembled page): 1270px typical
+   / 1307px with a live "0 of 10" Terminals count / 1319px worst-case (a
+   3-digit "999" flag count AND a 2-digit-vs-2-digit "99 of 99" terminals
+   count — both counts' `.cr-pill-count` slots are `min-width: 3.4ch`
+   tabular-nums, so ordinary digit growth costs at most a few px beyond this).
+   The bar needs `clientWidth >= content`; `clientWidth = viewport - 300`
+   (the open rail) for every viewport in this tier. Worst case: viewport >=
+   1319 + 300 = 1619px. `max-width: 1659px` below leaves >=40px of headroom
+   past that worst case (labelled mode starts at 1660px, giving a fully-open
+   bar `clientWidth` of 1360px against a 1319px worst-case requirement) while
+   still handing back full labels well before 1920px, where classic laptop-
+   width viewports (1440/1512) — previously overflowing outright — now get
+   the same verified-0-overflow icon-only tier the phone/tablet path already
+   uses.  Measured with the new boundary in place (Playwright, worst-case
+   digits included): 0px over at 1280/1300/1439/1600/1620/1659/1660/1700/1920,
+   both with and without a live Terminals count. See tests/test_cr_topbar_layout.py's
+   TestTopbarOverflowFixTierBoundary for the assertion that pins this
+   boundary so it can't silently move back.
    ============================================================ */
 @media (max-width: 1279px) {
   .tracker-next .cr-topbar {
@@ -344,7 +488,14 @@
   }
 }
 
-@media (min-width: 1280px) and (max-width: 1439px) {
+/* ADVERSARIAL REVIEW FIX: lower boundary unchanged (1280px, the rail-open
+ * cliff floor); upper boundary raised from 1439px to 1659px -- see the
+ * "ADVERSARIAL REVIEW FIX" / "ARITHMETIC" block comment above the previous
+ * (`max-width: 1279px`) tier for the measured, worst-case-digit arithmetic
+ * that justifies 1659px specifically. This is the ONLY line that changed in
+ * this rule -- the icon-only compaction mechanism itself (which already
+ * measured at 0 overflow across its original 1280-1439 range) is untouched. */
+@media (min-width: 1280px) and (max-width: 1659px) {
   .tracker-next .cr-back .cr-topbar-label,
   .tracker-next .cr-icon-btn .cr-topbar-label,
   .tracker-next .cr-newsession .cr-topbar-label,
@@ -779,7 +930,23 @@
   border-radius: 50%;
   background: var(--state-idle);
 }
-.tracker-next .cr-rail-dot.is-live { background: var(--state-thinking); }
+/* WORKING GLOW (owner: "always on ... easily identifiable"): 'is-live' is the
+ * ONE dot class sessionState()'s 'working' state maps to (STATE_DOT_CLASS,
+ * ext_cr_board.js) -- the same WORKING predicate (isWorking()) the board tile
+ * and the triage strip already key off, never a new threshold. The glow is a
+ * plain, unanimated box-shadow -- always on (not hover/selection-gated) and
+ * immune to prefers-reduced-motion by construction, since there is no
+ * animation here to disable (see the reduced-motion block near
+ * .cr-tile-dot.is-working below, which only ever turns off a KEYFRAME
+ * animation, never a static shadow). --glow-working/--state-working
+ * (ext_cr.css, both palettes) are the canonical working colour/glow; the
+ * fallback keeps this file rendering correctly even a moment before/without
+ * those tokens. Colour never carries meaning alone here: the row's
+ * aria-label already spells out "— working" (orbStateWord), unchanged. */
+.tracker-next .cr-rail-dot.is-live {
+  background: var(--state-working, var(--state-thinking));
+  box-shadow: var(--glow-working, var(--glow-agent-soft));
+}
 .tracker-next .cr-rail-dot.is-waiting { background: var(--state-awaiting); }
 /* BUG FIX: rail rows had no flagged/landed colour at all — only is-live/
  * is-waiting existed, so most non-idle sessions showed no state colour. */
@@ -1046,7 +1213,16 @@
   background: var(--state-idle);
   border: 2px solid var(--surface-top);
 }
-.tracker-next .cr-orb-pip.is-live { background: var(--state-thinking); }
+/* WORKING GLOW, collapsed-rail counterpart of the rail dot above -- the orb
+ * pip is the ONLY state signal left once the rail collapses to bare orbs
+ * (doc 03), so it must carry the same always-on glow or the indicator
+ * vanishes exactly when the rail is collapsed. Same tokens, same fallback,
+ * same "static box-shadow, no animation, immune to reduced-motion" reasoning
+ * as .cr-rail-dot.is-live above. */
+.tracker-next .cr-orb-pip.is-live {
+  background: var(--state-working, var(--state-thinking));
+  box-shadow: var(--glow-working, var(--glow-agent-soft));
+}
 .tracker-next .cr-orb-pip.is-waiting { background: var(--state-awaiting); }
 .tracker-next .cr-orb-pip.is-flagged { background: var(--state-flagged); }
 /* DEFECT 2: the orb's aria-label already said "failing" while its pip stayed
@@ -1311,9 +1487,19 @@
    bg-agent-only restriction (formerly a separate `.cr-tile--agent-glow`
    modifier added only when `s.bg > 0`); that ruling is superseded, so the
    border+glow now lives directly on the base working state. */
+/* WORKING GLOW (owner ruling): this box-shadow was already unconditional (see
+ * the comment above), so a working tile already read as "always on" -- but it
+ * shared the generic --glow-agent-soft with plain agent/selection accents
+ * elsewhere on this board (.cr-orb--selected, .cr-rail-row--selected), so a
+ * working tile didn't read as visually distinct from "just selected/agent-
+ * bordered". Strengthened to the canonical, working-specific --glow-working
+ * (ext_cr.css: wider spread + higher alpha than --glow-agent-soft in both
+ * palettes), with --glow-agent-soft kept only as the fallback for a moment
+ * before/without that token. Border colour is left alone -- --line-agent is a
+ * border token, not the glow, and changing it is outside this task's scope. */
 .tracker-next .cr-tile--working {
   border-color: var(--line-agent);
-  box-shadow: var(--glow-agent-soft), var(--shadow-raised);
+  box-shadow: var(--glow-working, var(--glow-agent-soft)), var(--shadow-raised);
 }
 .tracker-next .cr-tile--flagged { background: var(--surface-flagged); border-color: var(--line-flagged); }
 /* A5 — Failing (brick, 01-foundations.md's state table): same background+border

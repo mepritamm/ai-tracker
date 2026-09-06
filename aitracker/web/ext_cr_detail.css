@@ -120,10 +120,24 @@
   border-color: var(--line-awaiting);
   color: var(--text-awaiting);
 }
+/* JOB 3: the desktop header's own "glowing bulb" — the phone layout already has
+   one (`.crd-phone-orb.crd-state-working` below, box-shadow + crd-pulse) but the
+   desktop pill was flat, so an open+working session was identifiable on the
+   board/rail and on phone but not here. Same `crd-pulse` keyframe every other
+   pulsing dot in this file already uses (crd-seg-dot, crd-phone-orb) — no second
+   animation invented — and the canonical `--state-working`/`--glow-working`
+   tokens (ext_cr.css, both palettes) rather than the phone orb's older
+   `--line-agent`/`--glow-agent` pair, so this reads as the SAME "working" signal
+   the board tile and rail dot use, not a third slightly-different one. The base
+   `box-shadow` here only becomes visible once the animation is turned off (see
+   the reduced-motion override below) — while animating, the keyframe's own
+   box-shadow values are what's on screen, exactly like crd-seg-dot/crd-phone-orb. */
 .cr .crd-pill-state.crd-state-working {
   background: var(--surface-agent-quiet);
   border-color: var(--line-agent);
   color: var(--text-thinking);
+  box-shadow: var(--glow-working, var(--glow-agent-soft));
+  animation: crd-pulse 2.4s infinite;
 }
 .cr .crd-pill-state.crd-state-flagged {
   background: var(--surface-flagged);
@@ -340,6 +354,16 @@
 }
 .cr .crd-ico { width: 14px; height: 14px; display: inline-flex; }
 .cr .crd-ico svg { width: calc(14px * var(--ico-scale)); height: calc(14px * var(--ico-scale)); }
+/* BUG FIX: `ico()`/`svgIcon()` (app.js's ICON_STYLE) only emit an `<svg class="ico">` in
+   the "icons" style -- in "emoji"/"text" style they emit `<span class="ico ico-glyph">`
+   instead, which the svg-only rule above never matches. app.css's generic
+   `.ico-glyph{font-size:calc(1em*var(--ico-scale))}` then sizes it off the SURROUNDING
+   button's own font-size (fixed, e.g. 10.5px for .crd-convonav button) instead of this
+   wrapper's explicit 14px base -- the glyph drifts out of proportion with its "icons"-
+   style sibling and can overflow the 14px box into neighbouring text. Every icon inside
+   `.crd-ico` (pin, search, flag, rename, stop, jump-top, ...) shares this ONE wrapper, so
+   one rule here covers all of them, in all three ICON_STYLE values. */
+.cr .crd-ico > .ico-glyph { font-size: calc(14px * var(--ico-scale)); }
 
 /* One label span, one rule — every icon+label control in this header/composer
    row (search, flag, rename, pin, phone-stop) uses `.crd-btn-label` instead of
@@ -479,6 +503,10 @@
 .cr .crd-fork-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .cr .crd-fork-ico { color: var(--text-dusk); }
 .cr .crd-fork-ico svg { width: calc(13px * var(--ico-scale)); height: calc(13px * var(--ico-scale)); }
+/* Same emoji/text hole as the generic `.crd-ico > .ico-glyph` rule above, but this icon
+   (`branch`) sits in the smaller 13px `.crd-fork-ico` variant, not the 14px default --
+   override at the SAME 13px base so it doesn't fall back to the 14px generic rule. */
+.cr .crd-fork-ico.crd-ico > .ico-glyph { font-size: calc(13px * var(--ico-scale)); }
 .cr .crd-fork-label {
   text-transform: uppercase;
   letter-spacing: .07em;
@@ -609,6 +637,16 @@
 }
 @media (prefers-reduced-motion: reduce) {
   .cr .crd-seg-dot { animation: none; outline: 2px solid var(--state-thinking); outline-offset: 2px; }
+  /* JOB 3: same treatment as .crd-seg-dot/.crd-phone-orb above/below — turn off
+     the pulse keyframe, keep the static box-shadow (the base rule's own
+     `box-shadow: var(--glow-working, …)` is no longer masked by the animation
+     the instant it's disabled), and add the same outline affordance so the
+     "working" signal never depends on motion alone. */
+  .cr .crd-pill-state.crd-state-working {
+    animation: none;
+    outline: 2px solid var(--state-working);
+    outline-offset: 2px;
+  }
 }
 .cr .crd-seg-edge {
   position: absolute;
@@ -1450,19 +1488,26 @@
    narration is being fetched, or if that fetch failed (FIX 6: errorState). */
 .cr .crd-timeline-loading { text-align: center; font-size: 10px; color: var(--text-muted); padding: 4px 0 2px; }
 
-/* FIX 3: the live pinned entry — fixed below the scrolling history (never part of
-   it), so repainting its text every poll can't reflow anything above it. */
-.cr .crd-timeline-live {
+/* FIX 3 (job 2 relocation, owner correction: ABOVE the spine): the live "Now"
+   card — was pinned below the scrolling timeline history; now a top-level
+   card directly ABOVE `.crd-spine` in the main session view, the very first
+   thing under the header (same `margin: …24px 0` horizontal rhythm
+   `.crd-spine` itself uses — the two swapped vertical positions but keep the
+   SAME rhythm, so this reads as the spine's own lead-in rather than a stray
+   box), so repainting its text every poll can't reflow the timeline OR
+   anything else. */
+.cr .crd-now {
   display: flex;
   flex-direction: column;
   gap: 7px;
-  margin: 0 15px 10px;
+  margin: 16px 24px 0;
   padding: 9px 12px;
   border: 2px solid var(--line-agent);
   border-radius: 8px;
   background: var(--surface-agent-active);
   box-shadow: var(--glow-agent);
   font-size: 12.5px;
+  flex: 0 0 auto;
 }
 /* FIX (design-audit drift 4): 5b's live entry reads "Now · <clock>" — a dynamic,
    ticking wall-clock badge — instead of the literal word "LIVE", plus a small
