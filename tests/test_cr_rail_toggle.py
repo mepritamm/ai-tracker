@@ -899,6 +899,20 @@ if __name__ == "__main__":
 #      its age and a row with background agents lost it too -- while the
 #      classic sidebar (app.js sessionRow) shows the flag badge, the note
 #      badge, the agent chip AND the age all at once.
+#
+#      GAP CLOSE (since this section was first written): open_flags/note_count
+#      moved OFF railRowMeta() entirely, onto the row's TITLE-LINE badges
+#      (`cr-rail-badge--flag` / `--note`) -- printing them in both the meta
+#      line and the title line would double-report every flagged row.
+#      railRowMeta() itself now only ever emits the age plus, when `s.bg`, a
+#      clickable "N running" chip (built with `h('button', {...})`, since the
+#      background-agent chip is now a real, clickable element). So the
+#      "nothing gets swallowed" guarantee this section pins now spans TWO
+#      seams: railRowMeta() must not let age and the bg chip push each other
+#      out (TestRailRowMetaParity below), and the FULL ROW -- title-line
+#      badges plus the meta line -- must still carry all four facts together
+#      (TestRailRowNothingSwallowedOnTheRow below, driven through a real
+#      render).
 #   2. The rail width is one variable (--cr-rail-w) set to the classic
 #      sidebar's own 300px, read by every rule that sets a rail width, so the
 #      three rules can never drift apart again.
@@ -912,29 +926,46 @@ def _rail_row_meta_driver_js():
     return r"""
 var OUT = {};
 (function () {
-  // railRowMeta()'s dependencies: app.js's `ago()` string builder, stubbed to a
-  // fixed sentinel so "the age is present" can never be satisfied by some other
-  // number that happens to appear; and glyph(), which since the icon conversion
-  // returns a DOM ELEMENT -- stubbed to a marker string so the harness can
-  // assert which icons were emitted without a DOM.
+  // railRowMeta()'s free-variable dependencies: app.js's `ago()` string
+  // builder, stubbed to a fixed sentinel so "the age is present" can never
+  // be satisfied by some other number that happens to appear; glyph(), which
+  // since the icon conversion returns a DOM ELEMENT -- stubbed to a marker
+  // string; and, since the background-agent chip is now built with
+  // `h('button', {...})` (GAP CLOSE: "also make those markers clickable"),
+  // `h` itself -- stubbed the same way flat() already handles glyph elements:
+  // return a plain, joinable STRING (its children flattened, recursively,
+  // since a child may itself be a glyph-marker string) rather than a real DOM
+  // node, so this harness stays a pure function call with no DOM at all.
   function ago(sec) { return 'AGE'; }
   function glyph(name, cls) { return '<' + name + '>'; }
-  // railRowMeta returns an ARRAY (of strings and glyph elements) -- flatten it
-  // for assertion. Deliberately NOT the production path's job: this is only so
-  // the test can express "these parts are all present, in one row".
+  function h(tag, attrs, children) {
+    return (children || []).map(function (c) {
+      return (typeof c === 'string') ? c : String(c);
+    }).join('');
+  }
+  // railRowMeta returns an ARRAY (of strings and, now, an h()-built chip
+  // string) -- flatten it for assertion. Deliberately NOT the production
+  // path's job: this is only so the test can express "these parts are all
+  // present, in one row".
   function flat(parts) { return parts.join(''); }
 
   %s
 
   var NOW = 1000;
-  OUT['plain']        = flat(railRowMeta({ mtime: NOW }, NOW));
-  OUT['flagged']      = flat(railRowMeta({ mtime: NOW, open_flags: 2 }, NOW));
-  OUT['noted']        = flat(railRowMeta({ mtime: NOW, note_count: 3 }, NOW));
-  OUT['bg']           = flat(railRowMeta({ mtime: NOW, bg: 4 }, NOW));
-  OUT['all_at_once']  = flat(railRowMeta({ mtime: NOW, open_flags: 2, note_count: 3, bg: 4 }, NOW));
-  // The icon conversion's own trap: a glyph is an ELEMENT, so a .join() in the
-  // production path would render "[object HTMLSpanElement]". Pin that the row
-  // builder never does that.
+  OUT['plain'] = flat(railRowMeta({ mtime: NOW }, NOW));
+  OUT['bg']    = flat(railRowMeta({ mtime: NOW, bg: 4 }, NOW));
+  // GAP CLOSE ("all the markers in place"): open_flags/note_count moved OFF
+  // this function entirely (onto the row's title-line badges -- see
+  // TestRailRowNothingSwallowedOnTheRow below), so feeding them here must be
+  // inert: railRowMeta() must not mention them, and must not lose the age.
+  OUT['flagged_and_noted_ignored'] = flat(railRowMeta({ mtime: NOW, open_flags: 2, note_count: 3 }, NOW));
+  // THE SEAM railRowMeta() STILL OWNS: age and the bg chip must coexist even
+  // with open_flags/note_count ALSO set on the session -- nothing truthy may
+  // push the age back out.
+  OUT['all_at_once'] = flat(railRowMeta({ mtime: NOW, open_flags: 2, note_count: 3, bg: 4 }, NOW));
+  // The icon conversion's own trap: a glyph/chip is an ELEMENT in production,
+  // so a naive .join() in the row builder would render
+  // "[object HTMLSpanElement]". Pin that the row builder never does that.
   OUT['no_stringified_dom'] = OUT['all_at_once'].indexOf('[object') < 0;
 })();
 console.log("===RAIL_TOGGLE_JSON_START===");
@@ -946,7 +977,15 @@ console.log(JSON.stringify(OUT));
 class TestRailRowMetaParity(unittest.TestCase):
     """THE BUG: railRowMeta() returned early on the first truthy field, so a
     flagged rail row showed ONLY its flag count -- no age, no note count, no
-    background-agent count. The classic sidebar shows all of them together."""
+    background-agent count.
+
+    GAP CLOSE (since this class was first written): open_flags/note_count
+    moved OFF railRowMeta() entirely, onto the row's title-line badges. So the
+    seam this class pins is narrower than it used to be -- age vs. the bg
+    chip -- and flags/notes are asserted to be genuinely absent here (not
+    merely untested), with the FULL "nothing swallowed across all four facts"
+    guarantee moved to TestRailRowNothingSwallowedOnTheRow below, which
+    renders the real row rather than railRowMeta() in isolation."""
 
     @classmethod
     def setUpClass(cls):
@@ -963,40 +1002,291 @@ class TestRailRowMetaParity(unittest.TestCase):
         """The unchanged base case: nothing to report but recency."""
         self.assertEqual(self.OUT["plain"], "AGE")
 
-    def test_a_flagged_row_keeps_its_age(self):
-        """THE REGRESSION, precisely: before the fix this returned the flag
-        count ALONE and the age vanished from the row."""
-        r = self.OUT["flagged"]
-        self.assertIn("<flag>", r)
-        self.assertIn("2", r)
-        self.assertIn("AGE", r)
-
-    def test_a_noted_row_shows_the_note_count_and_the_age(self):
-        """Note counts were tooltip-only in the rail; classic shows a visible
-        badge, so parity means the count reaches the row itself."""
-        r = self.OUT["noted"]
-        self.assertIn("<note>", r)
-        self.assertIn("3", r)
-        self.assertIn("AGE", r)
-
     def test_a_background_agent_row_keeps_its_age(self):
+        """THE REGRESSION, precisely: before the fix this returned whichever
+        field was checked first, ALONE, and the age vanished from the row."""
         r = self.OUT["bg"]
         self.assertIn("<agent>", r)
         self.assertIn("4", r)
         self.assertIn("AGE", r)
 
-    def test_everything_at_once_is_all_present(self):
-        """The whole point of parity: flags, notes, agents and age coexist on
-        one row rather than the first one winning and hiding the rest."""
+    def test_flags_and_notes_no_longer_reach_railrowmeta_at_all(self):
+        """GAP CLOSE: they moved to the row's title-line badges, so feeding
+        them to railRowMeta() must be inert -- not swallow the age, and not
+        leak a flag/note count into the meta line (which would double-report
+        once the row also renders the badges)."""
+        self.assertEqual(self.OUT["flagged_and_noted_ignored"], "AGE")
+
+    def test_everything_at_once_keeps_age_and_bg_together(self):
+        """The seam railRowMeta() still owns: age and the bg chip coexist
+        even with open_flags/note_count ALSO set on the session -- nothing
+        truthy may push the age back out."""
         r = self.OUT["all_at_once"]
-        for expected in ("<flag>", "2", "<note>", "3", "<agent>", "4", "AGE"):
+        for expected in ("AGE", "<agent>", "4"):
             self.assertIn(expected, r)
 
     def test_row_never_stringifies_a_glyph_element(self):
-        """Since the icon conversion a glyph is a DOM element, so a .join() in
-        the row builder renders "[object HTMLSpanElement]" instead of an icon --
-        a trap this repo has already been bitten by once."""
+        """Since the icon conversion a glyph/chip is a DOM element, so a
+        .join() in the row builder renders "[object HTMLSpanElement]" instead
+        of an icon -- a trap this repo has already been bitten by once."""
         self.assertTrue(self.OUT["no_stringified_dom"])
+
+
+# ---------------------------------------------------------------------------
+# Companion to TestRailRowMetaParity above: the "nothing gets swallowed"
+# guarantee now spans the WHOLE row, not just railRowMeta()'s return value --
+# flags/notes render as real, clickable title-line badges
+# (`cr-rail-badge--flag` / `--note`), while age and the bg chip stay on the
+# meta line. Drives the REAL mount()/update() render path (same technique,
+# and the same hand-rolled DOM stub, as tests/test_cr_rail_row_parity.py's
+# `_REAL_DOM_PREAMBLE`, copied verbatim below) so a regression that drops ANY
+# ONE of the four facts -- not just a railRowMeta()-only regression -- fails
+# here.
+# ---------------------------------------------------------------------------
+
+NOW = 1_700_000_000  # fixed epoch seconds, matches tests/test_cr_rail_polish.py's own fixture clock
+
+
+def make_session(id, mtime, **overrides):
+    """Real list-dict shape (registry.all_sessions() / providers/claude.py
+    list_sessions()), matching tests/test_cr_rail_polish.py's own fixture
+    builder."""
+    s = {
+        "id": id, "project": "proj", "cwd": "/tmp/proj", "title": "t", "prompt": "p",
+        "source": "cli",
+        "agent": False, "group": "", "groupLabel": "", "parentId": "",
+        "bg": 0, "waiting": False, "ended": False, "mtime": mtime,
+        "todo_total": 0, "todo_done": 0, "todo_current": None, "todo_current_index": None,
+        "pr_num": None, "pr_url": None, "pr_repo": None, "pr_state": "",
+        "now_line": "",
+        "pinned": False, "note_count": 0, "open_flags": 0,
+        "continued_as": "", "continued_from": "",
+        "fail_cmd": None, "model": "",
+    }
+    s.update(overrides)
+    return s
+
+
+_REAL_DOM_PREAMBLE = r"""
+globalThis.window = globalThis;
+
+function makeDummy() {
+  var self = {
+    classList: { add: function () {}, remove: function () {}, toggle: function () { return false; }, contains: function () { return false; } },
+    style: {}, dataset: {},
+    setAttribute: function () {}, getAttribute: function () { return null; }, removeAttribute: function () {},
+    appendChild: function (c) { return c; }, append: function () {}, remove: function () {}, insertBefore: function (c) { return c; },
+    addEventListener: function () {}, removeEventListener: function () {},
+    querySelector: function () { return self; }, querySelectorAll: function () { return [self]; },
+    closest: function () { return self; }, firstElementChild: null, children: [],
+    innerHTML: "", textContent: "", value: "", hidden: false,
+    focus: function () {}, click: function () {}, scrollIntoView: function () {}
+  };
+  return self;
+}
+var dummy = makeDummy();
+
+function queryAllReal(root, sel) {
+  var out = [];
+  if (!sel || sel.charAt(0) !== '.') return out;
+  var cls = sel.slice(1);
+  (function walk(node) {
+    (node._children || []).forEach(function (c) {
+      if (c && c._classes && c._classes.has(cls)) out.push(c);
+      walk(c);
+    });
+  })(root);
+  return out;
+}
+
+function allTextIn(node) {
+  var out = [];
+  (function walk(n) {
+    // makeReal() uppercases every tag (`String(tag).toUpperCase()`), so a
+    // text node created via `document.createTextNode('#text')` carries
+    // tagName '#TEXT', never the lowercase DOM convention.
+    if (n.tagName === '#TEXT') { out.push(n.textContent || ''); return; }
+    (n._children || []).forEach(walk);
+  })(node);
+  return out.join('');
+}
+
+function makeReal(tag) {
+  var el = {
+    tagName: String(tag || 'div').toUpperCase(),
+    _classes: new Set(),
+    _children: [],
+    _attrs: {},
+    _id: '',
+    style: {}, dataset: {},
+    hidden: false, innerHTML: '', textContent: '', value: '',
+    parentNode: null
+  };
+  el.classList = {
+    add: function () { for (var i = 0; i < arguments.length; i++) if (arguments[i]) el._classes.add(arguments[i]); },
+    remove: function () { for (var i = 0; i < arguments.length; i++) el._classes.delete(arguments[i]); },
+    toggle: function (c, force) {
+      var has = el._classes.has(c);
+      var want = (force === undefined) ? !has : !!force;
+      if (want) el._classes.add(c); else el._classes.delete(c);
+      return want;
+    },
+    contains: function (c) { return el._classes.has(c); }
+  };
+  Object.defineProperty(el, 'className', {
+    get: function () { return Array.from(el._classes).join(' '); },
+    set: function (v) { el._classes = new Set(String(v == null ? '' : v).split(/\s+/).filter(Boolean)); }
+  });
+  Object.defineProperty(el, 'id', {
+    get: function () { return el._id; },
+    set: function (v) { el._id = v; if (v) _idRegistry[v] = el; }
+  });
+  var _innerHTML = '';
+  Object.defineProperty(el, 'innerHTML', {
+    get: function () { return _innerHTML; },
+    set: function (v) {
+      _innerHTML = v;
+      if (v === '') { el._children.forEach(function (c) { c.parentNode = null; }); el._children = []; }
+    }
+  });
+  el.setAttribute = function (k, v) { el._attrs[k] = v; if (k === 'class') el.className = v; if (k === 'id') el.id = v; };
+  el.getAttribute = function (k) { return (k in el._attrs) ? el._attrs[k] : null; };
+  el.removeAttribute = function (k) { delete el._attrs[k]; };
+  el.appendChild = function (c) { if (c) { el._children.push(c); c.parentNode = el; } return c; };
+  el.append = function () { for (var i = 0; i < arguments.length; i++) el.appendChild(arguments[i]); };
+  el.insertBefore = function (c) { if (c) { el._children.push(c); c.parentNode = el; } return c; };
+  el.removeChild = function (c) { var idx = el._children.indexOf(c); if (idx >= 0) el._children.splice(idx, 1); return c; };
+  el.remove = function () { if (el.parentNode) el.parentNode.removeChild(el); };
+  el.addEventListener = function () {}; el.removeEventListener = function () {};
+  el.focus = function () {}; el.click = function () {}; el.scrollIntoView = function () {};
+  el.querySelectorAll = function (sel) { return queryAllReal(el, sel); };
+  el.querySelector = function (sel) { return queryAllReal(el, sel)[0] || null; };
+  el.closest = function () { return null; };
+  Object.defineProperty(el, 'firstElementChild', { get: function () { return el._children[0] || null; } });
+  Object.defineProperty(el, 'lastChild', { get: function () { return el._children[el._children.length - 1] || null; } });
+  Object.defineProperty(el, 'children', { get: function () { return el._children.slice(); } });
+  return el;
+}
+
+var _idRegistry = {};
+var docBody = makeReal('body');
+
+window.document = {
+  createElement: function (tag) { return makeReal(tag); },
+  createElementNS: function (ns, tag) { return makeReal(tag); },
+  createTextNode: function (text) { var t = makeReal('#text'); t.textContent = text; return t; },
+  getElementById: function (id) { return _idRegistry[id] || dummy; },
+  querySelector: function (sel) { return queryAllReal(docBody, sel)[0] || null; },
+  querySelectorAll: function (sel) { return queryAllReal(docBody, sel); },
+  addEventListener: function () {}, removeEventListener: function () {}, dispatchEvent: function () {},
+  documentElement: dummy, body: docBody, head: dummy, readyState: "complete"
+};
+
+var _STORAGE = {};
+window.localStorage = {
+  getItem: function (k) { return (k in _STORAGE) ? _STORAGE[k] : null; },
+  setItem: function (k, v) { _STORAGE[k] = String(v); },
+  removeItem: function (k) { delete _STORAGE[k]; }
+};
+window.matchMedia = function () { return { matches: false, addEventListener: function () {}, addListener: function () {}, removeEventListener: function () {} }; };
+window.fetch = function () { return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); }, text: function () { return Promise.resolve(""); }, headers: { get: function () { return null; } } }); };
+window.setTimeout = function () { return 0; };
+window.setInterval = function () { return 0; };
+window.clearInterval = function () {}; window.clearTimeout = function () {};
+window.location = { href: "", search: "", pathname: "/", host: "localhost" };
+window.navigator = { userAgent: "node", clipboard: { writeText: function () { return Promise.resolve(); } } };
+window.CustomEvent = function (type, opts) { this.type = type; this.detail = opts && opts.detail; };
+window.Event = window.CustomEvent;
+window.requestAnimationFrame = function () { return 0; };
+window.getComputedStyle = function () { return { getPropertyValue: function () { return ""; } }; };
+window.getSelection = function () { return { toString: function () { return ""; } }; };
+window.addEventListener = function () {}; window.removeEventListener = function () {}; window.dispatchEvent = function () {};
+window.URLSearchParams = function () { return { get: function () { return null; } }; };
+process.on("unhandledRejection", function () {});
+
+try {
+"""
+
+_REAL_DOM_MID = r"""
+} catch (e) {
+  console.error("BUNDLE-THREW: " + (e && e.stack || e));
+  process.exit(1);
+}
+"""
+
+
+def _row_nothing_swallowed_driver_js():
+    bundle_js = _extract_script_content(_read_page())
+    # Non-default values throughout, per the load-bearing requirement: an age
+    # (mtime NOW-5, "just now"), open_flags=2, note_count=3, bg=4 -- a fixture
+    # where every one of those fields defaulting to 0/absent would make the
+    # "nothing swallowed" claim vacuous.
+    session = make_session(
+        "row_swallow_1", NOW - 5,
+        ended=False, open_flags=2, note_count=3, bg=4, flag_text="needs review",
+    )
+    tail = r"""
+var root = makeReal('div');
+docBody.appendChild(root);
+window.CR.board.mount(root, {});
+window.CR.board.update({ sessions: [%(session)s], now: %(now)d });
+
+var row = queryAllReal(root, '.cr-rail-row')[0];
+var meta = row ? queryAllReal(row, '.cr-rail-meta')[0] : null;
+var flagBadges = row ? queryAllReal(row, '.cr-rail-badge--flag') : [];
+var noteBadges = row ? queryAllReal(row, '.cr-rail-badge--note') : [];
+
+var out = {
+  rowFound: !!row,
+  metaText: meta ? allTextIn(meta) : null,
+  flagBadgeText: flagBadges.length ? allTextIn(flagBadges[0]) : null,
+  noteBadgeText: noteBadges.length ? allTextIn(noteBadges[0]) : null,
+};
+
+console.log("===RAIL_TOGGLE_JSON_START===");
+console.log(JSON.stringify(out));
+""" % {"session": json.dumps(session), "now": NOW}
+    return "\n".join([_REAL_DOM_PREAMBLE, bundle_js, _REAL_DOM_MID, tail])
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestRailRowNothingSwallowedOnTheRow(unittest.TestCase):
+    """THE ORIGINAL INTENT of TestRailRowMetaParity, carried to its new home:
+    railRowMeta() used to `return` on the first truthy field, so a flagged or
+    background-agent row silently lost its age -- the information must not be
+    swallowed. Flags/notes now live on the row's title line rather than in
+    railRowMeta() itself, so the right place to assert "nothing is swallowed"
+    is the whole rendered ROW. A session carrying open_flags=2, note_count=3,
+    bg=4 and a real age must show ALL FOUR facts on the row -- none pushed
+    out by another. This test fails if any one of the four disappears."""
+
+    @classmethod
+    def setUpClass(cls):
+        js = _row_nothing_swallowed_driver_js()
+        returncode, stdout, stderr = _run_node(js)
+        if returncode != 0:
+            raise AssertionError(
+                "Row-nothing-swallowed driver failed (exit %d)\n--- stdout ---\n%s\n--- stderr ---\n%s"
+                % (returncode, stdout, stderr)
+            )
+        cls.OUT = _extract_json(stdout)
+
+    def test_row_renders_at_all(self):
+        self.assertTrue(self.OUT["rowFound"], "the rail row did not render")
+
+    def test_age_reaches_the_meta_line(self):
+        self.assertIn("just now", self.OUT["metaText"] or "")
+
+    def test_bg_chip_reaches_the_meta_line(self):
+        self.assertIn("4 running", self.OUT["metaText"] or "")
+
+    def test_flag_count_reaches_a_title_line_badge(self):
+        self.assertIsNotNone(self.OUT["flagBadgeText"], ".cr-rail-badge--flag did not render")
+        self.assertIn("2", self.OUT["flagBadgeText"])
+
+    def test_note_count_reaches_a_title_line_badge(self):
+        self.assertIsNotNone(self.OUT["noteBadgeText"], ".cr-rail-badge--note did not render")
+        self.assertIn("3", self.OUT["noteBadgeText"])
 
 
 class TestRailWidthMatchesClassicSidebar(unittest.TestCase):

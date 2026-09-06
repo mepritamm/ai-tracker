@@ -553,13 +553,20 @@ class TestRailFooterCountsOnlyWhatIsActuallyHidden(unittest.TestCase):
         ]
         cls.OUT = _run(_D7_TAIL % {"sessions": json.dumps(sessions)})
 
+    # The footer's zero-hidden COPY changed when the expanded footer became a
+    # "Show N more" button: with nothing left to reveal it now reads
+    # "N sessions · all shown" instead of "scroll · 0 more". The assertion these
+    # tests actually make is unchanged and is the whole point of the defect —
+    # nothing is reported as hidden when nothing is. Only the wording moved.
     def test_nothing_hidden_when_everything_is_rendered(self):
         self.assertEqual(self.OUT["rowsNoQuery"], 2)
-        self.assertEqual(self.OUT["footerNoQuery"], "scroll · 0 more")
+        self.assertEqual(self.OUT["footerNoQuery"], "2 sessions · all shown")
+        self.assertNotIn("more", self.OUT["footerNoQuery"])
 
     def test_a_search_that_matches_nothing_reports_nothing_more_to_scroll_to(self):
         self.assertEqual(self.OUT["rowsNoMatch"], 0)
-        self.assertEqual(self.OUT["footerNoMatch"], "scroll · 0 more")
+        self.assertEqual(self.OUT["footerNoMatch"], "0 sessions · all shown")
+        self.assertNotIn("more", self.OUT["footerNoMatch"])
 
     def test_the_collapsed_footer_counts_the_same_way(self):
         self.assertEqual(self.OUT["collapsedFooterNoMatch"], "+0")

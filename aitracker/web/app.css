@@ -96,6 +96,8 @@ html,body{margin:0;height:100%;background:var(--app);color:var(--text);font-fami
 .flagbadge{flex:0 0 auto;font-size:10px;border-radius:4px;padding:0 5px;margin-left:2px;font-weight:600;color:var(--red);background:var(--chipbg)}
 /* compact todo progress ("N/M") on a session row — see sessionRow()'s todoBadge in app.js */
 .todobadge{flex:0 0 auto;font-size:10px;border-radius:4px;padding:0 5px;margin-left:2px;font-weight:600;font-family:'JetBrains Mono',monospace;color:var(--blue);background:var(--blue-deep)}
+/* matches the control room's failing state, which the sidebar could not show */
+.failbadge{color:var(--red);background:var(--red-bg);border:1px solid var(--red-line);border-radius:4px;padding:0 5px;font-size:10px;display:inline-flex;align-items:center;gap:3px}
 .ssnip{color:var(--dim);font-size:11px;margin-top:6px;line-height:1.35;font-family:'JetBrains Mono',monospace;overflow-wrap:anywhere}
 .ssnip b{color:var(--text);background:var(--hl);border-radius:2px}
 .smatch{color:var(--green)}

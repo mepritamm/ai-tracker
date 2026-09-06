@@ -1144,6 +1144,13 @@ function sessionRow(s,now,ex){
   // surface on classic's row, not just the detail-pane progress ring. No todos (absent or 0) ->
   // render nothing, never "0/0"/"undefined".
   const todoBadge=(typeof s.todo_total==="number"&&s.todo_total>0)?`<span class=todobadge title="${s.todo_done||0} of ${s.todo_total} todos done">${s.todo_done||0}/${s.todo_total}</span>`:"";
+  // GAP CLOSE (cross-view uniformity): `fail_cmd` rides the SHARED list dict for
+  // every provider — registry.py sets it on every session — and the control room
+  // has rendered it as a "failing" state since it landed. The classic sidebar read
+  // it ZERO times, so a session whose last command failed was simply invisible in
+  // one of the two UIs. Same badge idiom as the flag/note counts beside it, and the
+  // same 'x' glyph the control room's own failing tiles use.
+  const failBadge=s.fail_cmd?`<span class=failbadge title="last command failed: ${esc(s.fail_cmd)}">${ico('x')} fail</span>`:"";
   // end-state: waiting on your answer (wins, even while still live) > completed its last run.
   // "done" is gated to the live window (a session that JUST finished) — not every stale idle
   // session — so the checkmark marks fresh completions instead of flooding the list green.
@@ -1157,7 +1164,7 @@ function sessionRow(s,now,ex){
     :status==="done"?`<span class="statusbadge done" title="completed its last run">${ico('check')} done</span>`:"";
   return `<div class="sitem ${s.id===cur?'active':''}${s.pinned?' pinned':''}${s.agent?' agentrow':''}${ex?' hasagents':''}${status?' '+status:''}${s.open_flags?' flagged':''}" onclick="${onclick}" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
     `<div class=srow1>${chev}<span class="dot ${live?'live':''}"></span><span class=nm>${s.agent?ico('agent')+' ':''}${esc(label)}</span>`+
-    `${statusBadge}${flagBadge}${noteBadge}${todoBadge}`+
+    `${statusBadge}${failBadge}${flagBadge}${noteBadge}${todoBadge}`+
     (s._runs>1?`<span class="agentbadge runs" title="ran ${s._runs}× — collapsed; opens the latest">×${s._runs}</span>`:"")+
     `<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">${ico('pin')}</span>`+
     `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename this session">${ico('edit')}</span></div>`+

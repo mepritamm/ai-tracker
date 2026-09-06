@@ -763,18 +763,24 @@ def _detail_driver_js():
               " nul: window.CR.detail._internal.spineSpanChoices(null).map(function(c){ return c.key; })"
               " };" % (192 * HOUR_MS, 10 * MIN_MS, 2 * HOUR_MS))
 
-    js.append("OUT2.win_clamp = (function(){"
-              " var W = window.CR.detail._internal.spineWindow;"
-              " var now = %d, first = now - %d;"
+    # The spine is a ZOOM now, not a window: chips widen the strip and the
+    # viewport's own scrollLeft does the panning (and the clamping). What needs
+    # pinning is the width arithmetic -- above all its cap, because an uncapped
+    # zoom on the real 2192h session here would ask for 8,768,000%.
+    js.append("OUT2.zoom = (function(){"
+              " var Z = window.CR.detail._internal.spineZoomPct;"
               " return {"
-              "   none: W({ spineSpanMs: null, spineEndMs: null }, first, now),"
-              "   no_ui: W(null, first, now),"
-              "   anchored: W({ spineSpanMs: %d, spineEndMs: null }, first, now).endMs - now,"
-              "   past_first: W({ spineSpanMs: %d, spineEndMs: now - %d }, first, now).endMs - first,"
-              "   future: W({ spineSpanMs: %d, spineEndMs: now + %d }, first, now).endMs - now,"
-              "   span_gt_session: W({ spineSpanMs: %d, spineEndMs: null }, first, now).endMs - now"
-              " }; })();" % (BASE_MS, 4 * HOUR_MS, HOUR_MS, HOUR_MS, 10 * HOUR_MS,
-                             HOUR_MS, 5 * HOUR_MS, 24 * HOUR_MS))
+              "   all: Z({ spineZoomMs: null }, %d),"
+              "   no_ui: Z(null, %d),"
+              "   six_h_of_14h39: Z({ spineZoomMs: %d }, %d),"
+              "   span_longer_than_session: Z({ spineZoomMs: %d }, %d),"
+              "   zero_elapsed: Z({ spineZoomMs: %d }, 0),"
+              "   pathological: Z({ spineZoomMs: %d }, %d)"
+              " }; })();" % (14 * HOUR_MS, 14 * HOUR_MS,
+                             6 * HOUR_MS, (14 * HOUR_MS + 39 * MIN_MS),
+                             24 * HOUR_MS, 4 * HOUR_MS,
+                             HOUR_MS,
+                             15 * MIN_MS, 2192 * HOUR_MS))
 
     return "\n".join(js)
 
@@ -1251,17 +1257,23 @@ class TestCRLogic(unittest.TestCase):
         self.assertEqual(c["zero"], [])
         self.assertEqual(c["nul"], [])
 
-    def test_spine_window_clamps_so_a_drag_pan_cannot_leave_the_session(self):
-        """The drag-pan writes ui.spineEndMs straight from pointer deltas, so
-        every bound that keeps the window sane lives in spineWindow()."""
-        c = self.OUT["win_clamp"]
-        self.assertIsNone(c["none"], "no span chosen == All == no window")
-        self.assertIsNone(c["no_ui"], "no ui object must not throw")
-        self.assertEqual(c["anchored"], 0, "endMs null == pinned to the live edge")
-        # dragged 10h back on a 4h session: the window's LEFT edge stops at first
-        self.assertEqual(c["past_first"], 60 * 60 * 1000)
-        self.assertEqual(c["future"], 0, "cannot pan into the future")
-        self.assertEqual(c["span_gt_session"], 0, "span longer than the session pins to now")
+    def test_spine_zoom_width_and_its_cap(self):
+        """The chips are a ZOOM: they set how wide the strip is drawn, and the
+        viewport scrolls. Nothing is ever filtered out, which is why clicking one
+        can no longer empty the bar.
+
+        The cap is the load-bearing part. The real 2192h session on this machine
+        at a 15m zoom would want 8,768,000% -- tens of millions of pixels -- so it
+        clamps to 6000% (60x), still a dramatic spread."""
+        z = self.OUT["zoom"]
+        self.assertEqual(z["all"], 100, "All == fits the panel, exactly as before")
+        self.assertEqual(z["no_ui"], 100, "no ui object must not throw")
+        # 14h39m shown at a 6h zoom -> 14.65/6 == ~244%
+        self.assertAlmostEqual(z["six_h_of_14h39"], 244.2, delta=1.0)
+        self.assertEqual(z["span_longer_than_session"], 100,
+                         "a zoom wider than the session can only ever be 'fits'")
+        self.assertEqual(z["zero_elapsed"], 100, "no elapsed time -> nothing to zoom")
+        self.assertEqual(z["pathological"], 6000, "capped, not 8,768,000%")
 
     def test_spine_segments_ended_at_alone_is_not_mistaken_for_real_timing(self):
         """Regression for the exact real-world shape confirmed live: a completed
