@@ -123,13 +123,31 @@ def _tail_scan(path, nbytes=96000):
     giant single command's tool_use can in principle fall outside the 96 KB window
     while its result is inside (same known limitation as the waiting-question miss
     above); that just means the id is unmatched and this stays honestly None, never
-    a guess."""
+    a guess.
+
+    Also harvests `shells_running` — the session-list "a background shell is still going"
+    signal, off this SAME bounded tail (zero extra I/O): a Bash `run_in_background` tool_use
+    seen in the tail records its id; the matching tool_result (same `SHELL_RE` that
+    `parse_shells` uses, below) resolves that id to the harness' shell id; a
+    `<task-notification>` seen anywhere in this tail (same `TASKDONE_RE` harvest
+    `parse_shells` does, matched on the RAW line text so it's caught even inside the
+    `queue-operation` JSON wrapper, not just the `type: user` echo) marks a shell id done.
+    `shells_running` is the count of launches in this tail whose resolved shell id was never
+    marked done here. KNOWN LIMITATION: a shell launched before this 96 KB tail window began
+    (so its launch+result pair, or a still-earlier `<task-notification>` for it, falls
+    outside `lines`) is invisible to this count even if it is still running right now — this
+    UNDERCOUNTS, on purpose: the failure mode this leaves is "we missed a shell" (self-heals
+    the moment fresh activity pulls the launch back into the tail), never "this session
+    reads as working forever" from a shell that isn't really running."""
     ai = custom = entry = None
     last_text = ""
     model = ""
     bash_cmds = {}   # tool_use_id -> command text[:60], Bash calls seen in this tail
     fail_cmd = None
     open_asks, last = set(), ""
+    shell_launches = {}   # tool_use_id -> True, Bash run_in_background calls seen in this tail
+    shell_ids = {}        # tool_use_id -> harness shell id, from that launch's matching tool_result
+    shell_done = set()    # harness shell/task ids marked done via <task-notification> in this tail
     try:
         sz = os.path.getsize(path)
         with open(path, "rb") as fh:
@@ -139,6 +157,8 @@ def _tail_scan(path, nbytes=96000):
         if sz > nbytes and lines:
             lines = lines[1:]  # drop the partial first line from mid-file seek
         for line in lines:
+            if "<task-notification>" in line:   # raw-text check: matches inside the
+                shell_done.update(TASKDONE_RE.findall(line))  # queue-operation JSON wrapper too
             try:
                 o = json.loads(line)
             except ValueError:
@@ -165,9 +185,12 @@ def _tail_scan(path, nbytes=96000):
                         if b.get("name") == "AskUserQuestion" and b.get("id"):
                             open_asks.add(b["id"])          # opened; a matching tool_result answers it
                         elif b.get("name") == "Bash" and b.get("id"):
-                            cmdtxt = (b.get("input") or {}).get("command")
+                            inp = b.get("input") or {}
+                            cmdtxt = inp.get("command")
                             if isinstance(cmdtxt, str) and cmdtxt:
                                 bash_cmds[b["id"]] = cmdtxt[:60]
+                            if inp.get("run_in_background"):
+                                shell_launches[b["id"]] = True
                     elif bt == "text":
                         t = (b.get("text") or "").strip()
                         if t and not t.startswith("<"):     # skip command/system echoes
@@ -190,6 +213,10 @@ def _tail_scan(path, nbytes=96000):
                                     # _is_real_bash_error)
                                 else:
                                     fail_cmd = None
+                            if tid in shell_launches and tid not in shell_ids:
+                                mt = SHELL_RE.search(_result_text(b.get("content")))
+                                if mt:
+                                    shell_ids[tid] = mt.group(1)
                     last = "tool_result"
                 elif o.get("isMeta"):
                     pass                                     # injected system text (task-notification, skill reload) — not a turn
@@ -202,8 +229,11 @@ def _tail_scan(path, nbytes=96000):
         pass
     waiting = bool(open_asks)
     ended = (not waiting) and last == "assistant_text"
+    # See the docstring's `shells_running` section for the undercount-on-purpose rationale.
+    shells_running = sum(1 for sid in shell_ids.values() if sid not in shell_done)
     return {"ai": ai, "custom": custom, "entry": entry, "waiting": waiting, "ended": ended,
-            "last_text": last_text, "model": model, "fail_cmd": fail_cmd}
+            "last_text": last_text, "model": model, "fail_cmd": fail_cmd,
+            "shells_running": shells_running}
 
 
 def _tail_fields(path, nbytes=96000):
@@ -220,7 +250,8 @@ def _session_meta(path):
         mt = os.path.getmtime(path)
     except OSError:
         return {"cwd": "", "title": "", "source": "", "prompt": "", "first": 0, "waiting": False, "ended": False, "sessionKind": None,
-                "pr_num": None, "pr_url": None, "pr_repo": None, "pr_state": "", "last_text": "", "model": "", "fail_cmd": None}
+                "pr_num": None, "pr_url": None, "pr_repo": None, "pr_state": "", "last_text": "", "model": "", "fail_cmd": None,
+                "shells_running": 0}
     hit = _META_CACHE.get(path)
     if hit and hit[0] == mt:
         return hit[1]
@@ -273,6 +304,10 @@ def _session_meta(path):
         # in this SAME bounded tail if it errored, else honestly None. See _tail_scan's
         # docstring for the join and its "latest wins" semantics.
         "fail_cmd": ts["fail_cmd"],
+        # Board/rail/sidebar "a background shell is still going" signal, off this SAME
+        # bounded tail read -- see _tail_scan's `shells_running` docstring section for the
+        # launch/task-notification join and its deliberate undercount-on-purpose bias.
+        "shells_running": ts["shells_running"],
         # PR data is the expensive half — a full-file scan (collect_prs et al, ~1ms median but
         # ~28ms at the p95 file size) that this cheap 40-line/tail-only pass must not eat. Only
         # an ENDED session can ever render as a Landed tile (ext_cr_board.js's sessionState()),
@@ -527,12 +562,24 @@ def list_sessions(limit=200):
         # session with running background agents but no fresh foreground turn should say
         # what its agents are doing, not resurface a stale waiting/todo/narration line from
         # before its foreground turn closed).
+        # shells_running rides the SAME bounded tail read as waiting/ended/bg above (see
+        # _tail_scan's docstring) -- a background shell still going is surfaced the same
+        # way a background agent already is (owner ruling: "those need to behave in the
+        # similar fashion like the agents"), both in now_line just below and in the shared
+        # list dict every provider carries (registry.py's all_sessions() setdefaults it to
+        # 0 for any provider, like Auggie, with no shell concept).
+        shells_running = sm.get("shells_running", 0)
         now_line = ""
         if (time.time() - mt) < LIVE_WINDOW:
             if not sm["ended"] and sm["waiting"]:
                 now_line = "⧖ waiting for your answer"
+            elif bg and shells_running:
+                now_line = "⚙ %d background agent%s · %d shell%s" % (
+                    bg, "" if bg == 1 else "s", shells_running, "" if shells_running == 1 else "s")
             elif bg:
                 now_line = "⚙ %d background agent%s" % (bg, "" if bg == 1 else "s")
+            elif shells_running:
+                now_line = "⚙ %d background shell%s" % (shells_running, "" if shells_running == 1 else "s")
             elif not sm["ended"] and todo_current:
                 now_line = "▶ " + now_phrase(todo_current)
             elif not sm["ended"] and sm.get("last_text"):
@@ -548,6 +595,7 @@ def list_sessions(limit=200):
             "group": gkey, "groupLabel": glabel,     # fallback bucket (repo/sandbox) for orphan agents
             "parentId": parent,                      # the originating session it nests under; "" -> bucket
             "bg": bg,                                # in-transcript background agents live now -> 🤖 sidebar badge
+            "shells_running": shells_running,        # background shell(s) still going -> same treatment as bg
             "waiting": sm["waiting"],                # unanswered AskUserQuestion -> ⏳ sidebar highlight
             "ended": sm["ended"],                    # last turn was the assistant finishing -> ✅ completed
             "mtime": mt,  # counts background-agent activity too

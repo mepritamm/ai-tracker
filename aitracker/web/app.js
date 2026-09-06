@@ -992,7 +992,7 @@ const LIVE=300; // seconds since last activity a session stays "live" (5 min)
 // sessionRow() status badge AND the control room's ext_cr_board.js `isWorking()` (which
 // feeds sessionState/triageCounts/railRow) both call this — defining it twice is exactly
 // how the two views disagreed before (ext_cr_board.js got the bg-aware fix, app.js didn't).
-function isSessionWorking(s,live){ return !!live && (!s.ended || !!s.bg); }
+function isSessionWorking(s,live){ return !!live && (!s.ended || !!s.bg || !!s.shells_running); }
 window.isSessionWorking=isSessionWorking;
 const EXT=[];   // feature modules (web/ext_*.js) push a fn(d); called at the end of every render
 // Live terminal count for the sidebar's "Manage terminals" badge, read off /api/list's
@@ -1132,6 +1132,11 @@ function sessionRow(s,now,ex){
   const kidchip=ex?` · <span class=agentbadge title="agent sessions this one spawned">${ico('agent')} ${ex.live?ex.live+" live / ":""}${ex.n} agent${ex.n==1?"":"s"}</span>`:"";
   // in-transcript background agents (Task/Workflow) running now — they spawn no separate session, so this is their only sidebar cue
   const bgchip=s.bg?` · <span class="agentbadge live" title="${s.bg} background agent${s.bg==1?'':'s'} running now">${ico('agent')} ${s.bg} running</span>`:"";
+  // background SHELLS running now — same treatment as bgchip just above (owner ruling: shells
+  // must surface "in the similar fashion like the agents", not just fix isSessionWorking).
+  // `ico('keyboard')` is the SAME glyph the detail drawer already uses for shells (see the
+  // bgchip('...shells'...) chip built in render()), so this doesn't invent a new icon.
+  const shchip=s.shells_running?` · <span class="agentbadge live" title="${s.shells_running} background shell${s.shells_running==1?'':'s'} running now">${ico('keyboard')} ${s.shells_running} running</span>`:"";
   // a parent row: clicking the title toggles its agents too (not just the agent-toggle button) while still opening it
   const onclick=ex?`pickToggle('${s.id}','${encodeURIComponent(ex.gk)}')`:`pick('${s.id}')`;
   const noteBadge=s.note_count?`<span class=notebadge title="${s.note_count} note${s.note_count==1?'':'s'}">${ico('note')}${s.note_count}</span>`:"";
@@ -1168,7 +1173,7 @@ function sessionRow(s,now,ex){
     (s._runs>1?`<span class="agentbadge runs" title="ran ${s._runs}× — collapsed; opens the latest">×${s._runs}</span>`:"")+
     `<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">${ico('pin')}</span>`+
     `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename this session">${ico('edit')}</span></div>`+
-    `<div class=smeta>${s.agent?'<span class=agentbadge>'+ico('agent')+' Agent</span> · ':''}${bits.join(" · ")}${kidchip}${bgchip}</div></div>`;
+    `<div class=smeta>${s.agent?'<span class=agentbadge>'+ico('agent')+' Agent</span> · ':''}${bits.join(" · ")}${kidchip}${bgchip}${shchip}</div></div>`;
 }
 // collapse agent sessions that are re-runs of the same task (first prompt) into one row, newest as
 // representative, with _runs=N — so a finding re-executed 12× shows once, not twelve times.

@@ -88,6 +88,11 @@ def all_sessions():
         # signal, augment_ext.py an honest None), but the seam guarantees the key exists
         # for EVERY session regardless, same defensive pattern as the fields above.
         s.setdefault("fail_cmd", None)
+        # A background shell still running, like `bg`/agents above -- guaranteed for every
+        # provider (Claude's list_sessions/claude.py sets a real count; Auggie and the
+        # Augment-ext providers have no shell concept and never set it, so this is the seam's
+        # honest 0, never omitted).
+        s.setdefault("shells_running", 0)
     out.sort(key=lambda s: (not s.get("pinned"), -s.get("mtime", 0)))   # pinned first, then newest
     return out
 

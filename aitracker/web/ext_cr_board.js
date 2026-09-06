@@ -76,7 +76,7 @@ window.CR = window.CR || {};
   // the bg-aware fix); a shared global is the actual fix for the parity requirement.
   function isWorking(s, live) {
     if (typeof isSessionWorking === 'function') return isSessionWorking(s, live);
-    return !!live && (!s.ended || !!s.bg);
+    return !!live && (!s.ended || !!s.bg || !!s.shells_running);
   }
 
   function sessionState(s, now) {
@@ -1239,6 +1239,16 @@ window.CR = window.CR || {};
         'aria-label': s.bg + ' background agents running, open the session',
         onclick: function (e) { e.stopPropagation(); openSession(s.id); },
       }, [glyph('agent', ''), ' ' + s.bg + ' running'])]);
+      // background SHELLS running now -- same badge idiom as the agent chip just above
+      // (owner ruling: shells must surface "in the similar fashion like the agents").
+      // `glyph('keyboard', ...)` is the SAME icon app.js's detail-drawer bgchip already
+      // uses for shells, so this doesn't invent a new glyph.
+      if (s.shells_running) groups.push([h('button', {
+        class: 'cr-rail-badge cr-rail-badge--bg', type: 'button',
+        title: s.shells_running + ' background shell' + (s.shells_running === 1 ? '' : 's') + ' running now \u2014 click to open the session',
+        'aria-label': s.shells_running + ' background shells running, open the session',
+        onclick: function (e) { e.stopPropagation(); openSession(s.id); },
+      }, [glyph('keyboard', ''), ' ' + s.shells_running + ' running'])]);
       var out = [];
       groups.forEach(function (g, i) {
         if (i) out.push(' · ');
@@ -1273,6 +1283,14 @@ window.CR = window.CR || {};
         bits.push(h('div', { class: 'cr-rail-bg' },
           [glyph('agent', ''),
            ' ' + s.bg + ' background agent' + (s.bg === 1 ? '' : 's')]));
+      }
+      // Same treatment for background shells -- the board tile's own now_line already
+      // says "N background shell(s)" (providers/claude.py's list_sessions) when a
+      // session has no agents but a shell running; this line matches that wording here.
+      if (s.shells_running) {
+        bits.push(h('div', { class: 'cr-rail-bg' },
+          [glyph('keyboard', ''),
+           ' ' + s.shells_running + ' background shell' + (s.shells_running === 1 ? '' : 's')]));
       }
       var ticks = todoTicks(s);   // null when the session recorded no todos
       if (ticks) bits.push(ticks);
