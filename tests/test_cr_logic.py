@@ -291,6 +291,61 @@ def _board_driver_js():
                                for i in range(20)]
     eviction_sessions = live_working_sessions + stale_failing_sessions
 
+    # 6d) THE BOARD-TABS BUG (reports/board-tabs.md): boardTiles() used to (1)
+    # exclude every idle session before the cap and (2) apply the cap BEFORE a
+    # triage-cell filter ran -- so a corpus that is entirely idle (the live
+    # screenshot's exact 957-sessions/0-tiles shape) rendered an empty board,
+    # and clicking a triage cell (e.g. PINNED, count 4) filtered an
+    # already-capped, already-idle-stripped list down to nothing even though 4
+    # matching sessions existed. Fixed shape (owner ruling, supersedes doc 02's
+    # "idle sessions never get a tile"): the DEFAULT (unfiltered) view backfills
+    # with idle sessions once live/working/etc. run out (RANK already sorts
+    # idle last, so this falls out of the existing sort + cap with NO exclusion
+    # filter); a FILTERED view (`boardTiles(sessions, now, key)`) matches over
+    # the FULL session set -- idle included -- and only caps AFTER filtering.
+
+    # (a) All-idle corpus, count > cap: exactly boardTileCap() (8, default)
+    # tiles must render, all of them idle -- this is the literal 957-idle/
+    # 0-tiles screenshot bug, scaled down. Newest-mtime idle sessions win the
+    # backfill slots (RANK ties break on mtime desc, same as any other tier).
+    all_idle_sessions = [make_session("allidle%d" % i, NOW - (LIVE_WINDOW + 100 + i), ended=False)
+                         for i in range(15)]
+
+    # (a2) All-idle corpus, count < cap: exactly that count of tiles (min(cap,
+    # sessions)) -- not zero, not the cap padded with anything that isn't there.
+    few_idle_sessions = [make_session("fewidle%d" % i, NOW - (LIVE_WINDOW + 100 + i), ended=False)
+                         for i in range(3)]
+
+    # (b) Filtering by 'pinned': 4 pinned IDLE sessions among a pile of
+    # non-pinned idle noise -- the filter must match over the FULL set (idle
+    # included) and return exactly the 4 pinned ones, regardless of the cap.
+    # mtime must sit OUTSIDE LIVE_WINDOW (like every other idle fixture here) --
+    # `ended=False` alone does not make a session idle if its mtime is still
+    # live; `sessionState()` reads a live `ended=False` session as 'working'.
+    pinned_idle_sessions = (
+        [make_session("pinidle%d" % i, NOW - (LIVE_WINDOW + 100 + i), ended=False, pinned=True) for i in range(4)]
+        + [make_session("noise%d" % i, NOW - (LIVE_WINDOW + 100 + i), ended=False, pinned=False) for i in range(10)]
+    )
+
+    # (c) A filter whose matches EXCEED the cap: 10 pinned idle sessions, cap
+    # stays at the default 8 -- exactly 8 tiles must render (the filtered list
+    # is capped too, just AFTER matching, not before).
+    pinned_over_cap_sessions = [make_session("pinover%d" % i, NOW - (LIVE_WINDOW + 100 + i),
+                                              ended=False, pinned=True)
+                                for i in range(10)]
+
+    # (d) Non-idle sessions must still sort ahead of idle backfill in the
+    # unfiltered view: 2 genuinely LIVE 'working' sessions (mtime inside
+    # LIVE_WINDOW) plus 5 idle sessions (mtime well outside it) all seat on an
+    # 8-tile board with the 2 working ones FIRST -- RANK (working=3 ahead of
+    # idle=5), not merely "happens to also be newer" (idle mtimes here are, by
+    # construction of what "idle" even means, always older than any live mtime,
+    # so this pins the RANK-driven ordering, whatever the recency would say).
+    order_sessions = (
+        [make_session("ordwork%d" % i, NOW - 5 - i, ended=False) for i in range(2)]
+        + [make_session("ordidle%d" % i, NOW - (LIVE_WINDOW + 100 + i), ended=False) for i in range(5)]
+    )
+
     # 7) railOrder: pinned/unpinned partition, each newest-first.
     rail_sessions = [
         make_session("p_old", NOW - 500, pinned=True),
@@ -397,6 +452,34 @@ def _board_driver_js():
     # corpus and report everything the test needs to prove no eviction happened.
     js.append("var evictionSessions = %s;" % json.dumps(eviction_sessions))
     js.append("OUT.eviction_tiles = %s;" % tiles_summary("evictionSessions"))
+
+    # 6d) THE BOARD-TABS BUG: unfiltered idle-backfill + filter-before-cap.
+    js.append("var allIdleSessions = %s;" % json.dumps(all_idle_sessions))
+    js.append("OUT.all_idle_tiles = %s;" % tiles_summary("allIdleSessions"))
+
+    js.append("var fewIdleSessions = %s;" % json.dumps(few_idle_sessions))
+    js.append("OUT.few_idle_tiles = %s;" % tiles_summary("fewIdleSessions"))
+
+    js.append("var pinnedIdleSessions = %s;" % json.dumps(pinned_idle_sessions))
+    js.append("OUT.pinned_idle_tiles = (function(){"
+              " var tiles = window.CR.board.boardTiles(pinnedIdleSessions, NOW, 'pinned');"
+              " return tiles.map(function(t){ return { id: t.session.id, state: t.state }; }); })();")
+    js.append("OUT.pinned_idle_total = (function(){"
+              " return window.CR.board.boardTiles(pinnedIdleSessions, NOW, 'pinned').total; })();")
+
+    js.append("var pinnedOverCapSessions = %s;" % json.dumps(pinned_over_cap_sessions))
+    js.append("OUT.pinned_over_cap_tiles = (function(){"
+              " var tiles = window.CR.board.boardTiles(pinnedOverCapSessions, NOW, 'pinned');"
+              " return tiles.map(function(t){ return t.session.id; }); })();")
+    js.append("OUT.pinned_over_cap_total = (function(){"
+              " return window.CR.board.boardTiles(pinnedOverCapSessions, NOW, 'pinned').total; })();")
+    # Sanity control: the SAME sessions with NO filter must still hit the plain
+    # unfiltered cap (8) -- proves the filtered-vs-unfiltered cap distinction
+    # isn't accidental (e.g. a filter that silently never applied).
+    js.append("OUT.pinned_over_cap_unfiltered_len = window.CR.board.boardTiles(pinnedOverCapSessions, NOW).length;")
+
+    js.append("var orderSessions = %s;" % json.dumps(order_sessions))
+    js.append("OUT.order_tiles = %s;" % tiles_summary("orderSessions"))
 
     js.append("var railSessions = %s;" % json.dumps(rail_sessions))
     js.append("(function(){ var r = window.CR.board.railOrder(railSessions);"
@@ -750,11 +833,81 @@ class TestCRLogic(unittest.TestCase):
         got = [t["id"] for t in self.OUT["pin_order"]]
         self.assertEqual(got, ["old_pinned", "new_unpinned"])
 
-    def test_board_tiles_idle_never_gets_a_tile(self):
-        ids = [t["id"] for t in self.OUT["idle_tiles"]]
-        self.assertNotIn("stale", ids)
-        self.assertIn("fresh", ids)
+    def test_board_tiles_idle_sessions_still_derive_idle_state(self):
+        """sessionState() itself is unchanged: an idle session still reads 'idle'
+        directly. (Whether it gets a board TILE is a separate question -- see the
+        backfill tests below, which supersede the old "idle never gets a tile"
+        rule per the owner's ruling.)"""
         self.assertEqual(self.OUT["idle_state_direct"], "idle")
+        ids = [t["id"] for t in self.OUT["idle_tiles"]]
+        self.assertIn("fresh", ids)
+        self.assertIn("stale", ids)   # now backfilled, not excluded
+        # and 'fresh' (working, RANK 3) still sorts strictly ahead of the idle
+        # backfill ('stale', RANK 5) -- attention-claim before backfill.
+        self.assertEqual(ids, ["fresh", "stale"])
+
+    def test_board_tiles_default_view_backfills_idle_when_corpus_exceeds_cap(self):
+        """THE 957-idle/0-tiles SCREENSHOT BUG. Root cause A: boardTiles() used to
+        drop every idle session before the sort/cap ever ran, so an all-idle
+        corpus rendered zero tiles no matter its size. Fixed: idle is simply not
+        excluded any more (RANK's own 'idle': 5 puts it last), so the unfiltered
+        board still returns exactly boardTileCap() (8) tiles out of 15 all-idle
+        sessions -- non-zero, and capped at the newest 8 by mtime."""
+        tiles = self.OUT["all_idle_tiles"]
+        self.assertEqual(len(tiles), 8, "the all-idle corpus must still fill the board, not empty it")
+        self.assertTrue(all(t["state"] == "idle" for t in tiles))
+        ids = [t["id"] for t in tiles]
+        self.assertEqual(ids, ["allidle%d" % i for i in range(8)], "newest-mtime idle sessions win the backfill")
+
+    def test_board_tiles_default_view_never_pads_past_available_sessions(self):
+        """The mirror case: fewer idle sessions than the cap must render exactly
+        that many tiles (min(cap, sessions)), never zero and never a phantom pad
+        up to the cap."""
+        tiles = self.OUT["few_idle_tiles"]
+        self.assertEqual(len(tiles), 3)
+        self.assertEqual([t["id"] for t in tiles], ["fewidle0", "fewidle1", "fewidle2"])
+
+    def test_board_tiles_filter_matches_full_corpus_before_capping(self):
+        """THE 4-PINNED/0-TILES SCREENSHOT BUG. Root cause B: the triage-cell
+        filter used to run AFTER boardTiles' own cap slice, so it could only ever
+        surface matches that happened to survive the unfiltered top-N -- with
+        idle sessions excluded outright (cause A), that top-N was often empty,
+        so PINNED (count 4) rendered 'Nothing matches that filter right now.'
+        Fixed: `boardTiles(sessions, now, 'pinned')` matches over the FULL
+        session set -- 4 pinned IDLE sessions among 10 non-pinned idle noise
+        sessions -- and only caps after. All 4 pinned sessions must render,
+        none of the noise."""
+        tiles = self.OUT["pinned_idle_tiles"]
+        self.assertEqual(len(tiles), 4)
+        ids = {t["id"] for t in tiles}
+        self.assertEqual(ids, {"pinidle0", "pinidle1", "pinidle2", "pinidle3"})
+        self.assertTrue(all(t["state"] == "idle" for t in tiles), "pinned sessions here are idle, not live")
+        # the cell count and the rendered tile count must agree exactly (4 <= cap).
+        self.assertEqual(self.OUT["pinned_idle_total"], 4)
+
+    def test_board_tiles_filter_still_caps_when_matches_exceed_it(self):
+        """Requirement 3's other half: when a filter matches MORE than the cap,
+        the board still shows exactly boardTileCap() (8) tiles -- capping happens
+        AFTER the filter, not "no cap at all" -- while the footer's pre-cap total
+        (`.total`) reports the true 10, so the overflow is visible, not silently
+        dropped. A sanity control proves the filter is doing real work: the SAME
+        10 sessions with NO filter hit the identical plain 8-tile cap (this isn't
+        "the filter never ran")."""
+        ids = self.OUT["pinned_over_cap_tiles"]
+        self.assertEqual(len(ids), 8)
+        self.assertEqual(self.OUT["pinned_over_cap_total"], 10)
+        self.assertEqual(self.OUT["pinned_over_cap_unfiltered_len"], 8)
+
+    def test_board_tiles_non_idle_still_ranked_ahead_of_idle_backfill(self):
+        """Requirement 1's other half: backfill never lets idle sessions crowd out
+        or rank ahead of a genuinely non-idle one -- RANK (working=3 ahead of
+        idle=5) governs the order, and the 2 live 'working' sessions here occupy
+        the first 2 board positions ahead of all 5 idle backfill sessions."""
+        tiles = self.OUT["order_tiles"]
+        states = [t["state"] for t in tiles]
+        self.assertEqual(states, ["working", "working", "idle", "idle", "idle", "idle", "idle"])
+        ids = [t["id"] for t in tiles]
+        self.assertEqual(ids[:2], ["ordwork0", "ordwork1"])
 
     def test_board_tile_cap(self):
         """Default cap is 8; cr.boardTileCount (localStorage) can move it, always
@@ -794,26 +947,38 @@ class TestCRLogic(unittest.TestCase):
         tiles, and the one live session got bumped off the board entirely.
 
         Fixture: 5 genuinely live 'working' sessions + 20 long-dead sessions each
-        carrying a stale fail_cmd (fixture builder above). Asserts all three legs of
-        the guard: the cap still holds, every live session got a tile, and no stale
-        session did."""
+        carrying a stale fail_cmd, i.e. 20 idle sessions (fixture builder above).
+        Asserts the guard's real invariant -- RANK alone (working=3 ahead of
+        idle=5) guarantees a live session can never be bumped by an idle one,
+        regardless of how many idle sessions exist or how the remaining slots
+        get backfilled. Per the board-tabs fix (idle backfill, this file's
+        "board-tabs bug" section above), the 3 leftover slots under the 8-tile
+        cap ARE now legitimately backfilled with the 3 most-recently-modified
+        stale/idle sessions -- that is the intended behaviour, not a second
+        eviction bug -- so this only asserts the two live-session invariants
+        that still matter: every live session got a tile, in the first 5
+        (highest-ranked) positions, and none of the OLDER 17 stale sessions
+        (evict_stale3..19) displaced them or a backfill slot."""
         tiles = self.OUT["eviction_tiles"]
-        self.assertLessEqual(len(tiles), 8, "the hard cap must still hold")
+        self.assertEqual(len(tiles), 8, "the hard cap must still hold and be filled (5 live + 3 idle backfill)")
         ids = [t["id"] for t in tiles if t["kind"] == "session"]
+        states = {t["id"]: t["state"] for t in tiles if t["kind"] == "session"}
         for i in range(5):
             self.assertIn("evict_live%d" % i, ids,
                           "a genuinely live session was evicted from the board")
-        for i in range(20):
-            self.assertNotIn("evict_stale%d" % i, ids,
-                             "a long-dead session with a stale fail_cmd occupied a board slot")
-        # every tile that DID make it onto the board is one of the 5 live sessions --
-        # not merely "the live ones are present among others", but "nothing else is".
-        self.assertEqual(set(ids), set("evict_live%d" % i for i in range(5)))
-        # and every one of those tiles reads as plain 'working', never 'failing' --
-        # sessionState() correctly gates fail_cmd on liveness for this corpus too.
-        states = {t["id"]: t["state"] for t in tiles if t["kind"] == "session"}
-        for i in range(5):
             self.assertEqual(states["evict_live%d" % i], "working")
+        # the 5 live sessions occupy the first 5 (highest-ranked) positions --
+        # RANK put them ahead of every idle session, never merely "somewhere".
+        self.assertEqual(ids[:5], ["evict_live%d" % i for i in range(5)])
+        # only the 3 MOST RECENT stale sessions may occupy the leftover
+        # backfill slots (newest-mtime-first tiebreak, same as any other tier);
+        # the 17 older ones must never occupy a board slot.
+        for i in range(3, 20):
+            self.assertNotIn("evict_stale%d" % i, ids,
+                             "an older stale session occupied a board slot ahead of a newer one")
+        self.assertEqual(ids[5:], ["evict_stale%d" % i for i in range(3)])
+        for i in range(3):
+            self.assertEqual(states["evict_stale%d" % i], "idle")
 
     def test_board_tiles_agent_no_group_regression(self):
         """Regression for the '950 sessions, 0 tiles' bug: agent:true, group:"" must

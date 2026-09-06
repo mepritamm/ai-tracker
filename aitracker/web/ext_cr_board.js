@@ -176,6 +176,21 @@ window.CR = window.CR || {};
     return out;
   }
 
+  // THE ONE "is this session represented by an agent-group bucket" test.
+  // DEFECT 1: `agent: true` alone is NOT enough — providers/claude.py's
+  // _is_bg_agent() (:370) returns true for sessionKind == "bg" OR source ==
+  // "sdk-cli", while _agent_group() (:382) only ever buckets sdk-cli sessions
+  // and returns ("","") for everything else. So a plain `claude --bg` agent is
+  // `agent: true, group: ""` — it belongs to NO bucket and must therefore be
+  // rendered as an ordinary row/tile. boardTiles() already had this predicate
+  // inline (its own comment records the live-verified "950 sessions, 1 working,
+  // 0 tiles" symptom); the rail's three call sites each still used a bare
+  // `!s.agent`, so an ungrouped agent session appeared in neither the flat rows
+  // nor the buckets and vanished from the rail, the collapsed orbs and the
+  // Sessions-destination count. Hoisted here so every consumer asks the SAME
+  // question — a second copy of this predicate is exactly what caused the bug.
+  function isGroupedAgent(s) { return !!(s.agent && s.group); }
+
   // NOTE: doc 02 says "Agent-group tiles span 2 columns and sit last" and its
   // tile-anatomy table lists an "Agent group" row, but boardTiles' own
   // pseudocode never shows how groups are built — it only sorts/caps plain
@@ -189,7 +204,7 @@ window.CR = window.CR || {};
     var buckets = {};
     var order = [];
     sessions.forEach(function (s) {
-      if (!s.agent || !s.group) return;
+      if (!isGroupedAgent(s)) return;
       if (sessionState(s, now) === 'idle') return;
       var b = buckets[s.group];
       if (!b) {
@@ -267,20 +282,102 @@ window.CR = window.CR || {};
     if (!lastSid) {
       try { lastSid = localStorage.getItem('sid') || null; } catch (e) { lastSid = null; }
     }
+    // CROSS-VIEW STATE: uiState 'sid' as a further fallback — honours a selection made in the
+    // OTHER view (or another browser tab) that hasn't yet reached `cur`/the legacy localStorage
+    // key above. In practice both already mirror this most of the time: ext_cr_boot.js's go()
+    // calls app.js's pick(id), whose track() does `localStorage.setItem("sid",cur)` immediately
+    // followed by `uiState.set('sid',cur)` — this is only a further safety net, and the legacy
+    // key above is untouched, still checked FIRST, exactly as before.
+    if (!lastSid && typeof uiState !== 'undefined') {
+      try { lastSid = uiState.get('sid', null) || null; } catch (e) { lastSid = null; }
+    }
     if (lastSid && sessions.some(function (s) { return s.id === lastSid; })) return lastSid;
     var active = sessions
       .filter(function (s) { return sessionState(s, now) !== 'idle'; })
       .sort(function (a, b) { return (b.mtime || 0) - (a.mtime || 0); });
-    return active.length ? active[0].id : null;
+    var seeded = active.length ? active[0].id : null;
+    // Mirror a freshly-derived "most-recently-active" seed (no prior selection anywhere) into
+    // uiState too, so the other view's next read honours it — the same mirror classic's own
+    // track()/pick() does for a user-driven pick, just for this auto-seeded case.
+    if (seeded && typeof uiState !== 'undefined') { try { uiState.set('sid', seeded); } catch (e) {} }
+    return seeded;
   }
 
-  // THE RULE (doc 02 "Sort order — this is the design"; README decision 2):
-  // never more than boardTileCap() tiles — default 8, user-adjustable 3-12 per
-  // doc 04 (owner-ruled to supersede doc 02's flat "never more than 8");
-  // pinned group on top, unpinned below, newest first within each group —
-  // waiting-on-you outranks everything, including recency; idle sessions
-  // never get a tile; agent-group tiles sit last.
-  function boardTiles(sessions, now) {
+  // Module-level tile-match predicate — the ONE implementation of "does this
+  // tile belong to triage bucket `key`", extracted from the old in-closure
+  // passesFilter() so boardTiles() can filter the FULL session set, idle
+  // included, BEFORE capping (see below) — passesFilter used to run AFTER
+  // boardTiles' own cap, which is the second root cause this file fixes.
+  // `now` is always supplied by the caller (boardTiles has it in hand), so
+  // unlike old passesFilter there is no lastState fallback to carry. Keeps
+  // every branch passesFilter had, in particular the agent-group branch
+  // reading `t.sessions` (plural) and the pinned/flagged special cases —
+  // those were bug fixes and must not regress.
+  function tileMatches(t, key, now) {
+    if (!key) return true;
+    // PINNED (owner addition): not a per-tile `state` value, so it needs its
+    // own branch, same shape as the 'flagged' special-case below. An
+    // agent-group tile has no `.session` (it aggregates several), but DOES
+    // carry its own `.pinned` (agentGroups() ORs every member's pinned flag
+    // onto the group) — read straight off `t` for a group, off `t.session`
+    // for an individual session tile.
+    if (key === 'pinned') return t.kind === 'session' ? !!t.session.pinned : !!t.pinned;
+    // A group passes when ANY member session matches, which is the same
+    // question the strip's own count asked (agent-group tile aggregates
+    // several sessions under `.sessions`, plural — see agentGroups()).
+    if (t.kind !== 'session') {
+      return (t.sessions || []).some(function (m) {
+        return key === 'flagged' ? !!m.open_flags : sessionState(m, now) === key;
+      });
+    }
+    if (key === 'flagged') return !!t.session.open_flags;
+    return t.state === key;
+  }
+
+  // THE RULE (doc 02 "Sort order — this is the design"; README decision 2),
+  // as amended by the owner (supersedes doc 02's "idle sessions never get a
+  // tile"): never more than boardTileCap() tiles — default 8, user-adjustable
+  // 3-12 per doc 04; pinned group on top, unpinned below, newest first within
+  // each group — waiting-on-you outranks everything, including recency;
+  // agent-group tiles sit last.
+  //
+  // Two callers, two shapes of the same rule:
+  //   - No `filterKey` (the default board view): idle sessions are NOT
+  //     excluded any more — RANK already puts 'idle' last (5), so the
+  //     existing sort alone puts every non-idle session ahead of every idle
+  //     one, and the cap slice below naturally BACKFILLS with the
+  //     most-recently-modified idle sessions once live/working/etc. run out.
+  //     This is what makes the board non-empty when all 957 sessions are
+  //     idle — the bug this fixes (previously: `.filter(state !== 'idle')`
+  //     dropped every session before the sort even ran).
+  //   - A `filterKey` (a triage-cell click): tileMatches() runs over the
+  //     FULL individual+group tile set — idle included — BEFORE the cap is
+  //     applied, so a filter like 'pinned' can surface idle-only matches
+  //     (previously: the cap was applied first, so a filtered view could only
+  //     ever show matches that happened to survive the unfiltered top-N —
+  //     with idle sessions excluded outright, that top-N was empty).
+  //
+  // Returned value is a plain Array (so existing callers' `.filter()`/
+  // `.length`/`[i]` usage — ext_cr_boot.js's computeTriage(), this file's own
+  // keyboard 't' handler — keep working unchanged with a 2-arg call) with one
+  // extra property, `.total`: the count BEFORE the cap slice (matched count
+  // when filtered, else the full session count) — smaller diff than
+  // switching every caller to a `{tiles, total}` shape, and enough for
+  // renderCapFooter() to report the cap-footer honestly per view.
+  //
+  // `showAll` (TASK: cap + show-all toggle) lifts the boardTileCap() slice below. It is an
+  // explicit 4th argument, never read from uiState internally here, by design: the two
+  // pre-existing 2-arg callers — ext_cr_boot.js's computeTriage() (the "N of M needing
+  // attention" backline hint) and ext_cr_detail.js's stepSession() (j/k session navigation) —
+  // rank across the WHOLE board regardless of which triage tab (if any) is selected on
+  // screen; they are not "rendering the active tab", so tying them to that tab's show-all
+  // toggle would make their ranking/position silently balloon (or jump) whenever the user
+  // happened to have show-all on for an unrelated tab. Only callers that actually render the
+  // board GRID for the current tab — renderBoard(), and the 't' keyboard handler mirroring
+  // what's on screen — pass this explicitly (both read uiState.get('showAll', false)
+  // themselves). Passing no 4th argument (or a falsy one) reproduces the exact pre-existing
+  // capped behaviour.
+  function boardTiles(sessions, now, filterKey, showAll) {
     var individual = sessions
       // Exclude only agents that a group tile will actually represent (agent:true
       // WITH a non-empty `group` — a real `claude --bg` agent whose session isn't
@@ -296,16 +393,20 @@ window.CR = window.CR || {};
       // in `individual` (only agent+group together are excluded), so it gets
       // ranked and tiled exactly like any other session — smaller diff than
       // building a second "(no group)" bucket path through agentGroups().
-      .filter(function (s) { return !(s.agent && s.group); })
+      .filter(function (s) { return !isGroupedAgent(s); })
       .map(function (s) { return { kind: 'session', session: s, state: sessionState(s, now) }; })
-      .filter(function (t) { return t.state !== 'idle'; })
       .sort(function (a, b) {
         return (RANK[a.state] - RANK[b.state]) ||                                   // claim on attention first
                ((b.session.pinned ? 1 : 0) - (a.session.pinned ? 1 : 0)) ||          // then pinned
                (b.session.mtime - a.session.mtime);                                 // then recency
       });
     var groups = agentGroups(sessions, now);
-    var tiles = individual.concat(groups).slice(0, boardTileCap());   // HARD CAP
+    var all = individual.concat(groups);
+    var matched = filterKey ? all.filter(function (t) { return tileMatches(t, filterKey, now); }) : all;
+    // HARD CAP — applied AFTER the filter, not before — UNLESS showAll lifts it for this call
+    // (see the comment on this function's signature for exactly which callers may do that).
+    var tiles = showAll ? matched.slice() : matched.slice(0, boardTileCap());
+    tiles.total = filterKey ? matched.length : sessions.length;   // unaffected by showAll — always the true pre-cap count
     if (tiles.length && tiles[0].kind === 'session' && tiles[0].state === 'awaiting') {
       tiles[0].hero = true;   // single highest-ranked awaiting tile spans 2 columns
     }
@@ -450,6 +551,11 @@ window.CR = window.CR || {};
     return t.slice(0, 2).toUpperCase();
   }
 
+  // For a value that ends up inside MARKUP (an innerHTML/`html:` attr). Currently
+  // unreferenced: DEFECT 5 removed this file's only call site, which was escaping a
+  // value bound for a TEXT node (h() -> document.createTextNode), where escaping is
+  // always wrong. Kept, not deleted, so the next markup-bound interpolation has the
+  // right helper to hand rather than reaching for a raw template string.
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
@@ -479,17 +585,24 @@ window.CR = window.CR || {};
     // byte-for-byte the old default behaviour. The stale key is left alone.
     var railMode = (localStorage.getItem('tracker.rail.mode') || 'auto');
     var railOverlayOpen = false;      // < 1024px only: the rail as a slide-in overlay drawer
-    var activeFilter = null;          // 'awaiting' | 'working' | 'flagged' | 'pinned' | null
-    var searchQuery = '';
-    // GAP CLOSE (rail parity): mirrors classic's `liveOnly` (app.js) — the
-    // rail had no equivalent of the sidebar's "N live ✕" click-to-filter.
-    var railLiveOnly = false;
+    // CROSS-VIEW STATE (the user's ruling: "any activity on each view must be shared across
+    // the entire app end to end"). activeFilter/searchQuery/railLiveOnly used to be private to
+    // this module; they now mirror window.uiState's 'filter'/'query'/'liveOnly' fields — the
+    // SAME fields classic (app.js) reads/writes, not a parallel set (classic's own `liveOnly`
+    // and this file's old `railLiveOnly` used to be two variables for one concept; now one).
+    // Read the initial value from uiState here (this module-init code runs once, after app.js
+    // has already parsed localStorage into uiState — page.py concatenates app.js first). Every
+    // write from here on goes THROUGH uiState.set() (setFilter/toggleRailLiveOnly/the search
+    // input's oninput, below); the uiState.subscribe() call in mount() keeps these thin local
+    // mirrors in sync with a change made in the OTHER view or another browser tab. They stay
+    // plain vars, not accessor functions, so every existing READ site in this file (tileMatches
+    // callers, railRowsFor, etc.) keeps working unchanged — only the WRITE sites change.
+    var activeFilter = uiState.get('filter', null);   // 'awaiting' | 'working' | 'flagged' | 'pinned' | null
+    var searchQuery = uiState.get('query', '') || '';
+    var railLiveOnly = !!uiState.get('liveOnly', false);
     var focusedTileId = null;         // preserved across update() re-renders
     var selectedSessionId = null;     // for rail row highlight, set by ctx events if any
     var lastState = { sessions: [], now: Math.floor(Date.now() / 1000) };
-    var expandedRailGroup = null;     // which agent-group bucket (by `group` key) is expanded
-                                       // in the rail — 'rail:expandAgents' toggles this; own
-                                       // state, single-module, per this file's own scope note.
 
     // GAP CLOSE (rail parity, requirement: "session markers/pinned and other pieces of
     // information must be same in both the UIs"): classic's `.sitem.hasagents` (app.css)
@@ -511,6 +624,59 @@ window.CR = window.CR || {};
       var ids = {};
       (sessions || []).forEach(function (s) { if (s.agent && s.parentId) ids[s.parentId] = true; });
       return ids;
+    }
+
+    // -- Cross-view UI-state helpers (uiState 'groupsOpen' / 'scroll') -------
+
+    // Which agent-group bucket (by `group` key) the RAIL renders expanded. uiState's
+    // 'groupsOpen' is a shared ARRAY — classic can have several sidebar groups open at once,
+    // keyed by the exact same `s.group` string (app.js renderSide()'s `buckets[s.group]`, same
+    // key space this file's own agentBuckets[s.group] uses). The rail only ever shows ONE
+    // bucket expanded at a time, so it reads membership in that shared array rather than owning
+    // a second, incompatible single-value notion of "open" — toggling only adds/removes THIS
+    // group's own id (see the 'rail:expandAgents' handler in mount()), so collapsing it here can
+    // never silently close a group the OTHER view opened.
+    function isRailGroupOpen(g) {
+      var arr = uiState.get('groupsOpen', []);
+      return Array.isArray(arr) && arr.indexOf(g) !== -1;
+    }
+    // Scroll position, per pane, mirrored into uiState's 'scroll' field (keyed by pane name) —
+    // same pattern as app.js's _sidebarScroll()/_saveSidebarScroll() for its one 'slist' pane,
+    // generalised to this file's three scrolling panes ('board'/'rail'/'sessions'). Prefer the
+    // live DOM value (already correct for a same-render poll) and fall back to what was last
+    // persisted (covers a view switch, or this view being hidden/reshown, or a page reload).
+    // DEFECT 4 (falsy-zero scroll lock): this used to read
+    // `if (liveEl && liveEl.scrollTop) return liveEl.scrollTop;` — a GENUINE
+    // scrollTop of 0 is falsy, so scrolling a pane back to the top fell through
+    // to the stored value and 0 could never be persisted: the pane snapped back
+    // to its last non-zero offset on the very next 2s poll, forever (measured:
+    // scroll to 500 -> 500, scroll to 0 -> still 500, poll after poll). All
+    // three panes ('rail', 'sessions', 'board') go through this one helper.
+    // The real question is "is this pane RENDERED right now", not "is its offset
+    // truthy" — a display:none pane (the rail while the Sessions destination is
+    // showing; a hidden view slot) reports scrollTop 0 for a reason that has
+    // nothing to do with where the user left it, and clobbering the stored value
+    // with that 0 is the case the old truthiness test was accidentally covering.
+    // `clientHeight > 0` is that test: zero for a display:none element, non-zero
+    // for any laid-out scroll container. The stored fallback is likewise read
+    // with an explicit type check rather than `st[pane] || 0`, for the same
+    // "0 is a real value" reason.
+    // app.js's `_sidebarScroll()` (app.js:992) is the CLASSIC-side counterpart of
+    // this helper and carries the identical defect shape; it is fixed there, not
+    // duplicated here (app.js is not this file's to edit).
+    function paneScroll(pane, liveEl) {
+      if (liveEl && liveEl.clientHeight > 0 && typeof liveEl.scrollTop === 'number') return liveEl.scrollTop;
+      var st = uiState.get('scroll', {}) || {};
+      var v = st[pane];
+      return (typeof v === 'number' && isFinite(v)) ? v : 0;
+    }
+    function savePaneScroll(pane, v) {
+      var st = uiState.get('scroll', {}) || {};
+      if (st[pane] === v) return;   // uiState.set() would no-op anyway; skip the object rebuild
+      var next = {};
+      Object.keys(st).forEach(function (k) { next[k] = st[k]; });
+      next[pane] = v;
+      uiState.set('scroll', next);
     }
     // STRUCTURAL FIX: the rail + top bar are now mounted once (see buildShell()
     // below) and persist across every view; only the content region swaps. These
@@ -753,12 +919,41 @@ window.CR = window.CR || {};
       els.railSearchWrap = h('div', { class: 'cr-rail-search' }, [
         icon('search', '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>'),
         (els.railSearchInput = h('input', {
-          type: 'text', placeholder: 'Search', 'aria-label': 'Search sessions',
-          oninput: function (e) { searchQuery = e.target.value.toLowerCase(); renderRail(lastState); }
+          type: 'text', placeholder: 'Search', 'aria-label': 'Search sessions', value: searchQuery,
+          // Write THROUGH uiState — the 'query' subscriber (mount()) mirrors searchQuery back
+          // and re-renders. Shared with classic's own search box (app.js doSearch()/clearSearch()).
+          // DEFECT 3: this used to store `e.target.value.toLowerCase()`. uiState's 'query' is
+          // SHARED with classic, which stores the user's text verbatim (app.js:1204,
+          // `$("q").value.trim()`), so lowercasing on the way IN did two wrong things at once:
+          // it rewrote the user's own typed text mid-keystroke, and it left the two views
+          // disagreeing about what a stored query means. Case is now normalised at the point of
+          // COMPARISON instead (railRowsFor()), so both views can store text verbatim.
+          oninput: function (e) { uiState.set('query', e.target.value); }
         })),
         h('kbd', {}, ['⌘K']),
       ]);
       els.rail.appendChild(els.railSearchWrap);
+
+      // DEFECT 6 — the collapsed rail's "silently filtering, invisibly" hole.
+      // `.cr-rail-search`, `.cr-rail-count`, `.cr-rail-groupby` and
+      // `.cr-rail-group-header` are all `display: none` under `.cr-rail--collapsed`
+      // (ext_cr_board.css), but renderRail() still applies BOTH the live-only
+      // toggle and the search query to the orb list. `.cr-rail-count` is the only
+      // control bound to toggleRailLiveOnly, so collapsing the rail with live-only
+      // on left the user looking at 1 orb out of 957 with no visible cause and no
+      // way back short of expanding the rail again.
+      // CHOICE (lower blast radius of the two options): keep the filters applied —
+      // silently WIDENING the collapsed rail to 957 orbs the instant it collapses
+      // would be a bigger behaviour change, and would also contradict the "N more"
+      // footer right below it — and add this one always-visible, self-contained
+      // affordance instead. It renders ONLY in the collapsed rail and ONLY while a
+      // filter is actually active (CSS gates on `.cr-rail--collapsed`; JS toggles
+      // `--on`), so the expanded rail is byte-for-byte unchanged. Clicking it clears
+      // both filters through the same uiState fields their own controls write.
+      els.railFilterChip = h('button', {
+        class: 'cr-rail-filterchip', type: 'button', onclick: clearRailFilters
+      }, ['']);
+      els.rail.appendChild(els.railFilterChip);
 
       // Decision 2: the rail's group-by control. Persists via cr.railGroupBy
       // (railGroupMode()/persistRailGroupMode() above); renderSessionRows()
@@ -892,7 +1087,12 @@ window.CR = window.CR || {};
     // The rail's own unpaginated call (renderRail) omits it, so its behaviour
     // is unchanged: still filtered by its own live `searchQuery`.
     function railRowsFor(sessions, qOverride) {
-      var q = (typeof qOverride === 'string') ? qOverride : searchQuery;
+      // DEFECT 3: only the HAYSTACK used to be lowercased, and the needle came in raw
+      // from the shared uiState 'query' field — which classic writes case-PRESERVED
+      // (app.js:1204). Typing "Normal" in the classic search box therefore emptied the
+      // control-room rail. Case is normalised HERE, at the comparison, so both sides
+      // agree no matter which view stored the query.
+      var q = String(((typeof qOverride === 'string') ? qOverride : searchQuery) || '').toLowerCase();
       if (!q) return sessions;
       return sessions.filter(function (s) {
         return ((s.title || '') + ' ' + (s.project || '') + ' ' + (s.prompt || '')).toLowerCase().indexOf(q) >= 0;
@@ -955,11 +1155,16 @@ window.CR = window.CR || {};
     // footer and the Sessions pager both need the UNWINDOWED total), `shown` is
     // how many individual rows this call actually rendered.
     function renderSessionRows(container, sessions, now, opts) {
-      var filtered = railRowsFor(sessions.filter(function (s) { return !s.agent; }), opts ? '' : undefined);
+      // DEFECT 1: was `!s.agent`, which is NOT the complement of the agent-bucket
+      // pass below (`s.agent && s.group`) — an `agent: true, group: ""` session
+      // (a plain `claude --bg` agent; see isGroupedAgent()'s comment) matched
+      // neither and disappeared from the rail entirely. Both halves now key off
+      // the same isGroupedAgent() predicate, so every session lands in exactly one.
+      var filtered = railRowsFor(sessions.filter(function (s) { return !isGroupedAgent(s); }), opts ? '' : undefined);
       var order = railOrder(filtered);
       var flat = order.pinned.concat(order.unpinned);   // pinned-first, newest-first within each
       var agentBuckets = {};
-      sessions.filter(function (s) { return s.agent && s.group; }).forEach(function (s) {
+      sessions.filter(isGroupedAgent).forEach(function (s) {
         var b = agentBuckets[s.group] || (agentBuckets[s.group] = { label: s.groupLabel || s.group, n: 0, live: 0, mtime: 0, sessions: [] });
         b.n++;
         if ((now - (s.mtime || 0)) < LIVE_WINDOW) b.live++;
@@ -989,7 +1194,18 @@ window.CR = window.CR || {};
         // that one header with one per sub-group, in groupUnpinnedSessions()'s
         // order, each still just railRow() calls over the SAME rows.
         var groupMode = railGroupMode();
-        if (groupMode === 'none') {
+        // DEFECT 9: the rail's own search had no empty state — a query that
+        // matched nothing rendered the bare header "Sessions — 0 · newest first"
+        // and no explanation. The Sessions destination already answers this
+        // exact question (renderSessionsView: `No sessions match “…”.` in a
+        // `.cr-sessions-empty`), so the same copy and the same markup idiom are
+        // reused here rather than a second one invented. Rail-only (`!opts`):
+        // the Sessions destination's browse mode passes qOverride '' and does
+        // its own empty state for the search path.
+        if (!opts && !flat.length && searchQuery) {
+          container.appendChild(h('div', { class: 'cr-sessions-empty cr-rail-empty' },
+            ['No sessions match “' + searchQuery + '”.']));
+        } else if (groupMode === 'none') {
           container.appendChild(h('div', { class: 'cr-rail-group-header' },
             ['Sessions — ' + unpinnedShown.length + ' · newest first']));
           unpinnedShown.forEach(function (s) { container.appendChild(railRow(s, now)); });
@@ -1002,26 +1218,52 @@ window.CR = window.CR || {};
         }
       }
 
+      // DEFECT 7: the rail's "N more" footer used to be
+      // `baseSessions.length - shown`, i.e. it counted every session the CURRENT
+      // filters had already thrown away — a search matching nothing rendered zero
+      // rows under "scroll · 954 more", pointing at content that does not exist.
+      // What is genuinely hidden from THIS view is: the sessions outside the page
+      // window (Sessions destination only), plus the members of agent buckets that
+      // are currently collapsed. Counted here, where that is actually known.
+      var agentHidden = 0;
       if (!opts || isLastPage) {
         Object.keys(agentBuckets).forEach(function (g) {
           var b = agentBuckets[g];
-          var isOpen = expandedRailGroup === g;
+          var isOpen = isRailGroupOpen(g);
+          if (!isOpen) agentHidden += b.n;
           container.appendChild(h('div', {
             class: 'cr-rail-agentrow' + (isOpen ? ' cr-rail-agentrow--open' : ''),
             tabindex: '0', role: 'button', 'aria-expanded': isOpen ? 'true' : 'false',
             title: 'Agents · ' + b.label, 'aria-label': 'Agents · ' + b.label,
             onclick: function () { ctx && ctx.emit && ctx.emit('rail:expandAgents', { group: g }); },
             onkeydown: function (e) { if (e.key === 'Enter') ctx && ctx.emit && ctx.emit('rail:expandAgents', { group: g }); }
-          }, [glyph('agent', '', null), 'Agents · ' + esc(b.label) + (b.live ? ' (' + b.live + ' live)' : ''),
+            // DEFECT 5: this label used to be wrapped in esc(). It is passed to h()
+            // as a STRING child, and h() puts a string child through
+            // document.createTextNode() — a text node needs NO HTML escaping, so
+            // esc() only ever double-escaped: a real repo directory named "R&D"
+            // (_agent_group() returns os.path.basename(repo)) rendered as "R&amp;D",
+            // while the title/aria-label on this very element used the raw label,
+            // so tooltip and visible text disagreed. This was the file's only esc()
+            // call site.
+          }, [glyph('agent', '', null), 'Agents · ' + b.label + (b.live ? ' (' + b.live + ' live)' : ''),
               h('span', { class: 'cr-rail-agentchevron' }, [icon('chevron', '<path d="M9 6l6 6-6 6"/>')])]));
           if (isOpen) {
             collapseAgentRuns(b.sessions).sort(function (a, c) { return (c.mtime || 0) - (a.mtime || 0); })
               .forEach(function (s) { container.appendChild(railRow(s, now)); });
           }
         });
+      } else {
+        // Not the last page: no agent rows were rendered at all, so every member
+        // of every bucket is hidden from this view.
+        Object.keys(agentBuckets).forEach(function (g) { agentHidden += agentBuckets[g].n; });
       }
 
-      return { total: flat.length, shown: windowed.length };
+      return {
+        total: flat.length,
+        shown: windowed.length,
+        // DEFECT 7 — what this view is genuinely NOT showing right now.
+        hidden: (flat.length - windowed.length) + agentHidden
+      };
     }
 
     function renderRail(state) {
@@ -1047,21 +1289,47 @@ window.CR = window.CR || {};
       els.railCount.title = railCountLabel;
       els.railCount.setAttribute('aria-label', railCountLabel);
 
-      var scrollTop = els.railList.scrollTop;
+      var scrollTop = paneScroll('rail', els.railList);
       var activeEl = document.activeElement;
       var activeWasSearch = (activeEl === els.railSearchInput);
+      // DEFECT 8: renderRail() clears and rebuilds every row on every 2s poll, but
+      // only the SEARCH INPUT's focus was ever restored — a rail row (they all carry
+      // tabindex="0") lost keyboard focus to document.body twice a minute, so the
+      // rail could not be driven from the keyboard at all. Snapshot the focused
+      // row's session id and restore it after the rebuild, the same way the board
+      // already does with `focusedTileId` (renderBoard) — that existing pattern,
+      // not a second one. Rows are the focusable element themselves and carry
+      // `data-id`, so no ancestor walk is needed.
+      // ponytail: the rebuild itself is the real ceiling here — 957 sessions
+      // measured at ~87ms per update() with ~3,800 addEventListener calls recreated
+      // per poll (h() attaches one listener per `on*` attr, 4 per row). Fixing that
+      // needs row diffing/virtualisation or delegated listeners on `.cr-rail-list`,
+      // which is a restructure of this render path and explicitly out of scope for
+      // this pass.
+      var focusedRowId = (!activeWasSearch && activeEl && typeof activeEl.getAttribute === 'function')
+        ? activeEl.getAttribute('data-id') : null;
 
       var collapsed = els.rail.classList.contains('cr-rail--collapsed');
       els.railList.innerHTML = '';
 
-      var shown;
+      // DEFECT 7: everything the CURRENT filters admit — the honest denominator for
+      // "what is hidden", as opposed to `sessions.length`/`baseSessions.length`,
+      // which count rows the search already threw away.
+      var matching = railRowsFor(baseSessions).length;
+      var shown, hidden;
       if (collapsed) {
-        var filtered = railRowsFor(baseSessions.filter(function (s) { return !s.agent; }));
+        // DEFECT 1: `!s.agent` here lost `agent:true, group:""` sessions from the
+        // collapsed orbs exactly as it did from the expanded rows — the collapsed
+        // rail has no agent buckets at all, so such a session had nowhere else to go.
+        var filtered = railRowsFor(baseSessions.filter(function (s) { return !isGroupedAgent(s); }));
         var order = railOrder(filtered);
         renderCollapsedOrbs(order, now);
         shown = order.pinned.length + order.unpinned.length;
+        hidden = matching - shown;   // the grouped-agent sessions the orb strip cannot show
       } else {
-        shown = renderSessionRows(els.railList, baseSessions, now).total;
+        var rows = renderSessionRows(els.railList, baseSessions, now);
+        shown = rows.total;
+        hidden = rows.hidden;
       }
 
       // FIX (collapsed rail alignment, 48px column): the expanded footer's
@@ -1069,8 +1337,7 @@ window.CR = window.CR || {};
       // clips to "scrol . N more" -- collapsed gets a compact "+N" instead,
       // with the full sentence kept in `title` so nothing is lost, just
       // reflowed. The expanded form is untouched.
-      var more = baseSessions.length - shown;
-      var moreN = Math.max(0, more);
+      var moreN = Math.max(0, hidden);
       if (collapsed) {
         els.railFooter.textContent = '+' + moreN;
         els.railFooter.title = moreN + ' more session' + (moreN === 1 ? '' : 's') + ' — expand the rail to see them';
@@ -1079,13 +1346,60 @@ window.CR = window.CR || {};
         els.railFooter.removeAttribute('title');
       }
 
+      // DEFECT 6: the one always-visible affordance for the collapsed rail's
+      // otherwise invisible filters. CSS gates it on `.cr-rail--collapsed`, so this
+      // toggle is a no-op for the expanded rail (whose search box and "N live" pill
+      // are both on screen and already say the same thing).
+      if (els.railFilterChip) {
+        var filterActive = !!(railLiveOnly || searchQuery);
+        els.railFilterChip.classList.toggle('cr-rail-filterchip--on', filterActive);
+        if (filterActive) {
+          var bits = [];
+          if (railLiveOnly) bits.push('live only');
+          if (searchQuery) bits.push('search “' + searchQuery + '”');
+          // innerHTML is safe here: both interpolated values are NUMBERS (counts);
+          // the query itself only ever reaches the title/aria-label, via
+          // setAttribute/`.title`, never markup. Same pattern as els.railCount above.
+          els.railFilterChip.innerHTML = shown + ' of ' + sessions.length + ' ' + ico('close');
+          var chipLabel = 'Filtered: ' + bits.join(' · ') + ' — click to clear';
+          els.railFilterChip.title = chipLabel;
+          els.railFilterChip.setAttribute('aria-label', chipLabel);
+        } else {
+          els.railFilterChip.textContent = '';
+          els.railFilterChip.removeAttribute('title');
+          els.railFilterChip.removeAttribute('aria-label');
+        }
+      }
+
       els.railList.scrollTop = scrollTop;
-      if (activeWasSearch) els.railSearchInput.focus();
+      savePaneScroll('rail', scrollTop);
+      if (activeWasSearch) {
+        els.railSearchInput.focus();
+      } else if (focusedRowId) {
+        // DEFECT 8 — restore keyboard focus onto the same session's row. Matched by
+        // walking `.cr-rail-row` (a class selector the rail already renders) rather
+        // than an attribute selector, so no id needs quoting/escaping to be found.
+        var railRows = els.railList.querySelectorAll('.cr-rail-row');
+        for (var ri = 0; ri < railRows.length; ri++) {
+          if (railRows[ri].getAttribute('data-id') === focusedRowId) { railRows[ri].focus(); break; }
+        }
+      }
     }
 
     function toggleRailLiveOnly() {
-      railLiveOnly = !railLiveOnly;
-      renderRail(lastState);
+      // Write THROUGH uiState — the same 'liveOnly' field classic's "N live" pill uses. The
+      // 'liveOnly' subscriber (mount()) mirrors railLiveOnly back and re-renders the rail.
+      uiState.set('liveOnly', !railLiveOnly);
+    }
+
+    // DEFECT 6: clears BOTH rail filters at once, through the same uiState fields
+    // their own (collapsed-hidden) controls write — `liveOnly` for the "N live"
+    // pill, `query` for the search box — so classic sees the change too and the
+    // 'liveOnly'/'query' subscribers do the re-render. Bound to the collapsed
+    // rail's filter chip (buildRailShell).
+    function clearRailFilters() {
+      if (railLiveOnly) uiState.set('liveOnly', false);
+      if (searchQuery) uiState.set('query', '');
     }
 
     // ------------------------------------------------------------------
@@ -1176,7 +1490,10 @@ window.CR = window.CR || {};
     // ------------------------------------------------------------------
     function sessionsTotalCount(sessions) {
       if (sessionsSearchQuery) return (sessionsSearchResults || []).length;
-      return railRowsFor(sessions.filter(function (s) { return !s.agent; }), '').length;
+      // DEFECT 1: must use the SAME predicate renderSessionRows() renders with,
+      // or the Sessions destination's pager reports a total that disagrees with
+      // the rows below it for every `agent:true, group:""` session.
+      return railRowsFor(sessions.filter(function (s) { return !isGroupedAgent(s); }), '').length;
     }
     function changeSessionsPage(delta) {
       sessionsPage = Math.max(0, sessionsPage + delta);
@@ -1216,7 +1533,7 @@ window.CR = window.CR || {};
       var maxPage = Math.max(0, Math.ceil(totalCount / sessionsPageSize) - 1);
       if (sessionsPage > maxPage) sessionsPage = maxPage;   // clamp BEFORE rendering/slicing
 
-      var scrollTop = els.sessionsList.scrollTop;
+      var scrollTop = paneScroll('sessions', els.sessionsList);
       els.sessionsList.innerHTML = '';
 
       if (sessionsSearchQuery) {
@@ -1236,6 +1553,7 @@ window.CR = window.CR || {};
       }
 
       els.sessionsList.scrollTop = scrollTop;
+      savePaneScroll('sessions', scrollTop);
       updateSessionsPagerUI(totalCount);
     }
 
@@ -1272,9 +1590,17 @@ window.CR = window.CR || {};
     // pipClassFor() below, both built on top of the single sessionState()
     // derivation — never a second state derivation. 'idle' maps to '' because
     // both .cr-rail-dot and .cr-orb-pip already default to --state-idle grey.
+    // DEFECT 2: 'failing' — the sixth state sessionState() can return — had NO
+    // entry here, so stateDotClass('failing') returned '' and both the rail dot
+    // and the collapsed orb pip fell back to `--state-idle` grey. A live session
+    // with a failing command therefore rendered a byte-identical dot to an idle
+    // one, while the board painted the same session red with "fail: <cmd>" at the
+    // same instant — refuting this map's own claim that the row and the orb "never
+    // disagree on a session's colour". Uses the existing --state-failed token
+    // (defined in BOTH palettes in ext_cr.css), never a new one.
     var STATE_DOT_CLASS = {
       awaiting: 'is-waiting', working: 'is-live', flagged: 'is-flagged',
-      landed: 'is-landed', idle: ''
+      failing: 'is-failing', landed: 'is-landed', idle: ''
     };
     function stateDotClass(state) { return STATE_DOT_CLASS[state] || ''; }
 
@@ -1290,7 +1616,7 @@ window.CR = window.CR || {};
     // previous label omitted the state word entirely (title + "(pinned)" only),
     // which an earlier audit flagged — that suffix is dropped here since the
     // doc's format has no room for it and the state word is what's required.
-    var ORB_STATE_WORD = { awaiting: 'waiting on you', flagged: 'flagged', working: 'working', landed: 'landed', idle: 'idle' };
+    var ORB_STATE_WORD = { awaiting: 'waiting on you', flagged: 'flagged', working: 'working', failing: 'failing', landed: 'landed', idle: 'idle' };
     function orbStateWord(state) { return ORB_STATE_WORD[state] || state; }
 
     function railOrb(s, now) {
@@ -1356,7 +1682,19 @@ window.CR = window.CR || {};
       // sidebar, which pairs its own (unmodified) ended-only "done" badge with a
       // separate always-shown `bgchip` ("N running"), the rail row has no such second
       // badge, so `done` here must be the one place that already accounts for `bg`.
-      var statusKind = s.waiting ? 'waiting' : ((s.ended && isLiveRow && !isWorking(s, isLiveRow)) ? 'done' : '');
+      // DEFECT 2 (second half): this used to read `s.waiting ? 'waiting' : (s.ended
+      // && isLiveRow && !isWorking(...) ? 'done' : '')` — a live session with
+      // `ended: true` AND a failing command got a green ✓ "done" badge while the
+      // board, from the SAME sessionState(), showed it red with "fail: <cmd>". The
+      // badge is now derived from `state` (already computed at the top of this
+      // function) rather than from a second, independent read of the raw fields, so
+      // it can never disagree with the dot beside it or with the board. Note
+      // `state === 'awaiting'` is exactly the old `s.waiting` test (sessionState's
+      // first branch), and 'failing' outranks the ended/live "done" check the same
+      // way it does in sessionState's own precedence.
+      var statusKind = (state === 'awaiting') ? 'waiting'
+        : (state === 'failing') ? 'failing'
+        : ((s.ended && isLiveRow && !isWorking(s, isLiveRow)) ? 'done' : '');
       // GAP CLOSE: flag_text rides the row's existing tooltip too — same reasoning as
       // tileHead() above. '' when null/absent, so an unflagged row's tooltip is
       // byte-for-byte unchanged.
@@ -1408,6 +1746,9 @@ window.CR = window.CR || {};
         + (s.agent ? ' cr-rail-row--agent' : '')
         + (hasAgentChildren ? ' cr-rail-row--hasagents' : '')
         + (statusKind === 'waiting' ? ' cr-rail-row--waiting' : '')
+        // DEFECT 2: a failing row now reads as failing on the ROW too (the same
+        // --line-failed token the board's own failing tile uses), not just on the dot.
+        + (statusKind === 'failing' ? ' cr-rail-row--failing' : '')
         + (statusKind === 'done' ? ' cr-rail-row--done' : '')
         + (s.open_flags ? ' cr-rail-row--flagged' : '');
       // classic prefixes the agent icon onto the NAME itself (app.js
@@ -1456,13 +1797,17 @@ window.CR = window.CR || {};
           h('span', { class: 'cr-rail-title' + (s.agent ? ' cr-rail-title--agent' : '') }, titleChildren),
           dirLine ? h('span', { class: 'cr-rail-dir' }, [dirLine]) : null,
         ]),
+        // DEFECT 2: the badge grew a third kind ('failing'). Its glyph is the same
+        // one the board's failing tile uses (stateIcon('failing') -> 'x'), and its
+        // tooltip is the board's own stateWord('failing', s) — "fail: <cmd>" —
+        // rather than a second phrasing of the same fact.
         statusKind ? h('span', {
           class: 'cr-rail-status cr-rail-status--' + statusKind,
           title: statusKind === 'waiting'
             ? 'waiting for your answer — respond in the session'
-            : 'completed its last run',
-        }, [glyph(statusKind === 'waiting' ? 'hourglass' : 'check', ''),
-            ' ' + (statusKind === 'waiting' ? 'answer' : 'done')]) : null,
+            : (statusKind === 'failing' ? stateWord('failing', s) : 'completed its last run'),
+        }, [glyph(statusKind === 'waiting' ? 'hourglass' : (statusKind === 'failing' ? 'x' : 'check'), ''),
+            ' ' + (statusKind === 'waiting' ? 'answer' : (statusKind === 'failing' ? 'fail' : 'done'))]) : null,
         h('span', { class: 'cr-rail-meta' },
           // GAP CLOSE (rail parity): `s._runs` only exists on a row folded by
           // collapseAgentRuns() above (a re-run collapsed into one row) —
@@ -1750,9 +2095,15 @@ window.CR = window.CR || {};
     }
 
     function setFilter(key) {
-      activeFilter = (activeFilter === key) ? null : key;
-      renderTriage(lastState);
-      renderBoard(lastState);
+      var next = (activeFilter === key) ? null : key;
+      // TASK 2 / the user's ruling: the show-all expansion lasts only "until you switch away"
+      // — switching triage tabs (including clearing back to the unfiltered view) drops it.
+      // uiState.set() no-ops when showAll is already false, so this is a real write (and
+      // render) only on the rare tab-switch that happens while showAll was actually on.
+      uiState.set('showAll', false);
+      // Write THROUGH uiState — the 'filter' subscriber (mount()) mirrors activeFilter back
+      // and re-renders the triage strip + board; no direct render call needed here.
+      uiState.set('filter', next);
     }
 
     function renderTriage(state) {
@@ -1807,42 +2158,16 @@ window.CR = window.CR || {};
 
     function tileId(t) { return t.kind === 'session' ? t.session.id : 'group:' + t.group; }
 
-    function passesFilter(t, now) {
-      if (!activeFilter) return true;
-      // PINNED (owner addition): not a per-tile `state` value, so it needs its
-      // own branch, same shape as the 'flagged' special-case below. An
-      // agent-group tile has no `.session` (it aggregates several), but DOES
-      // carry its own `.pinned` (agentGroups() ORs every member's pinned flag
-      // onto the group) — read straight off `t` for a group, off `t.session`
-      // for an individual session tile.
-      if (activeFilter === 'pinned') return t.kind === 'session' ? !!t.session.pinned : !!t.pinned;
-      // TWO BUGS on the line this replaces, both in the group-tile branch:
-      //   1. It read `t.session.open_flags` -- but an agent-group tile has NO
-      //      `.session`; it aggregates several under `.sessions` (plural, see
-      //      agentGroups()). So the 'flagged' filter threw a TypeError the
-      //      moment any group tile was on the board.
-      //   2. Every other filter returned a flat `false`, so the sessions folded
-      //      into a group were invisible to the 'awaiting'/'working' filters --
-      //      while triageCounts() counts those same sessions in the strip. That
-      //      is a cell reading a non-zero count that renders an empty board.
-      // A group passes when ANY member session matches, which is the same
-      // question the strip's own count asked.
-      if (t.kind !== 'session') {
-        var when = (typeof now === 'number') ? now : ((lastState && lastState.now) || 0);
-        return (t.sessions || []).some(function (m) {
-          return activeFilter === 'flagged'
-            ? !!m.open_flags
-            : sessionState(m, when) === activeFilter;
-        });
-      }
-      if (activeFilter === 'flagged') return !!t.session.open_flags;
-      return t.state === activeFilter;
-    }
+    // NOTE: the old in-closure passesFilter(t, now) is gone — its logic is now
+    // the module-level tileMatches() above, which boardTiles() calls directly
+    // BEFORE its cap slice (the actual bug fix: a filtered view used to filter
+    // an already-capped list). There is exactly one implementation left.
 
     function renderBoard(state) {
       var sessions = state.sessions || [], now = state.now;
-      var allTiles = boardTiles(sessions, now);
-      var tiles = allTiles.filter(function (t) { return passesFilter(t, now); });
+      // filter runs INSIDE boardTiles, before its cap; showAll (per-tab, shared via uiState)
+      // lifts that cap for exactly this render — see boardTiles()'s own signature comment.
+      var tiles = boardTiles(sessions, now, activeFilter, uiState.get('showAll', false));
 
       // A8: mirrors renderRail()'s / renderSessionsView()'s own scroll-position
       // preservation across a poll re-render — same pattern (snapshot scrollTop
@@ -1853,7 +2178,7 @@ window.CR = window.CR || {};
       // this function replaces — because els.board itself has no overflow of
       // its own. Doc 02's keyboard section calls re-render scroll/focus loss
       // "the single most likely regression."
-      var scrollTop = els.boardScroll.scrollTop;
+      var scrollTop = paneScroll('board', els.boardScroll);
 
       els.board.innerHTML = '';
       if (!tiles.length) {
@@ -1869,8 +2194,9 @@ window.CR = window.CR || {};
       }
 
       els.boardScroll.scrollTop = scrollTop;
+      savePaneScroll('board', scrollTop);
 
-      renderCapFooter(sessions, allTiles);
+      renderCapFooter(sessions, tiles);
     }
 
     function cssEscape(s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, '\\$&'); }
@@ -2143,19 +2469,42 @@ window.CR = window.CR || {};
       ]);
     }
 
-    function renderCapFooter(sessions, allTiles) {
+    function renderCapFooter(sessions, tiles) {
       els.capfooter.innerHTML = '';
       // BUG FIX / preference support: the "8" in this sentence used to be a
       // literal, but the cap is now a user preference (cr.boardTileCount,
       // clamped 3-12 per doc 04) — the copy's shape is doc 02's "Cap footer"
       // verbatim, only the number is dynamic.
-      els.capfooter.appendChild(h('span', { class: 'cr-capfooter-count' }, [allTiles.length + ' of ' + sessions.length]));
+      // BUG FIX (denominator honesty): this used to always read `sessions.length`
+      // — right for the unfiltered view, wrong the instant a triage cell was
+      // active (a PINNED count of 4 rendering "4 of 957" instead of "4 of 4").
+      // `tiles.total` (set by boardTiles()) is the pre-cap match count for the
+      // CURRENT view: the matched-tile count when a filter is active, else the
+      // full session count — same value either way `sessions.length` gave
+      // before for the unfiltered case, so this is a no-op there.
+      var total = (typeof tiles.total === 'number') ? tiles.total : sessions.length;
+      var showAll = !!uiState.get('showAll', false);
+      els.capfooter.appendChild(h('span', { class: 'cr-capfooter-count' }, [tiles.length + ' of ' + total]));
       els.capfooter.appendChild(document.createTextNode(
-        ' — The board never shows more than ' + boardTileCap() + ' tiles. Everything else lives in the rail — pinned on top, newest first in each group. — '));
+        showAll
+          ? ' — Showing every matching tile for this tab. — '
+          : ' — The board never shows more than ' + boardTileCap() + ' tiles. Everything else lives in the rail — pinned on top, newest first in each group. — '));
       els.capfooter.appendChild(h('button', {
         class: 'cr-capfooter-link', type: 'button',
         onclick: function () { els.railSearchInput && els.railSearchInput.focus(); els.rail.scrollIntoView({ block: 'nearest' }); }
       }, ['Scroll for the rest']));
+      // TASK 2 (cap + show-all toggle): only offer the affordance when something is actually
+      // hidden by the cap (total > shown) — OR showAll is already on, so the user can always
+      // turn it back off even if the match count has since dropped to/below the cap. Shared
+      // via uiState's 'showAll' (per the cross-view rule); setFilter() resets it to false on
+      // every tab switch, so the expansion really does last only "until you switch away".
+      if (total > tiles.length || showAll) {
+        els.capfooter.appendChild(document.createTextNode(' '));
+        els.capfooter.appendChild(h('button', {
+          class: 'cr-capfooter-link', type: 'button',
+          onclick: function () { uiState.set('showAll', !showAll); }
+        }, [showAll ? 'Show fewer' : 'Show all ' + total]));
+      }
     }
 
     // -- keyboard (doc 02 "Keyboard") ---------------------------------------
@@ -2221,7 +2570,9 @@ window.CR = window.CR || {};
         } else if (e.key === 't') {
           if (idx >= 0) {
             e.preventDefault();
-            var tiles = boardTiles(lastState.sessions || [], lastState.now).filter(passesFilter);
+            // Mirrors what's actually on screen (renderBoard's own call, just above) — if
+            // showAll is on, the focused tile at `idx` came from the uncapped list too.
+            var tiles = boardTiles(lastState.sessions || [], lastState.now, activeFilter, uiState.get('showAll', false));
             var t = tiles[idx];
             if (t && t.kind === 'session') ctx && ctx.emit && ctx.emit('terminal:open', { id: t.session.id });
           }
@@ -2264,13 +2615,18 @@ window.CR = window.CR || {};
           railMode = (v === 'open' || v === 'collapsed') ? v : 'auto';
           applyRailMode();
         });
-        // Clicking (or Enter-activating) an agent-group row/tile toggles that group's
-        // sessions open inline in the rail — own expand state, this module only.
+        // Clicking (or Enter-activating) an agent-group row/tile toggles that group's sessions
+        // open inline in the rail. Write THROUGH uiState's shared 'groupsOpen' array — only
+        // this group's own id is added/removed (see isRailGroupOpen()'s comment above for why
+        // that's safe); the 'groupsOpen' subscriber (below) re-renders the rail.
         ctx.on('rail:expandAgents', function (payload) {
           var g = payload && payload.group;
           if (!g) return;
-          expandedRailGroup = (expandedRailGroup === g) ? null : g;
-          renderRail(lastState);
+          var arr = uiState.get('groupsOpen', []);
+          arr = (Array.isArray(arr) ? arr : []).slice();
+          var idx = arr.indexOf(g);
+          if (idx === -1) arr.push(g); else arr.splice(idx, 1);
+          uiState.set('groupsOpen', arr);
         });
         // boot.js's own go()/showView() already emit this on every navigation
         // (board/sessions/detail); this is how the persistent rail/topbar learn
@@ -2284,6 +2640,39 @@ window.CR = window.CR || {};
           if (view === 'sessions') renderSessionsView(lastState);
         });
       }
+      // CROSS-VIEW SYNC (the user's ruling — see the module-state block above): a change to
+      // any of these uiState fields made in the OTHER view, or in another browser tab (app.js's
+      // 'storage' listener re-emits it here as a normal uiState.set), re-renders the control
+      // room. Each branch first checks whether the mirrored value actually differs before
+      // touching the DOM — uiState.set() already no-ops for an unchanged value (so OUR OWN
+      // writes above don't bounce back into a redundant render via this same subscriber), and
+      // this guard additionally keeps a genuinely-external no-op (e.g. another tab re-saving
+      // the same query) from re-rendering here for nothing.
+      uiState.subscribe(function (key, value) {
+        if (key === 'filter') {
+          if (activeFilter === (value || null)) return;
+          activeFilter = value || null;
+          renderTriage(lastState);
+          renderBoard(lastState);
+        } else if (key === 'query') {
+          var q = value || '';
+          if (searchQuery === q) return;
+          searchQuery = q;
+          if (els.railSearchInput && els.railSearchInput.value !== searchQuery) els.railSearchInput.value = searchQuery;
+          renderRail(lastState);
+        } else if (key === 'liveOnly') {
+          var lo = !!value;
+          if (railLiveOnly === lo) return;
+          railLiveOnly = lo;
+          renderRail(lastState);
+        } else if (key === 'groupsOpen') {
+          renderRail(lastState);   // isRailGroupOpen() re-reads uiState directly — no local mirror to diff
+        } else if (key === 'showAll') {
+          renderBoard(lastState);   // renderBoard() reads uiState.get('showAll') fresh — see its boardTiles() call
+        }
+        // 'sid' and 'scroll' are read fresh at seed/render time (seedSessionId(), paneScroll())
+        // rather than mirrored into a local var, so no branch is needed for them here.
+      });
     }
 
     function update(state) {
@@ -2332,6 +2721,17 @@ window.CR = window.CR || {};
       // so ext_cr_detail.js (loaded after this file) reuses it rather than
       // forking a second mapping.
       modelShort: modelShort,
+      // exposed for tests (tests/test_cr_crossview.py): the cross-view uiState wiring —
+      // setFilter's write-through + showAll reset, and the three thin local mirrors kept in
+      // sync by the uiState.subscribe() call in mount() — has no other externally observable
+      // surface under this file's minimal test-DOM stub (no click simulation, no tracked
+      // classList). Same "expose internals for tests" pattern as boardTiles/sessionState
+      // above, not a new public contract.
+      setFilter: setFilter,
+      isRailGroupOpen: isRailGroupOpen,
+      getActiveFilter: function () { return activeFilter; },
+      getRailLiveOnly: function () { return railLiveOnly; },
+      getSearchQuery: function () { return searchQuery; },
     };
   }
 

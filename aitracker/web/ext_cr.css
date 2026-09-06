@@ -140,6 +140,19 @@
      WIN — it is identical to --line-strong in the doc's own light block;
      that collision is the doc's, not a bug to correct here. */
   --state-idle: #A89C8B;
+  /* --state-pinned: PINNED is not one of 01-foundations.md's six state-
+     vocabulary rows (see the .cr-triage-cell--pinned comment in
+     ext_cr_board.css) — the doc's own hue ramps have no "blue" family at
+     all (orange/wheat/rust/brick/forest/grey only). Per the owner's explicit
+     ask ("pin — blue"), this is mapped onto --text-dusk, the ONE blue-
+     leaning accent this app's token set actually defines (the "provenance /
+     fork-lineage" ink, already dual-themed above/below and already used for
+     a triage-count-like number at .cr-stat-dusk .cr-stat-num in
+     ext_cr_dialogs.css). Aliased via var(), not a new hex, so there is
+     exactly one source of truth for this colour. Supersedes the prior
+     "pinned gets no hued colour, reuse --text-agent" ruling in
+     ext_cr_board.css — that ruling predates this explicit colour request. */
+  --state-pinned: var(--text-dusk);
 
   /* fills (2) */
   --fill-action: linear-gradient(180deg, #3B5747, #2E4438);
@@ -333,6 +346,11 @@
   --state-failed: #D2735A;
   --state-flagged: #C27950;
   --state-idle: #877866;
+  /* --state-pinned: see the light block's own comment above for why this
+     token exists at all. Same alias here — --text-dusk's dark-theme value
+     (#A8C0C9, already measured/used for --cr-stat-dusk and the fork-lineage
+     ink), never a separately-invented dark hex. */
+  --state-pinned: var(--text-dusk);
 
   /* fills (2 + solid) */
   --fill-action: linear-gradient(180deg, #8FB187, #6E8A75);

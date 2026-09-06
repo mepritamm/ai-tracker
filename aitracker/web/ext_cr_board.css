@@ -520,6 +520,42 @@
   cursor: pointer;
 }
 .tracker-next .cr-rail-count--on { color: var(--text-thinking); }
+
+/* DEFECT 6 -- the collapsed rail's filter affordance. `.cr-rail-search`,
+ * `.cr-rail-count` (the ONLY control bound to the live-only toggle),
+ * `.cr-rail-groupby` and `.cr-rail-group-header` are all `display: none`
+ * under `.cr-rail--collapsed` further down this file, yet renderRail() keeps
+ * applying both filters to the orb list -- so collapsing the rail with
+ * live-only on left the user staring at 1 orb out of 957 with no visible
+ * cause and no way to clear it. This chip is the one always-visible way out:
+ * hidden by default and in the EXPANDED rail (whose own search box and
+ * "N live" pill are on screen), shown only when the rail is collapsed AND a
+ * filter is actually active (`--on`, toggled in renderRail()). */
+.tracker-next .cr-rail-filterchip { display: none; }
+.tracker-next .cr-rail--collapsed .cr-rail-filterchip--on {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  margin: 0 4px 6px;
+  padding: 3px 2px;
+  border: 1px solid var(--line-agent);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-thinking);
+  font: var(--fw-trace) 9px/1 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  cursor: pointer;
+}
+.tracker-next .cr-rail--collapsed .cr-rail-filterchip--on .ico { width: 9px; height: 9px; }
+
+/* DEFECT 9 -- the rail's own "nothing matched" state, reusing
+ * `.cr-sessions-empty`'s copy and styling (the Sessions destination already
+ * answers this exact question) with only the 300px rail's tighter padding
+ * overridden here. */
+.tracker-next .cr-rail-empty { padding: 22px 10px; }
 .tracker-next .cr-rail-chevron {
   flex: 0 0 auto;
   width: 22px;
@@ -654,6 +690,15 @@
 .tracker-next .cr-rail-row--done {
   border-left: 3px solid var(--line-done);
 }
+/* DEFECT 2: `failing` (sessionState()'s sixth state) had no row treatment at
+ * all -- a live session with a failing command rendered exactly like an idle
+ * one in the rail while the board painted it red. Uses the SAME --line-failed
+ * token the board's own failing tile uses (declared in both palettes in
+ * ext_cr.css); declared between --done and --flagged so flagged still wins
+ * last, exactly as in app.css's own ordering. */
+.tracker-next .cr-rail-row--failing {
+  border-left: 3px solid var(--line-failed);
+}
 .tracker-next .cr-rail-row--flagged {
   border-left: 3px solid var(--line-flagged);
 }
@@ -673,6 +718,10 @@
 /* BUG FIX: rail rows had no flagged/landed colour at all — only is-live/
  * is-waiting existed, so most non-idle sessions showed no state colour. */
 .tracker-next .cr-rail-dot.is-flagged { background: var(--state-flagged); }
+/* DEFECT 2: no failing colour existed on the rail dot -- stateDotClass('failing')
+ * returned '' and the dot fell through to the --state-idle default above, so a
+ * failing session's dot was byte-identical to an idle one's. */
+.tracker-next .cr-rail-dot.is-failing { background: var(--state-failed); }
 .tracker-next .cr-rail-dot.is-landed { background: var(--state-done); }
 /* Decision 1 — the rail row's title + directory now stack in their own
  * column so the row can carry both without growing the dot/meta layout;
@@ -720,6 +769,9 @@
   white-space: nowrap;
 }
 .tracker-next .cr-rail-status--waiting { color: var(--state-awaiting); }
+/* DEFECT 2: the rail used to call a failing session "done" (green ✓). It now
+ * gets its own badge, in the same --state-failed token the board uses. */
+.tracker-next .cr-rail-status--failing { color: var(--state-failed); }
 .tracker-next .cr-rail-status--done { color: var(--state-done); }
 
 /* GAP CLOSE (rail parity): pin/rename controls the classic sidebar always
@@ -884,6 +936,9 @@
 .tracker-next .cr-orb-pip.is-live { background: var(--state-thinking); }
 .tracker-next .cr-orb-pip.is-waiting { background: var(--state-awaiting); }
 .tracker-next .cr-orb-pip.is-flagged { background: var(--state-flagged); }
+/* DEFECT 2: the orb's aria-label already said "failing" while its pip stayed
+ * idle-grey (STATE_DOT_CLASS had no 'failing' key). Same token as the rail dot. */
+.tracker-next .cr-orb-pip.is-failing { background: var(--state-failed); }
 /* BUG FIX: no landed colour existed on the orb pip at all. */
 .tracker-next .cr-orb-pip.is-landed { background: var(--state-done); }
 
@@ -996,17 +1051,15 @@
 .tracker-next .cr-triage-cell--working.cr-triage-cell--active { border-bottom-color: var(--text-thinking); }
 .tracker-next .cr-triage-cell--flagged.cr-triage-cell--active { border-bottom-color: var(--state-flagged); }
 /* PINNED (owner addition, doc 02 lists only awaiting/working/flagged): not a
- * state in 01-foundations.md's state vocabulary table, so it gets no hued
- * state colour of its own — inventing one would contradict "use only existing
- * tokens, no new meaning." --text-agent is the doc's own "neutral" ink
- * (01-foundations.md's emoji table classes 📌 pinned and 🤖 agent under the
- * SAME untinted `tn-emo` treatment), and it is already dark-mode-safe
- * (ext_cr.css defines both light and dark values) — reused here rather than
- * --text-muted, which 01-foundations.md's contrast section reserves for
- * "supporting copy only, never primary content," and a 33px triage count is
- * primary content. */
-.tracker-next .cr-triage-cell--pinned .cr-triage-count { color: var(--text-agent); }
-.tracker-next .cr-triage-cell--pinned.cr-triage-cell--active { border-bottom-color: var(--text-agent); }
+ * state in 01-foundations.md's state vocabulary table, and the doc's hue
+ * ramps have no "blue" family at all. SUPERSEDES the prior ruling here
+ * (which reused the untinted --text-agent, "no hued colour of its own") —
+ * the owner has now explicitly asked for a blue pinned tab/tile, so it gets
+ * --state-pinned, a dedicated token (ext_cr.css, both themes) aliased to
+ * --text-dusk — the one blue-leaning accent this app's token set already
+ * defines (the provenance/fork-lineage ink), not a freshly invented hex. */
+.tracker-next .cr-triage-cell--pinned .cr-triage-count { color: var(--state-pinned); }
+.tracker-next .cr-triage-cell--pinned.cr-triage-cell--active { border-bottom-color: var(--state-pinned); }
 .tracker-next .cr-triage-count {
   display: block;
   font: var(--fw-triage-count) var(--fs-triage-count-max)/var(--lh-triage-count) var(--font-serif);
@@ -1137,6 +1190,36 @@
    state (both themes) — no new tokens needed. */
 .tracker-next .cr-tile--failing { background: var(--surface-failed); border-color: var(--line-failed); }
 .tracker-next .cr-tile--landed { background: var(--surface-done); border-color: var(--line-done); }
+/* Awaiting (non-hero) — same background+border-color pairing convention as
+   flagged/failing/landed above, using the existing --surface-awaiting/
+   --line-awaiting tokens (already dual-themed in ext_cr.css, already used
+   for the analogous .cr-rail-row--waiting rail treatment above). Only the
+   TOP-ranked awaiting tile gets `.cr-tile--hero`'s gradient frame — every
+   other awaiting tile previously fell through to the untinted default tile
+   background, indistinguishable from idle. Per the doc's own state-colour
+   family there is no red for "awaiting"; --state-awaiting is the orange-
+   amber this app already uses everywhere else for this state (rail row,
+   triage cell, hero gradient) — reusing --state-failed/--surface-failed
+   instead would make awaiting and failing render identically, which is
+   worse than a hue mismatch with a "red" request. The border-left accent
+   mirrors the same strong-edge idiom already used at
+   .cr-rail-row--waiting (line ~650-653) so the state reads unmistakably,
+   not just via a faint background tint. */
+.tracker-next .cr-tile--awaiting {
+  background: var(--surface-awaiting);
+  border-color: var(--line-awaiting);
+  border-left: 3px solid var(--state-awaiting);
+}
+/* Idle — new on the board now that boardTiles() backfills with idle sessions
+   instead of excluding them. Must read as strictly LOWER priority than every
+   other state, so it borrows the app's existing "recessed" surface
+   (--surface-sunken, already used for quiet/inset panels elsewhere in this
+   file — brand-plate, agent group backdrops) rather than any state-tinted
+   surface, plus --line-strong, the neutral border token that already equals
+   --state-idle in this doc's own light ramp (see ext_cr.css's comment on
+   --line-strong) — no new token, no colour family invented for a state
+   that is deliberately supposed to fade back. */
+.tracker-next .cr-tile--idle { background: var(--surface-sunken); border-color: var(--line-strong); }
 .tracker-next .cr-tile--agentgroup { border-color: var(--line-subtle); }
 
 /* Awaiting hero: a 2px gradient frame wrapping a --surface-raised inner panel.

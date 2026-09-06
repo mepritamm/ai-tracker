@@ -1,4 +1,82 @@
-let cur=localStorage.getItem("sid")||"", timer=null;
+let cur="", timer=null;
+// Guarded like every other localStorage touch below (private browsing / blocked site data throws
+// a SecurityError) -- this is the FIRST read in the file, before the store even exists, and the
+// whole page is one <script> tag, so an unguarded throw here would kill every ext_cr_*.js that
+// follows it.
+try{ cur=localStorage.getItem("sid")||""; }catch(e){ cur=""; }
+// ---- Shared UI-state store (window.uiState) ----
+// The user's ruling: any UI state set in one view (classic dashboard / control room) must be
+// shared across the whole app. Before this, the same concept had two variables -- app.js's
+// `liveOnly` vs ext_cr_board.js's `railLiveOnly`, `searchResults`'s query vs `searchQuery`, etc.
+// This is the ONE store both sides read/write. Deliberately small: a plain object + get/set/
+// subscribe, not a framework. Standardised field names (used verbatim by both views):
+//   'sid'         selected session id (string)
+//   'liveOnly'    bool -- sidebar/rail "live only" filter
+//   'query'       search string
+//   'filter'      Board triage tab: 'awaiting'|'working'|'flagged'|'pinned'|null
+//   'showAll'     bool -- Board lifts its tile cap for the active tab
+//   'groupsOpen'  array of expanded agent-group ids
+//   'scroll'      object keyed by view/pane name -> scrollTop number
+// Persistence: ONE localStorage key, tracker.uiState, holding the whole object as JSON. Every
+// localStorage touch is try/catch'd -- private browsing and blocked site data both throw, and the
+// app must still render correctly with nothing stored. Cross-tab: a 'storage' event on that key
+// converges other open tabs; _uiApplyingStorage guards against turning that into a write loop.
+const UI_STATE_KEY="tracker.uiState";
+let _uiState={};
+try{ _uiState=JSON.parse(localStorage.getItem(UI_STATE_KEY)||"{}")||{}; }catch(e){ _uiState={}; }
+// Change-detection snapshot, tracked SEPARATELY from _uiState itself. Comparing a new value
+// against `_uiState[key]` directly breaks when a caller mutates an already-stored object/array in
+// place and re-calls set() with that SAME reference: both sides of the compare are then literally
+// the same object, so JSON.stringify equality can never see a difference and the write (and its
+// notify) gets silently dropped. Keyed by the same JSON string set() persists, so the compare
+// stays correct regardless of what happens to the live object afterward.
+let _uiSnapshot={}; Object.keys(_uiState).forEach(k=>{ _uiSnapshot[k]=JSON.stringify(_uiState[k]); });
+let _uiSubs=[], _uiApplyingStorage=false;
+function _uiPersist(){ try{ localStorage.setItem(UI_STATE_KEY,JSON.stringify(_uiState)); }catch(e){} }
+const uiState={
+  get(key,fallback){ return Object.prototype.hasOwnProperty.call(_uiState,key)?_uiState[key]:fallback; },
+  // No-op (no persist, no notify) when the value is unchanged -- compared by JSON.stringify so
+  // object/array values work too -- so a 2s poll re-affirming the same value can't cause a
+  // render storm in every subscriber.
+  set(key,value){
+    // JSON can't represent `undefined`/`NaN` -- persisting either would silently drop/null the key,
+    // so a reload would read back `null` while the in-memory value was still `undefined`/`NaN`
+    // until then. Normalise both to `null` up front so memory and a reload always agree.
+    if(value===undefined || (typeof value==="number" && Number.isNaN(value))) value=null;
+    const json=JSON.stringify(value);
+    if(_uiSnapshot[key]===json) return;
+    _uiSnapshot[key]=json;
+    _uiState[key]=value;
+    _uiPersist();
+    _uiSubs.forEach(fn=>{ try{ fn(key,value); }catch(e){ console.error("uiState subscriber",e); } });
+  },
+  subscribe(fn){ _uiSubs.push(fn); return ()=>{ _uiSubs=_uiSubs.filter(f=>f!==fn); }; }
+};
+window.uiState=uiState;
+try{
+  window.addEventListener("storage",e=>{
+    if(e.key!==UI_STATE_KEY||_uiApplyingStorage)return;
+    let next={}; try{ next=JSON.parse(e.newValue||"{}")||{}; }catch(err){ next={}; }
+    _uiApplyingStorage=true;
+    try{
+      const keys=new Set([...Object.keys(_uiState),...Object.keys(next)]);
+      keys.forEach(k=>{
+        // A key absent from the remote blob (e.g. it was never written there) reads back as
+        // `undefined` from `next[k]` -- normalise it to `null` exactly like set() does, so this
+        // path can't introduce a raw `undefined` into _uiState that set()'s own normalisation
+        // never gets a chance to touch.
+        let nv=next[k]; if(nv===undefined) nv=null;
+        const nj=JSON.stringify(nv);
+        if(_uiSnapshot[k]!==nj){
+          _uiSnapshot[k]=nj;
+          _uiState[k]=nv;
+          _uiSubs.forEach(fn=>{ try{ fn(k,nv); }catch(err){ console.error("uiState subscriber",err); } });
+        }
+      });
+    } finally { _uiApplyingStorage=false; }
+  });
+}catch(e){}
+if(uiState.get('sid',null)===null && cur) uiState.set('sid',cur);   // seed once from the legacy key
 // ponytail: one sprite + one helper; every emoji call site becomes ico(<name>).
 // Icon STYLE is server policy (config ICON_STYLE): "icons" (the SVG sprite, default) | "emoji" |
 // "text" (monochrome typographic glyphs). Both glyph maps cover every sprite id; a name missing
@@ -897,7 +975,8 @@ const SRC={}; for(const k in SRC_TEXT) SRC[k]=ico(SRC_ICON[k])+" "+SRC_TEXT[k];
 const srcLabel=v=>SRC[v]||v||"";
 const CIRC=2*Math.PI*51; // progress-ring circumference
 
-let sessions=[], searchResults=null, liveOnly=false;
+let sessions=[], searchResults=null;
+let liveOnly=uiState.get('liveOnly',false);   // thin accessor over uiState -- see the store above
 // The sidebar's clock: set from /api/list's X-Server-Now header on every poll, so
 // live/done here is computed from the SAME clock the detail pane uses (its `now`
 // field, server-stamped too) -- never the browser's own Date.now(), which drifts on
@@ -930,9 +1009,35 @@ function hl(text,q){
   return e.replace(re,"<b>$1</b>");
 }
 let selEntry=null;   // last list row seen for the selected session — pin it so a poll can't drop it
+// Sidebar scroll, mirrored into uiState's 'scroll' field (keyed by pane name) so it survives not
+// just a same-render poll (the live DOM scrollTop already does that) but classic being hidden and
+// re-shown, or a page reload. Prefer the live DOM value when the pane is mounted and scrolled;
+// fall back to what was last persisted otherwise.
+function _sidebarScroll(){
+  const sl=$("slist");
+  // A mounted element's scrollTop of 0 is a real, current value -- `sl.scrollTop` is FALSY at 0,
+  // so checking truthiness (the old bug) falls through to whatever was last persisted and a
+  // genuine scroll-to-top can never stick. Check for the element's EXISTENCE instead, and always
+  // prefer it: this also means a remote (storage-event) scroll value can never fight a tab whose
+  // list is actually mounted -- the local DOM wins unconditionally whenever it's there.
+  if(sl) return sl.scrollTop;
+  return (uiState.get('scroll',{})||{}).slist??0;
+}
+function _saveSidebarScroll(v){
+  const st=uiState.get('scroll',{})||{};
+  if(st.slist===v) return;
+  uiState.set('scroll',Object.assign({},st,{slist:v}));
+}
+let _renderingSide=false;   // re-entrancy guard: see the 'groupsOpen' uiState notify below and the
+                              // prune-triggered _persistGroups() further down in this function --
+                              // either can synchronously re-enter renderSide() mid-pass, whose nested
+                              // DOM write would just be overwritten when the outer pass finishes.
 function renderSide(){
+  if(_renderingSide) return;
+  _renderingSide=true;
+  try{
   const now=listNow;   // server clock (see listNow above) -- every live/done check below flows from this one value
-  const sl=$("slist"), sc=sl?sl.scrollTop:0;   // preserve scroll: a background poll must not yank the list to the top
+  const sl=$("slist"), sc=_sidebarScroll();   // preserve scroll: a background poll (or a hide/show) must not yank the list to the top
   if(searchResults!==null){       // search mode: show matches instead of the full list
     const q=$("q").value.trim();
     $("livecount").textContent=`${searchResults.length} match${searchResults.length==1?"":"es"}`;
@@ -945,7 +1050,7 @@ function renderSide(){
         (s.snippet?`<div class=ssnip>${hl(s.snippet,q)}</div>`:"")+
         `</div>`;
     }).join(""):`<div class=empty>no sessions match “${esc(q)}”</div>`;
-    if(sl)sl.scrollTop=sc;
+    if(sl){ sl.scrollTop=sc; _saveSidebarScroll(sc); }
     return;
   }
   const liveN=sessions.filter(s=>now-s.mtime<LIVE).length;
@@ -992,7 +1097,7 @@ function renderSide(){
   const liveGroups=new Set(sessions.filter(s=>s.agent&&s.group).map(s=>s.group)), liveIds=new Set(sessions.map(s=>s.id));
   let pruned=false;
   for(const k of [...expandedGroups]){ if(!(k.startsWith("sess:")?liveIds.has(k.slice(5)):liveGroups.has(k))){ expandedGroups.delete(k); pruned=true; } }
-  if(pruned) localStorage.setItem("agrpOpen",JSON.stringify([...expandedGroups]));
+  if(pruned) _persistGroups();
   const kidsBlock=ks=>`<div class=agrpkids>${ks.slice().sort((x,y)=>y.mtime-x.mtime).map(k=>sessionRow(k,now)).join("")}</div>`;
   const hasPin=items.some(x=>x.pinned); let _sec=null;   // Pinned / Recent section labels (only when there are pins)
   const secDiv=it=>{ if(!hasPin)return ""; const s=it.pinned?"pin":"recent"; if(s===_sec)return ""; _sec=s; return `<div class=secband>${s==="pin"?ico('pin')+" Pinned":"Recent"}</div>`; };
@@ -1012,7 +1117,8 @@ function renderSide(){
       (open?kidsBlock(b.kids):"")+
       `</div>`;
   }).join(""):`<div class=empty>${liveOnly?"no live sessions":"no sessions"}</div>`;
-  if(sl)sl.scrollTop=sc;
+  if(sl){ sl.scrollTop=sc; _saveSidebarScroll(sc); }
+  } finally { _renderingSide=false; }
 }
 // one session row — shared by the flat list, agent-group children, and expandable parents.
 // ex (optional) = {gk,open,n,live}: this session originated N agents; render an expander + count.
@@ -1062,22 +1168,69 @@ function collapseAgents(arr){
   }
   return [...by.values()];
 }
-let expandedGroups=new Set(JSON.parse(localStorage.getItem("agrpOpen")||"[]"));
+// One-time migration onto the shared store: if groupsOpen was never set there but the old
+// per-view localStorage["agrpOpen"] key has a value from before this store existed, seed
+// groupsOpen from it so nobody loses their expanded agent groups.
+if(uiState.get('groupsOpen',null)===null){
+  let legacy=null;
+  try{ legacy=JSON.parse(localStorage.getItem("agrpOpen")||"null"); }catch(e){ legacy=null; }
+  uiState.set('groupsOpen',Array.isArray(legacy)?legacy:[]);
+}
+function _persistGroups(){ uiState.set('groupsOpen',[...expandedGroups]); }
+let expandedGroups=new Set(uiState.get('groupsOpen',[]));
 let autoExpandedFor=null;   // last selection we auto-expanded a container for (fires once per change)
 function toggleGroup(k){
   k=decodeURIComponent(k);
   if(expandedGroups.has(k))expandedGroups.delete(k); else expandedGroups.add(k);
-  localStorage.setItem("agrpOpen",JSON.stringify([...expandedGroups]));
-  renderSide();
+  _persistGroups();   // uiState.set('groupsOpen',...) notifies the subscriber below SYNCHRONOUSLY,
+                       // which already re-renders on this exact change -- an explicit renderSide()
+                       // here would just double-render (and, mid-render elsewhere, be a re-entrant
+                       // call caught by _renderingSide instead).
 }
 // clicking an originating session's title both opens it and toggles its agent list
 function pickToggle(id,encGk){
   const k=decodeURIComponent(encGk);
   if(expandedGroups.has(k))expandedGroups.delete(k); else expandedGroups.add(k);
-  localStorage.setItem("agrpOpen",JSON.stringify([...expandedGroups]));
+  _persistGroups();
   pick(id);   // pick() re-renders
 }
-function toggleLiveOnly(){liveOnly=!liveOnly;renderSide();}
+function toggleLiveOnly(){uiState.set('liveOnly',!liveOnly);}   // subscriber below flips liveOnly + re-renders
+// Reflect a uiState change made elsewhere (another tab via the 'storage' event today; the
+// control room once it migrates onto this store) into classic's own render, even while classic
+// is hidden behind the other view -- so switching back to it shows the up-to-date state instead
+// of what classic itself last wrote.
+uiState.subscribe(function(key,value){
+  if(key==='liveOnly'){ liveOnly=!!value; renderSide(); }
+  else if(key==='groupsOpen'){ expandedGroups=new Set(Array.isArray(value)?value:[]); renderSide(); }
+  else if(key==='query'){
+    const qEl=$("q"), v=value||"";
+    if(qEl && qEl.value!==v) qEl.value=v;
+    // Keep what's ON SCREEN consistent with what's in the box. The old code stopped at syncing the
+    // input, so a remote query change left the STALE searchResults array (and its "N matches" count)
+    // on screen while hl() highlighted the NEW term over the OLD hits. Lower-blast-radius fix: drop
+    // the stale results rather than re-running the search from here -- re-running would mean firing
+    // a network request from a passive subscriber, and would need its own argument that doSearch()'s
+    // own uiState.set('query',q) call can't loop back into this same subscriber (it can't: q is
+    // already equal, so set() no-ops -- but that's exactly the kind of reasoning this path avoids
+    // needing at all by simply not calling doSearch() here).
+    if(searchResults!==null){ searchResults=null; renderSide(); }
+  }
+  else if(key==='sid'){
+    const v=value||"";
+    // Guard doubles as the anti-reentrancy check: track() (below) mirrors its OWN selection into
+    // uiState via `uiState.set('sid',cur)` AFTER already updating `cur` -- so that local-origin
+    // notify always arrives here with value===cur already, and returns immediately without calling
+    // track() again. Only a genuinely remote change (value differs from this tab's `cur`) proceeds.
+    if(v===cur) return;
+    const sidEl=$("sid");
+    if(sidEl){
+      sidEl.value=v;
+      track();   // updates cur, mirrors the legacy localStorage["sid"] key (ext_cr_board.js reads
+                 // it directly) and restarts polling for the newly-selected session
+      renderSide();
+    }
+  }
+});
 // In-flight guard: /api/list can be slow (cold cache, load). Without this, setInterval keeps
 // firing every 5s regardless of whether the previous call finished, and slow calls stack up
 // unboundedly, eating the browser's 6-socket-per-host budget until nothing else on the page can
@@ -1115,13 +1268,14 @@ function closeBgDrawer(){ const d=$("bgdrawer"); if(d)d.classList.remove("open")
 async function doSearch(){
   const q=$("q").value.trim();
   if(!q){clearSearch();return}
+  uiState.set('query',q);   // shared with the control room's own search state
   $("qclear").style.display="";
   $("slist").innerHTML="<div class=empty>searching…</div>";
   try{searchResults=await(await fetch("/api/search?q="+encodeURIComponent(q))).json()}
   catch(e){searchResults=[]}
   renderSide();
 }
-function clearSearch(){searchResults=null;$("q").value="";$("qclear").style.display="none";renderSide();}
+function clearSearch(){searchResults=null;$("q").value="";$("qclear").style.display="none";uiState.set('query','');renderSide();}
 
 // in-session search — find text across THIS session's narration/prompts/files/commands/todos.
 // Server searches the full parsed detail (both providers, one endpoint); each hit carries full
@@ -1192,17 +1346,24 @@ async function start(){
   // fall back to the newest session if nothing is stored or the stored id is stale
   if((!cur||!sessions.some(s=>s.id===cur))&&sessions[0])cur=sessions[0].id;
   if(cur){$("sid").value=cur;track();renderSide();}
+  const savedQ=uiState.get('query','');   // resume a search started from the other view
+  if(savedQ){ $("q").value=savedQ; doSearch(); }
   setInterval(loadSide,5000);
 }
 function track(){
   cur=$("sid").value.trim();localStorage.setItem("sid",cur);
+  uiState.set('sid',cur);   // mirror into the shared store -- the legacy "sid" key above stays authoritative here
   if(timer)clearInterval(timer);
   if(!cur)return;
   poll();timer=setInterval(poll,2000);
 }
 let lastData=null;
 // ---- completion notifications: agent/shell running -> done ----
-let soundOn=localStorage.getItem("soundOff")!=="1";
+// Same DEFECT-5 hazard as the `cur` read at the top of this file: a top-level (module-scope)
+// localStorage read, evaluated synchronously while the single <script> tag is still parsing --
+// guarded for the same reason.
+let soundOn=true;
+try{ soundOn=localStorage.getItem("soundOff")!=="1"; }catch(e){ soundOn=true; }
 let notifSession=null, notifRunning=null, audioCtx=null;
 function setBell(){const b=$("bell");if(b){b.innerHTML=soundOn?ico("bell"):ico("bell-off");b.title="Completion sound: "+(soundOn?"on":"muted");}}
 function toggleSound(){soundOn=!soundOn;localStorage.setItem("soundOff",soundOn?"0":"1");setBell();if(soundOn){beep();primeNotify();}}

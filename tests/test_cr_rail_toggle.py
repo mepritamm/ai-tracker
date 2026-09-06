@@ -1039,12 +1039,20 @@ class TestRailWidthMatchesClassicSidebar(unittest.TestCase):
 def _passes_filter_driver_js():
     html = _read_page()
     bundle = _extract_script_content(html)
-    fn_src = _extract_function(bundle, "passesFilter")
+    # The in-closure passesFilter(t, now) this harness used to extract is gone:
+    # it is now the module-level tileMatches(t, key, now), so boardTiles() can
+    # apply the triage filter to the FULL session set BEFORE its tile cap
+    # (previously the cap ran first, so a filtered view could only ever surface
+    # matches that survived the unfiltered top-N -- with idle sessions excluded
+    # outright, that top-N was empty and every tab rendered "Nothing matches").
+    # Same predicate, same branches, filter key passed explicitly instead of
+    # read off an enclosing `activeFilter`. Every assertion below is unchanged --
+    # this class guards the agent-group branch, which must not regress.
+    fn_src = _extract_function(bundle, "tileMatches")
 
     return r"""
 var OUT = {};
 (function () {
-  var activeFilter = null;
   var lastState = { now: 1000 };
   // The real sessionState() vocabulary, reduced to what these cases need.
   function sessionState(s, now) {
@@ -1057,8 +1065,7 @@ var OUT = {};
   %s
 
   function run(filter, tile) {
-    activeFilter = filter;
-    try { return { ok: passesFilter(tile, 1000) }; }
+    try { return { ok: tileMatches(tile, filter, 1000) }; }
     catch (e) { return { threw: String(e && e.message || e) }; }
   }
 
