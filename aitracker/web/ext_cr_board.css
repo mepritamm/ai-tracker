@@ -46,6 +46,12 @@
   overflow: hidden;
 }
 
+/* Floor for icon()'s no-ctx.icon fallback svg (ext_cr_board.js) -- most call sites
+ * already size their icon through a container rule (e.g. `.cr-rail-chevron svg`),
+ * which still wins here on specificity, but a container with no svg rule of its own
+ * would otherwise leave this at the browser's ~300x150 replaced-element default. */
+.tracker-next .cr-icon-fallback { width: calc(16px * var(--ico-scale)); height: calc(16px * var(--ico-scale)); }
+
 .tracker-next .cr-main {
   flex: 1;
   min-width: 0;
@@ -771,6 +777,10 @@
   font: var(--fw-row-min) 12px/var(--lh-row-min) var(--font-sans);
 }
 .tracker-next .cr-rail-agentrow:hover { background: var(--fill-row-hover); }
+/* the trailing chevron on the Agents bucket header -- unsized before this rule existed,
+ * so it fell to the browser's default replaced-element size (~300x150). Same base as
+ * the sibling .cr-rail-chevron (14px) so both chevrons read at one visual weight. */
+.tracker-next .cr-rail-agentchevron svg { width: calc(14px * var(--ico-scale)); height: calc(14px * var(--ico-scale)); }
 
 .tracker-next .cr-rail-footer {
   flex: 0 0 auto;

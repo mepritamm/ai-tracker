@@ -351,15 +351,15 @@ window.CR = window.CR || {};
     return { bins: bins, peak: peak };
   }
 
-  function ago(seconds) {
-    seconds = Math.max(0, Math.floor(seconds));
-    if (seconds < 60) return 'just now';
-    var m = Math.floor(seconds / 60);
-    if (m < 60) return m + 'm';
-    var h = Math.floor(m / 60);
-    if (h < 24) return h + 'h';
-    return Math.floor(h / 24) + 'd';
-  }
+  // TASK 3 (control-rail-polish): this used to carry its OWN copy of app.js's
+  // global ago() (app.js:885 -- a true top-level global, app.js has no wrapping
+  // IIFE, already reachable here) -- same 60s/3600s/86400s thresholds, a
+  // different, more compact spelling ("just now"/"Xm"/"Xh"/"Xd", no " ago")
+  // deliberately kept for these space-constrained tile/rail rows, which concat
+  // it into tight strips ("· 2h · Claude Code"). That's now app.js's `short`
+  // param (`ago(seconds, true)`) instead of a second forked implementation, so
+  // the thresholds can never drift between the two call sites. Rendered output
+  // here is unchanged.
 
   // "tool" (as in "age · tool" / "project · tool") isn't a field the list
   // dict carries; the nearest available signal is `source`. This used to
@@ -571,12 +571,21 @@ window.CR = window.CR || {};
         }
       }
       // Minimal inline fallback so the shell still renders if ctx.icon is
-      // missing a glyph — not a substitute for the real glyph set.
+      // missing a glyph — not a substitute for the real glyph set. The primary
+      // path above returns a bare, unclassed <svg> too -- it relies on the
+      // caller's wrapping container for sizing (ext_cr_board.css targets
+      // e.g. `.cr-rail-chevron svg`). That works here as well since this
+      // fallback lands in the same containers, but a container without its
+      // own svg rule would leave this at the browser's ~300x150 default, so
+      // it also carries its own knob-driven class as a floor -- lower
+      // specificity than any container rule, so a container rule still wins
+      // where one exists (matching the primary path's rendered size).
       var svgEl = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
       svgEl.setAttribute('viewBox', '0 0 24 24');
       svgEl.setAttribute('fill', 'none');
       svgEl.setAttribute('stroke', 'currentColor');
       svgEl.setAttribute('stroke-width', '2');
+      svgEl.setAttribute('class', 'cr-icon-fallback');
       svgEl.innerHTML = fallbackPath || '<circle cx="12" cy="12" r="8"/>';
       return svgEl;
     }
@@ -915,7 +924,7 @@ window.CR = window.CR || {};
       if (s.open_flags) groups.push([glyph('flag', 'tn-emo-f'), ' ' + s.open_flags + ' flag' + (s.open_flags !== 1 ? 's' : '')]);
       if (s.note_count) groups.push([glyph('note', ''), ' ' + s.note_count]);
       if (s.bg) groups.push([glyph('agent', ''), ' ' + s.bg]);
-      groups.push([ago(now - (s.mtime || 0))]);
+      groups.push([ago(now - (s.mtime || 0), true)]);
       var out = [];
       groups.forEach(function (g, i) {
         if (i) out.push(' · ');
@@ -1994,7 +2003,7 @@ window.CR = window.CR || {};
         : (state === 'failing' && s.fail_cmd) ? stateWord(state, s) : null;
       var kids = [
         glyph(ew[0], ew[1]),
-        h('span', { class: 'cr-tile-state', title: flagTitle }, [stateWord(state, s) + (state === 'awaiting' ? ' · ' + ago(now - (s.mtime || 0)) : '')]),
+        h('span', { class: 'cr-tile-state', title: flagTitle }, [stateWord(state, s) + (state === 'awaiting' ? ' · ' + ago(now - (s.mtime || 0), true) : '')]),
       ];
       if (s.pinned) kids.push(glyph('pin', '', 'Pinned'));
       var head = h('div', { class: 'cr-tile-head', 'data-state': state }, kids);
@@ -2009,7 +2018,7 @@ window.CR = window.CR || {};
       // wins: trailing meta drops the age for awaiting tiles and shows tool only,
       // every other state keeps the full "age · tool".
       var trailing = (state === 'awaiting') ? toolLabel(s.source)
-        : (ago(now - (s.mtime || 0)) + ' · ' + toolLabel(s.source));
+        : (ago(now - (s.mtime || 0), true) + ' · ' + toolLabel(s.source));
       // Model is subordinate metadata, tacked onto the SAME trailing strip
       // rather than a new visual element -- absent whenever the session's
       // last-known model is unknown (never "unknown", never a placeholder).

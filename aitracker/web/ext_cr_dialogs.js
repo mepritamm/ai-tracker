@@ -111,8 +111,12 @@
     var d = GLYPH_PATHS[name] || GLYPH_PATHS.close;
     var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.setAttribute('viewBox', '0 0 24 24');
-    svg.setAttribute('width', '16');
-    svg.setAttribute('height', '16');
+    // Knob-driven, not a fixed 16x16: inline style (not a CSS-file class rule) so it
+    // still tracks --ico-scale even if this fallback is reached before ext_cr_dialogs.css
+    // has loaded, and still resolves to a sane 16px -- never the browser's ~300x150
+    // replaced-element default -- since --ico-scale is set once at :root (app.css).
+    svg.style.width = 'calc(16px * var(--ico-scale))';
+    svg.style.height = 'calc(16px * var(--ico-scale))';
     svg.setAttribute('aria-hidden', 'true');
     svg.setAttribute('class', 'cr-glyph' + (cls ? ' ' + cls : ''));
     var p = document.createElementNS('http://www.w3.org/2000/svg', 'path');

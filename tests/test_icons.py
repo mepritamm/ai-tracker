@@ -503,6 +503,165 @@ class TestIconScaleWired(unittest.TestCase):
 
 
 # ============================================================================
+# 8b. The "PLAN ON THE GO" notes-panel icon carries the sizing class.
+# ============================================================================
+
+class TestNotesPanelIconIsSized(unittest.TestCase):
+    """Regression guard: the control-room detail view's "PLAN ON THE GO" notes
+    panel rendered its note icon at the SVG element's ~300x150 intrinsic
+    default -- filling the whole card -- because its wrapper span carried only
+    the tint class `tn-emo-n`, never the base `tn-emo` class. Both
+    ext_cr_dialogs.css's `.cr .tn-emo svg {...}` rule and ext_cr.css's twin key
+    off the bare `tn-emo` token to apply `width/height: calc(1em *
+    var(--ico-scale))`; without it the icon gets no size at all AND ignores
+    the ICON_SCALE config knob. Fix: `class="tn-emo tn-emo-n"`, matching every
+    other tinted icon in this file (e.g. the `tn-emo tn-emo-a` awaiting glyph).
+    """
+
+    def test_plan_head_note_icon_carries_the_tn_emo_sizing_class(self):
+        js = _read("ext_cr_detail.js")
+        m = re.search(
+            r'crd-plan-head"><span class="([^"]*)"[^>]*>\'\s*\+\s*svgIcon\(ctx,\s*"note"\)',
+            js,
+        )
+        self.assertIsNotNone(
+            m,
+            "could not find the PLAN ON THE GO notes-panel icon markup in "
+            "ext_cr_detail.js -- render site moved, update this test's regex "
+            "to match it",
+        )
+        classes = m.group(1).split()
+        self.assertIn(
+            "tn-emo", classes,
+            "PLAN ON THE GO icon wrapper is missing the base `tn-emo` class -- "
+            "without it neither `.cr .tn-emo svg` (ext_cr_dialogs.css) nor "
+            "`.tracker-next .tn-emo svg` (ext_cr.css) apply, so the icon "
+            "renders unsized (SVG's ~300x150 default) and ICON_SCALE has no "
+            'effect on it. Got class="%s".' % m.group(1)
+        )
+
+
+# ============================================================================
+# 8c. Regression guard for the exact "tn-emo-<tint> without base tn-emo" bug:
+#     a wrapper span carrying only the tint class never matches `.tn-emo svg`
+#     (ext_cr_dialogs.css / ext_cr.css), so its icon renders unsized.
+# ============================================================================
+
+_TINT_CLASS_FILES = (
+    "ext_cr_detail.js", "ext_cr_board.js", "ext_cr_dialogs.js", "ext_cr_boot.js",
+)
+# Both quoting shapes actually used for a `class` value across these files: an
+# HTML string literal (`class="tn-emo tn-emo-a"`, built by hand) and a JS h()
+# attrs-object literal (`class: '...'`). The glyph()/buildChrome() helpers
+# build their class value via string concatenation (`'tn-emo' + (cls ? ... :
+# '')`), which this regex can't (and doesn't need to) see through -- it only
+# ever captures the literal `'tn-emo'` piece of that expression, which is not
+# an offender.
+_CLASS_ATTR_RE = re.compile(r'class(?:="([^"]*)"|:\s*\'([^\']*)\')')
+_TN_EMO_TINT_RE = re.compile(r'^tn-emo-[a-z0-9]+$')
+
+
+class TestTintClassCarriesBaseTnEmo(unittest.TestCase):
+    """THE BUG this guards: ext_cr_detail.js's PLAN ON THE GO note icon once
+    had `class="tn-emo-n"` with no bare `tn-emo` alongside it -- neither `.cr
+    .tn-emo svg` (ext_cr_dialogs.css) nor its ext_cr.css twin matched, so the
+    icon rendered at the SVG element's ~300x150 intrinsic default, ignoring
+    ICON_SCALE entirely. Four more instances of the identical mistake were
+    found in the same file. This scans every control-room JS file that emits
+    a `tn-emo-<tint>` class and asserts the bare `tn-emo` token always rides
+    along with it, forever."""
+
+    def test_every_tn_emo_tint_class_carries_the_base_tn_emo_token(self):
+        offenders = []
+        for fn in _TINT_CLASS_FILES:
+            text = _read(fn)
+            for m in _CLASS_ATTR_RE.finditer(text):
+                value = m.group(1) if m.group(1) is not None else m.group(2)
+                tokens = value.split()
+                if any(_TN_EMO_TINT_RE.match(t) for t in tokens) and "tn-emo" not in tokens:
+                    lineno = text.count("\n", 0, m.start()) + 1
+                    offenders.append("%s:%d: class=\"%s\"" % (fn, lineno, value))
+        self.assertEqual(
+            offenders, [],
+            "tn-emo-<tint> class present without the base `tn-emo` token -- "
+            "the icon's sizing rule (`.tn-emo svg`) won't match, so it renders "
+            "unsized and ICON_SCALE has no effect:\n" + "\n".join(offenders)
+        )
+
+
+# ============================================================================
+# 8d. The two icons found unsized this round now have knob-driven CSS rules.
+# ============================================================================
+
+class TestPreviouslyUnsizedIconsNowHaveKnobDrivenRules(unittest.TestCase):
+    """Regression guard for two icons that fell to the SVG element's ~300x150
+    default because no CSS rule sized them at all:
+      - `.crd-timeline-popout` (ext_cr_detail.js's timeline pop-out button)
+        had no matching svg rule in ext_cr_detail.css.
+      - `.cr-rail-agentchevron` (ext_cr_board.js's Agents-bucket chevron) was
+        never defined in ext_cr_board.css at all.
+    Both now have a `... svg { width/height: ... }` rule whose value
+    references `var(--ico-scale)`, so the Config dialog's Icon size knob
+    actually governs them.
+    """
+
+    def _assert_scaled_svg_rule(self, css_filename, selector_suffix):
+        css = _read(css_filename)
+        found = None
+        for sel, body in _css_rules(css):
+            for part in (p.strip() for p in sel.split(",")):
+                if part.endswith(selector_suffix):
+                    found = (part, body)
+                    break
+            if found:
+                break
+        self.assertIsNotNone(
+            found,
+            "no `... %s {...}` rule found in %s -- the icon is unsized again"
+            % (selector_suffix, css_filename)
+        )
+        part, body = found
+        w = re.search(r'width:\s*([^;]+);', body)
+        h = re.search(r'height:\s*([^;]+);', body)
+        self.assertIsNotNone(w, "%s rule `%s` has no width" % (css_filename, part))
+        self.assertIn("var(--ico-scale)", w.group(1),
+                       "%s rule `%s`'s width doesn't reference --ico-scale" % (css_filename, part))
+        self.assertIsNotNone(h, "%s rule `%s` has no height" % (css_filename, part))
+        self.assertIn("var(--ico-scale)", h.group(1),
+                       "%s rule `%s`'s height doesn't reference --ico-scale" % (css_filename, part))
+
+    def test_crd_timeline_popout_svg_is_knob_driven(self):
+        self._assert_scaled_svg_rule("ext_cr_detail.css", ".crd-timeline-popout svg")
+
+    def test_cr_rail_agentchevron_svg_is_knob_driven(self):
+        self._assert_scaled_svg_rule("ext_cr_board.css", ".cr-rail-agentchevron svg")
+
+
+# ============================================================================
+# 8e. fallbackGlyph() no longer hardcodes a fixed 16x16 that ignores the knob.
+# ============================================================================
+
+class TestFallbackGlyphIsKnobDriven(unittest.TestCase):
+    """Regression guard: ext_cr_dialogs.js's `fallbackGlyph(name, cls)` used
+    to set `width="16"`/`height="16"` as DOM attributes on the <svg> it
+    builds -- a fixed size that never tracked the ICON_SCALE config knob.
+    It's sized via `var(--ico-scale)` now (inline style, so it applies even
+    if this fallback fires before ext_cr_dialogs.css has loaded)."""
+
+    def test_fallback_glyph_does_not_hardcode_width_16(self):
+        js = _read("ext_cr_dialogs.js")
+        m = re.search(r'function fallbackGlyph\(name, cls\)\s*\{(.*?)\n  \}', js, re.S)
+        self.assertIsNotNone(m, "fallbackGlyph() not found -- update this test's regex")
+        body = m.group(1)
+        self.assertNotRegex(body, r'setAttribute\(\s*[\'"]width[\'"]\s*,\s*[\'"]16[\'"]\s*\)',
+                             "fallbackGlyph() still hardcodes width=\"16\" as a DOM attribute")
+        self.assertNotRegex(body, r'setAttribute\(\s*[\'"]height[\'"]\s*,\s*[\'"]16[\'"]\s*\)',
+                             "fallbackGlyph() still hardcodes height=\"16\" as a DOM attribute")
+        self.assertIn("var(--ico-scale)", body,
+                       "fallbackGlyph() no longer references --ico-scale -- it won't track the knob")
+
+
+# ============================================================================
 # 9. The assembled page carries the style/scale machinery, not just the sprite.
 # ============================================================================
 

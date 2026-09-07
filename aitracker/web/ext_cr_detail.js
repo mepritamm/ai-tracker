@@ -853,7 +853,7 @@
     }).join("");
     card.hidden = false;
     card.innerHTML =
-      '<div class="crd-phone-awaiting-head"><span class="tn-emo-a" aria-hidden="true">' + ico('hourglass') + '</span> Waiting on you' +
+      '<div class="crd-phone-awaiting-head"><span class="tn-emo tn-emo-a" aria-hidden="true">' + ico('hourglass') + '</span> Waiting on you' +
         (open.length > 1 ? '<span class="crd-phone-awaiting-more mono"> +' + (open.length - 1) + " more</span>" : "") +
       "</div>" +
       '<div class="crd-phone-awaiting-q">' + esc(q0.q) + "</div>" +
@@ -1676,7 +1676,7 @@
     renderRunPanel(ui.panels.run, session);
     renderTerminalPanel(ui.panels.terminal, session);
 
-    renderTimeline(node, ui, session, ctx);
+    renderTimeline(node, ui, session, ctx, nowMs);
     renderLiveEntry(node, session, nowSec); // FIX 3
   }
 
@@ -1744,8 +1744,8 @@
     // Glyph needs its own tinted span (doc 01 table: hourglass awaiting -> tn-emo-a,
     // check done -> tn-emo-d) so plain textContent won't do — it can't parse the
     // wrapper markup. st.word/st.age are still escaped since they land in HTML now.
-    var glyph = st.cls === "awaiting" ? '<span class="tn-emo-a" aria-hidden="true">' + svgIcon(ctx, "hourglass") + '</span> ' :
-      (st.cls === "failed" ? "" : (st.cls === "done" ? '<span class="tn-emo-d" aria-hidden="true">' + svgIcon(ctx, "check") + '</span> ' : ""));
+    var glyph = st.cls === "awaiting" ? '<span class="tn-emo tn-emo-a" aria-hidden="true">' + svgIcon(ctx, "hourglass") + '</span> ' :
+      (st.cls === "failed" ? "" : (st.cls === "done" ? '<span class="tn-emo tn-emo-d" aria-hidden="true">' + svgIcon(ctx, "check") + '</span> ' : ""));
     pill.innerHTML = glyph + esc(st.word) + (st.age ? " · " + esc(st.age) : "");
     // GAP CLOSE: session.flag_text (registry.py parse_any(), the unresolved flag's own
     // text) had zero consumers — the pill above only ever showed the COUNT via
@@ -1939,7 +1939,7 @@
     gutter.innerHTML = plan.markers.map(function (m) {
       var cls = "crd-mark crd-mark-" + m.kind;
       // Doc 01 icon table: hourglass (ask) -> tn-emo-a, agent/chat (agent/prompt) -> base tn-emo.
-      var glyphCls = m.kind === "ask" ? "tn-emo-a" : "tn-emo";
+      var glyphCls = m.kind === "ask" ? "tn-emo tn-emo-a" : "tn-emo";
       var content = m.kind === "fail" ? '<span class="crd-mark-word mono">FAIL</span>' :
         (m.kind === "now" ? '<span class="crd-mark-word mono">NOW</span>' :
         (m.glyph ? '<span class="crd-mark-emoji ' + glyphCls + '" aria-hidden="true">' + svgIcon(ctx, m.glyph) + "</span>" : ""));
@@ -2096,7 +2096,7 @@
           '<button data-act="note-remove" data-idx="' + i + '">remove</button>' +
         "</span></div>";
     }).join("");
-    var body = '<div class="crd-plan-head"><span class="tn-emo-n" aria-hidden="true">' + svgIcon(ctx, "note") + '</span> PLAN ON THE GO · ' + notes.length + " notes</div>" +
+    var body = '<div class="crd-plan-head"><span class="tn-emo tn-emo-n" aria-hidden="true">' + svgIcon(ctx, "note") + '</span> PLAN ON THE GO · ' + notes.length + " notes</div>" +
       (rows || emptyHtml("No notes queued", "Jot one below — it'll queue for delivery.")) +
       '<div class="crd-plan-footer">' +
         '<input class="crd-plan-input" type="text" placeholder="Jot the next thing…">' +
@@ -2397,7 +2397,16 @@
       "The transcript exists but a line failed to parse. Everything before it is shown." + (detail ? " " + detail : ""));
   }
 
-  function renderTimeline(node, ui, session, ctx) {
+  function renderTimeline(node, ui, session, ctx, nowMs) {
+    // TASK 1/2 (relative age beside the timeline clock): the server-stamped "now"
+    // (renderUpdate's own `state.now`, in epoch ms) is stashed on `ui` -- the same
+    // per-session state object renderTimelineEntries/entryHtml/openTimelineEntry
+    // already read (ui.timelineEntries, ui.diagramEntries, ui.sid, ...) -- so every
+    // caller that repaints timeline rows without a fresh nowMs of its own (the
+    // filter-chip click and loadOlderNarration's renderTimelineEntries calls below,
+    // neither of which run from renderUpdate) still reads the last polled server
+    // clock instead of falling back to the client's Date.now().
+    if (nowMs != null) ui.nowMs = nowMs;
     var wrap = ui.panels.timeline;
     var scrollEl = qs(wrap, ".crd-timeline-scroll");
     var filterEl = qs(wrap, ".crd-timeline-filters");
@@ -2433,9 +2442,29 @@
     return ' data-act="timeline-entry-open" data-key="' + esc(e.key) + '"';
   }
 
-  function entryHtml(e, ctx, diagram) {
+  // TASK 1 (relative age beside the timeline clock): every entry row shows the
+  // absolute clock (fmtClock) as the primary read, plus the SAME relative wording
+  // the Narration header already uses -- `ago()`, app.js:885, a true top-level
+  // global (app.js has no wrapping IIFE) reused here rather than reimplemented --
+  // as a small, muted second line so it stays secondary. `t` is epoch MILLISECONDS
+  // (parseT()/Date.parse, proved at mergeTimeline's own `.t` construction); `ago()`
+  // wants SECONDS, so this divides once, not the `e.t/1000/1000` double-divide that
+  // would render everything ~1000x too old. `nowMs` is the server-stamped clock
+  // threaded down from renderUpdate's `state.now` via ui.nowMs (see renderTimeline)
+  // -- never Date.now(), so the age can't drift on client clock skew. A missing/zero
+  // `t` (or no nowMs yet, e.g. a first paint that races renderTimeline) renders just
+  // the clock, not a nonsense age.
+  function entryTsHtml(t, nowMs, extraClass) {
+    var cls = "crd-entry-ts mono" + (extraClass ? " " + extraClass : "");
+    var ageStr = (t && nowMs != null && typeof ago === "function") ?
+      ago(Math.max(0, Math.round((nowMs - t) / 1000))) : "";
+    var ageHtml = ageStr ? '<span class="crd-entry-age">(' + esc(ageStr) + ")</span>" : "";
+    return '<span class="' + cls + '">' + fmtClock(t) + ageHtml + "</span>";
+  }
+
+  function entryHtml(e, ctx, diagram, nowMs) {
     if (e.kind === "prompt") {
-      return '<div class="crd-entry crd-entry-prompt"' + entryOpenAttrs(e) + '><span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
+      return '<div class="crd-entry crd-entry-prompt"' + entryOpenAttrs(e) + '>' + entryTsHtml(e.t, nowMs) +
         '<div class="crd-bubble crd-bubble-prompt">' + mdHtml(ctx, e.text) + "</div></div>";
     }
     if (e.kind === "narration") {
@@ -2458,7 +2487,7 @@
         }).join("");
         var b64 = _mmdEncodeSrc(diagram.src || "");
         return '<div class="crd-entry crd-entry-narration crd-entry-diagram"' + entryOpenAttrs(e) + '>' +
-          '<span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
+          entryTsHtml(e.t, nowMs) +
           '<div class="crd-narration-body">' + pre +
           '<div class="cr-diagram-card crd-diagram-inline">' +
             '<div class="cr-diagram-render mmd-slot" data-mmd-src="' + b64 + '">' +
@@ -2469,7 +2498,7 @@
             "</div></div>" + suf + "</div></div>";
       }
       return '<div class="crd-entry crd-entry-narration"' + entryOpenAttrs(e) + '>' +
-        '<span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
+        entryTsHtml(e.t, nowMs) +
         '<div class="crd-narration-text">' + mdHtml(ctx, e.text) + "</div></div>";
     }
     if (e.kind === "ask") {
@@ -2483,9 +2512,9 @@
       // ("hourglass It asked you · still open") above the question — only while it's
       // still open; a closed decision doesn't claim to still be open. 5b's
       // view-only copy also drops "itself" and adds the "never writes" clause.
-      var miniHead = d.open ? '<div class="crd-ask-minihead"><span class="tn-emo-a" aria-hidden="true">' + svgIcon(ctx, "hourglass") + '</span>' +
+      var miniHead = d.open ? '<div class="crd-ask-minihead"><span class="tn-emo tn-emo-a" aria-hidden="true">' + svgIcon(ctx, "hourglass") + '</span>' +
         '<span class="crd-ask-minihead-label">It asked you · still open</span></div>' : "";
-      return '<div class="crd-entry crd-entry-ask"' + entryOpenAttrs(e) + '><span class="crd-entry-ts mono crd-ts-ask">' + fmtClock(e.t) + "</span>" +
+      return '<div class="crd-entry crd-entry-ask"' + entryOpenAttrs(e) + '>' + entryTsHtml(e.t, nowMs, "crd-ts-ask") +
         '<div class="crd-bubble crd-bubble-ask">' + miniHead + '<div class="crd-ask-q">' + mdHtml(ctx, q0.q) + "</div>" +
         '<div class="crd-ask-opts">' + opts + "</div>" +
         '<div class="crd-ask-note">View-only — answer in the session. The tracker never writes to it.</div></div></div>';
@@ -2493,7 +2522,7 @@
     if (e.kind === "command" || e.kind === "command-fail") {
       var c = e.cmd;
       return '<div class="crd-entry crd-entry-tool' + (e.kind === "command-fail" ? " is-fail" : "") + '"' + entryOpenAttrs(e) + '>' +
-        '<span class="crd-entry-ts mono ' + (e.kind === "command-fail" ? "crd-ts-fail" : "") + '">' + fmtClock(e.t) + "</span>" +
+        entryTsHtml(e.t, nowMs, e.kind === "command-fail" ? "crd-ts-fail" : "") +
         '<div class="crd-toolrow">' + (e.kind === "command-fail" ? '<span class="crd-tool-fail">fail</span>' : "") +
         '<span class="crd-tool-name mono">' + esc(c.cmd) + "</span></div></div>";
     }
@@ -2507,7 +2536,7 @@
     // per-op timestamps and line counts, which it does not today.
     if (e.kind === "tool") {
       return '<div class="crd-entry crd-entry-tool"' + entryOpenAttrs(e) + '>' +
-        '<span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
+        entryTsHtml(e.t, nowMs) +
         '<div class="crd-toolrow"><span class="crd-tool-verb mono">' + esc(e.verb) + "</span>" +
         '<span class="crd-tool-name mono">' + esc(e.target) + "</span>" +
         (e.agent ? '<span class="crd-tag-agent">agent</span>' : "") +
@@ -2712,7 +2741,7 @@
       var heightBefore = scrollEl.scrollHeight;
       var olderEl = scrollEl.querySelector(".crd-timeline-older"); // preserved across the repaint below
       scrollEl.innerHTML = filtered.length ?
-        filtered.map(function (e) { return entryHtml(e, ctx, diagramByKey[e.key]); }).join("") :
+        filtered.map(function (e) { return entryHtml(e, ctx, diagramByKey[e.key], ui.nowMs); }).join("") :
         "";
       if (!filtered.length) scrollEl.innerHTML = timelineEmptyMessage(ui);
       if (olderEl) scrollEl.appendChild(olderEl); // FIX (defect 1): older status lives at the bottom now
@@ -2749,8 +2778,14 @@
   // the narration." Builds the {title, when, text} the classic modal expects from
   // whatever kind of merged-timeline entry was clicked; no new markdown renderer —
   // openText() below still does mdBlock() itself, same as openMsg()/openReq().
-  function timelineEntryModalPayload(e) {
-    var when = (typeof ago === "function" && e.t) ? ago(Math.max(0, (Date.now() - e.t) / 1000)) : fmtClock(e.t);
+  //
+  // TASK 2: `when` used to re-derive its age from the browser's own clock -- the
+  // CLIENT clock, forbidden by this repo's rule that ages are server-stamped
+  // (client skew makes it wrong). `nowMs` is ui.nowMs, the same server-stamped
+  // `state.now` (ms) renderTimeline stashes on `ui` every poll -- see
+  // openTimelineEntry below.
+  function timelineEntryModalPayload(e, nowMs) {
+    var when = (typeof ago === "function" && e.t && nowMs != null) ? ago(Math.max(0, Math.round((nowMs - e.t) / 1000))) : fmtClock(e.t);
     if (e.kind === "prompt") return { title: "Prompt", when: when, text: e.text || "" };
     if (e.kind === "narration") return { title: "Narration", when: when, text: e.text || "" };
     if (e.kind === "ask") {
@@ -2788,7 +2823,7 @@
     if (!e) return;
     _setNav(function (i) { openTimelineEntry(ui, i); }, idx, list.length,
       { len: function () { return (ui.timelineEntries || []).length; }, live: true });
-    var payload = timelineEntryModalPayload(e);
+    var payload = timelineEntryModalPayload(e, ui.nowMs);
     openText(payload.title, payload.when, payload.text);
   }
 

@@ -882,7 +882,13 @@ function upgradeMermaidIn(root){
 }
 document.addEventListener("themechange", ()=>upgradeMermaidIn(document));
 
-function ago(sec){sec=Math.max(0,sec|0);if(sec<60)return sec+"s ago";if(sec<3600)return(sec/60|0)+"m ago";if(sec<86400)return(sec/3600|0)+"h ago";return(sec/86400|0)+"d ago"}
+// TASK 3 (control-rail-polish): `short` serves ext_cr_board.js's tile/rail rows,
+// which concat this into tight strips ("· 2h · Claude Code") where the long-form
+// " ago" suffix and "45s ago" spelling don't fit -- that file used to carry its
+// own second copy of this function (same 60s/3600s/86400s thresholds, different
+// spelling: "just now"/"Xm"/"Xh"/"Xd", no " ago"). One function, one set of
+// thresholds, so the two forms can never drift apart on where a boundary falls.
+function ago(sec,short){sec=Math.max(0,sec|0);if(sec<60)return short?"just now":sec+"s ago";if(sec<3600)return(sec/60|0)+"m"+(short?"":" ago");if(sec<86400)return(sec/3600|0)+"h"+(short?"":" ago");return(sec/86400|0)+"d"+(short?"":" ago")}
 function base(p){return (p||"").split("/").pop()}
 // One plain-TEXT source-of-truth for the words (no markup, ever) -- SRC (the HTML label used by
 // renderSide()'s tiles/rows) is built FROM this, so the two can never drift. Any consumer that

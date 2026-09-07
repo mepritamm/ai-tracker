@@ -1120,6 +1120,12 @@
   font-size: 12px !important;
   line-height: 1;
 }
+/* boot.js's icon() emits a bare, unclassed <svg> on purpose (sizing is meant to come
+ * from the wrapping container) -- this button is that container, and had no svg sizing
+ * rule at all, so its icon fell to the browser's ~300x150 replaced-element default.
+ * Base size split the difference between .crd-ico (14px) and .crd-fork-ico (13px), the
+ * two nearest-weight siblings in this file. */
+.cr .crd-timeline-popout svg { width: calc(14px * var(--ico-scale)); height: calc(14px * var(--ico-scale)); }
 
 .cr .crd-timeline-panel .crd-panel-body {
   display: flex;
@@ -1144,12 +1150,32 @@
 }
 
 .cr .crd-entry { display: flex; gap: 11px; cursor: pointer; }
+/* TASK 1 (relative age beside the timeline clock): stacked two lines -- the
+ * absolute clock on top (primary), the "(18m ago)" wording ago() already owns
+ * on a second line underneath (secondary: smaller, muted, see .crd-entry-age).
+ * The gutter was a fixed 34px sized for "HH:MM" alone; "(18m ago)" doesn't fit
+ * that width even on its own line without wrapping mid-word, so this widens it
+ * to 50px -- enough for the longest case ("(45s ago)"/"(18m ago)", 9 chars) on
+ * one line at 9px mono -- while staying far short of the ~100px a single
+ * combined "15:15 (18m ago)" line would need (the classic dashboard's own
+ * wider 56px gutter, app.css:246, holds ONLY the relative wording, never the
+ * clock too). 16px off the message column, not ~66px.
+ */
 .cr .crd-entry-ts {
-  flex: 0 0 34px;
+  flex: 0 0 50px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
   text-align: right;
   font-size: 10px;
   color: var(--text-muted);
   padding-top: 2px;
+}
+.cr .crd-entry-age {
+  font-size: 9px;
+  color: var(--text-muted);
+  opacity: .72;
 }
 .cr .crd-entry-prompt .crd-entry-ts { color: var(--text-dusk); }
 .cr .crd-ts-fail { color: var(--text-failed) !important; }
