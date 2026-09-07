@@ -2545,7 +2545,7 @@
     // `typeof ... === "function"` before use for exactly that reason. The untruncated path and
     // the raw command still reach the user via the tooltip below.
     var cwdTail = (t.cwd || "").split("/").pop() || (t.cwd || "");
-    label.textContent = (identity || (t.cmd || "shell")) + "  ·  " + cwdTail + "  ·  " + mins + "m";
+    label.textContent = (identity || (t.cmd || "shell")) + (t.suffix || "") + "  ·  " + cwdTail + "  ·  " + mins + "m";
     label.title = t.tty + "  ·  " + (t.cmd || "shell") + "  ·  " + (t.cwd || "");
     row.appendChild(label);
     (actions || []).forEach(function (a) {

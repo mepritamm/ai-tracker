@@ -465,6 +465,60 @@ def _same_dir_sessions(projdir):
     return humans, agents
 
 
+def newest_session_in_cwd(cwd, after_ts, exclude=()):
+    """The freshest human session id whose log lives under `cwd` and STARTED (not merely
+    was last modified) after `after_ts` — the join a polling route uses to notice "a new
+    Claude session just showed up in this terminal's directory" (e.g. after a resume
+    spawns a fresh transcript) without the caller having to know which project-dir file
+    it landed in.
+
+    The match is on `sm["first"]` — the session's own start time (a sub-second epoch
+    float, same field `_same_dir_sessions`/`_pick_parent` above use to order sessions;
+    see `_ts_epoch` in util.py) — NOT on `os.path.getmtime`. mtime is last-*modified*: a
+    session created well before `after_ts` but still being appended to has an mtime of
+    right now, so an mtime-only test would wrongly report it as the session THIS
+    terminal just spawned — a false positive that would put the wrong name on a
+    dashboard row. mtime is kept as a cheap pre-filter only, to skip obviously-old files
+    without paying for `_session_meta` on every one: a session that started after
+    `after_ts` necessarily also has mtime > `after_ts`, so this narrowing is safe and
+    never drops a real match. A session whose start is unknown/unparseable
+    (`sm["first"] == 0`, the same "not yet written" sentinel `_pick_parent` treats as
+    unknown rather than 'earliest') is excluded, never guessed at — a wrong name is
+    worse than no rename, and the caller falls back gracefully to the existing name
+    when this returns "". Deliberately excludes anything in `exclude` (the caller's own
+    id / ones it has already claimed) and any sdk-cli background-agent transcript (see
+    _same_dir_sessions above — an agent must never be mistaken for the human session a
+    terminal is polling for). Cheap on repeat calls since _session_meta is
+    mtime-cached. Survivors are ranked by start time (greatest = newest), ties broken
+    by id, same idiom as _pick_parent, so the answer doesn't depend on glob order.
+    Never raises -- a bad/vanished file just doesn't win, same guarding style as
+    _session_meta/_tail_scan; the caller is a poll loop that can't afford an
+    exception."""
+    try:
+        best_id, best_first = "", -1.0
+        for f in glob.glob(os.path.join(config.PROJECTS, "*", "*.jsonl")):
+            try:
+                mt = os.path.getmtime(f)
+            except OSError:
+                continue
+            if mt <= after_ts:
+                continue                                # cheap pre-filter: start time <= mtime always
+            sm = _session_meta(f)
+            if sm["cwd"] != cwd or sm["source"] == "sdk-cli":
+                continue
+            first = sm["first"]
+            if not first or first <= after_ts:
+                continue                                # unknown/unparseable start, or started too early
+            fid = os.path.basename(f)[:-6]
+            if fid in exclude:
+                continue
+            if first > best_first or (first == best_first and fid > best_id):
+                best_id, best_first = fid, first
+        return best_id
+    except OSError:
+        return ""
+
+
 def child_agent_sessions(sid, projdir):
     """The agent (sdk-cli) sessions this session originated — same project dir, and this session
     won the _pick_parent attribution. Surfaced in the parent's background-agents panel to jump

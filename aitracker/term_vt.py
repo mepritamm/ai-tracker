@@ -1364,6 +1364,31 @@ class Pty:
                                     # _LOCK like every other PTYS-dict-visible field here.
         self.mode = ""              # "cwd" | "resume" | "new", set alongside `session` above for
                                     # the same reason (the standalone view's `?mode=` param).
+        self.spawned = ""          # the session id this terminal CREATED after the fact, for a
+                                    # "cwd"/"new" open that had none to begin with (`claude` typed
+                                    # into a bare shell, or the bare `claude` of mode="new", writes
+                                    # a brand-new transcript the moment it starts). Resolved by
+                                    # `resolve_spawned()` below, which watches this pty's cwd for a
+                                    # transcript newer than `started` and not already claimed by
+                                    # another live pty. A LATCH, not a poll: once non-empty it is
+                                    # never re-probed and never cleared, because a terminal's first
+                                    # session is the one whose title names it -- a later `/clear`
+                                    # or a second `claude` in the same shell must not rename the
+                                    # row out from under the user. `_live_list()` reports
+                                    # `spawned or session`, so the row starts session-less and
+                                    # silently acquires the real id (and with it the human title
+                                    # the client resolves from that id) within a poll or two.
+                                    # `mode` deliberately does NOT change with it: the LAUNCH mode
+                                    # is what the `-terminal`/`-new` suffix names, and that is
+                                    # history, not state.
+        self.spawn_probe = 0.0     # time.time() of the last `resolve_spawned()` filesystem probe
+                                    # for this pty, or 0.0 for never-probed. Purely a throttle
+                                    # (see that function's `throttle` argument): the list route
+                                    # that drives the probe is polled every ~2s per client, and a
+                                    # directory glob per pty per poll per client is real I/O for a
+                                    # question whose answer changes at most once in a terminal's
+                                    # life. Written under `_LOCK` -- which is also what makes two
+                                    # concurrent list requests unable to probe the same pty twice.
         self.viewers = 0           # open SSE /api/term/screen connections; guarded by _LOCK
         self.raw_queues = []       # queue.Queue per open /api/term/raw viewer -- see raw_stream()
                                     # and the TRACKER_TERM_RENDERER switch comment below. Mutated
@@ -1611,20 +1636,170 @@ def _live_count():
     return sum(1 for p in PTYS.values() if not p.done)
 
 
+_MODE_SUFFIX = {"cwd": "-terminal", "new": "-new", "resume": "-resume"}
+"""The name suffix each launch mode earns in the terminal list, e.g. a `cwd` open of the
+`ai-tracker` project reads as `ai-tracker-terminal`. The mapping lives HERE, server-side, and
+rides out on every `_live_list()` row as `suffix`, because conventions rule 5 says the server
+owns the label and the client only renders it: the alternative -- a `{cwd: '-terminal', ...}`
+literal in app.js keyed off the `mode` field -- is the client re-deriving a server value, and
+the two copies drift the first time a fourth mode appears here and nowhere else. Unknown/empty
+modes map to `""` via `.get`, which is why `suffix` can be reported unconditionally."""
+
+
+def resolve_spawned(throttle=5.0):
+    """Latch each session-less terminal onto the Claude session it went on to CREATE.
+
+    A terminal opened in mode `cwd` (a login shell) or `new` (a bare `claude`) starts with
+    `Pty.session == ""`, so its row has no id and the client has no title to resolve for it --
+    it stays "terminal in ~/foo" forever, even after the user's `claude` has been writing a real
+    transcript in that directory for an hour. This walks the candidates and asks the Claude
+    provider for the newest transcript rooted at the pty's cwd that appeared AFTER the pty
+    started, and on a hit stores it in `Pty.spawned`; `_live_list()` then reports that id and the
+    row renames itself on the next poll. A `resume` open is never a candidate: it already has the
+    id it was launched against, by definition.
+
+    LOCK ORDERING -- the point of this function's shape. Both critical sections (the candidate
+    scan with its `spawn_probe` reservation, and the per-candidate CLAIM below) are SEPARATE,
+    TOP-LEVEL `with _LOCK:` blocks; every filesystem call happens with the lock released, in
+    between them. `_LOCK` is the module-wide mutex behind PTYS, and the route that calls this is
+    polled every ~2s by every open client -- globbing a session directory while holding it would
+    stall `open_pty`, `close_pty`, `resize_pty` and every other terminal route behind directory
+    I/O on someone else's disk. `_LOCK` is a plain `threading.Lock()` and is NOT reentrant, so
+    the claim block must never be nested inside the scan block (and this function must never be
+    called from a caller already holding `_LOCK` -- see `term_list()`'s docstring, which spells
+    out that it calls this BEFORE its own critical section for exactly that reason): a nested
+    acquire is a hard, unrecoverable deadlock of the whole server, not a slow path. Neither
+    critical section touches `pt.lock`, so there is still no lock PAIR to order here.
+
+    Two concurrent list requests cannot double-probe: `spawn_probe` is stamped inside the same
+    critical section that selects the candidate, so the second thread's `now - p.spawn_probe >=
+    throttle` test fails and it takes no candidates at all.
+
+    CLAIMING IS ATOMIC, AND THE SNAPSHOT ALONE IS NOT ENOUGH. `claimed` is a per-thread snapshot
+    of every id a live pty already holds (`session` or `spawned`), and it feeds `exclude` so the
+    provider never even offers an id someone owns. But a snapshot goes stale the moment the lock
+    drops: two `GET /api/term/list` requests (this is a ThreadingHTTPServer -- two browser tabs
+    are two threads) can each snapshot BEFORE either writes, both see the same brand-new
+    transcript, and both store it. `spawned` is a permanent latch that is never cleared, so the
+    result is two rows wearing the same session name forever. The store below therefore
+    RE-ACQUIRES `_LOCK` and re-derives the answer from live PTYS -- not from the stale snapshot
+    -- immediately before writing. PTYS is deliberately the single source of truth rather than a
+    module-level claimed-id set: a parallel set would have to be invalidated on every teardown
+    path (`close_pty`, `_reap`, `Pty.finish`), and the first one that forgot would poison an id
+    for the life of the process, whereas a scan of live ptys cannot go stale by construction.
+
+    A cwd holding a FORKED pty is skipped entirely. `_retry_with_fork` swaps a `--fork-session`
+    child into a `resume` pty; that child writes a BRAND-NEW transcript in the same cwd whose id
+    we can never learn (`store.record_fork` records the PARENT id -- the child's is never
+    reported back), so it can never appear in `claimed` and it passes every filter
+    `newest_session_in_cwd` applies (source `cli`, started after the neighbour pty). A sibling
+    `cwd` shell in that directory would then permanently latch its neighbour's fork onto its own
+    row. Since an unattributable fork transcript is indistinguishable from a genuinely new
+    session, and a WRONG name on a row is worse than no rename, such a candidate simply keeps
+    the name it has. The guard is narrow on purpose -- only a cwd where a forked pty is actually
+    live -- so the ordinary case still renames.
+
+    Never raises: a missing/broken provider (the flattened `dist/tracker.py` has no
+    `aitracker.providers` package at all) or a failing probe just leaves `spawned` empty, which
+    is exactly the pre-existing behaviour.
+
+    COST CEILING. A warm probe measures ~10ms, and probes run one per candidate, synchronously,
+    on the request thread. At `config.MAX_TERMS`'s ceiling of 64 session-less terminals that is
+    ~0.6s on one poll -- tolerable because `throttle` means any given pty is probed at most once
+    per 5s and a latched pty stops being a candidate forever after. If it ever does bite, the
+    upgrade is to move the probe loop (everything between the two critical sections) onto a
+    single background thread that writes `spawned` the same way; nothing else in the design has
+    to change. Not built now -- a background thread for a cost nobody has hit is machinery the
+    bound does not yet justify.
+    """
+    now = time.time()
+    with _LOCK:
+        claimed = set()
+        forked_cwds = set()
+        cands = []
+        for p in PTYS.values():
+            if p.done:
+                continue
+            if p.session:
+                claimed.add(p.session)
+            if p.spawned:
+                claimed.add(p.spawned)
+            if p.forked:
+                forked_cwds.add(p.cwd)   # see the docstring: this directory may hold a fork
+                                          # transcript whose id nobody can attribute
+            if (p.mode in ("cwd", "new") and not p.spawned and p.cwd not in forked_cwds
+                    and now - p.spawn_probe >= throttle):
+                cands.append(p)
+        # A forked pty later in the iteration cannot un-select a candidate already appended above
+        # (PTYS is a dict, so the order is arbitrary), so the filter is applied once more here,
+        # against the COMPLETE set -- still inside the same critical section, still no I/O.
+        cands = [p for p in cands if p.cwd not in forked_cwds]
+        for p in cands:
+            p.spawn_probe = now     # reserve, under the lock, before any I/O below
+    # ---- _LOCK IS RELEASED FROM HERE DOWN: filesystem work only, until the claim block below
+    # ---- re-acquires it. No _live_list, and no acquire that is NESTED inside another.
+    if not cands:
+        return
+    try:
+        # Guarded, late-bound, and an *expression* rather than a `from . import` statement --
+        # the same idiom registry._attached_pty() uses to reach into this module, and for the
+        # same two reasons: the provider is only needed on this rare path (this module is
+        # imported at server startup), and scripts/bundle.py's strip_module() leaves an
+        # __import__ call alone, so in the flattened bundle this simply raises and we return.
+        _claude = __import__("%s.providers.claude" % __package__, fromlist=["claude"])
+    except Exception:
+        return
+    exclude = tuple(claimed)
+    for p in cands:
+        try:
+            sid = _claude.newest_session_in_cwd(p.cwd, p.started, exclude=exclude)
+        except Exception:
+            sid = ""
+        if not sid:
+            continue
+        # THE CLAIM. A separate, top-level `with _LOCK:` -- never nested inside the scan above,
+        # which closed long ago (`_LOCK` is not reentrant; nesting would deadlock the server).
+        # Everything inside is a plain attribute read/store over live ptys: no I/O, no `pt.lock`,
+        # no call that could re-enter this lock, so the section is O(live ptys) and bounded.
+        # `claimed`/`forked_cwds` were accurate when they were snapshotted and may not be now, so
+        # both questions are asked again HERE, against live PTYS, in the same critical section
+        # that does the store -- which is what makes the claim atomic rather than check-then-act.
+        with _LOCK:
+            taken = p.spawned or any(
+                (q.session == sid or q.spawned == sid) or (q.forked and q.cwd == p.cwd)
+                for q in PTYS.values() if not q.done)
+            if not taken:
+                p.spawned = sid
+        # Claimed either way -- by us, or by whoever won the race -- so it must not be re-offered
+        # to a later candidate sharing this cwd.
+        claimed.add(sid)
+        exclude = tuple(claimed)
+
+
 def _live_list():
     """The live PTYs as plain dicts, oldest first -- what `open_pty()`'s 429 hands back so the
     client can show WHICH terminals hold the slots and close one, and what `GET /api/term/list`
     (below) hands back on demand for the same purpose. Call under `_LOCK`.
 
-    `session`/`mode` are always present, even when empty (a plain `cwd` shell has no session) --
-    the client must see `""`, never `undefined`, so a "peek into this terminal" link can always
-    be built the same way. `forked` rides along for the same reason: it is the LIVE value of
-    `Pty.forked`, so it reflects a LATE backstop retry too (unlike the POST /api/term/pty
-    response, which necessarily went out before `_resume_backstop` could flip it). Without it a
-    peeked terminal silently loses its `⑂ fork` chip, because the peek URL can only carry what
-    this row exposes."""
+    `session`/`mode`/`suffix` are always present, even when empty (a plain `cwd` shell has no
+    session) -- the client must see `""`, never `undefined`, so a "peek into this terminal" link
+    can always be built the same way. `forked` rides along for the same reason: it is the LIVE
+    value of `Pty.forked`, so it reflects a LATE backstop retry too (unlike the POST
+    /api/term/pty response, which necessarily went out before `_resume_backstop` could flip it).
+    Without it a peeked terminal silently loses its `⑂ fork` chip, because the peek URL can only
+    carry what this row exposes.
+
+    `session` is `spawned or session`: a `cwd`/`new` terminal that has since created its own
+    Claude session (see `resolve_spawned()` above) reports THAT id, so the row follows the real
+    session and the client's id -> title lookup renames it with no user action. `suffix` is the
+    server's own label for the LAUNCH mode (`_MODE_SUFFIX`) and is deliberately NOT recomputed
+    when a session is resolved -- how the terminal was opened doesn't change just because we
+    finally learned what it created -- and it is a plain lookup with a `""` default so an
+    unrecognised or empty mode still yields a key, never a missing one (conventions rule 5: the
+    label is the server's to decide, the client's only to render)."""
     return [{"tty": p.id, "cmd": p.cmd, "cwd": p.cwd, "started": p.started,
-             "session": p.session, "mode": p.mode, "forked": p.forked}
+             "session": p.spawned or p.session, "mode": p.mode,
+             "suffix": _MODE_SUFFIX.get(p.mode, ""), "forked": p.forked}
             for p in sorted(PTYS.values(), key=lambda p: p.started) if not p.done]
 
 
@@ -2538,7 +2713,8 @@ def close_pty(handler, parsed, body):
 
 
 def term_list(handler, parsed):
-    """GET /api/term/list -> {"terminals": [{tty, cmd, cwd, started, session, mode}, ...], "max": <int>}.
+    """GET /api/term/list -> {"terminals": [{tty, cmd, cwd, started, session, mode, suffix}, ...],
+    "max": <int>}.
 
     The on-demand counterpart to `open_pty()`'s 429 body: today a user can only see/manage their
     running terminals once they hit the cap and get refused. A "Manage terminals" panel needs the
@@ -2547,9 +2723,18 @@ def term_list(handler, parsed):
     enumeration, not two). `max` is `config.MAX_TERMS`, read late-bound here exactly like the 429
     check above reads it (never copied into a client-side constant -- conventions rule 5, server
     owns policy; see `test_cap_is_read_late_bound_from_config` for the discipline this mirrors).
+
+    This route is also what DRIVES `resolve_spawned()` -- the poll that already exists is the
+    natural clock for "has this session-less terminal created a session yet?", so no timer thread
+    is needed. It runs BEFORE the `_LOCK` below, never inside it: it takes and releases the lock
+    itself around its candidate scan and does its filesystem work in between (see its docstring's
+    lock-ordering note), and calling it from inside this critical section would both deadlock on
+    the non-reentrant `_LOCK` and put directory I/O on the path of every other terminal route.
+    Its own `throttle` keeps the probe rate sane no matter how many clients are polling.
     """
     if not term_gate.guard(handler):
         return
+    resolve_spawned()
     with _LOCK:
         _reap()
         terminals = _live_list()

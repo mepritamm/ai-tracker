@@ -1220,12 +1220,13 @@ class TestRoutes(unittest.TestCase):
         self.assertEqual(len(obj["terminals"]), 1)
         row = obj["terminals"][0]
         self.assertEqual(set(row.keys()),
-                         {"tty", "cmd", "cwd", "started", "session", "mode", "forked"})
+                         {"tty", "cmd", "cwd", "started", "session", "mode", "suffix", "forked"})
         self.assertEqual(row["tty"], "p1")
         self.assertEqual(row["cwd"], "/tmp/proj")
         self.assertEqual(row["cmd"], "claude --resume s1")
         self.assertEqual(row["session"], "s1")
         self.assertEqual(row["mode"], "resume")
+        self.assertEqual(row["suffix"], "-resume")
 
     def test_list_max_is_read_late_bound_from_config(self):
         """`max` must be `config.MAX_TERMS` re-read on every call, not a value frozen at import

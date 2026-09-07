@@ -1776,6 +1776,8 @@
         // only the raw `session` uuid) -- resolve a human name via sessionTitleFor(), same
         // as ext_vt.js/ext_cr_boot.js, and fall back to a truncated id rather than the full
         // 36-char uuid (never "undefined": t.session is "" for a plain shell, never unset).
+        // The server-supplied t.suffix ("", "-terminal", "-resume", "-new") distinguishes how
+        // the terminal was launched and is appended to the title.
         var identity = t.session ? (sessionTitleFor(t.session) || t.session.slice(0, 8)) : null;
         var peekBtn = h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'peek', onclick: function () { if (payload.onPeek) payload.onPeek(t); } });
         var killBtn = h('button', { class: 'cr-btn cr-btn-quiet cr-btn-danger', type: 'button', onclick: function () {
@@ -1791,7 +1793,7 @@
         rowBtns.push(peekBtn, killBtn);
         list.appendChild(h('div', { class: 'cr-termcap-row' }, [
           h('div', {}, [
-            h('div', { class: 'cr-termcap-title' }, [identity || cwdTail(t.cwd) || t.tty]),
+            h('div', { class: 'cr-termcap-title' }, [(identity || cwdTail(t.cwd) || t.tty) + (t.suffix || '')]),
             h('div', { class: 'cr-termcap-meta cr-mono' }, [cwdTail(t.cwd) + ' · ' + timeAgo(t.started)]),
           ]),
           peekBtn,
