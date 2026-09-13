@@ -56,10 +56,14 @@ def _extract_script_content(html):
     return matches[-1].group(1)
 
 
-def _extract_function(source, name):
+def _extract_function(source, name, after=0):
     """Brace-matches the exact `function NAME(...) { ... }` text out of the real bundle.
-    Raises loudly (never returns a guess) if the shape has moved."""
-    start = source.find("function " + name + "(")
+    Raises loudly (never returns a guess) if the shape has moved. `after`: search starting at
+    this offset -- needed when the same name is reused by an unrelated module elsewhere in the
+    concatenated bundle (ext_cr_detail.js has its own, differently-shaped `_killTerminal(ctx,
+    tty)`; page.build_page() concatenates every web/*.js file into one <script>, so a bare
+    `.find()` would grab whichever one happens to come first)."""
+    start = source.find("function " + name + "(", after)
     if start < 0:
         raise AssertionError("function %s() not found in the assembled bundle" % name)
     brace = source.find("{", start)
@@ -242,11 +246,10 @@ console.log(JSON.stringify(OUT));
 """
 
 
-def _run_node(script):
+def _run_node(script, marker="===PARITY_JSON_START==="):
     proc = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=60)
     if proc.returncode != 0:
         raise AssertionError("node failed: %s\n%s" % (proc.stderr[-2000:], proc.stdout[-1000:]))
-    marker = "===PARITY_JSON_START==="
     idx = proc.stdout.find(marker)
     if idx < 0:
         raise AssertionError("no JSON marker in node output:\n%s" % proc.stdout[-2000:])
@@ -511,6 +514,311 @@ class ManageDialogSingleKillIsWired(unittest.TestCase):
             dialogs = fh.read()
         self.assertIn("topName:", dialogs)
         self.assertIn("window.CR.dialogs = {", dialogs)
+
+
+# ===========================================================================
+# Folder-terminal busy confirm (409 {busy:true, fg}) in the Control Room's OWN
+# close paths -- ext_cr_term.js's _killTerminal (behind Manage terminals' single
+# ✕ and the cap dialog's onKill) and _closeAllTerminals (behind "Close all").
+#
+# THE GAP this fixes: ext_vt.js's closeTty() throws a distinguishable {busy, fg}
+# rejection on a 409 (the folder terminal has something running in its
+# foreground) so a caller can ask before force-killing it -- the dashboard's
+# manager already does (ext_vt.js's closeOneFromManager/_armBusyConfirm). The
+# Control Room's own close paths used to just turn that into a flat "Failed to
+# kill terminal." toast. The fix adds ext_cr_term.js's own _confirmBusyClose
+# (an inline confirm appended into the manage-terminals dialog ALREADY open,
+# reusing its existing .cr-inline-confirm/.cr-btn-* markup rather than a new
+# modal) and wires it into _killTerminal and into _closeAllTerminals's
+# killSeries(terminals, confirmBusy) hook.
+#
+# IDIOM: same "brace-match the exact function out of the real assembled bundle"
+# technique as the classes above -- _vt/_fgLabel/_confirmBusyClose/_killTerminal/
+# _closeAllTerminals come out of ext_cr_term.js's own text in that bundle, and
+# killSeries out of ext_vt.js's -- both concatenated into the one <script> tag
+# page.build_page() assembles, so a single _extract_function() call finds each
+# regardless of which source file it started in. A DOM stub (not a no-op one --
+# real enough that a wiring mistake is observable) drives the confirm's actual
+# row/button dance instead of asserting on ext_cr_term.js's text.
+# ===========================================================================
+
+_BUSY_CONFIRM_HARNESS = r"""
+var OUT = {};
+(async function () {
+  // ---- minimum DOM stub: real enough that a wiring mistake is observable ----
+  function makeEl(tag) {
+    var node = {
+      tag: tag, className: '', type: '', textContent: '', onclick: null, removed: false,
+      children: [],
+      appendChild: function (c) { node.children.push(c); },
+      remove: function () { node.removed = true; },
+      focus: function () {},
+      querySelector: function (sel) { return sel === '.cr-dialog-body' ? node._body : null; },
+    };
+    return node;
+  }
+  var dialogOpen = true;
+  var panel = makeEl('div');
+  var body = makeEl('div');
+  panel._body = body;
+  var document = {
+    querySelector: function (sel) {
+      if (sel === '[data-cr-dialog="manage-terminals"]') return dialogOpen ? panel : null;
+      return null;
+    },
+    createElement: function (tag) { return makeEl(tag); },
+  };
+  var sessions = [];
+  var toasts = [];
+  function showToast(t) { toasts.push(t); }
+  var refreshCount = 0;
+  function _refreshRunningList() { refreshCount++; }
+  var repaintCount = 0;
+  function _repaintManage() { repaintCount++; }
+  function delay(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function lastRow() { return body.children[body.children.length - 1]; }
+
+  // _killCurrent's own module-level state: the attached pane's tty, its status bar (the host
+  // _confirmBusyClose appends the busy-confirm row into -- see ext_cr_term.js's own comment on
+  // why this is NOT the manage dialog's body), and the overlay-close it calls on a real kill.
+  var st = { tty: null };
+  var closeCount = 0;
+  function close() { closeCount++; }
+  var el = { status: makeEl('div') };
+  function lastStatusRow() { return el.status.children[el.status.children.length - 1]; }
+
+  // killSeries (extracted from ext_vt.js below) calls the bare `closeTty(...)` as a free
+  // variable, not `vt.closeTty(...)` -- it lives INSIDE that file's own IIFE alongside the real
+  // one. This indirection lets each scenario below swap in its own stub while both that free
+  // variable and _killTerminal's `vt.closeTty(...)` (via window.ExtVT.term.closeTty) resolve to
+  // the SAME stub.
+  var closeTtyImpl = null;
+  function closeTty(tty, force) { return closeTtyImpl(tty, force); }
+  var window = { ExtVT: { term: { closeTty: closeTty } } };
+
+  // ---- the real functions, lifted verbatim from the assembled bundle ----
+  %s
+
+  %s
+
+  %s
+
+  %s
+
+  %s
+
+  %s
+
+  %s
+
+  window.ExtVT.term.killSeries = killSeries;
+
+  // ===== SCENARIO A: 409 then CONFIRM -- the retry re-POSTs with force:true =====
+  var attemptsA = [];
+  closeTtyImpl = function (tty, force) {
+    attemptsA.push({ tty: tty, force: !!force });
+    if (attemptsA.length === 1) {
+      var e = new Error('busy'); e.busy = true; e.fg = { session: 's1' };
+      return Promise.reject(e);
+    }
+    return Promise.resolve({ ok: true });
+  };
+  var settledA = null;
+  _killTerminal({ tty: '/dev/pts/3' }).then(function (r) { settledA = r; });
+  await delay(20);
+  var rowA = lastRow();
+  OUT['A_confirm_shown'] = !!rowA && rowA.className === 'cr-inline-confirm';
+  OUT['A_confirm_text'] = rowA ? rowA.children[0].textContent : null;
+  rowA.children[1].onclick();                  // "Close anyway"
+  await delay(20);
+  OUT['A_call_count'] = attemptsA.length;
+  OUT['A_first_force'] = attemptsA[0] && attemptsA[0].force;
+  OUT['A_second_force'] = attemptsA[1] && attemptsA[1].force;
+  OUT['A_resolved'] = !!settledA;
+  OUT['A_refresh_count'] = refreshCount;
+
+  // ===== SCENARIO B: 409 then DECLINE -- no second call, nothing counted as a failure =====
+  var attemptsB = [];
+  closeTtyImpl = function (tty, force) {
+    attemptsB.push({ tty: tty, force: !!force });
+    var e = new Error('busy'); e.busy = true; e.fg = { session: 's2' };
+    return Promise.reject(e);
+  };
+  body.children = [];
+  var settledB = null, rejectedB = null;
+  _killTerminal({ tty: '/dev/pts/4' }).then(function (r) { settledB = r; }, function (e) { rejectedB = e; });
+  await delay(20);
+  var rowB = lastRow();
+  rowB.children[2].onclick();                  // "Cancel"
+  await delay(20);
+  OUT['B_call_count'] = attemptsB.length;
+  OUT['B_resolved'] = !!settledB;
+  OUT['B_rejected_cancelled'] = !!(rejectedB && rejectedB.cancelled);
+
+  // ===== SCENARIO C: "Close all" -- one busy row DECLINED must not abort the sweep =====
+  var attemptsC = [];
+  closeTtyImpl = function (tty, force) {
+    attemptsC.push({ tty: tty, force: !!force });
+    if (tty === '/dev/pts/A' && !force) {
+      var e = new Error('busy'); e.busy = true; e.fg = { session: 's3' };
+      return Promise.reject(e);
+    }
+    return Promise.resolve({ ok: true });
+  };
+  body.children = [];
+  var sweepSettled = false;
+  _closeAllTerminals([{ tty: '/dev/pts/A' }, { tty: '/dev/pts/B' }]).then(function () { sweepSettled = true; });
+  await delay(20);
+  var rowC = lastRow();
+  OUT['C_confirm_shown_for_busy_row'] = !!rowC && rowC.className === 'cr-inline-confirm';
+  rowC.children[2].onclick();                  // decline the busy one
+  await delay(30);
+  OUT['C_attempts'] = attemptsC;
+  OUT['C_other_terminal_closed'] = attemptsC.some(function (a) { return a.tty === '/dev/pts/B'; });
+  OUT['C_busy_never_forced'] = !attemptsC.some(function (a) { return a.tty === '/dev/pts/A' && a.force; });
+  OUT['C_sweep_settled'] = sweepSettled;
+  OUT['C_toasts'] = toasts;
+
+  // ===== SCENARIO D: the ATTACHED PANE's own ■ Kill (_killCurrent) -- 409 then CONFIRM appends
+  // into el.status (the pane's status bar), NOT the manage dialog's body, and retries force:true
+  var attemptsD = [];
+  closeTtyImpl = function (tty, force) {
+    attemptsD.push({ tty: tty, force: !!force });
+    if (attemptsD.length === 1) {
+      var e = new Error('busy'); e.busy = true; e.fg = { session: 's4' };
+      return Promise.reject(e);
+    }
+    return Promise.resolve({ ok: true });
+  };
+  st.tty = '/dev/pts/9';
+  el.status.children = [];
+  body.children = [];
+  toasts.length = 0;
+  closeCount = 0;
+  _killCurrent();
+  await delay(20);
+  var rowD = lastStatusRow();
+  OUT['D_confirm_shown'] = !!rowD && rowD.className === 'cr-inline-confirm';
+  OUT['D_confirm_not_in_dialog_body'] = body.children.length === 0;
+  rowD.children[1].onclick();                  // "Close anyway"
+  await delay(20);
+  OUT['D_call_count'] = attemptsD.length;
+  OUT['D_first_force'] = attemptsD[0] && attemptsD[0].force;
+  OUT['D_second_force'] = attemptsD[1] && attemptsD[1].force;
+  OUT['D_closed'] = closeCount === 1;
+  OUT['D_toasts'] = toasts;
+
+  // ===== SCENARIO E: the ATTACHED PANE's own ■ Kill -- 409 then DECLINE -- no second call, and
+  // the pane is never actually closed =====
+  var attemptsE = [];
+  closeTtyImpl = function (tty, force) {
+    attemptsE.push({ tty: tty, force: !!force });
+    var e = new Error('busy'); e.busy = true; e.fg = { session: 's5' };
+    return Promise.reject(e);
+  };
+  st.tty = '/dev/pts/10';
+  el.status.children = [];
+  toasts.length = 0;
+  closeCount = 0;
+  _killCurrent();
+  await delay(20);
+  var rowE = lastStatusRow();
+  rowE.children[2].onclick();                  // "Cancel"
+  await delay(20);
+  OUT['E_call_count'] = attemptsE.length;
+  OUT['E_closed'] = closeCount === 1;
+  OUT['E_toasts'] = toasts;
+
+  console.log("===BUSY_CONFIRM_JSON_START===");
+  console.log(JSON.stringify(OUT));
+})();
+"""
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TermCloseBusyConfirm(unittest.TestCase):
+    """Pins ext_cr_term.js's own busy-confirm wiring against the REAL shipped source (brace-matched
+    out of the assembled page's bundle, both the ext_cr_term.js and ext_vt.js halves of it), not a
+    hand-retyped paraphrase."""
+
+    @classmethod
+    def setUpClass(cls):
+        src = _extract_script_content(_read_page())
+        fn_vt = _extract_function(src, "_vt")
+        fn_fglabel = _extract_function(src, "_fgLabel")
+        fn_confirm = _extract_function(src, "_confirmBusyClose")
+        # ext_cr_detail.js has its own, differently-shaped `_killTerminal(ctx, tty)` earlier in
+        # the concatenated bundle -- search from just past _confirmBusyClose (which this file's
+        # OWN _killTerminal is always defined right after) so the wrong one is never grabbed.
+        after = src.index(fn_confirm) + len(fn_confirm)
+        fn_kill = _extract_function(src, "_killTerminal", after=after)
+        fn_closeall = _extract_function(src, "_closeAllTerminals")
+        fn_killseries = _extract_function(src, "killSeries")
+        # _killCurrent is the ATTACHED PANE's own ■ Kill button (status bar, not the manage
+        # dialog) -- same brace-match idiom, grabbed after _confirmBusyClose like _killTerminal
+        # above so a stray same-named helper earlier in the bundle can't be grabbed instead.
+        fn_killcurrent = _extract_function(src, "_killCurrent", after=after)
+        fns = [fn_vt, fn_fglabel, fn_confirm, fn_kill, fn_closeall, fn_killseries, fn_killcurrent]
+        cls.out = _run_node(_BUSY_CONFIRM_HARNESS % tuple(fns), marker="===BUSY_CONFIRM_JSON_START===")
+
+    def test_confirm_then_yes_retries_with_force_true(self):
+        """The second POST /api/term/close must carry force:true -- that is the server's whole
+        contract for "yes, kill it anyway" once a 409 busy confirm has been answered."""
+        self.assertTrue(self.out.get("A_confirm_shown"), "a 409 busy rejection must raise the confirm")
+        text = self.out.get("A_confirm_text") or ""
+        self.assertIn("is running in this terminal — close anyway?", text)
+        self.assertIn("This kills the shell and the session process.", text)
+        self.assertEqual(self.out.get("A_call_count"), 2,
+                         "confirming must re-POST exactly once more")
+        self.assertFalse(self.out.get("A_first_force"), "the first attempt must not pre-emptively force")
+        self.assertTrue(self.out.get("A_second_force"), "the retry after 'Close anyway' must set force:true")
+        self.assertTrue(self.out.get("A_resolved"), "a forced close that succeeds must resolve, not reject")
+        self.assertEqual(self.out.get("A_refresh_count"), 1)
+
+    def test_confirm_then_no_makes_no_second_call(self):
+        """'On no -> nothing': declining must never re-POST at all, and must not be surfaced as a
+        generic failure the user never actually hit."""
+        self.assertEqual(self.out.get("B_call_count"), 1,
+                         "declining the busy confirm must not retry the close")
+        self.assertFalse(self.out.get("B_resolved"), "a declined close must not resolve as a success")
+        self.assertTrue(self.out.get("B_rejected_cancelled"),
+                        "a declined close must reject with a distinguishable {cancelled:true} so the "
+                        "caller's toast can tell a change of mind apart from a real failure")
+
+    def test_close_all_keeps_going_after_one_busy_row_is_declined(self):
+        """A busy terminal must never abort a 'Close all' sweep -- the dashboard's killSeries
+        contract already guarantees this; this pins that the Control Room actually wires its own
+        confirm into that same hook instead of treating a 409 as a flat failure."""
+        self.assertTrue(self.out.get("C_confirm_shown_for_busy_row"),
+                        "the busy row met inside a Close all sweep must still raise the confirm")
+        self.assertTrue(self.out.get("C_other_terminal_closed"),
+                        "declining ONE busy terminal must not stop the sweep from closing the rest "
+                        "(got attempts: %r)" % (self.out.get("C_attempts"),))
+        self.assertTrue(self.out.get("C_busy_never_forced"),
+                        "a declined terminal must never be force-closed behind the user's back")
+        self.assertTrue(self.out.get("C_sweep_settled"), "the sweep as a whole must still settle")
+
+    def test_pane_kill_confirm_then_yes_retries_with_force_true(self):
+        """The attached pane's own ■ Kill (_killCurrent) must not let a 409 busy rejection fall
+        through to a generic failure or silence -- it raises the SAME busy-confirm banner, but
+        appended into the pane's own status bar (there is no manage dialog open here), and 'Close
+        anyway' must re-POST with force:true and then actually close the pane."""
+        self.assertTrue(self.out.get("D_confirm_shown"),
+                        "a 409 busy rejection from the pane's ■ Kill must raise the confirm")
+        self.assertTrue(self.out.get("D_confirm_not_in_dialog_body"),
+                        "the pane's confirm must NOT land in the manage-terminals dialog body -- "
+                        "it isn't open")
+        self.assertEqual(self.out.get("D_call_count"), 2, "confirming must re-POST exactly once more")
+        self.assertFalse(self.out.get("D_first_force"), "the first attempt must not pre-emptively force")
+        self.assertTrue(self.out.get("D_second_force"), "the retry after 'Close anyway' must set force:true")
+        self.assertTrue(self.out.get("D_closed"), "a forced close that succeeds must close the pane")
+
+    def test_pane_kill_confirm_then_no_makes_no_second_call(self):
+        """Declining the pane's own busy confirm must never re-POST, and must never close the
+        pane out from under the user who just said no."""
+        self.assertEqual(self.out.get("E_call_count"), 1,
+                         "declining the pane's busy confirm must not retry the close")
+        self.assertFalse(self.out.get("E_closed"), "a declined close must not close the pane")
 
 
 if __name__ == "__main__":

@@ -692,7 +692,12 @@
               if (gen !== _capGen) return;
               if (typeof retry === "function") retry();
             }, (vt && vt.REAP_SETTLE_MS) || 0);
-          }).catch(function () { showToast("Failed to kill terminal."); });
+          }).catch(function (e) {
+            // "On no -> nothing": _killTerminal tags a declined busy-confirm so this doesn't
+            // report a failure the user never actually hit.
+            if (e && e.cancelled) return;
+            showToast("Failed to kill terminal.");
+          });
         },
         onCloseAll: _closeAllTerminals,
       });
@@ -729,6 +734,9 @@
             showToast("Terminal closed — " + (t.cmd || t.tty));
             _repaintManage();
           }).catch(function (e) {
+            // "On no -> nothing": _killTerminal tags a declined busy-confirm so this doesn't
+            // report a failure the user never actually hit.
+            if (e && e.cancelled) return;
             showToast("Couldn’t close that terminal — " + e);
           });
         },
@@ -752,6 +760,73 @@
     if (!w) showToast("Popup blocked — allow popups for this page to open a new tab.");
   }
 
+  // Names the session running in a busy terminal's foreground, for _confirmBusyClose's wording
+  // below -- the SAME `sessions[]` lookup ext_vt.js's `_confirmFgLabel` (~ext_vt.js:3105) and
+  // ext_cr_dialogs.js's `sessionTitleFor` already do. Kept as its own small copy rather than a
+  // call into either of those, for the reason `_confirmFgLabel`'s own comment gives: this file
+  // only reaches ext_vt.js through the vt.* seam (see _vt() below), never its internals, and
+  // ext_cr_dialogs.js's copy is a sibling module this one talks to only via the dialog payload
+  // contract, not a function it may call directly.
+  function _fgLabel(fg) {
+    if (!fg || !fg.session) return "something";
+    var list = (typeof sessions !== "undefined" && sessions) || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].id === fg.session) return list[i].title || list[i].project || fg.session.slice(0, 8);
+    }
+    return fg.session.slice(0, 8);
+  }
+
+  // Per-terminal busy confirm for THIS file's own close paths (server contract: POST
+  // /api/term/close may answer 409 {busy:true, fg} when the folder terminal being closed has
+  // something running in its foreground -- closing it anyway kills that too; vt.closeTty throws
+  // this as a distinguishable {busy, fg} rejection rather than a flat HTTP error, see its own
+  // comment in ext_vt.js). The dashboard's twin is ext_vt.js's `_armBusyConfirm`/`_confirmFgLabel`
+  // pair, but this file only reaches ext_vt.js through the vt.* seam (closeTty/killSeries/
+  // peekUrl/REAP_SETTLE_MS -- see _vt()'s own comment above), never its internals, so it grows
+  // its own copy of the idiom instead of calling in. Appended into `host` (reusing the exact
+  // `.cr-inline-confirm`/`.cr-btn-solid`/`.cr-btn-danger`/`.cr-btn-quiet` markup the "Close all"
+  // two-step confirm already renders in ext_cr_dialogs.js's renderManageTerminals) rather than a
+  // new modal shell. `host` defaults to the manage-terminals dialog's own body -- the caller this
+  // was written for (the row's kill button / the sweep's confirm button, both from the manage
+  // dialog) -- but `_killCurrent` below passes the attached pane's own status bar instead, since
+  // there's no manage dialog open when killing straight from the pane's ■ Kill button.
+  // ponytail: one shared banner at the bottom of `host`, not pinned under the one busy row the way
+  // the dashboard does it -- the caller (the row's kill button, the sweep's own confirm button, or
+  // _killCurrent's status bar) already disables every OTHER button in the panel for exactly the
+  // span this confirm is up, so a single banner reads the same for a much smaller diff. Resolves
+  // false (does nothing) if `host` (or the default manage dialog) isn't on screen to append into.
+  function _confirmBusyClose(t, fg, host) {
+    return new Promise(function (resolve) {
+      var body = host;
+      if (!body) {
+        var panel = document.querySelector('[data-cr-dialog="manage-terminals"]');
+        body = panel && panel.querySelector(".cr-dialog-body");
+      }
+      if (!body) { resolve(false); return; }
+      var row = document.createElement("div");
+      row.className = "cr-inline-confirm";
+      var msg = document.createElement("span");
+      msg.textContent = _fgLabel(fg) + " is running in this terminal — close anyway? "
+        + "This kills the shell and the session process.";
+      var yes = document.createElement("button");
+      yes.type = "button";
+      yes.className = "cr-btn cr-btn-solid cr-btn-danger";
+      yes.textContent = "Close anyway";
+      var no = document.createElement("button");
+      no.type = "button";
+      no.className = "cr-btn cr-btn-quiet";
+      no.textContent = "Cancel";
+      function settle(v) { row.remove(); resolve(v); }
+      yes.onclick = function () { settle(true); };
+      no.onclick = function () { settle(false); };
+      row.appendChild(msg);
+      row.appendChild(yes);
+      row.appendChild(no);
+      body.appendChild(row);
+      try { yes.focus(); } catch (e) {}
+    });
+  }
+
   function _killTerminal(t) {
     var vt = _vt();
     if (!vt) return Promise.reject(new Error("terminal support not loaded"));
@@ -760,6 +835,22 @@
     return vt.closeTty(t.tty).then(function (r) {
       _refreshRunningList();
       return r;
+    }).catch(function (e) {
+      if (!e || !e.busy) throw e;
+      // Ask, then re-POST with force:true on yes -- same contract vt.closeTty documents.
+      return _confirmBusyClose(t, e.fg).then(function (proceed) {
+        if (!proceed) {
+          // "On no -> nothing": tagged so onKill's own .catch below can tell a change of mind
+          // apart from a real failure and skip the toast it would otherwise show.
+          var declined = new Error("cancelled");
+          declined.cancelled = true;
+          throw declined;
+        }
+        return vt.closeTty(t.tty, true).then(function (r) {
+          _refreshRunningList();
+          return r;
+        });
+      });
     });
   }
 
@@ -770,7 +861,11 @@
     // Sequential via the shared killSeries, not this file's old Promise.all: it resolves with the
     // FAILURE COUNT, so a partial failure is reported instead of silently swallowed by the
     // per-request `.catch(function () {})` that used to sit here.
-    return vt.killSeries(terminals).then(function (failures) {
+    // `_confirmBusyClose` is killSeries's own `confirmBusy(t, fg)` hook (ext_vt.js's `closeAll`
+    // wires its dashboard twin the same way): a busy terminal never just aborts or silently fails
+    // the sweep -- it counts as a failure only if the user declines, and the sweep always moves
+    // on to the next terminal regardless of the answer.
+    return vt.killSeries(terminals, _confirmBusyClose).then(function (failures) {
       if (failures) showToast("Some terminals could not be closed — " + failures + " of " + total + " failed");
       else showToast("Closed all terminals — " + total + " killed");
       _repaintManage();
@@ -932,11 +1027,23 @@
     // second hand-rolled copy.
     var vt = _vt();
     if (!vt) { showToast("Terminal support isn’t loaded on this page."); return; }
-    vt.closeTty(tty).then(function (r) {
-      if (!r.ok) { showToast("Failed to kill terminal."); return; }
-      showToast("Terminal killed.");
-      close();
-    }).catch(function (e) { showToast("Failed to reach the server: " + e); });
+    function doClose(force) {
+      return vt.closeTty(tty, force).then(function (r) {
+        if (!r.ok) { showToast("Failed to kill terminal."); return; }
+        showToast("Terminal killed.");
+        close();
+      });
+    }
+    doClose().catch(function (e) {
+      if (!e || !e.busy) { showToast("Failed to reach the server: " + e); return; }
+      // Same busy-confirm idiom _killTerminal uses below, but with nowhere to put it — this is
+      // the attached pane's own ■ Kill button, not a row inside the manage-terminals dialog — so
+      // it's appended into el.status, the status bar that holds that button, instead.
+      _confirmBusyClose(null, e.fg, el.status).then(function (proceed) {
+        if (!proceed) return;
+        return doClose(true).catch(function (e2) { showToast("Failed to reach the server: " + e2); });
+      });
+    });
   }
 
   // ===== fork lineage — reads the SAME d.continued_as/d.continued_from fields app.js's own

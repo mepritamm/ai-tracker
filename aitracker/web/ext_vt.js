@@ -2545,7 +2545,36 @@
     // `typeof ... === "function"` before use for exactly that reason. The untruncated path and
     // the raw command still reach the user via the tooltip below.
     var cwdTail = (t.cwd || "").split("/").pop() || (t.cwd || "");
-    label.textContent = (identity || (t.cmd || "shell")) + (t.suffix || "") + "  ·  " + cwdTail + "  ·  " + mins + "m";
+    // Folder terminals (server contract: `folder`/`fg` on GET /api/term/list rows -- one shared
+    // shell per cwd, every session in that folder runs inside it) name themselves by the FOLDER,
+    // never by `identity` above: there may be many sessions, or none at all, sharing this one pty
+    // over its life. `fg` (set only while something is actually running in its foreground) names
+    // WHICH session that is right now; absent, the shell is simply idle at its prompt. Resolved
+    // via its own small inline lookup rather than sharing the `identity` one above -- this whole
+    // function is executed VERBATIM by tests/test_term_vt_exec.py and pinned by SOURCE TEXT in
+    // tests/test_term_vt_client.py's TestTerminalRowShowsSessionIdentity, both of which assert the
+    // exact lines above; factoring them into a shared helper would move that text out of the body
+    // those tests extract.
+    if (t.folder) {
+      var fgLabel = "shell";
+      if (t.fg && t.fg.session) {
+        var flist = (typeof sessions !== "undefined" && sessions) || [];
+        var fhit = null;
+        for (var fi = 0; fi < flist.length; fi++) {
+          if (flist[fi] && flist[fi].id === t.fg.session) { fhit = flist[fi]; break; }
+        }
+        fgLabel = "running " + ((fhit && (fhit.title || fhit.project)) || t.fg.session.slice(0, 8));
+      }
+      label.textContent = cwdTail + (t.suffix || "") + "  ·  " + fgLabel + "  ·  " + mins + "m";
+    } else {
+      // `t.overflow` (a dedicated one-off pty the server opened because the folder shell was busy
+      // running something else) rides along as a bracketed tag rather than a separate element --
+      // see this file's own "single .vtcaplabel span" test (TestTerminalRowShowsSessionIdentity.
+      // test_rows_stay_usable_on_phone_and_tablet); a second span/badge element there would break
+      // that pinned count. ponytail: a plain-text tag is the ceiling here, not a styled chip --
+      // revisit only if that single-span constraint is ever relaxed.
+      label.textContent = (identity || (t.cmd || "shell")) + (t.overflow ? " [overflow]" : "") + (t.suffix || "") + "  ·  " + cwdTail + "  ·  " + mins + "m";
+    }
     label.title = t.tty + "  ·  " + (t.cmd || "shell") + "  ·  " + (t.cwd || "");
     row.appendChild(label);
     (actions || []).forEach(function (a) {
@@ -2780,6 +2809,24 @@
     var mount = document.getElementById("ext_vt");
     if (!mount) return;
     var gen = ++openGen;
+    // Folder terminals (server contract: `folder`/`fg` on GET /api/term/list rows -- one shared
+    // shell per cwd, every session in that folder runs inside it) dedupe differently from a plain
+    // session+mode match: a "cwd" open reuses ANY live folder shell already at this session's
+    // working directory (not just one this exact session opened before), and a "resume" open
+    // reuses a folder shell that is ALREADY running this exact session's `claude --resume` in its
+    // foreground, even though no terminal was ever opened directly for {session: sid, mode:
+    // "resume"}. `targetCwd` is looked up the same guarded way buildTermRow resolves a session's
+    // title (typeof sessions !== "undefined" -- this file is also loaded standalone, where that
+    // global doesn't exist); if the session can't be found yet, the clause below is simply
+    // skipped -- the server dedupes on its own end regardless, this is only the client's shortcut
+    // to a peek instead of a round-trip spawn-then-reuse.
+    var targetCwd = null;
+    if (mode === "cwd") {
+      var slist = (typeof sessions !== "undefined" && sessions) || [];
+      for (var si = 0; si < slist.length; si++) {
+        if (slist[si] && slist[si].id === sid) { targetCwd = slist[si].cwd || null; break; }
+      }
+    }
     fetch("/api/term/list")
       .then(function (r) { return r.ok ? r.json().catch(function () { return {}; }) : {}; })
       // The catch sits HERE, on the FETCH alone, not on the end of the chain: a route that is off
@@ -2792,10 +2839,10 @@
         if (gen !== openGen) return;    // a newer open()/peek() already won
         var terms = (j && j.terminals) || [];
         for (var i = 0; i < terms.length; i++) {
-          if (terms[i].session === sid && terms[i].mode === mode) {
-            peekTerm(terms[i]);
-            return;
-          }
+          var t = terms[i];
+          if (t.session === sid && t.mode === mode) { peekTerm(t); return; }
+          if (mode === "cwd" && targetCwd && t.folder && t.cwd === targetCwd) { peekTerm(t); return; }
+          if (mode === "resume" && t.fg && t.fg.session === sid) { peekTerm(t); return; }
         }
         _openVTFresh(sid, mode, mount, gen);
       });
@@ -3030,6 +3077,40 @@
   var _ARM_GUARD_MS = 500;
   function _armGuardActive() { return Date.now() - mgrArmedAt < _ARM_GUARD_MS; }
 
+  // Per-row busy confirm (server contract: POST /api/term/close may answer 409 {busy:true, fg}
+  // when the folder terminal being closed has something running in its foreground -- closing it
+  // anyway kills that too). Same two-step IDIOM as mgrConfirmAll above -- an inline warning plus a
+  // Yes/Cancel pair, reusing its exact `.vtmgrfoot`/`.vtmgrwarn`/`.vtcapx` markup rather than a new
+  // modal shell -- just keyed to ONE tty instead of a fixed footer button, and resolved by a
+  // promise (`mgrConfirmResolve`) instead of a click landing on a hardcoded handler: killSeries()
+  // below needs to AWAIT the answer before moving on to the next terminal in a "Close all" sweep,
+  // which a plain onclick callback can't express.
+  var mgrConfirmTty = null, mgrConfirmFg = null, mgrConfirmResolve = null;
+
+  // Arms that confirm and hands back a promise resolving true/false once the user answers via the
+  // Yes/Cancel pair renderManagerBody draws for `mgrConfirmTty`. Shared by closeOneFromManager (a
+  // single row's ✕) and killSeries's `confirmBusy` hook (the "Close all" sweep) -- one place that
+  // decides what "ask about this busy terminal" means, not two.
+  function _armBusyConfirm(t, fg) {
+    return new Promise(function (resolve) {
+      mgrConfirmTty = t.tty;
+      mgrConfirmFg = fg || null;
+      mgrConfirmResolve = resolve;
+    });
+  }
+
+  // Small inline lookup for the confirm's own wording ("<title> is running in this terminal...").
+  // Not shared with buildTermRow's near-identical one -- see that function's own comment on why
+  // its copy stays self-contained for the test harnesses that extract/assert it verbatim.
+  function _confirmFgLabel(fg) {
+    if (!fg || !fg.session) return "something";
+    var list = (typeof sessions !== "undefined" && sessions) || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].id === fg.session) return list[i].title || list[i].project || fg.session.slice(0, 8);
+    }
+    return fg.session.slice(0, 8);
+  }
+
   function buildManager() {
     mgrOverlay = document.createElement("div");
     mgrOverlay.className = "overlay";
@@ -3074,9 +3155,19 @@
     });
   }
 
+  // Resolves a still-pending busy confirm as "no" and clears it -- called from both closeManager
+  // and openManager below so a dismissed (or reopened) panel never leaves killSeries's sweep
+  // awaiting an answer that can no longer arrive (the Yes/Cancel row it was waiting on is gone).
+  function _cancelBusyConfirm() {
+    var resolve = mgrConfirmResolve;
+    mgrConfirmTty = null; mgrConfirmFg = null; mgrConfirmResolve = null;
+    if (resolve) resolve(false);
+  }
+
   function closeManager() {
     if (mgrOverlay) mgrOverlay.style.display = "none";
     mgrConfirmAll = false;
+    _cancelBusyConfirm();
   }
 
   function openManager() {
@@ -3086,6 +3177,7 @@
     if (typeof closeDrawer === "function") closeDrawer();
     if (!mgrOverlay) buildManager();
     mgrConfirmAll = false;
+    _cancelBusyConfirm();
     mgrOverlay.style.display = "flex";
     refreshManager();
   }
@@ -3164,9 +3256,48 @@
           icon: "close",
           title: "kill this terminal — SIGKILLs its process group, it does not just stop watching",
           aria: "kill this terminal — " + (t.cmd || "shell"),
-          onClick: function () { closeOneFromManager(t); }
+          onClick: function () { closeOneFromManager(t, terminals, max); }
         }
       ]));
+      // Busy confirm for THIS row (server contract: POST /api/term/close answered 409 {busy:true,
+      // fg} -- see _armBusyConfirm's own comment). Reuses the exact `.vtmgrfoot`/`.vtmgrwarn`/
+      // `.vtcapx` markup "Close all"'s own two-step confirm below already uses, no new CSS: a
+      // Yes/Cancel pair resolving the promise closeOneFromManager/killSeries is awaiting instead
+      // of calling a fixed handler.
+      if (mgrConfirmTty === t.tty) {
+        var busyRow = document.createElement("div");
+        busyRow.className = "vtmgrfoot";
+        var busyWarn = document.createElement("span");
+        busyWarn.className = "vtmgrwarn";
+        busyWarn.textContent = _confirmFgLabel(mgrConfirmFg) +
+          " is running in this terminal — close anyway? This kills the shell and the session process.";
+        var busyYes = document.createElement("button");
+        busyYes.className = "vtcapx";
+        busyYes.textContent = "Close anyway";
+        busyYes.title = "Kill this terminal and whatever is running inside it";
+        busyYes.setAttribute("aria-label", "Confirm closing " + (t.cmd || "shell") + " even though something is running inside it");
+        busyYes.onclick = function () {
+          var resolve = mgrConfirmResolve;
+          mgrConfirmTty = null; mgrConfirmFg = null; mgrConfirmResolve = null;
+          renderManagerBody(terminals, max);
+          if (resolve) resolve(true);
+        };
+        var busyNo = document.createElement("button");
+        busyNo.className = "vtcapx";
+        busyNo.textContent = "Cancel";
+        busyNo.title = "Leave this terminal running";
+        busyNo.setAttribute("aria-label", "Cancel — leave this terminal running");
+        busyNo.onclick = function () {
+          var resolve = mgrConfirmResolve;
+          mgrConfirmTty = null; mgrConfirmFg = null; mgrConfirmResolve = null;
+          renderManagerBody(terminals, max);
+          if (resolve) resolve(false);
+        };
+        busyRow.appendChild(busyWarn);
+        busyRow.appendChild(busyYes);
+        busyRow.appendChild(busyNo);
+        wrap.appendChild(busyRow);
+      }
     });
 
     var foot = document.createElement("div");
@@ -3198,7 +3329,7 @@
         // on this button (it is created synchronously, inside the first click's own handler) and
         // kills every terminal with the warning never displayed for a single frame.
         if (_armGuardActive()) return;
-        closeAll(terminals);
+        closeAll(terminals, max);
       };
       // The keyboard twin of the same hazard: a HELD Enter auto-repeats keydown at ~30ms once the
       // OS repeat delay elapses, and each repeat activates the focused button -- so the timing
@@ -3263,11 +3394,25 @@
 
   // The existing route -- no bulk variant was added server-side for "close all"; looping this one
   // is the smaller diff and the server already does the only dangerous part exactly once per tty.
-  function closeTty(tty) {
+  // `force` re-POSTs with {tty, force:true} -- the server contract for "yes, kill it anyway" once
+  // a 409 busy confirm (below) has been answered.
+  function closeTty(tty, force) {
     return fetch("/api/term/close", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tty: tty })
+      body: JSON.stringify(force ? { tty: tty, force: true } : { tty: tty })
     }).then(function (r) {
+      // 409 {busy:true, fg} -- the folder terminal has something running in its foreground and the
+      // server refused to kill it silently. Surfaced as a distinguishable rejection (`err.busy`/
+      // `err.fg`) rather than the generic "HTTP 409" below, so a caller can offer the confirm
+      // instead of just reporting a flat failure.
+      if (r.status === 409) {
+        return r.json().catch(function () { return {}; }).then(function (j) {
+          var err = new Error("terminal is busy");
+          err.busy = true;
+          err.fg = j && j.fg;
+          throw err;
+        });
+      }
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r;
     });
@@ -3291,7 +3436,7 @@
                                  function (b) { b.disabled = disabled; });
   }
 
-  function closeOneFromManager(t) {
+  function closeOneFromManager(t, terminals, max) {
     _latchManager(true);
     closeTty(t.tty)
       .then(function () {
@@ -3304,6 +3449,25 @@
       })
       .catch(function (e) {
         _latchManager(false);
+        if (e && e.busy) {
+          // Arm the per-row confirm (see _armBusyConfirm's own comment) instead of a flat failure
+          // toast, then act on whatever the user decides.
+          _armBusyConfirm(t, e.fg).then(function (proceed) {
+            if (!proceed) return;
+            _latchManager(true);
+            closeTty(t.tty, true)
+              .then(function () {
+                if (typeof toast === "function") toast("Terminal closed", t.cmd || t.tty);
+                _refreshAfterReap();
+              })
+              .catch(function (e2) {
+                _latchManager(false);
+                if (typeof toast === "function") toast("Couldn't close that terminal", String(e2));
+              });
+          });
+          if (terminals) renderManagerBody(terminals, max);
+          return;
+        }
         if (typeof toast === "function") toast("Couldn't close that terminal", String(e));
       });
   }
@@ -3313,21 +3477,45 @@
   // the failure COUNT so each caller words its own toast without re-deriving the sequencing.
   // Sequential, not Promise.all: a dozen simultaneous SIGKILL+reap cycles on one server thread
   // pool is needless, and a serial chain gives a deterministic failure count to report.
-  function killSeries(terminals) {
+  // `confirmBusy(t, fg)` -- optional -- is called on a 409 for ONE terminal and must return a
+  // promise of true/false; the series waits for that answer and then moves on to the NEXT
+  // terminal regardless (a busy terminal must never abort the rest of a "Close all" sweep).
+  // Omitted entirely (ext_cr_term.js's own _closeAllTerminals does this today), a 409 just counts
+  // as a failure, same as any other rejection -- no worse than before this task.
+  function killSeries(terminals, confirmBusy) {
     var failures = 0;
     var chain = Promise.resolve();
     (terminals || []).forEach(function (t) {
       chain = chain.then(function () {
-        return closeTty(t.tty).catch(function () { failures++; });
+        return closeTty(t.tty).catch(function (e) {
+          if (e && e.busy && typeof confirmBusy === "function") {
+            return confirmBusy(t, e.fg).then(function (proceed) {
+              if (!proceed) { failures++; return; }
+              return closeTty(t.tty, true).catch(function () { failures++; });
+            });
+          }
+          failures++;
+        });
       });
     });
     return chain.then(function () { return failures; });
   }
 
-  function closeAll(terminals) {
+  function closeAll(terminals, max) {
     mgrConfirmAll = false;
     _latchManager(true);
-    killSeries(terminals).then(function (failures) {
+    killSeries(terminals, function (t, fg) {
+      // Pause the whole-panel latch while this ONE row's confirm is awaiting an answer -- the
+      // Yes/Cancel pair it renders must themselves be clickable -- then re-latch once answered so
+      // the rest of the sweep still reads as busy to the user.
+      _latchManager(false);
+      var proceedP = _armBusyConfirm(t, fg);
+      renderManagerBody(terminals, max);
+      return proceedP.then(function (proceed) {
+        _latchManager(true);
+        return proceed;
+      });
+    }).then(function (failures) {
       if (typeof toast === "function") {
         if (failures) toast("Some terminals could not be closed", failures + " of " + terminals.length + " failed");
         else toast("Closed all terminals", terminals.length + " killed");
@@ -3550,6 +3738,16 @@
       });
     } else if (target && target.session) {
       var sid = target.session, mode = target.mode || "";
+      // Same folder-dedupe extension as openVT's own copy (see that function's comment for the
+      // full reasoning) -- kept as its own inline lookup for the identical reason the whole scan
+      // below is self-contained rather than shared.
+      var targetCwd = null;
+      if (mode === "cwd") {
+        var slist = (typeof sessions !== "undefined" && sessions) || [];
+        for (var si = 0; si < slist.length; si++) {
+          if (slist[si] && slist[si].id === sid) { targetCwd = slist[si].cwd || null; break; }
+        }
+      }
       // Self-contained find-existing check -- see this function's own header comment for why it's
       // not shared with openVT's identical decision. Same fetch/catch/scan shape as that one.
       fetch("/api/term/list")
@@ -3558,7 +3756,10 @@
         .then(function (j) {
           var terms = (j && j.terminals) || [];
           for (var i = 0; i < terms.length; i++) {
-            if (terms[i].session === sid && terms[i].mode === mode) return terms[i];
+            var t = terms[i];
+            if (t.session === sid && t.mode === mode) return t;
+            if (mode === "cwd" && targetCwd && t.folder && t.cwd === targetCwd) return t;
+            if (mode === "resume" && t.fg && t.fg.session === sid) return t;
           }
           return null;
         })

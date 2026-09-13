@@ -1779,6 +1779,23 @@
         // The server-supplied t.suffix ("", "-terminal", "-resume", "-new") distinguishes how
         // the terminal was launched and is appended to the title.
         var identity = t.session ? (sessionTitleFor(t.session) || t.session.slice(0, 8)) : null;
+        // Folder terminals (server contract: `folder`/`fg` on GET /api/term/list rows -- one
+        // shared shell per cwd, every session in that folder runs inside it) name themselves by
+        // the folder rather than whichever session happens to be running inside them right now --
+        // same identity swap ext_vt.js's buildTermRow makes for the dashboard's own rows. `fg`
+        // (set only while something is actually running in the foreground) names which session
+        // that is; absent, the shell is just idle at its prompt.
+        var titleText = t.folder
+          ? cwdTail(t.cwd) + ' · ' + ((t.fg && t.fg.session)
+              ? 'running ' + (sessionTitleFor(t.fg.session) || t.fg.session.slice(0, 8))
+              : 'shell')
+          : (identity || cwdTail(t.cwd) || t.tty) + (t.suffix || '');
+        var titleChildren = [titleText];
+        if (t.folder) titleChildren.push(h('span', { class: 'cr-termcap-badge' }, ['folder']));
+        // `overflow` (a dedicated one-off pty the server opened because the folder shell was busy
+        // running something else) is mutually exclusive with `folder` -- both badges can never
+        // appear on the same row.
+        if (t.overflow) titleChildren.push(h('span', { class: 'cr-termcap-badge' }, ['overflow']));
         var peekBtn = h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'peek', onclick: function () { if (payload.onPeek) payload.onPeek(t); } });
         var killBtn = h('button', { class: 'cr-btn cr-btn-quiet cr-btn-danger', type: 'button', onclick: function () {
           if (!payload.onKill) return;
@@ -1793,7 +1810,7 @@
         rowBtns.push(peekBtn, killBtn);
         list.appendChild(h('div', { class: 'cr-termcap-row' }, [
           h('div', {}, [
-            h('div', { class: 'cr-termcap-title' }, [(identity || cwdTail(t.cwd) || t.tty) + (t.suffix || '')]),
+            h('div', { class: 'cr-termcap-title' }, titleChildren),
             h('div', { class: 'cr-termcap-meta cr-mono' }, [cwdTail(t.cwd) + ' · ' + timeAgo(t.started)]),
           ]),
           peekBtn,

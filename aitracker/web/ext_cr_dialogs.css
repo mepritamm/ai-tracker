@@ -544,6 +544,15 @@
 .cr .cr-termcap-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 6px; background: var(--surface-sunken, #F4F1E8); }
 .cr .cr-termcap-title { font: 600 12px var(--font-sans, sans-serif); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cr .cr-termcap-meta { color: var(--text-muted, #877866); flex: none; }
+/* Folder terminal / overflow-pty tags (server contract: `folder`/`overflow` on GET /api/term/list
+   rows) -- same neutral pill as .cr-envchip elsewhere in this file, reused rather than a second
+   badge style invented for this one row. */
+.cr .cr-termcap-badge {
+  font: 600 9.5px var(--font-mono, monospace); text-transform: uppercase;
+  padding: 1px 6px; margin-left: 6px; border-radius: var(--radius-pill, 999px);
+  background: var(--surface-sunken, #F4F1E8); color: var(--text-secondary, #4A4237);
+  border: 1px solid var(--line-default, #CFC7B7);
+}
 .cr .cr-inline-confirm { display: flex; align-items: center; gap: 8px; font: 400 12px var(--font-sans, sans-serif); color: var(--text-failed, #8A2F1B); }
 
 /* ---- motion ---- */

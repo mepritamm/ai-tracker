@@ -2492,7 +2492,7 @@ class TestTerminalManagerPanel(unittest.TestCase):
         i = mgr.index("if (mgrConfirmAll) {")
         j = mgr.index("} else {", i)
         armed, unarmed = mgr[i:j], mgr[j:]
-        self.assertIn("closeAll(terminals)", armed)
+        self.assertIn("closeAll(terminals, max)", armed)
         self.assertIn("Cancel", armed)                       # an explicit way back out
         self.assertIn("are you sure — this kills ", armed)   # and it says what it is about to do
         self.assertNotIn("closeAll(", unarmed,
@@ -2510,7 +2510,7 @@ class TestTerminalManagerPanel(unittest.TestCase):
         # invariant is unchanged and still pinned, just where the loop actually is now: closeAll
         # delegates, and the delegate loops the existing per-tty route.
         close_all = _body_until(self.js, "function closeAll(", ["window.ExtVT ="])
-        self.assertIn("killSeries(terminals)", close_all)
+        self.assertIn("killSeries(terminals,", close_all)
         kill_series = _body_until(self.js, "function killSeries(", ["function closeAll("])
         self.assertIn("closeTty(t.tty)", kill_series)
         self.assertIn('"/api/term/close"',

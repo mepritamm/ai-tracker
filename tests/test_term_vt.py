@@ -1182,7 +1182,12 @@ class TestRoutes(unittest.TestCase):
         self.assertEqual(term_vt._live_count(), 1)
         h2 = _FakeHandler()
         term_vt.close_pty(h2, None, {"tty": tid})
-        self.assertEqual(h2.calls[-1], ({"ok": True, "closed": True}, 200))
+        # Not exact-equality: the folder-terminal close response also carries `killed`
+        # (pids) and `confirmed` (see close_pty's docstring / reports/FOLDER-TERMINAL.md's
+        # C5) -- assert the two keys this test actually cares about.
+        obj2, code2 = h2.calls[-1]
+        self.assertEqual(code2, 200, obj2)
+        self.assertEqual((obj2.get("ok"), obj2.get("closed")), (True, True))
         for _ in range(200):                      # reader thread flips `done` on EOF
             if term_vt.PTYS[tid].done:
                 break
@@ -1209,7 +1214,10 @@ class TestRoutes(unittest.TestCase):
         self.assertIs(server.EXTRA_GET["/api/term/list"], term_vt.term_list)
 
     def test_list_returns_live_terminals_with_full_key_set(self):
-        """Assert the FULL key set so a dropped field fails loudly, not silently."""
+        """Assert the FULL key set so a dropped field fails loudly, not silently. The
+        folder-terminal feature (reports/FOLDER-TERMINAL.md) added `folder`/`overflow`/`fg`
+        to every row (see `_live_list`'s docstring) -- this plain, non-folder `Pty` reports
+        them at their defaults."""
         pt = term_vt.Pty(tid="p1", cwd="/tmp/proj", cmd="claude --resume s1")
         pt.session, pt.mode = "s1", "resume"
         term_vt.PTYS["p1"] = pt
@@ -1220,13 +1228,17 @@ class TestRoutes(unittest.TestCase):
         self.assertEqual(len(obj["terminals"]), 1)
         row = obj["terminals"][0]
         self.assertEqual(set(row.keys()),
-                         {"tty", "cmd", "cwd", "started", "session", "mode", "suffix", "forked"})
+                         {"tty", "cmd", "cwd", "started", "session", "mode", "suffix", "forked",
+                          "folder", "overflow", "fg"})
         self.assertEqual(row["tty"], "p1")
         self.assertEqual(row["cwd"], "/tmp/proj")
         self.assertEqual(row["cmd"], "claude --resume s1")
         self.assertEqual(row["session"], "s1")
         self.assertEqual(row["mode"], "resume")
         self.assertEqual(row["suffix"], "-resume")
+        self.assertEqual(row["folder"], False)
+        self.assertEqual(row["overflow"], False)
+        self.assertIsNone(row["fg"])
 
     def test_list_max_is_read_late_bound_from_config(self):
         """`max` must be `config.MAX_TERMS` re-read on every call, not a value frozen at import
@@ -1282,7 +1294,14 @@ class TestRoutes(unittest.TestCase):
     def test_list_session_and_mode_present_and_correct(self):
         """A pty opened with a session/mode reports both; a plain `cwd` shell (never given
         either) reports empty strings, not a missing key -- the client must never see
-        `undefined`."""
+        `undefined`.
+
+        The two opens below must land on DIFFERENT cwds: post folder-terminal, a second
+        `mode="cwd"` open of the SAME directory attaches to the first pty instead of
+        spawning a sibling (see `_folder_pty`/open_pty's "Folder terminal" docstring
+        section) -- opening "/tmp" twice here would just report the FIRST open's
+        session/mode back, which is `test_second_cwd_open_reuses_folder_shell` in
+        tests/test_folder_terminal.py's own territory, not what this test is pinning."""
         term_gate.session_cwd = lambda sid: "/tmp"
         h = _FakeHandler()
         term_vt.open_pty(h, None, {"session": "sess-42", "cols": 40, "rows": 10, "mode": "cwd"})
@@ -1296,18 +1315,21 @@ class TestRoutes(unittest.TestCase):
         self.assertEqual(rows[tid]["session"], "sess-42")
         self.assertEqual(rows[tid]["mode"], "cwd")
 
-        # A plain, session-less shell (the sidebar picker's "cwd" form) gets empty strings.
-        h3 = _FakeHandler()
-        term_vt.open_pty(h3, None, {"cwd": "/tmp", "cols": 40, "rows": 10, "mode": "cwd"})
-        obj3, code3 = h3.calls[-1]
-        self.assertEqual(code3, 200)
-        tid3 = obj3["tty"]
+        # A plain, session-less shell (the sidebar picker's "cwd" form) gets empty strings --
+        # a DIFFERENT cwd so this is a genuinely new folder pty, not a reuse of the one above.
+        with tempfile.TemporaryDirectory() as other_dir:
+            h3 = _FakeHandler()
+            term_vt.open_pty(h3, None, {"cwd": other_dir, "cols": 40, "rows": 10, "mode": "cwd"})
+            obj3, code3 = h3.calls[-1]
+            self.assertEqual(code3, 200)
+            tid3 = obj3["tty"]
+            self.assertNotEqual(tid3, tid, "the two cwds must not share a folder pty")
 
-        h4 = _FakeHandler()
-        term_vt.term_list(h4, _Q(""))
-        rows2 = {r["tty"]: r for r in h4.calls[-1][0]["terminals"]}
-        self.assertEqual(rows2[tid3]["session"], "")
-        self.assertEqual(rows2[tid3]["mode"], "cwd")
+            h4 = _FakeHandler()
+            term_vt.term_list(h4, _Q(""))
+            rows2 = {r["tty"]: r for r in h4.calls[-1][0]["terminals"]}
+            self.assertEqual(rows2[tid3]["session"], "")
+            self.assertEqual(rows2[tid3]["mode"], "cwd")
 
     def test_open_pty_spawns_a_real_shell_and_registers_it(self):
         term_gate.session_cwd = lambda sid: "/tmp"
@@ -1320,7 +1342,14 @@ class TestRoutes(unittest.TestCase):
         self.assertEqual((pt.screen.cols, pt.screen.rows), (40, 10))
 
     def test_pty_new_mode_spawns_claude_with_no_args(self):
-        """mode="new" on a Claude session id produces argv == ["claude"]."""
+        """mode="new" on a Claude session id no longer execs `claude` in a dedicated pty of
+        its own -- it is TYPED into the one shared folder shell for the cwd (see
+        open_pty's "Folder terminal" docstring section and _inject_argv). So this now pins
+        the injected text instead of spawn()'s argv, and additionally proves spawn() is
+        called exactly once here (for the shell itself, since PTYS is empty for "/tmp" at
+        the start of this test) -- not a second time with `["claude"]` as its own argv.
+        `_wait_for_quiescence`/`_inject_write` are stubbed so the folder path succeeds,
+        the same technique tests/test_folder_terminal.py uses against this server."""
         term_gate.session_cwd = lambda sid: "/tmp"
         h = _FakeHandler()
 
@@ -1333,11 +1362,23 @@ class TestRoutes(unittest.TestCase):
             return term_vt.Pty(tid="test-pty-new")
 
         term_vt.spawn = capture_spawn
+        injected = []
+
+        def _capture(pt, data):
+            injected.append(data)
+            return True
+
         try:
-            term_vt.open_pty(h, None, {"session": "claude-sid", "mode": "new", "cols": 80, "rows": 24})
+            with mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True), \
+                 mock.patch.object(term_vt, "_inject_write", side_effect=_capture):
+                term_vt.open_pty(h, None, {"session": "claude-sid", "mode": "new", "cols": 80, "rows": 24})
             obj, code = h.calls[-1]
             self.assertEqual(code, 200)
-            self.assertEqual(spawn_argv, [["claude"]])
+            shell_argv = [os.environ.get("SHELL", "/bin/bash"), "-l"]
+            self.assertEqual(spawn_argv, [shell_argv],
+                              "mode=new against a fresh folder must spawn only the shell")
+            joined = b"".join(injected)
+            self.assertIn(b"claude", joined, "the shell must have `claude` typed into it")
         finally:
             term_vt.spawn = original_spawn
 
@@ -1413,13 +1454,28 @@ class TestRoutes(unittest.TestCase):
             self.assertEqual(calls[0][0], d)
 
     def test_pty_cwd_form_mode_new_spawns_claude_with_no_args(self):
+        """See test_pty_new_mode_spawns_claude_with_no_args above: mode="new" now types
+        `claude` into the shared folder shell rather than spawning it directly, so
+        spawn() is called only once here, for the shell itself."""
         with tempfile.TemporaryDirectory() as d:
             calls = self._capture_spawn()
             h = _FakeHandler()
-            term_vt.open_pty(h, None, {"cwd": d, "mode": "new"})
+            injected = []
+
+            def _capture(pt, data):
+                injected.append(data)
+                return True
+
+            with mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True), \
+                 mock.patch.object(term_vt, "_inject_write", side_effect=_capture):
+                term_vt.open_pty(h, None, {"cwd": d, "mode": "new"})
             obj, code = h.calls[-1]
             self.assertEqual(code, 200)
-            self.assertEqual(calls[0], (d, ["claude"]))
+            shell_argv = [os.environ.get("SHELL", "/bin/bash"), "-l"]
+            self.assertEqual(calls, [(d, shell_argv)],
+                              "mode=new against a fresh folder must spawn only the shell")
+            joined = b"".join(injected)
+            self.assertIn(b"claude", joined, "the shell must have `claude` typed into it")
 
     def test_pty_cwd_form_expands_tilde(self):
         """`~` in a session-less `cwd` is expanded server-side (the browser has no shell to do
@@ -3612,12 +3668,24 @@ class TestOpenPtyForkedAndNoticeFields(_ResumeModeRoutes):
         """The regression test for the over-broad-detection bug: a session whose
         transcript claims sessionKind=="bg"/entrypoint=="sdk-cli" must NOT be forked
         proactively any more -- only term_vt's backstop (on an actual CLI refusal) may
-        fork it now."""
+        fork it now.
+
+        Post folder-terminal, `mode="resume"` no longer execs the resume argv in a
+        dedicated pty it can inspect directly -- it TYPES it into the one shared folder
+        shell (see open_pty's "Folder terminal" docstring section). The fake `Pty` this
+        test's `spawn` stub returns has no real fd (`fd=-1` by default), so the real
+        `_inject_write` would fail against it and the open would fall through to the
+        `overflow` branch with a non-None `notice` -- a fixture artifact, not the
+        behaviour under test. `_wait_for_quiescence`/`_inject_write` are stubbed so the
+        folder path succeeds, exactly as tests/test_folder_terminal.py's
+        TestFolderResumeInjection does against the same server."""
         self._write_bg_session("bg-sess")
         original_spawn = term_vt.spawn
         term_vt.spawn = lambda cwd, argv, cols, rows: term_vt.Pty(tid="pf1")
         try:
-            with mock.patch.object(term_vt, "_resume_backstop"):
+            with mock.patch.object(term_vt, "_resume_backstop"), \
+                 mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True), \
+                 mock.patch.object(term_vt, "_inject_write", return_value=True):
                 h = _FakeHandler()
                 term_vt.open_pty(h, None, {"session": "bg-sess", "mode": "resume"})
         finally:
@@ -3631,11 +3699,17 @@ class TestOpenPtyForkedAndNoticeFields(_ResumeModeRoutes):
         """No session file written for "plain" at all -- find_session() finds nothing,
         exactly like a real non-agent id would resolve. Same False result as the
         background-agent case above -- both go through the identical un-classified path
-        now."""
+        now.
+
+        See the sibling test above for why `_wait_for_quiescence`/`_inject_write` are
+        stubbed: the fake folder-shell `Pty` this test's `spawn` stub returns has no real
+        fd to type into."""
         original_spawn = term_vt.spawn
         term_vt.spawn = lambda cwd, argv, cols, rows: term_vt.Pty(tid="pf2")
         try:
-            with mock.patch.object(term_vt, "_resume_backstop"):
+            with mock.patch.object(term_vt, "_resume_backstop"), \
+                 mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True), \
+                 mock.patch.object(term_vt, "_inject_write", return_value=True):
                 h = _FakeHandler()
                 term_vt.open_pty(h, None, {"session": "plain", "mode": "resume"})
         finally:
@@ -3900,7 +3974,14 @@ class TestResumeBackstopFiresOnRefusal(unittest.TestCase):
             term_vt._retry_with_fork(pt, "raced-sid", 80, 24)
         t.join(timeout=5)
 
-        self.assertEqual(reply.get("got"), ({"ok": True, "closed": True}, 200),
+        # Not exact-equality: the folder-terminal close response also carries `killed`
+        # (pids) and `confirmed` (see close_pty's docstring / reports/FOLDER-TERMINAL.md's
+        # C5) -- assert the two keys (and the code) this test actually cares about.
+        got_obj, got_code = reply.get("got") or (None, None)
+        self.assertEqual(got_code, 200)
+        self.assertEqual((got_obj or {}).get("ok"), True,
+                          "close must not be able to observe the pre-swap state")
+        self.assertEqual((got_obj or {}).get("closed"), True,
                           "close must not be able to observe the pre-swap state")
         self.assertTrue(pt.closing)
         for _ in range(200):         # close killed the swapped-in child; its reader flips done

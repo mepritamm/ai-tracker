@@ -177,6 +177,7 @@ import os
 import pty
 import queue
 import select
+import shlex
 import signal
 import socket
 import struct
@@ -1257,6 +1258,27 @@ MAX_STREAMS = 24         # concurrent SSE /api/term/screen connections, across a
 IDLE_TIMEOUT = 1800       # seconds of no keystrokes AND no viewers before a PTY is reaped (30 min)
 _REAP_LINGER = 600        # seconds a FINISHED pty's record (its final rc) lingers in PTYS before
                           # being dropped, mirroring term_run._reap_old's 10-minute window.
+                          # An OVERFLOW pty (see `Pty.overflow`) gets NO linger at all -- it is
+                          # dropped by `_reap()` the moment it finishes, per the user's "back to one
+                          # terminal per folder" rule: a finished overflow row in the manage list is
+                          # exactly the clutter the folder terminal exists to remove.
+FG_PENDING_GRACE = 20.0   # seconds a folder pty's `fg` claim may sit with NO foreground job ever
+                          # observed before `_refresh_fg()` gives up on it. Covers the honest gap
+                          # between the claim in open_pty() and the shell actually forking the typed
+                          # command (`_inject_argv` waits up to INJECT_MAX_WAIT twice: for quiet,
+                          # then for the prompt -- 16s worst case) with margin, and
+                          # self-heals the one case nobody can observe: a job that ran and exited
+                          # between two `_refresh_fg()` calls (`claude: command not found` dies in
+                          # milliseconds; the list poll that drives the refresh runs every ~2s).
+                          # Without it such a claim would mark the folder shell busy forever.
+FOLDER_SPAWN_WAIT = 3.0   # seconds a second opener of a cwd waits for the FIRST opener's folder
+                          # shell to land in PTYS (`_FOLDER_SPAWNING`) before looking again. A
+                          # spawn is a fork plus a thread start -- milliseconds; this is the ceiling
+                          # past which the waiter stops trusting the reservation, not a budget.
+CLOSE_CONFIRM_WAIT = 2.0  # seconds close_pty() waits for PROOF that everything it killed is gone --
+CLOSE_CONFIRM_POLL = 0.05 # `pt.done` (the reader reaped the shell) AND `os.kill(pid, 0)` raising
+                          # for every targeted pid -- before answering. Bounded: past this it still
+                          # answers, with `confirmed: false`, rather than hanging the request.
 
 RAW_QUEUE_MAXLEN = 512
 """Per-viewer cap on un-drained chunks in a `Pty.raw_queues` entry (see `raw_stream()` below). A
@@ -1283,6 +1305,10 @@ dropped notice is invisible to a viewer whose `since_notice` is old enough to ha
 PTYS = {}                # id -> Pty
 _STREAMS = 0              # open SSE connections across all PTYs; guarded by _LOCK
 _LOCK = threading.Lock()
+_FOLDER_SPAWNING = {}     # cwd -> threading.Event: a folder shell for that cwd is being spawned
+                          # by some open_pty() right now and is not in PTYS yet. Guarded by _LOCK;
+                          # set + removed by the spawner on every exit. See open_pty()'s
+                          # find-or-spawn block for the race this closes.
 
 FG_CACHE_TTL = 5          # seconds a resolved pgid -> comm mapping is trusted before the next
                           # `ps` fork -- see `_foreground_is_claude()`'s docstring for why this is
@@ -1421,6 +1447,41 @@ class Pty:
                                     # no-ops on a done pty, so rc stays 1 and looks like the CLI
                                     # refusing). Write-once, never cleared: a closed pty is never
                                     # reopened, only replaced. See close_pty().
+        self.folder = False        # THE folder terminal for `cwd`: one login shell per directory,
+                                    # shared by every open against that directory (see open_pty()'s
+                                    # "Folder terminal" section). `mode` stays "cwd" for its whole
+                                    # life -- a resume/new does not respawn it, it is TYPED into it
+                                    # as a foreground job, and `fg` below says which one is running.
+        self.overflow = False      # a DEDICATED pty opened because the folder shell was busy
+                                    # (open_pty()'s fallback). Lives exactly as long as its child:
+                                    # `_reap()` drops it with no linger and close_pty() deletes it
+                                    # from PTYS in the same request, so the manage list is back to
+                                    # one row per folder the moment it is finished with.
+        self.fg = None             # folder ptys only: what THIS APP typed into the shell and
+                                    # believes is its foreground job -- `{"session": sid or "",
+                                    # "mode": "resume"|"new", "started": time.time()}` -- or None
+                                    # when the shell is (believed) idle at its prompt. A job the
+                                    # user typed themselves is NOT here (it is still busy by
+                                    # `_fg_pgid()`, which is the kernel's answer and the one every
+                                    # decision uses; this is the label). Cleared by `_refresh_fg()`
+                                    # once a job has been seen and the prompt is back. Guarded by
+                                    # `_LOCK` like every other PTYS-visible field.
+        self.fg_seen_child = False # folder ptys only: `_refresh_fg()` has observed a foreground
+                                    # pgrp OTHER than the shell's since `fg` was last set/cleared --
+                                    # the latch that turns "prompt is back" into "the job EXITED"
+                                    # rather than "the job has not started yet".
+        self.fg_pending = False    # folder ptys only: `fg` is CLAIMED but the line has not been
+                                    # typed yet -- the window between open_pty()'s claim under
+                                    # `_LOCK` and `_inject_argv()`'s Enter, up to 16s of UNLOCKED
+                                    # waiting for quiet and for the prompt. While it is set nothing
+                                    # `_refresh_fg()` sees counts: a foreground group then is the
+                                    # shell's own startup job (`pyenv rehash` from .zshrc), not the
+                                    # claimed one, and latching it made the next prompt sighting
+                                    # clear the claim BEFORE Claude was ever typed. Set with the
+                                    # claim, cleared by `_inject_argv()` on every exit.
+        self.shell_cmd = ""        # folder ptys only: the login shell's own argv string, so `cmd`
+                                    # (which follows the running job while one is typed in) can be
+                                    # put back when the prompt returns.
         self.notice = None         # human-readable warning set by _resume_backstop on the
                                     # missing-transcript case; same late-availability caveat
         self.notices = collections.deque(maxlen=NOTICE_QUEUE_MAX)   # ordered {"seq","text"}
@@ -1470,8 +1531,26 @@ class Pty:
         thread/process, a watcher -- survives a bare `kill` and keeps running after the PTY is
         marked dead. See term_run.Job.kill's docstring for the fuller account and
         TestProcessGroupKill below for the reproduction this guards against.
+
+        A FOLDER pty's shell has job control, which puts every foreground job -- the `claude`
+        this app typed into it -- in its OWN process group. Killing the shell's group alone
+        therefore orphans the session's Claude (the kernel's SIGHUP to the foreground group is
+        ignorable, and a TUI ignores it), so the foreground group is killed FIRST, here, on the
+        one kill path every caller shares (close_pty, the idle reap, test teardown) rather than
+        only in close_pty. `close_pty()` is what then PROVES both are gone.
         """
         if self.pid > 0 and not self.done:
+            if self.folder:
+                # `fg > 0` is load-bearing, not hygiene: once the shell (the session leader) is
+                # dead the tty has NO foreground group and tcgetpgrp reports 0 -- and killpg(0)
+                # is "my own process group", i.e. this server. Measured, not hypothetical: a
+                # second kill() on a not-yet-reaped folder pty took the test runner down with it.
+                try:
+                    fg = os.tcgetpgrp(self.fd)
+                    if fg > 0 and fg != self.pid:
+                        os.killpg(fg, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
             try:
                 os.killpg(os.getpgid(self.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
@@ -1636,7 +1715,140 @@ def _live_count():
     return sum(1 for p in PTYS.values() if not p.done)
 
 
-_MODE_SUFFIX = {"cwd": "-terminal", "new": "-new", "resume": "-resume"}
+# --------------------------------------------------------------------------- folder terminal
+# One login shell per directory, shared by every session in it. A `resume`/`new` open no longer
+# execs `claude` in a pty of its own; it is TYPED into that shell as a foreground job, and when
+# Claude exits the shell is back at its prompt -- the "original state" -- ready for the next one.
+# The kernel already keeps the one fact everything below turns on: an interactive login shell has
+# job control, so each foreground job runs in its OWN process group and `tcgetpgrp(master)` names
+# it. Idle therefore means "the foreground group IS the shell's", with no `ps`, no parsing and no
+# guessing -- one syscall per question, the same one `_foreground_is_claude()` already relies on.
+# ponytail: assumes a job-control shell (bash/zsh/fish -- every login shell macOS ships). Under a
+# shell without job control (`sh`, `dash`) the foreground group never changes, every job looks
+# idle, and a second open would type into the running program. Not guarded: $SHELL is the user's
+# own choice and a non-job-control login shell is not one anybody sets.
+
+def _fg_pgid(pt):
+    """The pty's foreground process group, or the shell's own pid (== "idle") when the pty is
+    dead/closed and the question has no answer -- a finished folder shell has nothing in its
+    foreground, and callers must never mistake an OSError for "busy". The same normalisation
+    covers a tty with NO foreground group at all (the shell is dead but not yet reaped, and
+    tcgetpgrp reports 0): every caller compares the result against `pt.pid` or signals it, and
+    0 must never reach `killpg` -- see `Pty.kill()` for the measured consequence."""
+    try:
+        fg = os.tcgetpgrp(pt.fd)
+    except OSError:
+        return pt.pid
+    return fg if fg > 0 else pt.pid
+
+
+def _refresh_fg(pt):
+    """Reconcile `pt.fg` (what this app believes is running in a folder shell) with what the
+    kernel says is in the foreground. Cheap on purpose -- one syscall, no `ps` -- because the
+    list poll calls it for every folder pty every ~2s. Call under `_LOCK`, like every other
+    mutation of a PTYS-visible field; the decisions built on the result (open_pty's idle check,
+    close_pty's busy check) are check-then-act sequences that need the same critical section.
+
+    A foreground group other than the shell's latches `fg_seen_child`; the prompt coming BACK
+    after that latch is the job exiting, so the label is cleared and `cmd` reverts to the shell's
+    own. The prompt with no job ever seen is the honest gap between a claim and the shell forking
+    the typed command -- left alone, until `FG_PENDING_GRACE` says it has been too long (see that
+    constant for the two cases it exists for).
+
+    A claim that is still PENDING (`fg_pending`: claimed, not yet typed) is not reconciled at
+    all -- neither latched nor cleared. Whatever holds the foreground in that window is by
+    definition not the claimed job (it has not been typed), and the latch it would set is what
+    turned the prompt's return into "the job exited" before the job existed: `fg` went None
+    under a running Claude, a same-session re-open then failed to peek and opened a duplicate
+    `--resume`, and close_pty's 409 carried `fg: null`."""
+    if pt.fg_pending:
+        return
+    fg = _fg_pgid(pt)
+    if fg != pt.pid:
+        pt.fg_seen_child = True
+        return
+    if pt.fg_seen_child or (pt.fg is not None
+                            and time.time() - pt.fg.get("started", 0) > FG_PENDING_GRACE):
+        pt.fg_seen_child = False
+        pt.fg = None
+        pt.cmd = pt.shell_cmd or pt.cmd
+
+
+def _folder_pty(cwd):
+    """The live folder shell for `cwd`, or None. Call under `_LOCK`. Equal-STRING match, on
+    purpose: `cwd` arrives either verbatim from a session's transcript (`term_gate.session_cwd`)
+    or `expanduser`'d from the picker, and both are what the shell was chdir'd into -- there is
+    no canonical form to normalise to that would not also change where the shell lives.
+    ponytail: `~/foo` and `~/foo/` are two folders here; the picker never emits the second."""
+    for p in PTYS.values():
+        if p.folder and not p.done and not p.closing and p.cwd == cwd:
+            return p
+    return None
+
+
+def _folder_wait_prompt(pt):
+    """Block until the folder shell is back at its prompt (foreground group == the shell), or
+    give up after BACKSTOP_WINDOW. The backstop's folder counterpart of "the refused child has
+    exited": a dedicated pty is simply `done` at that point, a folder pty is idle. False when
+    the pty died or was closed meanwhile -- nothing to type into."""
+    deadline = time.time() + BACKSTOP_WINDOW
+    while time.time() < deadline:
+        if pt.done or pt.closing:
+            return False
+        if _fg_pgid(pt) == pt.pid:
+            return True
+        time.sleep(BACKSTOP_POLL)
+    return False
+
+
+def _inject_argv(pt, argv):
+    """Type `argv` at a folder shell's prompt and press Enter -- the folder counterpart of
+    `_fork_child`: where a dedicated pty execs argv directly, the folder shell runs it as a
+    foreground job. Built from `inject()`'s own primitives (`_wait_for_quiescence`,
+    `_inject_write`, `_bracket_if_needed`, all defined further down) rather than a second typing
+    implementation; `shlex.join` makes the line safe for any argv the resume path can build.
+    Deliberately does NOT resend the CR the way `inject()` does: a shell prompt never eats an
+    Enter, and a second one would run the command twice. Returns (ok, reason) -- `reason` is the
+    human-readable failure the caller surfaces as the response `notice`.
+
+    Quiet is not the same as LISTENING, so the prompt is waited for as well: a fresh `zsh -l`
+    on this machine hands its foreground to a silent `pyenv rehash` ~0.2s in and keeps it there
+    for seconds (longer when several shells start at once and contend for its lock). A line
+    typed then sits in the tty's input queue and runs later -- but `fg` would have been claimed,
+    seen a job (the rehash), and been cleared as "exited" before Claude ever started. Bounded
+    by the same INJECT_MAX_WAIT as the quiescence wait; on expiry the caller falls back to a
+    dedicated pty rather than leaving a line queued behind an unknown job.
+
+    Owns the END of the caller's `fg_pending` window (see that field on `Pty`): the flag is
+    cleared on every exit, and on the typed exit `fg_seen_child` is reset with it in the same
+    critical section, so the only foreground group that can ever latch the claim is one seen
+    AFTER Enter -- the job itself. A failed exit leaves the claim for the caller to release."""
+    typed = False
+    try:
+        if not _wait_for_quiescence(pt):
+            return False, "folder shell never went quiet"
+        deadline = time.time() + INJECT_MAX_WAIT
+        while _fg_pgid(pt) != pt.pid:
+            if pt.done or time.time() >= deadline:
+                return False, "folder shell never returned to its prompt"
+            time.sleep(INJECT_POLL_INTERVAL)
+        if not _inject_write(pt, _bracket_if_needed(shlex.join(argv))):
+            return False, "write failed"
+        time.sleep(INJECT_KEY_GAP)
+        if not _inject_write(pt, b"\r"):
+            return False, "write failed"
+        typed = True
+    finally:
+        with _LOCK:
+            pt.fg_pending = False
+            if typed:
+                pt.fg_seen_child = False
+    pt.cmd = " ".join(argv)
+    pt.touch()
+    return True, ""
+
+
+_MODE_SUFFIX ={"cwd": "-terminal", "new": "-new", "resume": "-resume"}
 """The name suffix each launch mode earns in the terminal list, e.g. a `cwd` open of the
 `ai-tracker` project reads as `ai-tracker-terminal`. The mapping lives HERE, server-side, and
 rides out on every `_live_list()` row as `suffix`, because conventions rule 5 says the server
@@ -1699,6 +1911,16 @@ def resolve_spawned(throttle=5.0):
     the name it has. The guard is narrow on purpose -- only a cwd where a forked pty is actually
     live -- so the ordinary case still renames.
 
+    A FOLDER pty is a `cwd` shell and latches exactly like one for the first session it creates
+    -- but a `new` typed into it (`Pty.fg` with `mode == "new"` and no session yet) is ALSO a
+    candidate, every time, with the probe anchored on the JOB's start (`fg["started"]`) rather
+    than the shell's: the shell may be hours old and have latched long ago, and the question is
+    "which transcript did THIS job create". A hit fills `fg["session"]` (so the row can name the
+    running session) and still latches `spawned` if that was never set. A `resume` typed into
+    it is never a candidate for the same reason a `resume` pty never was -- its id is known --
+    and cannot be mis-latched either way: `newest_session_in_cwd` matches on a session's START,
+    and a resumed transcript started before the job did.
+
     Never raises: a missing/broken provider (the flattened `dist/tracker.py` has no
     `aitracker.providers` package at all) or a failing probe just leaves `spawned` empty, which
     is exactly the pre-existing behaviour.
@@ -1727,14 +1949,20 @@ def resolve_spawned(throttle=5.0):
             if p.forked:
                 forked_cwds.add(p.cwd)   # see the docstring: this directory may hold a fork
                                           # transcript whose id nobody can attribute
-            if (p.mode in ("cwd", "new") and not p.spawned and p.cwd not in forked_cwds
-                    and now - p.spawn_probe >= throttle):
-                cands.append(p)
+            fg = p.fg if p.folder else None
+            if fg is not None and fg.get("session"):
+                claimed.add(fg["session"])
+            # A `new` typed into a folder shell whose transcript is not yet known -- see the
+            # docstring's folder paragraph: probed from the JOB's start, not the shell's.
+            fg_new = fg is not None and fg.get("mode") == "new" and not fg.get("session")
+            if (((p.mode in ("cwd", "new") and not p.spawned) or fg_new)
+                    and p.cwd not in forked_cwds and now - p.spawn_probe >= throttle):
+                cands.append((p, fg["started"] if fg_new else p.started))
         # A forked pty later in the iteration cannot un-select a candidate already appended above
         # (PTYS is a dict, so the order is arbitrary), so the filter is applied once more here,
         # against the COMPLETE set -- still inside the same critical section, still no I/O.
-        cands = [p for p in cands if p.cwd not in forked_cwds]
-        for p in cands:
+        cands = [(p, after) for p, after in cands if p.cwd not in forked_cwds]
+        for p, _ in cands:
             p.spawn_probe = now     # reserve, under the lock, before any I/O below
     # ---- _LOCK IS RELEASED FROM HERE DOWN: filesystem work only, until the claim block below
     # ---- re-acquires it. No _live_list, and no acquire that is NESTED inside another.
@@ -1750,9 +1978,9 @@ def resolve_spawned(throttle=5.0):
     except Exception:
         return
     exclude = tuple(claimed)
-    for p in cands:
+    for p, after in cands:
         try:
-            sid = _claude.newest_session_in_cwd(p.cwd, p.started, exclude=exclude)
+            sid = _claude.newest_session_in_cwd(p.cwd, after, exclude=exclude)
         except Exception:
             sid = ""
         if not sid:
@@ -1765,11 +1993,15 @@ def resolve_spawned(throttle=5.0):
         # both questions are asked again HERE, against live PTYS, in the same critical section
         # that does the store -- which is what makes the claim atomic rather than check-then-act.
         with _LOCK:
-            taken = p.spawned or any(
+            taken = any(
                 (q.session == sid or q.spawned == sid) or (q.forked and q.cwd == p.cwd)
                 for q in PTYS.values() if not q.done)
             if not taken:
-                p.spawned = sid
+                if not p.spawned:
+                    p.spawned = sid    # the first-session latch, exactly as before
+                fg = p.fg if p.folder else None
+                if fg is not None and fg.get("mode") == "new" and not fg.get("session"):
+                    fg["session"] = sid    # the running job now has a name (folder ptys only)
         # Claimed either way -- by us, or by whoever won the race -- so it must not be re-offered
         # to a later candidate sharing this cwd.
         claimed.add(sid)
@@ -1796,19 +2028,26 @@ def _live_list():
     when a session is resolved -- how the terminal was opened doesn't change just because we
     finally learned what it created -- and it is a plain lookup with a `""` default so an
     unrecognised or empty mode still yields a key, never a missing one (conventions rule 5: the
-    label is the server's to decide, the client's only to render)."""
+    label is the server's to decide, the client's only to render).
+
+    `folder`/`overflow`/`fg` are the folder-terminal fields (see the "folder terminal" section
+    above): `fg` is the label dict or null, so a row can say "running <session>" and a close can
+    warn before killing it. Callers refresh `fg` (`_refresh_fg`) before building the list --
+    this only reports."""
     return [{"tty": p.id, "cmd": p.cmd, "cwd": p.cwd, "started": p.started,
              "session": p.spawned or p.session, "mode": p.mode,
-             "suffix": _MODE_SUFFIX.get(p.mode, ""), "forked": p.forked}
+             "suffix": _MODE_SUFFIX.get(p.mode, ""), "forked": p.forked,
+             "folder": p.folder, "overflow": p.overflow, "fg": p.fg}
             for p in sorted(PTYS.values(), key=lambda p: p.started) if not p.done]
 
 
 def _reap():
     """Drop finished PTYs older than `_REAP_LINGER` so PTYS cannot grow without bound. Called from
     EVERY route, not just `open_pty()` -- see term_run._reap_old's docstring for why an
-    open-once-only sweep leaves a pinned record for the life of the process."""
+    open-once-only sweep leaves a pinned record for the life of the process. An overflow pty
+    gets no linger at all -- see `_REAP_LINGER`'s own comment."""
     cut = time.time() - _REAP_LINGER
-    for tid in [t.id for t in PTYS.values() if t.done and t.ended < cut]:
+    for tid in [t.id for t in PTYS.values() if t.done and (t.overflow or t.ended < cut)]:
         PTYS.pop(tid, None)
 
 
@@ -1972,12 +2211,70 @@ def _feed_note(pt, text):
         pt.add_notice(text)
 
 
+def _folder_retype(pt, sid, argv):
+    """The folder-pty half of both retries below: instead of `_fork_child`-ing a replacement
+    child into the pty (a pid swap -- there is no pid to swap in a shared shell, and a second
+    `claude` forked beside the shell would fight it for the tty), wait for the refused `claude`
+    to hand the prompt back, re-claim `fg` for this retry and TYPE `argv` at that prompt, exactly
+    as open_pty() typed the original. Same `_LOCK` mutual exclusion against `close_pty` as the
+    swap it replaces: `closing` is read and the claim written in one critical section, so a ✕
+    that lands first wins and nothing is typed into a shell that is being killed (a ✕ landing
+    after the claim kills the shell under the write, which then simply fails). The claim is
+    made PENDING (`fg_pending`, the same discipline as open_pty's claim) so `_refresh_fg()`
+    leaves it alone until `_inject_argv` has typed the line and reset `fg_seen_child` itself.
+    True once the line has been typed; False when there was nothing to type into (dead/closed
+    pty, prompt never came back, write failed).
+
+    The same critical section also refuses to type OVER another session's claim: the prompt
+    can be showing because `_refresh_fg()` cleared this retry's own `fg` when the refused
+    `claude` exited and a NEW open has since claimed the shell for a different session (or a
+    `new`) and is still in its pending window. Re-claiming there would type this retry into
+    the line the other open is about to type -- two jobs queued at one prompt. That refusal
+    is surfaced as a notice (the pane belongs to the other session now, so nothing is fed
+    into its screen) and reported False like every other "nothing to type into"."""
+    if not _folder_wait_prompt(pt):
+        print("[ai-tracker] terminal %s: folder shell never returned to its prompt -- "
+              "retry abandoned" % pt.id)
+        return False
+    with _LOCK:
+        abandoned = pt.closing
+        other = pt.fg if pt.fg is not None and pt.fg.get("session") != sid else None
+        if not abandoned and other is None:
+            pt.fg = {"session": sid, "mode": "resume", "started": time.time()}
+            pt.fg_seen_child = False
+            pt.fg_pending = True
+    if abandoned:
+        print("[ai-tracker] terminal %s: retry abandoned -- closed while waiting for the "
+              "folder shell" % pt.id)
+        return False
+    if other is not None:
+        what = "%s %s" % (other.get("mode") or "job", other.get("session") or "session")
+        print("[ai-tracker] terminal %s: retry abandoned -- the folder shell was claimed for "
+              "%s meanwhile" % (pt.id, what))
+        with pt.lock:
+            pt.add_notice("[ai-tracker] note: the retry for session %s was abandoned -- this "
+                          "folder terminal is now running %s" % (sid, what))
+        return False
+    ok, why = _inject_argv(pt, argv)
+    if not ok:
+        print("[ai-tracker] terminal %s: could not type the retry into the folder shell (%s)"
+              % (pt.id, why))
+        with _LOCK:
+            pt.fg = None
+        return False
+    return True
+
+
 def _retry_with_fork(pt, sid, cols, rows):
     """The one-shot retry itself: fork a NEW child with --fork-session (reusing term_gate.
     resume_argv's own argv-building rather than re-deriving `["claude", "--resume", sid]`) and
     swap it into THIS SAME `Pty` -- same tty id the client already holds, fresh `Screen`, a new
     `_reader` thread. Called at most once per `_resume_backstop` run (that caller returns
-    immediately after this), so this itself never loops."""
+    immediately after this), so this itself never loops.
+
+    On a FOLDER pty nothing is forked: the retry is typed into the shared shell instead
+    (`_folder_retype`), the same reader keeps reading, and everything else -- the pre-exec
+    snapshot, `forked`, `record_fork`, the note, the `starting` clear -- is unchanged."""
     argv = term_gate.resume_argv(sid)
     if "--fork-session" not in argv:
         argv.append("--fork-session")
@@ -2010,6 +2307,27 @@ def _retry_with_fork(pt, sid, cols, rows):
         # unresolved (and is retried, then abandoned) rather than silently swallowing
         # the child forever.
         fork_snapshot = {"parent_uuids": [], "parent_dir": "", "pre_existing": None, "parent_ct": None}
+    if pt.folder:
+        # Typed, not forked -- see the docstring. The snapshot above was still captured BEFORE
+        # the line was typed, which is the ordering record_fork() depends on. `forked` stays set
+        # for the life of the folder pty even after this child exits (it is never cleared for a
+        # dedicated pty either): resolve_spawned()'s fork-transcript guard hangs off it, and a
+        # wrong name on a row is worse than a stale ⑂ chip.
+        # ponytail: the chip outlives the fork it describes on a folder row.
+        if not _folder_retype(pt, sid, argv):
+            return
+        with _LOCK:
+            pt.forked = True
+        try:
+            store.record_fork(sid, pt.cwd, time.time(), fork_snapshot)
+        except Exception as exc:
+            print("[ai-tracker] terminal %s: record_fork failed for session %s: %r" % (pt.id, sid, exc))
+        _feed_note(pt, "[ai-tracker] note: the resume was refused as a running background agent; "
+                       "retried automatically with --fork-session -- this is now a COPY under a "
+                       "new session id, not the live agent")
+        with pt.lock:
+            pt.starting = False
+        return
     pid, fd = _fork_child(pt.cwd, argv, cols, rows)
     screen = Screen(cols=cols, rows=rows)     # allocate before the lock; it touches nothing shared
     # MUTUAL EXCLUSION, not another re-check. `close_pty` and this swap are two check-then-act
@@ -2123,6 +2441,18 @@ def _retry_with_attach(pt, sid, target, cols, rows):
         return False
     print("[ai-tracker] terminal %s: resume refusal backstop fired for session %s -- "
           "retrying with `claude attach %s`" % (pt.id, sid, target))
+    if pt.folder:
+        # Typed into the shared shell, not forked -- see `_folder_retype` and `_retry_with_fork`'s
+        # folder branch. The three "does NOT do" items above hold here verbatim, and so does the
+        # closing comment's rule: no `pt.starting = False` -- the caller keeps watching. A
+        # `closing` seen inside `_folder_retype` returns False here, but the caller's own
+        # `not pt.closing` guard on its fork fallback makes that the same "nothing resurrected"
+        # outcome as the dedicated path's abandoned-True.
+        if not _folder_retype(pt, sid, argv):
+            return False
+        _feed_note(pt, "[ai-tracker] note: this session was already running in the background -- "
+                       "attached to the live session with `claude attach %s`" % target)
+        return True
     try:
         pid, fd = _fork_child(pt.cwd, argv, cols, rows)
     except Exception as exc:
@@ -2256,6 +2586,14 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
                             # this flag, not the matcher, is what makes the retry one-shot). The
                             # fork retry is one-shot by construction: every path that reaches it
                             # returns immediately after.
+    child_seen = False      # FOLDER ptys only: this watch has seen the shell hand its foreground
+                            # to a job. A folder pty is never `done` when the typed `claude`
+                            # exits -- the shell is -- so "the child exited" is instead "a job was
+                            # seen, and the prompt is back" (`gone`, below). Reset alongside the
+                            # other watch state whenever a retry types a NEW job, and kept here
+                            # rather than read off `pt.fg_seen_child`, which `_refresh_fg()`
+                            # clears the moment IT notices the prompt -- possibly before this
+                            # loop's next tick.
     try:
         while True:
             now = time.time()
@@ -2266,6 +2604,25 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
                 del buf[:-BACKSTOP_SCAN_BYTES]   # keep a bounded tail; see BACKSTOP_SCAN_BYTES
             except queue.Empty:
                 pass
+            if pt.folder:
+                at_prompt = _fg_pgid(pt) == pt.pid
+                if not at_prompt and not child_seen:
+                    # The job has just started. Everything scanned so far was the SHELL -- the
+                    # echo of the typed line, a prompt redraw -- and none of it is the child's
+                    # output the settle below must anchor on, so the scan starts over here.
+                    child_seen = True
+                    del buf[:]
+                    first_output_at = None
+                gone = pt.done or (child_seen and at_prompt)
+            else:
+                gone = pt.done
+            # `died` is the "exited AND it was a failure" half of every retry trigger below. A
+            # dedicated pty has an rc to ask and two "did WE kill it" guards (see the refusal
+            # branch's comment); a folder pty's job has no rc this side of the shell, so the
+            # refusal marker plus the prompt coming back IS the verdict, and only `closing`
+            # (the user's ✕, the one guard that is intent rather than a proxy) still applies.
+            died = gone and not pt.closing and (
+                pt.folder or (pt.rc not in (0, None) and pt.rc != -signal.SIGKILL))
             text = bytes(buf)
             # Anchor the settle on the first PRINTABLE output, not the first bytes. A real
             # `claude --resume` writes a terminal-init escape burst
@@ -2297,7 +2654,7 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
             # arriving by a second route. From here the `finally` owns the flag.
             if (pt.starting and not attach_tried and first_output_at is not None
                     and now - first_output_at >= BACKSTOP_SETTLE
-                    and not pt.done and not term_gate.looks_like_bg_refusal(text)):
+                    and not gone and not term_gate.looks_like_bg_refusal(text)):
                 with pt.lock:
                     pt.starting = False
             if not notice_fired and term_gate.looks_like_missing_transcript(text):
@@ -2307,11 +2664,10 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
                 _feed_note(pt, "[ai-tracker] note: " + pt.notice)
                 print("[ai-tracker] terminal %s: missing-transcript notice fired for session %s"
                       % (pt.id, sid))
-            if (not already_forked and not attach_tried and pt.done and pt.rc not in (0, None)
-                    and not pt.closing and pt.rc != -signal.SIGKILL
+            if (not already_forked and not attach_tried and died
                     and term_gate.looks_like_bg_refusal(text)):
-                # Two guards, because they catch different actors, and the intent one is the
-                # load-bearing half:
+                # `died` folds in two guards, because they catch different actors, and the intent
+                # one is the load-bearing half:
                 #   `pt.closing` -- the user clicked ✕ to free a capacity slot. This is INTENT,
                 #     and it holds whether or not the kill did anything: `Pty.kill()` no-ops on an
                 #     already-`done` pty, so a close arriving just after the child's own non-zero
@@ -2361,11 +2717,11 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
                     grace_until = None
                     deadline = time.time() + BACKSTOP_WINDOW
                     attach_settle_at = time.time() + ATTACH_SETTLE
+                    child_seen = False     # folder: the attach job has not started yet
                     continue
                 _retry_with_fork(pt, sid, cols, rows)
                 return
-            if (attach_tried and pt.done and pt.rc not in (0, None)
-                    and not pt.closing and pt.rc != -signal.SIGKILL):
+            if attach_tried and died:
                 # The attach child ITSELF died non-zero: a stale short id, a bg session that
                 # ended in the seconds since the refusal printed, or _fork_child's own exit 127
                 # from a failed execvp. No marker match is required -- an attach that exits
@@ -2379,8 +2735,11 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
                       "%s -- falling back to --fork-session" % (pt.id, pt.rc, sid))
                 _retry_with_fork(pt, sid, cols, rows)
                 return
-            if (attach_settle_at is not None and now >= attach_settle_at and not pt.done):
+            if (attach_settle_at is not None and now >= attach_settle_at and not gone
+                    and (not pt.folder or child_seen)):
                 # THE ATTACH WORKED. The replacement child has been alive for ATTACH_SETTLE --
+                # (on a folder pty: has been SEEN to start -- a typed line the shell never ran
+                # would otherwise look exactly like a child that is quietly alive) --
                 # comfortably past the point a failing one would have died and been caught by the
                 # branch directly above, which is checked FIRST on every tick precisely so a dead
                 # child is never mistaken for a settled one.
@@ -2402,7 +2761,7 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
                 print("[ai-tracker] terminal %s: `claude attach` retry settled for session %s"
                       % (pt.id, sid))
                 return
-            if pt.done and grace_until is None:
+            if gone and grace_until is None:
                 grace_until = time.time() + BACKSTOP_DONE_GRACE
     finally:
         # Fail-open, unconditional: however this function is exiting (window expiry, an
@@ -2492,6 +2851,29 @@ def open_pty(handler, parsed, body):
     be at that point: a synthesized note line fed straight into the terminal's own Screen
     (_feed_note), plus a server-side log line, NOT a follow-up JSON payload -- there is no route
     that re-delivers `forked`/`notice` after the fact today.
+
+    ## Folder terminal: one shell per directory, every mode runs inside it
+
+    Every open FINDS OR SPAWNS the one folder shell for `cwd` (`_folder_pty`, a login shell
+    with `Pty.folder` set, `mode == "cwd"` for life) and answers with its tty; the response
+    gains `reused` (it already existed) and `folder` (this tty IS the shared shell). Then, by
+    mode:
+      * `"cwd"` -- that is the whole answer. A second "terminal" click on the same folder
+        attaches to the same shell instead of spawning a sibling.
+      * `"resume"`/`"new"` with the shell IDLE (foreground group == the shell's, no `fg` claim
+        pending) -- the exact argv a dedicated pty would have exec'd is TYPED at its prompt
+        (`_inject_argv`, after the same quiescence wait `inject()` uses -- this is the one open
+        that blocks the request for ~2s, the shell has to be listening before it is typed at)
+        and `fg` records what is running. When that Claude exits the shell is back at its
+        prompt, idle, in its original state -- nothing to reap, nothing to respawn.
+      * `"resume"` while the shell is already running THAT session -- a peek: the same tty,
+        nothing typed.
+      * otherwise the shell is busy (some other session, a job the user typed, or the typed
+        line could not be delivered) -- this falls through to the pre-folder behaviour: a
+        DEDICATED pty for this one session, flagged `overflow` so it vanishes from the list the
+        moment it is finished with (`_reap`, `close_pty`), and `notice` says why. The user chose
+        this over queueing or refusing ("silently open a dedicated one, then remove it").
+    `reused` is honest, not nominal: False when this very request spawned the folder shell.
     """
     if not term_gate.guard(handler):
         return
@@ -2518,17 +2900,6 @@ def open_pty(handler, parsed, body):
         cwd = os.path.expanduser(raw_cwd.strip())
         if not os.path.isdir(cwd):
             return handler._json({"error": "cwd does not exist or is not a directory"}, 400)
-    with _LOCK:
-        _reap()
-        if _live_count() >= config.MAX_TERMS:
-            # Ride the list of slot-holders on the 429 itself rather than making the client ask a
-            # second route for it: this response IS the only moment that list is wanted, and it is
-            # the same "server-owned policy handed to the client on the response that already
-            # exists" move the `renderer` field below makes. Without it the cap is a dead end --
-            # closeVT() only detaches, so the slots are held by terminals the user cannot see,
-            # cannot name and cannot reclaim short of waiting out IDLE_TIMEOUT.
-            return handler._json({"error": "too many running terminals (max %d)" % config.MAX_TERMS,
-                                  "terminals": _live_list()}, 429)
     cols = _clamp_int(body.get("cols"), MIN_COLS, MAX_COLS, DEFAULT_COLS)
     rows = _clamp_int(body.get("rows"), MIN_ROWS, MAX_ROWS, DEFAULT_ROWS)
     forked = False
@@ -2538,14 +2909,127 @@ def open_pty(handler, parsed, body):
     elif mode == "new":
         argv = ["claude"]
     else:
-        argv = [os.environ.get("SHELL", "/bin/bash"), "-l"]
+        argv = None                          # "cwd" IS the folder shell; nothing to type into it
+    shell_argv = [os.environ.get("SHELL", "/bin/bash"), "-l"]
+    # ---- the folder shell: find it, or spawn it (see the docstring's "Folder terminal" section)
+    # The spawn cannot sit under `_LOCK` (a fork plus a reader thread, same as before), so the
+    # lookup-then-spawn is made one step by a RESERVATION instead: the first opener of a cwd with
+    # no shell registers it in `_FOLDER_SPAWNING` and spawns; a concurrent opener that finds the
+    # cwd reserved waits for that spawn (bounded by FOLDER_SPAWN_WAIT) and looks again, finding
+    # the shell the first one registered. Without it two simultaneous first opens both passed the
+    # lookup, both spawned `folder=True`, and the manage list showed two folder rows for one cwd.
+    reserved = None     # this request's own reservation, when it is the one spawning
+    waited = False
+    while True:
+        with _LOCK:
+            _reap()
+            fp = _folder_pty(cwd)
+            reused = fp is not None
+            pending = None if fp is not None else _FOLDER_SPAWNING.get(cwd)
+            if fp is None and (pending is None or waited):
+                if _live_count() >= config.MAX_TERMS:
+                    # Ride the list of slot-holders on the 429 itself rather than making the client
+                    # ask a second route for it: this response IS the only moment that list is
+                    # wanted, and it is the same "server-owned policy handed to the client on the
+                    # response that already exists" move the `renderer` field below makes. Without
+                    # it the cap is a dead end -- closeVT() only detaches, so the slots are held by
+                    # terminals the user cannot see, cannot name and cannot reclaim short of
+                    # waiting out IDLE_TIMEOUT.
+                    return handler._json({"error": "too many running terminals (max %d)"
+                                          % config.MAX_TERMS, "terminals": _live_list()}, 429)
+                reserved = _FOLDER_SPAWNING[cwd] = threading.Event()
+        if fp is not None or reserved is not None:
+            break
+        # Someone else is spawning this cwd's shell right now: let them finish, then look again.
+        # ponytail: one wait only. A spawn that is STILL in flight after FOLDER_SPAWN_WAIT (or a
+        # third opener that re-reserved after the first spawn failed) is spawned past, which is
+        # the pre-reservation duplicate -- a plain shell nobody reuses -- not a hang or a refusal.
+        pending.wait(FOLDER_SPAWN_WAIT)
+        waited = True
+    if fp is None:
+        try:
+            try:
+                fp = spawn(cwd, shell_argv, cols, rows)
+            except OSError as e:
+                return handler._json({"error": "spawn failed: %s" % e}, 500)
+            fp.session = sid    # the opener's session, as before -- `fg` names what is RUNNING
+            fp.mode = "cwd"
+            fp.folder = True
+            fp.shell_cmd = fp.cmd
+            with _LOCK:
+                PTYS[fp.id] = fp
+        finally:
+            # Released on EVERY exit, the failed spawn included, so a waiter re-runs the lookup
+            # against the truth (the shell, or nothing -- in which case it spawns itself).
+            with _LOCK:
+                if _FOLDER_SPAWNING.get(cwd) is reserved:
+                    del _FOLDER_SPAWNING[cwd]
+            reserved.set()
+    if mode == "cwd":
+        return handler._json({"tty": fp.id, "renderer": config.TERM_RENDERER, "forked": False,
+                              "notice": None, "starting": False, "reused": reused, "folder": True})
+    # ---- resume/new: type it into the shell if idle, peek if it is already this session, else
+    # ---- fall through to a dedicated overflow pty
+    busy_what = None
+    with _LOCK:
+        _refresh_fg(fp)
+        fg = fp.fg
+        if _fg_pgid(fp) == fp.pid and fg is None:
+            # The CLAIM, under the lock that every other open's idle check takes -- so two
+            # simultaneous resumes into one shell cannot both find it idle and both type. It is
+            # PENDING from here until `_inject_argv` below has pressed Enter (see `Pty.fg_pending`):
+            # the list poll's `_refresh_fg()` runs unlocked-to-us for those seconds and must not
+            # mistake the shell's own startup job for this claim's.
+            fp.fg = {"session": sid if mode == "resume" else "", "mode": mode,
+                     "started": time.time()}
+            fp.fg_seen_child = False
+            fp.fg_pending = True
+        elif mode == "resume" and fg is not None and fg.get("session") == sid:
+            busy_what = ""       # peek: it is already running this very session
+        elif fg is not None:
+            busy_what = "running %s %s" % (fg.get("mode") or "job", fg.get("session") or "session")
+        else:
+            busy_what = "a foreground job"    # something the user typed themselves
+    if busy_what == "":
+        return handler._json({"tty": fp.id, "renderer": config.TERM_RENDERER, "forked": fp.forked,
+                              "notice": None, "starting": False, "reused": True, "folder": True})
+    if busy_what is None:
+        starting = mode == "resume"
+        if starting:
+            # Set BEFORE the line is typed -- see the readiness-state section above
+            # `_resume_backstop`; a viewer of the shared shell sees the placeholder rather than a
+            # refusal flash, exactly as a dedicated resume pane would.
+            with fp.lock:
+                fp.starting = True
+        ok, why = _inject_argv(fp, argv)
+        if ok:
+            if starting:
+                starting = _start_backstop(fp, sid, forked, cols, rows)
+            return handler._json({"tty": fp.id, "renderer": config.TERM_RENDERER, "forked": forked,
+                                  "notice": None, "starting": starting, "reused": reused,
+                                  "folder": True})
+        # The shell would not take the line (never went quiet, or the write failed because it
+        # is dying). Release the claim and give the user a dedicated pane instead of a shell
+        # with nothing running in it -- the same fallback as "busy", with a truthful reason.
+        with _LOCK:
+            fp.fg, fp.fg_seen_child, fp.fg_pending = None, False, False
+        with fp.lock:
+            fp.starting = False
+        busy_what = why
+    # ---- overflow: the pre-folder behaviour, verbatim, plus the `overflow` flag and a notice
+    with _LOCK:
+        _reap()
+        if _live_count() >= config.MAX_TERMS:
+            return handler._json({"error": "too many running terminals (max %d)" % config.MAX_TERMS,
+                                  "terminals": _live_list()}, 429)
     try:
         pt = spawn(cwd, argv, cols, rows)
     except OSError as e:
         return handler._json({"error": "spawn failed: %s" % e}, 500)
-    pt.session = sid    # "" for a session-less `cwd` open -- see Pty.__init__'s comment
+    pt.session = sid
     pt.mode = mode
     pt.forked = forked
+    pt.overflow = True
     starting = mode == "resume"
     if starting:
         # Set BEFORE the backstop thread starts (and thus before any viewer can possibly learn
@@ -2557,10 +3041,29 @@ def open_pty(handler, parsed, body):
     with _LOCK:
         PTYS[pt.id] = pt
     if mode == "resume":
-        try:
-            threading.Thread(target=_resume_backstop, args=(pt, sid, forked, cols, rows),
-                              daemon=True).start()
-        except RuntimeError:
+        starting = _start_backstop(pt, sid, forked, cols, rows)
+    # `renderer` is server-owned policy handed to the client, never asked of it (conventions rule
+    # 5) -- see the TRACKER_TERM_RENDERER switch comment above raw_stream() below. Riding along on
+    # the response that already exists (rather than a forced extra round trip) is what lets the
+    # modal open its Terminal/XtermTerminal without waiting on anything else. `starting` rides the
+    # same way: True only for a fresh `mode="resume"` pty (a "cwd"/"new" pty answers False here
+    # and never touches the flag again), so a viewer attaching later already knows to expect
+    # `_screen_stream_body()`'s rows-suppressed frames until the `starting` key in those frames
+    # itself goes False.
+    handler._json({"tty": pt.id, "renderer": config.TERM_RENDERER, "forked": forked,
+                   "notice": "folder terminal busy (%s) — opened a dedicated one" % busy_what,
+                   "starting": starting, "reused": False, "folder": False})
+
+
+def _start_backstop(pt, sid, forked, cols, rows):
+    """Start `_resume_backstop` for a just-launched `mode="resume"` -- dedicated pty or a line
+    typed into a folder shell, one copy of the one failure case. Returns the `starting` value
+    the response should carry: True, or False when the thread could not start."""
+    try:
+        threading.Thread(target=_resume_backstop, args=(pt, sid, forked, cols, rows),
+                          daemon=True).start()
+        return True
+    except RuntimeError:
             # The backstop is the SOLE owner of clearing `starting` (Pty.finish() deliberately
             # does not -- see its comment), so a pty that never gets one would withhold rows
             # forever: a permanently blank terminal, strictly worse than the refusal flash this
@@ -2570,19 +3073,9 @@ def open_pty(handler, parsed, body):
             # shows whatever the CLI prints, which is exactly the old behaviour.
             with pt.lock:
                 pt.starting = False
-            starting = False
             print("[ai-tracker] terminal %s: could not start the resume backstop -- "
                   "readiness disabled for this pane" % pt.id)
-    # `renderer` is server-owned policy handed to the client, never asked of it (conventions rule
-    # 5) -- see the TRACKER_TERM_RENDERER switch comment above raw_stream() below. Riding along on
-    # the response that already exists (rather than a forced extra round trip) is what lets the
-    # modal open its Terminal/XtermTerminal without waiting on anything else. `starting` rides the
-    # same way: True only for a fresh `mode="resume"` pty (a "cwd"/"new" pty answers False here
-    # and never touches the flag again), so a viewer attaching later already knows to expect
-    # `_screen_stream_body()`'s rows-suppressed frames until the `starting` key in those frames
-    # itself goes False.
-    handler._json({"tty": pt.id, "renderer": config.TERM_RENDERER, "forked": forked, "notice": None,
-                   "starting": starting})
+            return False
 
 
 CWD_LIST_CAP = 20
@@ -2688,6 +3181,25 @@ def close_pty(handler, parsed, body):
     `finish()`, which is what actually flips `done` and frees the slot -- so this does NOT touch
     `PTYS` or `done` itself (single-writer discipline, see `_reader`). An already-finished tty is
     a no-op success, not a 404: the caller's intent ("make this slot go away") is satisfied.
+
+    ## Folder terminals: ask first, then PROVE it
+
+    A folder shell with a live foreground job (`_fg_pgid` != the shell -- a session's Claude,
+    or something the user typed) answers **409 `{busy: true, fg, tty}`** and kills nothing
+    unless the body carries `force: true`; the client turns that into "<session> is running in
+    this terminal -- close anyway?". The user asked for two things here and this route is
+    where both land: confirm before killing a running session, and make sure the close really
+    kills BOTH the shell and the session's process. The second is not a given -- a job-control
+    shell puts `claude` in its own process group, so killing the shell's group orphans it --
+    which is why `Pty.kill()` kills the foreground group first, and why this route then WAITS
+    (bounded by CLOSE_CONFIRM_WAIT) for `pt.done` AND for `os.kill(pid, 0)` to raise for every
+    pid it targeted, answering `{ok, closed, killed: [pids], confirmed: bool}`. `confirmed:
+    false` is a real answer ("something survived, or the reaper has not caught up"), never a
+    5xx. Every pty gets the same shape; a dedicated one simply has a one-pid `killed` list.
+
+    An OVERFLOW pty is additionally deleted from PTYS right here, in the same request, so the
+    manage list never shows a finished overflow row (the `_reap` linger is for the FINAL rc of
+    a pty the user may want to read; an overflow pty exists only to be gone).
     """
     if not term_gate.guard(handler):
         return
@@ -2698,18 +3210,49 @@ def close_pty(handler, parsed, body):
         _reap()
         pt = PTYS.get(tid)
         if pt is not None:
+            targets = [pt.pid] if pt.pid > 0 else []
+            if pt.folder and not pt.done:
+                _refresh_fg(pt)
+                fg = _fg_pgid(pt)
+                if fg != pt.pid:
+                    if not body.get("force"):
+                        return handler._json({"busy": True, "fg": pt.fg, "tty": tid}, 409)
+                    targets.append(fg)
             # `closing` is set and `done` is read in ONE critical section, under the same lock
             # `_retry_with_fork` commits its swap beneath -- see the mutual-exclusion comment
             # there. Split them and the backstop can resurrect this pty in the gap: it would see
             # `done` still True, take the no-kill branch below, and get a fresh child anyway.
             pt.closing = True
             was_done = pt.done
+            if was_done and pt.overflow:
+                PTYS.pop(tid, None)
     if pt is None:
         return handler._json({"error": "no such terminal"}, 404)
     if was_done:
         return handler._json({"ok": True, "closed": False})
     pt.kill()                       # the syscall itself needs no lock; the decision did
-    handler._json({"ok": True, "closed": True})
+    deadline = time.time() + CLOSE_CONFIRM_WAIT if targets else 0   # no process, nothing to await
+    confirmed = False
+    while True:
+        alive = []
+        for p in targets:
+            try:
+                os.kill(p, 0)
+                alive.append(p)      # still exists (possibly a zombie awaiting its reap)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                alive.append(p)      # EPERM etc.: exists, just not ours to signal -- not proof
+        if pt.done and not alive:
+            confirmed = True
+            break
+        if time.time() >= deadline:
+            break
+        time.sleep(CLOSE_CONFIRM_POLL)
+    if pt.overflow:
+        with _LOCK:
+            PTYS.pop(tid, None)
+    handler._json({"ok": True, "closed": True, "killed": targets, "confirmed": confirmed})
 
 
 def term_list(handler, parsed):
@@ -2737,6 +3280,9 @@ def term_list(handler, parsed):
     resolve_spawned()
     with _LOCK:
         _reap()
+        for p in PTYS.values():
+            if p.folder and not p.done:
+                _refresh_fg(p)      # one syscall each -- the poll IS the clock for `fg`, too
         terminals = _live_list()
     handler._json({"terminals": terminals, "max": config.MAX_TERMS})
 
@@ -2848,6 +3394,8 @@ def attached(handler, parsed):
     with _LOCK:
         _reap()
         pt = PTYS.get(tid)
+        if pt is not None and pt.folder and not pt.done:
+            _refresh_fg(pt)         # this poll runs per open terminal: keep `fg` honest from it too
     if pt is None or pt.done:
         return handler._json({"error": "no such terminal"}, 404)
     handler._json({"claude_attached": _foreground_is_claude(pt.fd)})

@@ -265,8 +265,23 @@ if _HAS_NODE:
     # harness that has nothing to do with them -- so it gets its own narrow span instead, bounded by
     # the next top-level function declared after it (`closeTty`).
     _peekterm_start = _SRC.index("function peekTerm(t) {")
-    _peekterm_end = _SRC.index("function closeTty(tty) {")
+    _peekterm_end = _SRC.index("function closeTty(tty, force) {")
     _PEEK_TERM_SRC = _SRC[_peekterm_start:_peekterm_end]
+
+    # `mountInto`'s own find-existing-terminal scan (a deliberate SECOND copy of openVT's decision
+    # -- see mountInto's own header comment for why it isn't shared) had NO execution-backed test at
+    # all before this task; only openVT's copy did (`_OPENVT_SRC`/`TestOpenVTPeekBeforeSpawn` above).
+    # `mountInto` is a top-level function, so it's extracted the same "span between two literal
+    # markers" way as `_OPENVT_SRC`: from its own declaration through (but not including) the
+    # `window.ExtVT = { open: openVT, manage: openManager };` line right after it. That exact string
+    # (note the spacing: "open:"/"manage:", not the doc-comment's "open(sid, mode)"/"manage()" near
+    # the top of the file) appears only once in the whole file -- confirmed by hand, the same trap
+    # `_MANAGER_PANEL_SRC`'s own comment above warns about for a naive `.index()` from the top.
+    _mountinto_start = _SRC.index("function mountInto(container, target, opts) {")
+    _mountinto_end = _SRC.index(
+        "window.ExtVT = { open: openVT, manage: openManager };", _mountinto_start
+    )
+    _MOUNTINTO_SRC = _SRC[_mountinto_start:_mountinto_end]
 
 
 _HARNESS_PRELUDE = """
@@ -2665,8 +2680,12 @@ console.log(JSON.stringify({
 _MANAGER_MOCKS = """
 var __fetchCalls = [];
 var __listQueue = [{ terminals: [], max: 8 }];   // each entry: {terminals, max} or {reject:true}
-var __closeQueue = [{}];                          // each entry: {} (200 ok), {status:N}, {reject:true}
+var __closeQueue = [{}];                          // each entry: {} (200 ok), {status:N, body:{...}}, {reject:true}
 var __closeCalls = [];                            // every tty POSTed to /api/term/close, in order
+var __closeBodies = [];                           // the FULL body of every /api/term/close POST, in
+                                                   // order -- added this task so a test can assert
+                                                   // `force:true` rode along on a retry, without
+                                                   // touching __closeCalls's own pinned tty-only shape.
 var __toastCalls = [];
 
 function __nextFrom(queue) { return queue.length > 1 ? queue.shift() : queue[0]; }
@@ -2690,10 +2709,11 @@ function fetch(url, opts) {
     var body = {};
     try { body = JSON.parse(opts.body); } catch (e) {}
     __closeCalls.push(body.tty);
+    __closeBodies.push(body);
     var cspec = __nextFrom(__closeQueue);
     if (cspec.reject) return Promise.reject(new Error("simulated network failure"));
     var cstatus = cspec.status === undefined ? 200 : cspec.status;
-    return Promise.resolve(__makeResponse(cstatus, {}));
+    return Promise.resolve(__makeResponse(cstatus, cspec.body || {}));
   }
   return Promise.resolve(__makeResponse(200, {}));
 }
@@ -2844,6 +2864,14 @@ function findRowKillButtons() {
   });
 }
 function hasWarning() { return mgrBodyEl.querySelectorAll(".vtmgrwarn").length > 0; }
+// Added this task: the per-row busy confirm's Yes/Cancel pair carry plain text labels ("Close
+// anyway"/"Cancel"), same idiom findCancelBtn() already uses for the Close-all footer's own
+// Cancel, just generalised to any label instead of one hardcoded string.
+function findBtnByText(text) {
+  var btns = mgrBodyEl.querySelectorAll(".vtcapx");
+  for (var i = 0; i < btns.length; i++) { if (btns[i].textContent === text) return btns[i]; }
+  return null;
+}
 """
 
 
@@ -3056,6 +3084,113 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         self.assertFalse(result["armedAfterRefresh"], "a row kill's refresh must clear the armed flag too")
         self.assertFalse(result["hasWarningAfterRefresh"])
         self.assertTrue(result["closeAllLabelRestored"])
+
+    # ===== busy-close confirm (this task) ==========================================================
+    # Server contract: POST /api/term/close may answer 409 {busy:true, fg} when the folder terminal
+    # being closed has something running in its foreground -- closeOneFromManager must arm a
+    # per-row confirm (mgrConfirmTty/_armBusyConfirm) instead of a flat failure toast, and act on
+    # whatever the user decides.
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_busy_close_then_confirm_retries_the_same_tty_with_force(self):
+        """Confirming ("Close anyway") must re-POST the SAME tty with {force:true}. Reverting
+        _armBusyConfirm's wiring, or the `closeTty(t.tty, true)` retry in closeOneFromManager,
+        makes this go red: the second close either never happens or never carries force:true."""
+        script = self._script("""
+async function main() {
+  __listQueue = [{ terminals: [makeTerm("t1")], max: 8 }];
+  __closeQueue = [{ status: 409, body: { busy: true, fg: { session: "sess1" } } }, {}];
+  openManager();
+  await __flush();
+
+  findRowKillButtons()[0].onclick();   // closeOneFromManager(t1) -> 409 -> arms the row confirm
+  await __flush(6);
+
+  var confirmBtn = findBtnByText("Close anyway");
+  var hadConfirm = !!confirmBtn;
+  if (confirmBtn) confirmBtn.onclick();
+  await __flush(6);
+  __runTimers();
+  await __flush(6);
+
+  console.log(JSON.stringify({
+    hadConfirm: hadConfirm,
+    closeCalls: __closeCalls,
+    closeBodies: __closeBodies,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertTrue(result["hadConfirm"], "a 409 busy close must arm a per-row confirm")
+        self.assertEqual(result["closeCalls"], ["t1", "t1"], "confirming must retry the SAME tty")
+        self.assertTrue(result["closeBodies"][1].get("force") is True,
+                         "the retry must carry force:true")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_busy_close_then_cancel_sends_no_second_request(self):
+        """The mirror property: declining the confirm must leave the terminal running -- no retry,
+        no second POST /api/term/close at all."""
+        script = self._script("""
+async function main() {
+  __listQueue = [{ terminals: [makeTerm("t1")], max: 8 }];
+  __closeQueue = [{ status: 409, body: { busy: true, fg: { session: "sess1" } } }];
+  openManager();
+  await __flush();
+
+  findRowKillButtons()[0].onclick();
+  await __flush(6);
+
+  var cancelBtn = findBtnByText("Cancel");
+  var hadCancel = !!cancelBtn;
+  if (cancelBtn) cancelBtn.onclick();
+  await __flush(6);
+
+  console.log(JSON.stringify({
+    hadCancel: hadCancel,
+    closeCalls: __closeCalls,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertTrue(result["hadCancel"], "a 409 busy close must offer a way to decline too")
+        self.assertEqual(result["closeCalls"], ["t1"], "declining must never retry the close")
+
+    # ===== folder-row title (this task) ============================================================
+    # buildTermRow's folder branch (server contract: `folder`/`fg`): identity is the FOLDER, not a
+    # session, and the fg session's title (resolved off the `sessions` global, same as the non-folder
+    # `identity` lookup right above it) rides along as "running <title>"; absent, it reads "shell".
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_folder_row_with_fg_shows_folder_and_running_session_title(self):
+        """Reverting the `if (t.folder)` branch back to the plain identity/cmd path makes this go
+        red -- the label would read the raw tty/cmd instead of the folder name."""
+        script = self._script("""
+var sessions = [{ id: "sess1", title: "My Session" }];
+var row = buildTermRow({
+  tty: "tty-1", cwd: "/Users/x/proj", started: 940, session: "", mode: "cwd",
+  folder: true, fg: { session: "sess1", mode: "resume", started: 900 }
+}, 1000, []);
+console.log(JSON.stringify({ label: row.children[0].textContent, title: row.children[0].title }));
+""")
+        result = _run_node(script)
+        self.assertEqual(result["label"], "proj  ·  running My Session  ·  1m")
+        self.assertIn("tty-1", result["title"])
+        self.assertIn("/Users/x/proj", result["title"])
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_folder_row_without_fg_shows_shell(self):
+        """The idle case: no `fg` on the row -- the shell is just sitting at its prompt."""
+        script = self._script("""
+var sessions = [];
+var row = buildTermRow({
+  tty: "tty-2", cwd: "/Users/x/proj", started: 1000, session: "", mode: "cwd", folder: true
+}, 1000, []);
+console.log(JSON.stringify({ label: row.children[0].textContent }));
+""")
+        result = _run_node(script)
+        self.assertEqual(result["label"], "proj  ·  shell  ·  0m")
 
 
 # ===== Bell flash: one shared helper, two triggers (this task) ==================================
@@ -4026,6 +4161,107 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         self.assertEqual(len(result["ptyCalls"]), 1,
                           "a rejected list check must still fall back to a fresh spawn")
 
+    # ===== folder-terminal dedupe (this task) =====================================================
+    # Server contract: GET /api/term/list rows gain `folder`/`fg`. A "cwd" open now also matches a
+    # live folder shell at this session's own cwd (not just one THIS session opened before), and a
+    # "resume" open also matches a folder shell already running this exact session's
+    # `claude --resume` in its foreground -- see openVT's own comment on why.
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_folder_shell_at_the_same_cwd_is_peeked_for_a_cwd_open(self):
+        """Scenario: no terminal matches {session, mode} directly, but a LIVE folder shell is
+        already open at this session's own working directory (resolved via the `sessions` global,
+        the same way buildTermRow resolves a session's title). Reverting the
+        `t.folder && t.cwd === targetCwd` clause in openVT makes this go red: `ptyCalls` flips from
+        `[]` to a fresh spawn and `windowOpenCalls` drops to `[]`."""
+        script = self._script("""
+var sessions = [{ id: "sess1", cwd: "/Users/x/proj" }];
+async function main() {
+  __listQueue = [{ terminals: [
+    { tty: "tty-folder", session: "", mode: "cwd", folder: true, cwd: "/Users/x/proj" }
+  ] }];
+  openVT("sess1", "cwd");
+  await __flush();
+  console.log(JSON.stringify({ windowOpenCalls: __windowOpenCalls, ptyCalls: __ptyCalls }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(len(result["windowOpenCalls"]), 1,
+                          "a live folder shell at this session's own cwd must be peeked")
+        self.assertIn("tty-folder", result["windowOpenCalls"][0])
+        self.assertEqual(result["ptyCalls"], [],
+                          "no new pty may be spawned when the folder shell is reused")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_folder_shell_at_a_different_cwd_is_not_reused(self):
+        """The mirror property: a folder shell exists, but NOT at this session's own cwd -- it must
+        not be treated as interchangeable just because `folder` is set."""
+        script = self._script("""
+var sessions = [{ id: "sess1", cwd: "/Users/x/proj" }];
+async function main() {
+  __listQueue = [{ terminals: [
+    { tty: "tty-other-folder", session: "", mode: "cwd", folder: true, cwd: "/Users/x/OTHER" }
+  ] }];
+  openVT("sess1", "cwd");
+  await __flush();
+  flushRAF();
+  await __flush();
+  console.log(JSON.stringify({ windowOpenCalls: __windowOpenCalls, ptyCalls: __ptyCalls }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(result["windowOpenCalls"], [])
+        self.assertEqual(len(result["ptyCalls"]), 1,
+                          "a folder shell at a DIFFERENT cwd must fall through to a fresh spawn")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_folder_shell_running_this_sessions_resume_is_peeked(self):
+        """Scenario: a folder shell's `fg` names THIS session as currently running inside it --
+        even though no terminal was ever opened directly for {session: sid, mode: 'resume'}, a
+        "Resume terminal here" click must peek that shell instead of starting a second
+        `claude --resume <sid>` alongside it. Reverting the `t.fg && t.fg.session === sid` clause
+        makes this go red the same way the cwd test above does."""
+        script = self._script("""
+async function main() {
+  __listQueue = [{ terminals: [
+    { tty: "tty-folder", session: "", mode: "cwd", folder: true, cwd: "/x",
+      fg: { session: "sess1", mode: "resume", started: 1 } }
+  ] }];
+  openVT("sess1", "resume");
+  await __flush();
+  console.log(JSON.stringify({ windowOpenCalls: __windowOpenCalls, ptyCalls: __ptyCalls }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(len(result["windowOpenCalls"]), 1,
+                          "a folder shell already running this session's resume must be peeked")
+        self.assertIn("tty-folder", result["windowOpenCalls"][0])
+        self.assertEqual(result["ptyCalls"], [])
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_folder_shell_running_a_different_sessions_resume_is_not_reused(self):
+        """The mirror property: `fg.session` names someone else's session -- must not be peeked."""
+        script = self._script("""
+async function main() {
+  __listQueue = [{ terminals: [
+    { tty: "tty-folder", session: "", mode: "cwd", folder: true, cwd: "/x",
+      fg: { session: "sess-OTHER", mode: "resume", started: 1 } }
+  ] }];
+  openVT("sess1", "resume");
+  await __flush();
+  flushRAF();
+  await __flush();
+  console.log(JSON.stringify({ windowOpenCalls: __windowOpenCalls, ptyCalls: __ptyCalls }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(result["windowOpenCalls"], [])
+        self.assertEqual(len(result["ptyCalls"]), 1)
+
     @unittest.skipUnless(_HAS_NODE, "node not available")
     def test_stale_generation_does_neither_peek_nor_spawn(self):
         """Scenario 7, the generation guard: openVT claims `gen = ++openGen` BEFORE its async list
@@ -4138,6 +4374,216 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         )
         self.assertEqual(result["ptyCalls"], [], "the throw happened before any POST /api/term/pty")
         self.assertEqual(result["windowOpenCalls"], [], "a throw must never fall back to peeking either")
+
+
+# ===== mountInto's own find-existing scan (this task) ============================================
+# openVT's copy of the folder-dedupe scan (t.folder && t.cwd === targetCwd / t.fg && t.fg.session
+# === sid) is pinned above by TestOpenVTPeekBeforeSpawn's folder-terminal tests. mountInto's own
+# inline copy -- self-contained by design, per that function's own header comment -- had nothing
+# proving it at all: no test in this file even mentioned "mountInto" before this task. These tests
+# execute the REAL `mountInto`, extracted verbatim above as `_MOUNTINTO_SRC`, the same way
+# `_OPENVT_SRC` is executed above it, with `resolveRenderer`'s and `finish`'s own dependencies
+# (Terminal/XtermTerminal, document.createElement, fetch, requestAnimationFrame, computeColsRows)
+# stubbed rather than resolveRenderer/finish themselves -- both are closures declared INSIDE
+# mountInto's own extracted body, so there is nothing outside it to override; stubbing what they
+# call is what actually lets the real decision logic run.
+_MOUNTINTO_MOCKS = """
+// ----- fetch: GET /api/term/list answers from __listResponse (set per-test); POST /api/term/pty
+// records the attempted spawn and always REJECTS -- exactly like _OPENVT_MOCKS's own fetch stub,
+// so a "spawns" scenario is provable (the POST was attempted) without needing the success branch
+// (attachRenderer/finish) to run for the freshly-spawned case too.
+var __listResponse = { terminals: [] };
+var __ptyCalls = [];
+var __fetchCalls = [];
+function fetch(url, opts) {
+  __fetchCalls.push(url);
+  if (url === "/api/term/list") {
+    return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve(__listResponse); } });
+  }
+  if (url === "/api/term/pty") {
+    __ptyCalls.push(JSON.parse(opts.body));
+    return Promise.reject(new Error("simulated network failure -- the spawn's success branch is not under test here"));
+  }
+  return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({}); } });
+}
+
+// ----- minimal fake DOM element: just enough for mountInto's own container.appendChild(wrap),
+// wrap.appendChild(probe), wrap.innerHTML = "" (spawn path) -- a slimmed copy of _OPENVT_MOCKS's
+// own __makeEl, plus classList/style.setProperty since mountInto's wrap/container also get those.
+function __makeEl(tag) {
+  var _html = "";
+  var el = {
+    tagName: tag, className: "", parentNode: null,
+    style: { setProperty: function () {} },
+    classList: { toggle: function () {}, add: function () {}, remove: function () {} },
+    children: [],
+    appendChild: function (child) { el.children.push(child); child.parentNode = el; return child; },
+    removeChild: function (child) {
+      var idx = el.children.indexOf(child);
+      if (idx >= 0) el.children.splice(idx, 1);
+      child.parentNode = null;
+    },
+    addEventListener: function () {},
+  };
+  Object.defineProperty(el, "innerHTML", {
+    get: function () { return _html; },
+    set: function (v) { _html = v; el.children = []; },
+  });
+  return el;
+}
+var document = { createElement: function (tag) { return __makeEl(tag); } };
+
+// ----- requestAnimationFrame: manually driven, same "nothing fires until told to" contract as
+// _OPENVT_MOCKS's own __rafQueue/flushRAF -- mountInto's spawn path schedules its probe-then-POST
+// work inside one.
+var __rafQueue = [];
+function requestAnimationFrame(cb) { __rafQueue.push(cb); return __rafQueue.length; }
+function flushRAF() { var q = __rafQueue; __rafQueue = []; q.forEach(function (cb) { cb(); }); }
+
+// computeColsRows is stubbed for the same reason _OPENVT_MOCKS stubs it: it measures a canvas 2D
+// context via getComputedStyle, unrelated to the reuse-vs-spawn decision under test.
+function computeColsRows(pane) { return { cols: 80, rows: 24, cellW: 8, cellH: 16, padX: 0, padY: 0 }; }
+
+// ----- Terminal / XtermTerminal: attachRenderer's `new Cls(wrap, tty, {...})` -- stubbed to record
+// which tty (and which renderer class) it was constructed with, instead of building a real
+// renderer, so "attaches to the existing tty" is provable by inspecting __terminalCtorCalls without
+// a full fake grid/xterm rig. A plain function that RETURNS an object makes `new Cls(...)` resolve
+// to that returned object (ordinary JS constructor-return semantics), so this is a safe fake class,
+// not a hack.
+var __terminalCtorCalls = [];
+function __makeTermInstance(tty) {
+  return {
+    tty: tty,
+    pane: { classList: { toggle: function () {} } },
+    attach: function () {},
+    destroy: function () {},
+  };
+}
+function Terminal(wrap, tty, opts) { __terminalCtorCalls.push({ renderer: "grid", tty: tty }); return __makeTermInstance(tty); }
+function XtermTerminal(wrap, tty, opts) { __terminalCtorCalls.push({ renderer: "xterm", tty: tty }); return __makeTermInstance(tty); }
+
+// Real setTimeout is untouched here (same reasoning as _OPENVT_MOCKS's own __flush), so __flush can
+// hop through it to drain mountInto's multi-`.then` fetch chain.
+function __flush(n) {
+  var p = Promise.resolve();
+  for (var i = 0; i < (n || 8); i++) {
+    p = p.then(function () { return new Promise(function (r) { setTimeout(r, 0); }); });
+  }
+  return p;
+}
+"""
+
+
+class TestMountIntoFolderDedupe(unittest.TestCase):
+    """Executes the REAL `mountInto` straight out of aitracker/web/ext_vt.js (never retyped -- see
+    `_MOUNTINTO_SRC` above) to pin its own copy of the folder-terminal dedupe scan: a mode="cwd"
+    mount must attach to a live folder shell already running at this session's own cwd, a
+    mode="resume" mount must attach to a folder shell whose `fg.session` already names this exact
+    session, and neither clause may fire when it shouldn't -- the opts.renderer passed to every
+    call here skips resolveRenderer's own GET /api/term/renderer fetch (curRenderer is already set),
+    so each script only needs to drive the ONE fetch chain (`/api/term/list`) under test.
+
+    Deliberately does NOT reuse `_HARNESS_PRELUDE`: that string's own `var Terminal = function () {}`
+    (needed by the mouse/motion tests above, which stub `Terminal.prototype.X` methods onto it) is a
+    plain `var` assignment that EXECUTES after `_MOUNTINTO_MOCKS`'s `function Terminal(...)` has
+    already been hoisted -- source order, not hoisting order, decides which wins for two
+    same-named bindings -- so it would silently clobber this class's own Terminal stub back to a
+    no-op returning `undefined`, and `attachRenderer`'s `term.attach()` would then throw on every
+    "attaches" scenario. Confirmed by hand: reusing `_HARNESS_PRELUDE` here does exactly that."""
+
+    def _script(self, body):
+        return "'use strict';\n" + _MOUNTINTO_MOCKS + _MOUNTINTO_SRC + body
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_folder_row_at_the_same_cwd_is_attached_for_a_cwd_mount(self):
+        """Reverting the `mode === "cwd" && targetCwd && t.folder && t.cwd === targetCwd` clause in
+        mountInto's copy of the scan (this test's ONLY difference from the sibling below) makes this
+        go red: `finish` never runs against the existing tty, and a POST /api/term/pty happens
+        instead."""
+        script = self._script("""
+var sessions = [{ id: "sess1", cwd: "/Users/x/proj" }];
+async function main() {
+  __listResponse = { terminals: [
+    { tty: "tty-folder", session: "", mode: "cwd", folder: true, cwd: "/Users/x/proj" }
+  ] };
+  var container = __makeEl("div");
+  var handle = mountInto(container, { session: "sess1", mode: "cwd" }, { renderer: "grid" });
+  await __flush();
+  console.log(JSON.stringify({
+    handleTty: handle.tty,
+    terminalCtorCalls: __terminalCtorCalls,
+    ptyCalls: __ptyCalls,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(result["handleTty"], "tty-folder",
+                          "a live folder shell at this session's own cwd must be attached")
+        self.assertEqual(result["terminalCtorCalls"], [{"renderer": "grid", "tty": "tty-folder"}])
+        self.assertEqual(result["ptyCalls"], [],
+                          "no new pty may be spawned when the folder shell is reused")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_folder_row_running_this_sessions_resume_is_attached(self):
+        """Reverting the `mode === "resume" && t.fg && t.fg.session === sid` clause in mountInto's
+        copy makes this go red the same way the cwd sibling above does."""
+        script = self._script("""
+async function main() {
+  __listResponse = { terminals: [
+    { tty: "tty-folder", session: "", mode: "cwd", folder: true, cwd: "/x",
+      fg: { session: "sess1", mode: "resume", started: 1 } }
+  ] };
+  var container = __makeEl("div");
+  var handle = mountInto(container, { session: "sess1", mode: "resume" }, { renderer: "grid" });
+  await __flush();
+  console.log(JSON.stringify({
+    handleTty: handle.tty,
+    terminalCtorCalls: __terminalCtorCalls,
+    ptyCalls: __ptyCalls,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(result["handleTty"], "tty-folder",
+                          "a folder shell already running this session's resume must be attached")
+        self.assertEqual(result["terminalCtorCalls"], [{"renderer": "grid", "tty": "tty-folder"}])
+        self.assertEqual(result["ptyCalls"], [])
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_folder_row_at_a_different_cwd_falls_through_to_a_fresh_spawn(self):
+        """The mirror property: a folder shell exists, but NOT at this session's own cwd -- it must
+        not be treated as interchangeable just because `folder` is set, and mountInto must fall
+        through to its own spawn path (probe -> rAF -> POST /api/term/pty)."""
+        script = self._script("""
+var sessions = [{ id: "sess1", cwd: "/Users/x/proj" }];
+async function main() {
+  __listResponse = { terminals: [
+    { tty: "tty-other-folder", session: "", mode: "cwd", folder: true, cwd: "/Users/x/OTHER" }
+  ] };
+  var container = __makeEl("div");
+  var handle = mountInto(container, { session: "sess1", mode: "cwd" }, { renderer: "grid" });
+  await __flush();
+  flushRAF();
+  await __flush();
+  console.log(JSON.stringify({
+    handleTty: handle.tty,
+    terminalCtorCalls: __terminalCtorCalls,
+    ptyCalls: __ptyCalls,
+  }));
+}
+main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
+""")
+        result = _run_node(script)
+        self.assertEqual(len(result["ptyCalls"]), 1,
+                          "a folder shell at a DIFFERENT cwd must fall through to a fresh spawn")
+        self.assertEqual(result["ptyCalls"][0]["session"], "sess1")
+        self.assertEqual(result["ptyCalls"][0]["mode"], "cwd")
+        self.assertEqual(result["terminalCtorCalls"], [],
+                          "the spawn's POST is stubbed to reject, so finish()/attachRenderer must "
+                          "never run -- the mismatched folder row must not have been attached")
+        self.assertIsNone(result["handleTty"])
 
 
 if __name__ == "__main__":

@@ -326,6 +326,14 @@
   flex: none;
 }
 .cr .cr-term-statusbar[hidden] { display: none; }
+/* _killCurrent (ext_cr_term.js) appends the same .cr-inline-confirm busy-confirm banner
+ * (ext_cr_dialogs.css) into this bar when the ■ Kill button hits a busy 409 -- the bar is a
+ * two-item nowrap flex row, so the banner needs its own line, and its default red
+ * (--text-failed, tuned for a light surface) is unreadable against this bar's frozen dark
+ * background (see file header), so it gets a frozen literal from the same dark-theme family
+ * instead. */
+.cr .cr-term-statusbar { flex-wrap: wrap; }
+.cr .cr-term-statusbar .cr-inline-confirm { flex-basis: 100%; color: #E8A488; }
 .cr .cr-term-ctxreadout { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cr .cr-term-ctxused { color: #FBFAF7; }
 .cr .cr-term-ctxcum { color: #A89C8B; margin-left: 8px; }

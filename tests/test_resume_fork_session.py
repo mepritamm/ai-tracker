@@ -41,6 +41,7 @@ which is exactly why the badge stays transcript-based while the fork decision co
 """
 import json
 import os
+import shlex
 import tempfile
 import time
 import unittest
@@ -181,6 +182,14 @@ class TestBothCallSitesAgree(_ResumeArgvBase):
         term_vt.PTYS.clear()
         self._session_cwd0 = term_gate.session_cwd
         term_gate.session_cwd = lambda sid: "/tmp"  # bypass the on-disk cwd check; not what's under test
+        # The folder fixture below is built with a made-up pid (44444); tearDown's `pt.kill()`
+        # would `killpg(getpgid(44444))` -- a REAL process group whenever the kernel's pid
+        # counter has landed there (macOS wraps at 99999). Neutered for the whole test, tearDown
+        # included (cleanups run after tearDown) -- the same guard as test_folder_terminal's
+        # `_stub_kill`. Never `pid=0` instead: that is our own group.
+        kill_patcher = mock.patch.object(term_vt.Pty, "kill", autospec=True)
+        kill_patcher.start()
+        self.addCleanup(kill_patcher.stop)
 
     def tearDown(self):
         config.TERMINAL, config.AUTH = self._terminal0, self._auth0
@@ -192,20 +201,46 @@ class TestBothCallSitesAgree(_ResumeArgvBase):
         super().tearDown()
 
     def test_term_vt_pty_argv_matches_term_gate_resume_argv_and_does_not_fork(self):
+        """Post folder-terminal (reports/FOLDER-TERMINAL.md), a resume open no longer spawns a
+        dedicated pty with the resume argv -- it TYPES that argv into the one shared folder shell
+        (see term_vt.open_pty's "Folder terminal" docstring section and _inject_argv). So the seam
+        this test pins moved from spawn()'s argv to the injected text; it must still equal
+        term_gate.resume_argv()'s output with no --fork-session, and spawn() must not be called at
+        all when the folder shell is idle (test_folder_terminal.py's
+        TestFolderResumeInjection.test_resume_reuses_idle_folder_shell_and_injects_the_resume_command
+        is the same assertion against the server directly -- this one additionally proves
+        term_gate.resume_argv is the SAME seam both call sites in this suite share)."""
         _write_session("live-agent", entrypoint="sdk-cli", age_seconds=5)
-        spawned = []
-        original_spawn = term_vt.spawn
-        term_vt.spawn = lambda cwd, argv, cols, rows: spawned.append(argv) or term_vt.Pty(tid="t1")
-        try:
-            with mock.patch.object(term_vt, "_resume_backstop"):
-                h = _FakeHandler()
-                term_vt.open_pty(h, None, {"session": "live-agent", "mode": "resume"})
+        folder_pty = term_vt.Pty(tid="t1", pid=44444, fd=99, cwd="/tmp")
+        folder_pty.folder = True
+        folder_pty.mode = "cwd"
+        folder_pty.fg = None
+        term_vt.PTYS["t1"] = folder_pty
+
+        injected = []
+
+        def _capture(pt, data):
+            injected.append(data)
+            return True
+
+        with mock.patch.object(term_vt, "spawn") as spawn_mock, \
+             mock.patch.object(term_vt.os, "tcgetpgrp", return_value=44444), \
+             mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True), \
+             mock.patch.object(term_vt, "_inject_write", side_effect=_capture), \
+             mock.patch.object(term_vt, "_resume_backstop"):
+            h = _FakeHandler()
+            term_vt.open_pty(h, None, {"session": "live-agent", "mode": "resume"})
             obj, code = h.calls[-1]
-            self.assertEqual(code, 200, obj)
-        finally:
-            term_vt.spawn = original_spawn
-        self.assertEqual(spawned, [term_gate.resume_argv("live-agent")])
-        self.assertNotIn("--fork-session", spawned[0])
+        self.assertEqual(code, 200, obj)
+        self.assertFalse(spawn_mock.called,
+                          "resume against an idle folder shell must attach and type, not spawn")
+        self.assertEqual(obj["tty"], "t1")
+
+        expected_argv = term_gate.resume_argv("live-agent")
+        joined = b"".join(injected)
+        self.assertIn(shlex.join(expected_argv).encode(), joined,
+                       "the injected text must be the resume argv term_gate computed")
+        self.assertNotIn("--fork-session", expected_argv)
         self.assertFalse(obj["forked"])
 
     def test_term_launch_build_script_still_carries_the_fork_fallback(self):
