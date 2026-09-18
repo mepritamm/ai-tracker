@@ -1462,6 +1462,17 @@ class TestBundle(unittest.TestCase):
         sessions = ns["all_sessions"]()         # the shared seam -- must not raise
         self.assertIsInstance(sessions, list)
 
+    def test_bundle_save_json_works(self):
+        # scripts/bundle.py's HEADER dropped store.py's own `import fcntl, ..., uuid` (stripped
+        # as a top-level intra-module import, never re-added) -- _save_json() (used by every
+        # config.json write, including tunnel.py's) raised NameError as soon as it was actually
+        # called, invisible to test_bundle_selfcheck_runs_without_crashing since that path
+        # never calls it. Load the bundle as a plain module and call it for real.
+        ns = runpy.run_path(self.dist, run_name="tracker_bundle_smoke_save_json")
+        p = os.path.join(tempfile.mkdtemp(), "d.json")
+        ns["_save_json"](p, {"a": 1})
+        self.assertTrue(os.path.exists(p))
+
 
 class TestCoverageGaps(unittest.TestCase):
     """High-value gaps across modules: liveness-constant parity, provider isolation,

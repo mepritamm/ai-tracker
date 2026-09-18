@@ -14,7 +14,7 @@ stop:
 	  pid=$$(lsof -nP -iTCP:$$p -sTCP:LISTEN -t 2>/dev/null); \
 	  if [ -n "$$pid" ]; then echo "Stopping :$$p (pid $$pid)"; kill $$pid; fi; \
 	done
-	@pkill -f "cloudflared tunnel --url http://localhost:$(TUNNEL_PORT)" 2>/dev/null && echo "Stopped Cloudflare tunnel" || true
+	@pkill -f "cloudflared tunnel --url http://(localhost|127.0.0.1):$(TUNNEL_PORT)" 2>/dev/null && echo "Stopped Cloudflare tunnel" || true
 
 # public remote access — authed tracker on TUNNEL_PORT + a free Cloudflare quick tunnel; prints the URL.
 # Needs TRACKER_AUTH="user:pass" (the URL is public) and cloudflared (brew install cloudflared).

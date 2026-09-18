@@ -1,7 +1,8 @@
-import json, os, sys, errno, webbrowser, base64, hmac, hashlib, time, traceback
+import json, os, sys, errno, webbrowser, base64, hmac, hashlib, time, traceback, signal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from . import config                       # referenced live (config.AUTH) so tests/env see one source
+from . import tunnel                       # runtime tunnel switch -- see tunnel.py's module docstring
 from .config import LIVE_WINDOW, NARR_PAGE
 from .page import build_page
 from .registry import all_sessions, parse_any, search_all, search_session, drill
@@ -22,22 +23,26 @@ EXTRA_GET = {}    # path -> fn(handler, parsed_url)
 EXTRA_POST = {}   # path -> fn(handler, parsed_url, body)
 
 # --- login gate: a styled login page + a signed-cookie session (routes accept the cookie OR HTTP Basic,
-# so curl -u still works). One credential — config.AUTH (TRACKER_AUTH) — compared in constant time. ---
+# so curl -u still works). TWO credentials now, resolved per request by Handler._cred(): a request
+# that demonstrably arrived through cloudflared (Cf-Connecting-Ip/Cf-Ray -- tunnel.via_tunnel()) is
+# judged against the staged tunnel.cred(); every direct loopback/LAN request still uses config.AUTH
+# (TRACKER_AUTH), exactly as before. Both compared in constant time; _sign/_make_token/_token_ok take
+# the key explicitly (not a hardcoded config.AUTH) so either credential can sign/verify a cookie. ---
 _COOKIE_TTL = 43200  # 12h
 
-def _sign(msg):
-    return hmac.new(config.AUTH.encode(), msg.encode(), hashlib.sha256).hexdigest()
+def _sign(msg, key):
+    return hmac.new(key.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
-def _make_token(ttl=_COOKIE_TTL):
+def _make_token(key, ttl=_COOKIE_TTL):
     exp = str(int(time.time()) + ttl)
-    return exp + "." + _sign(exp)
+    return exp + "." + _sign(exp, key)
 
-def _token_ok(tok):
+def _token_ok(tok, key):
     try:
         exp, sig = tok.split(".", 1)
     except ValueError:
         return False
-    if not hmac.compare_digest(sig, _sign(exp)):   # constant-time — a forged/edited cookie fails
+    if not hmac.compare_digest(sig, _sign(exp, key)):   # constant-time — a forged/edited cookie fails
         return False
     try:
         return int(exp) > int(time.time())          # not expired
@@ -157,14 +162,28 @@ class Handler(BaseHTTPRequestHandler):
                 return v
         return ""
 
+    def _cred(self):
+        """Which credential THIS request is judged against. A request that demonstrably
+        arrived through cloudflared (tunnel.via_tunnel()) is judged against the tunnel's own
+        staged tunnel.cred(); everything else (loopback/LAN, unchanged) uses config.AUTH.
+        A tunnel and TRACKER_AUTH are two DIFFERENT credentials on purpose — see config.py's
+        "Tunnel management" comment."""
+        if tunnel.via_tunnel(self.headers):
+            return tunnel.cred()
+        return config.AUTH
+
     def _authok(self):
         """True if the request may proceed: no auth configured, a valid signed cookie, or valid HTTP
         Basic (so curl -u keeps working). No side effects — the caller renders the response."""
-        cred = config.AUTH
+        cred = self._cred()
         if not cred:
-            return True
+            # A DIRECT request with no TRACKER_AUTH: unchanged "auth disabled" behaviour.
+            # A TUNNEL request with no TUNNEL_USER/TUNNEL_PASS staged: the opposite -- refuse.
+            # start()/autostart() already run ensure_creds() first so this shouldn't normally
+            # be reachable, but a dashboard must never be silently open to the internet.
+            return not tunnel.via_tunnel(self.headers)
         tok = self._cookie_token()
-        if tok and _token_ok(tok):
+        if tok and _token_ok(tok, cred):
             return True
         got = self.headers.get("Authorization", "")
         if got.startswith("Basic "):
@@ -194,15 +213,16 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or "{}")
         except (ValueError, TypeError):
             body = {}
+        cred = self._cred()   # tunnel credential when arriving via cloudflared, else config.AUTH
         creds = (body.get("user") or "") + ":" + (body.get("pass") or "")
-        if not config.AUTH or not hmac.compare_digest(creds, config.AUTH):
+        if not cred or not hmac.compare_digest(creds, cred):
             return self._json({"ok": False}, 401)
         out = b'{"ok":true}'
         try:
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Set-Cookie",
-                             "ai_auth=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d" % (_make_token(), _COOKIE_TTL))
+                             "ai_auth=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d" % (_make_token(cred), _COOKIE_TTL))
             self.send_header("Content-Length", str(len(out)))
             self.end_headers()
             self.wfile.write(out)
@@ -269,10 +289,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json(snap)
         elif p.path == "/api/tunnel":
             # Config dialog's Tunnel section, default read: URL (not sensitive) plus only
-            # WHETHER a user/password are staged -- never the raw values. See config.py's
-            # "Tunnel management" section for the full design rationale.
+            # WHETHER a user/password are staged -- never the raw values -- merged with the
+            # LIVE child-process status (on/pid/started/expires/error/cloudflared/
+            # autostarted) from tunnel.py. Never leaks a raw credential: tunnel.status() has
+            # no such key either. See config.py's "Tunnel management" section and
+            # tunnel.py's module docstring for the full design rationale.
             overrides = _load_json(config.CONFIG_FILE, {})
-            self._json(config.tunnel_public(overrides))
+            self._json({**config.tunnel_public(overrides), **tunnel.status()})
         elif p.path == "/api/tunnel/reveal":
             # The ONE route allowed to return the raw tunnel credential -- reached only by
             # the dialog's explicit "Show" action, already gated by the same _authok() check
@@ -477,6 +500,45 @@ class Handler(BaseHTTPRequestHandler):
                 resp["value"] = coerced
             self._json(resp)
             return
+        if p.path == "/api/tunnel/ctl":
+            # Runtime tunnel switch (the Config dialog's Tunnel toggle/rotate buttons):
+            # start/stop/rotate a cloudflared quick tunnel from THIS already-running
+            # process, no restart needed. See aitracker/tunnel.py's module docstring for the
+            # child-process lifecycle. Reports the SAME merged shape GET /api/tunnel does
+            # (config.tunnel_public() + tunnel.status()) so the dialog can render off either
+            # response uniformly, plus -- ONLY when a credential was just (re)generated --
+            # the one-time user/pass/share_url the browser could otherwise never learn.
+            action = body.get("action")
+            if action not in ("start", "stop", "rotate", "rotate_creds"):
+                self._json({"error": "unknown action"}, 400)
+                return
+            port = self.server.server_address[1]   # the port THIS server actually bound
+            generated = False
+            gen_user = gen_pass = None
+            if action == "start":
+                gen_user, gen_pass, generated = tunnel.ensure_creds()
+                tunnel.start(port, config.BIND_HOST)
+            elif action == "stop":
+                tunnel.stop()
+            elif action == "rotate":
+                # Same generated-creds disclosure as "start": rotate() calls ensure_creds()
+                # internally too, but that call is invisible to this route -- without calling
+                # it here as well, a rotate that happened to be the FIRST thing to ever mint
+                # creds would silently hide the one-time user/pass from the browser.
+                gen_user, gen_pass, generated = tunnel.ensure_creds()
+                tunnel.rotate(port, config.BIND_HOST)
+            elif action == "rotate_creds":
+                gen_user, gen_pass = tunnel.rotate_creds()
+                generated = True
+            overrides = _load_json(config.CONFIG_FILE, {})
+            resp = {**config.tunnel_public(overrides), **tunnel.status()}
+            if generated:
+                resp["user"] = gen_user
+                resp["pass"] = gen_pass
+                resp["share_url"] = config.share_url(resp["url"], gen_user, gen_pass)
+                resp["generated"] = True
+            self._json(resp)
+            return
         if p.path == "/api/pin":
             sid = body.get("session", "")
             pins = load_pins()
@@ -624,11 +686,31 @@ def publish_endpoint(actual):
         if config.AUTH:
             fd = os.open(config.TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as fh:
-                fh.write(_make_token(_LOCAL_TTL))
+                # A local hook always talks to this process directly (never through
+                # cloudflared), so it is always judged against config.AUTH -- pass it
+                # explicitly now that _make_token takes its signing key as an argument.
+                fh.write(_make_token(config.AUTH, _LOCAL_TTL))
         elif os.path.exists(config.TOKEN_FILE):
             os.remove(config.TOKEN_FILE)      # login turned off — don't leave a live credential
     except OSError:
         pass
+
+
+def _on_sigterm(signum, frame):
+    """`make stop` (and any other plain `kill`) sends SIGTERM, and Python runs NO atexit
+    handlers on an unhandled signal -- only on a normal interpreter exit or an explicit
+    sys.exit()/SystemExit. Without this, tunnel.py's `atexit.register(_on_exit)` (which
+    SIGTERMs cloudflared's own process group) never fires and a live tunnel is orphaned,
+    still publicly reachable after the dashboard itself is gone. `raise SystemExit(0)` is
+    what turns this into a normal exit, so the atexit hook still runs on top of this explicit
+    stop() -- belt and braces, and stop() is idempotent either way. `keep_on=True`: this is
+    the SERVER PROCESS exiting, not the user switching the tunnel off, so TUNNEL_ON survives
+    in config.json and the next `make serve` re-mints the tunnel (see tunnel.stop()'s
+    docstring). Module-level (not a closure) so a test can call it directly. SIGINT is left
+    alone: serve_forever() already raises KeyboardInterrupt on it, which is handled the
+    normal way."""
+    tunnel.stop(keep_on=True)
+    raise SystemExit(0)
 
 
 def run(host="127.0.0.1", port=8790, open_browser=True):
@@ -639,9 +721,14 @@ def run(host="127.0.0.1", port=8790, open_browser=True):
     # override needs this explicit apply at real startup to take effect immediately rather
     # than waiting for someone to open the Config dialog first).
     config.apply_overrides(_load_json(config.CONFIG_FILE, {}))
+    signal.signal(signal.SIGTERM, _on_sigterm)
     srv = bind(host, port)
     actual = srv.server_address[1]
     publish_endpoint(actual)
+    tunnel.autostart(actual, host)   # config.json TUNNEL_ON=true from a previous run -> bring it back up
+    if tunnel.status()["on"]:
+        print("Tunnel restored from last run (TUNNEL_ON in config.json) — flip it off in "
+              "Config → Tunnel if you didn't mean that")
     url = f"http://localhost:{actual}"
     if actual != port:
         print(f"Starting AI session tracker on http://localhost:{actual} ({port}-{actual-1} were busy)")

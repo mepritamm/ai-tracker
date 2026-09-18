@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest import mock
 
-from aitracker import config, term_vt
+from aitracker import config, term_vt, tunnel
 from aitracker.config import LIVE_WINDOW
 from aitracker.util import _short_title, _window, _git_branch, push_when
 from aitracker.store import load_flags, save_flags, load_titles, load_tasks, load_notes, save_notes, _save_json
@@ -836,6 +836,20 @@ def _run():
     assert "MAX_TERMS" in config.EDITABLE
     assert "TRACKER_AUTH" not in config.EDITABLE, "TRACKER_AUTH must never be browser-writable"
     assert "NOT_A_REAL_KEY" not in config.EDITABLE, "a non-allowlisted key must never validate"
+    # Same invariant, one level down: TUNNEL_ON (child-process-alive) must never be flippable
+    # through the general-purpose POST /api/tunnel route (config.TUNNEL_EDITABLE) -- only
+    # tunnel.start()/stop()/autostart() may set it, so a client can never fake "on" without
+    # an actual cloudflared child (see tunnel.py's module docstring and config.py's Tunnel
+    # management section).
+    assert "TUNNEL_ON" not in config.TUNNEL_EDITABLE, "TUNNEL_ON must never be browser-writable"
+    # tunnel.via_tunnel() is the one thing that decides which credential (TUNNEL_USER/PASS
+    # vs TRACKER_AUTH) a request is judged against (server.py's Handler._cred()) -- it must
+    # key off cloudflared's own Cf-Connecting-Ip/Cf-Ray headers, never assume "via tunnel" by
+    # default, since that would apply the WRONG credential to a plain loopback/LAN request.
+    assert tunnel.via_tunnel({"Cf-Connecting-Ip": "1.2.3.4"}) is True, \
+        "a request carrying Cf-Connecting-Ip must be recognised as arriving via the tunnel"
+    assert tunnel.via_tunnel({}) is False, \
+        "a request with neither cloudflared header must never be treated as via-tunnel"
 
     # session-LIST `now_line` (a short "what's it doing right now" board-tile phrase) and
     # `model` (its current model id) -- both ride the SAME bounded tail read _tail_scan

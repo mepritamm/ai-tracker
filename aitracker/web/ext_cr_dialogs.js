@@ -288,8 +288,16 @@
     ]);
     function dismiss() { if (dismissed) return; dismissed = true; clearTimeout(timer); el.remove(); }
     var actionBtn = el.querySelector('.cr-btn');
-    if (actionBtn) actionBtn.addEventListener('click', function () { if (opts.onAction) opts.onAction(); dismiss(); });
-    el.querySelector('.cr-toast-x').addEventListener('click', dismiss);
+    if (actionBtn) actionBtn.addEventListener('click', function (e) { e.stopPropagation(); if (opts.onAction) opts.onAction(); dismiss(); });
+    el.querySelector('.cr-toast-x').addEventListener('click', function (e) { e.stopPropagation(); dismiss(); });
+    // opts.onClick — a click anywhere else on the toast body (not the action/dismiss
+    // buttons, which stop propagation above). Used by checkTunnelOnBoot() below to jump
+    // straight to Config's Tunnel tab from the "tunnel restored" toast; generic to any
+    // future caller that wants a clickable toast.
+    if (typeof opts.onClick === 'function') {
+      el.classList.add('cr-toast-clickable');
+      el.addEventListener('click', function () { opts.onClick(); dismiss(); });
+    }
     function arm() { timer = setTimeout(dismiss, opts.duration || 8000); }
     function disarm() { clearTimeout(timer); }
     el.addEventListener('mouseenter', disarm);
@@ -367,6 +375,32 @@
       ctx.on('dialog:open', function (payload) { open((payload && payload.name) || '', payload && payload.data); });
       ctx.on('dialog:close', function () { close(); });
     }
+    checkTunnelOnBoot();
+  }
+
+  // Boot-time "tunnel restored" popup. A tunnel can survive a server restart
+  // (cloudflared child kept running, or reattached) -- GET /api/tunnel's `autostarted`
+  // flag distinguishes that from a tunnel THIS page session just started by flipping the
+  // switch. Shown once per boot per tab (sessionStorage, keyed by the tunnel's own
+  // `started` epoch so a genuinely NEW tunnel after a later restart warns again even in
+  // the same tab). Every storage access is try/caught -- a private window or blocked
+  // site data must not break page load over a nice-to-have popup.
+  function checkTunnelOnBoot() {
+    fetchTunnelPublic(function (t) {
+      if (!t || !t.on || !t.autostarted) return;
+      var key = 'cr-tunnel-warned';
+      var already = null;
+      try { already = sessionStorage.getItem(key); } catch (e) {}
+      if (already === String(t.started)) return;
+      toast({
+        title: 'Tunnel restored — this dashboard is reachable from the internet',
+        meta: t.url || 'connecting…',
+        icon: 'alert', iconClass: 'tn-emo-a',
+        duration: 12000,
+        onClick: function () { open('config', { section: 'Tunnel' }); },
+      });
+      try { sessionStorage.setItem(key, String(t.started)); } catch (e) {}
+    });
   }
 
   function buildChrome(name, title, emo, contextStr, wide, emoCls) {
@@ -959,6 +993,43 @@
       .catch(function (e) { cb(false, { error: String((e && e.message) || e) }); });
   }
 
+  // POST /api/tunnel/ctl {action: 'start'|'stop'|'rotate'|'rotate_creds'} -- the tunnel
+  // switch, "Rotate URL" and "Rotate credentials" all funnel through this one call. The
+  // response is the SAME merged status dict GET /api/tunnel returns (on/url/pid/started/
+  // expires/error/cloudflared/autostarted), plus (rotate_creds always, start when creds
+  // were blank and got auto-generated) user/pass/share_url/generated:true -- callers
+  // assign the response straight onto the local `tunnel` snapshot.
+  function postTunnelCtl(action, cb) {
+    fetch('/api/tunnel/ctl', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: action }),
+    }).then(function (r) { return r.json().then(function (d) { cb(r.ok, d); }); })
+      .catch(function (e) { cb(false, { error: String((e && e.message) || e) }); });
+  }
+
+  // Renders the Tunnel switch row's status text, persistently (no fade-out timer, unlike
+  // showStatus() above -- this reflects the tunnel's actual current state, not a transient
+  // save confirmation). Priority: an explicit error from the last ctl call always wins;
+  // else a missing `cloudflared` binary is surfaced proactively (the toggle stays usable --
+  // the server itself returns the same message once you try); else "connecting…" while
+  // `on` but no `url` yet; else, once a url exists, the local HH:MM `expires` reads until.
+  function paintTunnelStatus(el, t) {
+    t = t || {};
+    var text = '', failed = false;
+    if (t.error) { text = t.error; failed = true; }
+    else if (t.cloudflared === false) { text = 'cloudflared not found — brew install cloudflared'; failed = true; }
+    else if (t.on && !t.url) { text = 'connecting…'; }
+    else if (t.url) {
+      var exp = t.expires ? new Date(t.expires * 1000) : null;
+      text = exp
+        ? ('open until ' + ('0' + exp.getHours()).slice(-2) + ':' + ('0' + exp.getMinutes()).slice(-2))
+        : 'open';
+    }
+    el.textContent = text;
+    el.classList.toggle('is-failed', failed);
+    el.classList.toggle('is-info', !failed && !!text);
+  }
+
   // A visible, honest saved/failed state next to the control it belongs to -- mirrors
   // this file's existing Copy/Copied transient-state pattern (see copyBtn above).
   function statusBadge() {
@@ -1045,15 +1116,60 @@
     var sections = ['Interface', 'Board', 'Terminal', 'Notifications', 'Server', 'Tunnel', 'Data files'];
     var nav = h('div', { class: 'cr-cfg-nav' });
     var body = h('div', { class: 'cr-cfg-body' });
-    var active = 'Interface';
+    // `payload.section` lets a caller open Config straight onto a given tab -- the boot-
+    // time "tunnel restored" toast (see checkTunnelOnBoot()) uses this to land on Tunnel
+    // instead of the default Interface tab. Every other existing caller omits `section`
+    // and gets the unchanged default.
+    var active = (payload && payload.section) || 'Interface';
     // Tunnel section's own state -- local to THIS renderConfig() call, so it starts fresh
-    // every time the dialog opens. `tunnel` is the masked snapshot (GET /api/tunnel);
-    // `tunnelRevealed` is null until "Show" is clicked and is never written back to
-    // anything that outlives this dialog instance -- closing/reopening always starts
-    // masked again, satisfying "the revealed value must not persist across dialog
-    // close/reopen" (the security requirement this feature was built under).
+    // every time the dialog opens. `tunnel` is the masked snapshot (GET /api/tunnel, now
+    // also carrying on/pid/started/expires/error/cloudflared/autostarted -- see
+    // postTunnelCtl's comment); `tunnelRevealed` is null until "Show" is clicked (or a
+    // rotate response asks for a fresh reveal) and is never written back to anything that
+    // outlives this dialog instance -- closing/reopening always starts masked again,
+    // satisfying "the revealed value must not persist across dialog close/reopen" (the
+    // security requirement this feature was built under).
     var tunnel = {};
     var tunnelRevealed = null;
+    // One-shot "Rotated — old logins are signed out" note, shown for exactly the render
+    // right after a rotate_creds round trip lands, then cleared so it doesn't linger on
+    // every later re-render of this section (e.g. the live GET /api/tunnel poll below).
+    var tunnelJustRotated = false;
+
+    // Polls GET /api/tunnel every 1500ms (cap ~40 tries) while a just-started/rotated
+    // tunnel is still connecting (`on` but no `url` yet) -- stops the moment a url lands,
+    // an error is reported, or the tunnel is no longer on. Guards every step on
+    // chrome.panel.isConnected so a closed dialog's stale timer never touches a detached
+    // render or a DOM that isn't there anymore.
+    function pollTunnel(triesLeft) {
+      if (triesLeft <= 0 || !chrome.panel.isConnected) return;
+      setTimeout(function () {
+        if (!chrome.panel.isConnected) return;
+        fetchTunnelPublic(function (t) {
+          if (!t || !chrome.panel.isConnected) return;
+          tunnel = t;
+          if (active === 'Tunnel') renderSection();
+          if (t.on && !t.url && !t.error) pollTunnel(triesLeft - 1);
+        });
+      }, 1500);
+    }
+
+    // The Tunnel switch's onChange -- POST ctl start/stop, adopt the merged status the
+    // response carries, reveal freshly-generated creds if the server minted them, and
+    // (only when now connecting) start the poll loop above.
+    function onTunnelToggle(v) {
+      postTunnelCtl(v ? 'start' : 'stop', function (ok, resp) {
+        if (resp && ('on' in resp)) tunnel = resp;   // only a real status dict replaces state
+        else tunnel.error = (resp && resp.error) || 'request failed';   // an error body must not wipe on/url
+        function paint() { if (active === 'Tunnel') renderSection(); }
+        if (resp && resp.generated) {
+          fetchTunnelReveal(function (rev) { if (rev) tunnelRevealed = rev; paint(); });
+        } else {
+          paint();
+        }
+        if (v && tunnel.on && !tunnel.url && !tunnel.error) pollTunnel(40);
+      });
+    }
 
     // A generic editable row for a server config.json key: renders whatever `ctlFn(value,
     // onCommit)` builds, POSTs on commit, shows an honest Saved/Failed badge, and rolls the
@@ -1225,19 +1341,56 @@
           ', permissions locked to you only) — the share URL below carries it too. Treat both like a password.',
         ]));
 
-        body.appendChild(cfgRow('Tunnel URL', null,
-          'Not discoverable from here — a Cloudflare quick tunnel (`make tunnel`) mints a new address every run. Paste the one it printed.',
-          (function () {
-            var status = statusBadge();
-            var ctl = textFieldCtl(tunnel.url || '', function (v) {
-              postTunnelValue('TUNNEL_URL', v, function (ok, resp) {
-                if (ok) { tunnel.url = resp.value; if (tunnelRevealed) tunnelRevealed = null; showStatus(status, true); renderSection(); }
-                else { showStatus(status, false, (resp && resp.error) || 'request failed'); renderSection(); }
-              });
-            }, { type: 'text' });
-            ctl.classList.add('cr-cfg-textfield-wide');
-            return [ctl, status];
-          })()));
+        // --- The Tunnel switch: the ONE control that starts/stops it. No separate "off"
+        // button by design -- the toggle is authoritative in both directions. Works
+        // identically from a phone/tablet layout and from a remote host: nothing here
+        // reads location.hostname or otherwise special-cases how this page is reached.
+        var tunnelStatusEl = h('span', { class: 'cr-cfg-status cr-tunnel-status' });
+        paintTunnelStatus(tunnelStatusEl, tunnel);
+        var tunnelToggle = toggleCtl(!!tunnel.on, onTunnelToggle);
+        tunnelToggle.setAttribute('aria-label', 'Tunnel');
+        body.appendChild(cfgRow('Tunnel', null,
+          'Starts a Cloudflare quick tunnel from this server (needs `cloudflared`). Auto-closes after 12 h; every start mints a new address.',
+          [tunnelToggle, tunnelStatusEl]));
+
+        // --- Tunnel URL: a live read-only address (+ Copy/Rotate) while the tunnel is up
+        // or coming up; the old editable paste field (the manual `make tunnel` flow still
+        // exists) when it's off.
+        if (tunnel.on || tunnel.url) {
+          var rotateUrlBtn = h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Rotate URL' });
+          rotateUrlBtn.disabled = !tunnel.url;
+          rotateUrlBtn.addEventListener('click', function () {
+            postTunnelCtl('rotate', function (ok, resp) {
+              if (resp && ('on' in resp)) tunnel = resp;   // only a real status dict replaces state
+              else tunnel.error = (resp && resp.error) || 'request failed';   // an error body must not wipe on/url
+              renderSection();
+              if (tunnel.on && !tunnel.url && !tunnel.error) pollTunnel(40);
+            });
+          });
+          var urlCopyBtn = copyBtn(function () { return tunnel.url || ''; });
+          if (!tunnel.url) urlCopyBtn.disabled = true;
+          body.appendChild(cfgRow('Tunnel URL', null,
+            'Public address for this dashboard while the tunnel is on — every "Rotate URL" mints a new one.',
+            h('div', { class: 'cr-tunnel-cmdrow' }, [
+              h('code', { class: 'cr-mono cr-tunnel-cmd' }, [tunnel.url || 'connecting…']),
+              urlCopyBtn,
+              rotateUrlBtn,
+            ])));
+        } else {
+          body.appendChild(cfgRow('Tunnel URL', null,
+            'Not discoverable from here — a Cloudflare quick tunnel (`make tunnel`) mints a new address every run. Paste the one it printed.',
+            (function () {
+              var status = statusBadge();
+              var ctl = textFieldCtl(tunnel.url || '', function (v) {
+                postTunnelValue('TUNNEL_URL', v, function (ok, resp) {
+                  if (ok) { tunnel.url = resp.value; if (tunnelRevealed) tunnelRevealed = null; showStatus(status, true); renderSection(); }
+                  else { showStatus(status, false, (resp && resp.error) || 'request failed'); renderSection(); }
+                });
+              }, { type: 'text' });
+              ctl.classList.add('cr-cfg-textfield-wide');
+              return [ctl, status];
+            })()));
+        }
 
         var shown = !!tunnelRevealed;
         function maskedRow(label, key, sub) {
@@ -1254,7 +1407,10 @@
                 // the restart command / share URL below embed this value -- keep them
                 // in sync with what was just saved, not the pre-edit reveal snapshot.
                 tunnelRevealed.restart_cmd = (resp && resp.restart_cmd) || tunnelRevealed.restart_cmd;
-                showStatus(status, true, 'restart required to apply');
+                // Credentials now apply LIVE to tunnel traffic (no restart needed for
+                // that) -- the stale "restart required to apply" message this used to
+                // show would directly contradict the sub-text below.
+                showStatus(status, true);
                 renderSection();
               } else {
                 showStatus(status, false, (resp && resp.error) || 'request failed');
@@ -1263,8 +1419,8 @@
           }, { type: 'text' });
           return cfgRow(label, null, sub, [ctl, status], true);
         }
-        body.appendChild(maskedRow('Username', 'user', 'Same credential as TRACKER_AUTH — masked until you click Show.'));
-        body.appendChild(maskedRow('Password', 'pass', 'Editing here only stages the value — it takes effect once you restart with the command below.'));
+        body.appendChild(maskedRow('Username', 'user', 'Applies live to traffic arriving through the tunnel — no restart.'));
+        body.appendChild(maskedRow('Password', 'pass', 'Applies live to traffic arriving through the tunnel — no restart.'));
 
         var showBtn = h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: shown ? 'Hide' : 'Show' });
         showBtn.addEventListener('click', function () {
@@ -1275,7 +1431,26 @@
             renderSection();
           });
         });
-        body.appendChild(h('div', { class: 'cr-tunnel-showrow' }, [showBtn]));
+        var rotateCredsBtn = h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Rotate credentials' });
+        rotateCredsBtn.addEventListener('click', function () {
+          postTunnelCtl('rotate_creds', function (ok, resp) {
+            if (resp && ('on' in resp)) tunnel = resp;   // only a real status dict replaces state
+            else tunnel.error = (resp && resp.error) || 'request failed';   // an error body must not wipe on/url
+            // Simplest path to fresh values everywhere they're shown: re-fetch the
+            // reveal (same route "Show" already uses) rather than hand-assembling the
+            // four fields from two different responses.
+            fetchTunnelReveal(function (rev) {
+              if (rev) tunnelRevealed = rev;
+              tunnelJustRotated = true;
+              renderSection();
+            });
+          });
+        });
+        body.appendChild(h('div', { class: 'cr-tunnel-showrow' }, [rotateCredsBtn, showBtn]));
+        if (tunnelJustRotated) {
+          body.appendChild(h('p', { class: 'cr-help-note' }, ['Rotated — old logins are signed out.']));
+          tunnelJustRotated = false; // one-shot: shown for this render only
+        }
 
         // Both blocks below embed the raw credential (the restart command needs it to be
         // useful; the share URL IS it, in userinfo form) -- gated behind the SAME reveal
@@ -1347,7 +1522,7 @@
         h('code', {}, ['config.json']),
         ' and applies immediately — except Port and Host, which only take effect on the next ',
         h('code', {}, ['make serve']),
-        '. The Server tab’s Auth row stays env-only and is never writable from here — the Tunnel tab is the one deliberate exception, since it edits that same credential and always requires a restart to take effect (see its own disclosure line).',
+        '. The Server tab’s Auth row stays env-only and is never writable from here — the Tunnel tab is the one deliberate exception: its username/password apply live to traffic arriving through the tunnel — no restart (see its own disclosure line).',
       ]),
       h('div', { class: 'cr-cfg-actions' }, [
         h('button', {

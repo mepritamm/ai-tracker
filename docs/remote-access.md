@@ -29,7 +29,7 @@ TRACKER_AUTH="you:pick-a-strong-pass" HOST=0.0.0.0 make serve
 | Env var | Default | Set it to… |
 |---|---|---|
 | `HOST` | `127.0.0.1` (localhost only) | `0.0.0.0` to accept connections from LAN / Tailscale |
-| `TRACKER_AUTH` | *(empty — off)* | `"user:pass"` to require HTTP Basic Auth on **every** route |
+| `TRACKER_AUTH` | *(empty — off)* | `"user:pass"` to require HTTP Basic Auth on localhost and LAN; tunnel traffic uses `TUNNEL_USER`/`TUNNEL_PASS` instead (see Tunnel below) |
 | `PORT` | `8790` | any free port |
 
 `HOST` and `TRACKER_AUTH` are **off by default** — local development is completely unchanged unless you
@@ -119,33 +119,27 @@ Simplest, but only works while the phone is on the **same network** as the Mac (
 A free public HTTPS tunnel over Cloudflare's edge. No account for a **quick tunnel**, no interstitial, and
 it commonly works where ngrok/Tailscale are blocked.
 
-1. Install once: `brew install cloudflared`.
-2. Start an **authed** tracker on a dedicated port (keeps your local `:8790` untouched):
+**In-app tunnel (recommended):** Start `make serve` normally, then use the **Config → Tunnel** switch to toggle the tunnel on. The switch spawns `cloudflared` inside the running server, displays the tunnel URL with **Copy** and **Rotate URL** buttons, and manages tunnel credentials — generating a random username/password if you start with blank credentials (the tunnel is never open unauthenticated). The tunnel auto-closes after 12 hours and reopens automatically on the next `make serve`. Tunnel credentials are live: old logins are signed out immediately when rotated. Requires `cloudflared` on PATH (`brew install cloudflared`).
+
+**Shell alternative:** Once `cloudflared` is installed, run:
+
+```bash
+make tunnel   # authed tracker (:8790) + Cloudflare tunnel; prints the URL and tunnel credentials
+make stop     # stops the tracker AND the tunnel
+```
+
+Or manually:
+1. Start an **authed** tracker on a dedicated port (keeps your local `:8790` untouched):
    ```bash
    TRACKER_AUTH="you:pick-a-strong-pass" PORT=8790 python3 -m aitracker &
    ```
-3. Open the quick tunnel — it prints a `https://<random>.trycloudflare.com` URL:
+2. Open the quick tunnel — it prints a `https://<random>.trycloudflare.com` URL:
    ```bash
    cloudflared tunnel --url http://localhost:8790
    ```
-4. Open that URL on the phone and enter the password.
+3. Open that URL on the phone and enter the password.
 
-The quick-tunnel URL is **random each run** (rotates on restart) — for a stable one see **A permanent URL**
-below. Free backup with the same properties (also no account): `npx tunnelmole 8790`.
-
----
-
-## Run it yourself — one-command start & stop
-
-The Makefile wraps the Cloudflare flow once `cloudflared` is installed:
-
-```bash
-TRACKER_AUTH="you:pick-a-strong-pass" make tunnel   # authed tracker (:8790) + Cloudflare tunnel; prints the URL
-make stop                                            # stops the tracker AND the tunnel
-```
-
-`make tunnel` refuses to start without `TRACKER_AUTH` (the URL is public). `make stop` tears down the local
-tracker, the authed `:8790` instance, and any `cloudflared` tunnel. Raw equivalents if you prefer:
+The quick-tunnel URL is **random each run** (rotates on restart). Free backup with the same properties (also no account): `npx tunnelmole 8790`.
 
 ```bash
 # start

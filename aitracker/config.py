@@ -524,6 +524,17 @@ def snapshot(overrides):
 # general config snapshot route (GET /api/config), only through the one deliberate reveal
 # endpoint. tests/test_selfcheck.py already asserts `"TRACKER_AUTH" not in config.EDITABLE`;
 # this feature does not touch that tuple at all, so that invariant is untouched.
+#
+# UPDATE (tunnel switch): aitracker/tunnel.py can now mint a real cloudflared tunnel from
+# THIS process (no restart) and writes the live URL into this very TUNNEL_URL key itself --
+# so it's no longer *only* user-entered data, it's also app-written whenever a tunnel is
+# actually running (still user-editable as a manual fallback when the feature is off; the
+# comment above about "no resolver chain, config.json is the only source" still holds). A
+# companion key, TUNNEL_ON (child process should be alive across restarts), is intentionally
+# left OUT of TUNNEL_EDITABLE below -- it is only ever flipped by tunnel.start()/stop()/
+# autostart(), never by this general POST /api/tunnel route, so a client can't fake "on"
+# without an actual cloudflared child existing. See server.py's POST /api/tunnel/ctl and
+# tunnel.py's module docstring for the rest of the design.
 
 TUNNEL_EDITABLE = ("TUNNEL_URL", "TUNNEL_USER", "TUNNEL_PASS")
 

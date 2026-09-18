@@ -264,6 +264,10 @@
   font: 400 12.5px/1.4 var(--font-sans, sans-serif);
   color: var(--text-primary, #1E1B17);
 }
+/* toast(opts.onClick) — the whole toast body becomes a clickable target (checkTunnelOnBoot()
+   uses this to jump to Config's Tunnel tab); the action/dismiss buttons stop propagation
+   so they still work independently of it. */
+.cr .cr-toast-clickable { cursor: pointer; }
 .cr .cr-toast-title { font-weight: 600; }
 .cr .cr-toast-meta { font: 400 10.5px var(--font-mono, monospace); color: var(--text-muted, #877866); margin-top: 2px; }
 .cr .cr-toast-body { flex: 1; min-width: 0; }
@@ -407,6 +411,10 @@
 }
 .cr .cr-cfg-status.is-saved { opacity: 1; color: var(--text-link, #3B5747); }
 .cr .cr-cfg-status.is-failed { opacity: 1; color: var(--text-failed, #8A2F1B); }
+/* Tunnel switch row's persistent status text ("connecting…", "open until HH:MM") --
+   unlike is-saved/is-failed above this is never cleared by a timeout, since it reflects
+   the tunnel's actual current state rather than a transient save confirmation. */
+.cr .cr-cfg-status.is-info { opacity: 1; color: var(--text-secondary, #4A4237); }
 
 /* ---- Tunnel section (Config dialog) — a wider text field for the URL row, the always-
    visible plaintext-storage disclosure, the Show/Hide row, and the restart-command /
@@ -420,7 +428,9 @@
   color: var(--text-awaiting, #9A4F19);
   border: 1px solid var(--line-awaiting, #E8B98A);
 }
-.cr .cr-tunnel-showrow { display: flex; justify-content: flex-end; padding: 6px 0; }
+/* Two quiet buttons (Rotate credentials, Show/Hide) — wraps on a phone-width panel
+   instead of overflowing the dialog. */
+.cr .cr-tunnel-showrow { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; padding: 6px 0; }
 .cr .cr-tunnel-block {
   margin-top: 10px;
   padding: 10px 12px;
@@ -429,7 +439,10 @@
   border: 1px solid var(--line-subtle, #E7E2D5);
 }
 .cr .cr-tunnel-block-label { font: 600 11px var(--font-sans, sans-serif); color: var(--text-secondary, #4A4237); margin-bottom: 6px; }
-.cr .cr-tunnel-cmdrow { display: flex; align-items: center; gap: 8px; }
+/* flex-wrap: the Tunnel URL row now also reuses this class with a Copy AND a Rotate
+   button alongside the <code> address — wrap them onto their own line rather than
+   overflowing a narrow/phone-width dialog. */
+.cr .cr-tunnel-cmdrow { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .cr .cr-tunnel-cmd {
   flex: 1; min-width: 0;
   font-size: 11.5px;

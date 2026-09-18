@@ -86,11 +86,19 @@ class TestTunnelConfigNoAuth(_TunnelServerCase):
 
     def test_reports_not_set_honestly_when_nothing_is_staged(self):
         """Requirement 6/4th test bucket: "not set" must be the real, unfabricated state --
-        never guessed, never defaulted to something that looks configured."""
+        never guessed, never defaulted to something that looks configured.
+
+        GET /api/tunnel is now config.tunnel_public() MERGED with tunnel.status() (the
+        runtime tunnel-switch feature -- see aitracker/tunnel.py), so the response carries
+        extra live-process keys (on/pid/started/expires/error/cloudflared/autostarted)
+        alongside these four; this only pins the original masked-read subset, not the whole
+        dict, so it doesn't churn every time that merged shape grows a field."""
         st, body = _get(self.port, "/api/tunnel")
         self.assertEqual(st, 200)
         d = json.loads(body)
-        self.assertEqual(d, {"url": "", "user_set": False, "pass_set": False, "auth_set": False})
+        self.assertEqual({k: d[k] for k in ("url", "user_set", "pass_set", "auth_set")},
+                         {"url": "", "user_set": False, "pass_set": False, "auth_set": False})
+        self.assertFalse(d["on"], "no tunnel process has been started")
 
     def test_post_rejects_a_malformed_username(self):
         """3rd test bucket: validation rejects a malformed user:pass. A username containing
@@ -233,6 +241,45 @@ class TestTunnelConfigWithAuth(_TunnelServerCase):
         st, body = _post(self.port, "/api/tunnel", {"key": "TUNNEL_PASS", "value": "sneaky"})
         self.assertEqual(st, 401)
         self.assertFalse(os.path.exists(config.CONFIG_FILE), "an unauthenticated write must never reach disk")
+
+
+class TestTunnelSwitchUIWiring(unittest.TestCase):
+    """Browser-side pin for the Tunnel switch (Config dialog's Tunnel tab,
+    aitracker/web/ext_cr_dialogs.js + .css): the ASSEMBLED page (aitracker.page.build_page(),
+    same "inlined at serve time" idiom every other test in this repo that inspects real
+    markup uses -- see tests/test_cr_rail_toggle.py's _read_page()) must actually wire the
+    switch to POST /api/tunnel/ctl, expose it as an accessible control, and never gate it
+    by hostname: the switch, "Rotate URL" and "Rotate credentials" all have to work
+    identically from a phone/tablet layout and from a remote host reached through the
+    tunnel itself -- not only from localhost, which is exactly the kind of thing an
+    accidental `if (location.hostname === 'localhost')` guard would quietly break."""
+
+    def test_ctl_call_and_switch_aria_label_present_with_no_hostname_gate_nearby(self):
+        from aitracker import page as _page
+        html = _page.build_page()
+
+        self.assertIn("/api/tunnel/ctl", html,
+                      "the Tunnel switch / Rotate URL / Rotate credentials controls must "
+                      "POST the new /api/tunnel/ctl route (postTunnelCtl() in "
+                      "ext_cr_dialogs.js)")
+        self.assertIn("'aria-label', 'Tunnel'", html,
+                      "the switch must be given aria-label=\"Tunnel\" -- pins the exact "
+                      "tunnelToggle.setAttribute('aria-label', 'Tunnel') call, not just "
+                      "some unrelated aria-label elsewhere on the page")
+
+        # Isolate a window around the tunnel wiring itself so a hostname check ANYWHERE
+        # ELSE on the assembled page (e.g. the external-terminal/launch-shell localhost
+        # gates that legitimately exist in other ext_*.js files) can't produce a false
+        # pass here -- this must fail if a hostname gate is added NEAR the tunnel code,
+        # not merely if one existed nowhere on the page at all.
+        idx = html.find("/api/tunnel/ctl")
+        self.assertGreaterEqual(idx, 0, "sanity: the call above already asserted this substring exists")
+        window = html[max(0, idx - 6000):idx + 6000]
+        self.assertIn("postTunnelCtl", window, "sanity: the window is centred on the real tunnel-ctl wiring")
+        self.assertNotIn("location.hostname", window,
+                          "no rule may gate the Tunnel switch/Rotate controls by "
+                          "location.hostname -- they must work the same from a phone/"
+                          "tablet layout and from a remote host, not just localhost")
 
 
 if __name__ == "__main__":
