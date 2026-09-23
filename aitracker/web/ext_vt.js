@@ -2370,7 +2370,7 @@
       return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
     }).then(function (res) {
       if (res.ok && res.j && res.j.ok === true) return;
-      var reason = (res.j && res.j.error) ||
+      var reason = (res.j && (res.j.error || res.j.reason)) ||
         (res.status === 404 ? "the model-switch route isn't available in this build yet" :
          res.status === 400 ? "the terminal rejected that request" :
          "the terminal didn't confirm the switch");
@@ -2392,7 +2392,7 @@
       return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
     }).then(function (res) {
       if (res.ok && res.j && res.j.ok === true) return;
-      var reason = (res.j && res.j.error) ||
+      var reason = (res.j && (res.j.error || res.j.reason)) ||
         (res.status === 404 ? "the effort-switch route isn't available in this build yet" :
          res.status === 400 ? "the terminal rejected that request" :
          "the terminal didn't confirm the switch");

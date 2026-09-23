@@ -2739,7 +2739,7 @@
     _termPost("/api/term/inject", { tty: tty, text: text, submit: true, clear_first: true })
       .then(_termJson).then(function (res) {
         if (res.ok && res.j && res.j.ok === true) { ctx.emit("notify", { text: "Switched." }); return; }
-        var reason = (res.j && res.j.error) ||
+        var reason = (res.j && (res.j.error || res.j.reason)) ||
           (res.status === 404 ? "that route isn’t available in this build yet" :
            res.status === 400 ? "the terminal rejected that request" :
            "the terminal didn’t confirm the switch");

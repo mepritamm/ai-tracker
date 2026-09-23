@@ -974,7 +974,7 @@
     post("/api/term/inject", { tty: st.tty, text: text, submit: true, clear_first: true })
       .then(j).then(function (res) {
         if (res.ok && res.j && res.j.ok === true) return;
-        var reason = (res.j && res.j.error) ||
+        var reason = (res.j && (res.j.error || res.j.reason)) ||
           (res.status === 404 ? "that route isn't available in this build yet" :
            res.status === 400 ? "the terminal rejected that request" :
            "the terminal didn't confirm the switch");

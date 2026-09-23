@@ -2788,8 +2788,14 @@ class TestInject(unittest.TestCase):
         stop = threading.Event()
 
         def keep_busy():
+            n = 0
             while not stop.is_set():
-                self.pt.last_output = time.time()
+                n += 1
+                # like _reader(): stamp AND repaint a body row -- quiescence now reads the rows
+                # above the footer band (INJECT_IGNORE_BOTTOM_ROWS), not the raw timestamp
+                with self.pt.lock:
+                    self.pt.last_output = time.time()
+                    self.pt.screen.feed(("\x1b[1;1Hbusy %d" % n).encode())
                 time.sleep(0.02)
 
         busy_thread = threading.Thread(target=keep_busy, daemon=True)

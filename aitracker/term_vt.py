@@ -3691,6 +3691,98 @@ misbehave the same way a naive multi-line paste does. A short single-line comman
 the wrapper and skipping it avoids depending on the child having bracketed-paste mode enabled for
 the overwhelmingly common case."""
 
+INJECT_IGNORE_BOTTOM_ROWS = 5
+"""The FLOOR on how many rows, counted from the bottom of the screen, `_body_rows_version`
+excludes when deciding whether a terminal is "quiet". Claude's own footer -- rule, input box,
+rule, status line(s), mode line -- redraws on a timer well inside `INJECT_QUIET_WINDOW`, and a
+naive "any byte since last_output" quiescence check (the original bug: see
+`_wait_for_quiescence`'s docstring) never sees that terminal go quiet, so `inject()` always times
+out against it. Rows ABOVE this band are real transcript output and must still hold the wait --
+only the footer band itself is exempt. This is only a floor: `_body_rows_version` widens the band
+past this fixed count when it can find Claude's actual input-box rule on screen (see
+`_footer_anchor_band`), because a fixed count is defeated the moment the footer grows past it --
+a wrapped status/mode line, a queued-message line, a compact warning -- and the redrawing rows
+that land above it starve quiescence exactly like the original bug."""
+
+
+def _footer_anchor_band(screen):
+    """How many bottom rows are Claude's own input box + footer, going by what's actually on
+    screen right now, or None when no such layout is recognisable (a plain program, or a `>`/`❯`
+    sitting in scrollback text rather than a live input line).
+
+    Claude's bottom layout (top to bottom) is: a rule row (box-drawing `─` characters,
+    possibly with a session name mixed in), the input line (starts with `❯`, or `>` on
+    older versions), another rule row, then the footer lines proper. The anchor this returns is
+    the FIRST of those -- the rule row directly above the input line -- because the whole block
+    from there down redraws together (input box border included) on Claude's status timer, not
+    just the footer text below it.
+
+    Finds the input line by scanning from the bottom of the screen up, stopping at the first
+    (i.e. bottommost) row whose left-stripped text starts with the prompt marker -- only within
+    the BOTTOM HALF of the screen, so a `>`/`❯` left over in scrollback-ish text higher up
+    on a tall pane is never mistaken for the live prompt. The row directly above that must itself
+    look like a rule (a run of at least 4 `─` characters) before it's trusted; a program that
+    merely happens to print a line starting with `>` (a shell prompt, a quoted email) falls back
+    to None rather than guessing.
+
+    Cheap by construction: scans only the bottom half of `screen.grid`, and reuses
+    `Screen._encode_row` (the same per-row text extraction `snapshot()`/`history()` already use)
+    rather than walking cells itself.
+
+    Callers must hold `pt.lock` -- this only reads `screen.grid`, never mutates it."""
+    rows = screen.rows
+    if rows < 2:
+        return None
+    grid = screen.grid
+    half = rows // 2
+    prompt_row = None
+    for r in range(rows - 1, half - 1, -1):
+        text = Screen._encode_row(grid[r])[0].lstrip()
+        if text.startswith("❯") or text.startswith(">"):
+            prompt_row = r
+            break
+    if prompt_row is None or prompt_row == 0:
+        return None
+    rule_row = prompt_row - 1
+    rule_text = Screen._encode_row(grid[rule_row])[0]
+    if rule_text.count("─") < 4:
+        return None
+    return rows - rule_row
+
+
+def _body_rows_version(pt):
+    """`pt.screen.row_v`, minus a bottom band, as a tuple -- the quiescence signal
+    `_wait_for_quiescence` and `inject()`'s post-CR submitted check compare across polls instead
+    of `Pty.last_output`/`Screen.v`, so a footer redraw confined to that band can neither keep
+    the terminal from looking quiet nor fake a submitted Enter.
+
+    The band is `max(INJECT_IGNORE_BOTTOM_ROWS, _footer_anchor_band(pt.screen))` -- the fixed
+    floor, widened to reach Claude's own input-box rule when `_footer_anchor_band` can find one
+    on screen right now (a taller-than-usual footer -- wrapped status line, queued messages, a
+    compact warning -- pushes that rule further up than the floor covers, and without the widening
+    those rows would land back in "body" and reintroduce the starved-quiescence bug). No anchor
+    found -> the floor alone, unchanged from before.
+
+    Read under `pt.lock` -- the same lock `_reader()` holds while `feed()` mutates
+    `pt.screen`/`row_v` (see `Pty.lock`'s own comment) -- so this can never read a half-updated
+    row_v mid-`feed()`, and `_footer_anchor_band`'s read of `screen.grid` is consistent with it.
+
+    When the live row count is at or below the band, ignoring it would ignore the whole screen,
+    so it falls back to using every row instead. A resize changes `len(row_v)` itself, which
+    changes the length of the tuple this returns -- already "a change" to any caller diffing two
+    of these, with no special-casing needed.
+
+    Callers must not call this against a `pt` whose `screen` is None (`_wait_for_quiescence`
+    falls back to `last_output` in that case instead)."""
+    with pt.lock:
+        row_v = pt.screen.row_v
+        band = INJECT_IGNORE_BOTTOM_ROWS
+        anchor_band = _footer_anchor_band(pt.screen)
+        if anchor_band is not None and anchor_band > band:
+            band = anchor_band
+        body = max(1, len(row_v) - band)
+        return tuple(row_v[:body])
+
 
 def _wait_for_quiescence(pt):
     """Block the calling (HTTP handler) thread until `pt` has been silent for
@@ -3703,16 +3795,32 @@ def _wait_for_quiescence(pt):
     against a PTY that never stops producing output; the WORST CASE wall-clock time this function
     can consume is `INJECT_MAX_WAIT` (plus at most one `INJECT_POLL_INTERVAL` of overshoot).
 
-    Reads the four `INJECT_*` constants BY NAME on every iteration (not as bound default
-    arguments) so a caller -- production code choosing to retune them, or a test monkeypatching
+    The idle clock resets on a `_body_rows_version(pt)` CHANGE, not on every `pt.last_output`
+    byte -- a footer confined to the bottom `INJECT_IGNORE_BOTTOM_ROWS` rows (Claude's status
+    line redrawing faster than `INJECT_QUIET_WINDOW`) never resets it, while real transcript
+    output above that band still does. `pt.screen is None` (no Screen at all for this pty) falls
+    back to the original `pt.last_output`-based check, since there is no `row_v` to diff.
+
+    Reads the `INJECT_*` constants BY NAME on every iteration (not as bound default arguments) so
+    a caller -- production code choosing to retune them, or a test monkeypatching
     `term_vt.INJECT_QUIET_WINDOW` etc. -- sees the effect immediately, exactly like `_reader`'s
     own use of `IDLE_TIMEOUT` above.
     """
     start = time.time()
     deadline = start + INJECT_MAX_WAIT
+    has_screen = pt.screen is not None
+    last_change = start
+    last_version = _body_rows_version(pt) if has_screen else None
     while True:
         now = time.time()
-        idle = now - pt.last_output
+        if has_screen:
+            version = _body_rows_version(pt)
+            if version != last_version:
+                last_version = version
+                last_change = now
+            idle = now - last_change
+        else:
+            idle = now - pt.last_output
         elapsed = now - start
         if idle >= INJECT_QUIET_WINDOW and elapsed >= INJECT_MIN_WAIT:
             return True
@@ -3773,9 +3881,11 @@ def inject(handler, parsed, body):
     2. **Text, then CR as a separate `os.write`** -- not concatenated into one write. Reproduces
        the reference implementation's finding that some TUIs process a combined "text\\r" write
        differently (worse) than the same bytes arriving as two reads.
-    3. **Resends CR up to `INJECT_RESEND_MAX_ATTEMPTS` times** if the screen's version counter
-       (`Screen.v`) hasn't moved `INJECT_RESEND_DELAY` seconds after a CR -- Claude's TUI is known
-       to sometimes eat the first Enter. MISFIRE, both directions: (a) a command that legitimately
+    3. **Resends CR up to `INJECT_RESEND_MAX_ATTEMPTS` times** if the screen's body-rows version
+       (`_body_rows_version` -- everything but the bottom `INJECT_IGNORE_BOTTOM_ROWS` footer rows,
+       so a footer redraw alone can't fake a submit) hasn't moved `INJECT_RESEND_DELAY` seconds
+       after a CR -- Claude's TUI is known to sometimes eat the first Enter. MISFIRE, both
+       directions: (a) a command that legitimately
        produces NO visible output (e.g. a cleared/blank response) looks identical to a swallowed
        Enter, so this can resend CR into an already-submitted line and doubly-execute it; (b) a
        command that's simply slow to respond (past `INJECT_RESEND_DELAY` but before it draws
@@ -3829,14 +3939,12 @@ def inject(handler, parsed, body):
     if submit:
         time.sleep(INJECT_KEY_GAP)
         for _ in range(INJECT_RESEND_MAX_ATTEMPTS):
-            with pt.lock:
-                v_before = pt.screen.v
+            v_before = _body_rows_version(pt)
             if not _inject_write(pt, b"\r"):
                 return handler._json({"ok": False, "reason": "write failed"})
             cr_attempts += 1
             time.sleep(INJECT_RESEND_DELAY)
-            with pt.lock:
-                v_after = pt.screen.v
+            v_after = _body_rows_version(pt)
             if v_after != v_before:
                 submitted = True
                 break
