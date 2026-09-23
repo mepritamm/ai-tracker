@@ -205,7 +205,11 @@ def open_terminal(handler, parsed, body) -> None:
     if mode == "resume" and not _is_claude(sid):
         handler._json({"error": "resume is Claude-only"}, 400)
         return
-    cwd = term_gate.session_cwd(sid)
+    # resume=True: a removed worktree/folder shouldn't block resuming -- claude looks the
+    # session up by id, so any existing ancestor directory works (term_gate.session_cwd).
+    # Passed only on resume: cwd keeps the old plain call (some tests stub session_cwd with a
+    # one-arg lambda; unconditionally passing resume=False would break those too).
+    cwd = term_gate.session_cwd(sid, resume=True) if mode == "resume" else term_gate.session_cwd(sid)
     if not cwd:
         handler._json({"error": "session not found or its cwd no longer exists"}, 404)
         return

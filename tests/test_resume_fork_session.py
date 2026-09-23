@@ -181,7 +181,7 @@ class TestBothCallSitesAgree(_ResumeArgvBase):
         self._ptys0 = dict(term_vt.PTYS)
         term_vt.PTYS.clear()
         self._session_cwd0 = term_gate.session_cwd
-        term_gate.session_cwd = lambda sid: "/tmp"  # bypass the on-disk cwd check; not what's under test
+        term_gate.session_cwd = lambda sid, resume=False: "/tmp"  # bypass the on-disk cwd check; not what's under test
         # The folder fixture below is built with a made-up pid (44444); tearDown's `pt.kill()`
         # would `killpg(getpgid(44444))` -- a REAL process group whenever the kernel's pid
         # counter has landed there (macOS wraps at 99999). Neutered for the whole test, tearDown

@@ -3629,7 +3629,7 @@ class _ResumeModeRoutes(unittest.TestCase):
         self._ptys0 = dict(term_vt.PTYS)
         term_vt.PTYS.clear()
         self._session_cwd0 = term_gate.session_cwd
-        term_gate.session_cwd = lambda sid: "/tmp"
+        term_gate.session_cwd = lambda sid, resume=False: "/tmp"
 
     def tearDown(self):
         config.PROJECTS = self._projects0

@@ -68,16 +68,32 @@ def guard(handler):
         return False
     return True
 
-def session_cwd(sid):
+def session_cwd(sid, resume=False):
     """The working directory for a session id, or "" if unknown/gone. Late import: registry
-    pulls in every provider, and this module is imported from server at startup."""
+    pulls in every provider, and this module is imported from server at startup.
+
+    With resume=True, a recorded cwd that no longer exists (the session's worktree/folder was
+    since removed) walks up via os.path.dirname to the nearest EXISTING ancestor directory and
+    returns that instead of "". Verified empirically on claude 2.1.280: `claude --resume <sid>`
+    looks the session up by id, not by cwd, so it resumes fine from ANY directory that merely
+    exists -- the exact ancestor is cosmetic. Stops and returns "" if the walk's nearest
+    existing ancestor is "/" (not a real place to land a shell); the home dir is fine."""
     import os
     from .registry import parse_any
     try:
         cwd = ((parse_any(sid) or {}).get("meta") or {}).get("cwd") or ""
     except Exception:
         return ""
-    return cwd if cwd and os.path.isdir(cwd) else ""
+    if not cwd:
+        return ""
+    if os.path.isdir(cwd):
+        return cwd
+    if not resume:
+        return ""
+    ancestor = os.path.dirname(cwd)
+    while ancestor and ancestor != "/" and not os.path.isdir(ancestor):
+        ancestor = os.path.dirname(ancestor)
+    return ancestor if ancestor and ancestor != "/" and os.path.isdir(ancestor) else ""
 
 
 REFUSAL_MARKER = "is currently running as a background agent (bg)"

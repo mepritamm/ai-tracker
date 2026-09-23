@@ -256,7 +256,7 @@ class TestFolderResumeInjection(unittest.TestCase):
         folder_pty.mode = "cwd"
         folder_pty.fg = None
         term_vt.PTYS["folder1"] = folder_pty
-        term_gate.session_cwd = lambda sid: cwd
+        term_gate.session_cwd = lambda sid, resume=False: cwd
 
         injected = []
 
@@ -293,7 +293,7 @@ class TestFolderResumeInjection(unittest.TestCase):
         folder_pty.mode = "resume"
         folder_pty.fg = {"session": "other-sid", "mode": "resume", "started": time.time()}
         term_vt.PTYS["folder2"] = folder_pty
-        term_gate.session_cwd = lambda sid: cwd
+        term_gate.session_cwd = lambda sid, resume=False: cwd
 
         overflow_pty = term_vt.Pty(tid="overflow1", pid=0)
 
@@ -344,7 +344,7 @@ class TestFgClaimPendingUntilTyped(unittest.TestCase):
         fp.folder = True
         fp.mode = "cwd"
         term_vt.PTYS["folderP"] = fp
-        term_gate.session_cwd = lambda sid: cwd
+        term_gate.session_cwd = lambda sid, resume=False: cwd
 
         fg_now = [self.SHELL]           # what the kernel would answer for tcgetpgrp right now
         injected = []
