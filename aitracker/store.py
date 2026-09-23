@@ -30,6 +30,23 @@ def load_titles():
     return _load_json(config.TITLES_FILE, {})
 
 
+def load_title_sync():
+    """{session_id: title} -- the title last successfully synced into the REAL Claude
+    session via a `/rename` typed into an attached terminal (server._sync_title_to_claude).
+    Read live, like titles.json itself."""
+    d = _load_json(config.TITLE_SYNC_FILE, {})
+    return d if isinstance(d, dict) else {}
+
+
+def save_title_sync(sid, title):
+    """Record that `sid`'s Claude session was successfully renamed to `title` (already the
+    exact, truncated string written into titles.json) -- registry.parse_any() compares this
+    against the CURRENT tracker override to decide meta.title_local_only."""
+    sync = load_title_sync()
+    sync[sid] = title
+    _save_json(config.TITLE_SYNC_FILE, sync)
+
+
 def load_pins():
     """Session ids the user pinned to the top of the list — read live, like titles."""
     p = _load_json(config.PINS_FILE, [])

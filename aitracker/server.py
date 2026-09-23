@@ -1,12 +1,12 @@
-import json, os, sys, errno, webbrowser, base64, hmac, hashlib, time, traceback, signal
+import json, os, re, sys, errno, webbrowser, base64, hmac, hashlib, time, traceback, signal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from . import config                       # referenced live (config.AUTH) so tests/env see one source
 from . import tunnel                       # runtime tunnel switch -- see tunnel.py's module docstring
 from .config import LIVE_WINDOW, NARR_PAGE
 from .page import build_page
-from .registry import all_sessions, parse_any, search_all, search_session, drill
-from .store import load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, save_model_keep, _load_json, _save_json
+from .registry import all_sessions, parse_any, search_all, search_session, drill, _attached_pty
+from .store import load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, save_model_keep, load_title_sync, save_title_sync, _load_json, _save_json
 # TITLES_FILE/PINS_FILE (below) are referenced live as config.TITLES_FILE/config.PINS_FILE at
 # their write sites, never imported by name -- a copied name freezes the value at import
 # time, so a caller that repoints config.TITLES_FILE (e.g. a test's temp-dir override) would
@@ -137,6 +137,61 @@ def _term_count():
     # change in the reported value.
     with term_vt._LOCK:
         return term_vt._live_count()
+
+
+_RENAME_SANITIZE_RE = re.compile(r"[\r\n\t\x00-\x1f\x7f\x85\u2028\u2029]+")
+
+
+def _sanitize_rename_text(t):
+    """Collapse every run of \\r/\\t/\\n or any other control byte (<0x20, plus DEL) into a
+    single space and strip -- this string is typed into a live pty via term_vt.inject()
+    (POST /api/title's best-effort Claude-session sync), so a raw newline must never reach
+    it: that would submit the line early or inject extra keystrokes the user never asked
+    for. Ordinary spaces are left alone."""
+    return _RENAME_SANITIZE_RE.sub(" ", t).strip()
+
+
+class _RenameSyncCapture:
+    """Minimal handler-like shim so term_vt.inject()/term_gate.guard() -- which only ever
+    call `handler._json(obj, code, headers)` and read `handler.headers` -- can run headless,
+    capturing their result instead of writing to a real HTTP response. POST /api/title's own
+    response is already in flight on the REAL handler by the time this sync runs; a second
+    write to that same socket would corrupt it."""
+    def __init__(self):
+        self.result = None
+        self.headers = {}
+
+    def _json(self, obj, code=200, headers=None):
+        self.result = obj
+
+
+def _sync_title_to_claude(sid, title):
+    """Best-effort sync of a tracker rename into the REAL Claude session, by typing Claude
+    Code's own `/rename <title>` slash command into whatever terminal currently has this
+    session's `claude` CLI in its foreground. Hard rule (CLAUDE.md): this NEVER writes to
+    ~/.claude/** itself -- the only sync path is this injected slash command, same as a
+    human typing it. Returns False, never raises, for every case sync isn't possible: no
+    open terminal for `sid`, the foreground process isn't `claude`, the terminal tier
+    module isn't loaded (bundler / parallel-dev worktree), or the injection itself
+    failed/timed out.
+
+    Reuses -- does not reimplement -- the exact two primitives the model/effort switchers
+    already drive from the client: `registry._attached_pty(sid)` (the SAME tty lookup +
+    foreground-Claude check behind meta.term_tty/term_attached) and `term_vt.inject()`
+    (the SAME primitive behind POST /api/term/inject)."""
+    try:
+        pty = _attached_pty(sid)
+        if pty is None:
+            return False
+        term_vt = sys.modules.get("aitracker.term_vt")
+        if term_vt is None:
+            return False
+        cap = _RenameSyncCapture()
+        text = "/rename " + _sanitize_rename_text(title)
+        term_vt.inject(cap, None, {"tty": pty.id, "text": text, "submit": True, "clear_first": True})
+        return isinstance(cap.result, dict) and cap.result.get("ok") is True
+    except Exception:
+        return False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -418,14 +473,23 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "bad body"}, 400)
             return
         if p.path == "/api/title":
-            sid, t = body.get("session", ""), (body.get("title") or "").strip()
+            sid, t = body.get("session", ""), _sanitize_rename_text(body.get("title") or "")  # stored == what Claude gets
             titles = load_titles()
+            synced = False
             if t:
                 titles[sid] = t[:120]
+                _save_json(config.TITLES_FILE, titles)
+                synced = _sync_title_to_claude(sid, titles[sid])
+                if synced:
+                    save_title_sync(sid, titles[sid])
             else:
                 titles.pop(sid, None)  # empty = clear override, fall back to auto
-            _save_json(config.TITLES_FILE, titles)
-            self._json({"ok": True})
+                _save_json(config.TITLES_FILE, titles)
+                sync = load_title_sync()
+                if sid in sync:
+                    sync.pop(sid, None)
+                    _save_json(config.TITLE_SYNC_FILE, sync)
+            self._json({"ok": True, "synced": synced})
             return
         if p.path == "/api/config":
             # Writes a runtime setting into config.json (see config.py's big module comment

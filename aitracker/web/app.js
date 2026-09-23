@@ -1346,8 +1346,14 @@ async function renameSession(e,id){
   const s=sessions.find(x=>x.id===id)||{};
   const t=prompt("Rename session (leave blank for the auto title):", s.title||"");
   if(t===null)return;
-  await fetch("/api/title",{method:"POST",headers:{"Content-Type":"application/json"},
+  const r=await fetch("/api/title",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({session:id,title:t})});
+  // title-local-only nudge: `synced` (server-owned) says whether /rename was typed
+  // into the attached Claude CLI. When it wasn't, paintTitleNote()'s note already
+  // says so on the next poll — the toast here is just the positive confirmation.
+  let synced=false;
+  try{synced=(await r.json()).synced===true;}catch(e2){}
+  if(synced)toast("Renamed in Claude too","");
   await loadSide();
   if(id===cur)poll();  // refresh the main header title too
 }
@@ -1621,6 +1627,36 @@ function renderForkLinks(d){
   }
 }
 
+// title-local-only nudge (model-update-nudge sibling gap-close): server owns the
+// policy (meta.title_local_only/meta.title_claude) -- this only renders it. A
+// rename made in the tracker while no Claude CLI was attached (or on a tool with
+// no rename channel at all, e.g. Auggie) never reaches the tool's own session
+// name; this says so and how to fix it. Same localStorage key prefix as Control
+// Room's ext_cr_detail.js paintTitleNote(), so dismissing in one view dismisses
+// in the other; keyed by session id + current title so a NEW rename shows it
+// again. Wrapped in try/catch: localStorage can throw (private mode, blocked
+// site data) and the note must still render correctly without it.
+const titleNoteKey=(sid,title)=>`cr.titleNote.${sid}.${title||""}`;
+function paintTitleNote(m,sid){
+  const el=$("titlenote");
+  if(!el)return;
+  if(!m.title_local_only){el.style.display="none";el.innerHTML="";return;}
+  const title=m.title||m.customTitle||m.aiTitle||"";
+  const key=titleNoteKey(sid,title);
+  let dismissed=false;
+  try{dismissed=localStorage.getItem(key)==="1";}catch(e){}
+  if(dismissed){el.style.display="none";el.innerHTML="";return;}
+  const claudeTitle=m.title_claude||"";
+  const text=claudeTitle?
+    `Renamed in the tracker only — Claude still calls this session "${esc(claudeTitle)}". Rename again while its Claude terminal is open to sync.`:
+    "Renamed in the tracker only — this session's own name wasn't changed.";
+  el.style.display="flex";
+  el.innerHTML=`<span class=titlenote-text>${text}</span><button type=button class=titlenote-x aria-label=Dismiss>&times;</button>`;
+  el.querySelector(".titlenote-x").onclick=()=>{
+    try{localStorage.setItem(key,"1");}catch(e){}
+    el.style.display="none";el.innerHTML="";
+  };
+}
 function render(d){
   if(dSid!==cur){   // switching sessions closes the search card and drops stale results
     clearDetailSearch();
@@ -1666,6 +1702,7 @@ function render(d){
   meta.push(`${(d.tokens.in/1000|0)}k in / ${(d.tokens.out/1000|0)}k out`);
   if(m.version)meta.push("v"+esc(m.version));
   $("hmeta").innerHTML=meta.map(x=>`<span>${x}</span>`).join("");
+  paintTitleNote(m,cur);
 
   const chip=(n,v,cls,tgt)=>v?`<span class="chip ${cls||''} ${tgt?'clk':''}"${tgt?` onclick="flashTo('${tgt}')"`:''}><span class=lbl>${n}</span><b>${v}</b></span>`:"";
   // agents & shells → open the right-side Background-work drawer (both already on the shared shape)

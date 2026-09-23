@@ -1,6 +1,7 @@
 # Personal / runtime data — do not share
 flags.json
 titles.json
+title_sync.json
 pins.json
 notes.json
 model_keep.json

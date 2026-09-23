@@ -6,7 +6,7 @@ from .providers.augment_ext import AugmentVscodeProvider, AugmentCursorProvider
 # NOTE: one line, no parenthesised continuation — scripts/bundle.py strips imports
 # line-by-line (`^(import |from )`), so a wrapped import leaves its tail behind and
 # `make bundle` emits a file that won't parse.
-from .store import load_pins, load_notes, load_flags, load_forks, resolve_fork_child, fork_parent_of, load_model_keep
+from .store import load_pins, load_notes, load_flags, load_forks, resolve_fork_child, fork_parent_of, load_model_keep, load_titles, load_title_sync
 from .util import annotate_liveness, model_version, model_label
 
 
@@ -240,6 +240,25 @@ def parse_any(sid):
                     "label": model_label(newest_id),
                     "current_label": model_label(meta.get("model")),
                 }
+        # title_claude / title_local_only: renaming a session in the tracker (POST
+        # /api/title) best-effort syncs the real Claude session by typing `/rename` into
+        # an attached terminal (server._sync_title_to_claude) -- but that only works while
+        # a terminal with `claude` in its foreground is open, so the client needs an
+        # honest signal for "this title only exists in the tracker" (design_handoff's
+        # rename contract). title_claude is Claude's OWN name straight off its log
+        # (meta.customTitle, set by a `/rename` line; else meta.aiTitle) -- "" for a
+        # provider with no such concept (Auggie/Augment). title_local_only is True only
+        # when ALL of: a tracker override is in effect (store.load_titles), it differs
+        # from Claude's own customTitle, AND no successful sync was ever recorded for
+        # EXACTLY that override (store.load_title_sync -- comparing against the CURRENT
+        # override, not "was any sync ever recorded", so a later un-synced rename still
+        # reports true even after an earlier one synced fine).
+        meta["title_claude"] = meta.get("customTitle") or meta.get("aiTitle") or ""
+        override = load_titles().get(sid)
+        meta["title_local_only"] = bool(
+            override and override != meta.get("customTitle")
+            and load_title_sync().get(sid) != override
+        )
     return d
 
 

@@ -206,6 +206,12 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid var(--line)}
 .activebadge{display:inline-flex;align-items:center;gap:6px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--green);background:var(--green-deep);border:1px solid var(--green-line);padding:3px 9px;border-radius:20px}
 .activebadge .dot{width:7px;height:7px}
 .hmeta{margin-top:8px;color:var(--muted);font-size:12.5px;font-family:'JetBrains Mono',monospace;display:flex;flex-wrap:wrap;gap:6px 14px}
+/* title-local-only nudge (model-update-nudge sibling gap-close) — slight/subtle, small
+   muted text; same dismissible-row shape as Control Room's .cr-nudge (ext_cr_dialogs.css),
+   parallel classes here since that one is scoped under .cr and this page isn't. */
+.titlenote{align-items:flex-start;gap:8px;margin-top:6px;font-size:11.5px;line-height:1.4;color:var(--muted)}
+.titlenote-text{flex:1;overflow-wrap:anywhere}
+.titlenote-x{border:none;background:transparent;color:var(--dim);font-size:16px;line-height:1;cursor:pointer;padding:2px 4px;flex:none}
 .chips{display:flex;flex-wrap:wrap;gap:7px;margin-top:14px}
 .chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:4px 10px;border-radius:20px;background:var(--chipbg);border:1px solid var(--line3);color:var(--head)}
 .chip .lbl{color:var(--muted)}

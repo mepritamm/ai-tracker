@@ -1043,6 +1043,55 @@
     qs(btn, ".crd-btn-label").textContent = pinned ? "Pinned" : "Pin";
   }
 
+  // title-local-only nudge: server owns the policy (meta.title_local_only /
+  // meta.title_claude) — this only renders it. A rename made in the tracker while
+  // no Claude CLI was attached (or on a tool with no rename channel at all, e.g.
+  // Auggie) never reaches the tool's own session name; this tells the user so and
+  // how to fix it. Dismissal is keyed by session id + current title in
+  // localStorage (shared prefix with app.js's classic view, so dismissing in one
+  // view dismisses in the other) -- a NEW rename gets a fresh title and shows the
+  // note again. Wrapped in try/catch: localStorage can throw (private mode,
+  // blocked site data) and the note must still render correctly without it.
+  function titleNoteKey(sid, title) {
+    return "cr.titleNote." + sid + "." + (title || "");
+  }
+
+  function paintTitleNote(node, session) {
+    var el2 = qs(node, ".crd-titlenote");
+    if (!el2) return;
+    var meta = session.meta || {};
+    if (!meta.title_local_only) {
+      el2.hidden = true;
+      el2.innerHTML = "";
+      return;
+    }
+    var sid = meta.sessionId || session.id || "";
+    var title = meta.title || meta.customTitle || meta.aiTitle || "";
+    var key = titleNoteKey(sid, title);
+    var dismissed = false;
+    try { dismissed = localStorage.getItem(key) === "1"; } catch (e) {}
+    if (dismissed) {
+      el2.hidden = true;
+      el2.innerHTML = "";
+      return;
+    }
+    var claudeTitle = meta.title_claude || "";
+    var text = claudeTitle ?
+      'Renamed in the tracker only — Claude still calls this session "' + claudeTitle +
+        '". Rename again while its Claude terminal is open to sync.' :
+      "Renamed in the tracker only — this session's own name wasn't changed.";
+    el2.hidden = false;
+    el2.innerHTML =
+      '<span class="crd-titlenote-text"></span>' +
+      '<button type="button" class="cr-nudge-x crd-titlenote-x" aria-label="Dismiss">&times;</button>';
+    qs(el2, ".crd-titlenote-text").textContent = text;
+    qs(el2, ".crd-titlenote-x").addEventListener("click", function () {
+      try { localStorage.setItem(key, "1"); } catch (e) {}
+      el2.hidden = true;
+      el2.innerHTML = "";
+    });
+  }
+
   function makePanel(ctx, sid, col, key, title, opts) {
     opts = opts || {};
     var defCollapsed = opts.defaultCollapsed === false ? false : defaultFolded();
@@ -1153,6 +1202,11 @@
           // `goal`) -- demoted to its own line below the name (see TASK 1 FIX in
           // renderHeader), never occupying the h1. Hidden whenever there's no goal.
           '<div class="crd-goalline" hidden></div>' +
+          // title-local-only nudge (model-update-nudge sibling gap-close): tells the
+          // user a tracker-side rename didn't reach the tool's own session name.
+          // hidden by default; paintTitleNote() below fills/reveals it on every
+          // render pass, same convention as .crd-goalline just above.
+          '<div class="crd-titlenote" hidden></div>' +
           // Row 3 — stat chips (doc 03 Row 3 / doc 04 capability #21). PERMANENT
           // — no preference, no `hidden` gate; renderStatChips() fills it on
           // every render pass. Hidden on phone via CSS only (doc's phone layout
@@ -2090,6 +2144,7 @@
       goalEl.hidden = !goalText;
       goalEl.textContent = goalText;
     }
+    paintTitleNote(node, session);
     qs(node, ".crd-rename .crd-ico").innerHTML = svgIcon(ctx, "edit");
 
     // FIX (drift A10): session.pinned used to be present only on the board-list dict

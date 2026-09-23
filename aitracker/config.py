@@ -13,6 +13,15 @@ FLAGS_FILE = os.path.join(_HERE, "flags.json")
 TITLES_FILE = os.path.join(_HERE, "titles.json")
 
 
+# {session_id: title} -- the title (already truncated to 120 chars, exactly what was
+# written into TITLES_FILE) that was last successfully synced into the REAL Claude
+# session via a `/rename` typed into an attached terminal (server._sync_title_to_claude).
+# Read live via store._load_json, same idiom as every other app-owned file here.
+# registry.parse_any() compares this against the CURRENT tracker override (not just "was
+# ANY sync ever recorded") so a later, un-synced override still reports title_local_only.
+TITLE_SYNC_FILE = os.path.join(_HERE, "title_sync.json")
+
+
 PINS_FILE = os.path.join(_HERE, "pins.json")
 
 

@@ -582,8 +582,19 @@ window.CR = window.CR || {};
     fetch('/api/title', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session: sid, title: payload.title || '' }),
-    }).then(function (r) { return r.ok; }).then(function (ok) {
-      emit('notify', { text: ok ? 'Renamed.' : 'Couldn’t rename that session.' });
+    }).then(function (r) {
+      var ok = r.ok;
+      return r.json().catch(function () { return {}; }).then(function (body) {
+        return { ok: ok, body: body || {} };
+      });
+    }).then(function (res) {
+      var ok = res.ok;
+      // title-local-only nudge: `synced` (server-owned) says whether /rename was
+      // typed into the attached Claude CLI. When it wasn't, the note that
+      // meta.title_local_only drives (ext_cr_detail.js's paintTitleNote) already
+      // says so on the next poll -- no extra toast needed for that case.
+      var synced = ok && res.body && res.body.synced === true;
+      emit('notify', { text: ok ? (synced ? 'Renamed — and synced to Claude too.' : 'Renamed.') : 'Couldn’t rename that session.' });
       if (typeof loadSide === 'function') loadSide();
       if (ok && typeof cur !== 'undefined' && sid === cur && typeof poll === 'function') poll();
     }).catch(function () {
