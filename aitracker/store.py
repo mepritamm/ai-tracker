@@ -106,6 +106,23 @@ def save_notes(notes):
     _save_json(config.NOTES_FILE, notes)
 
 
+def load_model_keep():
+    """{session_id: model_id} -- the newest-per-family model id the user dismissed the
+    model-update nudge for, per session (registry.parse_any()'s meta.model_update). Read
+    live, like pins/notes."""
+    d = _load_json(config.MODEL_KEEP_FILE, {})
+    return d if isinstance(d, dict) else {}
+
+
+def save_model_keep(sid, model_id):
+    """Record that `sid` should stop nudging until an EVEN NEWER model than `model_id`
+    lands (registry.parse_any() compares the stored value against the current newest id,
+    not just "any update")."""
+    keep = load_model_keep()
+    keep[sid] = model_id
+    _save_json(config.MODEL_KEEP_FILE, keep)
+
+
 # --- fork lineage -----------------------------------------------------------
 #
 # When a `claude --resume <sid>` is refused (the CLI considers that session a

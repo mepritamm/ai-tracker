@@ -19,6 +19,13 @@ PINS_FILE = os.path.join(_HERE, "pins.json")
 NOTES_FILE = os.path.join(_HERE, "notes.json")
 
 
+# {session_id: model_id} -- the newest-per-family model id the user deliberately chose to
+# keep dismissing the "a newer model has landed" nudge for (registry.newest_models() /
+# parse_any()'s meta.model_update). Same shape/idiom as PINS_FILE etc.: app-owned, read
+# live via store._load_json/_save_json.
+MODEL_KEEP_FILE = os.path.join(_HERE, "model_keep.json")
+
+
 # Fork lineage (a `claude --resume` retried with `--fork-session` because the CLI refused
 # to resume a session it considers a background agent). Keyed by the PARENT session id ->
 # {"at": unix-time-of-fork, "cwd": …, "child": resolved child id or "", "abandoned": bool,

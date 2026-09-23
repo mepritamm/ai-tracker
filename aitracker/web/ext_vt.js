@@ -2159,6 +2159,8 @@
     this.effortDropdownOpen = false;
     this.currentModel = null;
     this.currentEffort = null;
+    this.currentModelUpdate = null;   // model-update-nudge: meta.model_update | null
+    this._modelUpdateEl = null;       // the notice node currently inserted into modelDd, if any
     this._hasUsage = false;   // does the usage readout currently have anything to show — see
                                // _syncBarVisibility() below, which this and `attached` jointly
                                // gate the WHOLE bar's visibility on.
@@ -2331,6 +2333,30 @@
     if (this.effortDd) this.effortDd.classList.remove("show");
   };
 
+  // model-update-nudge: keeps the dropdown's own "a newer version is available" banner in sync
+  // with this.currentModelUpdate every poll, reusing ext_cr_dialogs.js's shared builder
+  // (window.CR.dialogs.modelUpdateNotice — see its own comment) instead of a second copy of the
+  // markup/behaviour. Looked up LAZILY (not at this file's own load time): ext_* files share one
+  // script tag, and a throw at load time would kill every file after it, so a missing/not-yet-
+  // ready builder is just a silent no-op here, same defensiveness as `toast` above. Always
+  // clears any previously-inserted notice first, so a Keep (which the shared builder removes
+  // from the DOM itself) or the server answering model_update: null on the next poll both leave
+  // exactly zero or one banner, never a stale duplicate.
+  ContextBar.prototype._syncModelUpdateNotice = function () {
+    if (this._modelUpdateEl && this._modelUpdateEl.parentNode) {
+      this._modelUpdateEl.parentNode.removeChild(this._modelUpdateEl);
+    }
+    this._modelUpdateEl = null;
+    if (!this.currentModelUpdate || !this.modelDd) return;
+    var builder = window.CR && window.CR.dialogs && window.CR.dialogs.modelUpdateNotice;
+    if (typeof builder !== "function") return;
+    var self = this;
+    var notice = builder(this.currentModelUpdate, this.sid, function (id) { self._pickModel(id); });
+    if (!notice) return;
+    this._modelUpdateEl = notice;
+    this.modelDd.insertBefore(notice, this.modelDd.firstChild);
+  };
+
   // Sends "/model <name>" via the inject route:
   //   POST /api/term/inject {tty, text, submit: true, clear_first: true} -> {ok: true, ...}
   // A 404/400 (or any non-ok response) surfaces a toast rather than failing silently, per the spec.
@@ -2382,6 +2408,13 @@
     // The model name is transcript-derived, so it goes in as TEXT and the chevron as a NODE --
     // never concatenated into an HTML string (see icoEl's comment at the top of this file).
     if (this.modelBtn) _textThenIcon(this.modelBtn, (this.currentModel || "model") + " ", 'chevron-down');
+
+    // model-update-nudge: server-owned field (meta.model_update), read straight off the polled
+    // dict — see _syncModelUpdateNotice below, which keeps the dropdown's own banner in sync
+    // with it every poll (including making it disappear once the server answers null again,
+    // e.g. after a Keep).
+    this.currentModelUpdate = meta.model_update || null;
+    this._syncModelUpdateNotice();
 
     // Unlike the model label (a heuristic string-match against MODEL_LADDER — see
     // _matchLadderModel's own comment), meta.effort is a clean literal straight off the

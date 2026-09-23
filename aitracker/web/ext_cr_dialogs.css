@@ -460,6 +460,20 @@
 .cr .cr-cfg-footer-note { font: 400 11px/1.5 var(--font-sans, sans-serif); color: var(--text-muted, #877866); margin: 0 0 10px; }
 .cr .cr-cfg-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
+/* ---- model-update nudge (modelUpdateNotice, ext_cr_dialogs.js) — same "awaiting attention"
+   tone as .cr-tunnel-disclosure above; shared by the model ladder picker AND ext_vt.js's own
+   inline dropdown, so it lives beside the other shared dialog tokens rather than per-surface. */
+.cr .cr-model-update-notice {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md-min, 8px);
+  background: var(--surface-awaiting, #FDF0E4);
+  border: 1px solid var(--line-awaiting, #E8B98A);
+}
+.cr .cr-model-update-text { margin: 0 0 8px; font: 400 12.5px/1.4 var(--font-sans, sans-serif); color: var(--text-awaiting, #9A4F19); }
+/* flex-wrap: two buttons must not overflow a phone-width dialog panel. */
+.cr .cr-model-update-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+
 /* ---- small controls shared by the newly-discovered dialogs (directory-picker,
    model/effort ladder, rename, fork-lineage) — ground-truthed against the real
    ctx.dialog() call sites in cr_term.js / cr_detail.js, see cr_dialogs.js ---- */

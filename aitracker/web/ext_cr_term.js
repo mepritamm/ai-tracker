@@ -87,6 +87,8 @@
     engineHandle: null,  // whatever _attachEngine() returned, or null while degraded
     attached: false,     // is a Claude CLI foreground on this pty right now
     model: null,
+    modelLabel: null,    // server's meta.model_label — display string, prefer over `model`
+    modelUpdate: null,   // server's meta.model_update — {id,label,current_label} | null
     effort: null,
     ctx: null,           // {current, limit, pct} | null — readContextUsage() shape
     cumulative: 0,
@@ -429,6 +431,8 @@
     st.notice = null;
     st.attached = false;
     st.model = null;
+    st.modelLabel = null;
+    st.modelUpdate = null;
     st.effort = null;
     st.ctx = null;
     st.cumulative = 0;
@@ -951,6 +955,9 @@
   function _openModelDialog() {
     ctx.dialog("model", {
       current: st.model,
+      currentLabel: st.modelLabel,
+      update: st.modelUpdate,
+      sessionId: st.sessionId,
       ladder: modelLadder(),
       onPick: function (name) { _injectSlash("/model " + name, "Couldn't switch model"); },
     });
@@ -1107,6 +1114,10 @@
     // ext_vt.js owns this matcher and exports it precisely so a second copy can't drift.
     var matchLadderModel = (window.ExtVT && window.ExtVT._matchLadderModel) || function (raw) { return raw; };
     st.model = matchLadderModel(meta.model);
+    // model-update-nudge: server-owned fields, read straight off the polled meta — no
+    // re-derivation here, same as the ladder-match above is a heuristic FALLBACK for `model`.
+    st.modelLabel = meta.model_label || null;
+    st.modelUpdate = meta.model_update || null;
     st.effort = (typeof meta.effort === "string" && meta.effort) ? meta.effort : null;
     st.ctx = _readContextUsage(d);
     st.cumulative = (d && d.tokens) ? ((d.tokens.in | 0) + (d.tokens.out | 0)) : 0;
@@ -1120,7 +1131,11 @@
     // Hide "Open terminal here" / "Resume terminal here" once a terminal is actually attached
     if (el.primaryGroup) el.primaryGroup.hidden = st.attached;
     if (st.attached) {
-      el.modelPill.textContent = "model · " + (st.model || "—");
+      // model-update-nudge: prefer the server's display label; the ladder match (st.model)
+      // stays the fallback (and still drives the picker's highlight — see _openModelDialog).
+      el.modelPill.textContent = "model · " + (st.modelLabel || st.model || "—") + (st.modelUpdate ? " ↑" : "");
+      el.modelPill.title = st.modelUpdate ? (st.modelUpdate.label + " available") : "";
+      el.modelPill.classList.toggle("has-update", !!st.modelUpdate);
       el.effortPill.textContent = "effort · " + (st.effort || "—");
     }
     var html = "";

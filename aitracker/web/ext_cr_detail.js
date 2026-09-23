@@ -1733,6 +1733,12 @@
           var meta2 = ui.lastSession.meta || {};
           ctx.dialog(isModel ? "model" : "effort", {
             current: isModel ? shortModel(meta2.model) : (meta2.effort || null),
+            // model-update-nudge: server-owned display label + update notice (meta.model_label/
+            // meta.model_update, providers/*.py) — this file never derives either itself, just
+            // hands them through to the shared picker (ext_cr_dialogs.js renderLadderPicker).
+            currentLabel: isModel ? (meta2.model_label || null) : undefined,
+            update: isModel ? (meta2.model_update || null) : undefined,
+            sessionId: sid,
             ladder: isModel ? MODEL_LADDER : EFFORT_LADDER,
             onPick: function (val) {
               _injectToTerminal(ctx, ttyMe, "/" + (isModel ? "model" : "effort") + " " + val,
@@ -1995,7 +2001,9 @@
     // Model tacks onto the SAME metadata line, subordinate to project/branch/
     // elapsed/tokens — never its own visual element. Empty means render
     // nothing (no "unknown"), handled by the existing .filter(Boolean).
-    var modelBit = shortModel(meta.model) || null;
+    // model-update-nudge: prefer the server's own display label (meta.model_label) over the
+    // client-side ladder-match heuristic — server owns the policy, this just reads the field.
+    var modelBit = meta.model_label || shortModel(meta.model) || null;
     var metaBits = [proj || null, meta.gitBranch || null, elapsedStr, fmtTokens(session) || null, modelBit].filter(Boolean);
     var metaEl = qs(node, ".crd-metaline");
     metaEl.textContent = metaBits.join(" · ");
@@ -2716,13 +2724,20 @@
     // term_tty is null — never a clickable control that cannot work.
     var tty = typeof session.term_tty === "string" && session.term_tty ? session.term_tty : null;
     var noRoute = "Not reachable from here yet — there’s no way to find this session’s terminal from the Evidence panel.";
-    var modelAttrs = tty ? 'data-act="terminal-model" title="Switch this session’s model"' :
-      'data-act="terminal-model" disabled aria-disabled="true" title="' + esc(noRoute) + '"';
+    // model-update-nudge: meta.model_update, when non-null, gets a small ↑ marker on the chip
+    // (title names the update) so the user notices without opening the picker — server owns
+    // whether an update exists, this just reads meta.model_update off the same polled dict.
+    var modelUpd = meta.model_update || null;
+    var modelTitle = tty ? (modelUpd ? modelUpd.label + " available — click to switch" : "Switch this session’s model") : noRoute;
+    var modelAttrs = tty ? 'data-act="terminal-model" title="' + esc(modelTitle) + '"' :
+      'data-act="terminal-model" disabled aria-disabled="true" title="' + esc(modelTitle) + '"';
     var effortAttrs = tty ? 'data-act="terminal-effort" title="Switch this session’s effort"' :
       'data-act="terminal-effort" disabled aria-disabled="true" title="' + esc(noRoute) + '"';
+    var modelLabel = meta.model_label || shortModel(meta.model) || "—";
+    var modelMark = modelUpd ? ' <span class="crd-model-update-mark" aria-hidden="true">↑</span>' : "";
     setPanelBody(wrap,
       '<div class="crd-term-row">' +
-        '<button class="crd-btn crd-btn-solid" ' + modelAttrs + '>model · ' + esc(shortModel(meta.model) || "—") + "</button>" +
+        '<button class="crd-btn crd-btn-solid" ' + modelAttrs + '>model · ' + esc(modelLabel) + modelMark + "</button>" +
         '<button class="crd-btn crd-btn-outline" ' + effortAttrs + '>effort · ' + esc(meta.effort || "—") + "</button>" +
         '<span class="crd-term-ctx mono">' + (ctxWin.current != null ? fmtK(ctxWin.current) : "—") + " / " +
           (ctxWin.limit != null ? fmtK(ctxWin.limit) : "—") + "</span>" +

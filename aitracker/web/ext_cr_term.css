@@ -359,6 +359,9 @@
 }
 .cr .cr-term-pill[hidden] { display: none; }
 .cr .cr-term-pill-model { background: #FBFAF7; color: #1E1B17; } /* doc: "white pill", frozen */
+/* model-update-nudge: the "↑ <label> available" state — a warmer tint on the otherwise-frozen
+   white pill so the marker reads as an attention cue, not decoration. */
+.cr .cr-term-pill-model.has-update { background: var(--surface-awaiting, #FDF0E4); color: var(--text-awaiting, #9A4F19); }
 .cr .cr-term-pill-effort {
   background: transparent;
   border: 1px solid #6F6455;

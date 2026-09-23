@@ -3,6 +3,7 @@ flags.json
 titles.json
 pins.json
 notes.json
+model_keep.json
 forks.json
 forks.json.lock
 config.json

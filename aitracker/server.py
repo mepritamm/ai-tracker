@@ -6,7 +6,7 @@ from . import tunnel                       # runtime tunnel switch -- see tunnel
 from .config import LIVE_WINDOW, NARR_PAGE
 from .page import build_page
 from .registry import all_sessions, parse_any, search_all, search_session, drill
-from .store import load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, _load_json, _save_json
+from .store import load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, save_model_keep, _load_json, _save_json
 # TITLES_FILE/PINS_FILE (below) are referenced live as config.TITLES_FILE/config.PINS_FILE at
 # their write sites, never imported by name -- a copied name freezes the value at import
 # time, so a caller that repoints config.TITLES_FILE (e.g. a test's temp-dir override) would
@@ -547,6 +547,20 @@ class Handler(BaseHTTPRequestHandler):
             elif not body.get("pinned") and sid in pins:
                 pins.remove(sid)
             _save_json(config.PINS_FILE, pins)
+            self._json({"ok": True})
+            return
+        if p.path == "/api/model-keep":
+            # "Keep current" for the model-update nudge (registry.parse_any()'s
+            # meta.model_update) -- the user dismissed the offer to switch session `id`
+            # to the newer `model` id. Recorded against that exact newer id (not just a
+            # bool), so an EVEN NEWER model that lands later still nudges -- see
+            # store.save_model_keep.
+            sid = body.get("id")
+            mid = body.get("model")
+            if not isinstance(sid, str) or not sid or not isinstance(mid, str) or not mid:
+                self._json({"error": "session and model required"}, 400)
+                return
+            save_model_keep(sid, mid)
             self._json({"ok": True})
             return
         flags = load_flags()

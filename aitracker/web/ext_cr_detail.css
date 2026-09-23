@@ -1307,6 +1307,10 @@
   color: var(--text-muted);
   margin-left: auto;
 }
+/* model-update-nudge: the model chip's "a newer version exists" marker — the chip's own
+   title attribute names it; this is just the visible ↑, in the same tone as the dialog's
+   .cr-model-update-notice (ext_cr_dialogs.css). */
+.cr .crd-model-update-mark { color: var(--text-awaiting, #9A4F19); font-weight: 700; }
 
 /* ============================== conversation timeline ============================== */
 

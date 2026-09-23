@@ -1,7 +1,7 @@
 import glob, json, os, re, time
 from ..config import EDIT_TOOLS, LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, pr_summary, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, pr_summary, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase, real_model
 from ..overview import build_overview
 from ..store import load_titles, load_tasks, load_notes, _TSTATUS
 from .base import Provider
@@ -171,8 +171,8 @@ def _tail_scan(path, nbytes=96000):
                 continue
             c = m.get("content")
             if o.get("type") == "assistant":
-                mv = m.get("model")
-                if isinstance(mv, str) and mv and mv != "<synthetic>":
+                mv = real_model(m.get("model"))
+                if mv:
                     model = mv
                 blocks = c if isinstance(c, list) else []
                 has_tool = False
@@ -879,8 +879,8 @@ def parse_agents(path):
                     m = o.get("message")
                     if not isinstance(m, dict):
                         continue
-                    mv = m.get("model")   # same "latest wins, skip the synthetic sentinel" rule as _tail_scan
-                    if isinstance(mv, str) and mv and mv != "<synthetic>":
+                    mv = real_model(m.get("model"))   # same "latest wins, skip the synthetic sentinel" rule as _tail_scan
+                    if mv:
                         model = mv
                     c = m.get("content")
                     if not task and m.get("role") == "user" and isinstance(c, str):
@@ -1257,8 +1257,9 @@ def parse_session(path):
             if u:  # a real usage block (not the {} default) -> this turn's occupancy; last one wins
                 ctx_current = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
                                + u.get("cache_creation_input_tokens", 0))
-            if msg.get("model"):
-                meta["model"] = msg["model"]
+            mv = real_model(msg.get("model"))   # latest real model wins; a client-side error's
+            if mv:                              # "<synthetic>" sentinel never overwrites (real_model)
+                meta["model"] = mv
             if o.get("effort"):  # top-level sibling of "message", not nested in it; last value wins
                 meta["effort"] = o["effort"]
             content = msg.get("content")

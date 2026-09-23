@@ -460,3 +460,74 @@ def unified(old, new, cap=20000):
     old, new = (old or "")[:cap], (new or "")[:cap]
     return "\n".join(difflib.unified_diff(
         old.splitlines(), new.splitlines(), "before", "after", lineterm=""))
+
+
+# --- model ids -----------------------------------------------------------------------
+# A Claude assistant message's `model` field takes several real shapes: the new form
+# "claude-<family>-<version...>" (claude-opus-5-5), the legacy form
+# "claude-<version...>-<family>-<date>" (claude-3-5-sonnet-20241022), a bare alias
+# ("sonnet"/"opus"/"haiku"), a "[1m]"-tagged context-window variant (claude-opus-5[1m]),
+# and the "<synthetic>" sentinel a client-side API error (rate limit, etc.) stamps on its
+# own assistant message in place of a real model id. These three helpers are the one
+# place that vocabulary is parsed, shared by providers/claude.py (list-tail scan,
+# background-agent scan, detail parser) and registry.py (newest-per-family nudge).
+
+_MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
+_MODEL_BRACKET_RE = re.compile(r"\[[^\]]*\]$")   # trailing context-window tag, e.g. "[1m]"
+_MODEL_DATE_RE = re.compile(r"-\d{8}$")          # trailing snapshot date, e.g. "-20241022"
+
+
+def real_model(mv):
+    """`mv` if it's a genuine model id (non-empty string, not the "<synthetic>" sentinel
+    a client-side API error stamps on an assistant message), else "" -- the one check
+    behind "latest real model wins, synthetic never overwrites" everywhere a transcript's
+    `message.model` is read."""
+    return mv if isinstance(mv, str) and mv and mv != "<synthetic>" else ""
+
+
+def model_version(mid):
+    """(family, version-tuple) parsed out of a raw Claude model id, or None when it
+    isn't a real versioned model (a bare alias like "opus", "<synthetic>", or ""). Strips
+    a trailing `[...]` context-window tag and a trailing 8-digit snapshot date first, then
+    matches either "claude-<family>-<nums...>" (claude-opus-5-5) or the legacy
+    "claude-<nums...>-<family>" (claude-3-5-sonnet-20241022). Version tuples compare
+    element-wise like a plain tuple, so (5,) < (5,5) -- a shorter version is "older" than
+    the same prefix with a point release appended."""
+    if not isinstance(mid, str) or not mid:
+        return None
+    s = _MODEL_DATE_RE.sub("", _MODEL_BRACKET_RE.sub("", mid))
+    parts = s.split("-")
+    if len(parts) < 3 or parts[0] != "claude":
+        return None
+    parts = parts[1:]
+    if parts[0] in _MODEL_FAMILIES:
+        family, nums = parts[0], parts[1:]
+    elif parts[-1] in _MODEL_FAMILIES:
+        family, nums = parts[-1], parts[:-1]
+    else:
+        return None
+    if not nums or not all(n.isdigit() for n in nums):
+        return None
+    return family, tuple(int(n) for n in nums)
+
+
+def model_label(mid):
+    """Human-friendly label for a model id: "Opus 5.5", "Haiku 4.5", "Opus 5 (1M)" for a
+    `[1m]` context-window tag, a bare alias title-cased ("opus" -> "Opus"), the id
+    unchanged for anything else non-empty and unrecognized, and "" for "" / "<synthetic>"."""
+    rm = real_model(mid)
+    if not rm:
+        return ""
+    tag = ""
+    m = _MODEL_BRACKET_RE.search(rm)
+    if m:
+        if m.group(0)[1:-1].strip().lower() == "1m":
+            tag = " (1M)"
+        rm = _MODEL_BRACKET_RE.sub("", rm)
+    if rm.lower() in _MODEL_FAMILIES:
+        return rm[:1].upper() + rm[1:].lower() + tag
+    mv = model_version(rm)
+    if mv is None:
+        return mid
+    family, version = mv
+    return "%s %s%s" % (family[:1].upper() + family[1:], ".".join(str(n) for n in version), tag)

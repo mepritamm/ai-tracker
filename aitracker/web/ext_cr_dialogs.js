@@ -2196,17 +2196,72 @@
 
   var DEFAULT_EFFORT_LADDER = ['low', 'medium', 'high', 'xhigh', 'max']; // README.md:95 — the CLI's own set
 
+  // POST /api/model-keep {id: sessionId, model: update.id} -> {ok:true} — same fetch/JSON/auth
+  // shape as postConfigValue/postTunnelValue above (this file's one carved-out exception to its
+  // own "no fetch()" rule, now shared by the model-update nudge below).
+  function postModelKeep(sessionId, modelId, cb) {
+    fetch('/api/model-keep', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: sessionId, model: modelId }),
+    }).then(function (r) { return r.json().then(function (d) { cb(r.ok, d); }); })
+      .catch(function (e) { cb(false, { error: String((e && e.message) || e) }); });
+  }
+
+  // Shared "a newer model is available" nudge — one banner, built once here, used both above
+  // the model ladder picker's rows (renderLadderPicker below) and as the first row of
+  // ext_vt.js's own inline model dropdown (ContextBar._syncModelUpdateNotice), instead of two
+  // forked copies of the same markup/behaviour. `update` is the session detail's own
+  // meta.model_update ({id,label,current_label}); `sessionId` is the session the Keep POST
+  // targets; `onSwitch(update.id)` lets each caller decide how the actual switch is sent (the
+  // ladder picker's own onPick vs ext_vt.js's _pickModel) — this function never types a slash
+  // command itself. Returns null when there's nothing to show. On a successful Keep the notice
+  // removes itself from wherever it was appended; the caller's next poll simply stops re-adding
+  // it once the server answers model_update: null.
+  function modelUpdateNotice(update, sessionId, onSwitch) {
+    if (!update || !update.id) return null;
+    var notice = h('div', { class: 'cr-model-update-notice' });
+    notice.appendChild(h('p', { class: 'cr-model-update-text' }, [
+      h('strong', {}, [update.label || update.id]), ' is available — this session is on ',
+      h('strong', {}, [update.current_label || 'an older version']), '.',
+    ]));
+    var switchBtn = h('button', {
+      class: 'cr-btn cr-btn-solid', type: 'button', text: 'Switch to ' + (update.label || update.id),
+      onclick: function () { if (onSwitch) onSwitch(update.id); },
+    });
+    var keepBtn = h('button', {
+      class: 'cr-btn cr-btn-quiet', type: 'button', text: 'Keep ' + (update.current_label || 'current'),
+      onclick: function () {
+        keepBtn.disabled = true; switchBtn.disabled = true;
+        postModelKeep(sessionId, update.id, function (ok) {
+          if (ok && notice.parentNode) { notice.parentNode.removeChild(notice); return; }
+          keepBtn.disabled = false; switchBtn.disabled = false;
+        });
+      },
+    });
+    notice.appendChild(h('div', { class: 'cr-model-update-actions' }, [switchBtn, keepBtn]));
+    return notice;
+  }
+
   function renderLadderPicker(kind) {
     return function (payload) {
       payload = payload || {};
       var ladder = payload.ladder || (kind === 'effort' ? DEFAULT_EFFORT_LADDER : null);
-      var chrome = buildChrome(kind, kind === 'effort' ? 'Effort' : 'Model', null, payload.current || '', false);
+      // FIX (model-update-nudge): the header used to always show the raw `current` value
+      // (the ladder-matched short name, or "<synthetic>" per the reported screenshot) —
+      // `currentLabel` (server's meta.model_label) is the honest display string when the
+      // caller has one; `current` still drives the ladder row highlight below, unchanged.
+      var headerCtx = (kind === 'model' && payload.currentLabel) ? payload.currentLabel : (payload.current || '');
+      var chrome = buildChrome(kind, kind === 'effort' ? 'Effort' : 'Model', null, headerCtx, false);
       function pick(val) {
         if (payload.onPick) { payload.onPick(val); close(); return; }
         if (_ctx && typeof _ctx.emit === 'function') {
           _ctx.emit(kind === 'effort' ? 'cr:effort-pick' : 'cr:model-pick', { sessionId: payload.sessionId, value: val });
         }
         close();
+      }
+      if (kind === 'model' && payload.update) {
+        var notice = modelUpdateNotice(payload.update, payload.sessionId, function (id) { pick(id); });
+        if (notice) chrome.body.appendChild(notice);
       }
       if (ladder) {
         var list = h('div', { class: 'cr-flag-list' });
@@ -2398,6 +2453,13 @@
     // re-lists; without this it would re-open a dialog the user dismissed during that window,
     // because open()'s same-name dedupe only applies while the dialog is still topmost.
     topName: function () { var t = topEntry(); return t ? t.name : null; },
+    // Exposed so ext_vt.js's own inline model dropdown (ContextBar, a second surface that
+    // predates this dialog and is NOT built via open()/REGISTRY) can render the SAME
+    // model-update nudge banner instead of forking a second copy — see modelUpdateNotice's
+    // own comment above. Loaded lazily by name (window.CR.dialogs.modelUpdateNotice), never
+    // called at ext_vt.js's own load time, per this file's load-order guarantee (ext_cr_dialogs
+    // sorts before ext_vt — page.py's read_ext()) but also as a defensive habit.
+    modelUpdateNotice: modelUpdateNotice,
     CAPABILITIES: CAPABILITIES, // exposed read-only — tests/test_capability_table.py asserts against this directly
   };
 })();

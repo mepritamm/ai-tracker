@@ -1,11 +1,13 @@
+import time
+
 from .providers.claude import ClaudeProvider
 from .providers.auggie import AuggieProvider
 from .providers.augment_ext import AugmentVscodeProvider, AugmentCursorProvider
 # NOTE: one line, no parenthesised continuation — scripts/bundle.py strips imports
 # line-by-line (`^(import |from )`), so a wrapped import leaves its tail behind and
 # `make bundle` emits a file that won't parse.
-from .store import load_pins, load_notes, load_flags, load_forks, resolve_fork_child, fork_parent_of
-from .util import annotate_liveness
+from .store import load_pins, load_notes, load_flags, load_forks, resolve_fork_child, fork_parent_of, load_model_keep
+from .util import annotate_liveness, model_version, model_label
 
 
 PROVIDERS = [ClaudeProvider(), AuggieProvider(),
@@ -97,6 +99,35 @@ def all_sessions():
     return out
 
 
+_NEWEST_MODELS_TTL = 60   # ponytail: recompute ceiling for newest_models() below
+_newest_models_cache = {"at": 0.0, "val": {}}
+
+
+def newest_models():
+    """{family: model_id} -- the single newest-VERSION real model id seen across every
+    provider's session-list `model` field (opus/sonnet/haiku/fable). Feeds parse_any()'s
+    meta.model_update nudge. all_sessions() has no cache of its own beyond each provider's
+    own per-file/mtime memo, and this would otherwise re-scan every session's model on
+    every ~2s detail poll of every open session -- memoized for _NEWEST_MODELS_TTL seconds
+    instead."""
+    now = time.time()
+    if now - _newest_models_cache["at"] < _NEWEST_MODELS_TTL:
+        return _newest_models_cache["val"]
+    best = {}          # family -> (version tuple, model id) -- keep the id alongside the
+    for s in all_sessions():          # version so the winning RAW id (not just its family/
+        mv = model_version(s.get("model"))    # version) is what gets reported and compared.
+        if mv is None:
+            continue
+        family, version = mv
+        cur = best.get(family)
+        if cur is None or version > cur[0]:
+            best[family] = (version, s["model"])
+    val = {family: mid for family, (_, mid) in best.items()}
+    _newest_models_cache["at"] = now
+    _newest_models_cache["val"] = val
+    return val
+
+
 def provider_for(sid):
     """The provider that owns a namespaced session id (longest prefix wins;
     the unprefixed provider is the fallback)."""
@@ -185,6 +216,30 @@ def parse_any(sid):
     # is what made term_attached itself dead code twice in this codebase before it landed
     # on the shared detail dict).
     d["term_tty"] = _pty.id if _pty is not None else None
+    # Model-update nudge: server owns the policy (conventions rule 5), the client only
+    # renders it. meta.model_label is always present when meta is a dict (possibly "" for
+    # an unknown/never-set model); meta.model_update is a dict {id, label, current_label}
+    # only when a STRICTLY newer same-family model exists AND the user hasn't already
+    # chosen to keep the current one (store.save_model_keep -- comparing against the
+    # NEWEST id, not just "any keep ever recorded", so a later, even-newer model still
+    # nudges). Every provider flows through this one seam (registry.parse_any), so this
+    # covers Claude/Auggie/Augment alike -- a meta with no `model` (Auggie/Augment often
+    # have none) just gets model_label="" and model_update=None, no crash.
+    meta = d.get("meta")
+    if isinstance(meta, dict):
+        meta["model_label"] = model_label(meta.get("model"))
+        meta["model_update"] = None
+        cur = model_version(meta.get("model"))
+        if cur:
+            family, cur_ver = cur
+            newest_id = newest_models().get(family)
+            newest_ver = model_version(newest_id) if newest_id else None
+            if newest_ver and newest_ver[1] > cur_ver and load_model_keep().get(sid) != newest_id:
+                meta["model_update"] = {
+                    "id": newest_id,
+                    "label": model_label(newest_id),
+                    "current_label": model_label(meta.get("model")),
+                }
     return d
 
 
