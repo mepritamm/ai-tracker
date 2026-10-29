@@ -1,6 +1,6 @@
 ---
 name: tracker-gap
-description: Close a capability GAP in the ai-tracker app (tracker.py — a single stdlib http.server backend + an embedded vanilla-JS SPA) with ONE change landed at the SHARED SEAM so every path inherits it — never two forked implementations. The tracker's paths/asymmetries: (1) the SESSION-LIST shape produced by BOTH list_sessions() (Claude) and list_auggie() (Auggie), merged in /api/list — a per-session capability (title, source badge, live-ness, filter, search) must hold for both; (2) the SESSION-DETAIL result dict produced by BOTH parse_session() (Claude) and parse_auggie() (Auggie) — same keys (meta/todos/files/commands/narration/agents_bg/shells/overview/counts/note/mtime/now), so a detail capability lands on the shared shape + both producers; (3) the SERVER→CLIENT contract — a capability spans the parse/endpoint AND render()/renderSide() in the embedded PAGE, never hardcoded in one; (4) background AGENTS vs background SHELLS (parallel panels that usually move together); (5) LOCALHOST vs REMOTE (tunnel/phone/tablet) — a control the user merely records must work from a remote host, never be gated to localhost. MANDATORY on every capability: ships BOTH a behavioral eval (an assertion in the self-check / tests/test_selfcheck.py) AND unit tests in the tests/ suite for its distinct code paths + edge cases — covering both providers when it spans them — and keeps `make check` (selfcheck + unit tests) 100% green. Then RESTARTS the server and curls the endpoint to prove it end-to-end (the page is baked at startup — a UI change is invisible until restart). For ADDING or uplifting a capability in THIS repo — not fixing an issue the user 🚩-flagged in the app (that's /fix-flags). Local change only — no commit/push unless asked.
+description: Close a capability GAP in the ai-tracker app (tracker.py — a single stdlib http.server backend + an embedded vanilla-JS SPA) with ONE change landed at the SHARED SEAM so every path inherits it — never two forked implementations. The tracker's paths/asymmetries: (1) the SESSION-LIST shape produced by BOTH list_sessions() (Claude) and list_auggie() (Auggie), merged in /api/list — a per-session capability (title, source badge, live-ness, filter, search) must hold for both; (2) the SESSION-DETAIL result dict produced by BOTH parse_session() (Claude) and parse_auggie() (Auggie) — same keys (meta/todos/files/commands/narration/agents_bg/shells/overview/counts/note/mtime/now), so a detail capability lands on the shared shape + both producers; (3) the SERVER→CLIENT contract — a capability spans the parse/endpoint AND render()/renderSide() in the embedded PAGE, never hardcoded in one; (4) background AGENTS vs background SHELLS (parallel panels that usually move together); (5) LOCALHOST vs REMOTE (tunnel/phone/tablet) — a control the user merely records must work from a remote host, never be gated to localhost. MANDATORY on every capability: ships BOTH a behavioral eval (an assertion in the self-check / tests/test_selfcheck.py) AND unit tests in the tests/ suite for its distinct code paths + edge cases — covering both providers when it spans them — and keeps `make check` (selfcheck + unit tests) 100% green. Then RESTARTS the server and curls the endpoint to prove it end-to-end (the page is baked at startup — a UI change is invisible until restart). For ADDING or uplifting a capability in THIS repo — not fixing an issue the user 🚩-flagged in the app (that's /fix-flags). Done in a separate worktree, then `/branch-sync` and push the branch to `personal` (never `main`).
 ---
 
 # Close a Capability Gap in the tracker — universally, across every path
@@ -12,7 +12,7 @@ this is a small **feature**, not a bug fix.
 
 > Not `/fix-flags` (that resolves an issue the user raised with the 🚩 button in the app — a specific
 > defect, minimal diff). Here you build a capability and make **every path** expose it. No PR gate, no
-> Jira. Do **not** commit or push unless asked.
+> Jira. Work in a worktree; when verified, commit, `/branch-sync`, and push the branch to `personal` (Steps 0 and 5).
 
 **Close the gap at the SHARED SEAM — once — so every path inherits it.** The tracker runs Claude and
 Auggie sessions through parallel producers that emit the **same shapes**, and the browser renders those
@@ -63,9 +63,9 @@ next gap.
 ## Step 0 — Start in a worktree (mandatory)
 **Never edit the primary checkout in place.** This repo is worked by multiple concurrent sessions sharing
 one checkout, so an in-place edit interleaves with another session's WIP and forces a `git add -A` that
-sweeps their unfinished work. Before touching a file: create a git worktree (EnterWorktree, based on local
-HEAD — this repo has **no `origin` remote**, only `personal`), do **all** edits there, get `make check`
-green **in the worktree**, and only then move to the main checkout / push to `personal`. Mirrors
+sweeps their unfinished work. Before touching a file: `git fetch personal`, then create a git worktree (EnterWorktree) based on
+`personal/main` — this repo has **no `origin` remote** and no `develop` (use `develop` if one ever exists).
+Do **all** edits there and get `make check` green **in the worktree**; Step 5 syncs and pushes. Mirrors
 bug-smasher's `smasher-gap` Worktree-discipline thesis.
 
 ## Step 1 — Frame the gap (name the capability + find the asymmetry)
@@ -147,6 +147,11 @@ them is unfinished, no matter how well it runs by hand. Land them in the same ch
 6. **Report** per path: the capability, the seam it landed on, and the proof — the **new eval + test
    names** plus the curl/browser output.
 
+## Step 5 — Sync and push (always, the last step)
+In the worktree, after Step 4 is green: commit, run the **`/branch-sync`** skill so the branch has the
+latest `personal/main` (rebase a solo branch, merge a shared one), re-run `make check` until green, then
+`git push personal <branch>` — a feature branch, **never `main`**. Landing on `main` is `/tracker-push`.
+
 ## Rules
 - Confirm the data shape from **real** session files before changing any parser — assumption is the #1
   cause of bad fixes here.
@@ -162,10 +167,10 @@ them is unfinished, no matter how well it runs by hand. Land them in the same ch
   `notes.json`) are read live. Say which kind of change you made so the user knows whether to reload or restart.
 - **This file is edited by multiple sessions.** Re-read the region right before editing; never assume it
   matches an earlier read. If a match fails, the file diverged — re-read.
-- **Worktree discipline (mandatory).** Every edit happens in a git worktree, is validated there (`make
-  check` green), and only then moves to the main checkout — never in-place on the primary checkout. Base
-  the worktree on local HEAD (no `origin` remote here). This is what keeps concurrent sessions from
-  clobbering each other. See Step 0.
+- **Worktree discipline (mandatory).** Every edit happens in a git worktree based on a freshly fetched
+  `personal/main` (no `origin`, no `develop`), is validated there (`make check` green), then `/branch-sync`
+  and pushed to `personal` as a feature branch — never in-place on the primary checkout. This is what keeps
+  concurrent sessions from clobbering each other. See Steps 0 and 5.
 - If the gap needs a product decision (two reasonable behaviors) or data that isn't on disk (e.g. Auggie's
   cloud transcript), **ask** or ship the honest local-only version with a `note`, rather than guessing.
-- Local change only — no commit, push, or PR unless the user asks.
+- Always finish with Step 5: commit, `/branch-sync`, push the branch to `personal` (never `main`, no PR).

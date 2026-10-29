@@ -551,10 +551,32 @@ def child_agent_sessions(sid, projdir):
     return out
 
 
+def _blocked_jobs():
+    """session id -> question text for Claude Code background jobs whose state.json says
+    "blocked" (Needs input). Both sessionId and resumeSessionId map, as either may be the
+    transcript's id."""
+    # ponytail: rereads ~100s of small files per poll; cache by dir mtime if it ever shows up in profiles.
+    out = {}
+    for f in glob.glob(os.path.join(config.JOBS_DIR, "*", "state.json")):
+        try:
+            with open(f) as fh:
+                st = json.load(fh)
+            if st.get("state") != "blocked":
+                continue
+            needs = st.get("needs") or "needs your input"
+            for k in ("sessionId", "resumeSessionId"):
+                if st.get(k):
+                    out[st[k]] = needs
+        except Exception:
+            continue
+    return out
+
+
 def list_sessions(limit=200):
     fs = glob.glob(os.path.join(config.PROJECTS, "*", "*.jsonl"))
     fs.sort(key=os.path.getmtime, reverse=True)
     titles = load_titles()
+    blocked = _blocked_jobs()
     metas = {f: _session_meta(f) for f in fs}   # cached; cheap on repeat
     # candidate orchestrators per project dir, over ALL sessions (not just the top-N shown) so the
     # sidebar nesting and each session's agent_sessions panel attribute from the identical set.
@@ -638,6 +660,9 @@ def list_sessions(limit=200):
                 now_line = "▶ " + now_phrase(todo_current)
             elif not sm["ended"] and sm.get("last_text"):
                 now_line = now_phrase(sm["last_text"])
+        job_waiting = sid in blocked
+        if job_waiting:     # a Claude Code job blocked on the user waits until they answer, live or not
+            now_line = "⧖ " + now_phrase(blocked[sid])
         out.append({
             "id": sid,
             "project": os.path.basename(sm["cwd"]) if sm["cwd"] else os.path.basename(os.path.dirname(f)),
@@ -650,7 +675,7 @@ def list_sessions(limit=200):
             "parentId": parent,                      # the originating session it nests under; "" -> bucket
             "bg": bg,                                # in-transcript background agents live now -> 🤖 sidebar badge
             "shells_running": shells_running,        # background shell(s) still going -> same treatment as bg
-            "waiting": sm["waiting"],                # unanswered AskUserQuestion -> ⏳ sidebar highlight
+            "waiting": sm["waiting"] or job_waiting,  # unanswered AskUserQuestion / blocked job -> ⏳ sidebar highlight
             "ended": sm["ended"],                    # last turn was the assistant finishing -> ✅ completed
             "mtime": mt,  # counts background-agent activity too
             "todo_total": todo_total, "todo_done": todo_done, "todo_current": todo_current,
@@ -663,6 +688,9 @@ def list_sessions(limit=200):
             "pr_repo": sm.get("pr_repo"), "pr_state": sm.get("pr_state") or "",
             # short "what's happening now" phrase for the board tile — "" unless LIVE (see above)
             "now_line": now_line,
+            # the blocked job's question (same phrase as the "⧖" now_line), "" for any other
+            # session -- the awaiting board tile shows it in place of the first prompt.
+            "needs": now_phrase(blocked[sid]) if job_waiting else "",
             # current model id (e.g. "claude-opus-5") off the same bounded tail read —
             # unconditional, not gated on liveness: "" only when the tail truly has no signal.
             "model": sm.get("model") or "",
@@ -1498,6 +1526,7 @@ def parse_session(path):
     # always return a bool.
     meta["ended"] = _session_meta(path)["ended"]
     st = os.stat(path)
+    job_blocked = _blocked_jobs()
     result = {
         "meta": meta,
         "todos": todos,
@@ -1521,7 +1550,7 @@ def parse_session(path):
         "decisions": sorted(asks.values(), key=lambda a: (a["open"], a["t"] or ""), reverse=True),
         # an unanswered AskUserQuestion: the session isn't idle, it's blocked on the user.
         # Same signal the sidebar's ⏳ uses, off the whole transcript instead of the tail.
-        "waiting": any(a["open"] for a in asks.values()),
+        "waiting": any(a["open"] for a in asks.values()) or sid in job_blocked,
         # board "failing" tile signal (ext_cr_board.js's sessionState()), SAME field name as
         # the list dict (see list_sessions/registry.all_sessions) so board and detail derive
         # "failing" off one field -- off the WHOLE transcript here instead of just the tail,
@@ -1563,6 +1592,8 @@ def parse_session(path):
     result["overview"] = build_overview(result, todos, result["files"], cmds, commits,
                                          tests, agents, requests, narrative, agents_bg,
                                          time.time() - result["mtime"], t_first, t_last)
+    if sid in job_blocked:     # the detail banner reads overview.now; show the job's question, not the last narration
+        result["overview"]["now"] = "⧖ " + now_phrase(job_blocked[sid])
     return result
 
 

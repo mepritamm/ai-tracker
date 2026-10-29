@@ -68,6 +68,7 @@ AUGMENT_DIR = os.path.expanduser("~/.augment")
 
 
 TASKS_DIR = os.path.expanduser("~/.claude/tasks")
+JOBS_DIR = os.path.expanduser("~/.claude/jobs")
 
 
 EDIT_TOOLS = {"Edit", "MultiEdit", "NotebookEdit"}

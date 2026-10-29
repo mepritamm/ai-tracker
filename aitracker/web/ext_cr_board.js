@@ -2804,7 +2804,7 @@ window.CR = window.CR || {};
     // that state alone" exception — so it alone still shows the prompt.
     function tileLine(s, state) {
       if (state === 'awaiting') {
-        return h('div', { class: 'cr-tile-line' }, [s.prompt || '']);
+        return h('div', { class: 'cr-tile-line' }, [s.needs || s.prompt || '']);
       }
       var nowLine = (typeof s.now_line === 'string') ? s.now_line.trim() : '';
       if (!nowLine) return null;   // no now_line -> no second line at all, never s.prompt

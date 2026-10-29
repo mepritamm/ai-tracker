@@ -2,8 +2,15 @@
 # Mandatory gate: the test suite must be green before a commit lands.
 set -e
 cd "$(git rev-parse --show-toplevel)"
+unset TRACKER_AUTH                                    # a set token turns the server tests into blanket 401s
 if ls tests/test_*.py >/dev/null 2>&1; then          # package layout
-    python3 -m unittest discover -s tests -t . -q || { echo "✗ tests failed — commit blocked"; exit 1; }
+    # one module per process: the whole suite in one process gets OOM-killed (Killed: 9) under memory pressure
+    for f in tests/test_*.py; do
+        m="tests.$(basename "$f" .py)"; rc=0
+        python3 -m unittest -q "$m" || rc=$?
+        [ "$rc" -eq 137 ] && { echo "↻ $m OOM-killed — retrying once"; rc=0; python3 -m unittest -q "$m" || rc=$?; }
+        [ "$rc" -eq 0 ] || [ "$rc" -eq 5 ] || { echo "✗ $m failed (rc=$rc) — commit blocked"; exit 1; }   # 5 = no TestCase in module
+    done
 elif [ -f test_tracker.py ]; then                    # legacy single-file layout
     python3 tracker.py --selfcheck && python3 -m unittest -q test_tracker || { echo "✗ tests failed — commit blocked"; exit 1; }
 fi
