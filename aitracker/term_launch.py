@@ -31,40 +31,17 @@ from . import server, term_gate
 
 TERM_APPS = ("Terminal", "iTerm")   # TRACKER_TERM_APP; anything else falls back to Terminal
 
-# Headers that only ever appear when something forwarded the request on the caller's behalf.
-# cloudflared (`make tunnel`) sets CF-Connecting-IP / CF-Ray / X-Forwarded-For; nginx, Caddy and
-# ngrok set the X-Forwarded-* / Forwarded family. WHY sniff headers at all: the peer address
-# does not distinguish a local user from the public internet, because a tunnel terminates on
-# this machine and connects to the server over loopback. Any of these present => refuse.
-_PROXY_HEADERS = ("X-Forwarded-For", "X-Forwarded-Host", "Forwarded",
-                  "CF-Connecting-IP", "CF-Ray", "X-Real-IP")
+# The caller-identity helpers live in server.py (module level, so the standalone bundle has them
+# and server.Handler's read-only gate can use them without a late import). Aliased here so this
+# module and its tests keep their historical names.
+_PROXY_HEADERS = server._PROXY_HEADERS
+_proxy_header = server._proxy_header
+_local_caller = server._local_caller
 
 # Glob metacharacters and path separators. providers.claude.find_session interpolates the sid
 # straight into glob.glob("<PROJECTS>/*/<sid>.jsonl"), so a sid of "*" quietly resolves to
 # whichever session sorts first — one the caller never named. "*" is not a typo of a session id.
 _SID_BAD = re.compile(r"[*?\[\]/\\]")
-
-_NOT_LOCAL = "; this opens a terminal on the tracker's own Mac"
-
-
-def _proxy_header(handler):
-    """Name of the first proxy fingerprint header present, or "" — see _PROXY_HEADERS."""
-    for h in _PROXY_HEADERS:
-        if handler.headers.get(h, ""):
-            return h
-    return ""
-
-
-def _local_caller(handler):
-    """(ok, error). Belt: no proxy fingerprint. Braces: the peer address is still loopback.
-    Neither is sufficient alone — see the module docstring for what this does NOT promise."""
-    hdr = _proxy_header(handler)
-    if hdr:
-        return False, "refused: request appears to be proxied (%s)%s" % (hdr, _NOT_LOCAL)
-    peer = handler.client_address[0]
-    if peer != "127.0.0.1":
-        return False, "refused: caller is not on this machine (%s)%s" % (peer, _NOT_LOCAL)
-    return True, ""
 
 
 def normalize_sid(sid):
@@ -185,7 +162,7 @@ def open_terminal(handler, parsed, body) -> None:
         return
     ok, err = _local_caller(handler)
     if not ok:
-        handler._json({"error": err}, 403)
+        handler._json({"error": err, "remote": True}, 403)
         return
     if not isinstance(body, dict):      # server.do_POST accepts ANY JSON value, "a string" included
         handler._json({"error": "bad body: expected a JSON object"}, 400)

@@ -1462,6 +1462,65 @@ class TestBundle(unittest.TestCase):
         sessions = ns["all_sessions"]()         # the shared seam -- must not raise
         self.assertIsInstance(sessions, list)
 
+    def test_bundle_readonly_gate_does_not_break_local_callers(self):
+        """The read-only gate's caller-identity helpers must live at module level in server.py:
+        bundle.py strips only top-level imports and does not bundle term_launch, so a late
+        relative import would raise inside dist/tracker.py and fail closed for LOCALHOST too.
+        Run the real bundle with the env floor on: a local POST is 200 and /api/list carries no
+        X-Read-Only. Copied into a tempdir so its app-owned json files never touch dist/."""
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        script = os.path.join(tmp, "tracker.py")
+        shutil.copy(self.dist, script)
+        env = dict(os.environ, TRACKER_TUNNEL_READONLY="1", PORT=str(port), HOST="127.0.0.1")
+        env.pop("TRACKER_AUTH", None)
+        # run() opens a browser tab; python's webbrowser honours $BROWSER first, so point it at a
+        # recorder that drops a marker instead of launching a real browser during the gate.
+        marker = os.path.join(tmp, "browser_called")
+        recorder = os.path.join(tmp, "recorder.py")
+        with open(recorder, "w") as fh:
+            fh.write("import sys\nopen(%r, 'w').write(' '.join(sys.argv[1:]))\n" % marker)
+        env["BROWSER"] = "%s %s %%s" % (sys.executable, recorder)
+        proc = subprocess.Popen([sys.executable, script], env=env, cwd=tmp,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            def req(method, path, body=None):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                c.request(method, path, body=body, headers={"Content-Type": "application/json"})
+                r = c.getresponse()
+                r.read()
+                out = (r.status, dict(r.getheaders()))
+                c.close()
+                return out
+            deadline = time.time() + 15
+            while True:
+                try:
+                    st, hdrs = req("GET", "/api/list")
+                    break
+                except OSError:
+                    if time.time() > deadline or proc.poll() is not None:
+                        raise
+                    time.sleep(0.2)
+            self.assertEqual(st, 200)
+            self.assertNotIn("X-Read-Only", hdrs)
+            pst, _h = req("POST", "/api/pin", json.dumps({"session": "bundle-ro-probe", "pinned": False}))
+            self.assertEqual(pst, 200)
+            self.assertEqual(req("GET", "/api/file?path=/etc/hosts")[0], 200)
+            # the stub, not a real browser, was reached (webbrowser launches it asynchronously)
+            t_end = time.time() + 5
+            while not os.path.exists(marker) and time.time() < t_end:
+                time.sleep(0.1)
+            self.assertTrue(os.path.exists(marker), "BROWSER stub never called")
+        finally:
+            proc.terminate()                 # by PID only -- never pkill -f aitracker
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
     def test_bundle_save_json_works(self):
         # scripts/bundle.py's HEADER dropped store.py's own `import fcntl, ..., uuid` (stripped
         # as a top-level intra-module import, never re-added) -- _save_json() (used by every

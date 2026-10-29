@@ -11,6 +11,9 @@ Usage: ai-tracker [--serve | --selfcheck | --version | --help]
 Env:   PORT          (default 8790)
        HOST          bind address (default 127.0.0.1; use 0.0.0.0 for LAN/Tailscale access)
        TRACKER_AUTH  "user:pass" to require HTTP Basic Auth on every route (default off)
+       TRACKER_TUNNEL_READONLY=1  make every non-local caller (tunnel/Tailscale/LAN) view-only; cannot be
+                     switched off from config. Header-less forwarders (ssh -R, VS Code port-forward)
+                     look local and are NOT covered.
 """
 
 

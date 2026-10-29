@@ -551,19 +551,59 @@ def child_agent_sessions(sid, projdir):
     return out
 
 
+def _pid_alive(pid):
+    """True iff `pid` is a real positive int naming a live process. bool/str/float/<=0 are never
+    alive (os.kill(0|-n, 0) would signal a whole process group)."""
+    if type(pid) is not int or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (TypeError, ValueError, OverflowError, OSError):
+        return False
+    return True
+
+
+def _live_daemon_shorts():
+    """Set of daemon job shorts whose worker is alive under a live supervisor, from the roster.
+    The roster holds secrets (ptyAuth/rvAuth/sockets): only pids are read, nothing is logged.
+    Strict: missing/unparseable/wrong-shaped roster or a dead supervisor -> empty set.
+    Residual: a recycled pid reads as alive."""
+    try:
+        with open(config.DAEMON_ROSTER) as fh:
+            ro = json.load(fh)
+        if not isinstance(ro, dict) or not isinstance(ro.get("workers"), dict):
+            return set()
+        if not _pid_alive(ro.get("supervisorPid")):
+            return set()
+        return {k for k, w in ro["workers"].items()
+                if isinstance(k, str) and isinstance(w, dict) and _pid_alive(w.get("pid"))}
+    except Exception:
+        return set()
+
+
 def _blocked_jobs():
-    """session id -> question text for Claude Code background jobs whose state.json says
+    """session id -> question text for LIVE Claude Code background jobs whose state.json says
     "blocked" (Needs input). Both sessionId and resumeSessionId map, as either may be the
-    transcript's id."""
-    # ponytail: rereads ~100s of small files per poll; cache by dir mtime if it ever shows up in profiles.
+    transcript's id. Only shorts in the live roster are read; stale blocked jobs are ignored."""
     out = {}
-    for f in glob.glob(os.path.join(config.JOBS_DIR, "*", "state.json")):
+    for short in _live_daemon_shorts():
+        if not safe_path_component(short):
+            continue
         try:
-            with open(f) as fh:
+            with open(os.path.join(config.JOBS_DIR, short, "state.json")) as fh:
                 st = json.load(fh)
             if st.get("state") != "blocked":
                 continue
-            needs = st.get("needs") or "needs your input"
+            if st.get("daemonShort") not in (None, short):
+                continue
+            n = st.get("needs")
+            if isinstance(n, dict):
+                n = n.get("question")
+            needs = n.strip() if isinstance(n, str) and n.strip() else "needs your input"
             for k in ("sessionId", "resumeSessionId"):
                 if st.get(k):
                     out[st[k]] = needs

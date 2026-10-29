@@ -406,6 +406,26 @@ class RegistrySetdefaultTests(unittest.TestCase):
         rows = {s["id"]: s for s in all_sessions()}
         self.assertEqual(rows["setter:x"]["fail_cmd"], "already set")
 
+    def test_resumable_and_needs_on_every_provider(self):
+        """resumable = native resume exists = the unprefixed (Claude) provider only; needs
+        defaults to "" but a provider-set value is kept."""
+        class _P:
+            def __init__(self, prefix, rows):
+                self.prefix, self._rows = prefix, rows
+            def available(self):
+                return True
+            def list(self):
+                return [dict(r) for r in self._rows]
+        now = time.time()
+        registry.PROVIDERS = [_P("", [{"id": "c1", "mtime": now}, {"id": "c2", "mtime": now, "needs": "q?"}]),
+                              _P("auggie:", [{"id": "auggie:a", "mtime": now}])]
+        rows = {s["id"]: s for s in all_sessions()}
+        self.assertIs(rows["c1"]["resumable"], True)
+        self.assertIs(rows["auggie:a"]["resumable"], False)
+        self.assertEqual(rows["c1"]["needs"], "")
+        self.assertEqual(rows["auggie:a"]["needs"], "")
+        self.assertEqual(rows["c2"]["needs"], "q?")
+
     def test_a_broken_provider_does_not_sink_the_whole_list(self):
         """A provider whose list() raises must not take fail_cmd (or anything else)
         down with it for the OTHER providers -- registry.all_sessions()'s existing

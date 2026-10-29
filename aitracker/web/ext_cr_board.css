@@ -1754,6 +1754,34 @@
   color: var(--text-on-action);
   font: 600 11.5px/1 var(--font-sans);
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.tracker-next .cr-tile-action[data-act="resume"] { white-space: nowrap; }
+.tracker-next .cr-tile-action svg { width: calc(12px * var(--ico-scale)); height: calc(12px * var(--ico-scale)); flex: 0 0 auto; }
+
+/* Icon-only resume on non-hero "Waiting on you" tiles (the hero carries icon + label). */
+.tracker-next .cr-tile-resume {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  margin-left: 4px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--fill-action);
+  color: var(--text-on-action);
+  cursor: pointer;
+}
+.tracker-next .cr-tile-resume svg { width: calc(12px * var(--ico-scale)); height: calc(12px * var(--ico-scale)); }
+.tracker-next .cr-tile-resume:focus-visible { outline: 2px solid var(--line-focus); outline-offset: 2px; }
+/* 32px touch target on phones. */
+@media (max-width: 600px) {
+  .tracker-next .cr-tile-resume { width: 32px; height: 32px; }
 }
 
 .tracker-next .cr-tile-pr {

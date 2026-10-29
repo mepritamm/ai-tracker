@@ -20,7 +20,12 @@ def all_sessions():
     for p in PROVIDERS:
         try:
             if p.available():
-                out += p.list()
+                rows = p.list()
+                for r in rows:
+                    # Native resume (POST /api/term/open mode=resume) exists only for Claude
+                    # (the unprefixed provider); set at the seam so every row carries it.
+                    r["resumable"] = not p.prefix
+                out += rows
         except Exception:
             pass  # one broken provider must not sink the whole list
     pins = set(load_pins())                       # user-pinned ids, read live
@@ -95,6 +100,8 @@ def all_sessions():
         # Augment-ext providers have no shell concept and never set it, so this is the seam's
         # honest 0, never omitted).
         s.setdefault("shells_running", 0)
+        # `needs` = the blocked-job question, "" unless a provider sets it.
+        s.setdefault("needs", "")
     out.sort(key=lambda s: (not s.get("pinned"), -s.get("mtime", 0)))   # pinned first, then newest
     return out
 

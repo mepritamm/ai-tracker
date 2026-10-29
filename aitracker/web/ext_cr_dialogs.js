@@ -1135,6 +1135,9 @@
     // right after a rotate_creds round trip lands, then cleared so it doesn't linger on
     // every later re-render of this section (e.g. the live GET /api/tunnel poll below).
     var tunnelJustRotated = false;
+    // Last failed read-only toggle's error. Kept in section state (not on the status element) so the
+    // renderSection() that follows the POST rebuilds the row with it instead of wiping it.
+    var roError = null;
 
     // Polls GET /api/tunnel every 1500ms (cap ~40 tries) while a just-started/rotated
     // tunnel is still connecting (`on` but no `url` yet) -- stops the moment a url lands,
@@ -1352,6 +1355,28 @@
         body.appendChild(cfgRow('Tunnel', null,
           'Starts a Cloudflare quick tunnel from this server (needs `cloudflared`). Auto-closes after 12 h; every start mints a new address.',
           [tunnelToggle, tunnelStatusEl]));
+
+        // --- Read-only for remote visitors (server-decided; the server 403s writes, this
+        // is only the switch). Locked on when TRACKER_TUNNEL_READONLY is set in the env.
+        var roLocked = !!tunnel.readonly_env;
+        var roStatusEl = h('span', { class: 'cr-cfg-status cr-readonly-status' });
+        roStatusEl.textContent = roLocked ? 'Locked on by TRACKER_TUNNEL_READONLY' : (roError || '');
+        var roToggle = toggleCtl(roLocked || !!tunnel.readonly, function (v) {
+          if (v && !window.confirm('Visitors from outside this Mac — including this device if it is remote — will be view-only. Turn it off from the Mac itself.')) {
+            roToggle.classList.remove('is-on'); roToggle.setAttribute('aria-checked', 'false');
+            return;
+          }
+          postTunnelValue('TUNNEL_READONLY', v, function (ok, resp) {
+            if (ok) { roError = null; tunnel.readonly = !!resp.value; if (resp.locked) tunnel.readonly_env = true; }
+            else roError = (resp && resp.error) || 'request failed';
+            if (active === 'Tunnel') renderSection();
+          });
+        });
+        roToggle.setAttribute('aria-label', 'Read-only for remote visitors');
+        if (roLocked) { roToggle.disabled = true; roToggle.classList.add('is-on'); roToggle.setAttribute('aria-checked', 'true'); }
+        body.appendChild(cfgRow('Read-only for remote visitors', null,
+          'Remote visitors (tunnel, Tailscale/LAN) can look but not change anything or open terminals. This Mac’s localhost is unaffected. Applies live.',
+          [roToggle, roStatusEl]));
 
         // --- Tunnel URL: a live read-only address (+ Copy/Rotate) while the tunnel is up
         // or coming up; the old editable paste field (the manual `make tunnel` flow still

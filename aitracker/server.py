@@ -194,6 +194,65 @@ def _sync_title_to_claude(sid, title):
         return False
 
 
+# --- caller identity (moved here from term_launch.py so the read-only gate and the terminal route
+# share one definition, at module level: scripts/bundle.py strips only top-level imports and does
+# not bundle term_launch, so a late/relative import here would raise in dist/tracker.py).
+# Headers that only ever appear when something forwarded the request on the caller's behalf.
+# cloudflared (`make tunnel`) sets CF-Connecting-IP / CF-Ray / X-Forwarded-For; nginx, Caddy and
+# ngrok set the X-Forwarded-* / Forwarded family. WHY sniff headers at all: the peer address
+# does not distinguish a local user from the public internet, because a tunnel terminates on
+# this machine and connects to the server over loopback. Any of these present => not local.
+_PROXY_HEADERS = ("X-Forwarded-For", "X-Forwarded-Host", "Forwarded",
+                  "CF-Connecting-IP", "CF-Ray", "X-Real-IP")
+_NOT_LOCAL = "; this opens a terminal on the tracker's own Mac"
+
+
+def _proxy_header(handler):
+    """Name of the first proxy fingerprint header present, or "" -- see _PROXY_HEADERS."""
+    for h in _PROXY_HEADERS:
+        if handler.headers.get(h, ""):
+            return h
+    return ""
+
+
+def _local_caller(handler):
+    """(ok, error). Belt: no proxy fingerprint. Braces: the peer address is still loopback.
+    Neither is sufficient alone -- header-less forwarders (ssh -R, VS Code port-forward) look
+    local; see term_launch.py's module docstring for what this does NOT promise."""
+    hdr = _proxy_header(handler)
+    if hdr:
+        return False, "refused: request appears to be proxied (%s)%s" % (hdr, _NOT_LOCAL)
+    peer = handler.client_address[0]
+    if peer != "127.0.0.1":
+        return False, "refused: caller is not on this machine (%s)%s" % (peer, _NOT_LOCAL)
+    return True, ""
+
+
+def _load_config_strict():
+    """config.json as a dict, {} when the file does not exist. Unlike store._load_json (lenient:
+    corrupt/non-dict -> default) this RAISES on an unreadable, unparseable or non-dict file, so
+    the read-only gate can fail closed instead of silently reading "not read-only"."""
+    try:
+        with open(config.CONFIG_FILE) as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(d, dict):
+        raise ValueError("config.json is not an object")
+    return d
+
+
+# Read-only (tunnel) mode: GET paths a remote caller may still reach. Exact allow-list -- anything
+# else (incl. /api/file, /api/tunnel/reveal, /api/term/*, and any future route) is refused.
+_RO_GET_ALLOW = frozenset((
+    "/", "/api/list", "/api/session", "/api/narration", "/api/search", "/api/session_search",
+    "/api/diff", "/api/output", "/api/shell", "/api/agent", "/api/flags", "/api/tunnel",
+    "/api/config",
+    "/vendor/xterm.js", "/vendor/xterm.css", "/vendor/addon-fit.js", "/vendor/mermaid.min.js",
+))
+_RO_BODY = {"error": "read-only: this tracker is shared view-only", "readonly": True}
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code=200, headers=None):
         body = json.dumps(obj).encode()
@@ -209,6 +268,20 @@ class Handler(BaseHTTPRequestHandler):
             # client closed the connection (normal: a newer 2s poll superseded
             # this one, or the tab closed). Nothing to send; don't crash.
             pass
+
+    def _readonly(self):
+        """Is THIS request subject to tunnel read-only mode? Never for a local caller; for any
+        non-local one (proxy header OR non-loopback peer) it is config.resolve_tunnel_readonly
+        over a STRICT config read. Fails closed: any error while deciding means read-only."""
+        try:
+            if _local_caller(self)[0]:
+                return False
+        except Exception:
+            pass
+        try:
+            return bool(config.resolve_tunnel_readonly(_load_config_strict()))
+        except Exception:
+            return True
 
     def _cookie_token(self):
         for part in self.headers.get("Cookie", "").split(";"):
@@ -289,6 +362,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authok():
             # HTML routes -> styled login page; API -> 401 (the SPA's polls carry the cookie once in)
             return self._json({"error": "auth required"}, 401) if p.path.startswith("/api") else self._serve_login()
+        ro = self._readonly()
+        if ro and p.path not in _RO_GET_ALLOW:
+            return self._json(_RO_BODY, 403)
         if p.path == "/":
             body = build_page().encode()
             try:
@@ -318,9 +394,12 @@ class Handler(BaseHTTPRequestHandler):
             # X-Term-Count rides the same header-not-body trick, for the same reason -- see
             # _term_count()'s docstring above for why a header, and why it degrades to None/omitted.
             headers = {"X-Server-Now": str(time.time())}
-            tc = _term_count()
-            if tc is not None:
-                headers["X-Term-Count"] = str(tc)
+            if ro:
+                headers["X-Read-Only"] = "1"    # the SPA hides write controls; the 403s are the real gate
+            else:
+                tc = _term_count()
+                if tc is not None:
+                    headers["X-Term-Count"] = str(tc)
             self._json(all_sessions(), headers=headers)
         elif p.path == "/api/flags":
             self._json(load_flags())
@@ -350,7 +429,12 @@ class Handler(BaseHTTPRequestHandler):
             # no such key either. See config.py's "Tunnel management" section and
             # tunnel.py's module docstring for the full design rationale.
             overrides = _load_json(config.CONFIG_FILE, {})
-            self._json({**config.tunnel_public(overrides), **tunnel.status()})
+            d = {**config.tunnel_public(overrides), **tunnel.status()}
+            try:   # same strict, fail-closed read the gate uses -- a corrupt config.json must not report false
+                d["readonly"] = config.resolve_tunnel_readonly(_load_config_strict())
+            except Exception:
+                d["readonly"] = True
+            self._json(d)
         elif p.path == "/api/tunnel/reveal":
             # The ONE route allowed to return the raw tunnel credential -- reached only by
             # the dialog's explicit "Show" action, already gated by the same _authok() check
@@ -466,6 +550,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._do_login()
         if not self._authok():
             return self._json({"error": "auth required"}, 401)
+        if self._readonly():            # deny-all, before the body is even parsed
+            return self._json(_RO_BODY, 403)
         try:
             n = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(n) or "{}")
@@ -562,6 +648,10 @@ class Handler(BaseHTTPRequestHandler):
             resp = {"ok": True, "key": key, "restart": key in ("TUNNEL_USER", "TUNNEL_PASS")}
             if key == "TUNNEL_URL":
                 resp["value"] = coerced
+            elif key == "TUNNEL_READONLY":
+                # the EFFECTIVE value (the env floor may override what was just saved) + a lock flag
+                resp["value"] = config.resolve_tunnel_readonly(overrides)
+                resp["locked"] = config.tunnel_readonly_env()
             self._json(resp)
             return
         if p.path == "/api/tunnel/ctl":

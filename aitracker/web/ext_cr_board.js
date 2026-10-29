@@ -2633,7 +2633,8 @@ window.CR = window.CR || {};
           if (e.target.closest('button,a,input,select,textarea,[role=button]')) return;
           activateTile(t);
         },
-        onkeydown: function (e) { if (e.key === 'Enter') activateTile(t); }
+        // Enter on a focused inner control (e.g. the Resume button) bubbles here; only the tile itself activates.
+        onkeydown: function (e) { if (e.key === 'Enter' && e.target === e.currentTarget) activateTile(t); }
       };
     }
 
@@ -2832,8 +2833,21 @@ window.CR = window.CR || {};
       attrs.title = (s.prompt || s.title || '(no prompt)') + '\n' + (s.cwd || '') +
         (s.model ? '\nModel: ' + s.model : '');
 
+      // Awaiting Claude tiles resume natively (server flag `resumable`); read-only
+      // viewers get no write control at all. Other awaiting tiles keep the old button.
+      var readOnly = !!(ctx && typeof ctx.readOnly === 'function' && ctx.readOnly());
+      var canResume = state === 'awaiting' && !!s.resumable && !readOnly;
+      var answerPayload = { id: s.id, resumable: s.resumable };
+      var head = tileHead(s, state, now);
+      if (canResume && !t.hero) {
+        head.appendChild(h('button', {
+          class: 'cr-tile-resume', type: 'button', 'data-act': 'resume',
+          title: 'Resume this session to answer', 'aria-label': 'Resume this session to answer',
+          onclick: function (e) { e.stopPropagation(); ctx && ctx.emit && ctx.emit('session:answer', answerPayload); }
+        }, [icon('play', '<path d="M8 4.5l11.5 7.5L8 19.5z"/>')]));
+      }
       var body = [
-        tileHead(s, state, now),
+        head,
         h('div', { class: 'cr-tile-title' }, [tileTitleText(s, state)]),
       ];
       // Doc 02 tile-anatomy table: EVERY tile gets a "project · tool" sub-line
@@ -2863,7 +2877,13 @@ window.CR = window.CR || {};
         // other two counters — REQUIRED ADDITION in the report.
         var sidebar = h('div', { class: 'cr-tile-sidebar' }, [
           h('div', { class: 'cr-tile-counts' }, [glyph('note', 'tn-emo-n'), (s.note_count || 0) + ' notes']),
-          h('button', {
+          canResume ? h('button', {
+            class: 'cr-tile-action', type: 'button', 'data-act': 'resume',
+            title: 'Resume this session to answer', 'aria-label': 'Resume this session to answer',
+            onclick: function (e) { e.stopPropagation(); ctx && ctx.emit && ctx.emit('session:answer', answerPayload); }
+          }, [icon('play', '<path d="M8 4.5l11.5 7.5L8 19.5z"/>'), 'Resume'])
+          : readOnly ? null
+          : h('button', {
             class: 'cr-tile-action', type: 'button',
             onclick: function (e) { e.stopPropagation(); ctx && ctx.emit && ctx.emit('terminal:open', { id: s.id }); }
           }, ['Open terminal to answer']),
@@ -3016,6 +3036,7 @@ window.CR = window.CR || {};
           idx = (idx < 0) ? 0 : Math.max(0, idx - 1);
           tileEls[idx].focus();
         } else if (e.key === 't') {
+          if (ctx && ctx.readOnly && ctx.readOnly()) return;   // terminals are refused for read-only visitors
           if (idx >= 0) {
             e.preventDefault();
             // Mirrors what's actually on screen (renderBoard's own call, just above) — if

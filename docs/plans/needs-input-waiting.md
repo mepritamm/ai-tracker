@@ -6,11 +6,11 @@ Branch `worktree-needs-input-waiting` (base `594ac65`). Authored by an opus Plan
 
 | # | User's words | How discharged | Status |
 |---|---|---|---|
-| C1 | "whats there in the needs input should also go in the waiting for you section in the ai-tracker" | `claude._blocked_jobs()` → `waiting`, `needs`, `⧖ now_line`. **(F7)** narrowed by the user's own C5/C6 answers to *live* daemon jobs whose transcript exists. Unit A adds the narrowing + `needs`/`resumable` on every provider at the registry seam | partly (base impl, uncommitted) |
-| C2 | "make sure the waiting for you section should have the native resume button instead of open-terminal button in that view" | Unit C: awaiting Claude tiles → `session:answer` = native `POST /api/term/open {mode:"resume"}` | not yet |
-| C3 | "Hero tile only, for others add a small icon button which resumes it. the hero tile gets the icon + label in the button and the others get only the icon" | Unit C: hero `.cr-tile-action` = `play` + "Resume"; non-hero awaiting → icon-only `.cr-tile-resume`; both `data-act="resume"` | not yet |
-| C4 | in-browser resume fallback when not on localhost "and add a separate config to have a read-only tunnel option in the tracker, thats specially important when sharing the tunnel with friends and colleagues" | **(F5)** fallback only on `/api/term/open` 403 with `remote:true` and no `readonly` → `session:resume`. **(F1–F4)** `TUNNEL_READONLY` enforced at one point in `server.Handler`: deny all POST, allow-listed GET only; SPA hides buttons from `X-Read-Only` | not yet |
-| C5 | Q "Filter them out?" → **"Only live daemon jobs (Recommended)"** | Unit A: short ∈ roster workers ∧ supervisor pid alive ∧ worker pid alive | not yet |
+| C1 | "whats there in the needs input should also go in the waiting for you section in the ai-tracker" | `claude._blocked_jobs()` → `waiting`, `needs`, `⧖ now_line`. **(F7)** narrowed by the user's own C5/C6 answers to *live* daemon jobs whose transcript exists. Unit A adds the narrowing + `needs`/`resumable` on every provider at the registry seam | **discharged** (live jobs only, per C5/C6) |
+| C2 | "make sure the waiting for you section should have the native resume button instead of open-terminal button in that view" | Unit C: awaiting Claude tiles → `session:answer` = native `POST /api/term/open {mode:"resume"}` | **discharged** |
+| C3 | "Hero tile only, for others add a small icon button which resumes it. the hero tile gets the icon + label in the button and the others get only the icon" | Unit C: hero `.cr-tile-action` = `play` + "Resume"; non-hero awaiting → icon-only `.cr-tile-resume`; both `data-act="resume"` | **discharged** |
+| C4 | in-browser resume fallback when not on localhost "and add a separate config to have a read-only tunnel option in the tracker, thats specially important when sharing the tunnel with friends and colleagues" | **(F5)** fallback only on `/api/term/open` 403 with `remote:true` and no `readonly` → `session:resume`. **(F1–F4)** `TUNNEL_READONLY` enforced at one point in `server.Handler`: deny all POST, allow-listed GET only; SPA hides buttons from `X-Read-Only` | **discharged** |
+| C5 | Q "Filter them out?" → **"Only live daemon jobs (Recommended)"** | Unit A: short ∈ roster workers ∧ supervisor pid alive ∧ worker pid alive | **discharged** |
 | C6 | Q transcript-less jobs → **"Only live ones (Recommended)"**; awaiting tile shows the question | no synthesized rows; `ext_cr_board.js:2807` `s.needs \|\| s.prompt` | **discharged** |
 
 ## 1. Verified facts
@@ -97,3 +97,8 @@ Branch `worktree-needs-input-waiting` (base `594ac65`). Authored by an opus Plan
 - Gate baseline: `test_selfcheck` (0 tests per-module) and `test_term_vt` (OOM `Killed: 9`) identical on base `594ac65` — pre-existing.
 - Rev 1 review (opus): REFUTED as written; F1–F3 blocking → rev 2.
 - Rev 2 re-review (opus): SIGN-OFF-WITH-AMENDMENTS; R1 blocking → rev 3 (§7). Plan signed off pending user approval of §6.
+- User approved §6: global toggle; remote = any non-local caller; terminals blocked.
+- Implemented: Unit 0, A, B, C, D, F (sonnet). Unit E not needed (live∩blocked∩rs≠sid = 0).
+- E2E on :8799 (sonnet): 11 PASS / 0 FAIL (browser screenshot skipped — extension not connected).
+- Impl review (opus ×2): server VERIFIED-WITH-FIXES (no read-only bypass found; F1 non-string needs, F2 dialog strict readonly, F3 bundle test opened a browser) and SPA VERIFIED-WITH-FIXES (F1 nowrap overflow, F2 chip margin, F3 toggle error, F4 two vacuous tests, F5 hide list) — all fixed RED→GREEN (sonnet).
+- Known gaps (no change): pid reuse; header-less forwarders look local; Auggie `drill` `../` reaches other `*.json` (same as base); `.flagbtn` stays interactive under RO (server 403s).

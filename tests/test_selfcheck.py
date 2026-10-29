@@ -851,6 +851,78 @@ def _run():
     assert tunnel.via_tunnel({}) is False, \
         "a request with neither cloudflared header must never be treated as via-tunnel"
 
+    # --- needs-input-waiting: shared-shape fields, blocked-job waiting, read-only predicate ---
+    # (1) every all_sessions() row carries bool `resumable` + str `needs`, set at the registry
+    # seam: resumable only for the unprefixed (Claude) provider; `needs` "" unless a job blocks.
+    _nw_save = (config.PROJECTS, config.AUGMENT_DIR, config.AUGGIE_SESSIONS,
+                config.JOBS_DIR, config.DAEMON_ROSTER)
+    try:
+        _nw_p = tempfile.mkdtemp(); _nw_a = tempfile.mkdtemp(); _nw_j = tempfile.mkdtemp()
+        config.PROJECTS = _nw_p; config.AUGMENT_DIR = _nw_a
+        config.AUGGIE_SESSIONS = os.path.join(_nw_a, "sessions"); os.makedirs(config.AUGGIE_SESSIONS)
+        config.JOBS_DIR = _nw_j
+        config.DAEMON_ROSTER = os.path.join(_nw_j, "no-roster.json")      # absent -> no live shorts
+        _AUGGIE_LIST_CACHE.clear()
+        _nwd = os.path.join(_nw_p, "-repo-nw"); os.makedirs(_nwd)
+        with open(os.path.join(_nwd, "nwsess.jsonl"), "w") as fh:
+            fh.write(json.dumps({"cwd": "/repo/nw", "entrypoint": "cli", "timestamp": "2026-06-01T10:00:00Z",
+                                 "message": {"role": "user", "content": "do it"}}) + "\n")
+        with open(os.path.join(config.AUGGIE_SESSIONS, "nwaug.json"), "w") as fh:
+            json.dump({"sessionId": "nwaug", "modified": "2026-06-27T05:48:03Z", "customTitle": "aug",
+                       "chatHistory": []}, fh)
+        _nw_rows = all_sessions()
+        _nw_by = {r["id"]: r for r in _nw_rows}
+        assert "nwsess" in _nw_by and "auggie:nwaug" in _nw_by, sorted(_nw_by)
+        for r in _nw_rows:
+            assert isinstance(r.get("resumable"), bool), ("resumable must be a bool on every row", r["id"])
+            assert isinstance(r.get("needs"), str), ("needs must be a str on every row", r["id"])
+        assert _nw_by["nwsess"]["resumable"] is True, "a Claude row is natively resumable"
+        assert _nw_by["auggie:nwaug"]["resumable"] is False, "an Auggie row is not"
+        assert _nw_by["nwsess"]["needs"] == "" and _nw_by["auggie:nwaug"]["needs"] == "", "needs defaults to ''"
+
+        # (2) a blocked daemon job marks its Claude session waiting + needs=question, only while
+        # its short is in the live roster (supervisor + worker pid = this process).
+        os.makedirs(os.path.join(_nw_j, "nwjob"))
+        with open(os.path.join(_nw_j, "nwjob", "state.json"), "w") as fh:
+            json.dump({"state": "blocked", "sessionId": "nwsess", "daemonShort": "nwjob",
+                       "needs": "Approve the deploy?"}, fh)
+        _nw_ro = os.path.join(_nw_j, "roster.json")
+        with open(_nw_ro, "w") as fh:
+            json.dump({"supervisorPid": os.getpid(), "workers": {"nwjob": {"pid": os.getpid()}}}, fh)
+        config.DAEMON_ROSTER = _nw_ro
+        _nw_r = {r["id"]: r for r in all_sessions()}["nwsess"]
+        assert _nw_r["waiting"] is True, "a live blocked job must mark its session waiting"
+        assert "Approve the deploy?" in _nw_r["needs"], _nw_r["needs"]
+        with open(_nw_ro, "w") as fh:
+            json.dump({"supervisorPid": os.getpid(), "workers": {}}, fh)   # job absent from roster
+        _nw_r = {r["id"]: r for r in all_sessions()}["nwsess"]
+        assert _nw_r["waiting"] is False and _nw_r["needs"] == "", "a stale (non-roster) blocked job is ignored"
+    finally:
+        (config.PROJECTS, config.AUGMENT_DIR, config.AUGGIE_SESSIONS,
+         config.JOBS_DIR, config.DAEMON_ROSTER) = _nw_save
+        _AUGGIE_LIST_CACHE.clear()
+
+    # (3) tunnel read-only predicate (no server in _run(), so predicate level): fails closed, and
+    # _local_caller distinguishes a tunnel/LAN caller from true loopback.
+    _nw_env = os.environ.pop("TRACKER_TUNNEL_READONLY", None)
+    try:
+        assert config.resolve_tunnel_readonly({}) is False, "read-only is off by default"
+        assert config.resolve_tunnel_readonly({"TUNNEL_READONLY": "true"}) is True, "non-bool fails closed"
+        assert config.resolve_tunnel_readonly([]) is True, "non-dict overrides fail closed"
+        from aitracker import server as _nw_srv
+
+        class _NwH:
+            def __init__(self, ip, headers=None):
+                self.client_address = (ip, 1)
+                self.headers = dict(headers or {})
+        assert _nw_srv._local_caller(_NwH("127.0.0.1", {"CF-Connecting-IP": "1.2.3.4"}))[0] is False, \
+            "a Cf-Connecting-Ip request is never local"
+        assert _nw_srv._local_caller(_NwH("192.168.1.9"))[0] is False, "a LAN peer is never local"
+        assert _nw_srv._local_caller(_NwH("127.0.0.1"))[0] is True, "loopback with no proxy header is local"
+    finally:
+        if _nw_env is not None:
+            os.environ["TRACKER_TUNNEL_READONLY"] = _nw_env
+
     # session-LIST `now_line` (a short "what's it doing right now" board-tile phrase) and
     # `model` (its current model id) -- both ride the SAME bounded tail read _tail_scan
     # already does for waiting/ended (providers/claude.py), cached in the same mtime-keyed

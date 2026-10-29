@@ -435,6 +435,8 @@ window.CR = window.CR || {};
     // than forking a second resolution formula (see the report).
     theme: { get: getThemePref, set: setThemePref, resolved: resolveTheme },
     icon: icon,
+    // Server-decided read-only view (app.js's trackerReadOnly, from /api/list's X-Read-Only header).
+    readOnly: function () { return typeof trackerReadOnly !== 'undefined' && !!trackerReadOnly; },
     dialog: dialog,
     markdown: markdown,
     fmt: fmt,
@@ -761,16 +763,22 @@ window.CR = window.CR || {};
   // new endpoint, just a third caller of an existing one. Resume when the
   // session is Claude's own (mirrors ext_launch.js's isClaudeId check),
   // otherwise a plain cwd shell.
+  // POST /api/term/open, shared by openExternal and answerSession. Resolves
+  // { ok, status, j } (j = {} when the body isn't JSON); rejects on network failure.
+  function postTermOpen(id, mode) {
+    return fetch('/api/term/open', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: id, mode: mode }),
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
+    });
+  }
+
   on('session:openExternal', function (payload) {
     var id = payload && payload.id;
     if (!id || typeof fetch !== 'function') return;
     var resumable = !/^(auggie|augment-vscode|augment-cursor):/.test(id);
-    fetch('/api/term/open', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session: id, mode: resumable ? 'resume' : 'cwd' }),
-    }).then(function (r) {
-      return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
-    }).then(function (res) {
+    postTermOpen(id, resumable ? 'resume' : 'cwd').then(function (res) {
       if (!res.ok || (res.j && res.j.error)) {
         emit('notify', { text: (res.j && res.j.error) || 'Couldn’t open an external terminal.' });
         return;
@@ -780,6 +788,43 @@ window.CR = window.CR || {};
       emit('notify', { text: 'Couldn’t reach the server to open an external terminal.' });
     });
   });
+
+  // "Waiting on you" tiles: resume the session natively (the server opens the
+  // window on this machine). payload = { id, resumable } — resumable is the
+  // server's own list-row flag, never re-derived from the id here. A remote
+  // caller is refused with 403 {remote:true} (and NOT readonly): fall back to
+  // the in-browser terminal ('session:resume'). Every other failure is notified.
+  function answerSession(payload) {
+    var id = payload && payload.id;
+    if (!id) return;
+    if (ctx.readOnly()) {
+      emit('notify', { text: 'This tracker is shared view-only.' });
+      return;
+    }
+    if (!payload.resumable) {
+      if (window.CR.term && typeof window.CR.term.open === 'function') {
+        window.CR.term.open(id, { mode: 'cwd' });
+      } else {
+        emit('notify', { text: 'Terminal isn’t available right now.' });
+      }
+      return;
+    }
+    if (typeof fetch !== 'function') return;
+    return postTermOpen(id, 'resume').then(function (res) {
+      var j = res.j || {};
+      if (res.ok && !j.error) {
+        emit('notify', { text: 'Resuming in an external window — this machine only.' });
+      } else if (res.status === 403 && j['remote'] && !j['readonly']) {
+        emit('session:resume', { id: id });
+      } else {
+        emit('notify', { text: j.error || 'Couldn’t resume that session.' });
+      }
+    }).catch(function () {
+      emit('notify', { text: 'Couldn’t reach the server to resume that session.' });
+    });
+  }
+  on('session:answer', answerSession);
+  window.CR.answerSession = answerSession;
 
   // Terminal model/effort controls from the detail view — REQUIRED ADDITION,
   // not wired here: cr_term.js's own model/effort switch (_openModelDialog/

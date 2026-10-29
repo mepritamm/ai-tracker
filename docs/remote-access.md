@@ -60,6 +60,37 @@ opt in.
 
 ---
 
+## Read-only mode (sharing a tunnel with friends and colleagues)
+
+Turn this on before you hand someone the tunnel URL. A read-only tracker lets a visitor **look at**
+sessions but not change anything or reach a shell.
+
+- **Enable:** **Config → Tunnel → "Read-only for remote visitors"**, or set `TRACKER_TUNNEL_READONLY=1`
+  in the server's environment (also `true`/`yes`/`on`). The environment variable is a **floor**: while it
+  is set the Config toggle shows as locked and cannot switch it off. Default is **off**, so your own
+  phone's flag / note / pin workflow keeps working until you opt in. It is one global toggle, not a
+  separate guest login.
+- **What it blocks, for every non-local caller:** every `POST` (rename, pin, flags, notes, config,
+  tunnel control, all terminal routes) returns `403` with `{"readonly": true}`, and every `GET` outside
+  a short allow-list (the dashboard, session/search/diff/output views, `/api/flags`, `/api/tunnel`,
+  `/api/config`, and the four `/vendor/` assets) is refused too. That includes `/api/file`,
+  `/api/tunnel/reveal` and the live-terminal routes, so **terminals are fully blocked, viewing included.**
+  `/api/list` sends `X-Read-Only: 1` so the page can hide its write buttons; the `403`s, not the page,
+  are the real gate.
+- **Who counts as "remote":** any caller that is not local — a request carrying a proxy header
+  (`CF-Connecting-IP`, `X-Forwarded-For`, …) **or** one whose peer address is not `127.0.0.1`. So it
+  covers Cloudflare tunnels, ngrok, **Tailscale and plain LAN**. Note that with `HOST=0.0.0.0`, *you*
+  opening the dashboard from the Mac via its own LAN IP (`http://192.168.x.x:8790`) is non-loopback and
+  is read-only too; use `localhost` on the Mac. Likewise your phone is read-only while the mode is on —
+  turn it off from the Mac to edit from the phone.
+- **What it cannot protect:** forwarders that add no proxy header and connect over loopback — `ssh -R`
+  reverse tunnels, VS Code port-forwarding, and similar — look exactly like a local user, so they are
+  **not** read-only. Only expose the tracker through paths you control.
+- **Fails closed:** if `config.json` is unreadable, corrupt, not a JSON object, or holds a non-boolean
+  `TUNNEL_READONLY`, remote callers are treated as read-only. A local caller is never affected.
+
+---
+
 ## Option A — Tailscale (recommended for "on the go")
 
 A free, private WireGuard mesh: only *your* devices can see each other, from anywhere. No public exposure.

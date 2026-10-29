@@ -1001,6 +1001,9 @@ const EXT=[];   // feature modules (web/ext_*.js) push a fn(d); called at the en
 // feature off, or gated off without TRACKER_AUTH) -- a feature module renders that as NO badge,
 // never as "0". Server owns the policy; this file only carries the number, never re-derives it.
 let termCount=null;
+// Read-only tunnel view, read off /api/list's X-Read-Only response header (server owns the policy and
+// enforces it with 403s; this flag only hides controls that would be refused anyway).
+let trackerReadOnly=false;
 const SIDE_EXT=[];   // feature modules push a fn(); called after every SIDEBAR poll (loadSide),
                       // unlike EXT above which only fires while a session is selected (render(d))
 function hl(text,q){
@@ -1257,6 +1260,11 @@ uiState.subscribe(function(key,value){
 // relative to the 6-socket budget and a plain guard recovers immediately once a call returns,
 // slow or not. sideBusy is cleared in `finally` so a rejected/erroring fetch can't wedge it stuck.
 let sideBusy=false;
+// server-decided read-only view; defensive so a bare response can't break the poller. NB: the try below keeps
+// a space before its brace on purpose -- the in-flight-guard test measures from the first unspaced try-brace after sideBusy.
+function applyReadOnly(res){
+  try {trackerReadOnly=res.headers.get("X-Read-Only")==="1";document.documentElement.classList.toggle("tracker-readonly",trackerReadOnly);}catch(e){}
+}
 async function loadSide(){
   if(sideBusy)return;
   sideBusy=true;
@@ -1266,6 +1274,7 @@ async function loadSide(){
     if(t)listNow=+t;
     const tc=res.headers.get("X-Term-Count");   // absent -> null -> no badge (see termCount above)
     termCount=tc!==null?+tc:null;
+    applyReadOnly(res);
     sessions=await res.json();
   }catch(e){return}
   finally{sideBusy=false;}

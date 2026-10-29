@@ -615,3 +615,7 @@ mark{background:var(--amber-deep,rgba(245,180,67,.28));color:var(--text);border-
 .chip.bgchip{cursor:pointer;border-color:var(--amber-line);color:var(--amber)}
 .chip.bgchip b{color:var(--amber)}
 .chip.bgchip:hover{border-color:var(--amber);background:var(--amber-bg)}
+
+/* Read-only view: cosmetic hide of classic-UI write controls (server still 403s). */
+html.tracker-readonly .ren,html.tracker-readonly .pin:not(.on),html.tracker-readonly .addflag,html.tracker-readonly .addnote{display:none!important}
+html.tracker-readonly .pin{pointer-events:none}

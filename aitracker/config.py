@@ -69,6 +69,7 @@ AUGMENT_DIR = os.path.expanduser("~/.augment")
 
 TASKS_DIR = os.path.expanduser("~/.claude/tasks")
 JOBS_DIR = os.path.expanduser("~/.claude/jobs")
+DAEMON_ROSTER = os.path.expanduser("~/.claude/daemon/roster.json")
 
 
 EDIT_TOOLS = {"Edit", "MultiEdit", "NotebookEdit"}
@@ -553,7 +554,7 @@ def snapshot(overrides):
 # without an actual cloudflared child existing. See server.py's POST /api/tunnel/ctl and
 # tunnel.py's module docstring for the rest of the design.
 
-TUNNEL_EDITABLE = ("TUNNEL_URL", "TUNNEL_USER", "TUNNEL_PASS")
+TUNNEL_EDITABLE = ("TUNNEL_URL", "TUNNEL_USER", "TUNNEL_PASS", "TUNNEL_READONLY")
 
 
 def _v_tunnel_url(v):
@@ -578,6 +579,7 @@ TUNNEL_VALIDATORS = {
     "TUNNEL_URL": _v_tunnel_url,
     "TUNNEL_USER": _v_tunnel_user,
     "TUNNEL_PASS": _v_str(500),
+    "TUNNEL_READONLY": _v_bool,
 }
 
 
@@ -598,6 +600,25 @@ def resolve_tunnel_pass(overrides):
     return AUTH.split(":", 1)[1] if ":" in AUTH else ""
 
 
+def tunnel_readonly_env():
+    """Is the TRACKER_TUNNEL_READONLY env floor set? (1/true/yes/on, case-insensitive.)"""
+    return os.environ.get("TRACKER_TUNNEL_READONLY", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def resolve_tunnel_readonly(overrides):
+    """Tunnel read-only mode. The env var is a floor (cannot be switched off from config);
+    otherwise the TUNNEL_READONLY override applies. Fails closed: a non-bool value or a
+    non-dict `overrides` means read-only."""
+    if tunnel_readonly_env():
+        return True
+    if not isinstance(overrides, dict):
+        return True
+    if "TUNNEL_READONLY" in overrides:
+        v = overrides["TUNNEL_READONLY"]
+        return v if isinstance(v, bool) else True
+    return False
+
+
 def tunnel_public(overrides):
     """The Config dialog's default, no-secrets-in-the-response read (GET /api/tunnel): the
     URL (not sensitive) plus only WHETHER a user/password are set -- never the values
@@ -608,6 +629,8 @@ def tunnel_public(overrides):
         "user_set": bool(resolve_tunnel_user(overrides)),
         "pass_set": bool(resolve_tunnel_pass(overrides)),
         "auth_set": bool(AUTH),
+        "readonly": resolve_tunnel_readonly(overrides),
+        "readonly_env": tunnel_readonly_env(),
     }
 
 

@@ -374,6 +374,16 @@ class TestProxiedRequestRefused(_TerminalEnabled):
         self.assertEqual(code, 403)
         self.assertIn("proxied", obj.get("error", ""))
 
+    def test_proxied_refusal_body_has_remote_true(self):
+        """The SPA keys its in-browser resume fallback on `remote: true` (and no `readonly`)."""
+        for h in (_FakeHandler(client_ip="127.0.0.1", headers={"CF-Connecting-IP": "203.0.113.9"}),
+                  _FakeHandler(client_ip="10.0.0.5")):
+            term_launch.open_terminal(h, None, {"session": "abc-123", "mode": "resume"})
+            obj, code = h.calls[-1]
+            self.assertEqual(code, 403)
+            self.assertIs(obj.get("remote"), True)
+            self.assertNotIn("readonly", obj)
+
     def test_plain_loopback_request_is_not_refused_as_proxied(self):
         """Belt and braces must not become a brick: a genuine local fetch still gets past the
         remote check (it fails later, on the session lookup, not with a 403)."""

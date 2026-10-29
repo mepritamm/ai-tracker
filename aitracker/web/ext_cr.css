@@ -487,3 +487,28 @@
 .tracker-next.is-dark .tn-emo-d { color: var(--state-done); }
 .tracker-next.is-dark .tn-emo-n { color: var(--text-thinking); }
 .tracker-next .tn-emo svg { width: calc(1em * var(--ico-scale)); height: calc(1em * var(--ico-scale)); display: inline-block; vertical-align: -0.15em; flex-shrink: 0; }
+
+/* Read-only view (server-decided: app.js toggles html.tracker-readonly from X-Read-Only).
+   Cosmetic only -- the server 403s every write regardless. Scoped under the class, never host-based. */
+html.tracker-readonly .cr-newsession,
+html.tracker-readonly .tracker-next [data-act="open-terminal"],
+html.tracker-readonly .tracker-next [data-act="resume"],
+html.tracker-readonly .tracker-next [data-act="external"],
+html.tracker-readonly .tracker-next [data-act="toggle-flag"],
+html.tracker-readonly .tracker-next [data-act="toggle-note"],
+html.tracker-readonly .tracker-next [data-act="submit-flag"],
+html.tracker-readonly .tracker-next [data-act="rename"],
+html.tracker-readonly .tracker-next [data-act="toggle-pin"],
+html.tracker-readonly .tracker-next [data-act="shell-open"],
+html.tracker-readonly .tracker-next [data-act="run-submit"],
+html.tracker-readonly .tracker-next [data-act="phone-send"],
+html.tracker-readonly .tracker-next .crd-run-row,
+html.tracker-readonly .tracker-next .crd-notecard,
+html.tracker-readonly .tracker-next .cr-tile-action,
+html.tracker-readonly .tracker-next .cr-rail-pin,
+html.tracker-readonly .tracker-next .cr-rail-rename,
+html.tracker-readonly .tracker-next .crd-phone-input { display: none !important; }
+html.tracker-readonly .cr-topbar::after {
+  content: "View only"; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid currentColor; font-size: 11px; opacity: .8; white-space: nowrap;
+}
