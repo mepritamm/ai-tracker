@@ -1260,4 +1260,153 @@ def _run():
         for _v in ("--brand-plate", "--brand-dot"):
             assert _v in _css, "%s must define %s so the mark tints in both themes" % (_name, _v)
 
+    # ---- OpenRouter gateway: gateway_of / launcher / slots / model_meta / label / config /
+    # resume_argv / parse_any meta. Hermetic: the launcher + slot file are temp files, config attrs and
+    # os.environ are restored in finally. Both OpenRouter settings are empty by default.
+    from aitracker import gateway as _gw, registry as _reg, term_gate as _tg
+    from aitracker import util as _ut
+    assert _gw.gateway_of("openai/gpt-6.1-sol") == "openrouter"
+    assert _gw.gateway_of("claude-opus-5-5") == "anthropic" and _gw.gateway_of("opus") == "anthropic"
+    assert _gw.gateway_of(None) == "" and _gw.gateway_of("") == "" and _gw.gateway_of("<synthetic>") == ""
+    assert _ut.model_label("openai/gpt-6.1-sol") == "gpt-6.1-sol (OpenRouter)"
+    assert _ut.model_version("openai/gpt-6.1-sol") is None, "an OpenRouter id has no Anthropic family version"
+
+    _or_keys = ("OR_MODEL_HIGH", "OR_MODEL_MID", "OR_MODEL_LOW")
+    _or_saved = {k: os.environ.get(k) for k in _or_keys}
+    _cfg_saved = {a: getattr(config, a) for a in ("GATEWAY", "OPENROUTER_LAUNCHER", "OPENROUTER_SLOTS_FILE", "PROJECTS")}
+    _or_tmp = tempfile.mkdtemp()
+    try:
+        for k in _or_keys:
+            os.environ.pop(k, None)
+        _launch = os.path.join(_or_tmp, "or-launch")
+        with open(_launch, "w") as _f:
+            _f.write("#!/bin/sh\nexec claude \"$@\"\n")
+        os.chmod(_launch, 0o755)
+        _slots = os.path.join(_or_tmp, "slots.env")
+
+        # unconfigured (the default): launcher refuses, slots are empty, no silent fallback to `claude`
+        config.OPENROUTER_LAUNCHER = config.OPENROUTER_SLOTS_FILE = ""
+        assert _gw.launcher("anthropic") == "claude", "anthropic sessions launch via bare `claude`"
+        try:
+            _gw.launcher("openrouter"); assert False, "an unconfigured OpenRouter launcher must raise"
+        except _gw.GatewayError as _e:
+            assert "not configured" in str(_e)
+        assert _gw.slots() == {} and not _gw.openrouter_configured()
+        config.OPENROUTER_LAUNCHER = _launch
+        assert _gw.launcher("openrouter") == _launch and _gw.openrouter_configured()
+
+        # slots: file-backed, MID<-HIGH, LOW<-MID, quotes + trailing comment stripped
+        config.OPENROUTER_SLOTS_FILE = _slots
+        assert _gw.slots() == {}, "a missing slot file is an empty file"
+        with open(_slots, "w") as _f:
+            _f.write('OR_MODEL_HIGH="openai/gpt-6.1-sol"   # comment\nOR_MODEL_LOW="x/low:floor"\n')
+        assert _gw.slots() == {"opus": "openai/gpt-6.1-sol", "sonnet": "openai/gpt-6.1-sol",
+                               "haiku": "x/low:floor"}, "file values parsed, quotes+trailing comment stripped"
+        os.environ["OR_MODEL_MID"] = "y/mid"                 # process env beats the file
+        os.environ["OR_MODEL_HIGH"] = "z/env-high"
+        assert _gw.slots()["opus"] == "z/env-high" and _gw.slots()["sonnet"] == "y/mid"
+        os.environ.pop("OR_MODEL_MID"); os.environ.pop("OR_MODEL_HIGH")
+        os.environ["OR_MODEL_MID"] = "y/mid"                 # distinct MID so HIGH is unambiguous below
+        _ma = _gw.model_meta("claude-opus-5-5")
+        assert _ma == {"gateway": "anthropic", "model_ladder": ["haiku", "sonnet", "opus", "fable"],
+                       "model_hints": {}, "model_slot": None}, _ma
+        _mo = _gw.model_meta("openai/gpt-6.1-sol")
+        assert _mo["gateway"] == "openrouter" and _mo["model_ladder"] == ["haiku", "sonnet", "opus"]
+        assert _mo["model_hints"] == _gw.slots() and _mo["model_slot"] == "opus", _mo
+        assert _mo["openrouter_configured"] is True
+        assert _gw.model_meta("x/low")["model_slot"] == "haiku", "':floor' suffix ignored when matching a slot"
+        assert _gw.model_meta("nobody/else")["model_slot"] is None
+
+        # parse_any: meta gains the gateway keys; an OpenRouter session never gets a model_update
+        class _FakeProv:
+            def __init__(self, model, prefix=""): self._m = model; self.prefix = prefix
+            def parse(self, sid): return {"id": sid, "meta": {"model": self._m}}
+        _real_pf = _reg.provider_for
+        try:
+            _reg.provider_for = lambda sid: _FakeProv("openai/gpt-6.1-sol")
+            _pm = _reg.parse_any("claude:zz-or-test")["meta"]
+            assert _pm["gateway"] == "openrouter" and _pm["model_slot"] == "opus"
+            assert _pm["model_ladder"] == ["haiku", "sonnet", "opus"] and _pm["model_update"] is None
+            assert _pm["model_label"] == "gpt-6.1-sol (OpenRouter)"
+        finally:
+            _reg.provider_for = _real_pf
+
+        # config: GATEWAY is editable, validated, and applied to the plain module global
+        assert "GATEWAY" in config.EDITABLE and "OPENROUTER_LAUNCHER" in config.EDITABLE
+        _vg = config.VALIDATORS["GATEWAY"]
+        assert _vg("anthropic")[0] and _vg("openrouter")[0] and not _vg("bedrock")[0] and not _vg("")[0]
+        try:
+            config.apply_overrides({"GATEWAY": "openrouter"})
+            assert config.GATEWAY == "openrouter"
+        finally:
+            config.apply_overrides({})
+        assert config.GATEWAY == "anthropic"
+        config.OPENROUTER_LAUNCHER, config.OPENROUTER_SLOTS_FILE = _launch, _slots   # apply_overrides reset them
+
+        # resume_argv: argv[0] follows the session's OWN latest model (read from its transcript
+        # tail), not config.GATEWAY; an unconfigured OpenRouter launcher raises, never `claude`
+        config.PROJECTS = os.path.join(_or_tmp, "projects")
+        os.makedirs(os.path.join(config.PROJECTS, "proj"))
+        def _transcript(sid, *models):
+            with open(os.path.join(config.PROJECTS, "proj", sid + ".jsonl"), "w") as _f:
+                for m in models:
+                    _f.write(json.dumps({"type": "assistant", "message": {"model": m, "role": "assistant",
+                                         "content": [{"type": "text", "text": "hi"}]}}) + "\n")
+        _transcript("s-a", "claude-opus-5-5")
+        _transcript("s-o", "openai/gpt-6.1-sol")
+        _transcript("s-switch", "openai/gpt-6.1-sol", "claude-opus-5-5")
+        assert _tg.resume_argv("s-a") == ["claude", "--resume", "s-a"]
+        assert _tg.resume_argv("s-o") == [_launch, "--resume", "s-o"], "an OpenRouter session resumes via the launcher"
+        assert _tg.resume_argv("s-switch")[0] == "claude", "the LATEST model decides"
+        assert _tg.resume_argv("unknown")[0] == "claude", "unknown session falls back to claude"
+        config.OPENROUTER_LAUNCHER = ""
+        assert _tg.resume_argv("s-a")[0] == "claude", "anthropic resume is unaffected by the OpenRouter setting"
+        try:
+            _tg.resume_argv("s-o"); assert False, "unconfigured launcher must refuse an OpenRouter resume"
+        except _gw.GatewayError:
+            pass
+        config.OPENROUTER_LAUNCHER = _launch
+
+        os.environ.pop("OR_MODEL_MID", None)
+        # F3: undecodable bytes in the env file never raise
+        with open(_slots, "wb") as _f:
+            _f.write(b'OR_MODEL_HIGH="a/b"\n\xe9\n')
+        assert _gw.slots()["opus"] == "a/b", "a stray non-UTF-8 byte must not break slots()"
+        # F4a: a SET-but-empty env var beats the file, and with no HIGH there are no slots
+        with open(_slots, "w") as _f:
+            _f.write('OR_MODEL_HIGH="from/file"\n')
+        os.environ["OR_MODEL_HIGH"] = ""
+        assert _gw.slots() == {}, "empty env var overrides the file; nothing resolves, nothing is invented"
+        os.environ.pop("OR_MODEL_HIGH")
+        # F4b: ALL whitespace stripped, not just the ends
+        with open(_slots, "w") as _f:
+            _f.write('OR_MODEL_HIGH="openai/ gpt-6.1-sol"\n')
+        assert _gw.slots()["opus"] == "openai/gpt-6.1-sol", "inner whitespace stripped"
+        # F4c: a model matching several slots is ambiguous -> no slot claimed
+        with open(_slots, "w") as _f:
+            _f.write('OR_MODEL_HIGH="m/one"\nOR_MODEL_MID="m/one"\nOR_MODEL_LOW="m/two"\n')
+        assert _gw.model_meta("m/one")["model_slot"] is None, "matches opus AND sonnet -> ambiguous -> None"
+        assert _gw.model_meta("m/two")["model_slot"] == "haiku", "a unique match still names its slot"
+
+        # F5: server-owned resume command string (unprefixed provider only; None when unconfigured)
+        try:
+            _reg.provider_for = lambda sid: _FakeProv("openai/gpt-6.1-sol")
+            assert _reg.parse_any("zz-or")["meta"]["resume_cmd"] == _launch + " --resume zz-or"
+            config.OPENROUTER_LAUNCHER = ""
+            assert _reg.parse_any("zz-or")["meta"]["resume_cmd"] is None, "unconfigured -> no command to offer"
+            _reg.provider_for = lambda sid: _FakeProv("claude-opus-5-5")
+            assert _reg.parse_any("zz-an")["meta"]["resume_cmd"] == "claude --resume zz-an"
+            _reg.provider_for = lambda sid: _FakeProv("claude-opus-5-5", prefix="auggie:")
+            assert "resume_cmd" not in _reg.parse_any("auggie:zz")["meta"], "non-Claude sessions get no resume_cmd"
+        finally:
+            _reg.provider_for = _real_pf
+    finally:
+        for k, v in _or_saved.items():
+            if v is None: os.environ.pop(k, None)
+            else: os.environ[k] = v
+        for a, v in _cfg_saved.items():
+            setattr(config, a, v)
+        import shutil as _sh
+        _sh.rmtree(_or_tmp, ignore_errors=True)
+
     print("selfcheck ok")

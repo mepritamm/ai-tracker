@@ -845,6 +845,9 @@
     TERM_IDLE_TTL_MIN: 'TRACKER_TERM_IDLE_TTL_MIN',
     TERMINAL: 'TRACKER_TERMINAL',
     TERM_APP: 'TRACKER_TERM_APP',
+    GATEWAY: null,       // ditto — no env var, config.json > built-in default
+    OPENROUTER_LAUNCHER: null,
+    OPENROUTER_SLOTS_FILE: null,
     TERM_ALLOW: 'TRACKER_TERM_ALLOW',
     PORT: 'PORT',
     HOST: 'HOST',
@@ -1318,6 +1321,21 @@
           function (value, onCommit) {
             return segmented([['Terminal', 'Terminal'], ['iTerm', 'iTerm']], value || 'Terminal', onCommit);
           }));
+        body.appendChild(serverRow('Model gateway', 'GATEWAY',
+          'Where new Claude sessions are sent: Anthropic directly, or OpenRouter via the OpenRouter launcher command. Resumed sessions always reopen on the gateway they ran on.',
+          function (value, onCommit) {
+            return segmented([['anthropic', 'Anthropic'], ['openrouter', 'OpenRouter']], value || 'anthropic', onCommit);
+          }));
+        // server-owned flag (never re-derived here): shown only when the server says the launcher isn't usable
+        if (srv.cfg && srv.cfg.OPENROUTER_CONFIGURED === false) {
+          body.appendChild(h('p', { class: 'cr-help-note' }, ['OpenRouter: launcher not configured']));
+        }
+        body.appendChild(serverRow('OpenRouter launcher', 'OPENROUTER_LAUNCHER',
+          'Command or path of a wrapper that exports OpenRouter env vars and execs claude. Needed for the OpenRouter gateway (new and resumed sessions). Empty = not configured.',
+          function (value, onCommit) { return textFieldCtl(value || '', function (v) { onCommit(String(v).trim()); }); }));
+        body.appendChild(serverRow('OpenRouter slot file', 'OPENROUTER_SLOTS_FILE',
+          'Path to an env file with OR_MODEL_HIGH / OR_MODEL_MID / OR_MODEL_LOW lines; shows which model each /model slot maps to. Empty = no hints.',
+          function (value, onCommit) { return textFieldCtl(value || '', function (v) { onCommit(String(v).trim()); }); }));
         body.appendChild(serverRow('Command allowlist', 'TERM_ALLOW',
           'One argv prefix per line; replaces the default set outright. Leave empty to use the built-in default set.',
           function (value, onCommit) {
@@ -2290,7 +2308,8 @@
         ladder.forEach(function (v) {
           list.appendChild(h('button', {
             class: 'cr-btn cr-fullrow' + (v === payload.current ? ' cr-btn-solid' : ' cr-btn-quiet'),
-            type: 'button', text: v, onclick: function () { pick(v); },
+            type: 'button', text: (kind === 'model' && payload.hints && payload.hints[v]) ? v + ' \u2192 ' + payload.hints[v] : v,
+            onclick: function () { pick(v); },
           }));
         });
         chrome.body.appendChild(list);

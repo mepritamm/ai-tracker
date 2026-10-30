@@ -2196,13 +2196,8 @@
     btn.title = "Switch model — types /model <name> into the CLI";
     var dd = document.createElement("div");
     dd.className = "vtmodeldd";
-    MODEL_LADDER.forEach(function (name) {
-      var item = document.createElement("div");
-      item.className = "vtmodelitem";
-      item.textContent = name;
-      item.setAttribute("data-model", name);
-      dd.appendChild(item);
-    });
+    this.modelDd = dd;
+    this._setModelItems(MODEL_LADDER, null);
     modelWrap.appendChild(btn);
     modelWrap.appendChild(dd);
     switchers.appendChild(modelWrap);
@@ -2300,6 +2295,24 @@
   ContextBar.prototype._focusTerminal = function () {
     var input = this.getInput && this.getInput();
     if (input) { try { input.focus(); } catch (e) { } }
+  };
+
+  // (Re)build the dropdown's .vtmodelitem rows from a slot ladder + optional slot->model-id hints.
+  // Only touches .vtmodelitem children, so the model-update notice node is left alone. Clicks are
+  // delegated on the dd (data-model), so rebuilt rows need no re-wiring.
+  ContextBar.prototype._setModelItems = function (ladder, hints) {
+    var key = ladder.join(",") + "|" + ladder.map(function (n) { return (hints && hints[n]) || ""; }).join(",");
+    if (key === this._modelItemsKey) return;
+    this._modelItemsKey = key;
+    var dd = this.modelDd, old = dd.querySelectorAll(".vtmodelitem");
+    for (var i = 0; i < old.length; i++) dd.removeChild(old[i]);
+    ladder.forEach(function (name) {
+      var item = document.createElement("div");
+      item.className = "vtmodelitem";
+      item.textContent = (hints && hints[name]) ? name + " \u2192 " + hints[name] : name;
+      item.setAttribute("data-model", name);
+      dd.appendChild(item);
+    });
   };
 
   ContextBar.prototype._openModelDropdown = function () {
@@ -2404,7 +2417,9 @@
 
   ContextBar.prototype._applySessionData = function (d) {
     var meta = (d && d.meta) || {};
-    this.currentModel = _matchLadderModel(meta.model);
+    // OpenRouter: the server owns the slot (model_slot); never re-derive one from a vendor/model id.
+    this.currentModel = meta.model_slot || (meta.gateway === "openrouter" ? null : _matchLadderModel(meta.model));
+    if (this.modelDd) this._setModelItems(Array.isArray(meta.model_ladder) ? meta.model_ladder : MODEL_LADDER, meta.model_hints || null);
     // The model name is transcript-derived, so it goes in as TEXT and the chevron as a NODE --
     // never concatenated into an HTML string (see icoEl's comment at the top of this file).
     if (this.modelBtn) _textThenIcon(this.modelBtn, (this.currentModel || "model") + " ", 'chevron-down');

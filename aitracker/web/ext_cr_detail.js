@@ -2000,14 +2000,15 @@
           var isModel = act === "terminal-model";
           var meta2 = ui.lastSession.meta || {};
           ctx.dialog(isModel ? "model" : "effort", {
-            current: isModel ? shortModel(meta2.model) : (meta2.effort || null),
+            current: isModel ? (meta2.model_slot || (meta2.gateway === "openrouter" ? null : shortModel(meta2.model))) : (meta2.effort || null),
             // model-update-nudge: server-owned display label + update notice (meta.model_label/
             // meta.model_update, providers/*.py) — this file never derives either itself, just
             // hands them through to the shared picker (ext_cr_dialogs.js renderLadderPicker).
             currentLabel: isModel ? (meta2.model_label || null) : undefined,
             update: isModel ? (meta2.model_update || null) : undefined,
             sessionId: sid,
-            ladder: isModel ? MODEL_LADDER : EFFORT_LADDER,
+            ladder: isModel ? (meta2.model_ladder || MODEL_LADDER) : EFFORT_LADDER,
+            hints: isModel ? (meta2.model_hints || null) : undefined,
             onPick: function (val) {
               _injectToTerminal(ctx, ttyMe, "/" + (isModel ? "model" : "effort") + " " + val,
                 isModel ? "Couldn’t switch model" : "Couldn’t switch effort");

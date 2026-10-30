@@ -518,6 +518,8 @@ def model_label(mid):
     rm = real_model(mid)
     if not rm:
         return ""
+    if "/" in rm:  # OpenRouter "vendor/model[:suffix]" id
+        return rm.rsplit("/", 1)[1].split(":", 1)[0] + " (OpenRouter)"
     tag = ""
     m = _MODEL_BRACKET_RE.search(rm)
     if m:

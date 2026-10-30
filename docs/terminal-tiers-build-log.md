@@ -37,7 +37,7 @@
    verifies on its own spare port and kills only the PID it started.
 4. **Tier 1's host gate carries a comment** marking it a deliberate, user-approved exception to
    the no-host-gating rule in `.claude/rules/conventions.md`, so a later reader does not "fix" it.
-5. **`personal` remote only** — `advisor360` is archived.
+5. **`personal` remote only** — the former work-org remote is archived.
 
 ## Model assignment (rule 3: cheapest tier that can do the leg)
 
@@ -196,7 +196,7 @@ reviewer would have been disproportionate here.
 
 ## PR mechanics decided
 
-Remotes confirmed: `personal` (git@github-personal:mepritamm/ai-tracker.git) and `advisor360`
+Remotes confirmed: `personal` (git@github-personal:mepritamm/ai-tracker.git) and the former work-org remote
 (archived — **skipping**, per the standing note).
 
 Branches are auto-named `worktree-agent-<id>`, which is unreadable in a PR list. Rather than
@@ -497,7 +497,7 @@ The suites were not wrong; they tested what was written. The adversarial passes 
    on their base.
 2. Agents read the plan by absolute path (untracked, so invisible inside a worktree).
 3. No agent may run `make serve` or `pkill` (live dashboard, PID 26364, port 8787).
-4. `personal` remote only — `advisor360` is archived.
+4. `personal` remote only — the former work-org remote is archived.
 5. Branches pushed under human-readable refspecs rather than renaming checked-out branches.
 6. **`cat`/`ls` confined to the session cwd** — a narrowing of a default the plan approved.
 7. **`-c` banned anywhere in git argv** — also refuses the legitimate `git log -c`.
@@ -573,7 +573,7 @@ Both tiers work end-to-end on the merged tree.
 - liveness: `/api/list` carries the server clock
 - `tracker-push` skill rewritten for a single remote + both skills installed as symlinks
 
-## Skills reconciled + advisor360 retired
+## Skills reconciled + work-org remote retired
 
 **My premise was backwards.** I assumed the repo skill copy was authoritative because it is
 version-controlled. In fact:
@@ -592,10 +592,10 @@ cannot drift again. Backups of the pre-existing globals in `scratchpad/skills-ba
 `tracker-add-contributor`). So the authoritative copy is NOT in git and will not survive a fresh
 clone. **User's call: leave it ignored.** `tracker-gap` IS tracked.
 
-**advisor360 retired, per the user's decision:**
-- `.git/hooks/pre-push` DELETED — it existed solely to block a LICENSE reaching advisor360, so
+**work-org remote retired, per the user's decision:**
+- `.git/hooks/pre-push` DELETED — it existed solely to block a LICENSE reaching the former work-org remote, so
   removing the block removed the hook's entire purpose. Backup: `scratchpad/pre-push.backup`.
-- `git remote remove advisor360` — remote and all `refs/remotes/advisor360/*` gone.
+- the former work-org remote was removed (`git remote remove <name>`), with all its `refs/remotes/<name>/*`.
 - `.git/hooks/pre-commit` (the `make check` gate) deliberately PRESERVED.
 - **10 local `a360/*` branches LEFT ALONE** — now ordinary local branches with no upstream.
   Deleting branches is destructive and was not asked for; `git branch -d` will refuse any holding

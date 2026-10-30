@@ -1926,7 +1926,7 @@ window.CR = window.CR || {};
       // a new element — a short form here, e.g. "opus 4.8", with the raw id
       // only in the row's full tooltip (titleAttr below), per the "rail rows
       // are tight" instruction.
-      var mdl = modelShort(s.model);
+      var mdl = (s.gateway === 'openrouter' && s.model_label) ? s.model_label : modelShort(s.model);
       var dirLine = [dir, mdl].filter(Boolean).join(' · ');
       // `s.snippet` only exists on a decorated search-hit object (never on a
       // real list-dict session) — falls back to the prompt/title tooltip
@@ -2764,7 +2764,7 @@ window.CR = window.CR || {};
       // Model is subordinate metadata, tacked onto the SAME trailing strip
       // rather than a new visual element -- absent whenever the session's
       // last-known model is unknown (never "unknown", never a placeholder).
-      var mdl = modelShort(s.model);
+      var mdl = (s.gateway === 'openrouter' && s.model_label) ? s.model_label : modelShort(s.model);
       if (mdl) trailing += ' · ' + mdl;
       head.appendChild(h('span', { class: 'cr-tile-meta', title: s.model || null }, [trailing]));
       return head;

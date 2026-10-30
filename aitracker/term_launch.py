@@ -27,7 +27,7 @@ import re
 import shlex
 import subprocess
 
-from . import server, term_gate
+from . import gateway, server, term_gate
 
 TERM_APPS = ("Terminal", "iTerm")   # TRACKER_TERM_APP; anything else falls back to Terminal
 
@@ -196,7 +196,11 @@ def open_terminal(handler, parsed, body) -> None:
     # same seam term_vt.open_pty uses for its PTY argv -- see term_gate.resume_argv's
     # docstring for why this hands a COPY of a live agent's conversation rather than
     # attaching to it.
-    resume_argv = term_gate.resume_argv(sid) if mode == "resume" else None
+    try:
+        resume_argv = term_gate.resume_argv(sid) if mode == "resume" else None
+    except gateway.GatewayError as e:     # nothing is launched
+        handler._json({"error": str(e), "openrouter_configured": False}, 400)
+        return
     script = build_script(cwd, sid, mode, app, resume_argv)
     try:
         subprocess.run(["osascript", "-e", script], check=True, timeout=10,

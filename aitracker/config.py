@@ -155,7 +155,7 @@ BIND_HOST = "127.0.0.1"
 #      "cannot import name ... from partially initialized module" the instant config.py
 #      tries to pull a name from store at ITS top level.
 #
-# LIVE_WINDOW, TERM_RENDERER, MAX_TERMS and TERMINAL stay ordinary, freely-reassignable
+# LIVE_WINDOW, TERM_RENDERER, MAX_TERMS, TERMINAL and GATEWAY stay ordinary, freely-reassignable
 # module globals — NOT a PEP 562 dynamic attribute. That design was tried and reverted:
 # this codebase's existing test suite has ~15 files that repoint these directly
 # (`config.TERMINAL = True`, `config.MAX_TERMS = 3`, `config.TERM_RENDERER = "grid"`) and
@@ -202,7 +202,7 @@ CONFIG_FILE = os.path.join(_HERE, "config.json")
 # TRACKER_AUTH is deliberately not a member.
 EDITABLE = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL",
             "TERM_APP", "TERM_ALLOW", "PORT", "HOST", "ICON_STYLE", "ICON_SCALE",
-            "TERM_IDLE_TTL_MIN")
+            "TERM_IDLE_TTL_MIN", "GATEWAY", "OPENROUTER_LAUNCHER", "OPENROUTER_SLOTS_FILE")
 
 # Keys that only bind at process startup -- the dialog labels these "takes effect on
 # restart" and never claims a live apply for them.
@@ -255,6 +255,9 @@ VALIDATORS = {
     "PORT":          _v_int(1, 65535),
     "HOST":          _v_str(255),
     "ICON_STYLE":    _v_enum(("icons", "emoji", "text")),
+    "GATEWAY":       _v_enum(("anthropic", "openrouter")),  # launcher for NEW sessions only; resumes keep their own
+    "OPENROUTER_LAUNCHER":   _v_str(1024),      # empty string clears (= not configured)
+    "OPENROUTER_SLOTS_FILE": _v_str(1024),
     # Percent int, not a float: it fits the existing _v_int validator and the existing
     # integer slider control in the Config dialog with zero new machinery. 75..200% covers
     # "a bit smaller" to "twice as big" without letting a typo shrink icons to nothing or
@@ -424,6 +427,30 @@ def resolve_icon_style(overrides):
     return "icons"
 
 
+def resolve_gateway(overrides):
+    """Which launcher a NEW Claude session uses: "anthropic" (`claude`) or "openrouter" (the
+    configured OpenRouter launcher). Resumes follow the session's own recorded gateway
+    regardless of this setting. No env var -- config.json > built-in default "anthropic",
+    which keeps an unconfigured install unchanged."""
+    if "GATEWAY" in overrides and overrides["GATEWAY"] in ("anthropic", "openrouter"):
+        return overrides["GATEWAY"]
+    return "anthropic"
+
+
+def resolve_openrouter_launcher(overrides):
+    """Command or path of the OpenRouter launcher (a wrapper that exports OpenRouter env vars and
+    execs `claude`). No env var -- config.json only; built-in default is EMPTY = not configured."""
+    v = overrides.get("OPENROUTER_LAUNCHER")
+    return v.strip() if isinstance(v, str) else ""
+
+
+def resolve_openrouter_slots_file(overrides):
+    """Path of the OpenRouter slot file (`OR_MODEL_HIGH/MID/LOW=` lines). config.json only;
+    built-in default is EMPTY = no slot hints."""
+    v = overrides.get("OPENROUTER_SLOTS_FILE")
+    return v.strip() if isinstance(v, str) else ""
+
+
 def resolve_icon_scale(overrides):
     """Icon size as an integer percent of the sprite's native size (75..200). No env var --
     config.json > built-in default. Default 100 is exactly today's size, so an unconfigured
@@ -464,13 +491,17 @@ _RESOLVERS = {
     "HOST": resolve_host,
     "ICON_STYLE": resolve_icon_style,
     "ICON_SCALE": resolve_icon_scale,
+    "GATEWAY": resolve_gateway,
+    "OPENROUTER_LAUNCHER": resolve_openrouter_launcher,
+    "OPENROUTER_SLOTS_FILE": resolve_openrouter_slots_file,
 }
 
-# The four keys that ALSO exist as a plain, freely-reassignable module attribute (see the
-# big module comment above for why these four specifically, and why a PEP 562 dynamic
+# The seven keys that ALSO exist as a plain, freely-reassignable module attribute (see the
+# big module comment above for why these specifically, and why a PEP 562 dynamic
 # attribute was reverted in favour of this).
 _PLAIN_ATTR_KEYS = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL",
-                    "TERM_IDLE_TTL_MIN")
+                    "TERM_IDLE_TTL_MIN", "GATEWAY", "OPENROUTER_LAUNCHER",
+                    "OPENROUTER_SLOTS_FILE")
 
 # Seeded here from env/default ONLY (an explicit `{}`, never a file read) -- this module has
 # no filesystem access of its own (see the big comment above), so at its own import time
@@ -482,12 +513,15 @@ TERM_RENDERER = resolve_term_renderer({})
 MAX_TERMS = resolve_max_terms({})
 TERMINAL = resolve_terminal({})
 TERM_IDLE_TTL_MIN = resolve_term_idle_ttl_min({})
+GATEWAY = resolve_gateway({})
+OPENROUTER_LAUNCHER = resolve_openrouter_launcher({})
+OPENROUTER_SLOTS_FILE = resolve_openrouter_slots_file({})
 
 
 def apply_overrides(overrides):
     """Given the CURRENT config.json content (`overrides` -- the caller, server.py, reads it
     via store._load_json(CONFIG_FILE, {}); config.py never touches store, see the module
-    comment above), repoint the plain LIVE_WINDOW/TERM_RENDERER/MAX_TERMS/TERMINAL globals
+    comment above), repoint the plain LIVE_WINDOW/TERM_RENDERER/MAX_TERMS/TERMINAL/GATEWAY/OPENROUTER_* globals
     and refresh the TERM_APP/TERM_ALLOW os.environ mirror. Called by server.py at real
     startup (run()) and at the top of every GET/POST /api/config, so both a browser-made
     change and a hand-edited config.json apply immediately, no restart, without this module
@@ -500,7 +534,7 @@ def apply_overrides(overrides):
 
 def get(key, overrides):
     """Effective value of an EDITABLE key, given the config.json content the CALLER already
-    loaded (`overrides`). LIVE_WINDOW/TERM_RENDERER/MAX_TERMS/TERMINAL read the plain module
+    loaded (`overrides`). LIVE_WINDOW/TERM_RENDERER/MAX_TERMS/TERMINAL/GATEWAY/OPENROUTER_* read the plain module
     attribute directly (globals()[key]) -- exactly what term_gate.py/term_vt.py already do
     -- so this reports precisely what those call sites would see, including a value a test
     repointed directly for its own purposes. TERM_APP/TERM_ALLOW/PORT/HOST have no such

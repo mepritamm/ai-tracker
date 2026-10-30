@@ -19,7 +19,7 @@ import time
 import unittest
 from unittest import mock
 
-from aitracker import config, term_gate, term_vt
+from aitracker import config, gateway, term_gate, term_vt
 from aitracker.term_vt import Screen
 
 
@@ -5662,3 +5662,116 @@ class TestStartingClearedByBackstop(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGatewayLaunch(_ResumeModeRoutes):
+    """The OpenRouter launcher is user-configured and EMPTY by default: opening or resuming an
+    OpenRouter session without it is a 400 with the reason and spawns nothing."""
+
+    def setUp(self):
+        super().setUp()
+        self._cfg0 = (config.GATEWAY, config.OPENROUTER_LAUNCHER, config.OPENROUTER_SLOTS_FILE)
+        self.tmpd = tempfile.mkdtemp()
+        self.launcher = os.path.join(self.tmpd, "or-launch")
+        with open(self.launcher, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(self.launcher, 0o755)
+        config.GATEWAY, config.OPENROUTER_LAUNCHER, config.OPENROUTER_SLOTS_FILE = "anthropic", "", ""
+
+    def tearDown(self):
+        config.GATEWAY, config.OPENROUTER_LAUNCHER, config.OPENROUTER_SLOTS_FILE = self._cfg0
+        super().tearDown()
+
+    @staticmethod
+    def _await_typed(h, injected, timeout=5):
+        """Wait (bounded) for the Enter that ends the typed launcher line, when the open succeeded."""
+        deadline = time.time() + timeout
+        while b"\r" not in b"".join(injected) and h.calls[-1][1] == 200 and time.time() < deadline:
+            time.sleep(0.02)
+
+    def _open(self, body):
+        """open_pty with spawn + injection faked; returns (handler, spawn_calls, injected_bytes)."""
+        spawned, injected = [], []
+        h = _FakeHandler()
+        with mock.patch.object(term_vt, "spawn", side_effect=lambda cwd, argv, c, r: spawned.append(argv)
+                               or term_vt.Pty(tid="gw-%d" % len(spawned))), \
+             mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True), \
+             mock.patch.object(term_vt, "_inject_write", side_effect=lambda pt, d: injected.append(d) or True):
+            term_vt.open_pty(h, None, dict(body, cwd=self.tmpd))
+            # A fresh folder shell is started by a background thread (one terminal per session),
+            # so the launcher line is typed after open_pty returns; wait for it while faked.
+            self._await_typed(h, injected)
+        return h, spawned, b"".join(injected)
+
+    def test_pty_new_openrouter_unconfigured_is_400_and_spawns_nothing(self):
+        h, spawned, injected = self._open({"mode": "new", "gateway": "openrouter"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 400)
+        self.assertIn("not configured", obj["error"])
+        self.assertIs(obj["openrouter_configured"], False)
+        self.assertEqual((spawned, injected), ([], b""))
+
+    def test_pty_resume_openrouter_unconfigured_is_400(self):
+        spawned = []
+        h = _FakeHandler()
+        with mock.patch.object(term_gate, "resume_argv", side_effect=gateway.GatewayError("not configured x")), \
+             mock.patch.object(term_vt, "spawn", side_effect=lambda *a: spawned.append(a)):
+            term_vt.open_pty(h, None, {"session": "or-sid", "mode": "resume"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 400)
+        self.assertEqual(obj, {"error": "not configured x", "openrouter_configured": False})
+        self.assertEqual(spawned, [])
+
+    def test_pty_new_follows_config_gateway(self):
+        config.OPENROUTER_LAUNCHER = self.launcher
+        config.GATEWAY = "openrouter"
+        h, _, injected = self._open({"mode": "new"})
+        self.assertEqual(h.calls[-1][1], 200)
+        self.assertIn(self.launcher.encode(), injected)
+        config.GATEWAY = "anthropic"
+        d2 = tempfile.mkdtemp()
+        h2 = _FakeHandler()
+        inj2 = []
+        with mock.patch.object(term_vt, "spawn", side_effect=lambda *a: term_vt.Pty(tid="gw-an")), \
+             mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True), \
+             mock.patch.object(term_vt, "_inject_write", side_effect=lambda pt, d: inj2.append(d) or True):
+            term_vt.open_pty(h2, None, {"mode": "new", "cwd": d2})
+            self._await_typed(h2, inj2)
+        self.assertRegex(b"".join(inj2), rb"(^|\s)claude(\s|\r|$)")
+        self.assertNotIn(self.launcher.encode(), b"".join(inj2))
+
+    def test_pty_new_body_gateway_overrides_and_invalid_ignored(self):
+        config.OPENROUTER_LAUNCHER = self.launcher        # config.GATEWAY stays anthropic
+        h, _, injected = self._open({"mode": "new", "gateway": "openrouter"})
+        self.assertEqual(h.calls[-1][1], 200)
+        self.assertIn(self.launcher.encode(), injected)
+        d2 = tempfile.mkdtemp()
+        h2, inj2 = _FakeHandler(), []
+        with mock.patch.object(term_vt, "spawn", side_effect=lambda *a: term_vt.Pty(tid="gw-bad")), \
+             mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True), \
+             mock.patch.object(term_vt, "_inject_write", side_effect=lambda pt, d: inj2.append(d) or True):
+            term_vt.open_pty(h2, None, {"mode": "new", "cwd": d2, "gateway": "bedrock"})   # ignored -> config
+            self._await_typed(h2, inj2)
+        self.assertEqual(h2.calls[-1][1], 200)
+        self.assertNotIn(self.launcher.encode(), b"".join(inj2))
+
+    def test_retry_with_fork_gateway_error_feeds_note_and_clears_starting(self):
+        pt = _bare_pty(tid="gwr1")
+        pt.starting = True
+        buf = io.StringIO()
+        with mock.patch.object(term_gate, "resume_argv", side_effect=gateway.GatewayError("launcher cleared")), \
+             mock.patch.object(term_vt, "_fork_child") as fork, \
+             contextlib.redirect_stdout(buf):
+            term_vt._retry_with_fork(pt, "or-sid", 80, 24)
+        fork.assert_not_called()
+        self.assertFalse(pt.starting)
+        joined = " ".join(" ".join(t for _, t, _ in pt.screen.snapshot(-1)["rows"]).split())
+        self.assertIn("launcher cleared", joined)
+
+    def test_retry_with_fork_keeps_or_launcher(self):
+        pt = _bare_pty(tid="gwr2")
+        with mock.patch.object(term_gate, "resume_argv", return_value=[self.launcher, "--resume", "or-sid"]), \
+             mock.patch.object(term_vt, "_fork_child", return_value=(1, 2)) as fork, \
+             mock.patch.object(term_vt.threading, "Thread"):
+            term_vt._retry_with_fork(pt, "or-sid", 80, 24)
+        self.assertEqual(fork.call_args[0][1], [self.launcher, "--resume", "or-sid", "--fork-session"])

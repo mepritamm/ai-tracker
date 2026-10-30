@@ -125,7 +125,7 @@ host alias already resolves to `mepritamm`, so `git push` itself is fine.
 
 Route the PR + merge through `/tracker-push` (CLAUDE.md: never a manual push) rather than switching
 the global `gh` active account, which is shared machine state other sessions can observe.
-Per stored memory, the advisor360 remote is archived — personal half only.
+Per stored memory, the former work-org remote is archived — personal half only.
 
 ## Three live-path defects caught at INTEGRATION, after a green gate
 

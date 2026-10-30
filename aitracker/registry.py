@@ -1,5 +1,7 @@
+import shlex
 import time
 
+from . import config
 from .providers.claude import ClaudeProvider
 from .providers.auggie import AuggieProvider
 from .providers.augment_ext import AugmentVscodeProvider, AugmentCursorProvider
@@ -7,6 +9,7 @@ from .providers.augment_ext import AugmentVscodeProvider, AugmentCursorProvider
 # line-by-line (`^(import |from )`), so a wrapped import leaves its tail behind and
 # `make bundle` emits a file that won't parse.
 from .store import load_pins, load_notes, load_flags, load_forks, resolve_fork_child, fork_parent_of, load_model_keep, load_titles, load_title_sync
+from .gateway import gateway_of, model_meta, or_launcher
 from .util import annotate_liveness, model_version, model_label
 from .overview import empty_heartbeat
 
@@ -86,6 +89,8 @@ def all_sessions():
     for s in out:
         sid = s.get("id", "")
         s["pinned"] = sid in pins
+        s["gateway"] = gateway_of(s.get("model"))
+        s["model_label"] = model_label(s.get("model"))
         s["note_count"] = len(notes.get(sid, []))
         s["open_flags"] = open_flags.get(sid, 0)  # 🚩 badge + the cross-session flag list
         s["flag_text"] = flag_text.get(sid)       # the badge's text, or None when open_flags is 0
@@ -238,8 +243,15 @@ def parse_any(sid):
     if isinstance(meta, dict):
         meta["model_label"] = model_label(meta.get("model"))
         meta["model_update"] = None
+        meta.update(model_meta(meta.get("model")))   # gateway/model_ladder/model_hints/model_slot
+        if p is not None and p.prefix == "":   # Claude sessions only (the unprefixed provider)
+            if meta.get("gateway") == "openrouter":
+                lau, _err = or_launcher()      # None when unconfigured: no command to offer
+                meta["resume_cmd"] = (shlex.quote(lau) + " --resume " + sid) if lau else None
+            else:
+                meta["resume_cmd"] = "claude --resume " + sid
         cur = model_version(meta.get("model"))
-        if cur:
+        if cur and meta.get("gateway") != "openrouter":   # nudge is Anthropic-family logic
             family, cur_ver = cur
             newest_id = newest_models().get(family)
             newest_ver = model_version(newest_id) if newest_id else None

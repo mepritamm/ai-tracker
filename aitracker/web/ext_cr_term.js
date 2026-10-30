@@ -89,6 +89,10 @@
     model: null,
     modelLabel: null,    // server's meta.model_label — display string, prefer over `model`
     modelUpdate: null,   // server's meta.model_update — {id,label,current_label} | null
+    gateway: null,       // server's meta.gateway — "openrouter" disables the client-side slot fallback
+    modelSlot: null,     // server's meta.model_slot — authoritative current /model slot (gateway-aware)
+    modelLadder: null,   // server's meta.model_ladder — slots /model accepts on this gateway
+    modelHints: null,    // server's meta.model_hints — slot -> real model id
     effort: null,
     ctx: null,           // {current, limit, pct} | null — readContextUsage() shape
     cumulative: 0,
@@ -433,6 +437,10 @@
     st.model = null;
     st.modelLabel = null;
     st.modelUpdate = null;
+    st.gateway = null;
+    st.modelSlot = null;
+    st.modelLadder = null;
+    st.modelHints = null;
     st.effort = null;
     st.ctx = null;
     st.cumulative = 0;
@@ -954,11 +962,12 @@
   // via the SAME public route ContextBar._pickModel/_pickEffort already use directly. ========
   function _openModelDialog() {
     ctx.dialog("model", {
-      current: st.model,
+      current: st.modelSlot || (st.gateway === "openrouter" ? null : st.model),
       currentLabel: st.modelLabel,
       update: st.modelUpdate,
       sessionId: st.sessionId,
-      ladder: modelLadder(),
+      ladder: st.modelLadder || modelLadder(),
+      hints: st.modelHints,
       onPick: function (name) { _injectSlash("/model " + name, "Couldn't switch model"); },
     });
   }
@@ -1085,9 +1094,10 @@
         el.resumeHere.hidden = !resumable;
         el.extResume.hidden = !resumable || !localOnly();
         if (resumable) {
-          st.resumeCmd = "claude --resume " + sid;
-          el.resumecmd.textContent = st.resumeCmd;
-          el.resumecmd.hidden = false;
+          // server owns the launcher name; an explicit null (OpenRouter unconfigured) means "none to show"
+          if ("resume_cmd" in m) { st.resumeCmd = m.resume_cmd; } else { st.resumeCmd = "claude --resume " + sid; }
+          el.resumecmd.textContent = st.resumeCmd || "";
+          el.resumecmd.hidden = !st.resumeCmd;
         } else {
           el.resumecmd.hidden = true;
         }
@@ -1118,6 +1128,10 @@
     // re-derivation here, same as the ladder-match above is a heuristic FALLBACK for `model`.
     st.modelLabel = meta.model_label || null;
     st.modelUpdate = meta.model_update || null;
+    st.gateway = meta.gateway || null;
+    st.modelSlot = meta.model_slot || null;
+    st.modelLadder = meta.model_ladder || null;
+    st.modelHints = meta.model_hints || null;
     st.effort = (typeof meta.effort === "string" && meta.effort) ? meta.effort : null;
     st.ctx = _readContextUsage(d);
     st.cumulative = (d && d.tokens) ? ((d.tokens.in | 0) + (d.tokens.out | 0)) : 0;

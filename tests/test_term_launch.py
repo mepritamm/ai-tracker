@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from aitracker import config, term_gate, term_launch
+from aitracker import config, gateway, term_gate, term_launch
 
 
 def _iter_named_functions(src):
@@ -460,6 +460,24 @@ class TestSidShapeAtTheRoute(_TerminalEnabled):
         script = run.call_args[0][0][-1]
         self.assertIn("claude --resume abc-123", script)
         self.assertNotIn("abc-123.jsonl", script)
+
+
+class TestOpenTerminalGatewayError(_TerminalEnabled):
+    def test_open_terminal_openrouter_unconfigured_is_400(self):
+        with mock.patch.object(term_gate, "session_cwd", return_value="/tmp"), \
+             mock.patch.object(term_launch, "_is_claude", return_value=True), \
+             mock.patch.object(term_gate, "resume_argv", side_effect=gateway.GatewayError("not configured x")), \
+             mock.patch.object(term_launch.subprocess, "run") as run:
+            h = _FakeHandler()
+            term_launch.open_terminal(h, None, {"session": "abc-123", "mode": "resume"})
+        self.assertEqual(h.calls[-1], ({"error": "not configured x", "openrouter_configured": False}, 400))
+        run.assert_not_called()
+
+    def test_build_script_or_resume_chain(self):
+        script = term_launch.build_script("/tmp", "abcdef12-0000", "resume", "Terminal",
+                                          ["/x/or-launch", "--resume", "abcdef12-0000"])
+        self.assertIn("(/x/or-launch --resume abcdef12-0000 || claude attach abcdef12 || "
+                      "/x/or-launch --resume abcdef12-0000 --fork-session)", script)
 
 
 class TestBodyShape(_TerminalEnabled):

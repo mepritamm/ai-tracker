@@ -26,7 +26,7 @@ Follow-up answers:
 | C3 | Use `claude attach <short>` rather than a fork copy | not-discharged |
 | C4 | Add evals/tests so this cannot regress silently | not-discharged |
 | C5 | `make check` green (`env -u TRACKER_AUTH make check`) | not-discharged |
-| C6 | `/tracker-push` — push to `personal` only (advisor360 archived) | not-discharged |
+| C6 | `/tracker-push` — push to `personal` only (former work-org remote archived) | not-discharged |
 
 ## Root cause (established, not assumed)
 

@@ -44,7 +44,7 @@ User follow-up (verbatim): "incase the adversial review found real issues in the
 
 ## Head-out contract (user answers, 2026-10-29)
 User note (verbatim): "make sure you dont assume too much and make decisions on behalf of me"
-- Push: /tracker-push → `personal` only (advisor360 archived), only after a clean opus re-review.
+- Push: /tracker-push → `personal` only (the former work-org remote archived), only after a clean opus re-review.
 - Live check: worktree server on a separate free port, stopped by PID; never touch the user's :8787.
 - Product-decision findings: fix the clear bugs, PARK the judgment calls and HOLD the push.
 - Delete the stale `~/.pyenv/shims/.pyenv-shim` (user-approved).

@@ -5,6 +5,7 @@ from . import config                       # referenced live (config.AUTH) so te
 from . import tunnel                       # runtime tunnel switch -- see tunnel.py's module docstring
 from .config import LIVE_WINDOW, NARR_PAGE
 from .page import build_page
+from .gateway import openrouter_configured
 from .registry import all_sessions, parse_any, search_all, search_session, drill, _attached_pty
 from .store import load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, save_model_keep, load_title_sync, save_title_sync, _load_json, _save_json
 # TITLES_FILE/PINS_FILE (below) are referenced live as config.TITLES_FILE/config.PINS_FILE at
@@ -420,6 +421,7 @@ class Handler(BaseHTTPRequestHandler):
             # reads this to show honestly whether TRACKER_AUTH is currently configured --
             # never the value itself, same "set"/"not set" contract that row has always had.
             snap["AUTH_SET"] = bool(config.AUTH)
+            snap["OPENROUTER_CONFIGURED"] = openrouter_configured()   # server-owned: the Config dialog never re-derives it
             self._json(snap)
         elif p.path == "/api/tunnel":
             # Config dialog's Tunnel section, default read: URL (not sensitive) plus only

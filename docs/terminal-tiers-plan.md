@@ -424,7 +424,7 @@ budget the emulator separately from the plumbing.
 ## 6. Cross-cutting rules for all three sessions
 
 1. **Worktree, always.** `EnterWorktree` off local **HEAD** (there is no `origin`; the remotes are
-   `personal` and `advisor360`, and advisor360 is archived). No in-place edits on the primary
+   `personal` and the former work-org remote, and the former work-org remote is archived). No in-place edits on the primary
    checkout — concurrent sessions share it.
 2. **Restart to see anything.** `page.build_page()` bakes `web/*` at server start. After any
    `aitracker/**` or `web/**` edit, `make serve`. Only `flags/titles/pins/notes.json` are live.

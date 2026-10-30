@@ -280,8 +280,31 @@ def resume_argv(sid):
     session, but that's an interactive picker with no argv that could drive it
     non-interactively. Between "refuse to open a terminal at all" and "open one on a
     deliberate copy", this picks the copy -- and callers should say so where they surface
-    the result (a fork was the trade-off, not a mistake)."""
-    return ["claude", "--resume", sid]
+    the result (a fork was the trade-off, not a mistake).
+
+    GATEWAY: argv[0] follows the gateway the session LAST RAN ON (its latest recorded
+    model, via gateway.gateway_of), NOT the configured default `config.GATEWAY` -- a session
+    that ran through OpenRouter must resume via the configured OpenRouter launcher, and plain
+    `claude` would break it. Raises gateway.GatewayError when that launcher isn't usable (callers
+    report it; it never degrades to `claude`). A transcript lookup failure alone falls back to "claude"."""
+    return [_launcher_for(sid), "--resume", sid]
+
+
+def _launcher_for(sid):
+    """argv[0] for resuming `sid`, from its LATEST real model: the 96 KB tail first (O(1)); a full
+    parse only when the tail holds no assistant turn. Never the capped list. gateway.GatewayError
+    propagates (the caller reports it) -- it must never degrade to plain `claude`, which would
+    resume an OpenRouter session on Anthropic."""
+    from . import gateway
+    try:
+        from .providers import claude as _claude
+        path = _claude.find_session(sid)
+        model = (_claude._tail_scan(path).get("model") or "") if path else ""
+        if path and not model:
+            model = ((_claude.parse_session(path) or {}).get("meta") or {}).get("model") or ""
+    except Exception:
+        return "claude"                    # lookup failure only; never reached for a gateway error
+    return gateway.launcher(gateway.gateway_of(model))   # may raise gateway.GatewayError
 
 
 _ATTACH_HINT_RE = re.compile(r"claude attach ([0-9a-fA-F]{4,})")
@@ -353,8 +376,8 @@ def attach_target(output, sid="") -> str:
 
 def attach_argv(target):
     """The argv for `claude attach <target>`, mirroring resume_argv() above -- both are
-    bare `"claude"` (no resolved-binary helper exists in this file for resume_argv() to
-    share, so there's nothing to reuse here either). Returns [] if `target` is falsy, so
+    bare `"claude"` (attach targets an already-running process, so the launcher/gateway
+    never applies). Returns [] if `target` is falsy, so
     a caller that got "" from attach_target() can check truthiness of ONE thing (the argv)
     rather than re-checking the target it already asked for."""
     if not target:

@@ -186,7 +186,7 @@ import threading
 import time
 import uuid
 
-from . import config, server, store, term_gate, term_run
+from . import config, gateway, server, store, term_gate, term_run
 # Circular by design, exactly like term_run's own import of `server` -- see that module's
 # docstring comment. server.py's bottom-of-file loader imports this module by name, and this
 # module registers its routes back into server.EXTRA_GET/EXTRA_POST. Safe because those two dicts
@@ -2341,7 +2341,14 @@ def _retry_with_fork(pt, sid, cols, rows):
     On a FOLDER pty nothing is forked: the retry is typed into the shared shell instead
     (`_folder_retype`), the same reader keeps reading, and everything else -- the pre-exec
     snapshot, `forked`, `record_fork`, the note, the `starting` clear -- is unchanged."""
-    argv = term_gate.resume_argv(sid)
+    try:
+        argv = term_gate.resume_argv(sid)
+    except gateway.GatewayError as e:     # the launcher setting was cleared mid-resume
+        _feed_note(pt, "[ai-tracker] note: " + str(e))
+        with pt.lock:
+            pt.starting = False
+        print("[ai-tracker] terminal %s: resume retry for session %s abandoned: %s" % (pt.id, sid, e))
+        return
     if "--fork-session" not in argv:
         argv.append("--fork-session")
     # The line every genuine background-agent resume now prints once, since Option A no longer
@@ -2844,7 +2851,7 @@ def open_pty(handler, parsed, body):
     `mode` follows term_launch's own naming (`"cwd"` = a plain login shell in the session's
     working directory; `"resume"` = `claude --resume <sid>` (see `term_gate.resume_argv` for
     when this gains `--fork-session`); `"new"` = a fresh Claude session with `argv =
-    ["claude"]` borrowing the session's cwd) so the three buttons this route serves stay
+    [gateway.launcher(config.GATEWAY)]` (overridable by an optional body `gateway`) borrowing the session's cwd) so the three buttons this route serves stay
     consistent with Tier 1's. `"resume"` is refused for a non-Claude session id, exactly like
     term_launch.open_terminal -- see `_is_claude`. `"new"` is accepted for any session id (Claude
     or Auggie/etc.) because it merely borrows the working directory to start a fresh conversation.
@@ -2968,10 +2975,17 @@ def open_pty(handler, parsed, body):
     rows = _clamp_int(body.get("rows"), MIN_ROWS, MAX_ROWS, DEFAULT_ROWS)
     forked = False
     if mode == "resume":
-        argv = term_gate.resume_argv(sid)   # today always ["claude", "--resume", sid] -- no
-        forked = "--fork-session" in argv   # proactive fork; see term_gate.resume_argv's docstring
+        try:   # [launcher, "--resume", sid] -- no proactive fork; see term_gate.resume_argv's docstring
+            argv = term_gate.resume_argv(sid)
+        except gateway.GatewayError as e:     # nothing is spawned or claimed
+            return handler._json({"error": str(e), "openrouter_configured": False}, 400)
+        forked = "--fork-session" in argv
     elif mode == "new":
-        argv = ["claude"]
+        gw = body.get("gateway")   # optional per-open override of config.GATEWAY; other values ignored
+        try:
+            argv = [gateway.launcher(gw if gw in (gateway.ANTHROPIC, gateway.OPENROUTER) else config.GATEWAY)]
+        except gateway.GatewayError as e:
+            return handler._json({"error": str(e), "openrouter_configured": False}, 400)
     else:
         argv = None                          # "cwd" IS the folder shell; nothing to type into it
     shell_argv = [os.environ.get("SHELL", "/bin/bash"), "-l"]
@@ -3609,6 +3623,8 @@ def _foreground_is_claude(fd):
     if out.returncode != 0:
         return False
     comm = os.path.basename((out.stdout or "").strip()).lower()
+    # Known gap: a fresh OpenRouter-launcher terminal reads "bash" for its first moments and that is
+    # cached for FG_CACHE_TTL, so the model switcher can stay hidden for up to ~5s after start.
     with _FG_CACHE_LOCK:
         if pgid not in _FG_CACHE and len(_FG_CACHE) >= FG_CACHE_MAX:
             _FG_CACHE.pop(next(iter(_FG_CACHE)), None)  # oldest entry -- bound growth, not precise LRU

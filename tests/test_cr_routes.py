@@ -37,7 +37,8 @@ _PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "VSCODE_WS_ROOT", "CURSO
           "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "NOTES_FILE", "TASKS_DIR", "PORT_FILE",
           "TOKEN_FILE", "CONFIG_FILE", "FORKS_FILE")
 
-_CFG_ATTRS = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL", "TERM_IDLE_TTL_MIN")
+_CFG_ATTRS = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL", "TERM_IDLE_TTL_MIN",
+              "GATEWAY", "OPENROUTER_LAUNCHER", "OPENROUTER_SLOTS_FILE")
 
 
 
@@ -591,3 +592,176 @@ class TestServedPageNotHostGated(_ServerCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# =============================================================================
+# 6. Model gateway (Anthropic | OpenRouter) -- config round trip, session meta, page rows
+# =============================================================================
+
+def _write_claude_model(sid, model):
+    """A Claude session whose one assistant turn records `message.model` -- the field the
+    gateway is derived from (a `vendor/model` id means OpenRouter)."""
+    d = os.path.join(config.PROJECTS, "proj")
+    os.makedirs(d, exist_ok=True)
+    lines = [
+        {"type": "user", "cwd": "/x", "message": {"role": "user", "content": "go"}},
+        {"type": "assistant", "timestamp": "2026-06-22T10:00:00Z",
+         "message": {"role": "assistant", "model": model,
+                      "content": [{"type": "text", "text": "ok"}]}},
+    ]
+    with open(os.path.join(d, sid + ".jsonl"), "w") as fh:
+        for o in lines:
+            fh.write(json.dumps(o) + "\n")
+
+
+def _mk_exec(name="or-launcher"):
+    path = os.path.join(tempfile.mkdtemp(), name)
+    with open(path, "w") as fh:
+        fh.write("#!/bin/sh\nexit 0\n")
+    os.chmod(path, 0o755)
+    return path
+
+
+_GW_META_KEYS = ("gateway", "model_ladder", "model_hints", "model_slot", "model_label",
+                 "model_update", "resume_cmd")
+
+
+class TestGatewayEndToEnd(_ServerCase):
+    """GET/POST /api/config for the gateway keys, the session meta every provider returns,
+    the PTY-open refusal and the served Config rows. CONFIG_FILE is a temp path (see
+    _empty_env), and the three keys are in _CFG_ATTRS so a POST never leaks across tests."""
+
+    def test_gateway_config_round_trip(self):
+        st, j = self._get_json("/api/config")
+        self.assertEqual(j["GATEWAY"], {"value": "anthropic", "overridden": False, "restart": False})
+        st, j = self._post("/api/config", {"key": "GATEWAY", "value": "openrouter"})
+        self.assertEqual(st, 200)
+        self.assertEqual(j, {"ok": True, "key": "GATEWAY", "value": "openrouter", "restart": False})
+        self.assertEqual(config.GATEWAY, "openrouter")
+        self.assertEqual(json.load(open(config.CONFIG_FILE))["GATEWAY"], "openrouter")
+        st, j = self._get_json("/api/config")
+        self.assertEqual(j["GATEWAY"], {"value": "openrouter", "overridden": True, "restart": False})
+
+    def test_gateway_invalid_value_rejected_never_reaches_disk(self):
+        for bad in ("bedrock", "", True, 3):
+            st, j = self._post("/api/config", {"key": "GATEWAY", "value": bad})
+            self.assertEqual(st, 400, bad)
+            self.assertEqual(j, {"error": "invalid value for GATEWAY"})
+        self.assertFalse(os.path.exists(config.CONFIG_FILE))
+        self.assertEqual(config.GATEWAY, "anthropic")
+        for key in ("OPENROUTER_LAUNCHER", "OPENROUTER_SLOTS_FILE"):
+            st, j = self._post("/api/config", {"key": key, "value": 5})
+            self.assertEqual(st, 400, key)
+            st, j = self._post("/api/config", {"key": key, "value": "x" * 2000})
+            self.assertEqual(st, 400, key)
+        self.assertFalse(os.path.exists(config.CONFIG_FILE))
+
+    def test_openrouter_launcher_and_slots_round_trip_and_configured_flag(self):
+        st, j = self._get_json("/api/config")
+        self.assertIs(j["OPENROUTER_CONFIGURED"], False)
+        self.assertEqual(j["OPENROUTER_LAUNCHER"]["value"], "")
+        self.assertEqual(j["OPENROUTER_SLOTS_FILE"]["value"], "")
+        # a launcher path that does not exist is stored but is NOT configured
+        self._post("/api/config", {"key": "OPENROUTER_LAUNCHER", "value": "/nonexistent/launcher"})
+        self.assertIs(self._get_json("/api/config")[1]["OPENROUTER_CONFIGURED"], False)
+        lau = _mk_exec()
+        st, j = self._post("/api/config", {"key": "OPENROUTER_LAUNCHER", "value": lau})
+        self.assertEqual(j, {"ok": True, "key": "OPENROUTER_LAUNCHER", "value": lau, "restart": False})
+        slots = os.path.join(tempfile.mkdtemp(), "slots.env")
+        st, j = self._post("/api/config", {"key": "OPENROUTER_SLOTS_FILE", "value": slots})
+        self.assertEqual(st, 200)
+        st, j = self._get_json("/api/config")
+        self.assertIs(j["OPENROUTER_CONFIGURED"], True)
+        self.assertEqual(j["OPENROUTER_LAUNCHER"], {"value": lau, "overridden": True, "restart": False})
+        self.assertEqual(j["OPENROUTER_SLOTS_FILE"], {"value": slots, "overridden": True, "restart": False})
+        self.assertEqual(json.load(open(config.CONFIG_FILE))["OPENROUTER_LAUNCHER"], lau)
+        self._post("/api/config", {"key": "OPENROUTER_LAUNCHER", "value": ""})
+        self.assertIs(self._get_json("/api/config")[1]["OPENROUTER_CONFIGURED"], False)
+
+    def _meta(self, sid):
+        st, j = self._get_json("/api/session?id=" + urllib.parse.quote(sid))
+        self.assertEqual(st, 200)
+        return j["meta"]
+
+    def test_session_meta_gateway_fields_openrouter_and_anthropic(self):
+        _write_claude_model("or-sess", "openai/gpt-6.1-sol")
+        _write_claude_model("an-sess", "claude-sonnet-4-6")
+        m = self._meta("or-sess")
+        self.assertEqual(m["gateway"], "openrouter")
+        self.assertEqual(m["model_ladder"], ["haiku", "sonnet", "opus"])
+        self.assertEqual(m["model_hints"], {})
+        self.assertIsNone(m["model_slot"])
+        self.assertIs(m["openrouter_configured"], False)
+        self.assertIsNone(m["resume_cmd"])                  # unconfigured: no command to offer
+        self.assertEqual(m["model_label"], "gpt-6.1-sol (OpenRouter)")
+        self.assertIsNone(m["model_update"])                # the newer-model nudge is Anthropic-only
+        a = self._meta("an-sess")
+        self.assertEqual(a["gateway"], "anthropic")
+        self.assertEqual(a["model_ladder"], ["haiku", "sonnet", "opus", "fable"])
+        self.assertEqual(a["model_hints"], {})
+        self.assertEqual(a["resume_cmd"], "claude --resume an-sess")
+        self.assertNotIn("openrouter_configured", a)
+        # configured: slot file + launcher flip the OpenRouter meta, Anthropic is untouched
+        lau = _mk_exec()
+        slots = os.path.join(tempfile.mkdtemp(), "slots.env")
+        with open(slots, "w") as fh:
+            fh.write("OR_MODEL_HIGH=openai/gpt-6.1-sol\nOR_MODEL_LOW=vendor/small\n")
+        self._post("/api/config", {"key": "OPENROUTER_LAUNCHER", "value": lau})
+        self._post("/api/config", {"key": "OPENROUTER_SLOTS_FILE", "value": slots})
+        m2 = self._meta("or-sess")
+        self.assertIs(m2["openrouter_configured"], True)
+        self.assertEqual(m2["resume_cmd"], lau + " --resume or-sess")
+        self.assertEqual(m2["model_hints"], {"opus": "openai/gpt-6.1-sol", "sonnet": "openai/gpt-6.1-sol",
+                                              "haiku": "vendor/small"})
+        self.assertIsNone(m2["model_slot"])                  # opus and sonnet share it: ambiguous
+        self.assertEqual({k: self._meta("an-sess")[k] for k in _GW_META_KEYS},
+                         {k: a[k] for k in _GW_META_KEYS})
+
+    def test_session_meta_gateway_fields_other_providers(self):
+        _write_auggie("aug-1", "An auggie session")
+        m = self._meta("auggie:aug-1")
+        self.assertEqual(m["model_hints"], {})
+        self.assertNotIn("resume_cmd", m)                    # Claude-only
+        self.assertIsNone(m["model_slot"])
+        self.assertIsNone(m["model_update"])
+        self.assertIn(m["gateway"], ("", "anthropic"))
+
+    def test_list_carries_gateway_for_every_provider(self):
+        _write_claude_model("or-sess", "openai/gpt-6.1-sol")
+        _write_claude_model("an-sess", "claude-sonnet-4-6")
+        _write_auggie("aug-1", "An auggie session")
+        st, rows = self._get_json("/api/list")
+        self.assertEqual(st, 200)
+        by = {r["id"]: r for r in rows}
+        self.assertEqual(by["or-sess"]["gateway"], "openrouter")
+        self.assertEqual(by["or-sess"]["model_label"], "gpt-6.1-sol (OpenRouter)")
+        self.assertEqual(by["an-sess"]["gateway"], "anthropic")
+        self.assertTrue(rows and all("gateway" in r and "model_label" in r for r in rows))
+
+    def test_pty_and_external_open_report_unconfigured(self):
+        cwd = tempfile.mkdtemp()
+        st, j = self._post("/api/term/pty", {"cwd": cwd, "mode": "new", "gateway": "openrouter"})
+        if st == 403:
+            self.skipTest("terminal tier gated in this environment: %s" % j.get("error"))
+        self.assertEqual(st, 400)
+        self.assertIn("not configured", j["error"])
+        self.assertIs(j["openrouter_configured"], False)
+        # the setting alone (no per-open override) refuses the same way
+        config.GATEWAY = "openrouter"
+        st, j = self._post("/api/term/pty", {"cwd": cwd, "mode": "new"})
+        self.assertEqual(st, 400)
+        self.assertIn("not configured", j["error"])
+
+    def test_page_has_gateway_rows_without_host_gating(self):
+        st, body = self._get("/")
+        self.assertEqual(st, 200)
+        page = body.decode("utf-8", "replace")
+        self.assertIn("serverRow('Model gateway', 'GATEWAY'", page)
+        self.assertIn("serverRow('OpenRouter launcher', 'OPENROUTER_LAUNCHER'", page)
+        self.assertIn("serverRow('OpenRouter slot file', 'OPENROUTER_SLOTS_FILE'", page)
+        a = page.index("serverRow('Model gateway'")
+        b = page.index("serverRow('Command allowlist'", a)
+        sl = page[a:b]
+        self.assertNotIn("location.hostname", sl)
+        self.assertNotIn("localOnly", sl)
+        self.assertNotIn("isLocalhost", sl)

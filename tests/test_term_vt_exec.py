@@ -4630,5 +4630,87 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         self.assertIsNone(result["handleTty"])
 
 
+def _extract_ladder_picker():
+    from tests.test_model_update_nudge import _extract_function
+    with open(os.path.join(_WEB, "ext_cr_dialogs.js"), encoding="utf-8") as fh:
+        return _extract_function(fh.read(), "renderLadderPicker")
+
+
+class TestContextBarGatewayLadder(unittest.TestCase):
+    """The model button/picker render the SERVER's slot (`meta.model_slot`) and never re-derive one
+    from a `vendor/model` id on an OpenRouter session (conventions: server owns policy)."""
+
+    _SCRIPT_TAIL = """
+function run(meta) {
+  var container = document.createElement('div');
+  var bar = new ContextBar(container, 'sid1', 'tty1', 'cwd', function () { return null; });
+  // the shared mock's querySelectorAll returns [] so rebuilt rows would pile up (mock artifact)
+  bar.modelDd.querySelectorAll = function (sel) {
+    return bar.modelDd.children.filter(function (c) { return c.className === sel.slice(1); });
+  };
+  bar._applySessionData({ meta: meta, tokens: { in: 0, out: 0 } });
+  bar._openModelDropdown();
+  var items = bar.modelDd.children.filter(function (c) { return c.className === 'vtmodelitem'; });
+  return {
+    items: items.map(function (c) { return c.textContent; }),
+    cur: items.filter(function (c) { return c.classList.contains('cur'); }).map(function (c) { return c.getAttribute('data-model'); }),
+    button: bar.modelBtn.textContent.trim(),
+  };
+}
+var out = {
+  withHints: run({ gateway: 'openrouter', model: 'p/h', model_slot: 'opus',
+    model_ladder: ['haiku', 'sonnet', 'opus'], model_hints: { haiku: 'x/l', sonnet: 'd/m', opus: 'p/h' } }),
+  orNoHints: run({ gateway: 'openrouter', model: 'anthropic/claude-sonnet-4.6', model_slot: null,
+    model_ladder: ['haiku', 'sonnet', 'opus'], model_hints: {} }),
+  anthropic: run({ gateway: 'anthropic', model: 'claude-opus-5-5', model_slot: 'opus',
+    model_ladder: ['haiku', 'sonnet', 'opus', 'fable'], model_hints: {} }),
+  older: run({ model: 'claude-sonnet-4-6' }),
+};
+console.log(JSON.stringify(out));
+"""
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_slot_from_server_never_rederived_on_openrouter(self):
+        script = (_HARNESS_PRELUDE + _CONTEXT_BAR_MOCKS + _ESC_SRC + _CONTEXT_BAR_HELPERS_SRC
+                  + _CONTEXT_BAR_SRC + self._SCRIPT_TAIL)
+        r = _run_node(script)
+        self.assertEqual(r["withHints"]["items"], ["haiku → x/l", "sonnet → d/m", "opus → p/h"])
+        self.assertEqual(r["withHints"]["cur"], ["opus"])
+        self.assertEqual(r["withHints"]["button"], "opus")
+        self.assertEqual(r["orNoHints"]["items"], ["haiku", "sonnet", "opus"])
+        self.assertEqual(r["orNoHints"]["button"], "model")
+        self.assertEqual(r["orNoHints"]["cur"], [])
+        self.assertEqual(len(r["anthropic"]["items"]), 4)
+        self.assertIn("fable", r["anthropic"]["items"])
+        self.assertEqual(len(r["older"]["items"]), 4)
+        self.assertEqual(r["older"]["button"], "sonnet")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_ladder_picker_buttons_and_current(self):
+        script = """
+'use strict';
+var DEFAULT_EFFORT_LADDER = [], _ctx = null, lastBody = null;
+function close() {}
+function modelUpdateNotice() { return null; }
+function h(tag, attrs, kids) { return { tag: tag, attrs: attrs || {}, kids: kids || [], appendChild: function (k) { this.kids.push(k); } }; }
+function buildChrome() { lastBody = h('div'); return { body: lastBody, backdrop: {}, panel: {} }; }
+""" + _extract_ladder_picker() + """
+function btns(payload) {
+  renderLadderPicker('model')(payload);
+  return lastBody.kids[0].kids.map(function (b) { return [b.attrs.text, b.attrs.class.indexOf('cr-btn-solid') !== -1]; });
+}
+var ladder = ['haiku', 'sonnet', 'opus'];
+console.log(JSON.stringify({
+  hints: btns({ ladder: ladder, current: 'opus', hints: { haiku: 'a', sonnet: 'b', opus: 'c' } }),
+  empty: btns({ ladder: ladder, current: null, hints: {} }),
+  absent: btns({ ladder: ladder, current: 'sonnet' }),
+}));
+"""
+        r = _run_node(script)
+        self.assertEqual(r["hints"], [["haiku → a", False], ["sonnet → b", False], ["opus → c", True]])
+        self.assertEqual(r["empty"], [["haiku", False], ["sonnet", False], ["opus", False]])
+        self.assertEqual(r["absent"], [["haiku", False], ["sonnet", True], ["opus", False]])
+
+
 if __name__ == "__main__":
     unittest.main()

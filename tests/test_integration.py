@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 import aitracker.config as config
 from aitracker import server as _server
@@ -1596,6 +1597,55 @@ class TestBundle(unittest.TestCase):
         p = os.path.join(tempfile.mkdtemp(), "d.json")
         ns["_save_json"](p, {"a": 1})
         self.assertTrue(os.path.exists(p))
+
+    def test_bundle_openrouter_meta_works(self):
+        # The OpenRouter path (slots() -> shlex.split) must run inside the standalone bundle; it
+        # raised NameError: shlex because HEADER omitted gateway.py's import. The bundle flattens
+        # config.X to a plain global, and runpy returns a COPY of the globals, so the slot-file
+        # path is set on the function's own __globals__ (the dict slots() actually reads).
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        slot_file = os.path.join(d, "slots.env")
+        with open(slot_file, "w") as f:
+            f.write("OR_MODEL_HIGH=acme/high-1\nOR_MODEL_MID=acme/mid-1\nOR_MODEL_LOW=acme/low-1\n")
+        ns = runpy.run_path(self.dist, run_name="tracker_bundle_smoke_gw")
+        ns["slots"].__globals__["OPENROUTER_SLOTS_FILE"] = slot_file
+        with mock.patch.dict(os.environ):
+            for k in ("OR_MODEL_HIGH", "OR_MODEL_MID", "OR_MODEL_LOW"):
+                os.environ.pop(k, None)
+            self.assertEqual(ns["slots"]()["opus"], "acme/high-1")
+            meta = ns["model_meta"]("acme/high-1")
+        self.assertEqual(meta["gateway"], "openrouter")
+        self.assertEqual(meta["model_slot"], "opus")
+
+    def test_bundle_header_covers_every_stdlib_import(self):
+        # strip_module() drops every top-level import from each inlined module and HEADER must
+        # re-bind them all; a missing name is a NameError on first use (gateway.py's shlex).
+        def bound(line):
+            out = set()
+            m = re.match(r'^import (.+)$', line)
+            if m:
+                for part in m.group(1).split(","):
+                    out.add(part.strip().split(" as ")[-1].split(".")[0])
+            m = re.match(r'^from (?!\.)(\S+) import (.+)$', line)
+            if m:
+                for part in m.group(2).split(","):
+                    out.add(part.strip().split(" as ")[-1].strip())
+            return out
+
+        ns = runpy.run_path(os.path.join(self.root, "scripts", "bundle.py"),
+                            run_name="bundle_header_check")
+        header_names = set()
+        for line in ns["HEADER"].splitlines():
+            header_names |= bound(line)
+        missing = []
+        for rel in ns["ORDER"]:
+            with open(os.path.join(self.root, "aitracker", rel)) as f:
+                for line in f.read().splitlines():
+                    if re.match(r'^(import |from (?!\.))', line):
+                        for name in sorted(bound(line) - header_names):
+                            missing.append("%s: %s" % (rel, name))
+        self.assertEqual(missing, [], "HEADER must re-import every stdlib name the modules use")
 
 
 class TestCoverageGaps(unittest.TestCase):
