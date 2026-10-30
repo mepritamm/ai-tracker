@@ -51,4 +51,4 @@ The page is assembled from `web/*` **at server startup** (`page.build_page`). Af
 - **Edit the sources (`aitracker/`, `web/`), never `dist/tracker.py`** — it's generated. Re-read a region before editing (multiple sessions touch this repo).
 
 ## Skills (`.claude/skills/`)
-`/tracker-gap` (add a capability at the seam), `/fix-flags` (resolve a 🚩), `/tracker-push` (PR to both remotes, license-split).
+`/tracker-gap` (add a capability at the seam), `/fix-flags` (resolve a 🚩), `/tracker-push` (direct push of the worktree branch to `personal/main` — single remote, no PR).
