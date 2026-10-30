@@ -1915,6 +1915,26 @@ class TestTerminalModalTitleIsUppercase(unittest.TestCase):
         self.assertNotIn('document.title = "Terminal — ', self.src)
         self.assertNotIn('document.title = "TERMINAL — AI Tracker";', self.src)
 
+    def test_standalone_title_comes_from_term_list_row_title(self):
+        # Server owns the label: the tab reads `title` off its own tty's /api/term/list row on the
+        # render tick; the "TERMINAL — " string above is only the fallback until that answers.
+        body = _body_until(self.src, "function refreshStandaloneTitle()", ["function render(d)"])
+        self.assertIn('fetch("/api/term/list")', body)
+        self.assertIn("String(t.tty) === String(standaloneTty)", body)
+        self.assertIn('typeof t.title === "string" && t.title', body)
+        self.assertIn("standaloneTitle = t.title;", body)
+        self.assertIn("titleBusy", body)
+        self.assertIn("standaloneTty = tty;", self.src)
+        render = _body_until(self.src, "function render(d)", ["EXT.push(render)"])
+        self.assertIn("refreshStandaloneTitle();", render)
+        # (a) boot fetches the label once itself: the sidebar poll may never succeed.
+        boot = _body_until(self.src, "standaloneTty = tty;", ['mount.classList.add("vtfull")'])
+        self.assertIn("refreshStandaloneTitle();", boot)
+        # (b) the final .then resets titleBusy BEFORE the loop, so a throw can't wedge it.
+        final = body[body.index(".then(function (j)"):]
+        self.assertLess(final.index("titleBusy = false"), final.index("for (var i"))
+        self.assertIn("t && String(t.tty)", final)
+
     def test_standalone_title_survives_app_js_own_two_second_retitle(self):
         # app.js's render() does `document.title = title + " · tracker"` on EVERY poll, and it
         # keeps polling in the standalone tab -- so a title written only at boot is clobbered

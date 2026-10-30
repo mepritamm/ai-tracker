@@ -3890,10 +3890,38 @@
   // ⤢-opened tab ends up wearing the sidebar session's name instead of its own. EXT hooks run at
   // the very END of that same render (app.js ~1330), so this re-assert is the last write of each
   // tick and wins without app.js needing to know this mode exists.
+  // Title = the server-owned row.title of this tty in /api/term/list (refreshed from render());
+  // "TERMINAL — …" set by bootStandalone() is only the fallback until the list answers.
   var standaloneTitle = null;
+  var standaloneTty = null, titleBusy = false, titleAt = 0;
+
+  // Standalone only: pull this tty's server label. One request in flight, at most one per ~2s.
+  function refreshStandaloneTitle() {
+    var now = Date.now();
+    if (titleBusy || !standaloneTty || now - titleAt < 2000) return;
+    titleBusy = true; titleAt = now;
+    fetch("/api/term/list")
+      .then(function (r) { return r.ok ? r.json().catch(function () { return {}; }) : {}; })
+      .catch(function () { return {}; })
+      .then(function (j) {
+        titleBusy = false;   // first, so a throw below can't wedge the title for the tab's life
+        var terms = (j && j.terminals) || [];
+        for (var i = 0; i < terms.length; i++) {
+          var t = terms[i];
+          if (t && String(t.tty) === String(standaloneTty)) {
+            if (typeof t.title === "string" && t.title) {
+              standaloneTitle = t.title;
+              document.title = standaloneTitle;
+            }
+            break;
+          }
+        }
+      });
+  }
 
   function render(d) {
     if (document.documentElement.classList.contains("vt-standalone")) {
+      refreshStandaloneTitle();
       if (standaloneTitle && document.title !== standaloneTitle) document.title = standaloneTitle;
       return;   // that mode owns #ext_vt itself
     }
@@ -3938,6 +3966,7 @@
     }
     if (!tty) return;
     document.documentElement.classList.add("vt-standalone");
+    standaloneTty = tty;
     // Identify WHICH session this tab is, exactly like the modal's own header does
     // (modalTitleEl, in openVT) -- multiple standalone tabs are the whole point of the "⤢ New
     // tab" button, and a constant title makes them indistinguishable in the tab strip. `sid` is
@@ -3946,6 +3975,9 @@
     // only written here, because app.js's poll rewrites document.title every 2s.
     standaloneTitle = "TERMINAL — " + (mode === "resume" ? "resume · " : "") + (sid || "tty " + tty);
     document.title = standaloneTitle;
+    // Don't wait for app.js's sidebar poll (render() only runs after a successful /api/session):
+    // fetch the server label once now. titleAt starts at 0, so the 2s throttle can't block this.
+    refreshStandaloneTitle();
     var mount = document.getElementById("ext_vt");
     if (!mount) return;
     // The mount lives inside .app, which .vt-standalone hides with display:none -- and a

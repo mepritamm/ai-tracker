@@ -2074,7 +2074,41 @@ def resolve_spawned(throttle=5.0, new_only=False):
         exclude = tuple(claimed)
 
 
-def _live_list():
+def _term_title(p, or_launcher=""):
+    """Tab title "<folder> - <Anthropic models|OpenRouter models> - <Claude Code|Auggie>". Read off
+    `p.cmd`'s argv[0] (the shell when idle, the launcher once a job runs): the configured OpenRouter
+    launcher path -> OpenRouter, `claude` -> Anthropic, `auggie` -> "<folder> - Auggie" (no gateway
+    part), anything else "<folder> - Terminal". `or_launcher` is `gateway.or_launcher()[0]`.
+    The label follows `p.cmd`, so known gaps: (a) the `claude attach` retry pane (bare "claude") on an
+    OpenRouter session reads Anthropic; (b) clearing/changing the OpenRouter launcher setting after
+    spawn makes a running OpenRouter tab read "Terminal"; (c) `claude` typed by hand into a folder
+    shell reads "Terminal" (`_refresh_fg` never rewrites cmd), as does the brief window before a
+    deferred claim is injected; (d) the Auggie branch is unreachable from terminals today (nothing
+    spawns/injects `auggie`) -- kept so a future Auggie launch labels correctly.
+    ponytail: label is derived from the lossy cmd string; upgrade = store the gateway on Pty at the cmd= sites."""
+    folder = os.path.basename((p.cwd or "").rstrip(os.sep)) or p.cwd or ""
+    cmd = p.cmd or ""
+    if or_launcher and (cmd == or_launcher or cmd.startswith(or_launcher + " ")):
+        return " - ".join([folder, "OpenRouter models", "Claude Code"] if folder
+                          else ["OpenRouter models", "Claude Code"])    # path may hold spaces: shlex would cut it
+    try:
+        argv = shlex.split(p.cmd or "")
+    except ValueError:
+        argv = (p.cmd or "").split()
+    a0 = argv[0] if argv else ""
+    base = os.path.basename(a0)
+    if a0 and or_launcher and a0 == or_launcher:
+        tail = ["OpenRouter models", "Claude Code"]
+    elif base == "claude":
+        tail = ["Anthropic models", "Claude Code"]
+    elif base == "auggie":
+        tail = ["Auggie"]
+    else:
+        tail = ["Terminal"]
+    return " - ".join([folder] + tail if folder else tail)
+
+
+def _live_list(orl=None):
     """The live PTYs as plain dicts, oldest first -- what `open_pty()`'s 429 hands back so the
     client can show WHICH terminals hold the slots and close one, and what `GET /api/term/list`
     (below) hands back on demand for the same purpose. Call under `_LOCK`.
@@ -2099,10 +2133,15 @@ def _live_list():
     `folder`/`overflow`/`fg` are the folder-terminal fields (see the "folder terminal" section
     above): `fg` is the label dict or null, so a row can say "running <session>" and a close can
     warn before killing it. Callers refresh `fg` (`_refresh_fg`) before building the list --
-    this only reports."""
+    this only reports. `orl` is `gateway.or_launcher()[0]`, computed by the caller BEFORE taking
+    `_LOCK` (it stats the filesystem); `None` falls back to computing it here (direct callers only).
+
+    `title` is the server's browser-tab label, always a str (see `_term_title`)."""
+    orl = gateway.or_launcher()[0] if orl is None else orl   # fallback for callers not under _LOCK
     return [{"tty": p.id, "cmd": p.cmd, "cwd": p.cwd, "started": p.started,
              "session": p.spawned or p.session, "mode": p.mode,
              "suffix": _MODE_SUFFIX.get(p.mode, ""), "forked": p.forked,
+             "title": _term_title(p, orl),
              "folder": p.folder, "overflow": p.overflow, "fg": p.fg}
             for p in sorted(PTYS.values(), key=lambda p: p.started) if not p.done]
 
@@ -2989,6 +3028,7 @@ def open_pty(handler, parsed, body):
     else:
         argv = None                          # "cwd" IS the folder shell; nothing to type into it
     shell_argv = [os.environ.get("SHELL", "/bin/bash"), "-l"]
+    orl = gateway.or_launcher()[0]       # fs I/O: resolved here, never under _LOCK, for the 429 lists
     # ---- the folder shell: find it, or spawn it (see the docstring's "Folder terminal" section)
     # The spawn cannot sit under `_LOCK` (a fork plus a reader thread, same as before), so the
     # lookup-then-spawn is made one step by a RESERVATION instead: the first opener of a cwd with
@@ -3023,7 +3063,7 @@ def open_pty(handler, parsed, body):
                     # terminals the user cannot see, cannot name and cannot reclaim short of
                     # waiting out the idle TTL.
                     return handler._json({"error": "too many running terminals (max %d)"
-                                          % config.MAX_TERMS, "terminals": _live_list()}, 429)
+                                          % config.MAX_TERMS, "terminals": _live_list(orl)}, 429)
                 reserved = _FOLDER_SPAWNING[cwd] = threading.Event()
         if fp is not None or reserved is not None:
             break
@@ -3142,7 +3182,7 @@ def open_pty(handler, parsed, body):
         _reap()
         if _live_count() >= config.MAX_TERMS:
             return handler._json({"error": "too many running terminals (max %d)" % config.MAX_TERMS,
-                                  "terminals": _live_list()}, 429)
+                                  "terminals": _live_list(orl)}, 429)
     try:
         pt = spawn(cwd, argv, cols, rows)
     except OSError as e:
@@ -3467,7 +3507,7 @@ def close_pty(handler, parsed, body):
 
 
 def term_list(handler, parsed):
-    """GET /api/term/list -> {"terminals": [{tty, cmd, cwd, started, session, mode, suffix}, ...],
+    """GET /api/term/list -> {"terminals": [{tty, cmd, cwd, started, session, mode, suffix, title}, ...],
     "max": <int>}.
 
     The on-demand counterpart to `open_pty()`'s 429 body: today a user can only see/manage their
@@ -3489,12 +3529,13 @@ def term_list(handler, parsed):
     if not term_gate.guard(handler):
         return
     resolve_spawned()
+    orl = gateway.or_launcher()[0]      # fs I/O: before the lock
     with _LOCK:
         _reap()
         for p in PTYS.values():
             if p.folder and not p.done:
                 _refresh_fg(p)      # one syscall each -- the poll IS the clock for `fg`, too
-        terminals = _live_list()
+        terminals = _live_list(orl)
     handler._json({"terminals": terminals, "max": config.MAX_TERMS})
 
 

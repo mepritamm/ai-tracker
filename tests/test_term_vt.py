@@ -1268,7 +1268,8 @@ class TestRoutes(unittest.TestCase):
         row = obj["terminals"][0]
         self.assertEqual(set(row.keys()),
                          {"tty", "cmd", "cwd", "started", "session", "mode", "suffix", "forked",
-                          "folder", "overflow", "fg"})
+                          "folder", "overflow", "fg", "title"})
+        self.assertEqual(row["title"], "proj - Anthropic models - Claude Code")
         self.assertEqual(row["tty"], "p1")
         self.assertEqual(row["cwd"], "/tmp/proj")
         self.assertEqual(row["cmd"], "claude --resume s1")
