@@ -197,5 +197,45 @@ class TestResolveSpawned(unittest.TestCase):
                           "the launch-mode suffix must not change when a session is resolved")
 
 
+class TestResolveSpawnedNewOnly(unittest.TestCase):
+    def setUp(self):
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        self._orig_probe = claude_provider.newest_session_in_cwd
+
+    def tearDown(self):
+        claude_provider.newest_session_in_cwd = self._orig_probe
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+
+    def _setup(self):
+        a = term_vt.Pty(tid="A", pid=0, cwd="/tmp/A"); a.mode = "cwd"
+        b = term_vt.Pty(tid="B", pid=0, cwd="/tmp/B"); b.mode = "new"
+        c = term_vt.Pty(tid="C", pid=0, cwd="/tmp/C"); c.mode = "cwd"; c.folder = True
+        c.fg = {"session": "", "mode": "new", "started": 0.0}
+        d = term_vt.Pty(tid="D", pid=0, cwd="/tmp/D"); d.mode = "cwd"; d.folder = True
+        d.fg = None
+        for p in (a, b, c, d):
+            term_vt.PTYS[p.id] = p
+        return a, b, c, d
+
+    def test_new_only_skips_plain_cwd_shells(self):
+        a, b, c, d = self._setup()
+        probed = []
+
+        def stub(cwd, after_ts, exclude=()):
+            probed.append(cwd)
+            return ""
+
+        claude_provider.newest_session_in_cwd = stub
+        term_vt.resolve_spawned(throttle=0, new_only=True)
+        self.assertEqual(set(probed), {"/tmp/B", "/tmp/C"})
+        self.assertEqual((a.spawn_probe, d.spawn_probe), (0.0, 0.0))
+        # control: the default scan still probes plain cwd shells
+        del probed[:]
+        term_vt.resolve_spawned(throttle=0)
+        self.assertTrue({"/tmp/A", "/tmp/D"} <= set(probed))
+
+
 if __name__ == "__main__":
     unittest.main()

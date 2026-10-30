@@ -2578,36 +2578,20 @@
     // `typeof ... === "function"` before use for exactly that reason. The untruncated path and
     // the raw command still reach the user via the tooltip below.
     var cwdTail = (t.cwd || "").split("/").pop() || (t.cwd || "");
-    // Folder terminals (server contract: `folder`/`fg` on GET /api/term/list rows -- one shared
-    // shell per cwd, every session in that folder runs inside it) name themselves by the FOLDER,
-    // never by `identity` above: there may be many sessions, or none at all, sharing this one pty
-    // over its life. `fg` (set only while something is actually running in its foreground) names
-    // WHICH session that is right now; absent, the shell is simply idle at its prompt. Resolved
-    // via its own small inline lookup rather than sharing the `identity` one above -- this whole
-    // function is executed VERBATIM by tests/test_term_vt_exec.py and pinned by SOURCE TEXT in
-    // tests/test_term_vt_client.py's TestTerminalRowShowsSessionIdentity, both of which assert the
-    // exact lines above; factoring them into a shared helper would move that text out of the body
-    // those tests extract.
-    if (t.folder) {
-      var fgLabel = "shell";
-      if (t.fg && t.fg.session) {
-        var flist = (typeof sessions !== "undefined" && sessions) || [];
-        var fhit = null;
-        for (var fi = 0; fi < flist.length; fi++) {
-          if (flist[fi] && flist[fi].id === t.fg.session) { fhit = flist[fi]; break; }
-        }
-        fgLabel = "running " + ((fhit && (fhit.title || fhit.project)) || t.fg.session.slice(0, 8));
+    // Folder shells (server `folder`/`fg` fields) and overflow ptys carry no label of their own:
+    // a row is titled by the session it runs -- `t.session`, or the foreground session `t.fg`
+    // names while something runs inside a shared folder shell -- else the shell/cmd. Same lookup
+    // as `identity` above, inline for the same reason (this body is executed verbatim by tests).
+    identity = t.folder ? "" : identity;   // a folder shell is titled by what runs now, never its opener
+    if ((t.folder || !identity) && t.fg && t.fg.session) {
+      var flist = (typeof sessions !== "undefined" && sessions) || [];
+      var fhit = null;
+      for (var fi = 0; fi < flist.length; fi++) {
+        if (flist[fi] && flist[fi].id === t.fg.session) { fhit = flist[fi]; break; }
       }
-      label.textContent = cwdTail + (t.suffix || "") + "  ·  " + fgLabel + "  ·  " + mins + "m";
-    } else {
-      // `t.overflow` (a dedicated one-off pty the server opened because the folder shell was busy
-      // running something else) rides along as a bracketed tag rather than a separate element --
-      // see this file's own "single .vtcaplabel span" test (TestTerminalRowShowsSessionIdentity.
-      // test_rows_stay_usable_on_phone_and_tablet); a second span/badge element there would break
-      // that pinned count. ponytail: a plain-text tag is the ceiling here, not a styled chip --
-      // revisit only if that single-span constraint is ever relaxed.
-      label.textContent = (identity || (t.cmd || "shell")) + (t.overflow ? " [overflow]" : "") + (t.suffix || "") + "  ·  " + cwdTail + "  ·  " + mins + "m";
+      identity = (fhit && (fhit.title || fhit.project)) || t.fg.session.slice(0, 8);
     }
+    label.textContent = (identity || (t.cmd || "shell")) + (t.suffix || "") + "  ·  " + cwdTail + "  ·  " + mins + "m";
     label.title = t.tty + "  ·  " + (t.cmd || "shell") + "  ·  " + (t.cwd || "");
     row.appendChild(label);
     (actions || []).forEach(function (a) {
@@ -2733,7 +2717,7 @@
           // you want headroom, but each click schedules its own retry and each retry calls openVT
           // again -- and openVT's destroy() only closes the client's SSE, it never kills the pty it
           // is replacing. Two clicks would therefore attach two terminals, orphan the first one
-          // viewer-less for the full 30-minute IDLE_TIMEOUT, and recreate the exact cap this block
+          // viewer-less for the full idle TTL (config.TERM_IDLE_TTL_MIN), and recreate the exact cap this block
           // exists to clear. One click, one retry.
           var unlatch = function () {
             Array.prototype.forEach.call(wrap.querySelectorAll(".vtcapx"),
@@ -2917,7 +2901,7 @@
             // because a same-session supersede (two opens for one sid, or two modes) leaves
             // activeSid equal and would slip through. Dropping the response used to LEAK the pty
             // the server had already spawned for us: live, viewer-less and invisible until
-            // IDLE_TIMEOUT — or, in the same-sid case, forever, since a second attach overwrote
+            // idle TTL (config.TERM_IDLE_TTL_MIN) — or, in the same-sid case, forever, since a second attach overwrote
             // the first terminal without closing its SSE, pinning pt.viewers above 0 so the idle
             // reap could never fire. Harmless-looking until you arrive here from the capacity
             // block, where the user is actively trying to free slots and would silently gain a
@@ -3738,7 +3722,7 @@
       if (destroyed) {
         // Superseded/torn down while the network round trip was in flight -- see openVT's own
         // comment on this exact race for why a freshly SPAWNED pty must be handed straight back
-        // rather than left running, viewer-less, until IDLE_TIMEOUT. `spawned` gates this: a
+        // rather than left running, viewer-less, until idle TTL (config.TERM_IDLE_TTL_MIN). `spawned` gates this: a
         // peeked/found tty (the other two call sites below) was ALREADY running before this call
         // and may still be viewed elsewhere (the classic overlay, another mount, the manage
         // panel) -- closing it here would SIGKILL someone else's live terminal, not free a leak.

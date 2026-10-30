@@ -1404,6 +1404,57 @@ class TestNarrationPagination(unittest.TestCase):
         self.assertEqual(r.status, 404)
 
 
+class TestTermIdleTtlEndToEnd(unittest.TestCase):
+    """TERM_IDLE_TTL_MIN end to end: the real server's /api/config, and the served page's row."""
+
+    def setUp(self):
+        self._saved = {k: getattr(config, k) for k in ("CONFIG_FILE", "TERM_IDLE_TTL_MIN", "AUTH")}
+        self._tmpdir = tempfile.mkdtemp()
+        config.CONFIG_FILE = os.path.join(self._tmpdir, "config.json")   # POST must never touch the real one
+        config.AUTH = ""
+        config.apply_overrides({})
+        self.srv = _server.Server(("127.0.0.1", 0), _server.Handler)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        for k, v in self._saved.items():
+            setattr(config, k, v)
+        config.apply_overrides({})
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _req(self, method, path, payload=None):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        body = json.dumps(payload).encode() if payload is not None else None
+        c.request(method, path, body=body,
+                  headers={"Content-Type": "application/json"} if body else {})
+        r = c.getresponse()
+        data = r.read()
+        c.close()
+        return r.status, data
+
+    def test_config_default_and_post_round_trip(self):
+        st, data = self._req("GET", "/api/config")
+        self.assertEqual(st, 200)
+        self.assertEqual(json.loads(data)["TERM_IDLE_TTL_MIN"]["value"], 30)
+        st, data = self._req("POST", "/api/config", {"key": "TERM_IDLE_TTL_MIN", "value": 45})
+        self.assertEqual(st, 200)
+        st, data = self._req("GET", "/api/config")
+        self.assertEqual(json.loads(data)["TERM_IDLE_TTL_MIN"]["value"], 45)
+        self.assertEqual(config.TERM_IDLE_TTL_MIN, 45)
+
+    def test_served_page_has_row_ungated_and_no_overflow_tag(self):
+        st, data = self._req("GET", "/")
+        self.assertEqual(st, 200)
+        page = data.decode("utf-8")
+        i = page.index("serverRow('Idle terminal TTL', 'TERM_IDLE_TTL_MIN'")
+        # not gated by host: nothing around the row reads location.hostname
+        self.assertNotIn("location.hostname", page[max(0, i - 1500):i + 1500])
+        self.assertNotIn("[overflow]", page)
+
+
 class TestBundle(unittest.TestCase):
     """`make bundle` produces a valid, standalone single-file build that actually RUNS.
 

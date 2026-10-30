@@ -968,7 +968,7 @@ class TestNoticeBannerLayoutContract(unittest.TestCase):
 class TestCapReclaimBlock(unittest.TestCase):
     """Hitting the concurrent-terminal cap must be recoverable from the browser: the 429 body
     names the ttys holding the slots, and the modal offers a kill-and-retry per row. Before this,
-    the only exit was waiting out the 30-minute IDLE_TIMEOUT."""
+    the only exit was waiting out the idle TTL (config.TERM_IDLE_TTL_MIN)."""
 
     def setUp(self):
         self.js = _read("ext_vt.js")
@@ -996,7 +996,7 @@ class TestCapReclaimBlock(unittest.TestCase):
     def test_one_click_latches_the_whole_block_not_just_its_own_button(self):
         """Each click schedules its own retry, and openVT's destroy() closes the client SSE
         WITHOUT killing the pty it replaces. So two clicks would attach two terminals and orphan
-        the first one viewer-less for the full IDLE_TIMEOUT — freeing two slots and immediately
+        the first one viewer-less for the full idle TTL (config.TERM_IDLE_TTL_MIN) — freeing two slots and immediately
         re-filling them. The latch must cover every row, and lift again only on failure."""
         block = _body_until(self.js, "function renderCapBlock(", ["function openVT("])
         self.assertIn('wrap.querySelectorAll(".vtcapx")', block)
@@ -1007,7 +1007,7 @@ class TestCapReclaimBlock(unittest.TestCase):
 
     def test_a_superseded_open_hands_its_pty_back_instead_of_leaking_it(self):
         """openVT's supersede branch used to drop a tty the server had already spawned: live,
-        viewer-less and invisible for the full IDLE_TIMEOUT. Reached most easily from the cap
+        viewer-less and invisible for the full idle TTL (config.TERM_IDLE_TTL_MIN). Reached most easily from the cap
         block itself — the user frees a slot, dismisses the modal mid-retry, and silently gains a
         hidden terminal instead. The abandon path must close what it abandons."""
         body = _body_until(self.js, "function openVT(", ["window.ExtVT ="])
@@ -2677,6 +2677,14 @@ class TestTerminalRowShowsSessionIdentity(unittest.TestCase):
         `id.slice(0,8)`) -- not a new format invented here."""
         self.assertIn("t.session.slice(0, 8)", self.row)
 
+    def test_folder_and_overflow_labels_are_gone(self):
+        """Folder shells / overflow ptys are titled by the session they run (t.fg.session
+        fallback), never by a "folder" title nor an "[overflow]" tag."""
+        self.assertNotIn("[overflow]", self.row)
+        self.assertNotIn("if (t.folder)", self.row)
+        self.assertNotIn('"running "', self.row)
+        self.assertIn("t.fg.session.slice(0, 8)", self.row)
+
     def test_plain_shell_degrades_cleanly(self):
         """`t.session === ""` is falsy, so the lookup is skipped entirely and the row falls
         straight through to the pre-existing `(t.cmd || "shell")` branch -- never "undefined",
@@ -2824,6 +2832,16 @@ class TestBellFlashReachesBothRenderers(unittest.TestCase):
         self.assertIn(".vtpane.vtbell { animation: vtbellflash .18s ease-out; }", page)
         self.assertIn("function _flashBellPane(pane) {", page)
         self.assertIn("this._disposeBell = term.onBell(", page)
+
+
+class TestIdleTtlSliderHelp(unittest.TestCase):
+    def test_help_states_slider_range_and_the_wider_server_clamp(self):
+        block = _body_until(_read("ext_cr_dialogs.js"),
+                            "serverRow('Idle terminal TTL', 'TERM_IDLE_TTL_MIN',",
+                            ["serverRow('Terminal enabled'"])
+        for needle in ("sliderCtlCommit(5, 240,", "TRACKER_TERM_IDLE_TTL_MIN",
+                       "config.json", "1\u20131440"):
+            self.assertIn(needle, block)
 
 
 if __name__ == "__main__":

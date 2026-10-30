@@ -22,6 +22,7 @@ stray value there makes `allowed()` disagree with what setUp already forces via 
 file works around it the same way every other terminal test file does, by writing config.AUTH
 directly rather than depending on the process environment at all.)
 """
+import contextlib
 import os
 import pty
 import signal
@@ -309,7 +310,7 @@ class TestFolderResumeInjection(unittest.TestCase):
                          "a folder shell busy with a DIFFERENT session must fall back to a dedicated spawn")
         self.assertNotEqual(obj["tty"], "folder2")
         self.assertTrue(overflow_pty.overflow, "the dedicated fallback pty must be flagged overflow")
-        self.assertIsNotNone(obj.get("notice"), "an overflow open must carry a notice for the client")
+        self.assertIsNone(obj.get("notice"), "the overflow label is no longer user-facing")
 
 
 # ---------------------------------------------------------------------------------------------- C2
@@ -793,3 +794,460 @@ class TestCloseKillsForegroundChildForReal(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------------------------- RC
+# One resume must yield ONE terminal: a folder shell this request just spawned is queued behind
+# its own slow rc files (deferred start), never abandoned for an overflow pty; and a resume of a
+# session already running in a non-folder pty attaches instead of typing a second one.
+
+
+def _timeline_pgid(t0, phases, shell):
+    """`_fg_pgid` fake driven by wall time since t0[0]: phases=[(until_s, pgid), ...]; past the end -> shell."""
+    def _pgid(pt):
+        t = time.time() - t0[0]
+        for until, pgid in phases:
+            if t < until:
+                return pgid
+        return shell
+    return _pgid
+
+
+class TestFreshFolderShellQueuesInsteadOfOverflow(unittest.TestCase):
+    SHELL, STARTUP_JOB = 61616, 61617
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        self._session_cwd0 = term_gate.session_cwd
+        _stub_kill(self)
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+        term_gate.session_cwd = self._session_cwd0
+
+    def _open(self, cwd, phases, startup_wait=None, quiesce=0.05):
+        term_gate.session_cwd = lambda sid, resume=False: cwd
+        fixture = term_vt.Pty(tid="fresh1", pid=self.SHELL, fd=99, cwd=cwd)
+        t0 = [time.time()]
+        typed = []
+        pending_seen = []
+
+        def _quiet(pt):
+            pending_seen.append(pt.fg_pending)
+            time.sleep(quiesce)
+            return True
+
+        patches = {
+            "spawn": mock.patch.object(term_vt, "spawn", return_value=fixture),
+            "pgid": mock.patch.object(term_vt, "_fg_pgid",
+                                      side_effect=_timeline_pgid(t0, phases, self.SHELL)),
+            "quiet_window": mock.patch.object(term_vt, "INJECT_QUIET_WINDOW", 0.2),
+            "max_wait": mock.patch.object(term_vt, "INJECT_MAX_WAIT", 0.3),
+            "poll": mock.patch.object(term_vt, "FOLDER_STARTUP_POLL", 0.01),
+            "key_gap": mock.patch.object(term_vt, "INJECT_KEY_GAP", 0),
+            "quiesce": mock.patch.object(term_vt, "_wait_for_quiescence", side_effect=_quiet),
+            "write": mock.patch.object(
+                term_vt, "_inject_write",
+                side_effect=lambda pt, data: typed.append((time.time() - t0[0], data)) or True),
+            "backstop": mock.patch.object(term_vt, "_start_backstop", return_value=True),
+            "note": mock.patch.object(term_vt, "_feed_note"),
+            "resolve": mock.patch.object(term_vt, "resolve_spawned"),
+        }
+        if startup_wait is not None:
+            patches["wait"] = mock.patch.object(term_vt, "FOLDER_STARTUP_WAIT", startup_wait)
+        with contextlib.ExitStack() as st:
+            m = {k: st.enter_context(p) for k, p in patches.items()}
+            h = _FakeHandler()
+            t0[0] = time.time()
+            term_vt.open_pty(h, None, {"session": "S1", "mode": "resume", "cols": 80, "rows": 24})
+            obj, code = h.calls[-1]
+            self.assertIsNotNone(fixture.deferred, "a fresh shell must start deferred")
+            fixture.deferred.join(15)
+            self.assertFalse(fixture.deferred.is_alive())
+        return fixture, obj, code, typed, pending_seen, m
+
+    def test_slow_shell_startup_queues_the_resume_instead_of_spawning_overflow(self):
+        S, J = self.SHELL, self.STARTUP_JOB
+        fixture, obj, code, typed, _p, m = self._open(
+            "/tmp/fresh-slow", [(0.05, S), (0.25, J), (0.30, S), (1.0, J)])
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(m["spawn"].call_count, 1, "exactly one pty may be spawned")
+        self.assertEqual(obj["tty"], "fresh1")
+        self.assertTrue(obj["folder"])
+        self.assertIsNone(obj["notice"])
+        self.assertIn(b"claude --resume S1", b"".join(d for _t, d in typed))
+        self.assertGreaterEqual(typed[0][0], 1.0, "typed while the rc files still held the tty")
+        m["note"].assert_not_called()
+        self.assertEqual([p for p in term_vt.PTYS.values() if p.overflow], [])
+        self.assertEqual(len(term_vt.PTYS), 1)
+        self.assertEqual(fixture.fg.get("session"), "S1")
+        self.assertFalse(fixture.fg_pending)
+
+    def test_rc_job_longer_than_inject_max_wait_still_starts_claude(self):
+        S, J = self.SHELL, self.STARTUP_JOB
+        fixture, obj, code, typed, _p, m = self._open("/tmp/fresh-longrc", [(0.05, S), (1.0, J)])
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(len([1 for _t, d in typed if d == b"\r"]), 1)
+        self.assertGreaterEqual(typed[0][0], 1.0)
+        m["note"].assert_not_called()
+        self.assertEqual(len(term_vt.PTYS), 1)
+
+    def test_job_after_settle_retries_with_claim_still_pending(self):
+        S, J = self.SHELL, self.STARTUP_JOB
+        # Timeline (INJECT_QUIET_WINDOW 0.2): SHELL until 0.55, JOB 0.55-1.35, SHELL after. The settle
+        # completes at ~0.2-0.3 (>=0.24s inside SHELL); the quiescence stub (0.6s) ends ~0.8-0.9, so the
+        # first typing check lands inside JOB (>=0.25s past 0.55, >=0.44s before 1.35) -> deferred attempt
+        # fails with the claim pending; the shell re-settles after 1.35 and types once.
+        fixture, obj, code, typed, pending_seen, m = self._open(
+            "/tmp/fresh-retry", [(0.55, S), (1.35, J)], quiesce=0.6)
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(len([1 for _t, d in typed if d == b"\r"]), 1)
+        self.assertGreaterEqual(typed[0][0], 1.35)
+        self.assertEqual(pending_seen, [True, True])
+        m["note"].assert_not_called()
+        self.assertFalse(fixture.fg_pending)
+
+    def test_startup_wait_expiry_feeds_a_note_and_still_leaves_one_pty(self):
+        S, J = self.SHELL, self.STARTUP_JOB
+        phases = [(0.05 * (k + 1), J if k % 2 else S) for k in range(200)]
+        fixture, obj, code, typed, _p, m = self._open("/tmp/fresh-stuck", phases, startup_wait=0.5)
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(m["spawn"].call_count, 1)
+        self.assertEqual(typed, [], "nothing may be typed into a shell that never reached a prompt")
+        self.assertTrue(m["note"].called, "the failure must be surfaced in the terminal")
+        self.assertIsNone(fixture.fg, "the claim must be released")
+        self.assertFalse(fixture.fg_pending)
+        self.assertFalse(fixture.starting)
+        self.assertEqual(len(term_vt.PTYS), 1)
+
+
+class TestInjectArgvGraceAndDeferredMode(unittest.TestCase):
+    def setUp(self):
+        self.pt = term_vt.Pty(tid="graceP", pid=555, fd=9)
+        self.pt.fg_pending = True
+        self.pt.fg = {"session": "s", "mode": "resume", "started": time.time() - 3600}
+        self.typed = []
+        for p in (mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True),
+                  mock.patch.object(term_vt, "_inject_write",
+                                    side_effect=lambda pt, d: self.typed.append(d) or True),
+                  mock.patch.object(term_vt, "INJECT_KEY_GAP", 0)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_grace_restarts_when_the_line_is_typed(self):
+        before = time.time()
+        with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=555):
+            ok, why = term_vt._inject_argv(self.pt, ["claude", "--resume", "s"])
+            self.assertTrue(ok, why)
+            with term_vt._LOCK:
+                term_vt._refresh_fg(self.pt)
+        self.assertIsNotNone(self.pt.fg, "FG_PENDING_GRACE must count from Enter, not the claim")
+        self.assertGreaterEqual(self.pt.fg["started"], before)
+
+    def test_deferred_failure_keeps_claim_pending_and_does_not_wait_for_prompt(self):
+        t = time.time()
+        with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=556):
+            ok, _why = term_vt._inject_argv(self.pt, ["claude", "--resume", "s"], deferred=True)
+        self.assertFalse(ok)
+        self.assertLess(time.time() - t, 0.5)
+        self.assertTrue(self.pt.fg_pending)
+        self.assertEqual(self.typed, [])
+
+
+class _OpenFixtureBase(unittest.TestCase):
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        self._session_cwd0 = term_gate.session_cwd
+        _stub_kill(self)
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+        term_gate.session_cwd = self._session_cwd0
+
+
+class TestSessionPtyIgnoresStaleFolderFg(_OpenFixtureBase):
+    def _run(self, cwd, fixture, tcgetpgrp):
+        term_gate.session_cwd = lambda sid, resume=False: cwd
+        term_vt.PTYS[fixture.id] = fixture
+        typed = []
+        with mock.patch.object(term_vt, "resolve_spawned"), \
+             mock.patch.object(term_vt, "spawn") as spawn_mock, \
+             mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True), \
+             mock.patch.object(term_vt, "_inject_write",
+                               side_effect=lambda pt, d: typed.append(d) or True), \
+             mock.patch.object(term_vt, "_start_backstop", return_value=True), \
+             mock.patch.object(term_vt, "INJECT_KEY_GAP", 0), \
+             mock.patch.object(term_vt.os, "tcgetpgrp", return_value=tcgetpgrp):
+            h = _FakeHandler()
+            term_vt.open_pty(h, None, {"session": "S1", "mode": "resume", "cols": 80, "rows": 24})
+            obj, code = h.calls[-1]
+        self.assertEqual(code, 200, obj)
+        return obj, typed, spawn_mock
+
+    def _fixture(self, cwd, pid):
+        fp = term_vt.Pty(tid="stale1", pid=pid, fd=99, cwd=cwd)
+        fp.folder, fp.mode = True, "cwd"
+        return fp
+
+    def test_resume_after_claude_exited_types_again_instead_of_attaching_to_bare_shell(self):
+        fp = self._fixture("/tmp/stale-fg", 42440)
+        fp.fg = {"session": "S1", "mode": "resume", "started": time.time() - 60}
+        fp.fg_seen_child = True
+        obj, typed, spawn_mock = self._run("/tmp/stale-fg", fp, 42440)
+        self.assertEqual(obj["tty"], "stale1")
+        self.assertIn(b"claude --resume S1", b"".join(typed))
+        spawn_mock.assert_not_called()
+        self.assertEqual(fp.fg["session"], "S1")
+        self.assertFalse(fp.fg_pending)
+
+    def test_pending_claim_still_attaches(self):
+        fp = self._fixture("/tmp/stale-pending", 42440)
+        claim = {"session": "S1", "mode": "resume", "started": time.time() - 3600}
+        fp.fg, fp.fg_pending = claim, True
+        obj, typed, spawn_mock = self._run("/tmp/stale-pending", fp, 42440)
+        self.assertEqual(obj["tty"], "stale1")
+        self.assertEqual(typed, [])
+        spawn_mock.assert_not_called()
+        self.assertIs(fp.fg, claim)
+
+    def test_live_claude_still_attaches(self):
+        fp = self._fixture("/tmp/stale-live", 42440)
+        fp.fg = {"session": "S1", "mode": "resume", "started": time.time() - 60}
+        fp.fg_seen_child = False
+        obj, typed, spawn_mock = self._run("/tmp/stale-live", fp, 42441)
+        self.assertEqual(obj["tty"], "stale1")
+        self.assertEqual(typed, [])
+        spawn_mock.assert_not_called()
+
+
+class TestUnsettledFolderShellDefersInsteadOfOverflow(_OpenFixtureBase):
+    SHELL, JOB, FOREIGN = 43430, 43431, 43439
+
+    def _patches(self, t0, phases, spawn_ret, typed):
+        return [
+            mock.patch.object(term_vt, "spawn", return_value=spawn_ret),
+            mock.patch.object(term_vt, "_fg_pgid",
+                              side_effect=_timeline_pgid(t0, phases, self.SHELL)),
+            mock.patch.object(term_vt, "INJECT_QUIET_WINDOW", 0.2),
+            mock.patch.object(term_vt, "INJECT_MAX_WAIT", 0.1),
+            mock.patch.object(term_vt, "FOLDER_STARTUP_POLL", 0.01),
+            mock.patch.object(term_vt, "INJECT_KEY_GAP", 0),
+            mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True),
+            mock.patch.object(term_vt, "_inject_write",
+                              side_effect=lambda pt, d: typed.append((time.time() - t0[0], d)) or True),
+            mock.patch.object(term_vt, "_start_backstop", return_value=True),
+            mock.patch.object(term_vt, "_feed_note"),
+            mock.patch.object(term_vt, "resolve_spawned"),
+        ]
+
+    def test_resume_into_a_shell_spawned_moments_ago_defers_not_overflows(self):
+        cwd = "/tmp/young-shell"
+        term_gate.session_cwd = lambda sid, resume=False: cwd
+        fp = term_vt.Pty(tid="young1", pid=self.SHELL, fd=99, cwd=cwd)
+        fp.folder, fp.mode, fp.startup_done = True, "cwd", False
+        term_vt.PTYS["young1"] = fp
+        ovf = term_vt.Pty(tid="ovf", pid=0)
+        t0, typed = [time.time()], []
+        with contextlib.ExitStack() as st:
+            ms = [st.enter_context(p) for p in
+                  self._patches(t0, [(0.05, self.SHELL), (0.6, self.JOB)], ovf, typed)]
+            h = _FakeHandler()
+            t0[0] = time.time()
+            term_vt.open_pty(h, None, {"session": "S1", "mode": "resume", "cols": 80, "rows": 24})
+            obj, code = h.calls[-1]
+            if fp.deferred is not None:
+                fp.deferred.join(15)
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(obj["tty"], "young1")
+        self.assertTrue(obj["reused"])
+        self.assertTrue(obj["folder"])
+        ms[0].assert_not_called()
+        self.assertIsNotNone(fp.deferred)
+        self.assertTrue(typed and typed[0][0] >= 0.6, typed)
+        self.assertEqual([p for p in term_vt.PTYS.values() if p.overflow], [])
+
+    def test_second_open_same_session_during_deferred_start_attaches(self):
+        cwd = "/tmp/young-attach"
+        term_gate.session_cwd = lambda sid, resume=False: cwd
+        fp = term_vt.Pty(tid="young2", pid=self.SHELL, fd=99, cwd=cwd)
+        fp.folder, fp.mode, fp.startup_done = True, "cwd", False
+        fp.fg = {"session": "S1", "mode": "resume", "started": time.time()}
+        fp.fg_pending = True
+        term_vt.PTYS["young2"] = fp
+        t0, typed = [time.time()], []
+        with contextlib.ExitStack() as st:
+            ms = [st.enter_context(p) for p in
+                  self._patches(t0, [(1e9, self.JOB)], term_vt.Pty(tid="ovf2", pid=0), typed)]
+            h = _FakeHandler()
+            term_vt.open_pty(h, None, {"session": "S1", "mode": "resume", "cols": 80, "rows": 24})
+            obj, code = h.calls[-1]
+        self.assertEqual(obj["tty"], "young2")
+        ms[0].assert_not_called()
+        self.assertIsNone(fp.deferred)
+        self.assertEqual(typed, [])
+
+    def test_cwd_spawn_marks_startup_done_once_settled(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = tmp.name       # a session-less open requires a real directory
+        fp = term_vt.Pty(tid="cwd1", pid=self.SHELL, fd=99, cwd=cwd)
+        self.addCleanup(setattr, fp, "closing", True)
+        t0, typed = [time.time()], []
+        with contextlib.ExitStack() as st:
+            for p in self._patches(t0, [(0.3, self.JOB)], fp, typed):
+                st.enter_context(p)
+            st.enter_context(mock.patch.object(term_vt, "INJECT_QUIET_WINDOW", 0.1))
+            h = _FakeHandler()
+            t0[0] = time.time()
+            term_vt.open_pty(h, None, {"mode": "cwd", "cwd": cwd, "cols": 80, "rows": 24})
+            self.assertFalse(fp.startup_done)
+            self.assertTrue(_wait_until(lambda: fp.startup_done, 3))
+
+    def test_settled_shell_with_user_job_still_overflows(self):
+        cwd = "/tmp/settled-busy"
+        term_gate.session_cwd = lambda sid, resume=False: cwd
+        fp = term_vt.Pty(tid="busy1", pid=self.SHELL, fd=99, cwd=cwd)
+        fp.folder, fp.mode = True, "cwd"
+        term_vt.PTYS["busy1"] = fp
+        ovf = term_vt.Pty(tid="ovf3", pid=0)
+        t0, typed = [time.time()], []
+        with contextlib.ExitStack() as st:
+            ms = [st.enter_context(p) for p in
+                  self._patches(t0, [(1e9, self.FOREIGN)], ovf, typed)]
+            h = _FakeHandler()
+            term_vt.open_pty(h, None, {"session": "S1", "mode": "resume", "cols": 80, "rows": 24})
+            obj, code = h.calls[-1]
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(ms[0].call_count, 1)
+        self.assertTrue(ovf.overflow)
+        self.assertEqual(typed, [])
+
+
+class TestUnsettledShellWithUserInputOverflows(_OpenFixtureBase):
+    """A shell the user has typed into counts as settled: with a foreground job of their own it
+    must overflow a different session, not be claimed behind a 120s "starting..." state."""
+    SHELL, JOB, FOREIGN = 43430, 43431, 43439
+    _patches = TestUnsettledFolderShellDefersInsteadOfOverflow._patches
+
+    def test_typed_into_unsettled_shell_with_busy_fg_overflows(self):
+        import base64
+        cwd = "/tmp/typed-unsettled"
+        term_gate.session_cwd = lambda sid, resume=False: cwd
+        fp = term_vt.Pty(tid="typed1", pid=self.SHELL, fd=99, cwd=cwd)
+        fp.folder, fp.mode, fp.startup_done = True, "cwd", False
+        term_vt.PTYS["typed1"] = fp
+        ovf = term_vt.Pty(tid="ovf4", pid=0)
+        t0, typed = [time.time()], []
+        with contextlib.ExitStack() as st:
+            ms = [st.enter_context(p) for p in
+                  self._patches(t0, [(1e9, self.FOREIGN)], ovf, typed)]
+            st.enter_context(mock.patch.object(term_gate, "guard", return_value=True))
+            st.enter_context(mock.patch.object(term_vt.os, "write", return_value=3))
+            kh = _FakeHandler()
+            term_vt.keys(kh, None, {"tty": "typed1",
+                                    "data": base64.b64encode(b"npm run dev\r").decode()})
+            self.assertEqual(kh.calls[-1][1], 200, kh.calls)
+            h = _FakeHandler()
+            term_vt.open_pty(h, None, {"session": "S2", "mode": "resume", "cols": 80, "rows": 24})
+            obj, code = h.calls[-1]
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(ms[0].call_count, 1)
+        self.assertTrue(ovf.overflow)
+        self.assertIsNone(fp.deferred)
+        self.assertFalse(fp.starting)
+        self.assertEqual(typed, [])
+
+
+class TestResumeAttachesToSessionRunningInDedicatedPty(unittest.TestCase):
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        self._session_cwd0 = term_gate.session_cwd
+        _stub_kill(self)
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+        term_gate.session_cwd = self._session_cwd0
+
+    def test_resume_of_session_running_in_dedicated_pty_attaches_not_types(self):
+        cwd = "/tmp/dedupe-dedicated"
+        term_gate.session_cwd = lambda sid, resume=False: cwd
+        folder = term_vt.Pty(tid="idlefolder", pid=42430, fd=99, cwd=cwd)
+        folder.folder, folder.mode = True, "cwd"
+        ded = term_vt.Pty(tid="dedicated1", pid=42431, fd=98, cwd=cwd)
+        ded.mode, ded.session = "resume", "S1"
+        term_vt.PTYS["idlefolder"], term_vt.PTYS["dedicated1"] = folder, ded
+        with mock.patch.object(term_vt, "_inject_write", return_value=True) as w, \
+             mock.patch.object(term_vt, "spawn") as spawn_mock, \
+             mock.patch.object(term_vt.os, "tcgetpgrp", return_value=42430), \
+             mock.patch.object(term_vt, "resolve_spawned"):
+            h = _FakeHandler()
+            term_vt.open_pty(h, None, {"session": "S1", "mode": "resume", "cols": 80, "rows": 24})
+            obj, code = h.calls[-1]
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(obj["tty"], "dedicated1")
+        self.assertTrue(obj["reused"])
+        w.assert_not_called()
+        spawn_mock.assert_not_called()
+
+    def _fixture(self, cwd, forked=False):
+        folder = term_vt.Pty(tid="idlefolder", pid=42430, fd=99, cwd=cwd)
+        folder.folder, folder.mode = True, "cwd"
+        ded = term_vt.Pty(tid="dedicated1", pid=42431, fd=98, cwd=cwd)
+        ded.mode, ded.session, ded.forked = "resume", "S1", forked
+        term_vt.PTYS["idlefolder"], term_vt.PTYS["dedicated1"] = folder, ded
+        return folder, ded
+
+    def test_resume_scan_is_new_only(self):
+        cwd = "/tmp/dedupe-newonly"
+        term_gate.session_cwd = lambda sid, resume=False: cwd
+        self._fixture(cwd)
+        with mock.patch.object(term_vt, "_inject_write", return_value=True), \
+             mock.patch.object(term_vt, "spawn"), \
+             mock.patch.object(term_vt.os, "tcgetpgrp", return_value=42430), \
+             mock.patch.object(term_vt, "resolve_spawned") as rs:
+            h = _FakeHandler()
+            term_vt.open_pty(h, None, {"session": "S1", "mode": "resume", "cols": 80, "rows": 24})
+        rs.assert_called_once_with(throttle=0, new_only=True)
+
+    def test_resume_never_attaches_to_a_forked_copy(self):
+        cwd = "/tmp/dedupe-forked"
+        term_gate.session_cwd = lambda sid, resume=False: cwd
+        folder, ded = self._fixture(cwd, forked=True)
+        typed = []
+        with mock.patch.object(term_vt, "resolve_spawned"), \
+             mock.patch.object(term_vt, "spawn") as spawn_mock, \
+             mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True), \
+             mock.patch.object(term_vt, "_inject_write",
+                               side_effect=lambda pt, d: typed.append(d) or True), \
+             mock.patch.object(term_vt, "_start_backstop", return_value=True), \
+             mock.patch.object(term_vt, "INJECT_KEY_GAP", 0), \
+             mock.patch.object(term_vt.os, "tcgetpgrp", return_value=42430):
+            h = _FakeHandler()
+            term_vt.open_pty(h, None, {"session": "S1", "mode": "resume", "cols": 80, "rows": 24})
+            obj, code = h.calls[-1]
+        self.assertEqual(code, 200, obj)
+        self.assertNotEqual(obj["tty"], "dedicated1")
+        self.assertEqual(obj["tty"], "idlefolder")
+        self.assertTrue(typed)
+
+    def test_session_pty_skips_forked(self):
+        _, ded = self._fixture("/tmp/dedupe-unit", forked=True)
+        with term_vt._LOCK:
+            self.assertIsNone(term_vt._session_pty("S1"))
+            ded.forked = False
+            self.assertIs(term_vt._session_pty("S1"), ded)

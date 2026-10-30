@@ -878,6 +878,26 @@ def _run():
     # member on purpose (writing a password from a browser into a plaintext file is a
     # security regression, not a convenience -- see config.py's AUTH comment).
     assert "MAX_TERMS" in config.EDITABLE
+    assert "TERM_IDLE_TTL_MIN" in config.EDITABLE and "TERM_IDLE_TTL_MIN" not in config.RESTART_REQUIRED
+    _ttl_env0 = os.environ.get("TRACKER_TERM_IDLE_TTL_MIN")
+    os.environ["TRACKER_TERM_IDLE_TTL_MIN"] = "10"
+    try:
+        assert config.resolve_term_idle_ttl_min({}) == 10, "env beats default"
+        assert config.resolve_term_idle_ttl_min({"TERM_IDLE_TTL_MIN": 99}) == 99, "config.json beats env"
+        assert config.resolve_term_idle_ttl_min({"TERM_IDLE_TTL_MIN": 99999}) == 1440, "clamped high"
+        assert config.resolve_term_idle_ttl_min({"TERM_IDLE_TTL_MIN": 0}) == 1, "clamped low"
+        os.environ["TRACKER_TERM_IDLE_TTL_MIN"] = "junk"
+        assert config.resolve_term_idle_ttl_min({}) == 30, "garbage env falls back to default"
+        del os.environ["TRACKER_TERM_IDLE_TTL_MIN"]
+        assert config.resolve_term_idle_ttl_min({}) == 30, "built-in default is 30 minutes"
+    finally:
+        if _ttl_env0 is None:
+            os.environ.pop("TRACKER_TERM_IDLE_TTL_MIN", None)
+        else:
+            os.environ["TRACKER_TERM_IDLE_TTL_MIN"] = _ttl_env0
+    with mock.patch.object(term_vt.subprocess, "run", return_value=mock.Mock(returncode=0,
+            stdout=" 100 1 100\n 200 100 200\n 201 100 100\n 300 999 300\n")):
+        assert term_vt._claude_work_children(100) == [200], "only own-group-escaping tool shells are work"
     assert "TRACKER_AUTH" not in config.EDITABLE, "TRACKER_AUTH must never be browser-writable"
     assert "NOT_A_REAL_KEY" not in config.EDITABLE, "a non-allowlisted key must never validate"
     # Same invariant, one level down: TUNNEL_ON (child-process-alive) must never be flippable

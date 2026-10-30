@@ -37,7 +37,7 @@ _PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "VSCODE_WS_ROOT", "CURSO
           "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "NOTES_FILE", "TASKS_DIR", "PORT_FILE",
           "TOKEN_FILE", "CONFIG_FILE", "FORKS_FILE")
 
-_CFG_ATTRS = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL")
+_CFG_ATTRS = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL", "TERM_IDLE_TTL_MIN")
 
 
 
@@ -228,6 +228,22 @@ class TestApiConfigWrite(_ServerCase):
         self.assertEqual(j["MAX_TERMS"], {"value": 5, "overridden": True, "restart": False})
         self.assertTrue(os.path.exists(config.CONFIG_FILE))
         self.assertEqual(json.load(open(config.CONFIG_FILE))["MAX_TERMS"], 5)
+
+    def test_term_idle_ttl_min_round_trip(self):
+        st, j = self._post("/api/config", {"key": "TERM_IDLE_TTL_MIN", "value": 45})
+        self.assertEqual(st, 200)
+        self.assertEqual(j, {"ok": True, "key": "TERM_IDLE_TTL_MIN", "value": 45, "restart": False})
+        st, j = self._get_json("/api/config")
+        self.assertEqual(j["TERM_IDLE_TTL_MIN"], {"value": 45, "overridden": True, "restart": False})
+        self.assertEqual(json.load(open(config.CONFIG_FILE))["TERM_IDLE_TTL_MIN"], 45)
+        self.assertEqual(config.TERM_IDLE_TTL_MIN, 45)
+
+    def test_term_idle_ttl_min_out_of_range_is_400(self):
+        for bad in (0, 1441):
+            st, j = self._post("/api/config", {"key": "TERM_IDLE_TTL_MIN", "value": bad})
+            self.assertEqual(st, 400)
+            self.assertEqual(j, {"error": "invalid value for TERM_IDLE_TTL_MIN"})
+        self.assertFalse(os.path.exists(config.CONFIG_FILE))
 
     def test_unknown_key_is_rejected_with_400(self):
         """RED demonstration #1: a key that isn't on config.EDITABLE at all."""

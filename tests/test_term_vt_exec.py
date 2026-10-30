@@ -3158,26 +3158,70 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         self.assertEqual(result["closeCalls"], ["t1"], "declining must never retry the close")
 
     # ===== folder-row title (this task) ============================================================
-    # buildTermRow's folder branch (server contract: `folder`/`fg`): identity is the FOLDER, not a
-    # session, and the fg session's title (resolved off the `sessions` global, same as the non-folder
-    # `identity` lookup right above it) rides along as "running <title>"; absent, it reads "shell".
+    # buildTermRow: a folder shell (server `folder`/`fg`) is titled like any other row -- by the
+    # session it runs (fg session's title, resolved off the `sessions` global), else the shell/cmd.
+    # No "folder" / "running" / "[overflow]" label text.
 
     @unittest.skipUnless(_HAS_NODE, "node not available")
-    def test_folder_row_with_fg_shows_folder_and_running_session_title(self):
-        """Reverting the `if (t.folder)` branch back to the plain identity/cmd path makes this go
-        red -- the label would read the raw tty/cmd instead of the folder name."""
+    def test_folder_row_with_fg_shows_running_session_title_without_folder_label(self):
+        """Dropping the `t.fg.session` identity fallback makes this go red -- the label would
+        read the raw cmd/"shell" instead of the session the folder shell is running."""
         script = self._script("""
 var sessions = [{ id: "sess1", title: "My Session" }];
 var row = buildTermRow({
-  tty: "tty-1", cwd: "/Users/x/proj", started: 940, session: "", mode: "cwd",
+  tty: "tty-1", cwd: "/Users/x/proj", started: 940, session: "opener9", mode: "cwd",
   folder: true, fg: { session: "sess1", mode: "resume", started: 900 }
 }, 1000, []);
 console.log(JSON.stringify({ label: row.children[0].textContent, title: row.children[0].title }));
 """)
         result = _run_node(script)
-        self.assertEqual(result["label"], "proj  ·  running My Session  ·  1m")
+        self.assertEqual(result["label"], "My Session  ·  proj  ·  1m")
+        self.assertNotIn("folder", result["label"])
+        self.assertNotIn("running", result["label"])
         self.assertIn("tty-1", result["title"])
         self.assertIn("/Users/x/proj", result["title"])
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_folder_row_names_fg_not_opener(self):
+        """A real folder pty always has `session` (the opener); the label must come from the fg
+        session only. Red when the `!identity` gate lets the opener win."""
+        script = self._script("""
+var sessions = [{ id: "S1", title: "Opener Title" }, { id: "S2", title: "Second Session" }];
+var row = buildTermRow({
+  tty: "tty-1", cwd: "/Users/x/proj", started: 940, session: "S1", mode: "cwd",
+  folder: true, fg: { session: "S2", mode: "resume", started: 900 }
+}, 1000, []);
+console.log(JSON.stringify({ label: row.children[0].textContent }));
+""")
+        label = _run_node(script)["label"]
+        self.assertTrue(label.startswith("Second Session"), label)
+        self.assertNotIn("Opener Title", label)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_idle_folder_row_does_not_name_opener(self):
+        script = self._script("""
+var sessions = [{ id: "S1", title: "Opener Title" }];
+var row = buildTermRow({
+  tty: "tty-1", cwd: "/Users/x/proj", started: 940, session: "S1", mode: "cwd",
+  folder: true, fg: null, cmd: "zsh"
+}, 1000, []);
+console.log(JSON.stringify({ label: row.children[0].textContent }));
+""")
+        label = _run_node(script)["label"]
+        self.assertNotIn("Opener Title", label)
+        self.assertTrue(label.startswith("zsh"), label)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_overflow_row_has_no_overflow_tag(self):
+        script = self._script("""
+var sessions = [{ id: "s9", title: "Other" }];
+var row = buildTermRow({
+  tty: "tty-3", cwd: "/Users/x/proj", started: 1000, session: "s9", mode: "resume", overflow: true
+}, 1000, []);
+console.log(JSON.stringify({ label: row.children[0].textContent }));
+""")
+        result = _run_node(script)
+        self.assertEqual(result["label"], "Other  ·  proj  ·  0m")
 
     @unittest.skipUnless(_HAS_NODE, "node not available")
     def test_folder_row_without_fg_shows_shell(self):
@@ -3190,7 +3234,7 @@ var row = buildTermRow({
 console.log(JSON.stringify({ label: row.children[0].textContent }));
 """)
         result = _run_node(script)
-        self.assertEqual(result["label"], "proj  ·  shell  ·  0m")
+        self.assertEqual(result["label"], "shell  ·  proj  ·  0m")
 
 
 # ===== Bell flash: one shared helper, two triggers (this task) ==================================

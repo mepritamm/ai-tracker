@@ -201,7 +201,8 @@ CONFIG_FILE = os.path.join(_HERE, "config.json")
 # VALIDATORS (below) using exactly this key set, and GET /api/config reports exactly these.
 # TRACKER_AUTH is deliberately not a member.
 EDITABLE = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL",
-            "TERM_APP", "TERM_ALLOW", "PORT", "HOST", "ICON_STYLE", "ICON_SCALE")
+            "TERM_APP", "TERM_ALLOW", "PORT", "HOST", "ICON_STYLE", "ICON_SCALE",
+            "TERM_IDLE_TTL_MIN")
 
 # Keys that only bind at process startup -- the dialog labels these "takes effect on
 # restart" and never claims a live apply for them.
@@ -248,6 +249,7 @@ VALIDATORS = {
     "TERM_RENDERER": _v_enum(("grid", "xterm")),
     "MAX_TERMS":     _v_int(1, 64),             # same clamp term_vt.py has always enforced
     "TERMINAL":      _v_bool,
+    "TERM_IDLE_TTL_MIN": _v_int(1, 1440),   # minutes; 1 min .. 24h
     "TERM_APP":      _v_enum(("Terminal", "iTerm")),
     "TERM_ALLOW":    _v_str(4000),              # one argv prefix per line; a generous cap, not a real limit
     "PORT":          _v_int(1, 65535),
@@ -264,6 +266,7 @@ VALIDATORS = {
 _ENV_NAME = {
     "TERM_RENDERER": "TRACKER_TERM_RENDERER",
     "MAX_TERMS": "TRACKER_MAX_TERMS",
+    "TERM_IDLE_TTL_MIN": "TRACKER_TERM_IDLE_TTL_MIN",
     "TERMINAL": "TRACKER_TERMINAL",
     "TERM_APP": "TRACKER_TERM_APP",
     "TERM_ALLOW": "TRACKER_TERM_ALLOW",
@@ -357,7 +360,7 @@ def resolve_max_terms(overrides):
     this app is watching SEVERAL concurrent AI sessions, so 12 was well under what the
     machine can hold and well under what the user actually runs. Clamped to [1, 64] so a
     typo can't uncap the box. The other half of this is reclaim: POST /api/term/close lets
-    the user free a slot instead of waiting out term_vt.IDLE_TIMEOUT, and the 429 body lists
+    the user free a slot instead of waiting out the idle TTL (TERM_IDLE_TTL_MIN), and the 429 body lists
     what is holding the slots -- see term_vt.open_pty. Now config.json-overridable -- same
     [1, 64] clamp applies to a browser-set override too (server.py's validator also enforces
     this range before it's ever written, so a bad value never reaches this function)."""
@@ -435,10 +438,25 @@ def resolve_icon_scale(overrides):
     return 100
 
 
+def resolve_term_idle_ttl_min(overrides):
+    """Minutes a terminal nobody is watching or typing into survives before it is closed.
+    config.json > TRACKER_TERM_IDLE_TTL_MIN > 30; clamped to [1, 1440]."""
+    if "TERM_IDLE_TTL_MIN" in overrides:
+        try:
+            return max(1, min(1440, int(overrides["TERM_IDLE_TTL_MIN"])))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(1, min(1440, int(os.environ.get("TRACKER_TERM_IDLE_TTL_MIN", 30))))
+    except (TypeError, ValueError):
+        return 30
+
+
 _RESOLVERS = {
     "LIVE_WINDOW": resolve_live_window,
     "TERM_RENDERER": resolve_term_renderer,
     "MAX_TERMS": resolve_max_terms,
+    "TERM_IDLE_TTL_MIN": resolve_term_idle_ttl_min,
     "TERMINAL": resolve_terminal,
     "TERM_APP": resolve_term_app,
     "TERM_ALLOW": resolve_term_allow,
@@ -451,7 +469,8 @@ _RESOLVERS = {
 # The four keys that ALSO exist as a plain, freely-reassignable module attribute (see the
 # big module comment above for why these four specifically, and why a PEP 562 dynamic
 # attribute was reverted in favour of this).
-_PLAIN_ATTR_KEYS = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL")
+_PLAIN_ATTR_KEYS = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL",
+                    "TERM_IDLE_TTL_MIN")
 
 # Seeded here from env/default ONLY (an explicit `{}`, never a file read) -- this module has
 # no filesystem access of its own (see the big comment above), so at its own import time
@@ -462,6 +481,7 @@ LIVE_WINDOW = resolve_live_window({})
 TERM_RENDERER = resolve_term_renderer({})
 MAX_TERMS = resolve_max_terms({})
 TERMINAL = resolve_terminal({})
+TERM_IDLE_TTL_MIN = resolve_term_idle_ttl_min({})
 
 
 def apply_overrides(overrides):

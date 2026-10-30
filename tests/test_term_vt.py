@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import signal
+import sys
 import tempfile
 import threading
 import time
@@ -711,6 +712,16 @@ def _wait_for(pred, timeout=10.0):
     return pred()
 
 
+def _join_deferred_starts(timeout=15.0):
+    """A fresh folder shell's resume/new start is DEFERRED (`_folder_settled` holds ~1.5s before
+    typing). Join those threads inside the test's patch scope: left running they type/back-stop
+    after the patches are undone and leak calls into the next test."""
+    for p in list(term_vt.PTYS.values()):
+        t = p.deferred
+        if t is not None:
+            t.join(timeout)
+
+
 class TestClampAndIsClaude(unittest.TestCase):
     def test_clamp_int_within_bounds(self):
         self.assertEqual(term_vt._clamp_int(80, 20, 500, 100), 80)
@@ -987,6 +998,34 @@ class TestProcessGroupKill(unittest.TestCase):
             finally:
                 pt.kill()
                 _drain(pt, 5)
+
+
+class TestNeverKillsOwnProcessGroup(unittest.TestCase):
+    """pty.fork() returns to the parent before the child's setsid, so getpgid(child) can be the
+    PARENT's group; killpg of it SIGKILLs this process. Nothing here may ever signal our group."""
+
+    def test_pty_kill_never_signals_own_group_when_getpgid_races(self):
+        own = os.getpgrp()
+        pt = term_vt.Pty(tid="ownpg", pid=424242, fd=-1)
+        with mock.patch.object(term_vt.os, "getpgid", lambda p: own), \
+             mock.patch.object(term_vt.os, "killpg") as killpg, \
+             mock.patch.object(term_vt.os, "kill") as kill:
+            pt.kill()
+        self.assertNotIn(mock.call(own, signal.SIGKILL), killpg.call_args_list)
+        kill.assert_any_call(424242, signal.SIGKILL)
+
+    def test_folder_pty_kill_never_signals_own_group_via_fg(self):
+        own = os.getpgrp()
+        pt = term_vt.Pty(tid="ownpg2", pid=424242, fd=99)
+        pt.folder = True
+        with mock.patch.object(term_vt.os, "getpgid", lambda p: own), \
+             mock.patch.object(term_vt.os, "tcgetpgrp", lambda fd: own), \
+             mock.patch.object(term_vt.os, "killpg") as killpg, \
+             mock.patch.object(term_vt.os, "kill"):
+            pt.kill()
+        self.assertNotIn(mock.call(own, signal.SIGKILL), killpg.call_args_list)
+        for c in killpg.call_args_list:
+            self.assertNotEqual(c[0][0], own)
 
 
 class TestRoutes(unittest.TestCase):
@@ -1372,6 +1411,7 @@ class TestRoutes(unittest.TestCase):
             with mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True), \
                  mock.patch.object(term_vt, "_inject_write", side_effect=_capture):
                 term_vt.open_pty(h, None, {"session": "claude-sid", "mode": "new", "cols": 80, "rows": 24})
+                _join_deferred_starts()    # the fresh shell's start is deferred (settle, then type)
             obj, code = h.calls[-1]
             self.assertEqual(code, 200)
             shell_argv = [os.environ.get("SHELL", "/bin/bash"), "-l"]
@@ -1469,6 +1509,7 @@ class TestRoutes(unittest.TestCase):
             with mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True), \
                  mock.patch.object(term_vt, "_inject_write", side_effect=_capture):
                 term_vt.open_pty(h, None, {"cwd": d, "mode": "new"})
+                _join_deferred_starts()    # the fresh shell's start is deferred (settle, then type)
             obj, code = h.calls[-1]
             self.assertEqual(code, 200)
             shell_argv = [os.environ.get("SHELL", "/bin/bash"), "-l"]
@@ -1905,37 +1946,229 @@ class TestWireFormat(unittest.TestCase):
                 b.close()
 
 
+_CLAUDE_LAYOUT_CHILD = r'''
+import sys, time
+W = sys.stdout.write
+W("\x1b[16;1H" + ("─" * 40) + "\x1b[17;1H❯ " + "\x1b[18;1H" + ("─" * 40))
+W("\x1b[2;1Hbody start"); sys.stdout.flush()
+BODY = %(body)s
+n = 0
+while True:
+    n += 1
+    W("\x1b7")
+    W("\x1b[18;1H\x1b[2K" + ("─" * 40))
+    for row in (19, 20, 21, 22, 23, 24):
+        W("\x1b[%%d;1H\x1b[2Kstatus %%d" %% (row, n))
+    if BODY:
+        W("\x1b[%%d;1Hbody %%d" %% (3 + n %% 10, n))
+    W("\x1b8"); sys.stdout.flush()
+    time.sleep(0.2)
+'''
+
+
 class TestIdleTimeout(unittest.TestCase):
-    """No keystrokes AND no viewers for IDLE_TIMEOUT -> the reader thread reaps the PTY."""
+    """No keystrokes AND no viewers for the idle TTL -> the reader thread reaps the PTY."""
+
+    def setUp(self):
+        self._ttl0 = config.TERM_IDLE_TTL_MIN
+
+    def tearDown(self):
+        config.TERM_IDLE_TTL_MIN = self._ttl0
 
     def test_idle_pty_is_reaped(self):
-        real_timeout = term_vt.IDLE_TIMEOUT
-        term_vt.IDLE_TIMEOUT = 0.2
+        config.TERM_IDLE_TTL_MIN = 0.001          # ~0.06s
+        pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
         try:
-            pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
-            try:
-                self.assertTrue(_drain(pt, 5).done, "idle PTY with no viewers was never reaped")
-                self.assertIsNotNone(pt.rc)
-            finally:
-                pt.kill()
+            self.assertTrue(_drain(pt, 5).done, "idle PTY with no viewers was never reaped")
+            self.assertIsNotNone(pt.rc)
         finally:
-            term_vt.IDLE_TIMEOUT = real_timeout
+            pt.kill()
+
+    def test_plain_shell_reap_never_forks_ps(self):
+        """The idle reap must not fork `ps` (cold pgid cache) for a screen that isn't Claude's."""
+        config.TERM_IDLE_TTL_MIN = 0.001
+        real = term_vt.subprocess.run
+        calls = []
+
+        def counting(cmd, *a, **kw):
+            if cmd and cmd[0] == "ps":
+                calls.append(cmd)
+            return real(cmd, *a, **kw)
+        with term_vt._FG_CACHE_LOCK:
+            term_vt._FG_CACHE.clear()
+        pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
+        try:
+            with mock.patch.object(term_vt.subprocess, "run", counting):
+                self.assertTrue(_drain(pt, 5).done)
+            self.assertEqual(calls, [], "plain-shell reap forked ps")
+        finally:
+            pt.kill()
 
     def test_active_viewer_prevents_idle_reap(self):
-        real_timeout = term_vt.IDLE_TIMEOUT
-        term_vt.IDLE_TIMEOUT = 0.2
+        config.TERM_IDLE_TTL_MIN = 0.001
+        pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
+        pt.viewers = 1                     # simulate an attached viewer, no route needed
         try:
+            time.sleep(0.6)
+            self.assertFalse(pt.done, "a PTY with an active viewer must not be idle-reaped")
+        finally:
+            pt.viewers = 0
+            pt.kill()
+            _drain(pt, 5)
+
+    def _claude(self, body):
+        script = _CLAUDE_LAYOUT_CHILD % {"body": "True" if body else "False"}
+        return term_vt.spawn(os.getcwd(), [sys.executable, "-c", script], 80, 24)
+
+    # the child is python, not claude: pretend Claude is the foreground so the footer rule applies
+    @mock.patch.object(term_vt, "_claude_work_children", return_value=[])
+    @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
+    def test_claude_footer_redraw_does_not_hold_off_reap(self, _fg, _kids):
+        config.TERM_IDLE_TTL_MIN = 0.05           # 3s
+        pt = self._claude(body=False)
+        try:
+            self.assertTrue(_wait_for(lambda: pt.screen.v > 3, 5), "fake Claude never drew")
+            self.assertTrue(_drain(pt, 12).done,
+                            "footer-only redraws kept a viewer-less Claude pty alive")
+        finally:
+            pt.kill()
+
+    # the child is python, not claude: pretend Claude is the foreground so the footer rule applies
+    @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
+    def test_body_output_holds_off_reap(self, _fg):
+        config.TERM_IDLE_TTL_MIN = 0.05           # 3s
+        pt = self._claude(body=True)
+        try:
+            time.sleep(6)                          # > 2x the TTL
+            self.assertFalse(pt.done, "body output must count as activity")
+        finally:
+            pt.kill()
+            _drain(pt, 5)
+
+    def test_progress_under_rule_prompt_holds_off_reap(self):
+        """A non-Claude shell whose prompt has a `─` rule must not look like a Claude footer: an
+        in-place `\\r` progress bar below it is activity, so the viewer-less pty is not reaped."""
+        config.TERM_IDLE_TTL_MIN = 0.05           # 3s
+        script = (
+            "import sys, time\n"
+            "w = sys.stdout.write\n"
+            "w('\\x1b[2J\\x1b[15;1H' + '\\u2500' * 60 + '\\x1b[16;1H\\u276f cmd')\n"
+            "sys.stdout.flush()\n"
+            "i = 0\n"
+            "while True:\n"
+            "    i += 1\n"
+            "    w('\\x1b[17;1H\\r' + 'progress %d' % i + ' ' * 10)\n"
+            "    sys.stdout.flush()\n"
+            "    time.sleep(0.2)\n")
+        pt = term_vt.spawn(os.getcwd(), [sys.executable, "-c", script], 80, 24)
+        try:
+            time.sleep(6)                          # > 2x the TTL
+            self.assertFalse(pt.done, "progress bar under a rule prompt must count as activity")
+        finally:
+            pt.kill()
+            _drain(pt, 5)
+
+    def test_plain_shell_activity_never_forks_ps(self):
+        """`_note_activity` must only probe `ps` when the screen already looks like Claude."""
+        calls = []
+        real = term_vt.subprocess.run
+
+        def counting(cmd, *a, **k):
+            if cmd and cmd[0] == "ps":
+                calls.append(cmd)
+            return real(cmd, *a, **k)
+
+        term_vt._FG_CACHE.clear()
+        with mock.patch.object(term_vt.subprocess, "run", counting):
             pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
-            pt.viewers = 1                     # simulate an attached viewer, no route needed
             try:
-                time.sleep(0.6)
-                self.assertFalse(pt.done, "a PTY with an active viewer must not be idle-reaped")
+                self.assertTrue(_wait_for(lambda: pt._act_v is not None, 5))
+                time.sleep(7)                      # > FG_CACHE_TTL (5s): old code forked ps here
+                self.assertEqual(calls, [], "a plain shell pty forked ps from _note_activity")
             finally:
-                pt.viewers = 0
                 pt.kill()
                 _drain(pt, 5)
+
+    def test_ttl_change_applies_without_restart(self):
+        config.apply_overrides({"TERM_IDLE_TTL_MIN": 30})
+        pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
+        try:
+            # the reader's first _note_activity touches last_active; let it run before backdating
+            self.assertTrue(_wait_for(lambda: pt._act_v is not None, 5))
+            pt.last_active = time.time() - 120    # idle 2 min: inside a 30 min TTL
+            time.sleep(1.6)
+            self.assertFalse(pt.done, "reaped under a 30 min TTL")
+            config.apply_overrides({"TERM_IDLE_TTL_MIN": 1})   # live change, same running reader
+            self.assertEqual(config.TERM_IDLE_TTL_MIN, 1)
+            self.assertTrue(_drain(pt, 5).done, "new TTL not picked up by the running reader")
         finally:
-            term_vt.IDLE_TIMEOUT = real_timeout
+            pt.kill()
+            config.apply_overrides({})
+
+
+    # ---- background work keeps a Claude pty alive (see _claude_busy) ----
+
+    @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
+    def test_claude_with_background_work_is_not_reaped(self, _fg):
+        config.TERM_IDLE_TTL_MIN = 0.05           # 3s
+        with mock.patch.object(term_vt, "_claude_work_children", return_value=[99999],
+                               create=True):
+            pt = self._claude(body=False)
+            try:
+                self.assertTrue(_wait_for(lambda: pt.screen.v > 3, 5), "fake Claude never drew")
+                time.sleep(6)                      # > 2x the TTL
+                self.assertFalse(pt.done, "a Claude with tool work still running was reaped")
+            finally:
+                pt.kill()
+                _drain(pt, 5)
+
+    @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
+    def test_busy_probe_runs_once_per_ttl_not_every_second(self, _fg):
+        config.TERM_IDLE_TTL_MIN = 0.05           # 3s
+        calls = []
+        with mock.patch.object(term_vt, "_claude_work_children",
+                               side_effect=lambda pid: calls.append(pid) or [1], create=True):
+            pt = self._claude(body=False)
+            try:
+                self.assertTrue(_wait_for(lambda: pt.screen.v > 3, 5))
+                time.sleep(7.5)
+                self.assertTrue(1 <= len(calls) <= 3, "probe calls: %d" % len(calls))
+            finally:
+                pt.kill()
+                _drain(pt, 5)
+
+    @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
+    def test_idle_claude_with_only_helpers_is_reaped(self, _fg):
+        config.TERM_IDLE_TTL_MIN = 0.05           # 3s
+        with mock.patch.object(term_vt, "_claude_work_children", return_value=[], create=True):
+            pt = self._claude(body=False)
+            try:
+                self.assertTrue(_wait_for(lambda: pt.screen.v > 3, 5))
+                self.assertTrue(_drain(pt, 12).done)
+            finally:
+                pt.kill()
+
+    def test_plain_shell_ignores_the_child_probe(self):
+        config.TERM_IDLE_TTL_MIN = 0.001
+        with mock.patch.object(term_vt, "_claude_work_children", return_value=[1],
+                               create=True) as probe:
+            pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
+            try:
+                self.assertTrue(_drain(pt, 5).done)
+                probe.assert_not_called()
+            finally:
+                pt.kill()
+
+    def test_claude_work_children_classifies_by_group(self):
+        out = " 100 1 100\n 200 100 200\n 201 100 100\n 300 999 300\n"
+        with mock.patch.object(term_vt.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout=out)):
+            self.assertEqual(term_vt._claude_work_children(100), [200])
+        with mock.patch.object(term_vt.subprocess, "run", side_effect=OSError("no ps")):
+            self.assertEqual(term_vt._claude_work_children(100), [])
+        with mock.patch.object(term_vt.subprocess, "run",
+                               return_value=mock.Mock(returncode=1, stdout=out)):
+            self.assertEqual(term_vt._claude_work_children(100), [])
 
 
 class TestEviction(unittest.TestCase):
@@ -3718,6 +3951,7 @@ class TestOpenPtyForkedAndNoticeFields(_ResumeModeRoutes):
                  mock.patch.object(term_vt, "_inject_write", return_value=True):
                 h = _FakeHandler()
                 term_vt.open_pty(h, None, {"session": "plain", "mode": "resume"})
+                _join_deferred_starts()    # else the thread outlives the patches and leaks a backstop call
         finally:
             term_vt.spawn = original_spawn
         obj, code = h.calls[-1]
@@ -3733,6 +3967,7 @@ class TestOpenPtyForkedAndNoticeFields(_ResumeModeRoutes):
                 with self.subTest(mode=mode), mock.patch.object(term_vt, "_resume_backstop") as backstop:
                     h = _FakeHandler()
                     term_vt.open_pty(h, None, {"session": "whatever-%s" % mode, "mode": mode})
+                    _join_deferred_starts()
                     time.sleep(0.05)
                     obj, code = h.calls[-1]
                     self.assertEqual(code, 200, obj)
@@ -3751,11 +3986,13 @@ class TestOpenPtyForkedAndNoticeFields(_ResumeModeRoutes):
         original_spawn = term_vt.spawn
         term_vt.spawn = lambda cwd, argv, cols, rows: term_vt.Pty(tid="pf4")
         try:
-            with mock.patch.object(term_vt, "_resume_backstop") as backstop:
+            with mock.patch.object(term_vt, "_resume_backstop") as backstop, \
+                 mock.patch.object(term_vt, "_inject_argv", return_value=(True, "")):
                 h = _FakeHandler()
                 term_vt.open_pty(h, None, {"session": "bg-sess2", "mode": "resume",
                                             "cols": 77, "rows": 21})
                 self.assertTrue(_wait_for(lambda: backstop.called))
+                _join_deferred_starts()
         finally:
             term_vt.spawn = original_spawn
         pt_arg, sid_arg, forked_arg, cols_arg, rows_arg = backstop.call_args[0]
@@ -3917,6 +4154,46 @@ class TestResumeBackstopFiresOnRefusal(unittest.TestCase):
         self.assertFalse(pt.forked, "the abandoned retry must not be swapped in")
         self.assertEqual(len(forked), 1)
         for _ in range(100):                          # the abandoned child must be reaped, not orphaned
+            try:
+                os.kill(forked[0], 0)
+            except OSError:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("the abandoned fork is still running")
+
+    def test_abandoned_fork_never_killpgs_own_group(self):
+        own = os.getpgrp()
+        pt = _bare_pty()
+        pt.done, pt.rc, pt.ended = True, 1, time.time()
+        term_vt.PTYS[pt.id] = pt
+        real_fork = term_vt._fork_child
+        real_killpg = os.killpg
+        forked, seen = [], []
+
+        def slow_fork(cwd, argv, cols, rows):
+            pid, fd = real_fork(cwd, argv, cols, rows)
+            forked.append(pid)
+            pt.closing = True                         # deterministic abandon
+            return pid, fd
+
+        def guarded(pg, sig):
+            seen.append(pg)
+            if pg == own:
+                os.kill(forked[0], signal.SIGKILL)
+                return
+            real_killpg(pg, sig)
+
+        with mock.patch.object(term_vt, "_fork_child", slow_fork), \
+             mock.patch.object(term_vt.os, "getpgid", lambda p: own), \
+             mock.patch.object(term_vt.os, "killpg", guarded), \
+             mock.patch.object(term_gate, "resume_argv",
+                                lambda s: ["/bin/sh", "-c", "sleep 30"]):
+            term_vt._retry_with_fork(pt, "raced-sid", 80, 24)
+        self.assertNotIn(own, seen)
+        self.assertFalse(pt.forked)
+        self.assertEqual(len(forked), 1)
+        for _ in range(100):
             try:
                 os.kill(forked[0], 0)
             except OSError:
@@ -4506,6 +4783,43 @@ class TestResumeBackstopStreamRecoversAfterAttach(unittest.TestCase):
             time.sleep(0.02)
         else:
             self.fail("the abandoned attach child is still running -- leaked, not reaped")
+
+    def test_3c_abandoned_attach_never_killpgs_own_group(self):
+        """getpgid(child) can be OUR group right after pty.fork(); the abandoned branch must not
+        killpg it (that SIGKILLed the test runner), yet must still reap the child."""
+        own = os.getpgrp()
+        pt = self._refused_pty(tid="streamrec3c")
+        pt.closing = True
+        spawned, seen = [], []
+        real_fork = term_vt._fork_child
+        real_killpg = os.killpg
+
+        def _spawn_sleep(cwd, argv, cols, rows):
+            pid, fd = real_fork(cwd, ["/bin/sh", "-c", "sleep 30"], cols, rows)
+            spawned.append(pid)
+            return pid, fd
+
+        def guarded(pg, sig):
+            seen.append(pg)
+            if pg == own:                     # what the old code does: deflect, never deliver
+                os.kill(spawned[0], signal.SIGKILL)
+                return
+            real_killpg(pg, sig)
+
+        with mock.patch.object(term_vt, "_fork_child", _spawn_sleep), \
+             mock.patch.object(term_vt.os, "getpgid", lambda p: own), \
+             mock.patch.object(term_vt.os, "killpg", guarded):
+            ok = term_vt._retry_with_attach(pt, self.FULL_SID, self.SHORT_SID, 80, 24)
+        self.assertTrue(ok)
+        self.assertNotIn(own, seen)
+        for _ in range(150):
+            try:
+                os.kill(spawned[0], 0)
+            except OSError:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("the abandoned attach child is still running")
 
     def test_4_output_from_the_replacement_child_reaches_a_late_subscriber(self):
         """The end-to-end "the pane comes back to life" assertion: a raw-stream consumer that

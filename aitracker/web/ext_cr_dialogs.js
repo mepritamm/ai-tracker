@@ -842,6 +842,7 @@
     ICON_SCALE: null,    // ditto — no env var, config.json > built-in default
     TERM_RENDERER: 'TRACKER_TERM_RENDERER',
     MAX_TERMS: 'TRACKER_MAX_TERMS',
+    TERM_IDLE_TTL_MIN: 'TRACKER_TERM_IDLE_TTL_MIN',
     TERMINAL: 'TRACKER_TERMINAL',
     TERM_APP: 'TRACKER_TERM_APP',
     TERM_ALLOW: 'TRACKER_TERM_ALLOW',
@@ -1302,6 +1303,11 @@
         body.appendChild(serverRow('Max terminals', 'MAX_TERMS', 'Clamped to 1–64.',
           function (value, onCommit) {
             return sliderCtlCommit(1, 64, value != null ? value : 12, onCommit, '');
+          }));
+        body.appendChild(serverRow('Idle terminal TTL', 'TERM_IDLE_TTL_MIN',
+          'A terminal nobody is watching or typing into is closed after this many minutes. The slider covers 5–240; env TRACKER_TERM_IDLE_TTL_MIN or config.json accept 1–1440.',
+          function (value, onCommit) {
+            return sliderCtlCommit(5, 240, value != null ? value : 30, onCommit, ' min');
           }));
         body.appendChild(serverRow('Terminal enabled', 'TERMINAL',
           'The kill-switch. ON means the tracker can start real shell processes on this machine, not just read logs — turn it OFF if you only want the read-only dashboard.',
@@ -1981,24 +1987,12 @@
         // 36-char uuid (never "undefined": t.session is "" for a plain shell, never unset).
         // The server-supplied t.suffix ("", "-terminal", "-resume", "-new") distinguishes how
         // the terminal was launched and is appended to the title.
-        var identity = t.session ? (sessionTitleFor(t.session) || t.session.slice(0, 8)) : null;
-        // Folder terminals (server contract: `folder`/`fg` on GET /api/term/list rows -- one
-        // shared shell per cwd, every session in that folder runs inside it) name themselves by
-        // the folder rather than whichever session happens to be running inside them right now --
-        // same identity swap ext_vt.js's buildTermRow makes for the dashboard's own rows. `fg`
-        // (set only while something is actually running in the foreground) names which session
-        // that is; absent, the shell is just idle at its prompt.
-        var titleText = t.folder
-          ? cwdTail(t.cwd) + ' · ' + ((t.fg && t.fg.session)
-              ? 'running ' + (sessionTitleFor(t.fg.session) || t.fg.session.slice(0, 8))
-              : 'shell')
-          : (identity || cwdTail(t.cwd) || t.tty) + (t.suffix || '');
+        var identity = (!t.folder && t.session) ? (sessionTitleFor(t.session) || t.session.slice(0, 8)) : null;
+        // Folder shells (`folder`/`fg`) and overflow ptys get no label of their own: title by the
+        // session they run (`t.session`, else the foreground session `t.fg` names), else cwd/tty.
+        if ((t.folder || !identity) && t.fg && t.fg.session) identity = sessionTitleFor(t.fg.session) || t.fg.session.slice(0, 8);
+        var titleText = (identity || cwdTail(t.cwd) || t.tty) + (t.suffix || '');
         var titleChildren = [titleText];
-        if (t.folder) titleChildren.push(h('span', { class: 'cr-termcap-badge' }, ['folder']));
-        // `overflow` (a dedicated one-off pty the server opened because the folder shell was busy
-        // running something else) is mutually exclusive with `folder` -- both badges can never
-        // appear on the same row.
-        if (t.overflow) titleChildren.push(h('span', { class: 'cr-termcap-badge' }, ['overflow']));
         var peekBtn = h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', text: 'peek', onclick: function () { if (payload.onPeek) payload.onPeek(t); } });
         var killBtn = h('button', { class: 'cr-btn cr-btn-quiet cr-btn-danger', type: 'button', onclick: function () {
           if (!payload.onKill) return;

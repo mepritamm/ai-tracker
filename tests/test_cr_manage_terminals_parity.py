@@ -116,7 +116,7 @@ var OUT = {};
   }
   function icon(n) { return { icon: n }; }
   var sessions = [];
-  function sessionTitleFor() { return null; }
+  function sessionTitleFor(sid) { return ({ S1: 'Opener Title', S2: 'Second Session' })[sid] || null; }
   function timeAgo() { return 'AGO'; }
   function cwdTail(c) { return c; }
 
@@ -240,6 +240,19 @@ var OUT = {};
   }
   OUT['row_kill_found'] = !!rowKill;
   OUT['row_kill_disabled_during_sweep'] = !!(rowKill && rowKill.disabled);
+
+  // ===== SCENARIO F: folder-shell rows are titled by what runs NOW, never by the opener =====
+  window = { ExtVT: { term: { armGuard: function () { return function () { return false; }; } } } };
+  function rowTitle(term) {
+    reset();
+    renderManageTerminals({ terminals: [term], max: 4,
+      onPeek: function () {}, onKill: function () {}, onCloseAll: function () {} });
+    return allText();
+  }
+  OUT['folder_fg_text'] = rowTitle({ tty: '/dev/pts/9', cwd: '/proj', started: 1000, session: 'S1',
+    mode: 'cwd', folder: true, fg: { session: 'S2' } });
+  OUT['folder_idle_text'] = rowTitle({ tty: '/dev/pts/9', cwd: '/proj', started: 1000, session: 'S1',
+    mode: 'cwd', folder: true, fg: null });
 })();
 console.log("===PARITY_JSON_START===");
 console.log(JSON.stringify(OUT));
@@ -287,6 +300,18 @@ class ManageTerminalsParity(unittest.TestCase):
                         "the confirm handler must consult the arm guard")
         self.assertFalse(self.out.get("close_all_fired_while_armed"),
                          "a confirm activated while still inside the arm window must be swallowed")
+
+    def test_folder_row_names_fg_not_opener(self):
+        """A real folder pty always carries the opener's `session`; the row must still be titled
+        by the fg session (`t.fg.session`), not the session that merely opened the shell."""
+        text = self.out.get("folder_fg_text") or ""
+        self.assertIn("Second Session", text)
+        self.assertNotIn("Opener Title", text)
+
+    def test_idle_folder_row_does_not_name_opener(self):
+        text = self.out.get("folder_idle_text") or ""
+        self.assertIn("proj", text)             # the row rendered, titled by its cwd
+        self.assertNotIn("Opener Title", text)
 
     def test_cap_is_never_fabricated_when_the_server_sends_none(self):
         """conventions rule 5: the server owns the cap. `payload.max || terms.length` invented one,
