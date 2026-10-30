@@ -4712,5 +4712,147 @@ console.log(JSON.stringify({
         self.assertEqual(r["absent"], [["haiku", False], ["sonnet", True], ["opus", False]])
 
 
+def _web_src(name):
+    with open(os.path.join(_WEB, name), encoding="utf-8") as fh:
+        return fh.read()
+
+
+_META_CASES_JS = """
+var ANTH = { gateway: 'anthropic', model: 'claude-opus-5-5', model_slot: 'opus',
+  model_ladder: ['haiku', 'sonnet', 'opus', 'fable'], model_hints: {} };
+var OR = { gateway: 'openrouter', model: 'p/h', model_slot: 'opus',
+  model_ladder: ['haiku', 'sonnet', 'opus'], model_hints: { haiku: 'x/l', sonnet: 'd/m', opus: 'p/h' } };
+var ORNULL = { gateway: 'openrouter', model: 'anthropic/claude-sonnet-4.6', model_slot: null,
+  model_ladder: ['haiku', 'sonnet', 'opus'], model_hints: {} };
+var OLD = { model: 'sonnet' };
+"""
+
+
+class TestTermAndDetailModelPickerWiring(unittest.TestCase):
+    """The gateway-aware model picker wiring in ext_cr_term.js (header dialog, resume command,
+    detach reset) and ext_cr_detail.js (`terminal-model` action): current/ladder/hints come from the
+    server's meta, never re-derived, and fall back cleanly when the fields are absent."""
+
+    _TERM_PRELUDE = """
+'use strict';
+var window = { ExtVT: { MODEL_LADDER: ['haiku', 'sonnet', 'opus', 'fable'] } };
+var st = { sessionId: 'sid1' }, el = { resumecmd: {}, cwd: {}, resumeHere: {}, extResume: {} };
+var dialogCalls = [];
+var ctx = { dialog: function (name, opts) { dialogCalls.push([name, opts]); } };
+function modelLadder() { return window.ExtVT.MODEL_LADDER; }
+function _injectSlash() {}
+function _readContextUsage() { return null; }
+function _syncStatusBar() {}
+function _syncControlVisibility() {}
+function isClaudeId(s) { return !/^auggie:/.test(s); }
+function localOnly() { return true; }
+"""
+
+    @classmethod
+    def _term_fns(cls):
+        from tests.test_model_update_nudge import _extract_function
+        src = _web_src("ext_cr_term.js")
+        return "\n".join(_extract_function(src, n) for n in
+                         ("_openModelDialog", "_applySessionData", "_resetPaneChrome", "_loadHeaderInfo"))
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_term_model_dialog_current_ladder_hints(self):
+        script = self._TERM_PRELUDE + self._term_fns() + _META_CASES_JS + """
+function run(meta) {
+  st = { sessionId: 'sid1' }; dialogCalls = [];
+  _applySessionData({ meta: meta });
+  _openModelDialog();
+  var o = dialogCalls[0][1];
+  return { current: o.current, ladder: o.ladder, hints: o.hints };
+}
+console.log(JSON.stringify({ anth: run(ANTH), or: run(OR), ornull: run(ORNULL), old: run(OLD) }));
+"""
+        r = _run_node(script)
+        self.assertEqual(r["anth"]["ladder"], ["haiku", "sonnet", "opus", "fable"])
+        self.assertEqual(r["anth"]["current"], "opus")
+        self.assertEqual(r["anth"]["hints"], {})
+        self.assertEqual(r["or"]["ladder"], ["haiku", "sonnet", "opus"])
+        self.assertEqual(r["or"]["current"], "opus")
+        self.assertEqual(r["or"]["hints"], {"haiku": "x/l", "sonnet": "d/m", "opus": "p/h"})
+        self.assertIsNone(r["ornull"]["current"])   # no substring guess on OpenRouter
+        self.assertEqual(r["old"]["ladder"], ["haiku", "sonnet", "opus", "fable"])  # built-in fallback
+        self.assertIsNone(r["old"]["hints"])
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_term_detach_resets_gateway_fields(self):
+        script = self._TERM_PRELUDE + self._term_fns() + _META_CASES_JS + """
+el = new Proxy({}, { get: function (t, k) { return t[k] || (t[k] = { classList: { add: function () {}, remove: function () {} } }); } });
+st = { sessionId: 'sid1' };
+_applySessionData({ meta: OR });
+var before = [st.gateway, st.modelSlot, st.modelLadder, st.modelHints];
+_resetPaneChrome();
+console.log(JSON.stringify({ before: before, after: [st.gateway, st.modelSlot, st.modelLadder, st.modelHints] }));
+"""
+        r = _run_node(script)
+        self.assertEqual(r["before"][0], "openrouter")
+        self.assertIsNotNone(r["before"][2])
+        self.assertEqual(r["after"], [None, None, None, None])
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_term_resume_cmd_string_null_absent(self):
+        script = self._TERM_PRELUDE + self._term_fns() + """
+var body = null;
+var fetch = function () { return Promise.resolve({ json: function () { return Promise.resolve(body); } }); };
+var location = { hostname: 'localhost' };
+function go(meta) {
+  st = { sessionId: 'sid1' };
+  el = { resumecmd: { hidden: null, textContent: null }, cwd: {}, resumeHere: {}, extResume: {} };
+  body = { meta: meta };
+  _loadHeaderInfo('sid1');
+  return new Promise(function (res) { setTimeout(function () {
+    res({ text: el.resumecmd.textContent, hidden: el.resumecmd.hidden }); }, 5); });
+}
+(async function () {
+  var out = { str: await go({ resume_cmd: 'launcher --resume sid1' }),
+              nul: await go({ resume_cmd: null }),
+              absent: await go({}) };
+  console.log(JSON.stringify(out));
+})();
+"""
+        r = _run_node(script)
+        self.assertEqual(r["str"], {"text": "launcher --resume sid1", "hidden": False})
+        self.assertEqual(r["nul"], {"text": "", "hidden": True})
+        self.assertEqual(r["absent"], {"text": "claude --resume sid1", "hidden": False})
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_detail_terminal_model_current_ladder_hints(self):
+        src = _web_src("ext_cr_detail.js")
+        a = src.index('var ttyMe = ui.lastSession && ui.lastSession.term_tty;')
+        b = src.index("break;", src.index("ctx.dialog(isModel", a))
+        body = src[a:b]
+        script = """
+'use strict';
+var MODEL_LADDER = ['haiku', 'sonnet', 'opus', 'fable'], EFFORT_LADDER = ['low', 'high'];
+function shortModel(m) { var h = /sonnet|opus|haiku/i.exec(m || ''); return h ? h[0].toLowerCase() : (m || ''); }
+function _injectToTerminal() {}
+var sid = 'sid1', act = 'terminal-model', calls = [];
+var ctx = { dialog: function (n, o) { calls.push(o); } };
+function click(meta) {
+  calls = [];
+  var ui = { lastSession: { term_tty: 'tty1', meta: meta } };
+  (function () { """ + body + """ })();
+  var o = calls[0];
+  return { current: o.current, ladder: o.ladder, hints: o.hints };
+}
+""" + _META_CASES_JS + """
+console.log(JSON.stringify({ anth: click(ANTH), or: click(OR), ornull: click(ORNULL), old: click(OLD) }));
+"""
+        r = _run_node(script)
+        self.assertEqual(r["anth"]["ladder"], ["haiku", "sonnet", "opus", "fable"])
+        self.assertEqual(r["anth"]["current"], "opus")
+        self.assertEqual(r["or"]["ladder"], ["haiku", "sonnet", "opus"])
+        self.assertEqual(r["or"]["current"], "opus")
+        self.assertEqual(r["or"]["hints"], {"haiku": "x/l", "sonnet": "d/m", "opus": "p/h"})
+        self.assertIsNone(r["ornull"]["current"])
+        self.assertEqual(r["old"]["ladder"], ["haiku", "sonnet", "opus", "fable"])
+        self.assertEqual(r["old"]["current"], "sonnet")
+        self.assertIsNone(r["old"]["hints"])
+
+
 if __name__ == "__main__":
     unittest.main()

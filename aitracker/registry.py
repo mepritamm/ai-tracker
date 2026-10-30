@@ -1,7 +1,6 @@
 import shlex
 import time
 
-from . import config
 from .providers.claude import ClaudeProvider
 from .providers.auggie import AuggieProvider
 from .providers.augment_ext import AugmentVscodeProvider, AugmentCursorProvider

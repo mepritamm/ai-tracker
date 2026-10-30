@@ -1126,6 +1126,7 @@
     // instead of the default Interface tab. Every other existing caller omits `section`
     // and gets the unchanged default.
     var active = (payload && payload.section) || 'Interface';
+    var orNote = null;   // the OpenRouter 'launcher not configured' note, toggled in place
     // Tunnel section's own state -- local to THIS renderConfig() call, so it starts fresh
     // every time the dialog opens. `tunnel` is the masked snapshot (GET /api/tunnel, now
     // also carrying on/pid/started/expires/error/cloudflared/autostarted -- see
@@ -1198,6 +1199,15 @@
           if (ok) {
             if (srv.cfg && srv.cfg[key]) srv.cfg[key].value = resp.value;
             showStatus(status, true);
+            // OPENROUTER_CONFIGURED is server-judged and depends only on the launcher: re-read it
+            // (never derive it here) and toggle the note in place, so focus and the Saved badge survive.
+            if (key === 'OPENROUTER_LAUNCHER') {
+              fetchServerConfig(function (cfg) {
+                if (!cfg || !('OPENROUTER_CONFIGURED' in cfg)) return;   // error body on non-OK
+                srv.cfg = cfg;
+                if (orNote) orNote.hidden = cfg.OPENROUTER_CONFIGURED !== false;
+              });
+            }
           } else {
             showStatus(status, false, (resp && resp.error) || 'request failed');
             if (typeof onFail === 'function') onFail();
@@ -1327,9 +1337,9 @@
             return segmented([['anthropic', 'Anthropic'], ['openrouter', 'OpenRouter']], value || 'anthropic', onCommit);
           }));
         // server-owned flag (never re-derived here): shown only when the server says the launcher isn't usable
-        if (srv.cfg && srv.cfg.OPENROUTER_CONFIGURED === false) {
-          body.appendChild(h('p', { class: 'cr-help-note' }, ['OpenRouter: launcher not configured']));
-        }
+        orNote = h('p', { class: 'cr-help-note' }, ['OpenRouter: launcher not configured']);
+        orNote.hidden = !(srv.cfg && srv.cfg.OPENROUTER_CONFIGURED === false);
+        body.appendChild(orNote);
         body.appendChild(serverRow('OpenRouter launcher', 'OPENROUTER_LAUNCHER',
           'Command or path of a wrapper that exports OpenRouter env vars and execs claude. Needed for the OpenRouter gateway (new and resumed sessions). Empty = not configured.',
           function (value, onCommit) { return textFieldCtl(value || '', function (v) { onCommit(String(v).trim()); }); }));
