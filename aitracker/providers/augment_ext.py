@@ -16,6 +16,7 @@ import glob, json, os, time, urllib.parse
 from .. import config
 from ..store import load_titles, load_notes, _load_json
 from ..util import _first_line, push_when, _window, _git_branch, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase
+from ..overview import empty_heartbeat
 from .base import Provider
 
 
@@ -284,6 +285,7 @@ def _parse(kind, prefix, src_label, sid):
         "narrative": narrative,
         "message": NOTE[:2000],
         "tokens": {"in": 0, "out": 0},
+        "heartbeat": empty_heartbeat("Augment's VS Code extension keeps usage in its own store — nothing to chart."),
         # no per-turn usage data survives stdlib-only (chat transcript is in the extension's
         # LevelDB kv-store) — honestly empty, never a fabricated occupancy/limit.
         "context": context_window(None, None),

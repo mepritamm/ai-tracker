@@ -572,18 +572,6 @@
   clip-path: inset(50%);
   white-space: nowrap;
 }
-.cr .crd-spine-label {
-  text-transform: uppercase;
-  letter-spacing: .08em;
-  font-size: 10.5px;
-  font-weight: 600;
-  color: var(--text-eyebrow);
-}
-.cr .crd-spine-count {
-  font-variant-numeric: tabular-nums;
-  font-size: 12px;
-  color: var(--text-primary);
-}
 .cr .crd-spine-hint {
   margin-left: auto;
   font-size: 10px;
@@ -2151,4 +2139,74 @@
      technique as `.cr-pill`/`.crd-decision` above: width stays
      content-driven, desktop chip density is untouched. ~20px -> 44px. */
   .cr .crd-timeline-filters button { min-height: 44px; }
+}
+
+/* ============================== heartbeat panel ============================== */
+/* Sits between the Now card and the columns, same slot as the progress spine; the
+   Config "Progress view" row shows one of the two via `hidden` -- so never set
+   `display` on these sections (it would beat the [hidden] attribute). */
+.cr .crd-hb,
+.cr .crd-progress { margin: 16px 24px 0; flex: 0 0 auto; }
+.cr .crd-progress .crd-spine {
+  margin: 0; padding: 0; border: 0; background: none; box-shadow: none; border-radius: 0;
+}
+.cr .crd-hb .crd-panel-body { max-height: min(300px, 36vh); overflow-y: auto; }
+
+.cr .crd-hb-svg { display: block; width: 100%; height: 40px; }
+.cr .crd-hb-out,
+.cr .crd-hb-seg-out,
+.cr .crd-hb-seg-busy { fill: var(--line-focus); background: var(--line-focus); }
+.cr .crd-hb-in,
+.cr .crd-hb-seg-in { fill: var(--line-agent); background: var(--line-agent); }
+.cr .crd-hb-seg-cache { background: var(--line-strong); }
+.cr .crd-hb-hit { fill: transparent; }
+.cr .crd-hb-bin:hover .crd-hb-hit { fill: var(--fill-row-hover); }
+.cr .crd-hb-live rect:not(.crd-hb-hit) {
+  animation: crd-now-pulse var(--motion-pulse-duration, 2.4s) ease-in-out infinite;
+}
+
+.cr .crd-hb-foot,
+.cr .crd-hb-legend,
+.cr .crd-hb-rest { font-size: 10px; color: var(--text-muted); }
+.cr .crd-hb-foot { display: flex; justify-content: space-between; gap: 8px; margin-top: 4px; }
+.cr .crd-hb-legend { margin-top: 2px; }
+.cr .crd-hb-key-out { color: var(--line-focus); }
+.cr .crd-hb-key-in { color: var(--line-agent); }
+.cr .crd-hb-key-cache { color: var(--line-strong); }
+.cr .crd-hb-rest { margin: 4px 0 0; }
+
+.cr .crd-hb-lists {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+  margin-top: 10px;
+}
+.cr .crd-hb-h {
+  margin: 0 0 4px;
+  font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--text-eyebrow);
+}
+.cr .crd-hb-list ol { list-style: none; margin: 0; padding: 0; }
+.cr .crd-hb-row {
+  display: grid; grid-template-columns: 1fr auto; column-gap: 8px;
+  padding: 3px 0; font-size: 12px;
+}
+.cr .crd-hb-main { font-weight: 600; }
+.cr .crd-hb-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.cr .crd-hb-model { font-size: 10px; font-weight: 400; color: var(--text-muted); }
+.cr .crd-hb-val { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.cr .crd-hb-track {
+  grid-column: 1 / -1; display: flex; height: 4px; margin-top: 2px;
+  border-radius: 2px; overflow: hidden; background: var(--surface-sunken);
+}
+
+@media (max-width: 480px) {
+  .cr .crd-hb,
+  .cr .crd-progress { margin: 10px 12px 0; }
+  .cr .crd-hb-svg { height: 32px; }
+  .cr .crd-hb-sum-cache,
+  .cr .crd-hb-sum-span { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cr .crd-hb-live rect:not(.crd-hb-hit) { animation: none; }
 }

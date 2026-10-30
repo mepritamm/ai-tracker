@@ -8,6 +8,7 @@ from .providers.augment_ext import AugmentVscodeProvider, AugmentCursorProvider
 # `make bundle` emits a file that won't parse.
 from .store import load_pins, load_notes, load_flags, load_forks, resolve_fork_child, fork_parent_of, load_model_keep, load_titles, load_title_sync
 from .util import annotate_liveness, model_version, model_label
+from .overview import empty_heartbeat
 
 
 PROVIDERS = [ClaudeProvider(), AuggieProvider(),
@@ -186,6 +187,7 @@ def parse_any(sid):
     # guarantee as all_sessions()'s (line ~89 above) for any provider that doesn't (Augment
     # ext honestly has no Bash-equivalent concept, so it never will) — the key always exists.
     d.setdefault("fail_cmd", None)
+    d.setdefault("heartbeat", empty_heartbeat())   # same seam guarantee: the key always exists
     # parse_error: honest "a line/record in this session's transcript failed to parse"
     # signal (design_handoff_control_room/04's "Something broke" degraded state) — each
     # provider computes its OWN raw fact (Claude off parse_session's per-line JSONL loop,

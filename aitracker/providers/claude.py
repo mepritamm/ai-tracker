@@ -2,7 +2,7 @@ import glob, json, os, re, time
 from ..config import EDIT_TOOLS, LIVE_WINDOW, NARRATION_CAP
 from .. import config
 from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, pr_summary, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase, real_model
-from ..overview import build_overview
+from ..overview import build_overview, build_heartbeat
 from ..store import load_titles, load_tasks, load_notes, _TSTATUS
 from .base import Provider
 
@@ -914,10 +914,47 @@ def _mtime_and_bg(path):
     return m, bg
 
 
-def parse_agents(path):
+def _hb_usage(u):
+    """(out, fresh, cache) off one usage block; `or 0` on every field (a null is not a number)."""
+    return (u.get("output_tokens") or 0,
+            (u.get("input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0),
+            u.get("cache_read_input_tokens") or 0)
+
+
+def _hb_agent_line(hb, aid, o, m, c, seen_mid, use_t):
+    """Feed one agent-transcript line into the heartbeat accumulators (who=aid)."""
+    u = m.get("usage")
+    mid = m.get("id")
+    ep = None
+    if u and not (mid and mid in seen_mid):
+        if mid:
+            seen_mid.add(mid)
+        ep = _ts_epoch(o.get("timestamp"))
+        hb["turns"].append((ep, real_model(m.get("model")) or "") + _hb_usage(u) + (aid,))
+    if isinstance(c, list):
+        for b in c:
+            if not isinstance(b, dict):
+                continue
+            bt = b.get("type")
+            if bt == "tool_use" and b.get("name"):
+                if ep is None:
+                    ep = _ts_epoch(o.get("timestamp"))
+                hb["calls"].append((ep, b["name"], aid))
+                use_t[b.get("id")] = (b["name"], ep)
+            elif bt == "tool_result" and b.get("tool_use_id") in use_t:
+                nm, e0 = use_t.pop(b["tool_use_id"])
+                if ep is None:
+                    ep = _ts_epoch(o.get("timestamp"))
+                if e0 > 0 and ep > 0:
+                    hb["iv"].setdefault(nm, []).append((e0, ep))
+
+
+def parse_agents(path, hb=None):
     """Parse background-agent transcripts: what each one is, doing, and whether it's live.
     Also harvests PRs the agents generated (a `gh pr create`/MCP in a subagent) + their state,
-    so a PR opened by a background agent is attributed to the session — not lost with the subagent."""
+    so a PR opened by a background agent is attributed to the session — not lost with the subagent.
+    `hb` (optional out-param, a dict with turns/calls/iv/labels) is filled for the heartbeat in
+    the SAME pass — no extra file read; the return value is unchanged."""
     out = []
     agent_files = {}      # path -> file entry : edits made by background agents (worktrees etc.)
     agent_prs = {}        # url -> entry : PRs an agent created/worked (merged into the session's prs)
@@ -935,6 +972,8 @@ def parse_agents(path):
         last_ts = None
         tools = 0
         pr_ids = set()    # tool_use_ids of `gh pr create`/MCP-create in THIS agent → its result URL = created
+        aid = os.path.basename(af)[6:-6]
+        seen_mid, use_t = set(), {}       # heartbeat: per-file usage dedup + tool_use id -> (name, epoch)
         try:
             with open(af, encoding="utf-8") as fh:
                 for line in fh:
@@ -951,6 +990,8 @@ def parse_agents(path):
                     if mv:
                         model = mv
                     c = m.get("content")
+                    if hb is not None:
+                        _hb_agent_line(hb, aid, o, m, c, seen_mid, use_t)
                     if not task and m.get("role") == "user" and isinstance(c, str):
                         s = " ".join(c.split())
                         if s and not s.startswith("<"):
@@ -997,6 +1038,8 @@ def parse_agents(path):
         except OSError:
             continue
         wf = next((p for p in af.split(os.sep) if p.startswith("wf_")), "")
+        if hb is not None:
+            hb["labels"][aid] = (" ".join(task.split())[:60] or "agent " + aid[:7], model)
         out.append({
             "id": os.path.basename(af)[6:-6][:10],  # strip "agent-" / ".jsonl"
             "aid": os.path.basename(af)[6:-6],       # full id, for the detail endpoint
@@ -1282,6 +1325,12 @@ def parse_session(path):
     text_last = ""
     tok_in = tok_out = 0
     ctx_current = None    # occupancy off the LATEST usage block only — not summed, unlike tok_in/out
+    # Claude Code logs one assistant message as several JSONL lines (one per content block),
+    # EACH carrying the whole message's usage block -> summing per line overcounts 2-4x. Add a
+    # message's usage once per message.id (id-less lines still sum). Gates ONLY the usage add.
+    seen_mid = set()
+    hb_desc = {}   # agentId -> Agent-call description (from toolUseResult)
+    hb_turns, hb_calls, hb_iv, use_t = [], [], {}, {}   # heartbeat inputs (see overview.build_heartbeat)
     n_search = 0
     t_first = t_last = None
     # Board/detail "the transcript quietly lied" gap: a truncated or corrupted JSONL line
@@ -1315,13 +1364,23 @@ def parse_session(path):
                       "entrypoint", "aiTitle", "customTitle"):
                 if o.get(k):
                     meta[k] = o[k]  # last value wins
+            r_ = o.get("toolUseResult")
+            if isinstance(r_, dict) and r_.get("agentId") and r_.get("description"):
+                hb_desc[r_["agentId"]] = r_["description"]   # the Agent call's short label (heartbeat by_agent)
             msg = o.get("message")
             if not isinstance(msg, dict):
                 continue
             u = msg.get("usage") or {}
-            tok_in += (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
-                       + u.get("cache_creation_input_tokens", 0))
-            tok_out += u.get("output_tokens", 0)
+            mid = msg.get("id")
+            ep = None     # this line's epoch, computed at most once and only when something needs it
+            if u and not (mid and mid in seen_mid):
+                if mid:
+                    seen_mid.add(mid)
+                tok_in += ((u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0)
+                           + (u.get("cache_creation_input_tokens") or 0))
+                tok_out += u.get("output_tokens") or 0
+                ep = _ts_epoch(ts)
+                hb_turns.append((ep, real_model(msg.get("model")) or "") + _hb_usage(u) + ("",))
             if u:  # a real usage block (not the {} default) -> this turn's occupancy; last one wins
                 ctx_current = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
                                + u.get("cache_creation_input_tokens", 0))
@@ -1375,6 +1434,12 @@ def parse_session(path):
                         collect_prs(prs, txt, ts, narr=True)      # PR links Claude prints in its narration
                 elif bt == "tool_result":
                     rid = b.get("tool_use_id")
+                    if rid in use_t:                               # heartbeat: tool busy interval
+                        nm, e0 = use_t.pop(rid)
+                        if ep is None:
+                            ep = _ts_epoch(ts)
+                        if e0 > 0 and ep > 0:
+                            hb_iv.setdefault(nm, []).append((e0, ep))
                     if b.get("is_error"):
                         errors_by_id[rid] = True
                     cc = b.get("content")                          # command output: gh prints the PR URL here
@@ -1402,6 +1467,11 @@ def parse_session(path):
                     name = b.get("name")
                     inp = b.get("input") or {}
                     bid = b.get("id")
+                    if name:                                      # heartbeat: one call + its start time
+                        if ep is None:
+                            ep = _ts_epoch(ts)
+                        hb_calls.append((ep, name, ""))
+                        use_t[bid] = (name, ep)
                     if name and "create_pull_request" in name:   # GitHub MCP: result URL is a created PR
                         pr_create_ids.add(bid)
                     if name and "merge_pull_request" in name:     # GitHub MCP merge → that PR is merged
@@ -1525,7 +1595,11 @@ def parse_session(path):
         t["started_at"] = _ts_epoch(tt["started"]) if tt and tt["started"] and t.get("status") in ("in_progress", "completed") else None
         t["ended_at"] = _ts_epoch(tt["ended"]) if tt and tt["ended"] and t.get("status") == "completed" else None
     done_todos = [t for t in todos if t.get("status") == "completed"]
-    agents_bg, newest_agent, agent_files, agent_prs, agent_pr_states = parse_agents(path)
+    hb_ag = {"turns": hb_turns, "calls": hb_calls, "iv": hb_iv, "labels": {}}   # parse_agents appends who=aid rows
+    agents_bg, newest_agent, agent_files, agent_prs, agent_pr_states = parse_agents(path, hb_ag)
+    for aid_, d_ in hb_desc.items():   # prefer the short Agent description over the prompt-prefix label
+        if aid_ in hb_ag["labels"] and " ".join(d_.split()):
+            hb_ag["labels"][aid_] = (" ".join(d_.split())[:60], hb_ag["labels"][aid_][1])
     # merge PRs a background agent generated into the session's prs (created stickies, agent-flagged),
     # so a PR opened by a subagent shows in the panel instead of vanishing with the subagent.
     for url, ae in agent_prs.items():
@@ -1634,6 +1708,7 @@ def parse_session(path):
                                          time.time() - result["mtime"], t_first, t_last)
     if sid in job_blocked:     # the detail banner reads overview.now; show the job's question, not the last narration
         result["overview"]["now"] = "⧖ " + now_phrase(job_blocked[sid])
+    result["heartbeat"] = build_heartbeat(hb_turns, hb_calls, hb_iv, hb_ag["labels"])
     return result
 
 

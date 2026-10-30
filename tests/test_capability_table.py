@@ -16,7 +16,8 @@ This test pins the truth on both sides of that reconciliation:
 
   1. CR.dialogs.CAPABILITIES exists, is non-empty, and every entry has the three
      required fields (a numeric id, a non-empty label, a non-empty owner module tag).
-  2. Its length is exactly 60 -- the real, reconciled count.
+  2. Its length is exactly 61 -- the real, reconciled count (60 from the doc plus
+     the Heartbeat panel row added after it).
   3. The rendered Coverage-tab stat (built by helpCoverageTab(), invoked the same way
      a real "?" press would via CR.dialogs.open('help', {})) shows that SAME number,
      not a stale hardcoded one -- so deleting an entry from CAPABILITIES, or
@@ -242,8 +243,9 @@ class TestCapabilityTable(unittest.TestCase):
 
         # The reconciled truth (Fix 5): the doc's capability map lists 60 items,
         # including the two rows it marks New (Config dialog, progress spine) which
-        # both genuinely shipped -- so 60, not the doc's stale "58", is correct.
-        self.assertEqual(len(caps), 60, "CR.dialogs.CAPABILITIES should list all 60 documented capabilities")
+        # both genuinely shipped -- so 60, not the doc's stale "58", was correct.
+        # The Heartbeat panel row (#61) was added after the doc and makes it 61.
+        self.assertEqual(len(caps), 61, "CR.dialogs.CAPABILITIES should list all 61 capabilities (60 documented + Heartbeat panel)")
 
         # The number Help's own Coverage tab renders must be the SAME number --
         # this is the drift the doc's instruction exists to prevent.

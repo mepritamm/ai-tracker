@@ -2,7 +2,7 @@ import glob, json, os, re, time
 from ..config import LIVE_WINDOW, NARRATION_CAP
 from .. import config
 from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase
-from ..overview import build_overview
+from ..overview import build_overview, build_heartbeat, empty_heartbeat
 from ..store import load_titles, load_tasks, load_notes
 from .base import Provider
 
@@ -506,6 +506,7 @@ def _degraded_auggie_detail(session_id, f):
         "narrative": [],
         "message": "This session's file exists but could not be read (corrupt or truncated JSON).",
         "tokens": {"in": 0, "out": 0},
+        "heartbeat": empty_heartbeat("Session file unreadable — nothing to chart."),
         "context": context_window(None, None),
         "counts": {"done": 0, "todos": 0, "created": 0, "edited": 0,
                    "read": 0, "commits": 0, "tests": 0,
@@ -548,6 +549,7 @@ def parse_auggie(session_id):
     task_times = {}   # chat-side task id -> {"started","ended"} (ISO), from update_tasks' own
                        # tool_use input — the name-matched fallback for started_at/ended_at (~ Claude's task_times)
     tok_in = tok_out = 0
+    hb_turns, hb_calls = [], []   # heartbeat inputs: one turn per token_usage block, one call per tool_use
     ctx_current = ctx_limit = None  # LATEST turn's occupancy + the session's own context-window size
     def _cprs(text, narr=False):  # collect PRs + note which exchange each URL first showed up in
         before = set(prs)
@@ -591,6 +593,9 @@ def parse_auggie(session_id):
                 tok_in += ((tu.get("input_tokens") or 0) + (tu.get("cache_read_input_tokens") or 0)
                            + (tu.get("cache_creation_input_tokens") or 0))
                 tok_out += tu.get("output_tokens") or 0
+                hb_turns.append((_ts_epoch(ts), ex.get("model_id") or "", tu.get("output_tokens") or 0,
+                                 (tu.get("input_tokens") or 0) + (tu.get("cache_creation_input_tokens") or 0),
+                                 tu.get("cache_read_input_tokens") or 0, ""))
                 # this turn's occupancy (last one wins) + Auggie's own stated context-window
                 # size, when present — unlike Claude's JSONL, Auggie's token_usage carries
                 # max_context_tokens, so a real limit/pct is honestly derivable here.
@@ -603,6 +608,8 @@ def parse_auggie(session_id):
             if isinstance(call, dict):
                 inp = _tool_input(call)
                 name = call.get("tool_name")
+                if name:
+                    hb_calls.append((_ts_epoch(ts), name, ""))
                 if name and "create_pull_request" in name:   # MCP PR creation in this exchange
                     pr_creates.append(i)
                 if name and "merge_pull_request" in name:     # MCP merge → that PR is merged
@@ -760,6 +767,8 @@ def parse_auggie(session_id):
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": latest[:2000],
         "tokens": {"in": tok_in, "out": tok_out},
+        "heartbeat": build_heartbeat(hb_turns, hb_calls, None, None,
+                                     "Auggie logs no per-tool timing — tools ranked by calls."),
         "context": context_window(ctx_current, ctx_limit),
         "counts": {"done": done, "todos": len(todos),
                    "created": sum(1 for x in files.values() if x.get("created")),

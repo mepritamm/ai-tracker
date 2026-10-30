@@ -178,6 +178,46 @@ def _run():
     assert apr and apr["created"] and apr.get("agent"), "agent-opened PR must surface, tagged 🤖"  # the gap
     assert apr["state"] == "merged", "the agent PR's merge state must surface too"
 
+    # heartbeat: a main transcript + an agent transcript, each with one message split over two
+    # lines sharing a message.id (a usage block on both). Main row == `tokens`; the agent counts once.
+    hdir = _tf.mkdtemp()
+    hpath = os.path.join(hdir, "hbs.jsonl")
+    _hu = {"input_tokens": 10, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 5,
+           "output_tokens": 7}
+    with open(hpath, "w") as f:
+        for ts_, blk in (("2026-06-22T10:00:00Z", {"type": "text", "text": "hi"}),
+                         ("2026-06-22T10:00:01Z", {"type": "tool_use", "id": "hb1", "name": "Bash",
+                                                    "input": {"command": "ls"}})):
+            f.write(json.dumps({"type": "assistant", "timestamp": ts_, "message": {
+                "id": "m1", "usage": _hu, "model": "claude-opus-4-7", "content": [blk]}}) + "\n")
+        f.write(json.dumps({"type": "user", "timestamp": "2026-06-22T10:00:05Z", "message": {
+            "role": "user", "content": [{"type": "tool_result", "tool_use_id": "hb1", "content": "ok"}]}}) + "\n")
+    hadir = os.path.join(hdir, "hbs", "subagents")
+    os.makedirs(hadir)
+    with open(os.path.join(hadir, "agent-hbagent01.jsonl"), "w") as f:
+        f.write(json.dumps({"type": "user", "timestamp": "2026-06-22T10:00:02Z",
+                            "message": {"role": "user", "content": "Check the thing"}}) + "\n")
+        for ts_ in ("2026-06-22T10:00:03Z", "2026-06-22T10:00:04Z"):
+            f.write(json.dumps({"type": "assistant", "timestamp": ts_, "message": {
+                "id": "am1", "usage": _hu, "model": "claude-haiku-4-5",
+                "content": [{"type": "text", "text": "working"}]}}) + "\n")
+    hd = parse_session(hpath)
+    hh = hd["heartbeat"]
+    assert hd["tokens"] == {"in": 115, "out": 7}, hd["tokens"]
+    mrow = next(r for r in hh["by_agent"]["rows"] if r["aid"] == "")
+    assert (mrow["out"], mrow["fresh"] + mrow["cache"]) == (7, 115), mrow            # main row == tokens
+    arow = next(r for r in hh["by_agent"]["rows"] if r["aid"] == "hbagent01")
+    assert (arow["out"], arow["fresh"] + arow["cache"], arow["label"]) == (7, 115, "Check the thing"), arow
+    assert hh["total"]["out"] == 14 and hh["agents_n"] == 1, hh["total"]
+    # the Agent call's short description (toolUseResult on the main transcript) labels the row, not the prompt
+    with open(hpath, "a") as f:
+        f.write(json.dumps({"type": "user", "timestamp": "2026-06-22T10:00:06Z", "toolUseResult": {
+            "agentId": "hbagent01", "description": "Plan review"}, "message": {
+            "role": "user", "content": [{"type": "tool_result", "tool_use_id": "hb2", "content": "ok"}]}}) + "\n")
+    arow2 = next(r for r in parse_session(hpath)["heartbeat"]["by_agent"]["rows"] if r["aid"] == "hbagent01")
+    assert arow2["label"] == "Plan review", arow2
+    assert hh["by_tool"]["rows"][0]["name"] == "Bash" and hh["by_tool"]["rows"][0]["busy_ms"] == 4000, hh["by_tool"]
+
     # live window: activity within 5 min counts as live; older does not
     af = os.path.join(adir, "agent-deadbeef00.jsonl")
     os.utime(af, (time.time() - 200, time.time() - 200))
@@ -435,6 +475,10 @@ def _run():
     assert _narr, pa["narrative"]
     assert len(_narr["text"]) > 2000, "narration must keep the full message, not cap at 900"
     assert pa["tokens"] == {"in": 110, "out": 20}, pa["tokens"]          # input + cache, like Claude
+    ph = pa["heartbeat"]                                                   # Auggie fills the shared heartbeat too
+    assert ph["total"]["out"] == 20 and ph["total"]["fresh"] + ph["total"]["cache"] == 110, ph["total"]
+    assert all(r["busy_ms"] is None for r in ph["by_tool"]["rows"]) and ph["waiting_ms"] is None, ph["by_tool"]
+    assert ph["note"] and "no per-tool timing" in ph["note"], ph["note"]
     # context occupancy + limit: Auggie's token_usage carries max_context_tokens (Claude's
     # doesn't), so a real percentage is honestly derivable here — 110/550 = 20.0%.
     assert pa["context"] == {"current": 110, "limit": 550, "pct": 20.0}, pa["context"]

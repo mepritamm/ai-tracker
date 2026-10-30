@@ -271,7 +271,7 @@ class TestSpineMotionHasAnOffSwitch(unittest.TestCase):
         # the entry animation is switched off by SELECTOR (.is-fresh .crd-seg),
         # which is what the rule actually has to name to win the cascade
         for sel in ("crd-seg-dot", "is-fresh", "crd-seg-running::after",
-                    "crd-seg-edge", "crd-mark-now"):
+                    "crd-seg-edge", "crd-mark-now", "crd-hb-live"):
             self.assertIn(sel, joined, sel + " animates with no reduced-motion off-switch")
 
     def test_entry_animation_is_gated_on_the_segment_set_changing(self):
@@ -280,6 +280,76 @@ class TestSpineMotionHasAnOffSwitch(unittest.TestCase):
         page = _read_page()
         self.assertIn("is-fresh", page)
         self.assertIn('bar.getAttribute("data-sig")', page)
+
+
+class TestHeartbeatPanelShipped(unittest.TestCase):
+    def test_heartbeat_body_is_capped_and_scrolls(self):
+        """The Heartbeat panel's body must cap its height and scroll, not grow the page."""
+        css = _detail_css()
+        m = re.search(r"\.cr\s+\.crd-hb\s+\.crd-panel-body\s*\{([^}]*)\}", css)
+        self.assertIsNotNone(m, "no '.cr .crd-hb .crd-panel-body' rule in ext_cr_detail.css")
+        body = m.group(1)
+        self.assertIn("max-height", body)
+        self.assertRegex(body, r"overflow-y\s*:\s*auto")
+
+    def test_progress_view_pref_and_label_are_wired(self):
+        """Config → 'Progress view' writes cr.progressView (Heartbeat is the default)."""
+        page = _read_page()
+        self.assertIn("progressView: 'cr.progressView'", page)
+        self.assertIn("'Progress view'", page)
+
+    def test_heartbeat_live_pulse_is_disabled_by_the_same_selector_under_reduced_motion(self):
+        """The live pulse animates `.cr .crd-hb-live rect:not(.crd-hb-hit)`. Its
+        reduced-motion override must name that SAME selector; a weaker one such as
+        `.cr .crd-hb-live rect` also matches the hit-test rects and does not win the
+        cascade for the animated ones, so the pulse keeps running."""
+        css = _detail_css()
+        spans = _reduced_motion_spans(css)
+
+        def inside(pos):
+            return any(a <= pos < b for a, b in spans)
+
+        rules = _css_rules(css)
+        live = [sel for pos, sel, body in rules
+                if not inside(pos) and "crd-hb-live" in sel and "animation" in body]
+        self.assertTrue(live, "no animated '.crd-hb-live' rule outside reduced-motion")
+        target = live[0]
+        overrides = [body for pos, sel, body in rules if inside(pos) and sel == target]
+        self.assertTrue(overrides, "reduced-motion block has no override for %r" % target)
+        self.assertRegex(overrides[0], r"animation\s*:\s*none")
+
+    def test_heartbeat_legend_keys_carry_their_series_colour(self):
+        """Each legend key swatch is coloured with the same series variable as its bars."""
+        css = _detail_css()
+        for cls, var in (("crd-hb-key-out", "--line-focus"),
+                         ("crd-hb-key-in", "--line-agent"),
+                         ("crd-hb-key-cache", "--line-strong")):
+            pat = (r"\.cr\s+\." + cls + r"\s*\{\s*color\s*:\s*var\(\s*"
+                   + re.escape(var) + r"\s*\)\s*;?\s*\}")
+            self.assertRegex(css, pat, cls)
+
+
+def _reduced_motion_spans(css):
+    """(start, end) character spans of the bodies of every prefers-reduced-motion block."""
+    spans = []
+    for m in re.finditer(r"@media[^{]*prefers-reduced-motion[^{]*\{", css):
+        depth, i = 0, m.end() - 1
+        while i < len(css):
+            if css[i] == "{":
+                depth += 1
+            elif css[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        spans.append((m.end(), i))
+    return spans
+
+
+def _css_rules(css):
+    """(position, normalised selector, body) for every innermost rule in the sheet."""
+    return [(m.start(), " ".join(m.group(1).split()), m.group(2))
+            for m in re.finditer(r"([^{}]+)\{([^{}]*)\}", css)]
 
 
 if __name__ == "__main__":

@@ -253,6 +253,35 @@ class TestClaudeEval(unittest.TestCase):
         self.assertIsNone(d["context"]["limit"])
         self.assertIsNone(d["context"]["pct"])
 
+    def test_usage_counted_once_per_message_id(self):
+        """Claude Code writes ONE assistant message as several JSONL lines (a line per content
+        block), each repeating the message's whole usage block. tokens must count that message
+        once — while every line's CONTENT (narration, commands) is still captured, so the dedup
+        gates only the usage add and never skips the line."""
+        usage = {"input_tokens": 10, "cache_read_input_tokens": 100,
+                 "cache_creation_input_tokens": 5, "output_tokens": 7}
+        base = {"type": "assistant", "timestamp": "2026-06-22T10:00:00Z"}
+        rows = [
+            {"type": "user", "message": {"role": "user", "content": "go"}},
+            dict(base, message={"id": "msg_1", "role": "assistant", "usage": usage,
+                                "content": [{"type": "thinking", "thinking": "hm"}]}),
+            dict(base, message={"id": "msg_1", "role": "assistant", "usage": usage,
+                                "content": [{"type": "text", "text": "running it"}]}),
+            dict(base, message={"id": "msg_1", "role": "assistant", "usage": usage,
+                                "content": [{"type": "tool_use", "id": "tb1", "name": "Bash",
+                                             "input": {"command": "echo hi"}}]}),
+        ]
+        p = tempfile.mktemp(suffix=".jsonl")
+        with open(p, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        d = tracker.parse_session(p)
+        os.unlink(p)
+        self.assertEqual(d["tokens"], {"in": 115, "out": 7})      # once, not 345 / 21
+        self.assertIn("running it", [n["text"] for n in d["narrative"]])
+        self.assertEqual([c["cmd"] for c in d["commands"]], ["echo hi"])
+        self.assertEqual(d["heartbeat"]["total"]["out"], 7)       # the heartbeat dedups the same way
+
     def test_context_absent_when_no_usage_at_all(self):
         """No assistant `usage` block anywhere -> current stays None, not 0 (0 would lie:
         it would read as 'we know the session used zero tokens' instead of 'unknown')."""

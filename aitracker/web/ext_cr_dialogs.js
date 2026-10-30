@@ -543,7 +543,7 @@
     [53, 'Search within the session', 'detail'], [54, 'Command runner + constraint stated', 'detail'],
     [55, 'Model / effort switchers', 'terminal+detail'], [56, 'Context readout', 'terminal+detail'],
     [57, 'Open / resume / external terminal', 'detail+terminal'], [58, 'Degraded provider messaging', 'dialogs'],
-    [59, 'Config dialog (new)', 'dialogs'], [60, 'Progress spine (new)', 'detail'],
+    [59, 'Config dialog (new)', 'dialogs'], [60, 'Progress spine (new)', 'detail'], [61, 'Heartbeat panel (new)', 'detail'],
   ];
   var OWNER_LABEL = { board: 'Board', detail: 'Detail', terminal: 'Terminal', dialogs: 'Dialogs' };
 
@@ -819,6 +819,7 @@
     railLegacy: 'tracker.rail',
     railOpen: 'cr.railOpen',
     cardsFolded: 'cr.cardsFolded',
+    progressView: 'cr.progressView',
     // Owner ruling: doc 04's board-tiles row is the authoritative spec — a 3–12 slider,
     // default 8 — superseding doc 02's "never more than 8" cap. ext_cr_board.js's
     // enforcement ceiling was raised to 12 in lockstep; the two MUST agree on both the
@@ -1250,8 +1251,10 @@
         // first touch, leaving no way back to the default.
         body.appendChild(cfgRow('Session rail', null, 'Auto collapses it inside a session and on narrow screens; Open and Collapsed override that.',
           segmented([['auto', 'Auto'], ['open', 'Open'], ['collapsed', 'Collapsed']], readRailPref(), function (v) { writeRailPref(v); })));
-        body.appendChild(cfgRow('Cards start folded', null, 'Every detail-view panel starts collapsed except Conversation.',
+        body.appendChild(cfgRow('Cards start folded', null, 'Every detail-view panel starts collapsed except Conversation and the progress panel.',
           toggleCtl(readPref(CFG_PREF_KEYS.cardsFolded, true), function (v) { writePref(CFG_PREF_KEYS.cardsFolded, v); })));
+        body.appendChild(cfgRow('Progress view', null, 'Which panel sits under the Now card: Heartbeat (where tokens and tool time went) or Progress spine (the task plan over time).',
+          segmented([['heartbeat', 'Heartbeat'], ['spine', 'Progress spine']], readPref(CFG_PREF_KEYS.progressView, 'heartbeat'), function (v) { writePref(CFG_PREF_KEYS.progressView, v); })));
         // Fix (drift 4): 5c draws this as ONE row — "Desktop notifications + sound" —
         // not two separate toggles. Combined here, but both underlying preferences
         // still get set on every flip: `desktopNotif` (this dialog's own pref, read by

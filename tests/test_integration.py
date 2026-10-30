@@ -334,6 +334,20 @@ class TestServerEndToEnd(unittest.TestCase):
         ids = [s["id"] for s in json.loads(body)]
         self.assertIn("auggie:s", ids)
 
+    def test_api_session_carries_heartbeat_and_page_has_panel(self):
+        """Heartbeat is a shared-shape field served on /api/session for any provider, and the SPA
+        ships the panel that renders it (server field + client reader — conventions 4/5)."""
+        os.makedirs(os.path.join(config.AUGMENT_DIR, "task-storage", "tasks"))
+        open(os.path.join(config.AUGMENT_DIR, "settings.json"), "w").write('{"indexingAllowDirs":["/x"]}')
+        _write_auggie("hb", "Hello heartbeat")
+        st, body = self._get("/api/session?id=auggie:hb")
+        self.assertEqual(st, 200)
+        hb = json.loads(body)["heartbeat"]
+        self.assertIn("total", hb)
+        self.assertEqual(set(hb["total"]), {"out", "fresh", "cache", "calls"})
+        st, page = self._get("/")
+        self.assertIn(b'data-panel="heartbeat"', page)
+
     def test_api_session_missing_is_404(self):
         st, _ = self._get("/api/session?id=no-such-session-xyz")
         self.assertEqual(st, 404)

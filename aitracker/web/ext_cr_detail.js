@@ -299,6 +299,177 @@
     } catch (e) { return true; }
   }
 
+  // ============================== heartbeat / progress view ==============================
+
+  // Config's "Progress view" row writes `cr.progressView` via writePref() (JSON-stringified).
+  // Which of the two panels under the Now card is shown. Anything but an exact
+  // "spine" (unset, garbage, unparsable) is the default, "heartbeat".
+  function progressView() {
+    try {
+      var raw = localStorage.getItem("cr.progressView");
+      if (raw == null) return "heartbeat";
+      return JSON.parse(raw) === "spine" ? "spine" : "heartbeat";
+    } catch (e) { return "heartbeat"; }
+  }
+
+  function applyProgressView(node, view) {
+    if (!node || typeof node.querySelector !== "function") return;
+    var hb = node.querySelector('[data-panel="heartbeat"]');
+    var sp = node.querySelector('[data-panel="spine"]');
+    if (hb) hb.hidden = view === "spine";
+    if (sp) sp.hidden = view !== "spine";
+  }
+
+  var OPEN_BY_DEFAULT = { timeline: 1, heartbeat: 1, spine: 1 };
+  function panelDefaultCollapsed(key) {
+    return OPEN_BY_DEFAULT[key] ? false : defaultFolded();
+  }
+
+  // Abbreviated token counts: 950 -> 950, 1234 -> 1.2k, 18234 -> 18k, 1.2M, 18M.
+  function fmtTokS(n) {
+    n = Number(n);
+    if (!isFinite(n) || n < 0) n = 0;
+    n = Math.round(n);
+    function one(v, u) { return (Math.round(v * 10) / 10).toString().replace(/\.0$/, "") + u; }
+    if (n < 1000) return String(n);
+    if (n < 1e4) return one(n / 1e3, "k");
+    if (n < 1e6) {
+      var k = Math.round(n / 1e3);
+      return k >= 1000 ? "1M" : k + "k";
+    }
+    if (n < 1e7) return one(n / 1e6, "M");
+    if (n < 1e9) {
+      var m = Math.round(n / 1e6);
+      return m >= 1000 ? "1B" : m + "M";
+    }
+    return one(n / 1e9, "B");
+  }
+
+  function hbHasBeats(hb) { return !!(hb && hb.beats && hb.beats.length); }
+
+  // Panel-header summary (HTML; every dynamic piece through esc()/fmtTokS()).
+  function heartbeatSummaryHtml(hb) {
+    if (!hbHasBeats(hb)) return "&mdash;";
+    var t = hb.total || {};
+    var out = '<span>' + esc(fmtTokS(t.out)) + ' out</span> &middot; <span>' + esc(fmtTokS(t.fresh)) + ' in</span>' +
+      '<span class="crd-hb-sum-cache"> &middot; ' + esc(fmtTokS(t.cache)) + ' cached</span>' +
+      ' &middot; <span>' + esc(fmtNum(t.calls)) + ' calls</span>';
+    if (hb.span && hb.span.length === 2 && hb.span[1] >= hb.span[0]) {
+      out += '<span class="crd-hb-sum-span"> &middot; ' + esc(fmtAge(hb.span[1] - hb.span[0])) + '</span>';
+    }
+    if (hb.agents_n > 0) out += ' &middot; incl. ' + esc(hb.agents_n) + ' agent' + (hb.agents_n === 1 ? '' : 's');
+    return out;
+  }
+
+  function hbStack(r, max) {
+    function w(v) { return max > 0 ? Math.max(0, Math.min(100, (v || 0) * 100 / max)).toFixed(2) : "0"; }
+    return '<span class="crd-hb-track" aria-hidden="true">' +
+      '<span class="crd-hb-seg-out" style="width:' + w(r.out) + '%"></span>' +
+      '<span class="crd-hb-seg-in" style="width:' + w(r.fresh) + '%"></span>' +
+      '<span class="crd-hb-seg-cache" style="width:' + w(r.cache) + '%"></span></span>';
+  }
+
+  function hbTokenList(title, rows, rest, nameOf, mainOf, showModel) {
+    rows = rows || [];
+    if (!rows.length) return "";
+    function tot(r) { return (r.out || 0) + (r.fresh || 0) + (r.cache || 0); }
+    var max = 0;
+    rows.forEach(function (r) { max = Math.max(max, tot(r)); });
+    var html = '<section class="crd-hb-list"><h4 class="crd-hb-h">' + esc(title) + '</h4><ol>';
+    rows.forEach(function (r) {
+      var name = nameOf(r);
+      var model = (showModel && r.model) ? shortModel(r.model) : "";
+      var ttl = name + (r.model ? " (" + r.model + ")" : "") + " — " + fmtNum(r.out) + " out, " +
+        fmtNum(r.fresh) + " in, " + fmtNum(r.cache) + " cached";
+      html += '<li class="crd-hb-row' + (mainOf && mainOf(r) ? ' crd-hb-main' : '') + '" title="' + esc(ttl) + '">' +
+        '<span class="crd-hb-name mono">' + esc(name) +
+        (model ? ' <span class="crd-hb-model">' + esc(model) + '</span>' : '') + '</span>' +
+        '<span class="crd-hb-val mono">' + esc(fmtTokS(tot(r))) + ' &middot; ' + esc(fmtTokS(r.out)) + ' out</span>' +
+        hbStack(r, max) + '</li>';
+    });
+    html += '</ol>';
+    if (rest && rest.n > 0) {
+      html += '<p class="crd-hb-rest">+' + esc(rest.n) + ' more &middot; ' +
+        esc(fmtTokS((rest.out || 0) + (rest.fresh || 0) + (rest.cache || 0))) + '</p>';
+    }
+    return html + '</section>';
+  }
+
+  function hbToolList(bt) {
+    var rows = (bt && bt.rows) || [], rest = bt && bt.rest;
+    if (!rows.length) return "";
+    var anyBusy = rows.some(function (r) { return r.busy_ms != null; });
+    var max = 0;
+    rows.forEach(function (r) { max = Math.max(max, anyBusy ? (r.busy_ms || 0) : (r.calls || 0)); });
+    var html = '<section class="crd-hb-list"><h4 class="crd-hb-h">' + (anyBusy ? 'Tools &middot; busy time' : 'Tools &middot; calls') +
+      '</h4><ol>';
+    rows.forEach(function (r) {
+      var busy = r.busy_ms != null ? (fmtDurMs(r.busy_ms) || "0s") : "—";
+      var val = anyBusy ? busy + " · " + fmtNum(r.calls) + "×" : fmtNum(r.calls) + "×";
+      var ttl = r.name + " — " + fmtNum(r.calls) + " calls" +
+        (r.busy_ms != null ? ", " + fmtNum(Math.round(r.busy_ms / 1000)) + "s busy" : "");
+      var v = anyBusy ? (r.busy_ms || 0) : (r.calls || 0);
+      var pct = max > 0 ? Math.max(0, Math.min(100, v * 100 / max)).toFixed(2) : "0";
+      html += '<li class="crd-hb-row" title="' + esc(ttl) + '">' +
+        '<span class="crd-hb-name mono">' + esc(r.name) + '</span>' +
+        '<span class="crd-hb-val mono">' + esc(val) + '</span>' +
+        '<span class="crd-hb-track" aria-hidden="true"><span class="crd-hb-seg-busy" style="width:' + pct + '%"></span></span></li>';
+    });
+    html += '</ol>';
+    if (rest && rest.n > 0) {
+      html += '<p class="crd-hb-rest">+' + esc(rest.n) + ' more &middot; ' + esc(fmtNum(rest.calls)) + '×</p>';
+    }
+    return html + '</section>';
+  }
+
+  // The panel body. `hb` is the server's session.heartbeat, rendered as given.
+  function heartbeatHtml(hb, live) {
+    if (!hbHasBeats(hb)) {
+      return '<p class="crd-empty">' + esc((hb && hb.note) || "No model turns recorded yet.") + '</p>';
+    }
+    var beats = hb.beats, nb = beats.length, bs = hb.bucket_s || 0;
+    var max = 0;
+    beats.forEach(function (b) { max = Math.max(max, (b.out || 0) + (b.fresh || 0)); });
+    function h(v) { return v > 0 ? Math.max(1, v * 40 / max) : 0; }
+    var t = hb.total || {};
+    var summary = "Heartbeat: " + fmtTokS(t.out) + " out, " + fmtTokS(t.fresh) + " in, " +
+      fmtTokS(t.cache) + " cached, " + fmtNum(t.calls) + " calls";
+    var svg = '<svg class="crd-hb-svg" viewBox="0 0 ' + (nb * 10) + ' 40" preserveAspectRatio="none" role="img" aria-label="' +
+      esc(summary) + '" focusable="false">';
+    beats.forEach(function (b, i) {
+      var ho = h(b.out || 0), hi = h(b.fresh || 0);
+      hi = Math.min(hi, 40 - ho); // the 1-unit minimum height must not push the stack above the viewBox
+      var x = i * 10;
+      var title = fmtClock(b.t * 1000) + "–" + fmtClock((b.t + bs) * 1000) + " · " + fmtTokS(b.out) + " out · " +
+        fmtTokS(b.fresh) + " in · " + fmtTokS(b.cache) + " cached · " + fmtNum(b.calls) + " calls";
+      svg += '<g class="crd-hb-bin' + (live && i === nb - 1 ? ' crd-hb-live' : '') + '"><title>' + esc(title) + '</title>' +
+        '<rect class="crd-hb-hit" x="' + x + '" y="0" width="10" height="40"></rect>' +
+        '<rect class="crd-hb-in" x="' + (x + 1) + '" y="' + (40 - ho - hi).toFixed(2) + '" width="8" height="' + hi.toFixed(2) + '"></rect>' +
+        '<rect class="crd-hb-out" x="' + (x + 1) + '" y="' + (40 - ho).toFixed(2) + '" width="8" height="' + ho.toFixed(2) + '"></rect></g>';
+    });
+    svg += '</svg>';
+    var span = hb.span || [beats[0].t, beats[nb - 1].t + bs];
+    var foot = '<div class="crd-hb-foot mono"><span>' + esc(fmtClock(span[0] * 1000)) + '</span><span>each bar ≈ ' +
+      esc(fmtAge(bs)) + '</span><span>' + (live ? 'now · live' : esc(fmtClock(span[1] * 1000))) + '</span></div>';
+    var legend = '<div class="crd-hb-legend mono">' +
+      '<span class="crd-hb-key crd-hb-key-out" aria-hidden="true">■</span> out ' +
+      '<span class="crd-hb-key crd-hb-key-in" aria-hidden="true">■</span> in ' +
+      '<span class="crd-hb-key crd-hb-key-cache" aria-hidden="true">■</span> cached (lists only)</div>';
+    var lists = '<div class="crd-hb-lists">' + hbToolList(hb.by_tool) +
+      hbTokenList("Agents · tokens", hb.by_agent && hb.by_agent.rows, hb.by_agent && hb.by_agent.rest,
+        function (r) { return r.label || (r.aid ? "agent " + String(r.aid).slice(0, 7) : "main"); },
+        function (r) { return !r.aid; }, true) +
+      hbTokenList("Models · tokens", hb.by_model && hb.by_model.rows, hb.by_model && hb.by_model.rest,
+        function (r) { return shortModel(r.model) || r.model || "unknown"; }, null, false) +
+      '</div>';
+    var notes = "";
+    if (hb.waiting_ms > 0) {
+      notes += '<p class="crd-panel-footnote">Waiting on you or a prompt: ' + esc(fmtDurMs(hb.waiting_ms)) + ' (not counted as busy)</p>';
+    }
+    if (hb.note) notes += '<p class="crd-panel-footnote">' + esc(hb.note) + '</p>';
+    return svg + foot + legend + lists + notes;
+  }
+
   // ============================== derived / pure logic ==============================
 
   // Earliest timestamp we can find anywhere in the detail dict — there is no explicit
@@ -1115,6 +1286,8 @@
     var key = wrap.getAttribute("data-panel");
     wrap.classList.toggle("is-collapsed", val);
     qs(wrap, ".crd-chevron").innerHTML = val ? svgIcon(ctx, "chevron") : svgIcon(ctx, "chevron-down");
+    var hd = qs(wrap, ".crd-panel-head");
+    if (hd && hd.getAttribute("role") === "button") hd.setAttribute("aria-expanded", val ? "false" : "true");
     setCollapsed(sid, key, val);
   }
 
@@ -1260,11 +1433,20 @@
       // (not duplicated; see renderLiveEntry()/ui_findLiveEl() below, the ONE
       // renderer/call site for this fact) rather than shown in both places.
       '<div class="crd-now" hidden></div>' +
+      '<section class="crd-panel crd-hb" data-panel="heartbeat">' +
+        '<header class="crd-panel-head" data-act="toggle-panel" data-panel="heartbeat" data-col="progress" role="button" tabindex="0" aria-expanded="true" aria-controls="crd-hb-body">' +
+          '<span class="crd-chevron"></span><span class="crd-panel-label">Heartbeat</span>' +
+          '<span class="crd-panel-count mono"></span></header>' +
+        '<div class="crd-panel-body" id="crd-hb-body"></div>' +
+      "</section>" +
+      '<section class="crd-panel crd-progress" data-panel="spine">' +
+        '<header class="crd-panel-head" data-act="toggle-panel" data-panel="spine" data-col="progress" role="button" tabindex="0" aria-expanded="true" aria-controls="crd-spine-body">' +
+          '<span class="crd-chevron"></span><span class="crd-panel-label">Progress spine</span>' +
+          '<span class="crd-panel-count crd-spine-count mono"></span></header>' +
+        '<div class="crd-panel-body" id="crd-spine-body">' +
       '<div class="crd-spine" role="group" aria-label="Progress spine">' +
         '<span class="crd-spine-sr" aria-live="polite"></span>' +
         '<div class="crd-spine-head">' +
-          '<span class="crd-spine-label">PROGRESS SPINE</span>' +
-          '<span class="crd-spine-count mono"></span>' +
           '<span class="crd-spine-spans" role="group" aria-label="Spine zoom"></span>' +
           '<span class="crd-spine-hint mono">segment width = time actually spent · click to jump the chat there</span>' +
         "</div>" +
@@ -1280,6 +1462,8 @@
           '<span class="crd-spine-now"></span>' +
         "</div>" +
       "</div>" +
+        "</div>" +
+      "</section>" +
       '<div class="crd-columns">' +
         '<div class="crd-col crd-col-state">' +
           '<div class="crd-col-eyebrow">State' +
@@ -1397,6 +1581,12 @@
       var wrap = makePanel(ctx, "_", "evidence", p[0], p[1]);
       evidenceBody.appendChild(wrap);
       ui.panels[p[0]] = wrap;
+    });
+    ["heartbeat", "spine"].forEach(function (k) {
+      var w = qs(node, '[data-panel="' + k + '"]');
+      if (!w) return;
+      qs(w, ".crd-chevron").innerHTML = svgIcon(ctx, "chevron-down");
+      ui.panels[k] = w;
     });
     // FIX (design-audit drift 3): 5b renders fork lineage as a small card at the
     // BOTTOM of the Evidence column (after Terminal controls), not a full-width
@@ -1532,6 +1722,24 @@
       scroll.addEventListener("pointercancel", endPan);
     })();
 
+    // role=button panel headers (heartbeat/spine): Enter/Space activate like a click.
+    node.addEventListener("keydown", function (ev) {
+      if (ev.key !== "Enter" && ev.key !== " ") return;
+      var h = ev.target && ev.target.closest && ev.target.closest('[data-act="toggle-panel"][role="button"]');
+      if (!h || h !== ev.target) return;
+      ev.preventDefault();
+      h.click();
+    });
+    // Config's "Progress view" row: re-render now instead of waiting for the next poll.
+    if (ctx && typeof ctx.on === "function") {
+      ctx.on("cr:pref", function (p) {
+        if (p && p.key === "cr.progressView" && ui.lastState) {
+          ui._spineZoomKey = undefined;
+          renderUpdate(root, ctx, ui.lastState);
+        }
+      });
+    }
+
     // ---- single delegated click handler ----
     node.addEventListener("click", function (ev) {
       var t = ev.target.closest("[data-act]");
@@ -1547,6 +1755,12 @@
           var wrap = ui.panels[key];
           if (!wrap) return;
           setPanelCollapsed(ctx, wrap, sid, !wrap.classList.contains("is-collapsed"));
+          // The spine consumed its live-edge anchor while hidden (scrollWidth 0);
+          // re-anchor now that it is visible again.
+          if (key === "spine" && !wrap.classList.contains("is-collapsed")) {
+            ui._spineZoomKey = undefined;
+            repaintSpine(node, ctx, ui);
+          }
           break;
         }
         case "expand-all":
@@ -1949,6 +2163,7 @@
     var firstMount = ui.sid == null;
     ui.sid = sid;
     ui.lastSession = session;
+    ui.lastState = state;
     ui.lastTitle = (session.meta && session.meta.title) || "";
     ui.lastGoal = (session.overview && session.overview.goal) || ui.lastTitle;
 
@@ -1967,7 +2182,7 @@
       if (sc0) sc0.scrollLeft = 0;
       Object.keys(ui.panels).forEach(function (key) {
         var wrap = ui.panels[key];
-        var def = key === "timeline" ? false : defaultFolded(); // FIX 8: cr.cardsFolded pref
+        var def = panelDefaultCollapsed(key); // FIX 8: cr.cardsFolded pref (timeline/heartbeat/spine open)
         var collapsed = getCollapsed(sid, key, def);
         setPanelCollapsed(ctx, wrap, sid, collapsed);
       });
@@ -1981,7 +2196,9 @@
     renderPhoneStop(node, session);
     renderForkBanner(node, ctx, session, ui);
     renderLiveEntry(node, session, nowSec); // FIX 3 (job 2): the "Now" card, right above the spine
-    renderSpine(node, ctx, session, nowMs, ui);
+    var pView = progressView();
+    applyProgressView(node, pView);
+    if (pView === "spine") renderSpine(node, ctx, session, nowMs, ui);
 
     renderDecisions(ui.panels.decisions, session);
     renderPhoneAwaiting(node, session);
@@ -1997,6 +2214,19 @@
     renderTerminalPanel(ui.panels.terminal, session);
 
     renderTimeline(node, ui, session, ctx);
+    try {
+      renderHeartbeat(ui.panels.heartbeat, pView, session.heartbeat || null,
+        detailIsWorking(session, (nowSec - (session.mtime || 0)) < LIVE_WINDOW));
+    } catch (e) {}
+  }
+
+  function renderHeartbeat(wrap, view, hb, live) {
+    if (!wrap || view === "spine") return;
+    var sig = JSON.stringify(hb) + "|" + !!live;
+    if (wrap._hbSig === sig) return; // an identical poll must not restart the pulse
+    wrap._hbSig = sig;
+    setPanelCount(wrap, heartbeatSummaryHtml(hb));
+    setPanelBody(wrap, heartbeatHtml(hb, live));
   }
 
   function renderBackline(node, session, state) {
@@ -3366,6 +3596,14 @@
     timelineEntryVisible: timelineEntryVisible,
     TIMELINE_KIND_MAP: TIMELINE_KIND_MAP,
     timelineEntryModalPayload: timelineEntryModalPayload,
-    openTimelineEntry: openTimelineEntry
+    openTimelineEntry: openTimelineEntry,
+    progressView: progressView,
+    applyProgressView: applyProgressView,
+    panelDefaultCollapsed: panelDefaultCollapsed,
+    fmtTokS: fmtTokS,
+    heartbeatSummaryHtml: heartbeatSummaryHtml,
+    heartbeatHtml: heartbeatHtml,
+    renderHeartbeat: renderHeartbeat,
+    setPanelCollapsed: setPanelCollapsed
   };
 })();

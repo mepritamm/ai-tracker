@@ -68,6 +68,8 @@ sweeps their unfinished work. Before touching a file: `git fetch personal`, then
 Do **all** edits there and get `make check` green **in the worktree**; Step 5 syncs and pushes. Mirrors
 bug-smasher's `smasher-gap` Worktree-discipline thesis.
 
+**Branch from the latest default branch, sync before every push.** Cut the worktree's branch from the latest `main` (this repo's default; remote `personal`, no `origin`) — never implement on `main` or in the primary checkout. **Run the `branch-sync` skill (`/branch-sync`) in that worktree right before every push** (including the push `/tracker-push` makes), so the branch carries the latest `main` and `make check` ran on it.
+
 ## Step 1 — Frame the gap (name the capability + find the asymmetry)
 Before touching code, state in plain terms:
 1. **The capability, in one line** — what the app should now do, over *all* in-scope sessions/panels

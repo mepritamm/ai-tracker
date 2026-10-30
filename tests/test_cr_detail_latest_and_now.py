@@ -208,12 +208,15 @@ class TestNowCardRelocatedSource(unittest.TestCase):
         below it."""
         notecard_close = self.js.index('data-act="note-queue-send">Queue</button>')
         now_card = self.js.index('<div class="crd-now" hidden></div>')
+        heartbeat_open = self.js.index('<section class="crd-panel crd-hb" data-panel="heartbeat">')
         spine_open = self.js.index('<div class="crd-spine" role="group"')
         columns_open = self.js.index('<div class="crd-columns">')
         self.assertLess(notecard_close, now_card,
                          "'.crd-now' must come after the rest of the header/card block")
-        self.assertLess(now_card, spine_open,
-                         "'.crd-now' must come BEFORE the progress spine, not after it")
+        self.assertLess(now_card, heartbeat_open,
+                         "'.crd-now' must come BEFORE the heartbeat panel, not after it")
+        self.assertLess(heartbeat_open, spine_open,
+                         "the heartbeat panel must sit ABOVE the progress spine (it is the default panel)")
         self.assertLess(spine_open, columns_open,
                          "the progress spine must still precede the three-column layout")
 
