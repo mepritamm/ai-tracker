@@ -573,7 +573,7 @@
   function _openNewTab() {
     if (!st.tty) return;
     var url = location.origin + location.pathname + "?tty=" + encodeURIComponent(st.tty) +
-      "&sid=" + encodeURIComponent(st.sessionId || "") +
+      "&sid=" + encodeURIComponent((window.ExtVT && window.ExtVT.ttySession(st.tty) !== null) ? window.ExtVT.ttySession(st.tty) : (st.sessionId || "")) +
       "&mode=" + encodeURIComponent(st.mode || "") +
       "&renderer=" + encodeURIComponent(st.renderer || "grid") +
       "&forked=" + (st.forked ? "1" : "0") +
@@ -627,6 +627,7 @@
     // on an EMPTY field — exactly when they most need it to stay put.
     if (!path) { showToast("Choose or type a directory first."); return Promise.reject(new Error("no directory chosen")); }
     return post("/api/term/pty", { cwd: path, cols: 100, rows: 30, mode: mode }).then(j).then(function (res) {
+      if (res.j && res.j.tty && window.ExtVT) window.ExtVT.bindTty(res.j.tty, "");   // session-less shell
       if (!res.ok || !res.j || !res.j.tty) {
         // FIX 2: 429 is the server's real structured cap-reached signal — term_vt.py's open_pty
         // returns {error, terminals} at status 429 when config.MAX_TERMS is hit — not a guessed
@@ -683,6 +684,7 @@
         return;
       }
       st.running = (res.j && res.j.terminals) || [];
+      if (window.ExtVT) window.ExtVT.bindRows(st.running);
       st.maxRunning = res.j && res.j.max;
       _syncBadge();
       ctx.dialog("manage-terminals", {
@@ -731,6 +733,7 @@
         return;
       }
       st.running = (res.j && res.j.terminals) || [];
+      if (window.ExtVT) window.ExtVT.bindRows(st.running);
       st.maxRunning = res.j && res.j.max;
       _syncBadge();
       ctx.dialog("manage-terminals", {
@@ -906,6 +909,7 @@
     fetch("/api/term/list").then(j).then(function (res) {
       if (!res.ok) return;
       st.running = (res.j && res.j.terminals) || [];
+      if (window.ExtVT) window.ExtVT.bindRows(st.running);
       st.maxRunning = res.j && res.j.max;
       _syncBadge();
     }).catch(function () {});
@@ -980,7 +984,7 @@
   }
   function _injectSlash(text, failLabel) {
     if (!st.tty) { showToast(failLabel + ": no terminal attached"); return; }
-    post("/api/term/inject", { tty: st.tty, text: text, submit: true, clear_first: true })
+    post("/api/term/inject", window.ExtVT.ttyBody(st.tty, { text: text, submit: true, clear_first: true }))
       .then(j).then(function (res) {
         if (res.ok && res.j && res.j.ok === true) return;
         var reason = (res.j && (res.j.error || res.j.reason)) ||
@@ -1203,7 +1207,7 @@
         .then(function (d) { if (gen === pollGen && d && !d.error) _applySessionData(d); })
         .catch(function () {});
       if (st.tty) {
-        fetch("/api/term/attached?tty=" + encodeURIComponent(st.tty))
+        fetch("/api/term/attached?" + window.ExtVT.ttyQuery(st.tty))
           .then(function (r) { return r.ok ? r.json() : { claude_attached: false }; })
           .then(function (jj) {
             if (gen !== pollGen) return;

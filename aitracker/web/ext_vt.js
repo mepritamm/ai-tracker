@@ -312,20 +312,33 @@
   function b64utf8(s) {
     return btoa(unescape(encodeURIComponent(s)));
   }
+  // tty -> the session this page obtained it FOR ("" = a session-less shell). Written only where a
+  // tty ENTERS the page; every tty-addressed call reads it. Unbound => session omitted => server 400.
+  var TTY_SESS = {};
+  function bindTty(tty, sid, onlyIfNew) { if (tty && !(onlyIfNew && tty in TTY_SESS)) TTY_SESS[tty] = sid || ""; return tty; }
+  function ttySession(tty) { return (tty in TTY_SESS) ? TTY_SESS[tty] : null; }
+  function ttyBody(tty, extra) { var b = Object.assign({ tty: tty }, extra || {}), s = ttySession(tty); if (s !== null) b.session = s; return b; }
+  function ttyQuery(tty) { var s = ttySession(tty); return "tty=" + encodeURIComponent(tty) + (s === null ? "" : "&session=" + encodeURIComponent(s)); }
+  // Row provenance: a GET /api/term/list (or 429) row carries the session that opened that tty.
+  function bindRows(terms) {
+    if (!terms || !terms.length) return terms;
+    for (var i = 0; i < terms.length; i++) { var t = terms[i]; if (t && t.tty) bindTty(t.tty, t.session, true); }
+    return terms;
+  }
   function postKeys(tty, s) {
     return fetch("/api/term/keys", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tty: tty, data: b64utf8(s) })
+      body: JSON.stringify(ttyBody(tty, { data: b64utf8(s) }))
     });
   }
   function postResize(tty, cols, rows) {
     return fetch("/api/term/resize", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tty: tty, cols: cols, rows: rows })
+      body: JSON.stringify(ttyBody(tty, { cols: cols, rows: rows }))
     }).catch(function () { });
   }
   function fetchScrollback(tty, offset, rows) {
-    return fetch("/api/term/scrollback?tty=" + encodeURIComponent(tty) + "&offset=" + offset + "&rows=" + rows)
+    return fetch("/api/term/scrollback?" + ttyQuery(tty) + "&offset=" + offset + "&rows=" + rows)
       .then(function (r) { return r.json(); });
   }
 
@@ -898,7 +911,7 @@
     var self = this;
     if (self.es) self.es.close();
     if (self._onStatusChange) self._onStatusChange("connecting…");
-    self.es = new EventSource("/api/term/screen?tty=" + encodeURIComponent(self.ttyId));
+    self.es = new EventSource("/api/term/screen?" + ttyQuery(self.ttyId));
     self.es.onopen = function () { if (self._onStatusChange) self._onStatusChange("connected"); };
     self.es.onmessage = function (ev) {
       var msg;
@@ -1917,7 +1930,7 @@
     var self = this;
     self._closeStream();
     if (self._onStatusChange) self._onStatusChange("connecting…");
-    self.es = new EventSource("/api/term/raw?tty=" + encodeURIComponent(self.ttyId));
+    self.es = new EventSource("/api/term/raw?" + ttyQuery(self.ttyId));
     self.es.onopen = function () { if (self._onStatusChange) self._onStatusChange("connected"); };
     self.es.onmessage = function (ev) {
       if (!self.term) return;
@@ -2144,6 +2157,7 @@
   // ===== ContextBar: one instance per open terminal (modal or standalone), destroyed with it. ==
   function ContextBar(container, sid, ttyId, mode, getInput) {
     this.sid = sid; this.ttyId = ttyId; this.getInput = getInput;
+    bindTty(ttyId, sid, true);
     // Whether a Claude CLI is actually listening for "/model ..."/"/effort ..." on THIS pty RIGHT
     // NOW — the server's own answer (GET /api/term/attached, term_vt.py's _foreground_is_claude),
     // NEVER `mode`. `mode` ("resume"/"new"/"cwd" — how this terminal was OPENED) used to gate this
@@ -2378,7 +2392,7 @@
     this._focusTerminal();
     fetch("/api/term/inject", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tty: this.ttyId, text: "/model " + name, submit: true, clear_first: true })
+      body: JSON.stringify(ttyBody(this.ttyId, { text: "/model " + name, submit: true, clear_first: true }))
     }).then(function (r) {
       return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
     }).then(function (res) {
@@ -2400,7 +2414,7 @@
     this._focusTerminal();
     fetch("/api/term/inject", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tty: this.ttyId, text: "/effort " + level, submit: true, clear_first: true })
+      body: JSON.stringify(ttyBody(this.ttyId, { text: "/effort " + level, submit: true, clear_first: true }))
     }).then(function (r) {
       return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
     }).then(function (res) {
@@ -2522,7 +2536,7 @@
       // (_foreground_is_claude: any failure there reports False too): hiding the switchers is the
       // harmless failure, leaving a stale one visible would type a slash command into whatever's
       // now listening on this pty instead.
-      fetch("/api/term/attached?tty=" + encodeURIComponent(self.ttyId))
+      fetch("/api/term/attached?" + ttyQuery(self.ttyId))
         .then(function (r) { return r.ok ? r.json() : { claude_attached: false }; })
         .then(function (j) { if (!self._destroyed) self._setAttached(!!(j && j.claude_attached)); })
         .catch(function () { if (!self._destroyed) self._setAttached(false); });
@@ -2720,6 +2734,7 @@
     head.className = "vtcaphead";
     head.textContent = j.error + " — close one to free a slot:";
     wrap.appendChild(head);
+    bindRows(j.terminals);
     j.terminals.forEach(function (t) {
       // The row itself comes from the SHARED row builder above -- this block contributes only
       // the one action it needs and what that action does.
@@ -2742,7 +2757,7 @@
                                        function (b) { b.disabled = true; });
           fetch("/api/term/close", {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ tty: t.tty })
+            body: JSON.stringify(ttyBody(t.tty))
           }).then(function (r) {
             if (!r.ok) { unlatch(); return; }
             // The slot frees on the reader thread noticing EOF, not on this response, so give it a
@@ -2869,7 +2884,7 @@
       .catch(function () { return {}; })
       .then(function (j) {
         if (gen !== openGen) return;    // a newer open()/peek() already won
-        var terms = (j && j.terminals) || [];
+        var terms = bindRows((j && j.terminals) || []);
         for (var i = 0; i < terms.length; i++) {
           var t = terms[i];
           if (t.session === sid && t.mode === mode) { peekTerm(t); return; }
@@ -2911,6 +2926,7 @@
         body: JSON.stringify({ session: sid, cols: m.cols, rows: m.rows, mode: mode })
       }).then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; }); })
         .then(function (res) {
+          if (res.j && res.j.tty) bindTty(res.j.tty, sid);   // the session this POST named
           if (gen !== openGen) {
             // Superseded by a later open() while this was in flight — generation, not `activeSid`,
             // because a same-session supersede (two opens for one sid, or two modes) leaves
@@ -2925,7 +2941,7 @@
             if (res.ok && res.j && res.j.tty) {
               fetch("/api/term/close", {
                 method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ tty: res.j.tty })
+                body: JSON.stringify(ttyBody(res.j.tty))
               }).catch(function () {});
             }
             return;
@@ -3071,7 +3087,7 @@
     // ?tty= link with no renderer param at all. `forked` and `notice` are similarly relayed so
     // the new tab can display the same fork chip and advisory notice as the opening modal.
     var url = location.origin + location.pathname + "?tty=" + encodeURIComponent(activeTty) +
-      "&sid=" + encodeURIComponent(activeSid || "") + "&mode=" + encodeURIComponent(activeMode || "") +
+      "&sid=" + encodeURIComponent(ttySession(activeTty) !== null ? ttySession(activeTty) : (activeSid || "")) + "&mode=" + encodeURIComponent(activeMode || "") +
       "&renderer=" + encodeURIComponent(activeRenderer || "grid") +
       "&forked=" + (activeForked ? "1" : "0") +
       (activeNotice ? "&notice=" + encodeURIComponent(activeNotice) : "");
@@ -3241,7 +3257,7 @@
           ) + "</div>";
           return;
         }
-        renderManagerBody((res.j && res.j.terminals) || [], res.j && res.j.max);
+        renderManagerBody(bindRows((res.j && res.j.terminals) || []), res.j && res.j.max);
       })
       .catch(function (e) {
         mgrStatusEl.textContent = "";
@@ -3431,7 +3447,7 @@
   function closeTty(tty, force) {
     return fetch("/api/term/close", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(force ? { tty: tty, force: true } : { tty: tty })
+      body: JSON.stringify(ttyBody(tty, force ? { force: true } : {}))
     }).then(function (r) {
       // 409 {busy:true, fg} -- the folder terminal has something running in its foreground and the
       // server refused to kill it silently. Surfaced as a distinguishable rejection (`err.busy`/
@@ -3439,6 +3455,7 @@
       // instead of just reporting a flat failure.
       if (r.status === 409) {
         return r.json().catch(function () { return {}; }).then(function (j) {
+          if (!(j && j.busy)) throw new Error((j && j.error) || "HTTP 409");   // ownership mismatch, not "busy"
           var err = new Error("terminal is busy");
           err.busy = true;
           err.fg = j && j.fg;
@@ -3744,7 +3761,7 @@
         if (spawned) {
           fetch("/api/term/close", {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ tty: tty })
+            body: JSON.stringify(ttyBody(tty))
           }).catch(function () { });
         }
         return;
@@ -3763,6 +3780,7 @@
     }
 
     if (target && target.tty) {
+      bindTty(target.tty, target.session, true);
       // "Peek": attach to an already-running pty in place, no spawn -- this call never owns the
       // pty, so a destroy() mid-resolution above just drops the response (nothing to hand back).
       resolveRenderer().then(function (renderer) {
@@ -3786,7 +3804,7 @@
         .then(function (r) { return r.ok ? r.json().catch(function () { return {}; }) : {}; })
         .catch(function () { return {}; })
         .then(function (j) {
-          var terms = (j && j.terminals) || [];
+          var terms = bindRows((j && j.terminals) || []);
           for (var i = 0; i < terms.length; i++) {
             var t = terms[i];
             if (t.session === sid && t.mode === mode) return t;
@@ -3818,6 +3836,7 @@
               body: JSON.stringify({ session: sid, cols: m.cols, rows: m.rows, mode: mode })
             }).then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; }); })
               .then(function (res) {
+                if (res.j && res.j.tty) bindTty(res.j.tty, sid);
                 if (!res.ok || !res.j || !res.j.tty) {
                   if (destroyed) return;
                   fail((res.j && res.j.error) ||
@@ -3848,6 +3867,11 @@
   // extending the object inline would break a passing assertion over a cosmetic difference. Same
   // object, same two original entries, one more property.
   window.ExtVT.mountInto = mountInto;
+  window.ExtVT.bindTty = bindTty;
+  window.ExtVT.bindRows = bindRows;
+  window.ExtVT.ttyBody = ttyBody;
+  window.ExtVT.ttyQuery = ttyQuery;
+  window.ExtVT.ttySession = ttySession;
   // Same reasoning again: the model/effort ladders and their two helper functions (defined above,
   // ~line 2071-2127) were previously reachable only from inside this IIFE, so ext_cr_term.js held
   // byte-identical copies that could silently desync from these. Widen the export, don't move or
@@ -3905,7 +3929,7 @@
       .catch(function () { return {}; })
       .then(function (j) {
         titleBusy = false;   // first, so a throw below can't wedge the title for the tab's life
-        var terms = (j && j.terminals) || [];
+        var terms = bindRows((j && j.terminals) || []);
         for (var i = 0; i < terms.length; i++) {
           var t = terms[i];
           if (t && String(t.tty) === String(standaloneTty)) {
@@ -3967,6 +3991,7 @@
     if (!tty) return;
     document.documentElement.classList.add("vt-standalone");
     standaloneTty = tty;
+    bindTty(tty, sid);
     // Identify WHICH session this tab is, exactly like the modal's own header does
     // (modalTitleEl, in openVT) -- multiple standalone tabs are the whole point of the "⤢ New
     // tab" button, and a constant title makes them indistinguishable in the tab strip. `sid` is

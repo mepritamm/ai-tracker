@@ -55,6 +55,15 @@ def _span(src, start_marker, end_marker):
     return src[start:end]
 
 
+def _tty_binding_src():
+    """The REAL session-binding block (TTY_SESS / bindTty / ttyBody / ttyQuery / bindRows) sliced out
+    of ext_vt.js: every tty-addressed call carries its session, so any harness that runs extracted
+    ext_vt.js code needs these in scope. Prepended by _run_node -- never retyped."""
+    src = _read_src()
+    a = src.index("var TTY_SESS = {};")
+    return src[a:src.index("function postKeys(", a)]
+
+
 def _run_node(js_source):
     """Writes `js_source` to a temp file and runs it with `node`, returning parsed JSON printed
     to stdout by the script's own final `console.log(JSON.stringify(...))`. Raises with the
@@ -63,7 +72,7 @@ def _run_node(js_source):
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "harness.js")
         with open(path, "w", encoding="utf-8") as fh:
-            fh.write(js_source)
+            fh.write(_tty_binding_src() + "\n" + js_source)
         proc = subprocess.run(["node", path], capture_output=True, text=True, timeout=30)
     if proc.returncode != 0:
         raise AssertionError(
@@ -2297,7 +2306,7 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         self.assertEqual(result["url"], "/api/term/inject")
         self.assertEqual(result["method"], "POST")
         self.assertEqual(result["body"], {
-            "tty": "tty42", "text": "/model opus", "submit": True, "clear_first": True,
+            "tty": "tty42", "session": "sid1", "text": "/model opus", "submit": True, "clear_first": True,
         })
         self.assertEqual(result["toasts"], [], "a successful inject must not surface a toast")
 
@@ -2338,7 +2347,7 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         self.assertEqual(result["url"], "/api/term/inject")
         self.assertEqual(result["method"], "POST")
         self.assertEqual(result["body"], {
-            "tty": "tty42", "text": "/effort xhigh", "submit": True, "clear_first": True,
+            "tty": "tty42", "session": "sid1", "text": "/effort xhigh", "submit": True, "clear_first": True,
         })
         self.assertEqual(result["toasts"], [], "a successful inject must not surface a toast")
 

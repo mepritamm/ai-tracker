@@ -158,6 +158,7 @@ def parse_any(sid):
     d = p.parse(sid) if p else None
     if d is None:
         return None
+    d["id"] = sid   # the namespaced id the caller asked for: the client refuses a payload whose id isn't the session on screen
     # Same two keys as all_sessions() above (shared seam, one implementation — Auggie/
     # Augment ext ids never appear in forks.json, so they get "" here too, same as there).
     # Deliberately NOT shipping a title for the other end: that would mean parsing the
@@ -307,7 +308,7 @@ def _attached_pty(sid):
         return None
     try:
         with term_vt._LOCK:
-            ptys = [p for p in term_vt.PTYS.values() if p.session == sid and not p.done]
+            ptys = list(term_vt._session_ptys(sid))
         for p in ptys:
             if term_vt._foreground_is_claude(p.fd):
                 return p

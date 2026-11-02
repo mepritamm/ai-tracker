@@ -633,6 +633,7 @@ class TermAttachedTests(unittest.TestCase):
     def test_true_when_live_pty_and_claude_foreground(self):
         pt = term_vt.Pty(tid="t1")
         pt.session, pt.done = "s_a", False
+        pt.mode = "resume"   # a resume pty RUNS its session; opener-only no longer counts
         term_vt.PTYS[pt.id] = pt
         with mock.patch("aitracker.term_vt._foreground_is_claude", return_value=True):
             self.assertTrue(parse_any("s_a")["term_attached"])
@@ -640,6 +641,7 @@ class TermAttachedTests(unittest.TestCase):
     def test_false_when_pty_open_but_not_claude_foreground(self):
         pt = term_vt.Pty(tid="t1")
         pt.session, pt.done = "s_a", False
+        pt.mode = "resume"   # a resume pty RUNS its session; opener-only no longer counts
         term_vt.PTYS[pt.id] = pt
         with mock.patch("aitracker.term_vt._foreground_is_claude", return_value=False):
             self.assertFalse(parse_any("s_a")["term_attached"])
@@ -647,6 +649,7 @@ class TermAttachedTests(unittest.TestCase):
     def test_false_when_pty_is_done(self):
         pt = term_vt.Pty(tid="t1")
         pt.session, pt.done = "s_a", True
+        pt.mode = "resume"   # a resume pty RUNS its session; opener-only no longer counts
         term_vt.PTYS[pt.id] = pt
         with mock.patch("aitracker.term_vt._foreground_is_claude", return_value=True):
             self.assertFalse(parse_any("s_a")["term_attached"])
@@ -654,6 +657,7 @@ class TermAttachedTests(unittest.TestCase):
     def test_a_different_sessions_pty_does_not_leak_over(self):
         pt = term_vt.Pty(tid="t1")
         pt.session, pt.done = "s_b", False
+        pt.mode = "resume"   # a resume pty RUNS its session; opener-only no longer counts
         term_vt.PTYS[pt.id] = pt
         with mock.patch("aitracker.term_vt._foreground_is_claude", return_value=True):
             self.assertFalse(parse_any("s_a")["term_attached"])
@@ -662,8 +666,10 @@ class TermAttachedTests(unittest.TestCase):
     def test_multiple_ptys_one_attached_one_not(self):
         pt_dead = term_vt.Pty(tid="t1")
         pt_dead.session, pt_dead.done = "s_a", False
+        pt_dead.mode = "resume"   # a resume pty RUNS its session; opener-only no longer counts
         pt_live = term_vt.Pty(tid="t2")
         pt_live.session, pt_live.done = "s_a", False
+        pt_live.mode = "resume"   # a resume pty RUNS its session; opener-only no longer counts
         term_vt.PTYS[pt_dead.id] = pt_dead
         term_vt.PTYS[pt_live.id] = pt_live
 

@@ -443,7 +443,8 @@ class TestContextBarDocksToBottomOfBothMounts(unittest.TestCase):
     def test_standalone_carries_sid_and_mode_in_the_new_tab_url(self):
         body = _body_until(self.src, "function openNewTab",
                             ['// ===== "Manage terminals" panel'])
-        self.assertIn('"&sid=" + encodeURIComponent(activeSid || "")', body)
+        # the session the tty was BOUND to (what the server will accept), falling back to activeSid
+        self.assertIn('"&sid=" + encodeURIComponent(ttySession(activeTty) !== null ? ttySession(activeTty) : (activeSid || ""))', body)
         self.assertIn('"&mode=" + encodeURIComponent(activeMode || "")', body)
 
     def test_close_destroys_the_bar(self):
@@ -675,7 +676,7 @@ class TestXtermRendererSwitch(unittest.TestCase):
             self.assertNotIn(host, self.js)
 
     def test_raw_stream_uses_the_dedicated_raw_route(self):
-        self.assertIn('"/api/term/raw?tty="', self.js)
+        self.assertIn('"/api/term/raw?" + ttyQuery(self.ttyId)', self.js)
 
     def test_context_bar_focus_works_for_either_renderer_object(self):
         # ContextBar's getInput callback hands back the TERMINAL object (not a raw DOM node) at
@@ -982,7 +983,7 @@ class TestCapReclaimBlock(unittest.TestCase):
     def test_reclaim_rows_post_to_the_close_route_and_retry_the_open(self):
         block = _body_until(self.js, "function renderCapBlock(", ["function openVT("])
         self.assertIn('"/api/term/close"', block)
-        self.assertIn('JSON.stringify({ tty: t.tty })', block)
+        self.assertIn('JSON.stringify(ttyBody(t.tty))', block)
         self.assertIn("openVT(sid, mode)", block)
 
     def test_the_retry_does_not_reopen_a_dismissed_or_superseded_modal(self):
@@ -1014,7 +1015,7 @@ class TestCapReclaimBlock(unittest.TestCase):
         i = body.index("if (gen !== openGen) {")
         supersede = body[i:body.index("if (!res.ok", i)]      # just the supersede branch
         self.assertIn('"/api/term/close"', supersede)
-        self.assertIn("tty: res.j.tty", supersede)
+        self.assertIn("ttyBody(res.j.tty)", supersede)
 
     def test_supersede_is_keyed_on_a_generation_not_on_the_session_id(self):
         """`activeSid !== sid` cannot see a SAME-session supersede — two opens for one sid, or two
@@ -2862,6 +2863,48 @@ class TestIdleTtlSliderHelp(unittest.TestCase):
         for needle in ("sliderCtlCommit(5, 240,", "TRACKER_TERM_IDLE_TTL_MIN",
                        "config.json", "1\u20131440"):
             self.assertIn(needle, block)
+
+
+class TestTtyAddressedCallsCarryTheirSession(unittest.TestCase):
+    """Static guard for strict session isolation: no tty-addressed call in the terminal client
+    files leaves the page without its session (the server answers 400/409 otherwise)."""
+
+    FILES = ("ext_vt.js", "ext_cr_term.js", "ext_launch.js", "ext_cr_detail.js")
+
+    def test_every_tty_post_body_is_bound_or_names_a_session(self):
+        import re
+        for f in self.FILES:
+            src = _read(f)
+            for m in re.finditer(r'["\']/api/term/(keys|resize|inject|close)["\']\s*,', src):
+                chunk = src[m.end():m.end() + 400]
+                self.assertTrue("ttyBody(" in chunk or "_ttyBodyFor(" in chunk or "session" in chunk,
+                                "%s: /api/term/%s POST without a session binding" % (f, m.group(1)))
+
+    def test_every_tty_get_url_is_built_with_ttyQuery(self):
+        import re
+        for f in self.FILES:
+            src = _read(f)
+            for m in re.finditer(r'/api/term/(screen|raw|scrollback|attached)\?"?', src):
+                line_start = src.rfind("\n", 0, m.start()) + 1
+                line = src[line_start:src.find("\n", m.end())]
+                if line.lstrip().startswith("//") or line.lstrip().startswith("*"):
+                    continue
+                self.assertIn("ttyQuery(", line, "%s: unbound GET %s" % (f, line.strip()))
+
+    def test_binding_api_is_exported_and_closetty_discriminates_mismatch(self):
+        src = _read("ext_vt.js")
+        for name in ("bindTty", "bindRows", "ttyBody", "ttyQuery", "ttySession"):
+            self.assertIn("window.ExtVT.%s = %s;" % (name, name), src)
+        body = _body_until(src, "function closeTty", ["// A pty leaves the list"])
+        self.assertIn("j && j.busy", body)   # a mismatch-409 is NOT "close anyway?"
+
+    def test_every_tty_entry_point_binds(self):
+        src = _read("ext_vt.js")
+        for needle in ("bindTty(res.j.tty, sid)", "bindTty(target.tty, target.session, true)",
+                       "bindTty(tty, sid);", "bindTty(ttyId, sid, true)", "bindRows("):
+            self.assertIn(needle, src)
+        self.assertIn('bindTty(res.j.tty, "")', _read("ext_cr_term.js"))
+        self.assertIn('bindTty(res.j.tty, "")', _read("ext_launch.js"))
 
 
 if __name__ == "__main__":

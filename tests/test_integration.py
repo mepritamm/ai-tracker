@@ -1853,6 +1853,8 @@ function renderSide(){ __renderSideCalls++; }
 function loadFlags(){ __loadFlagsCalls++; }
 function render(d){ __renderCalls++; }
 function checkCompletions(d){ __checkCompletionsCalls++; }
+var sessAbort = { signal: undefined };   // poll() rides it; resetSession swaps it on a switch
+function sessLanded(id, d){ lastData = d; render(d); return true; }   // app.js: cache + renderFor + clear loading mark
 function esc(s){ return String(s); }
 var termCount = null;   // loadSide()'s X-Term-Count read target -- see app.js's own declaration
 var SIDE_EXT = [];      // loadSide() fires this after renderSide(); empty here, same as a page

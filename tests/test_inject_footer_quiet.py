@@ -229,7 +229,7 @@ class TestInjectFooterQuiet(unittest.TestCase):
         time.sleep(0.5)   # let the footer loop get going before we inject
 
         h = _FakeHandler()
-        term_vt.inject(h, None, {"tty": pt.id, "text": "hello", "submit": True})
+        term_vt.inject(h, None, {"session": "", "tty": pt.id, "text": "hello", "submit": True})
 
         self.assertEqual(len(h.calls), 1)
         result, code = h.calls[-1]
@@ -255,7 +255,7 @@ class TestInjectFooterQuiet(unittest.TestCase):
         time.sleep(0.5)   # let the footer loop get going before we inject
 
         h = _FakeHandler()
-        term_vt.inject(h, None, {"tty": pt.id, "text": "hello", "submit": True})
+        term_vt.inject(h, None, {"session": "", "tty": pt.id, "text": "hello", "submit": True})
 
         self.assertEqual(len(h.calls), 1)
         result, code = h.calls[-1]
@@ -280,7 +280,7 @@ class TestInjectFooterQuiet(unittest.TestCase):
                                "anchor detection found a prompt line that was never drawn")
 
         h = _FakeHandler()
-        term_vt.inject(h, None, {"tty": pt.id, "text": "hello", "submit": True})
+        term_vt.inject(h, None, {"session": "", "tty": pt.id, "text": "hello", "submit": True})
 
         self.assertEqual(len(h.calls), 1)
         result, code = h.calls[-1]
@@ -301,7 +301,7 @@ class TestInjectFooterQuiet(unittest.TestCase):
 
         h = _FakeHandler()
         with mock.patch.object(term_vt, "INJECT_MAX_WAIT", 2.0):
-            term_vt.inject(h, None, {"tty": pt.id, "text": "hello", "submit": True})
+            term_vt.inject(h, None, {"session": "", "tty": pt.id, "text": "hello", "submit": True})
 
         self.assertEqual(len(h.calls), 1)
         result, code = h.calls[-1]
@@ -318,7 +318,7 @@ class TestInjectFooterQuiet(unittest.TestCase):
                          "child never printed its initial prompt")
 
         h = _FakeHandler()
-        term_vt.inject(h, None, {"tty": pt.id, "text": "hi", "submit": True})
+        term_vt.inject(h, None, {"session": "", "tty": pt.id, "text": "hi", "submit": True})
 
         self.assertEqual(len(h.calls), 1)
         result, code = h.calls[-1]

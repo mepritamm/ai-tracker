@@ -913,7 +913,7 @@ class TestSpawnAndScreen(unittest.TestCase):
         term_vt.PTYS[pt.id] = pt
         h = _FakeHandler()
         payload = base64.b64encode(b"echo hi-from-tier3\n").decode()
-        term_vt.keys(h, None, {"tty": pt.id, "data": payload})
+        term_vt.keys(h, None, {"session": "", "tty": pt.id, "data": payload})
         self.assertEqual(h.calls[-1], ({"ok": True}, 200))
 
         def seen():
@@ -1189,7 +1189,7 @@ class TestRoutes(unittest.TestCase):
 
     def test_close_404s_an_unknown_tty(self):
         h = _FakeHandler()
-        term_vt.close_pty(h, None, {"tty": "nope"})
+        term_vt.close_pty(h, None, {"session": "", "tty": "nope"})
         obj, code = h.calls[-1]
         self.assertEqual(code, 404)
 
@@ -1204,7 +1204,7 @@ class TestRoutes(unittest.TestCase):
         pt.done, pt.ended = True, time.time()   # what finish() leaves behind; ended=0.0 would be
         term_vt.PTYS["fin"] = pt                # reaped by _reap() before the lookup, and is a 404
         h = _FakeHandler()
-        term_vt.close_pty(h, None, {"tty": "fin"})
+        term_vt.close_pty(h, None, {"session": "", "tty": "fin"})
         obj, code = h.calls[-1]
         self.assertEqual(code, 200)
         self.assertEqual((obj["ok"], obj["closed"]), (True, False))
@@ -1220,7 +1220,7 @@ class TestRoutes(unittest.TestCase):
         tid = obj["tty"]
         self.assertEqual(term_vt._live_count(), 1)
         h2 = _FakeHandler()
-        term_vt.close_pty(h2, None, {"tty": tid})
+        term_vt.close_pty(h2, None, {"session": "x", "tty": tid})   # the session open_pty was called for
         # Not exact-equality: the folder-terminal close response also carries `killed`
         # (pids) and `confirmed` (see close_pty's docstring / reports/FOLDER-TERMINAL.md's
         # C5) -- assert the two keys this test actually cares about.
@@ -1242,7 +1242,7 @@ class TestRoutes(unittest.TestCase):
         try:
             term_gate.guard = lambda handler: False
             h = _FakeHandler()
-            term_vt.close_pty(h, None, {"tty": "guarded"})
+            term_vt.close_pty(h, None, {"session": "", "tty": "guarded"})
             self.assertEqual(h.calls, [])
             self.assertFalse(pt.done)
         finally:
@@ -1578,28 +1578,28 @@ class TestRoutes(unittest.TestCase):
 
     def test_keys_404s_an_unknown_tty(self):
         h = _FakeHandler()
-        term_vt.keys(h, None, {"tty": "nope", "data": ""})
+        term_vt.keys(h, None, {"session": "", "tty": "nope", "data": ""})
         self.assertEqual(h.calls[-1][1], 404)
 
     def test_keys_400s_bad_base64(self):
         term_vt.PTYS["p1"] = term_vt.Pty(tid="p1", pid=0, fd=-1)
         h = _FakeHandler()
-        term_vt.keys(h, None, {"tty": "p1", "data": "not-valid-base64!!"})
+        term_vt.keys(h, None, {"session": "", "tty": "p1", "data": "not-valid-base64!!"})
         self.assertEqual(h.calls[-1][1], 400)
 
     def test_resize_404s_an_unknown_tty(self):
         h = _FakeHandler()
-        term_vt.resize_pty(h, None, {"tty": "nope", "cols": 80, "rows": 24})
+        term_vt.resize_pty(h, None, {"session": "", "tty": "nope", "cols": 80, "rows": 24})
         self.assertEqual(h.calls[-1][1], 404)
 
     def test_screen_404s_an_unknown_tty(self):
         h = _FakeHandler()
-        term_vt.screen_stream(h, _Q("tty=nope"))
+        term_vt.screen_stream(h, _Q("session=&tty=nope"))
         self.assertEqual(h.calls[-1][1], 404)
 
     def test_attached_404s_an_unknown_tty(self):
         h = _FakeHandler()
-        term_vt.attached(h, _Q("tty=nope"))
+        term_vt.attached(h, _Q("session=&tty=nope"))
         self.assertEqual(h.calls[-1][1], 404)
 
     def test_attached_reports_true_when_claude_is_in_the_foreground(self):
@@ -1608,7 +1608,7 @@ class TestRoutes(unittest.TestCase):
         try:
             term_vt._foreground_is_claude = lambda fd: True
             h = _FakeHandler()
-            term_vt.attached(h, _Q("tty=p1"))
+            term_vt.attached(h, _Q("session=&tty=p1"))
             self.assertEqual(h.calls[-1], ({"claude_attached": True}, 200))
         finally:
             term_vt._foreground_is_claude = old
@@ -1619,7 +1619,7 @@ class TestRoutes(unittest.TestCase):
         try:
             term_vt._foreground_is_claude = lambda fd: False
             h = _FakeHandler()
-            term_vt.attached(h, _Q("tty=p1"))
+            term_vt.attached(h, _Q("session=&tty=p1"))
             self.assertEqual(h.calls[-1], ({"claude_attached": False}, 200))
         finally:
             term_vt._foreground_is_claude = old
@@ -1631,7 +1631,7 @@ class TestRoutes(unittest.TestCase):
         a 500 or a raise, exactly like TestForegroundIsClaude.test_false_when_tcgetpgrp_raises."""
         term_vt.PTYS["p1"] = term_vt.Pty(tid="p1", pid=0, fd=-1)
         h = _FakeHandler()
-        term_vt.attached(h, _Q("tty=p1"))
+        term_vt.attached(h, _Q("session=&tty=p1"))
         self.assertEqual(h.calls[-1], ({"claude_attached": False}, 200))
 
     def test_attached_is_behind_the_same_gate_as_every_other_term_route(self):
@@ -1641,7 +1641,7 @@ class TestRoutes(unittest.TestCase):
         try:
             term_gate.guard = lambda handler: False
             h = _FakeHandler()
-            term_vt.attached(h, _Q("tty=guarded"))
+            term_vt.attached(h, _Q("session=&tty=guarded"))
             self.assertEqual(h.calls, [])
         finally:
             term_gate.guard = old_guard
@@ -1799,7 +1799,7 @@ class TestStreamAccounting(unittest.TestCase):
         term_vt.PTYS["p1"] = term_vt.Pty(tid="p1")
         term_vt._STREAMS = term_vt.MAX_STREAMS
         h = _FakeHandler()
-        term_vt.screen_stream(h, _Q("tty=p1"))
+        term_vt.screen_stream(h, _Q("session=&tty=p1"))
         obj, code = h.calls[-1]
         self.assertEqual(code, 429)
         self.assertIn("too many", obj["error"])
@@ -1808,7 +1808,7 @@ class TestStreamAccounting(unittest.TestCase):
 
     def test_unknown_tty_holds_no_stream_slot(self):
         h = _FakeHandler()
-        term_vt.screen_stream(h, _Q("tty=nope"))
+        term_vt.screen_stream(h, _Q("session=&tty=nope"))
         self.assertEqual(h.calls[-1][1], 404)
         self.assertEqual(term_vt._STREAMS, 0)
 
@@ -1821,8 +1821,8 @@ class TestStreamAccounting(unittest.TestCase):
         pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
         term_vt.PTYS[pt.id] = pt
         a, b = _StreamHandler(), _StreamHandler()
-        ta = threading.Thread(target=term_vt.screen_stream, args=(a, _Q("tty=" + pt.id)))
-        tb = threading.Thread(target=term_vt.screen_stream, args=(b, _Q("tty=" + pt.id)))
+        ta = threading.Thread(target=term_vt.screen_stream, args=(a, _Q("session=&tty=" + pt.id)))
+        tb = threading.Thread(target=term_vt.screen_stream, args=(b, _Q("session=&tty=" + pt.id)))
         ta.daemon = tb.daemon = True
         ta.start(); tb.start()
         try:
@@ -1850,7 +1850,7 @@ class TestStreamAccounting(unittest.TestCase):
         pt.done, pt.rc = True, 0
         term_vt.PTYS["done1"] = pt
         h = _StreamHandler()
-        term_vt.screen_stream(h, _Q("tty=done1"))
+        term_vt.screen_stream(h, _Q("session=&tty=done1"))
         self.assertEqual(term_vt._STREAMS, 0)
         self.assertEqual(pt.viewers, 0)
         h.close()
@@ -1884,7 +1884,7 @@ class TestWireFormat(unittest.TestCase):
         pt.screen.feed(b"hi")
         term_vt.PTYS["fmt1"] = pt
         h = _StreamHandler()
-        t = threading.Thread(target=term_vt.screen_stream, args=(h, _Q("tty=fmt1")))
+        t = threading.Thread(target=term_vt.screen_stream, args=(h, _Q("session=&tty=fmt1")))
         t.daemon = True
         t.start()
         try:
@@ -1915,7 +1915,7 @@ class TestWireFormat(unittest.TestCase):
         term_vt.PTYS["fmt2"] = pt
 
         a = _StreamHandler()
-        ta = threading.Thread(target=term_vt.screen_stream, args=(a, _Q("tty=fmt2")))
+        ta = threading.Thread(target=term_vt.screen_stream, args=(a, _Q("session=&tty=fmt2")))
         ta.daemon = True
         ta.start()
         b = None
@@ -1930,7 +1930,7 @@ class TestWireFormat(unittest.TestCase):
             # must still get its own full repaint -- `since` is per-connection, not shared, or
             # whichever viewer attaches second would starve on an empty diff forever.
             b = _StreamHandler()
-            tb = threading.Thread(target=term_vt.screen_stream, args=(b, _Q("tty=fmt2")))
+            tb = threading.Thread(target=term_vt.screen_stream, args=(b, _Q("session=&tty=fmt2")))
             tb.daemon = True
             tb.start()
             self.assertTrue(_wait_for(lambda: pt.viewers >= 2, 5))
@@ -2191,9 +2191,9 @@ class TestEviction(unittest.TestCase):
         term_vt.PTYS["stale"] = pt
 
     def test_every_route_sweeps_finished_ptys(self):
-        for call in (lambda h: term_vt.keys(h, None, {"tty": "nope", "data": ""}),
-                     lambda h: term_vt.resize_pty(h, None, {"tty": "nope"}),
-                     lambda h: term_vt.screen_stream(h, _Q("tty=nope"))):
+        for call in (lambda h: term_vt.keys(h, None, {"session": "", "tty": "nope", "data": ""}),
+                     lambda h: term_vt.resize_pty(h, None, {"session": "", "tty": "nope"}),
+                     lambda h: term_vt.screen_stream(h, _Q("session=&tty=nope"))):
             self._stale()
             self.assertIn("stale", term_vt.PTYS)
             call(_FakeHandler())
@@ -2894,13 +2894,13 @@ class TestScrollbackRoute(unittest.TestCase):
 
     def test_404s_an_unknown_tty(self):
         h = _FakeHandler()
-        term_vt.term_scrollback(h, _Q("tty=nope"))
+        term_vt.term_scrollback(h, _Q("session=&tty=nope"))
         self.assertEqual(h.calls[-1][1], 404)
 
     def test_403s_when_terminal_disabled(self):
         config.TERMINAL = False
         h = _FakeHandler()
-        term_vt.term_scrollback(h, _Q("tty=whatever"))
+        term_vt.term_scrollback(h, _Q("session=&tty=whatever"))
         self.assertEqual(h.calls[-1][1], 403)
 
     def test_returns_history_for_a_known_tty(self):
@@ -2909,7 +2909,7 @@ class TestScrollbackRoute(unittest.TestCase):
             screen.feed(text)
         term_vt.PTYS["p1"] = term_vt.Pty(tid="p1", screen=screen)
         h = _FakeHandler()
-        term_vt.term_scrollback(h, _Q("tty=p1&offset=1&rows=3"))
+        term_vt.term_scrollback(h, _Q("session=&tty=p1&offset=1&rows=3"))
         obj, code = h.calls[-1]
         self.assertEqual(code, 200)
         self.assertEqual(obj["total"], 3)
@@ -2922,7 +2922,7 @@ class TestScrollbackRoute(unittest.TestCase):
             screen.feed(text)
         term_vt.PTYS["p1"] = term_vt.Pty(tid="p1", screen=screen)
         h = _FakeHandler()
-        term_vt.term_scrollback(h, _Q("tty=p1"))
+        term_vt.term_scrollback(h, _Q("session=&tty=p1"))
         obj, code = h.calls[-1]
         self.assertEqual(code, 200)
         self.assertEqual(obj["rows"], [])            # offset defaulted to 0
@@ -2936,7 +2936,7 @@ class TestScrollbackRoute(unittest.TestCase):
         pt.ended = time.time()          # else _reap() (called by every route) drops it on sight
         term_vt.PTYS["p1"] = pt
         h = _FakeHandler()
-        term_vt.term_scrollback(h, _Q("tty=p1&offset=1&rows=3"))
+        term_vt.term_scrollback(h, _Q("session=&tty=p1&offset=1&rows=3"))
         self.assertEqual(h.calls[-1][1], 200)
 
 
@@ -3007,7 +3007,7 @@ class TestInject(unittest.TestCase):
 
         term_vt._inject_write = fake_write
         h = _FakeHandler()
-        term_vt.inject(h, None, {"tty": "inj1", "text": "echo hi"})
+        term_vt.inject(h, None, {"session": "", "tty": "inj1", "text": "echo hi"})
         obj, code = h.calls[-1]
         self.assertTrue(obj["ok"], obj)
         self.assertEqual(calls, [b"echo hi", b"\r"])
@@ -3043,7 +3043,7 @@ class TestInject(unittest.TestCase):
 
         start = time.time()
         h = _FakeHandler()
-        term_vt.inject(h, None, {"tty": "inj1", "text": "x", "submit": False})
+        term_vt.inject(h, None, {"session": "", "tty": "inj1", "text": "x", "submit": False})
         elapsed = time.time() - start
         busy_thread.join(2)
 
@@ -3062,7 +3062,7 @@ class TestInject(unittest.TestCase):
 
         start = time.time()
         h = _FakeHandler()
-        term_vt.inject(h, None, {"tty": "inj1", "text": "x"})
+        term_vt.inject(h, None, {"session": "", "tty": "inj1", "text": "x"})
         elapsed = time.time() - start
 
         obj, code = h.calls[-1]
@@ -3073,7 +3073,7 @@ class TestInject(unittest.TestCase):
 
     def test_inject_submit_false_sends_text_and_no_cr(self):
         h = _FakeHandler()
-        term_vt.inject(h, None, {"tty": "inj1", "text": "echo hi", "submit": False})
+        term_vt.inject(h, None, {"session": "", "tty": "inj1", "text": "echo hi", "submit": False})
         obj, code = h.calls[-1]
         self.assertTrue(obj["ok"], obj)
         self.assertEqual(self.writes, [b"echo hi"])
@@ -3082,7 +3082,7 @@ class TestInject(unittest.TestCase):
     def test_inject_clear_first_sends_ctrl_e_then_ctrl_u_before_text(self):
         h = _FakeHandler()
         term_vt.inject(h, None,
-                        {"tty": "inj1", "text": "hi", "submit": False, "clear_first": True})
+                        {"session": "", "tty": "inj1", "text": "hi", "submit": False, "clear_first": True})
         obj, code = h.calls[-1]
         self.assertTrue(obj["ok"], obj)
         self.assertEqual(self.writes, [b"\x05", b"\x15", b"hi"])
@@ -3091,7 +3091,7 @@ class TestInject(unittest.TestCase):
         """The recorder fake never mutates `screen.v`, so every CR looks unconfirmed -- inject()
         must give up after exactly INJECT_RESEND_MAX_ATTEMPTS, not loop forever."""
         h = _FakeHandler()
-        term_vt.inject(h, None, {"tty": "inj1", "text": "echo hi"})
+        term_vt.inject(h, None, {"session": "", "tty": "inj1", "text": "echo hi"})
         obj, code = h.calls[-1]
         self.assertTrue(obj["ok"], obj)
         self.assertEqual(obj["cr_attempts"], term_vt.INJECT_RESEND_MAX_ATTEMPTS)
@@ -3100,7 +3100,7 @@ class TestInject(unittest.TestCase):
 
     def test_inject_bracket_wraps_multiline_text(self):
         h = _FakeHandler()
-        term_vt.inject(h, None, {"tty": "inj1", "text": "line1\nline2", "submit": False})
+        term_vt.inject(h, None, {"session": "", "tty": "inj1", "text": "line1\nline2", "submit": False})
         obj, code = h.calls[-1]
         self.assertTrue(obj["ok"], obj)
         self.assertEqual(self.writes, [b"\x1b[200~line1\nline2\x1b[201~"])
@@ -3108,14 +3108,14 @@ class TestInject(unittest.TestCase):
     def test_inject_403s_when_terminal_disabled(self):
         config.TERMINAL = False
         h = _FakeHandler()
-        term_vt.inject(h, None, {"tty": "inj1", "text": "x"})
+        term_vt.inject(h, None, {"session": "", "tty": "inj1", "text": "x"})
         self.assertEqual(h.calls[-1][1], 403)
         self.assertFalse(term_gate.allowed())
         self.assertEqual(self.writes, [])
 
     def test_inject_404s_an_unknown_tty(self):
         h = _FakeHandler()
-        term_vt.inject(h, None, {"tty": "nope", "text": "x"})
+        term_vt.inject(h, None, {"session": "", "tty": "nope", "text": "x"})
         self.assertEqual(h.calls[-1][1], 404)
 
     def test_inject_400s_a_non_dict_body(self):
@@ -3125,7 +3125,7 @@ class TestInject(unittest.TestCase):
 
     def test_inject_400s_missing_text(self):
         h = _FakeHandler()
-        term_vt.inject(h, None, {"tty": "inj1"})
+        term_vt.inject(h, None, {"session": "", "tty": "inj1"})
         obj, code = h.calls[-1]
         self.assertEqual(code, 400)
         self.assertIn("text", obj["error"])
@@ -3167,7 +3167,7 @@ class TestInjectEndToEnd(unittest.TestCase):
         term_vt.PTYS[pt.id] = pt
 
         h = _FakeHandler()
-        term_vt.inject(h, None, {"tty": pt.id, "text": "echo INJECT-OK", "submit": True})
+        term_vt.inject(h, None, {"session": "", "tty": pt.id, "text": "echo INJECT-OK", "submit": True})
         obj, code = h.calls[-1]
         self.assertTrue(obj["ok"], obj)
 
@@ -3331,12 +3331,12 @@ class TestRawStreamRoute(unittest.TestCase):
     def test_403s_when_terminal_disabled(self):
         config.TERMINAL = False
         h = _FakeHandler()
-        term_vt.raw_stream(h, _Q("tty=nope"))
+        term_vt.raw_stream(h, _Q("session=&tty=nope"))
         self.assertEqual(h.calls[-1][1], 403)
 
     def test_404s_an_unknown_tty(self):
         h = _FakeHandler()
-        term_vt.raw_stream(h, _Q("tty=nope"))
+        term_vt.raw_stream(h, _Q("session=&tty=nope"))
         self.assertEqual(h.calls[-1][1], 404)
         self.assertEqual(term_vt._STREAMS, 0)
 
@@ -3344,7 +3344,7 @@ class TestRawStreamRoute(unittest.TestCase):
         term_vt.PTYS["p1"] = term_vt.Pty(tid="p1")
         term_vt._STREAMS = term_vt.MAX_STREAMS
         h = _FakeHandler()
-        term_vt.raw_stream(h, _Q("tty=p1"))
+        term_vt.raw_stream(h, _Q("session=&tty=p1"))
         obj, code = h.calls[-1]
         self.assertEqual(code, 429)
         self.assertEqual(term_vt.PTYS["p1"].viewers, 0)
@@ -3356,13 +3356,13 @@ class TestRawStreamRoute(unittest.TestCase):
         term_vt.PTYS["p1"].screen = Screen(cols=10, rows=2)
         term_vt._STREAMS = term_vt.MAX_STREAMS - 1
         h_grid = _StreamHandler()
-        t = threading.Thread(target=term_vt.screen_stream, args=(h_grid, _Q("tty=p1")))
+        t = threading.Thread(target=term_vt.screen_stream, args=(h_grid, _Q("session=&tty=p1")))
         t.daemon = True
         t.start()
         try:
             self.assertTrue(_wait_for(lambda: term_vt._STREAMS == term_vt.MAX_STREAMS, 5))
             h_raw = _FakeHandler()
-            term_vt.raw_stream(h_raw, _Q("tty=p1"))   # the shared budget is already exhausted
+            term_vt.raw_stream(h_raw, _Q("session=&tty=p1"))   # the shared budget is already exhausted
             self.assertEqual(h_raw.calls[-1][1], 429)
         finally:
             h_grid.close_peer()
@@ -3378,14 +3378,14 @@ class TestRawStreamRoute(unittest.TestCase):
         pt = term_vt.spawn(os.getcwd(), [shell, "-l"], 80, 24)
         term_vt.PTYS[pt.id] = pt
         h = _StreamHandler()
-        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("tty=" + pt.id)))
+        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("session=&tty=" + pt.id)))
         t.daemon = True
         t.start()
         try:
             self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
             payload = base64.b64encode(b"echo raw-tee-ok\n").decode()
             hk = _FakeHandler()
-            term_vt.keys(hk, None, {"tty": pt.id, "data": payload})
+            term_vt.keys(hk, None, {"session": "", "tty": pt.id, "data": payload})
 
             h.peer.settimeout(10)
             seen = b""
@@ -3419,7 +3419,7 @@ class TestRawStreamRoute(unittest.TestCase):
         pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
         term_vt.PTYS[pt.id] = pt
         h = _StreamHandler()
-        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("tty=" + pt.id)))
+        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("session=&tty=" + pt.id)))
         t.daemon = True
         t.start()
         try:
@@ -3465,7 +3465,7 @@ class TestNoticeReachesRawViewer(unittest.TestCase):
         pt = term_vt.spawn(os.getcwd(), [shell, "-l"], 80, 24)
         term_vt.PTYS[pt.id] = pt
         h = _StreamHandler()
-        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("tty=" + pt.id)))
+        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("session=&tty=" + pt.id)))
         t.daemon = True
         t.start()
         try:
@@ -3524,7 +3524,7 @@ class TestNoticeReachesRawViewer(unittest.TestCase):
         term_vt._feed_note(pt, "fired before any raw viewer attached")
 
         h = _StreamHandler()
-        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("tty=" + pt.id)))
+        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("session=&tty=" + pt.id)))
         t.daemon = True
         t.start()
         try:
@@ -3583,7 +3583,7 @@ class TestRawStreamNoticeEventDelivery(unittest.TestCase):
     @staticmethod
     def _open_raw(pt):
         h = _StreamHandler()
-        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("tty=" + pt.id)))
+        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("session=&tty=" + pt.id)))
         t.daemon = True
         t.start()
         return h, t
@@ -3722,7 +3722,7 @@ class TestRawStreamNoticeEventDelivery(unittest.TestCase):
         pt = term_vt.Pty(tid="screenreg1", screen=Screen(cols=10, rows=2))
         term_vt.PTYS[pt.id] = pt
         h = _StreamHandler()
-        t = threading.Thread(target=term_vt.screen_stream, args=(h, _Q("tty=" + pt.id)))
+        t = threading.Thread(target=term_vt.screen_stream, args=(h, _Q("session=&tty=" + pt.id)))
         t.daemon = True
         t.start()
         try:
@@ -4115,7 +4115,7 @@ class TestResumeBackstopFiresOnRefusal(unittest.TestCase):
             pt.done, pt.rc, pt.ended = True, 1, time.time()
             term_vt.PTYS[pt.id] = pt
             h = _FakeHandler()
-            term_vt.close_pty(h, None, {"tty": pt.id})   # ...and only THEN the user clicks ✕
+            term_vt.close_pty(h, None, {"session": "", "tty": pt.id})   # ...and only THEN the user clicks ✕
             self.assertEqual(h.calls[-1], ({"ok": True, "closed": False}, 200))
             t.join(timeout=2)
         self.assertTrue(pt.closing)
@@ -4141,7 +4141,7 @@ class TestResumeBackstopFiresOnRefusal(unittest.TestCase):
             pid, fd = real_fork(cwd, argv, cols, rows)
             forked.append(pid)
             h = _FakeHandler()                       # the ✕, landing mid-fork
-            term_vt.close_pty(h, None, {"tty": pt.id})
+            term_vt.close_pty(h, None, {"session": "", "tty": pt.id})
             return pid, fd
 
         with mock.patch.object(term_vt, "_fork_child", slow_fork), \
@@ -4247,7 +4247,7 @@ class TestResumeBackstopFiresOnRefusal(unittest.TestCase):
         def racer():
             at_commit.wait(5)
             h = _FakeHandler()
-            term_vt.close_pty(h, None, {"tty": pt.id})
+            term_vt.close_pty(h, None, {"session": "", "tty": pt.id})
             reply["got"] = h.calls[-1] if h.calls else None
 
         pt.lock = GatedLock()
@@ -4837,7 +4837,7 @@ class TestResumeBackstopStreamRecoversAfterAttach(unittest.TestCase):
             term_vt._retry_with_attach(pt, self.FULL_SID, self.SHORT_SID, 80, 24)
 
         h = _StreamHandler()
-        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("tty=" + pt.id)))
+        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("session=&tty=" + pt.id)))
         t.daemon = True
         t.start()
         try:
@@ -4953,7 +4953,7 @@ class TestResumeBackstopStreamRecoversAfterAttach(unittest.TestCase):
         self.assertTrue(any("attached to the live session" in n["text"] for n in pt.notices))
 
         h = _StreamHandler()
-        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("tty=" + pt.id)))
+        t = threading.Thread(target=term_vt.raw_stream, args=(h, _Q("session=&tty=" + pt.id)))
         t.daemon = True
         t.start()
         try:
@@ -5252,7 +5252,7 @@ class TestNoticeDeliveryOverScreenStream(unittest.TestCase):
 
     def _open(self, pt):
         h = _StreamHandler()
-        t = threading.Thread(target=term_vt.screen_stream, args=(h, _Q("tty=" + pt.id)))
+        t = threading.Thread(target=term_vt.screen_stream, args=(h, _Q("session=&tty=" + pt.id)))
         t.daemon = True
         t.start()
         self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
@@ -5438,7 +5438,7 @@ class TestStartingReadinessState(unittest.TestCase):
 
     def _open(self, pt):
         h = _StreamHandler()
-        t = threading.Thread(target=term_vt.screen_stream, args=(h, _Q("tty=" + pt.id)))
+        t = threading.Thread(target=term_vt.screen_stream, args=(h, _Q("session=&tty=" + pt.id)))
         t.daemon = True
         t.start()
         self.assertTrue(_wait_for(lambda: pt.viewers >= 1, 5))
@@ -5659,6 +5659,133 @@ class TestStartingClearedByBackstop(unittest.TestCase):
              mock.patch.object(term_vt.threading, "Thread"):
             term_vt._retry_with_fork(pt, "retry-sid", 80, 24)
         self.assertFalse(pt.starting)
+
+
+class TestSessionOwnership(unittest.TestCase):
+    """Strict session isolation: every tty-addressed route needs `session` (400 without) and the
+    (session, tty) pair must satisfy `_pty_owned` (409 {mismatch:true} otherwise). RED if a route
+    drops its check: the (b) mismatch assertions and the (d) stream-slot accounting both fail."""
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        term_vt._STREAMS = 0
+        self._fds = []
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        for fd in self._fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        for pt in list(term_vt.PTYS.values()):
+            pt.kill()
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+        term_vt._STREAMS = 0
+
+    def _pty(self, session="A", tid="own1"):
+        r, w = os.pipe()
+        self._fds += [r, w]
+        pt = term_vt.Pty(tid=tid, pid=0, fd=w, screen=Screen(80, 24))
+        pt.session = session
+        term_vt.PTYS[tid] = pt
+        return pt
+
+    def _call(self, route, tty, session=None, blank=False):
+        """-> the handler after one call. session=None omits it; blank=True sends `session=` on GETs."""
+        h = _FakeHandler()
+        sess = {} if session is None else {"session": session}
+        if route == "keys":
+            term_vt.keys(h, None, dict(sess, tty=tty, data=base64.b64encode(b"x").decode()))
+        elif route == "resize":
+            term_vt.resize_pty(h, None, dict(sess, tty=tty, cols=80, rows=24))
+        elif route == "inject":
+            term_vt.inject(h, None, dict(sess, tty=tty, text="x"))
+        elif route == "close":
+            term_vt.close_pty(h, None, dict(sess, tty=tty))
+        else:
+            fn = {"attached": term_vt.attached, "scrollback": term_vt.term_scrollback,
+                  "screen": term_vt.screen_stream, "raw": term_vt.raw_stream}[route]
+            q = "tty=" + tty + ("" if session is None else "&session=" + session)
+            fn(h, _Q(q))
+        return h
+
+    ROUTES = ("keys", "resize", "inject", "close", "attached", "scrollback", "screen", "raw")
+
+    def test_a_missing_session_is_400_on_every_route(self):
+        self._pty("A")
+        for route in self.ROUTES:
+            with self.subTest(route=route):
+                obj, code = self._call(route, "own1").calls[-1]
+                self.assertEqual(code, 400, obj)
+                self.assertEqual(obj["error"], "session required")
+
+    def test_another_sessions_pair_is_409_mismatch_on_every_route(self):
+        pt = self._pty("A")
+        for route in self.ROUTES:
+            with self.subTest(route=route):
+                obj, code = self._call(route, "own1", "B").calls[-1]
+                self.assertEqual(code, 409, obj)
+                self.assertTrue(obj.get("mismatch"), obj)
+                self.assertEqual(obj["error"], term_vt.SESSION_MISMATCH)
+        self.assertFalse(pt.closing, "a refused close must not mark the pty closing")
+
+    def test_the_owning_session_is_accepted_on_every_route(self):
+        self._pty("A")
+        fake = lambda *a, **k: None
+        for route in self.ROUTES:
+            with self.subTest(route=route), \
+                 mock.patch.object(term_vt, "_screen_stream_body", fake), \
+                 mock.patch.object(term_vt, "_raw_stream_body", fake), \
+                 mock.patch.object(term_vt, "_wait_for_quiescence", return_value=False):
+                if route == "close":
+                    term_vt.PTYS["own1"].done = True
+                    term_vt.PTYS["own1"].ended = time.time()
+                h = self._call(route, "own1", "A")
+                if route in ("screen", "raw"):
+                    self.assertEqual(h.calls, [], "a stream body writes via the handler, not _json")
+                    continue
+                obj, code = h.calls[-1]
+                self.assertNotIn(code, (400, 409), obj)
+
+    def test_a_refused_stream_takes_no_slot_and_no_viewer(self):
+        pt = self._pty("A")
+        for route in ("screen", "raw"):
+            with self.subTest(route=route):
+                self._call(route, "own1", "B")
+                self.assertEqual(term_vt._STREAMS, 0)
+                self.assertEqual(pt.viewers, 0)
+
+    def test_blank_session_is_a_real_value_not_absent(self):
+        """`?session=` (a session-less shell) must read as "" -- parse_qs drops blanks by default."""
+        self._pty("")
+        h = self._call("scrollback", "own1", "")
+        self.assertNotIn(h.calls[-1][1], (400, 409), h.calls[-1])
+        self._pty("A", tid="own2")
+        h = self._call("scrollback", "own2", "")
+        self.assertEqual(h.calls[-1][1], 409)
+
+    def test_close_mismatch_on_a_busy_folder_pty_is_mismatch_not_busy(self):
+        pt = self._pty("A")
+        pt.folder = True
+        with mock.patch.object(term_vt, "_fg_pgid", return_value=4242), \
+             mock.patch.object(term_vt, "_refresh_fg"):
+            obj, code = self._call("close", "own1", "B").calls[-1]
+        self.assertEqual(code, 409)
+        self.assertTrue(obj.get("mismatch"))
+        self.assertNotIn("busy", obj)
+        self.assertFalse(pt.closing)
+
+    def test_unknown_tty_is_still_404_once_a_session_is_named(self):
+        for route in self.ROUTES:
+            if route in ("screen", "raw"):
+                continue
+            with self.subTest(route=route):
+                self.assertEqual(self._call(route, "nope", "A").calls[-1][1], 404)
 
 
 if __name__ == "__main__":

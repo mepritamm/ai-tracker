@@ -1389,6 +1389,8 @@ class Pty:
                                     # built from that list can carry `sid` and get the full
                                     # ContextBar, not a degraded view. Write-once, read under
                                     # _LOCK like every other PTYS-dict-visible field here.
+        self.grants = set()        # every session id (incl. "") open_pty() has handed this tty to;
+                                    # add-only, under _LOCK. See _pty_owned().
         self.mode = ""              # "cwd" | "resume" | "new", set alongside `session` above for
                                     # the same reason (the standalone view's `?mode=` param).
         self.spawned = ""          # the session id this terminal CREATED after the fact, for a
@@ -3046,6 +3048,7 @@ def open_pty(handler, parsed, body):
             if mode == "resume":
                 hit = _session_pty(sid)
                 if hit is not None:
+                    hit.grants.add(sid)
                     return handler._json({"tty": hit.id, "renderer": config.TERM_RENDERER,
                                           "forked": hit.forked, "notice": None,
                                           "starting": False, "reused": True,
@@ -3101,6 +3104,8 @@ def open_pty(handler, parsed, body):
             with _LOCK:
                 fp.startup_done = True   # no watcher: later opens take the old (settled) path
     if mode == "cwd":
+        with _LOCK:
+            fp.grants.add(sid)
         return handler._json({"tty": fp.id, "renderer": config.TERM_RENDERER, "forked": False,
                               "notice": None, "starting": False, "reused": reused, "folder": True})
     # ---- resume/new: type it into the shell if idle, peek if it is already this session, else
@@ -3132,6 +3137,8 @@ def open_pty(handler, parsed, body):
         else:
             busy_what = "a foreground job"    # something the user typed themselves
     if busy_what == "":
+        with _LOCK:
+            fp.grants.add(sid)
         return handler._json({"tty": fp.id, "renderer": config.TERM_RENDERER, "forked": fp.forked,
                               "notice": None, "starting": False, "reused": True, "folder": True})
     if busy_what is None and not settled:
@@ -3151,6 +3158,8 @@ def open_pty(handler, parsed, body):
             with fp.lock:
                 fp.starting = False
             starting = False
+        with _LOCK:
+            fp.grants.add(sid)
         return handler._json({"tty": fp.id, "renderer": config.TERM_RENDERER, "forked": forked,
                               "notice": None, "starting": starting, "reused": reused,
                               "folder": True})
@@ -3166,6 +3175,8 @@ def open_pty(handler, parsed, body):
         if ok:
             if starting:
                 starting = _start_backstop(fp, sid, forked, cols, rows)
+            with _LOCK:
+                fp.grants.add(sid)
             return handler._json({"tty": fp.id, "renderer": config.TERM_RENDERER, "forked": forked,
                                   "notice": None, "starting": starting, "reused": reused,
                                   "folder": True})
@@ -3200,6 +3211,7 @@ def open_pty(handler, parsed, body):
         with pt.lock:
             pt.starting = True
     with _LOCK:
+        pt.grants.add(sid)
         PTYS[pt.id] = pt
     if mode == "resume":
         starting = _start_backstop(pt, sid, forked, cols, rows)
@@ -3221,19 +3233,58 @@ def _session_pty(sid):
     a dedicated pty opened/latched onto it), or None. Call under `_LOCK`. A resume of such a
     session must attach to it, never type a second `claude --resume` somewhere else. A forked
     pty runs a `--fork-session` copy under a new id, so it is never a hit."""
+    return next(_session_ptys(sid), None)
+
+
+def _session_ptys(sid):
+    """Every live pty running session `sid`, in PTYS order (see `_session_pty`). Call under
+    `_LOCK`. registry._attached_pty needs all of them: the first may have dropped back to a shell."""
     if not sid:
-        return None
-    for p in PTYS.values():
+        return
+    for p in list(PTYS.values()):
         if p.done or p.closing or p.forked:
             continue
         if p.folder:
             if p.fg and p.fg.get("session") == sid:
                 _refresh_fg(p)          # a stale label is not a hit; a PENDING claim is left alone -> still a hit
                 if p.fg and p.fg.get("session") == sid:
-                    return p
+                    yield p
         elif p.spawned == sid or (p.mode == "resume" and p.session == sid):
-            return p
-    return None
+            yield p
+
+
+SESSION_MISMATCH = "terminal belongs to another session"
+
+
+def _req_session(body=None, parsed=None):
+    """The `session` a tty-addressed request names: a str -- "" included, meaning a session-less
+    folder shell -- or None when it names none. Strict: every caller answers None with 400.
+    keep_blank_values because `?session=` (the "" case) must not read as absent."""
+    if body is not None:
+        v = body.get("session")
+    else:
+        from urllib.parse import parse_qs
+        vals = parse_qs(parsed.query, keep_blank_values=True).get("session")
+        v = vals[0] if vals else None
+    return v if isinstance(v, str) else None
+
+
+def _pty_owned(p, sid):
+    """THE one ownership rule every tty-addressed route checks. Call under _LOCK.
+    `sid` may address `p` when the server handed `p` to `sid` (grants), when `sid` opened it
+    (session), when `p` created `sid` (spawned -- the list row's own `session` field), or when
+    `sid` is what the app typed into this folder shell's foreground (fg). The "" session (a
+    Terminals-tab / launch-pad shell) may address only a pty that was opened session-less."""
+    if sid in p.grants:
+        return True
+    if sid == "":
+        return p.session == ""
+    return (p.session == sid or p.spawned == sid
+            or bool(p.folder and p.fg and p.fg.get("session") == sid))
+
+
+def _mismatch(handler, tid):
+    return handler._json({"error": SESSION_MISMATCH, "mismatch": True, "tty": tid}, 409)
 
 
 FOLDER_STARTUP_WAIT = 120.0
@@ -3396,11 +3447,17 @@ def keys(handler, parsed, body):
     if not isinstance(body, dict):
         return handler._json({"error": "bad body: expected a JSON object"}, 400)
     tid = body.get("tty") or ""
+    sid = _req_session(body)
+    if sid is None:
+        return handler._json({"error": "session required"}, 400)
     with _LOCK:
         _reap()
         pt = PTYS.get(tid)
+        owned = pt is None or _pty_owned(pt, sid)
     if pt is None or pt.done:
         return handler._json({"error": "no such terminal"}, 404)
+    if not owned:
+        return _mismatch(handler, tid)
     try:
         data = base64.b64decode(body.get("data") or "", validate=False)
     except Exception:
@@ -3457,9 +3514,14 @@ def close_pty(handler, parsed, body):
     if not isinstance(body, dict):
         return handler._json({"error": "bad body: expected a JSON object"}, 400)
     tid = body.get("tty") or ""
+    sid = _req_session(body)
+    if sid is None:
+        return handler._json({"error": "session required"}, 400)
     with _LOCK:
         _reap()
         pt = PTYS.get(tid)
+        if pt is not None and not _pty_owned(pt, sid):
+            return _mismatch(handler, tid)
         if pt is not None:
             targets = [pt.pid] if pt.pid > 0 else []
             if pt.folder and not pt.done:
@@ -3551,11 +3613,17 @@ def resize_pty(handler, parsed, body):
     if not isinstance(body, dict):
         return handler._json({"error": "bad body: expected a JSON object"}, 400)
     tid = body.get("tty") or ""
+    sid = _req_session(body)
+    if sid is None:
+        return handler._json({"error": "session required"}, 400)
     with _LOCK:
         _reap()
         pt = PTYS.get(tid)
+        owned = pt is None or _pty_owned(pt, sid)
     if pt is None or pt.done:
         return handler._json({"error": "no such terminal"}, 404)
+    if not owned:
+        return _mismatch(handler, tid)
     cols = _clamp_int(body.get("cols"), MIN_COLS, MAX_COLS, pt.screen.cols)
     rows = _clamp_int(body.get("rows"), MIN_ROWS, MAX_ROWS, pt.screen.rows)
     pt.touch()
@@ -3686,13 +3754,19 @@ def attached(handler, parsed):
         return
     from urllib.parse import parse_qs
     tid = parse_qs(parsed.query).get("tty", [""])[0]
+    sid = _req_session(parsed=parsed)
+    if sid is None:
+        return handler._json({"error": "session required"}, 400)
     with _LOCK:
         _reap()
         pt = PTYS.get(tid)
         if pt is not None and pt.folder and not pt.done:
             _refresh_fg(pt)         # this poll runs per open terminal: keep `fg` honest from it too
+        owned = pt is None or _pty_owned(pt, sid)
     if pt is None or pt.done:
         return handler._json({"error": "no such terminal"}, 404)
+    if not owned:
+        return _mismatch(handler, tid)
     handler._json({"claude_attached": _foreground_is_claude(pt.fd)})
 
 
@@ -3719,16 +3793,22 @@ def screen_stream(handler, parsed):
         return
     from urllib.parse import parse_qs
     tid = parse_qs(parsed.query).get("tty", [""])[0]
+    sid = _req_session(parsed=parsed)
+    if sid is None:
+        return handler._json({"error": "session required"}, 400)
     with _LOCK:
         _reap()
         pt = PTYS.get(tid)
+        mismatch = pt is not None and not _pty_owned(pt, sid)
         busy = pt is not None and _STREAMS >= MAX_STREAMS
-        if pt is not None and not busy:
+        if pt is not None and not busy and not mismatch:
             _STREAMS += 1
             pt.viewers += 1
             pt.touch()
     if pt is None:                                       # returns fast, holds no thread
         return handler._json({"error": "no such terminal", "tty": tid}, 404)
+    if mismatch:
+        return _mismatch(handler, tid)
     if busy:
         return handler._json({"error": "too many open screen streams (max %d)" % MAX_STREAMS}, 429)
     try:
@@ -3905,11 +3985,17 @@ def term_scrollback(handler, parsed):
     from urllib.parse import parse_qs
     qs = parse_qs(parsed.query)
     tid = qs.get("tty", [""])[0]
+    sid = _req_session(parsed=parsed)
+    if sid is None:
+        return handler._json({"error": "session required"}, 400)
     with _LOCK:
         _reap()
         pt = PTYS.get(tid)
+        owned = pt is None or _pty_owned(pt, sid)
     if pt is None:
         return handler._json({"error": "no such terminal", "tty": tid}, 404)
+    if not owned:
+        return _mismatch(handler, tid)
     offset = _clamp_int(qs.get("offset", ["0"])[0], 0, SCROLLBACK_MAX, 0)
     count = _clamp_int(qs.get("rows", ["0"])[0], 0, SCROLLBACK_MAX, 0)
     with pt.lock:
@@ -4199,6 +4285,9 @@ def inject(handler, parsed, body):
     if not isinstance(body, dict):
         return handler._json({"error": "bad body: expected a JSON object"}, 400)
     tid = body.get("tty") or ""
+    sid = _req_session(body)
+    if sid is None:
+        return handler._json({"error": "session required"}, 400)
     text = body.get("text")
     if not isinstance(text, str) or text == "":
         return handler._json({"error": "text required"}, 400)
@@ -4207,8 +4296,11 @@ def inject(handler, parsed, body):
     with _LOCK:
         _reap()
         pt = PTYS.get(tid)
+        owned = pt is None or _pty_owned(pt, sid)
     if pt is None or pt.done:
         return handler._json({"error": "no such terminal"}, 404)
+    if not owned:
+        return _mismatch(handler, tid)
 
     pt.touch()
     if not _wait_for_quiescence(pt):
@@ -4317,17 +4409,23 @@ def raw_stream(handler, parsed):
         return
     from urllib.parse import parse_qs
     tid = parse_qs(parsed.query).get("tty", [""])[0]
+    sid = _req_session(parsed=parsed)
+    if sid is None:
+        return handler._json({"error": "session required"}, 400)
     q = queue.Queue(maxsize=RAW_QUEUE_MAXLEN)
     with _LOCK:
         _reap()
         pt = PTYS.get(tid)
+        mismatch = pt is not None and not _pty_owned(pt, sid)
         busy = pt is not None and _STREAMS >= MAX_STREAMS
-        if pt is not None and not busy:
+        if pt is not None and not busy and not mismatch:
             _STREAMS += 1
             pt.viewers += 1
             pt.touch()
     if pt is None:                                       # returns fast, holds no thread
         return handler._json({"error": "no such terminal", "tty": tid}, 404)
+    if mismatch:
+        return _mismatch(handler, tid)
     if busy:
         return handler._json({"error": "too many open screen streams (max %d)" % MAX_STREAMS}, 429)
     with pt.lock:

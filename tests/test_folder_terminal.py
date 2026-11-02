@@ -577,7 +577,7 @@ class TestCloseFolderBusyAndOverflow(unittest.TestCase):
         with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=7002), \
              mock.patch.object(pt, "kill") as kill_mock:
             h = _FakeHandler()
-            term_vt.close_pty(h, None, {"tty": "busy1"})
+            term_vt.close_pty(h, None, {"session": "", "tty": "busy1"})
             obj, code = h.calls[-1]
 
         self.assertEqual(code, 409)
@@ -595,7 +595,7 @@ class TestCloseFolderBusyAndOverflow(unittest.TestCase):
         with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=7004), \
              mock.patch.object(pt, "kill") as kill_mock:
             h = _FakeHandler()
-            term_vt.close_pty(h, None, {"tty": "busy2", "force": True})
+            term_vt.close_pty(h, None, {"session": "", "tty": "busy2", "force": True})
             obj, code = h.calls[-1]
 
         self.assertEqual(code, 200, obj)
@@ -609,7 +609,7 @@ class TestCloseFolderBusyAndOverflow(unittest.TestCase):
         term_vt.PTYS["ov2"] = pt
 
         h = _FakeHandler()
-        term_vt.close_pty(h, None, {"tty": "ov2"})
+        term_vt.close_pty(h, None, {"session": "", "tty": "ov2"})
         obj, code = h.calls[-1]
 
         self.assertEqual(code, 200, obj)
@@ -765,7 +765,7 @@ class TestCloseKillsForegroundChildForReal(unittest.TestCase):
 
             term_vt.PTYS[pt.id] = pt
             h = _FakeHandler()
-            term_vt.close_pty(h, None, {"tty": pt.id, "force": True})
+            term_vt.close_pty(h, None, {"session": "", "tty": pt.id, "force": True})
             obj, code = h.calls[-1]
             self.assertEqual(code, 200, obj)
 
@@ -790,6 +790,113 @@ class TestCloseKillsForegroundChildForReal(unittest.TestCase):
                              "closing a folder terminal must SIGKILL both process groups, not "
                              "just the shell's (and must not rely on the kernel's own session "
                              "hangup, which a SIGHUP-ignoring child defeats)")
+
+
+# ------------------------------------------------------------------------- session isolation
+# A tty is addressed as a (session, tty) pair; `_pty_owned` is the one predicate. A folder shell is
+# shared per cwd, so ownership is grants U opener U spawned U foreground -- not opener alone.
+
+
+class TestFolderOwnership(unittest.TestCase):
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        self._tmpdir = tempfile.mkdtemp()
+        _stub_kill(self)
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+
+    def _folder(self, session="A"):
+        pt = term_vt.Pty(tid="fo1", pid=42424, fd=99, cwd=self._tmpdir)
+        pt.folder, pt.session = True, session
+        term_vt.PTYS["fo1"] = pt
+        return pt
+
+    def _keys(self, session):
+        h = _FakeHandler()
+        with mock.patch.object(term_vt.os, "write", return_value=1):
+            term_vt.keys(h, None, {"tty": "fo1", "session": session, "data": ""})
+        return h.calls[-1]
+
+    def test_opener_is_owner_and_a_stranger_is_not(self):
+        self._folder("A")
+        self.assertEqual(self._keys("A")[1], 200)
+        obj, code = self._keys("C")
+        self.assertEqual(code, 409, obj)
+        self.assertTrue(obj["mismatch"])
+
+    def test_a_granted_session_is_owner_of_the_shared_shell(self):
+        pt = self._folder("A")
+        pt.grants.add("B")
+        self.assertEqual(self._keys("B")[1], 200)
+        self.assertEqual(self._keys("C")[1], 409)
+
+    def test_the_session_in_the_foreground_is_owner(self):
+        pt = self._folder("A")
+        pt.fg = {"session": "C", "mode": "resume"}
+        self.assertEqual(self._keys("C")[1], 200)
+
+    def test_spawned_session_is_owner(self):
+        pt = self._folder("A")
+        pt.spawned = "Z"
+        self.assertEqual(self._keys("Z")[1], 200)
+
+    def test_blank_session_only_reaches_a_session_less_shell(self):
+        pt = self._folder("A")
+        self.assertEqual(self._keys("")[1], 409)
+        pt.grants.add("")
+        self.assertEqual(self._keys("")[1], 200)
+        self._folder("")
+        self.assertEqual(self._keys("")[1], 200)
+
+    def test_second_sessions_cwd_open_shares_the_shell_and_is_granted(self):
+        h1 = _FakeHandler()
+        with mock.patch.object(term_gate, "session_cwd", return_value=self._tmpdir):
+            term_vt.open_pty(h1, None, {"session": "A", "mode": "cwd", "cols": 80, "rows": 24})
+            h2 = _FakeHandler()
+            term_vt.open_pty(h2, None, {"session": "B", "mode": "cwd", "cols": 80, "rows": 24})
+        self.assertEqual((h1.calls[-1][1], h2.calls[-1][1]), (200, 200), (h1.calls, h2.calls))
+        tid = h1.calls[-1][0]["tty"]
+        _real = term_vt.PTYS[tid].pid       # kill is stubbed for this class: reap the real shell ourselves
+        self.addCleanup(lambda: _best_effort_killpg(_real))
+        self.assertEqual(h2.calls[-1][0]["tty"], tid, "one shell per cwd")
+        with term_vt._LOCK:
+            self.assertEqual(term_vt.PTYS[tid].grants, {"A", "B"})
+            self.assertTrue(term_vt._pty_owned(term_vt.PTYS[tid], "B"))
+            self.assertFalse(term_vt._pty_owned(term_vt.PTYS[tid], "C"))
+
+
+class TestAttachedPtyForeground(unittest.TestCase):
+    """registry._attached_pty reports the pty RUNNING the session, never its first opener."""
+
+    def setUp(self):
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        _stub_kill(self)
+        self.addCleanup(lambda: (term_vt.PTYS.clear(), term_vt.PTYS.update(self._ptys0)))
+
+    def test_folder_shell_belongs_to_the_session_in_its_foreground(self):
+        from aitracker import registry
+        pt = term_vt.Pty(tid="af1", pid=42424, fd=99)
+        pt.folder, pt.session = True, "A"
+        pt.fg, pt.fg_pending = {"session": "B", "mode": "resume"}, True
+        term_vt.PTYS["af1"] = pt
+        with mock.patch.object(term_vt, "_foreground_is_claude", return_value=True):
+            self.assertIs(registry._attached_pty("B"), pt)
+            self.assertIsNone(registry._attached_pty("A"))
+
+    def test_a_dedicated_new_pty_is_not_its_opener_sessions_terminal(self):
+        from aitracker import registry
+        pt = term_vt.Pty(tid="af2", pid=42424, fd=99)
+        pt.session, pt.mode = "A", "new"
+        term_vt.PTYS["af2"] = pt
+        with mock.patch.object(term_vt, "_foreground_is_claude", return_value=True):
+            self.assertIsNone(registry._attached_pty("A"))
 
 
 if __name__ == "__main__":
@@ -1154,7 +1261,7 @@ class TestUnsettledShellWithUserInputOverflows(_OpenFixtureBase):
             st.enter_context(mock.patch.object(term_gate, "guard", return_value=True))
             st.enter_context(mock.patch.object(term_vt.os, "write", return_value=3))
             kh = _FakeHandler()
-            term_vt.keys(kh, None, {"tty": "typed1",
+            term_vt.keys(kh, None, {"session": "", "tty": "typed1",
                                     "data": base64.b64encode(b"npm run dev\r").decode()})
             self.assertEqual(kh.calls[-1][1], 200, kh.calls)
             h = _FakeHandler()

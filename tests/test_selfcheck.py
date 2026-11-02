@@ -582,6 +582,9 @@ def _run():
     # provider registry routes ids to the owning adapter
     assert parse_any("auggie:sess1")["meta"]["source"] == "auggie", "auggie prefix must route to Auggie"
     assert parse_any("auggie:missing") is None
+    # the shared seam stamps the namespaced id it was asked for (client refuses a payload whose id isn't the session on screen)
+    assert parse_any("auggie:sess1")["id"] == "auggie:sess1", "Auggie detail must carry its auggie:-prefixed id"
+    assert parse_any("s_wait")["id"] == "s_wait", "Claude detail must carry the bare id it was asked for"
     assert parse_any("no-such-claude-session-id") is None, "bare id must route to the Claude provider"
 
     # search reaches Auggie too (it was Claude-only): match the transcript + title
@@ -1190,6 +1193,7 @@ def _run():
     try:
         pt = term_vt.Pty(tid="fake-term-1")
         pt.session = "s_done"
+        pt.mode = "resume"   # _attached_pty = the pty RUNNING the session (a dedicated resume pty)
         pt.done = False
         term_vt.PTYS[pt.id] = pt
         with mock.patch("aitracker.term_vt._foreground_is_claude", return_value=True):
@@ -1205,6 +1209,7 @@ def _run():
         # a live pty against a DIFFERENT session must not leak onto this one (both providers)
         pt2 = term_vt.Pty(tid="fake-term-2")
         pt2.session = "auggie:sess1"
+        pt2.mode = "resume"   # _attached_pty = the pty RUNNING the session (a dedicated resume pty)
         pt2.done = False
         term_vt.PTYS[pt2.id] = pt2
         with mock.patch("aitracker.term_vt._foreground_is_claude", return_value=True):

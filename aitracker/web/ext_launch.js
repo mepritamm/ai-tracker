@@ -334,6 +334,7 @@
           .then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
       })
       .then(function (res) {
+        if (res.j && res.j.tty && window.ExtVT && window.ExtVT.bindTty) window.ExtVT.bindTty(res.j.tty, "");   // session-less shell
         if (!res.ok || !res.j || !res.j.tty) {
           showPickerError(
             (res.j && res.j.error) ||

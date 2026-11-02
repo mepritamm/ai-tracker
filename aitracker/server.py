@@ -189,7 +189,7 @@ def _sync_title_to_claude(sid, title):
             return False
         cap = _RenameSyncCapture()
         text = "/rename " + _sanitize_rename_text(title)
-        term_vt.inject(cap, None, {"tty": pty.id, "text": text, "submit": True, "clear_first": True})
+        term_vt.inject(cap, None, {"tty": pty.id, "session": sid, "text": text, "submit": True, "clear_first": True})
         return isinstance(cap.result, dict) and cap.result.get("ok") is True
     except Exception:
         return False

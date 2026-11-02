@@ -2011,7 +2011,7 @@
             hints: isModel ? (meta2.model_hints || null) : undefined,
             onPick: function (val) {
               _injectToTerminal(ctx, ttyMe, "/" + (isModel ? "model" : "effort") + " " + val,
-                isModel ? "Couldn’t switch model" : "Couldn’t switch effort");
+                isModel ? "Couldn’t switch model" : "Couldn’t switch effort", sid);
             }
           });
           break;
@@ -2033,7 +2033,7 @@
           // tty to target.
           var ttySt = ui.lastSession && ui.lastSession.term_tty;
           if (!ttySt) return;
-          _killTerminal(ctx, ttySt);
+          _killTerminal(ctx, ttySt, sid);
           break;
         }
       }
@@ -2965,9 +2965,17 @@
   // Failure always surfaces a real message via the file's existing notice bus
   // (ctx.emit("notify", …) — see the "Note copied" callsite above); success gives a
   // WORD ("Switched."), never colour alone. Never a silent no-op, never a false positive.
-  function _injectToTerminal(ctx, tty, text, failLabel) {
+  // A tty always leaves the page WITH the session it was obtained for (server answers 400/409
+  // otherwise). `sid` is the session whose detail this tty came from; bound through ExtVT's one
+  // binding, with a literal-session fallback when ext_vt.js is not loaded.
+  function _ttyBodyFor(tty, sid, extra) {
+    var X = window.ExtVT;
+    if (X && X.bindTty && X.ttyBody) { X.bindTty(tty, sid); return X.ttyBody(tty, extra); }
+    return Object.assign({ tty: tty, session: sid || "" }, extra || {});
+  }
+  function _injectToTerminal(ctx, tty, text, failLabel, sid) {
     if (!tty) { ctx.emit("notify", { text: failLabel + ": no terminal attached" }); return; }
-    _termPost("/api/term/inject", { tty: tty, text: text, submit: true, clear_first: true })
+    _termPost("/api/term/inject", _ttyBodyFor(tty, sid, { text: text, submit: true, clear_first: true }))
       .then(_termJson).then(function (res) {
         if (res.ok && res.j && res.j.ok === true) { ctx.emit("notify", { text: "Switched." }); return; }
         var reason = (res.j && (res.j.error || res.j.reason)) ||
@@ -2977,9 +2985,9 @@
         ctx.emit("notify", { text: failLabel + " — " + reason });
       }).catch(function () { ctx.emit("notify", { text: "Couldn’t reach the server — the switch wasn’t sent" }); });
   }
-  function _killTerminal(ctx, tty) {
+  function _killTerminal(ctx, tty, sid) {
     if (!tty) { ctx.emit("notify", { text: "No terminal attached." }); return; }
-    _termPost("/api/term/close", { tty: tty }).then(function (r) {
+    _termPost("/api/term/close", _ttyBodyFor(tty, sid)).then(function (r) {
       if (!r.ok) { ctx.emit("notify", { text: "Failed to kill terminal." }); return; }
       ctx.emit("notify", { text: "Terminal killed." });
     }).catch(function () { ctx.emit("notify", { text: "Couldn’t reach the server — the terminal wasn’t killed." }); });

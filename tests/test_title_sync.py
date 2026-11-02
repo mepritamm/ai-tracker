@@ -118,6 +118,7 @@ class ApiTitleSyncTests(_ServerCase):
         self.assertEqual(len(self._inject_calls), 1)
         call = self._inject_calls[0]
         self.assertEqual(call["tty"], "tty-1")
+        self.assertEqual(call["session"], "s1")   # strict ownership: the inject names the session it types for
         self.assertEqual(call["text"], "/rename argocd-alerts")
         self.assertTrue(call["submit"])
         self.assertTrue(call["clear_first"])

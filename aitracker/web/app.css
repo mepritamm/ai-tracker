@@ -616,6 +616,13 @@ mark{background:var(--amber-deep,rgba(245,180,67,.28));color:var(--text);border-
 .chip.bgchip b{color:var(--amber)}
 .chip.bgchip:hover{border-color:var(--amber);background:var(--amber-bg)}
 
+/* Session switch: never show A's detail under B. loading = nothing cached; refreshing = B's own cached snapshot. */
+main[data-sess=loading]>*{visibility:hidden}
+main[data-sess=loading] #drawerBtn{visibility:visible}
+main[data-sess=loading]::before{content:"Loading session…";display:block;padding:24px;color:var(--muted,#888)}
+main[data-sess=refreshing] #hmeta::after{content:" · refreshing…"}
+
 /* Read-only view: cosmetic hide of classic-UI write controls (server still 403s). */
 html.tracker-readonly .ren,html.tracker-readonly .pin:not(.on),html.tracker-readonly .addflag,html.tracker-readonly .addnote{display:none!important}
 html.tracker-readonly .pin{pointer-events:none}
+

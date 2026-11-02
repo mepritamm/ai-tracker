@@ -1316,7 +1316,7 @@ async function runDetailSearch(){
   if(!q||!cur){ dHits=null; $("dsc").textContent=""; $("dresults").style.display="none"; return; }
   $("dresults").style.display="";
   $("dresults").innerHTML="<div class=empty>searching…</div>";
-  try{ const r=await(await fetch(`/api/session_search?id=${encodeURIComponent(cur)}&q=${encodeURIComponent(q)}`)).json(); dHits=r.hits||[]; }
+  try{ const r=await sessJSON(`/api/session_search?id=${encodeURIComponent(cur)}&q=${encodeURIComponent(q)}`); if(r===STALE)return; dHits=r.hits||[]; }
   catch(e){ dHits=[]; }
   renderDetailSearch(q);
 }
@@ -1384,13 +1384,72 @@ async function start(){
   setInterval(loadSide,5000);
 }
 function track(){
+  const prev=cur;
   cur=$("sid").value.trim();localStorage.setItem("sid",cur);
   uiState.set('sid',cur);   // mirror into the shared store -- the legacy "sid" key above stays authoritative here
   if(timer)clearInterval(timer);
+  if(cur!==prev){
+    resetSession(cur, prev);                         // synchronous: nothing of prev survives this line
+    const hit=cur&&sessCacheGet(cur);
+    sessRefreshing=!!hit;
+    document.querySelector("main").dataset.sess=hit?"refreshing":(cur?"loading":"");
+    if(hit) renderFor(cur, hit);                     // B's OWN snapshot, marked refreshing
+  }
   if(!cur)return;
-  poll();timer=setInterval(poll,2000);
+  poll();timer=setInterval(poll,2000);               // fires NOW -- pollBusy was cleared by resetSession
 }
 let lastData=null;
+// ---- Session isolation seam: ONE teardown both views use (classic + control room) ----
+let sessEpoch=0;                         // bumped on every selection change
+let sessAbort=new AbortController();     // aborts every in-flight session-scoped READ on a switch
+let sessRefreshing=false;                // true while the shown detail is a cached snapshot
+const SESSION_RESET=[];                  // fn(next, prev) -- per-session state MUST register here
+const SESS_CACHE=new Map(), SESS_CACHE_MAX=8;   // sid -> detail dict (d.id===sid), in-memory LRU
+const STALE=Object.freeze({stale:true}); // identity sentinel: the selection moved mid-request
+function onSessionReset(fn){ SESSION_RESET.push(fn); }
+function sessToken(){ return {sid:cur, epoch:sessEpoch}; }
+function sessCurrent(t){ return !!t && t.sid===cur && t.epoch===sessEpoch; }
+// The ONE guarded fetch: captures (sid, epoch) at request time; resolves to the parsed JSON, or
+// STALE if either moved. GETs ride sessAbort (cancelled on switch); writes are never aborted --
+// they carry their session explicitly in the body, only their RESPONSE is dropped.
+async function sessJSON(url, opts){
+  const t=sessToken(), o=Object.assign({}, opts||{});
+  if(!o.method||o.method==="GET") o.signal=sessAbort.signal;
+  let r, j;
+  try{ r=await fetch(url,o); j=await r.json().catch(()=>({})); }
+  catch(e){ if(!sessCurrent(t)) return STALE; throw e; }
+  if(!sessCurrent(t)) return STALE;
+  if(!r.ok && j && j.error==null) j.error="http "+r.status;
+  return j;
+}
+function sessCachePut(sid,d){
+  if(!sid||!d||d.error||d.id!==sid) return;
+  SESS_CACHE.delete(sid); SESS_CACHE.set(sid,d);
+  while(SESS_CACHE.size>SESS_CACHE_MAX) SESS_CACHE.delete(SESS_CACHE.keys().next().value);
+}
+function sessCacheGet(sid){ const d=SESS_CACHE.get(sid); return d&&d.id===sid?d:null; }
+// The ONLY way a detail dict reaches render(): refuses a payload for any other session.
+function renderFor(sid,d){
+  if(!sid||sid!==cur||!d||d.id!==sid) return false;
+  lastData=d; render(d); return true;
+}
+// poll()'s landing step: cache, clear the loading/refreshing mark, render through renderFor.
+function sessLanded(id,d){
+  const m=document.querySelector("main");
+  if(d&&d.error){ sessRefreshing=false; if(m)delete m.dataset.sess; return false; }
+  sessCachePut(id,d);
+  if(!renderFor(id,d)) return false;
+  sessRefreshing=false; if(m)delete m.dataset.sess;
+  return true;
+}
+function resetSession(next, prev){
+  sessEpoch++;
+  try{ sessAbort.abort(); }catch(e){}
+  sessAbort=new AbortController();
+  pollBusy=false;          // the aborted poll must not block the new session's first fetch
+  lastData=null;
+  SESSION_RESET.forEach(f=>{ try{ f(next, prev); }catch(e){ console.error("session reset hook",e); } });
+}
 // ---- completion notifications: agent/shell running -> done ----
 // Same DEFECT-5 hazard as the `cur` read at the top of this file: a top-level (module-scope)
 // localStorage read, evaluated synchronously while the single <script> tag is still parsing --
@@ -1470,12 +1529,13 @@ async function poll(){
   pollBusy=true;
   const seq=++pollSeq, id=cur;
   let d;
-  try{d=await(await fetch("/api/session?id="+encodeURIComponent(id))).json()}
+  try{d=await(await fetch("/api/session?id="+encodeURIComponent(id),{signal:sessAbort.signal})).json()}
   catch(e){return}
   finally{pollBusy=false;}
   if(seq!==pollSeq||id!==cur)return;   // superseded by a newer poll, or the selection moved on — discard
-  if(d.error){$("hmeta").innerHTML=`<span class=dot></span> ${esc(d.error)}: ${esc(cur)}`;return}
-  lastData=d;render(d);loadFlags();checkCompletions(d);
+  if(d.error){sessLanded(id,d);$("hmeta").innerHTML=`<span class=dot></span> ${esc(d.error)}: ${esc(cur)}`;return}
+  if(!sessLanded(id,d))return;
+  loadFlags();checkCompletions(d);
 }
 const KICON={commit:ico('branch'),test:ico('check'),install:ico('download'),build:ico('hammer'),git:ico('branch'),cmd:"$"};
 // Fork lineage banners (registry.py: d.continued_as/d.continued_from, on every provider's
@@ -1845,9 +1905,8 @@ function render(d){
   curNarr=narrState.items;
   const moreNarr=async()=>{
     if(narrState.items.length>=narrState.total) return null;
-    const r=await fetch(`/api/narration?id=${encodeURIComponent(cur)}&offset=${narrState.items.length}&limit=60`);
-    if(!r.ok) return null;
-    const j=await r.json();
+    const j=await sessJSON(`/api/narration?id=${encodeURIComponent(cur)}&offset=${narrState.items.length}&limit=60`);
+    if(j===STALE||j.error) return null;
     narrState.items=narrState.items.concat(j.items||[]);
     narrState.total=j.total!=null?j.total:narrState.total;
     curNarr=narrState.items;
@@ -1935,10 +1994,12 @@ async function openDiff(i){
   updateMdToggle();
   $("diffbody").innerHTML="<div class=empty>loading…</div>";
   $("diffmodal").style.display="flex";
-  try{const d=await(await fetch(`/api/diff?id=${encodeURIComponent(cur)}&file=${encodeURIComponent(f.path)}`)).json();
+  try{const d=await sessJSON(`/api/diff?id=${encodeURIComponent(cur)}&file=${encodeURIComponent(f.path)}`);
+      if(d===STALE)return;
       curDiffOps=(d.ops||[]).reverse();}   // newest edit first
   catch(e){curDiffOps=[];}
-  try{const r=await(await fetch("/api/file?path="+encodeURIComponent(f.path))).json();
+  try{const r=await sessJSON("/api/file?path="+encodeURIComponent(f.path));
+      if(r===STALE)return;
       if(!r.error) curDiffText=r.content||"";}catch(e){}   // full file → GitHub-style context expansion
   renderDiffView();
 }
@@ -2102,8 +2163,9 @@ async function openCmd(i){
   $("msgbody").innerHTML=`<div class=cmdcode><span class="${x.ok?'ok':'bad'}">${x.ok?ico('check'):ico('x')}</span> ${esc(x.cmd)}</div><div class=empty>loading output…</div>`;
   $("msgmodal").style.display="flex";
   let d;
-  try{d=await(await fetch(`/api/output?id=${encodeURIComponent(cur)}&cmd=${encodeURIComponent(x.id)}`)).json()}
+  try{d=await sessJSON(`/api/output?id=${encodeURIComponent(cur)}&cmd=${encodeURIComponent(x.id)}`)}
   catch(e){d={}}
+  if(d===STALE)return;
   $("msgbody").innerHTML=`<div class=cmdcode><span class="${x.ok?'ok':'bad'}">${x.ok?ico('check'):ico('x')}</span> ${esc(d.cmd||x.cmd)}</div>`+
     (d.out?`<pre class=cmdout>${esc(d.out)}</pre>`:"<div class=empty>no output captured</div>");
 }
@@ -2126,7 +2188,8 @@ async function openShell(i,quiet){
   $("msgbody").className="msgbody cmdmode";
   if(!quiet)$("msgbody").innerHTML=`<div class=cmdcode>${esc(s.cmd)}</div><div class=empty>loading output…</div>`;
   $("msgmodal").style.display="flex";
-  let d;try{d=await(await fetch(`/api/shell?id=${encodeURIComponent(cur)}&shell=${encodeURIComponent(s.id)}`)).json()}catch(e){d={}}
+  let d;try{d=await sessJSON(`/api/shell?id=${encodeURIComponent(cur)}&shell=${encodeURIComponent(s.id)}`)}catch(e){d={}}
+  if(d===STALE)return;
   $("msgbody").innerHTML=`<div class=cmdcode>${esc(d.cmd||s.cmd)}</div>`+
     (d.out?`<pre class=cmdout>${esc(d.out)}</pre>`:"<div class=empty>no output yet</div>");
   if(quiet)body.scrollTop=st;
@@ -2140,13 +2203,25 @@ async function openAgent(i,quiet){
   $("msgbody").className="msgbody";
   if(!quiet)$("msgbody").innerHTML="<div class=empty>loading…</div>";
   $("msgmodal").style.display="flex";
-  let d;try{d=await(await fetch(`/api/agent?id=${encodeURIComponent(cur)}&agent=${encodeURIComponent(a.aid||a.id)}`)).json()}catch(e){d={}}
+  let d;try{d=await sessJSON(`/api/agent?id=${encodeURIComponent(cur)}&agent=${encodeURIComponent(a.aid||a.id)}`)}catch(e){d={}}
+  if(d===STALE)return;
   $("msgbody").innerHTML=(d.task?`<div class=cmdcode>${esc(d.task)}</div>`:"")+
     `<div class="muted mono" style=margin-bottom:10px>${d.tools||0} tool calls · ${d.running?'running':'done'}</div>`+
     (d.narration?md(d.narration):"<div class=empty>no narration recorded</div>");
   if(quiet)body.scrollTop=st;
 }
 function closeMsg(){$("msgmodal").style.display="none";}
+// Classic view's per-session state: everything below belongs to ONE session and dies on a switch.
+onSessionReset(function(){
+  closeDiff(); closeMsg(); curModal=null;
+  curFiles=[]; curDiffFile=null; curDiffOps=[]; diffExpand=[]; curDiffText=null; diffAllExpanded=false;
+  curNarr=[]; curCmds=[]; curReqs=[]; curOv={}; curShells=[]; curAgents=[]; curTodos=[];
+  narrState={id:null,items:[],total:0};
+  clearDetailSearch(); dSid=null; const c=$("dsearchcard"); if(c)c.style.display="none";
+  const n=$("noteinput"); if(n)n.value="";
+  notifSession=null; notifRunning=null;          // re-baseline: never announce A's completions under B
+  document.title="tracker";
+});
 function copyModal(bodyId,btn){
   const el=$(bodyId); if(!el)return;
   const text=el.innerText||el.textContent||"";
@@ -2236,22 +2311,26 @@ async function addNote(){
   const inp=$("noteinput");
   const text=(inp.value||"").trim();
   if(!text)return;
-  const r=await fetch("/api/notes",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({session:cur,text})});
-  if(r.ok){inp.value="";if(lastData)lastData.notes=(await r.json()).notes||[];renderNotes(lastData.notes||[]);renderSide();}
+  const sid=cur;
+  const j=await sessJSON("/api/notes",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({session:sid,text})});
+  if(j===STALE||j.error)return;
+  inp.value="";if(lastData)lastData.notes=j.notes||[];renderNotes((lastData&&lastData.notes)||[]);renderSide();
 }
 async function removeNote(idx){
   if(!cur)return;
-  const r=await fetch("/api/notes/delete",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({session:cur,index:idx})});
-  if(r.ok){const j=await r.json();if(lastData)lastData.notes=j.notes||[];renderNotes(lastData.notes||[]);renderSide();}
+  const sid=cur;
+  const j=await sessJSON("/api/notes/delete",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({session:sid,index:idx})});
+  if(j===STALE||j.error)return;
+  if(lastData)lastData.notes=j.notes||[];renderNotes((lastData&&lastData.notes)||[]);renderSide();
 }
 async function pushNote(idx){
   if(!cur)return;
-  const r=await fetch("/api/notes/push",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({session:cur,index:idx})});
-  if(!r.ok)return;
-  const j=await r.json();
+  const sid=cur;
+  const j=await sessJSON("/api/notes/push",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({session:sid,index:idx})});
+  if(j===STALE||j.error)return;
   if(lastData)lastData.notes=j.notes||[];
   renderNotes(lastData?lastData.notes||[]:[]);renderSide();
   const now=(j.notes||[])[idx];
@@ -2326,11 +2405,12 @@ function toggleAllFlags(){
 }
 async function addFlag(){
   if(!cur){alert("Pick a session first");return}
+  const sid=cur;
   const note=prompt("Flag an issue or gap to resolve:");
   if(!note||!note.trim())return;
-  const s=sessions.find(x=>x.id===cur)||{};
+  const s=sessions.find(x=>x.id===sid)||{};
   await fetch("/api/flags",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({session:cur,project:s.project||"",note,context:($("nowtext").textContent||"").replace(/[▶▍]/g,"").trim()})});
+    body:JSON.stringify({session:sid,project:s.project||"",note,context:($("nowtext").textContent||"").replace(/[▶▍]/g,"").trim()})});
   loadFlags();
 }
 async function flagAction(path,id){
