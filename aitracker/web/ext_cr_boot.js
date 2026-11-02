@@ -548,9 +548,21 @@ window.CR = window.CR || {};
     var sid = payload.sessionId, arg = payload.arg;
     // A drill request for any session other than the one selected is stale (switched away).
     if (typeof cur !== 'undefined' && sid !== cur) return;
+    // The agent map asks via reply:'agent-map' and gets its answer through CR.dialogs.update, never a new dialog.
+    var toMap = payload && payload.reply === 'agent-map';
+    function out(x) {
+      if (toMap) {
+        if (window.CR && window.CR.dialogs && typeof window.CR.dialogs.update === 'function') {
+          window.CR.dialogs.update(Object.assign({ kind: 'agent-detail', sid: sid, aid: arg, seq: payload.seq }, x));
+        }
+        return;
+      }
+      dialog(name, Object.assign({ sessionId: sid }, x));
+    }
     sessJSON(urlFn(sid, arg)).then(function (d) {
       if (d === STALE) return;
-      if (!d || d.error) { dialog(name, { error: (d && d.error) || 'not found', sessionId: sid }); return; }
+      if (!d || d.error) { out({ error: (d && d.error) || 'not found' }); return; }
+      if (toMap) { out({ detail: d }); return; }
       if (kind === 'diff') {
         var ops = d.ops || [];
         var lastOp = ops.length ? ops[ops.length - 1] : null;
@@ -567,7 +579,7 @@ window.CR = window.CR || {};
         dialog(name, { text: d.narration || '(no narration recorded)', sessionId: sid });
       }
     }).catch(function () {
-      dialog(name, { error: 'couldn’t reach the server', sessionId: sid });
+      out({ error: 'couldn’t reach the server' });
     });
   });
 
@@ -1029,8 +1041,12 @@ window.CR = window.CR || {};
     EXT.push(function (d) {
       if (getUiMode() !== 'next' || !mounted) return;
       if (!d || d.error) return;
+      var tickSid = (typeof cur !== 'undefined' && cur) || (d.meta && d.meta.sessionId) || d.id;
       if (window.CR.detail && typeof window.CR.detail.update === 'function') {
-        try { window.CR.detail.update({ session: d, sid: d.id, refreshing: (typeof sessRefreshing !== 'undefined' && sessRefreshing), now: d.now, triage: computeTriage(d) }); } catch (e) { console.error('[CR] detail.update threw', e); }
+        try { window.CR.detail.update({ session: d, sid: tickSid, refreshing: (typeof sessRefreshing !== 'undefined' && sessRefreshing), now: d.now, triage: computeTriage(d) }); } catch (e) { console.error('[CR] detail.update threw', e); }
+      }
+      if (window.CR.dialogs && typeof window.CR.dialogs.update === 'function') {
+        try { window.CR.dialogs.update({ kind: 'session', sid: tickSid, session: d }); } catch (e) { console.error('[CR] dialogs.update threw', e); }
       }
     });
   }

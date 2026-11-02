@@ -355,6 +355,7 @@
     if (e.key !== 'Escape') return;
     var top = topEntry();
     if (!top) return;
+    if (typeof top.onEscape === 'function' && top.onEscape() === true) { e.preventDefault(); return; }
     e.preventDefault();
     close();
   }
@@ -461,7 +462,8 @@
     // update() below refuses to forward a poll-tagged payload to any dialog that
     // didn't opt in — see update()'s own comment for why this lives at the seam.
     var entry = { name: name, wrap: wrap, panel: built.panel, opener: opener, untrap: untrap, update: built.update, wantsPoll: !!built.wantsPoll,
-      sid: (payload && payload.sessionId) || '' };   // '' = session-less (flags, help, config...)
+      sid: (payload && payload.sessionId) || '',   // '' = session-less (flags, help, config...)
+      wantsSession: !!built.wantsSession, onEscape: built.onEscape };
     _stack.push(entry);
     // Focus the first focusable control, else the panel itself.
     var f = built.panel.querySelector(FOCUSABLE);
@@ -518,6 +520,7 @@
     var top = topEntry();
     if (!top || typeof top.update !== 'function') return;
     if (state && state.kind === 'poll' && !top.wantsPoll) return;
+    if (state && (state.kind === 'session' || state.kind === 'agent-detail') && !top.wantsSession) return;
     top.update(state);
   }
 
@@ -2472,6 +2475,387 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Agent map — the whole subagent tree of one session in one dialog. Server owns every
+  // label/state/threshold (model_label, state, ctx_tok, dur_s, parent); this only lays
+  // them out. The model/pane/fetch functions are pure (no DOM) so tests can run them in
+  // node. Hoisted function declarations on purpose: REGISTRY below is evaluated at load.
+  // ---------------------------------------------------------------------------
+
+  function amapFmtK(n) {
+    try {
+      var f = window.CR && window.CR.detail && window.CR.detail.fmt && window.CR.detail.fmt.k;
+      if (typeof f === 'function') return String(f(n));
+    } catch (e) {}
+    n = Number(n) || 0;
+    return n >= 1000 ? (Math.round(n / 100) / 10) + 'k' : String(n);
+  }
+
+  function amapFmtDur(sec) {
+    try {
+      var f = window.CR && window.CR.detail && window.CR.detail.fmt && window.CR.detail.fmt.durMs;
+      if (typeof f === 'function') return String(f(sec * 1000));
+    } catch (e) {}
+    sec = Math.max(0, Math.round(Number(sec) || 0));
+    return sec >= 60 ? Math.floor(sec / 60) + 'm ' + (sec % 60) + 's' : sec + 's';
+  }
+
+  function agentMapModel(session, opts) {
+    opts = opts || {};
+    session = session || {};
+    var meta = session.meta || {};
+    var rows = session.agents_bg || [];
+    var sess = session.agent_sessions || [];
+    var root = {
+      title: meta.title || meta.customTitle || meta.aiTitle || 'session',
+      model_label: meta.model_label || meta.model || '',
+      ctx: (session.context && session.context.current) || 0,
+    };
+    var counts = { total: rows.length, running: 0, byFamily: {} };
+    var byKey = {}, all = [];
+    rows.forEach(function (a, i) {
+      var n = { children: [], level: 0, dimmed: false };
+      for (var k in a) { if (Object.prototype.hasOwnProperty.call(a, k)) n[k] = a[k]; }
+      n.key = String(a.aid || a.id || ('#' + i));
+      all.push(n);
+      if (a.aid && !byKey[a.aid]) byKey[a.aid] = n;
+      if (a.id && !byKey[a.id]) byKey[a.id] = n;
+      if (a.state === 'running') counts.running++;
+      var fam = String(a.model_label || '').trim().split(/\s+/)[0].toLowerCase();
+      if (fam) counts.byFamily[fam] = (counts.byFamily[fam] || 0) + 1;
+    });
+    all.forEach(function (n) {
+      var p = n.parent ? byKey[n.parent] : null;
+      n.up = (p && p !== n) ? p : null;   // unknown parent (orphan) => root level
+    });
+    all.forEach(function (n) {           // cycle guard: a loop anywhere up the chain => root level
+      var seen = {}, c = n;
+      while (c) { if (seen[c.key]) { n.up = null; break; } seen[c.key] = 1; c = c.up; }
+    });
+    var hide = opts.hideFinished == null ? counts.running > 0 : !!opts.hideFinished;
+    var show = {}, forced = {};
+    function showUp(n) { for (var c = n; c && !show[c.key]; c = c.up) show[c.key] = true; }
+    [opts.focus, opts.selected].forEach(function (f) {
+      var n = f ? byKey[f] : null;
+      if (n) { for (var c = n; c; c = c.up) forced[c.key] = true; showUp(n); }
+    });
+    all.forEach(function (n) { if (n.state === 'running') showUp(n); });
+    var hidden = 0;
+    all.forEach(function (n) {
+      n.visible = !hide || !!show[n.key];
+      if (!n.visible) hidden++;
+      else n.dimmed = hide && n.state !== 'running' && !forced[n.key];
+    });
+    var roots = [];
+    all.forEach(function (n) {
+      if (!n.visible) return;
+      var p = n.up;
+      while (p && !p.visible) p = p.up;
+      if (p) p.children.push(n); else roots.push(n);
+    });
+    (function lvl(list, d) { list.forEach(function (n) { n.level = d; lvl(n.children, d + 1); }); })(roots, 0);
+    var visSessions = sess.filter(function (s) { return !hide || s.running; });
+    var hiddenAll = hidden + (sess.length - visSessions.length);
+    return {
+      root: root, nodes: roots, sessions: visSessions, counts: counts, hiddenCount: hiddenAll,
+      flags: {
+        hideFinished: hide,
+        hiding: hide && hiddenAll > 0,
+        emptyVisible: roots.length + visSessions.length === 0 && rows.length + sess.length > 0,
+        none: rows.length + sess.length === 0,
+      },
+    };
+  }
+
+  function agentMapSubtitle(m) {
+    var c = m.counts, parts = [c.total + ' agent' + (c.total === 1 ? '' : 's'), c.running + ' running'];
+    Object.keys(c.byFamily).sort(function (a, b) { return c.byFamily[b] - c.byFamily[a] || (a < b ? -1 : 1); })
+      .forEach(function (f) { parts.push(c.byFamily[f] + ' ' + f); });
+    parts.push('click an agent for details');
+    return parts.join(' · ');
+  }
+
+  function agentPaneModel(node, detail) {
+    node = node || {};
+    var facts = [];
+    if (node.model_label) facts.push(['Model', node.model_label]);
+    if (node.type) facts.push(['Type', node.type]);
+    if (node.state) facts.push(['State', node.state]);
+    if (node.dur_s != null) facts.push(['Duration', amapFmtDur(node.dur_s)]);
+    if (node.ctx_tok != null) facts.push(['Context', amapFmtK(node.ctx_tok) + ' tokens']);
+    if (node.tools != null) facts.push(['Tool calls', String(node.tools)]);
+    var tail = detail && typeof detail.tail === 'string' ? detail.tail : '';
+    if (tail.length > 2000) {
+      var s = tail.slice(-1990), i = s.indexOf('\n\n');
+      tail = '…\n' + (i >= 0 ? s.slice(i + 2) : s);
+    }
+    return {
+      title: node.desc || node.task || node.aid || 'agent',
+      facts: facts,
+      prompt: (detail && detail.task) || node.task || '',
+      lastOutput: tail,
+      error: detail && detail.error ? String(detail.error) : '',
+      loading: !detail,
+      actions: [{ id: 'transcript', label: 'Full transcript' }],
+    };
+  }
+
+  function amapFocusKey(el) {
+    if (!el || !el.getAttribute) return null;
+    var names = [['data-aid', 'aid'], ['data-sid', 'sid'], ['data-act', 'act']];
+    for (var i = 0; i < names.length; i++) {
+      var v = el.getAttribute(names[i][0]);
+      if (v != null) return names[i][1] + ':' + v;
+    }
+    return null;
+  }
+
+  function paneNeedsFetch(sel, node, cache, inflight, nowMs) {
+    if (!sel || !node) return false;
+    var f = inflight && inflight[sel];
+    if (f && nowMs - f.at < 10000) return false;
+    var c = cache && cache[sel];
+    if (!c) return true;
+    if (c.detail && c.detail.error) return nowMs - c.at >= 10000;
+    return c.ts !== node.ts && (node.state !== 'running' || nowMs - c.at >= 6000);
+  }
+
+  function renderAgentMap(payload) {
+    payload = payload || {};
+    var sid = payload.sessionId || '';
+    var session = payload.session || null;
+    var hideOverride = null;
+    var sel = null, paneOpen = false;
+    var cache = {}, inflight = {}, seqs = {};
+    var model = null, byAid = {}, paneKey = null;
+
+    var chrome = buildChrome('agent-map', 'Agent map', 'agent', '', true);
+    chrome.panel.classList.add('cr-dialog-map');
+    chrome.panel.setAttribute('tabindex', '-1');
+    var rootEl = h('div', { class: 'cr-amap-root' });
+    var treeEl = h('div', { class: 'cr-amap-tree' });
+    var paneEl = h('div', { class: 'cr-amap-pane', hidden: 'hidden' });
+    var grid = h('div', { class: 'cr-amap' }, [rootEl, treeEl, paneEl]);
+    chrome.body.appendChild(grid);
+
+    function chip(label) { return label ? h('span', { class: 'cr-amap-chip' }, [label]) : null; }
+
+    function focusNode(aid, scroll) {
+      var els = treeEl.querySelectorAll('[data-aid]');
+      for (var i = 0; i < els.length; i++) {
+        if (els[i].getAttribute('data-aid') === aid) {
+          els[i].focus({ preventScroll: true });
+          if (scroll && els[i].scrollIntoView) els[i].scrollIntoView({ block: 'nearest' });
+          return;
+        }
+      }
+    }
+
+    function focusByKey(host, key) {
+      if (!key) return;
+      var els = host.querySelectorAll('[data-aid],[data-sid],[data-act]');
+      for (var i = 0; i < els.length; i++) {
+        if (amapFocusKey(els[i]) === key) { els[i].focus({ preventScroll: true }); return; }
+      }
+      chrome.panel.focus({ preventScroll: true });
+    }
+
+    function activeKeyIn(host) {
+      var a = document.activeElement;
+      return a && host.contains(a) ? amapFocusKey(a) : null;
+    }
+
+    function paneKeyNow() {
+      var n = sel ? byAid[sel] : null, c = sel ? cache[sel] : null;
+      return sel ? [sel, c ? c.seq : 0, n ? n.ts : '', n ? n.state : ''].join('|') : '';
+    }
+
+    function selectNode(aid) {
+      sel = aid; paneOpen = true;
+      paintMap(); paintPane(); maybeFetch(); focusNode(aid, true);
+    }
+
+    function nodeEl(n) {
+      var run = n.state === 'running';
+      var key = n.aid || n.key;
+      var meta = [];
+      if (n.dur_s != null) meta.push(amapFmtDur(n.dur_s));
+      if (n.ctx_tok != null) meta.push(amapFmtK(n.ctx_tok) + ' tokens');
+      var btn = h('button', {
+        class: 'cr-amap-btn' + (sel === key ? ' is-sel' : ''), type: 'button', 'data-aid': key,
+        onclick: function () { selectNode(key); },
+      }, [
+        h('span', { class: 'cr-amap-dot ' + (run ? 'is-running' : 'is-done'), 'aria-hidden': 'true' }),
+        h('span', { class: 'cr-amap-desc' }, [n.desc || n.task || key]),
+        chip(n.model_label),
+        h('span', { class: 'cr-amap-meta cr-mono' }, [meta.join(' · ')]),
+      ]);
+      var li = h('li', { class: 'cr-amap-node' + (n.dimmed ? ' is-dimmed' : '') + (run ? ' is-running' : ''), style: '--amap-depth:' + n.level }, [btn]);
+      if (n.children.length) li.appendChild(h('ul', { class: 'cr-amap-list' }, n.children.map(nodeEl)));
+      return li;
+    }
+
+    function paintMap() {
+      model = agentMapModel(session, { hideFinished: hideOverride, focus: payload.focus, selected: sel });
+      byAid = {};
+      (function idx(list) { list.forEach(function (n) { byAid[n.aid || n.key] = n; idx(n.children); }); })(model.nodes);
+      var prevFocus = activeKeyIn(treeEl);
+      var scroll = treeEl.scrollTop;
+      chrome.panel.querySelector('.cr-dialog-context').textContent = session ? agentMapSubtitle(model) : '';
+      rootEl.innerHTML = ''; treeEl.innerHTML = '';
+      if (!session) {
+        treeEl.appendChild(emptyState({ title: 'Loading agents…', body: 'Waiting for the first session update.' }));
+        return;
+      }
+      rootEl.appendChild(h('div', { class: 'cr-amap-rootcard', onclick: function () { if (sel) closePane(); } }, [
+        h('div', { class: 'cr-amap-roottitle' }, [model.root.title]),
+        h('div', { class: 'cr-amap-rootmeta cr-mono' }, [
+          [model.root.model_label, model.root.ctx ? amapFmtK(model.root.ctx) + ' tokens in context' : ''].filter(Boolean).join(' · '),
+        ]),
+      ]));
+      var f = model.flags;
+      if (f.none) {
+        var src = session.meta && (session.meta.source || session.meta.entrypoint);
+        var note = providerNoteFor(src);
+        treeEl.appendChild(note && note.name === 'Auggie' && note.degraded
+          ? degraded({ panelLabel: 'AGENT MAP', providerLabel: note.name, message: note.degraded,
+              readable: 'What IS readable is shown in full: todos, files, and commands for this session.',
+              footer: 'Empty because it cannot exist, not because something broke.' })
+          : emptyState({ title: 'No subagents in this session', body: "If this provider doesn't record subagents, none will appear here." }));
+        return;
+      }
+      treeEl.appendChild(h('div', { class: 'cr-amap-bar' }, [
+        h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', 'data-act': 'toggle-finished', 'aria-pressed': f.hideFinished ? 'true' : 'false',
+          onclick: function () { hideOverride = !model.flags.hideFinished; paintMap(); } },
+          [f.hideFinished ? 'Show finished' : 'Hide finished']),
+      ]));
+      if (f.emptyVisible) {
+        treeEl.appendChild(h('div', { class: 'cr-amap-empty' }, [
+          'No agents running · ' + model.hiddenCount + ' finished hidden · ',
+          h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', 'data-act': 'show-finished', onclick: function () { hideOverride = false; paintMap(); } }, ['Show finished']),
+        ]));
+      } else if (f.hiding) {
+        treeEl.appendChild(h('div', { class: 'cr-amap-hint' }, [model.hiddenCount + ' finished hidden']));
+      }
+      if (model.nodes.length) treeEl.appendChild(h('ul', { class: 'cr-amap-list cr-amap-top' }, model.nodes.map(nodeEl)));
+      if (model.sessions.length) {
+        treeEl.appendChild(h('div', { class: 'cr-amap-grouphead' }, ['Agent sessions']));
+        treeEl.appendChild(h('ul', { class: 'cr-amap-list cr-amap-top' }, model.sessions.map(function (s) {
+          return h('li', { class: 'cr-amap-node' }, [h('button', {
+            class: 'cr-amap-btn', type: 'button', 'data-sid': s.id,
+            onclick: function () { if (typeof payload.onOpenSession === 'function') payload.onOpenSession(s.id); close(); },
+          }, [
+            h('span', { class: 'cr-amap-dot ' + (s.running ? 'is-running' : 'is-done'), 'aria-hidden': 'true' }),
+            h('span', { class: 'cr-amap-desc' }, [s.title || s.id]),
+            s.runs > 1 ? h('span', { class: 'cr-amap-meta cr-mono' }, ['×' + s.runs]) : null,
+            chip(s.model_label),
+          ])]);
+        })));
+      }
+      treeEl.scrollTop = scroll;
+      focusByKey(treeEl, prevFocus);
+    }
+
+    function paintPane() {
+      paneKey = paneKeyNow();
+      var node = sel ? byAid[sel] : null;
+      var prevFocus = activeKeyIn(paneEl);
+      var paneTop = paneEl.scrollTop, textTops = [];
+      Array.prototype.forEach.call(paneEl.querySelectorAll('.cr-amap-text'), function (t) { textTops.push(t.scrollTop); });
+      paneEl.innerHTML = '';
+      paintPaneBody(node);
+      paneEl.scrollTop = paneTop;
+      Array.prototype.forEach.call(paneEl.querySelectorAll('.cr-amap-text'), function (t, i) { if (textTops[i] != null) t.scrollTop = textTops[i]; });
+      focusByKey(paneEl, prevFocus);
+    }
+
+    function paintPaneBody(node) {
+      if (!paneOpen || !sel) { paneEl.setAttribute('hidden', 'hidden'); grid.classList.remove('has-pane'); return; }
+      paneEl.removeAttribute('hidden'); grid.classList.add('has-pane');
+      if (!node) { paneEl.appendChild(emptyState({ title: 'Agent not shown', body: 'It is hidden by the current filter.' })); return; }
+      var c = cache[sel];
+      var pm = agentPaneModel(node, c && c.detail);
+      paneEl.appendChild(h('div', { class: 'cr-amap-panehead' }, [
+        h('strong', {}, [pm.title]),
+        h('button', { class: 'cr-btn cr-btn-quiet', type: 'button', 'aria-label': 'Close details', 'data-act': 'pane-close', onclick: closePane }, ['Close']),
+      ]));
+      paneEl.appendChild(h('dl', { class: 'cr-amap-facts' }, pm.facts.reduce(function (acc, kv) {
+        acc.push(h('dt', {}, [kv[0]])); acc.push(h('dd', {}, [kv[1]])); return acc;
+      }, [])));
+      if (pm.prompt) {
+        paneEl.appendChild(h('div', { class: 'cr-amap-label' }, ['Prompt']));
+        paneEl.appendChild(h('pre', { class: 'cr-outputtext cr-amap-text' }, [pm.prompt]));
+      }
+      paneEl.appendChild(h('div', { class: 'cr-amap-label' }, ['Last output']));
+      paneEl.appendChild(pm.error ? h('div', { class: 'cr-amap-hint', role: 'alert' }, ["Couldn't load: " + pm.error])
+        : pm.loading ? h('div', { class: 'cr-amap-hint' }, ['Loading…'])
+        : h('pre', { class: 'cr-outputtext cr-amap-text' }, [pm.lastOutput || '(no output yet)']));
+      pm.actions.forEach(function (act) {
+        paneEl.appendChild(h('button', { class: 'cr-btn', type: 'button', 'data-act': act.id, onclick: function () {
+          open('agent-transcript', { sessionId: sid, agentId: sel });
+        } }, [act.label]));
+      });
+    }
+
+    function closePane() {
+      var was = sel;
+      paneOpen = false; sel = null;
+      paintMap(); paintPane();
+      if (was) focusNode(was, true);
+    }
+
+    function maybeFetch() {
+      var node = sel ? byAid[sel] : null;
+      var t = Date.now();
+      if (!node || !paneNeedsFetch(sel, node, cache, inflight, t)) return;
+      seqs[sel] = (seqs[sel] || 0) + 1;
+      inflight[sel] = { at: t, seq: seqs[sel], ts: node.ts };
+      if (_ctx && typeof _ctx.emit === 'function') {
+        _ctx.emit('cr:drill-request', { kind: 'agent', sessionId: sid, arg: sel, reply: 'agent-map', seq: seqs[sel] });
+      }
+    }
+
+    function applySession(state) {
+      state = state || {};
+      if (state.kind === 'agent-detail') {
+        if (state.sid !== sid) return;
+        var aid = state.aid;
+        var f = inflight[aid];
+        var reqTs = (f && f.seq === state.seq) ? f.ts : null;
+        delete inflight[aid];
+        var prev = cache[aid];
+        if (!prev || (state.seq || 0) > prev.seq) {
+          if (state.error) cache[aid] = { ts: reqTs, at: Date.now(), seq: state.seq || 0, detail: { error: String(state.error) } };
+          else if (state.detail) cache[aid] = { ts: reqTs, at: Date.now(), seq: state.seq || 0, detail: state.detail };
+        }
+        if (aid === sel) paintPane();
+        return;
+      }
+      var incoming = state.session;
+      var incomingSid = state.kind === 'session' ? state.sid : state.sessionId;
+      if (incoming && incomingSid && incomingSid !== sid) { close(); return; }
+      if (incoming) session = incoming;
+      paintMap();
+      if (state.focus) {
+        var fa = state.focus;
+        payload.focus = fa;
+        setTimeout(function () { selectNode(fa); }, 0);
+        return;
+      }
+      if (paneKeyNow() !== paneKey) paintPane();
+      maybeFetch();
+    }
+
+    function onEscape() {
+      if (!paneOpen) return false;
+      closePane();
+      return true;
+    }
+
+    applySession({ kind: 'session', sid: sid, session: session, focus: payload.focus });
+    return { backdrop: chrome.backdrop, panel: chrome.panel, update: applySession, wantsSession: true, onEscape: onEscape };
+  }
+
+  // ---------------------------------------------------------------------------
   // registry + public API
   // ---------------------------------------------------------------------------
 
@@ -2493,6 +2877,7 @@
     diff: renderDiffPopout,       // generic rich pop-out for a caller that already holds full content
     'run-output': renderRunOutput, // live "Run a command" pane (doc 04 #54) — see REQUIRED ADDITION above
     'narration-diagram': renderNarrationDiagram,
+    'agent-map': renderAgentMap,
   };
 
   window.CR.dialogs = {

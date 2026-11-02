@@ -793,7 +793,7 @@
     });
     (session.agents || []).forEach(function (a, i) {
       var t = parseT(a.t);
-      out.push({ kind: "tool", t: t == null ? 0 : t, verb: "Task",
+      out.push({ kind: "tool", t: t == null ? 0 : t, verb: a.tool || "Task",
         target: (a.desc || a.type || "background agent"), count: "", agent: true, key: "ag" + i });
     });
     // FIX (defect 1): newest-first, matching the rest of the app — the server's own
@@ -1370,6 +1370,10 @@
             // exactly like 'cr:rename'/'cr:flag-create'/'cr:note-push' already are
             // (this file's own contract rule 5: no fetch() calls here).
             '<button class="crd-pin" data-act="toggle-pin" type="button" aria-pressed="false"><span class="crd-ico"></span><span class="crd-btn-label"></span></button>' +
+          "</div>" +
+          // Agent map entry point: always shown, right under the session name.
+          '<div class="crd-id-row3">' +
+            '<button type="button" class="crd-mapbtn" data-act="agent-map" aria-label="Open agent map"><span class="crd-ico"></span><span class="crd-mapbtn-label">Open agent map</span><span class="crd-mapbtn-count mono"></span></button>' +
           "</div>" +
           // Doc 03 row 2's "goal" text (the session's last request, overview.py's
           // `goal`) -- demoted to its own line below the name (see TASK 1 FIX in
@@ -1995,6 +1999,20 @@
         case "command-row":
           ctx.dialog("command-output", { sessionId: sid, cmdId: t.getAttribute("data-id") });
           break;
+        case "agent-map":
+          ctx.dialog("agent-map", {
+            sessionId: sid || ui.sid, session: ui.lastSession,
+            focus: t.getAttribute("data-focus") || "",
+            onOpenSession: function (id) { ctx.go("detail", id); }
+          });
+          break;
+        case "agent-session-open":
+          ctx.go("detail", t.getAttribute("data-id"));
+          break;
+        case "agent-sessions-show-finished":
+          ui.agentSessionsShowFinished = !ui.agentSessionsShowFinished;
+          renderAgentsPanel(ui.panels.agents, ctx, ui, ui.lastSession);
+          break;
         case "agents-show-finished":
           ui.agentsShowFinished = !ui.agentsShowFinished;
           renderAgentsPanel(ui.panels.agents, ctx, ui, ui.lastSession);
@@ -2087,6 +2105,7 @@
     document.addEventListener("keydown", function (e) {
       if (!root.isConnected || !isDetailActive(root)) return;
       if (isTypingTarget(e)) return;
+      if (document.querySelector('.cr-dialog-layer[aria-hidden="false"]')) return; // a dialog (agent map) owns the keys
       if (e.key === "j") { e.preventDefault(); stepSession(ctx, ui, 1); }
       else if (e.key === "k") { e.preventDefault(); stepSession(ctx, ui, -1); }
     });
@@ -2173,6 +2192,7 @@
   var singleton = new Detail();
 
   window.CR.detail = {
+    fmt: { k: fmtK, durMs: fmtDurMs },
     mount: function (root, ctx) {
       this._root = root;
       this._ctx = ctx;
@@ -2424,6 +2444,13 @@
     }
     paintTitleNote(node, session);
     qs(node, ".crd-rename .crd-ico").innerHTML = svgIcon(ctx, "edit");
+    var mapIco = qs(node, ".crd-mapbtn .crd-ico");
+    if (mapIco) mapIco.innerHTML = svgIcon(ctx, "agent");
+    var mapCount = qs(node, ".crd-mapbtn-count");
+    if (mapCount) {
+      var mapN = (session.agents_bg || []).length + (session.agent_sessions || []).length;
+      mapCount.textContent = mapN ? " · " + mapN : "";
+    }
 
     // FIX (drift A10): session.pinned used to be present only on the board-list dict
     // (registry.py:70), never on parse_any()'s per-session detail — the shared seam now
@@ -2918,7 +2945,7 @@
     var finishedGroups = grouped.filter(function (g) { return !g.running; });
     var runningShells = Array.isArray(shells) ? shells.filter(function (s) { return s && s.running; }) : [];
     var finishedShells = Array.isArray(shells) ? shells.filter(function (s) { return s && !s.running; }) : [];
-    setPanelCount(wrap, (agentsBg.length + (Array.isArray(shells) ? shells.length : 0)) || "—");
+    setPanelCount(wrap, (agentsBg.length + (Array.isArray(shells) ? shells.length : 0) + (Array.isArray(session.agent_sessions) ? session.agent_sessions.length : 0)) || "—");
 
     function agentRow(g) {
       var a = g.latest;
@@ -2940,7 +2967,8 @@
       var titleHtml = a.task ? mdHtmlSafe(a.task) : esc(a.aid || "background agent");
       return '<div class="crd-agent-row-item"><span class="crd-state-dot ' + (g.running ? "is-working" : "is-done") +
         '"></span><span class="crd-agent-title">' + titleHtml + "</span>" +
-        tag + modelTag + '<button class="crd-open-link" data-act="agent-open" data-id="' + esc(a.aid) + '">open ›</button></div>'; // "opening the latest"
+        tag + modelTag + '<button type="button" class="crd-open-link" data-act="agent-map" data-focus="' + esc(a.aid) + '">map</button>' +
+        '<button class="crd-open-link" data-act="agent-open" data-id="' + esc(a.aid) + '">open ›</button></div>'; // "opening the latest"
     }
     function shellRow(s) {
       var label = (s && (s.cmd || s.id)) || "shell";
@@ -2960,6 +2988,26 @@
         html += '<button class="crd-show-finished" data-act="agents-show-finished">Show ' + finishedList.length + " finished</button>";
       }
     }
+    // Sessions group (agent_sessions): sessions the agents spawned; running first,
+    // finished behind a disclosure like the agents above.
+    var aSess = Array.isArray(session.agent_sessions) ? session.agent_sessions : [];
+    if (aSess.length) {
+      var sessRow = function (x) {
+        var runsTag = x.runs > 1 ? '<span class="crd-agent-wf mono">×' + x.runs + "</span>" : "";
+        var mTag = x.model_label ? '<span class="crd-agent-model mono">' + esc(x.model_label) + "</span>" : "";
+        return '<div class="crd-agent-row-item"><span class="crd-state-dot ' + (x.running ? "is-working" : "is-done") +
+          '"></span><span class="crd-agent-title">' + esc(x.title || x.wt || x.id) + "</span>" + runsTag + mTag +
+          '<button type="button" class="crd-open-link" data-act="agent-session-open" data-id="' + esc(x.id) + '">open ›</button></div>';
+      };
+      var sRun = aSess.filter(function (x) { return x && x.running; });
+      var sDone = aSess.filter(function (x) { return x && !x.running; });
+      var sHtml = '<div class="crd-agent-sessions-head">Sessions</div>' + sRun.map(sessRow).join("");
+      if (sDone.length) {
+        sHtml += ui.agentSessionsShowFinished ? sDone.map(sessRow).join("") :
+          '<button class="crd-show-finished" data-act="agent-sessions-show-finished">Show ' + sDone.length + " finished sessions</button>";
+      }
+      html += sHtml;
+    }
     if (!html) {
       // FIX 5: Auggie's PROVIDER_NOTES.degraded IS about this panel specifically
       // ("No background-work model — capability 48 shows empty-because-it-cannot-
@@ -2976,6 +3024,7 @@
         }, note.degraded) :
         emptyHtml("No agents or shells this session", "Background work will show up here once it starts.");
     }
+    if (agentsBg.length || aSess.length) html = '<button type="button" class="crd-open-link crd-map-link" data-act="agent-map">View in agent map ›</button>' + html;
     setPanelBody(wrap, html);
   }
 

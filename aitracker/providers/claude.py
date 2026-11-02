@@ -1,7 +1,7 @@
-import glob, json, os, re, time
+import glob, json, os, re, threading, time
 from ..config import EDIT_TOOLS, LIVE_WINDOW, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, pr_summary, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase, real_model
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, pr_summary, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase, real_model, model_label
 from ..overview import build_overview, build_heartbeat
 from ..store import load_titles, load_tasks, load_notes, _TSTATUS
 from .base import Provider
@@ -541,12 +541,14 @@ def child_agent_sessions(sid, projdir):
         g = groups.get(key)
         if g is None:
             groups[key] = {"id": fid, "title": titles.get(fid) or sm["title"], "wt": _worktree_name(sm["cwd"]),
-                           "running": running, "mtime": mt, "runs": 1}
+                           "running": running, "mtime": mt, "runs": 1,
+                           "model": sm.get("model") or "", "model_label": model_label(sm.get("model") or "")}
         else:
             g["runs"] += 1
             g["running"] = g["running"] or running
             if mt >= g["mtime"]:                       # newest run represents the group
                 g["mtime"] = mt; g["id"] = fid; g["title"] = titles.get(fid) or sm["title"]
+                g["model"] = sm.get("model") or ""; g["model_label"] = model_label(g["model"])
     out = sorted(groups.values(), key=lambda r: r["mtime"], reverse=True)
     return out
 
@@ -639,7 +641,7 @@ def list_sessions(limit=200):
             cands = humans_by_dir.get(os.path.dirname(f))   # a repo-root orchestrator's file lives here too
             if cands:
                 parent = _pick_parent(sm["first"], cands)
-        mt, bg = _mtime_and_bg(f)
+        mt, bg, agent_files_n = _mtime_bg_n(f)
         # Only a session both ENDED and still inside LIVE_WINDOW can ever render as a Landed
         # tile (ext_cr_board.js's sessionState()) — an idle session's PR data would never be
         # shown, so it's left pending indefinitely rather than spending a scan on it. Bounded
@@ -714,6 +716,9 @@ def list_sessions(limit=200):
             "group": gkey, "groupLabel": glabel,     # fallback bucket (repo/sandbox) for orphan agents
             "parentId": parent,                      # the originating session it nests under; "" -> bucket
             "bg": bg,                                # in-transcript background agents live now -> 🤖 sidebar badge
+            # ALL in-transcript agent files (live or not) -> the agent-map entry on board/rail. Distinct
+            # from the heartbeat's `agents_n`; SDK-only child sessions have no agent files, so no button.
+            "agent_files_n": agent_files_n,
             "shells_running": shells_running,        # background shell(s) still going -> same treatment as bg
             "waiting": sm["waiting"] or job_waiting,  # unanswered AskUserQuestion / blocked job -> ⏳ sidebar highlight
             "ended": sm["ended"],                    # last turn was the assistant finishing -> ✅ completed
@@ -897,21 +902,37 @@ def _active_mtime(path):
     return m
 
 
-def _mtime_and_bg(path):
-    """(_active_mtime, # background-agent files live right now). One glob+stat pass so the
-    sidebar can badge a session with running in-transcript agents — those spawn no separate
-    agent session, so parentId nesting never surfaces them."""
+def _mtime_bg_n(path):
+    """(_active_mtime, # background-agent files live right now, # agent files in all). One
+    glob+stat pass so the sidebar can badge a session with running in-transcript agents — those
+    spawn no separate agent session, so parentId nesting never surfaces them — and the board/rail
+    can offer the agent map when there is anything to map."""
     m = os.path.getmtime(path) if os.path.exists(path) else 0.0
-    now, bg = time.time(), 0
+    now, bg, n = time.time(), 0, 0
     for af in _agent_files(path):
         try:
             amt = os.path.getmtime(af)
         except OSError:
             continue
+        n += 1
         m = max(m, amt)
         if now - amt < LIVE_WINDOW:
             bg += 1
+    return m, bg, n
+
+
+def _mtime_and_bg(path):
+    """(_active_mtime, # background-agent files live right now) -- the 2-tuple view of _mtime_bg_n."""
+    m, bg, _n = _mtime_bg_n(path)
     return m, bg
+
+
+def _ctx_occupancy(u):
+    """Context a turn carries: input + cache-creation + cache-read off one usage block (each
+    `or 0` -- a null is not a number). The ONE definition, shared by the root session's
+    context.current and each agent's ctx_tok so the two can't drift."""
+    return ((u.get("input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0)
+            + (u.get("cache_read_input_tokens") or 0))
 
 
 def _hb_usage(u):
@@ -949,111 +970,268 @@ def _hb_agent_line(hb, aid, o, m, c, seen_mid, use_t):
                     hb["iv"].setdefault(nm, []).append((e0, ep))
 
 
-def parse_agents(path, hb=None):
-    """Parse background-agent transcripts: what each one is, doing, and whether it's live.
-    Also harvests PRs the agents generated (a `gh pr create`/MCP in a subagent) + their state,
-    so a PR opened by a background agent is attributed to the session — not lost with the subagent.
-    `hb` (optional out-param, a dict with turns/calls/iv/labels) is filled for the heartbeat in
-    the SAME pass — no extra file read; the return value is unchanged."""
-    out = []
-    agent_files = {}      # path -> file entry : edits made by background agents (worktrees etc.)
-    agent_prs = {}        # url -> entry : PRs an agent created/worked (merged into the session's prs)
-    agent_pr_states = {}  # num -> state : merge/close signals seen in agent transcripts
-    newest = 0.0
-    now = time.time()
-    for af in sorted(_agent_files(path)):
-        try:
-            mt = os.path.getmtime(af)
-        except OSError:
-            continue
-        newest = max(newest, mt)
-        task = last_text = ""
-        model = ""    # this agent's own current model -- may differ from its parent's (own separate transcript)
-        last_ts = None
-        tools = 0
-        pr_ids = set()    # tool_use_ids of `gh pr create`/MCP-create in THIS agent → its result URL = created
-        aid = os.path.basename(af)[6:-6]
-        seen_mid, use_t = set(), {}       # heartbeat: per-file usage dedup + tool_use id -> (name, epoch)
-        try:
-            with open(af, encoding="utf-8") as fh:
-                for line in fh:
-                    try:
-                        o = json.loads(line)
-                    except ValueError:
-                        continue
-                    if o.get("timestamp"):
-                        last_ts = o["timestamp"]
-                    m = o.get("message")
-                    if not isinstance(m, dict):
-                        continue
-                    mv = real_model(m.get("model"))   # same "latest wins, skip the synthetic sentinel" rule as _tail_scan
-                    if mv:
-                        model = mv
-                    c = m.get("content")
-                    if hb is not None:
-                        _hb_agent_line(hb, aid, o, m, c, seen_mid, use_t)
-                    if not task and m.get("role") == "user" and isinstance(c, str):
-                        s = " ".join(c.split())
-                        if s and not s.startswith("<"):
-                            task = s[:160]
-                    if isinstance(c, list):
-                        for b in c:
-                            if not isinstance(b, dict):
-                                continue
-                            if b.get("type") == "tool_use":
-                                tools += 1
-                                nm = b.get("name")
-                                if nm == "Write" or nm in EDIT_TOOLS:   # agents write files too
-                                    finp = b.get("input") or {}
-                                    fp = finp.get("file_path") or finp.get("notebook_path")
-                                    if fp and isinstance(fp, str):
-                                        fe = agent_files.setdefault(
-                                            fp, {"path": fp, "ops": 0, "created": False, "agent": True})
-                                        fe["ops"] += 1
-                                        if last_ts:
-                                            fe["last"] = last_ts
-                                        if nm == "Write":
-                                            fe["created"] = True
-                                elif nm == "Bash":                      # agents open PRs too
-                                    ac = (b.get("input") or {}).get("command", "")
-                                    if PR_CREATE_RE.search(ac):
-                                        pr_ids.add(b.get("id"))
-                                    collect_prs(agent_prs, ac, last_ts)
-                                    note_pr_states(agent_pr_states, ac)
-                                elif nm and "create_pull_request" in nm:   # GitHub MCP create in a subagent
+_AGENT_CACHE = {}              # agent-file path -> (key, entry); entries are treated as FROZEN
+_AGENT_CACHE_LOCK = threading.Lock()   # ThreadingHTTPServer: guards get/set/evict ONLY, never a parse
+_AGENT_CACHE_MAX = 2000
+
+
+def _agent_cache_on():
+    """Late-bound kill-switch: AITRACKER_NO_AGENT_CACHE=1 re-parses every agent file every call."""
+    return not os.environ.get("AITRACKER_NO_AGENT_CACHE")
+
+
+def _agent_file_pass(af, mt):
+    """One agent transcript -> a self-contained entry holding ONLY that file's data (never
+    anything cross-file or time-derived), so it can be cached by (mtime, size, sidecar mtime)
+    and merged later. Heartbeat parts are ALWAYS collected (a caller with no `hb` still warms
+    the cache for the one that has it). Returns None if the file can't be read."""
+    task = last_text = ""
+    model = ""    # this agent's own current model -- may differ from its parent's (own separate transcript)
+    last_ts = None
+    tools = 0
+    pr_ids = set()    # tool_use_ids of `gh pr create`/MCP-create in THIS agent → its result URL = created
+    aid = os.path.basename(af)[6:-6]
+    seen_mid, use_t = set(), {}       # heartbeat: per-file usage dedup + tool_use id -> (name, epoch)
+    hbl = {"turns": [], "calls": [], "iv": {}, "labels": {}}
+    files, prs, pst, spawned = {}, {}, {}, {}
+    segs, seg_start, last_msg_ep = [], None, 0.0
+    first_ts = stop_ts = None
+    n_stop, stop_after, ctx_tok = 0, False, None
+    try:
+        with open(af, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                if o.get("timestamp"):
+                    last_ts = o["timestamp"]
+                att = o.get("attachment")
+                if isinstance(att, dict) and att.get("hookEvent") == "SubagentStop":
+                    # the user's own hook rows: no `message` key, timestamps can be out of order, so
+                    # "ended" is FILE ORDER (a stop group after the last message), never a time compare.
+                    n_stop += 1
+                    stop_after = True
+                    stop_ts = o.get("timestamp") or last_ts
+                    if seg_start is not None:
+                        segs.append((seg_start, max(_ts_epoch(stop_ts) or last_msg_ep, seg_start)))
+                        seg_start = None
+                    continue
+                m = o.get("message")
+                if not isinstance(m, dict):
+                    continue
+                stop_after = False
+                mts = o.get("timestamp")
+                if mts and first_ts is None:
+                    first_ts = mts
+                ep = _ts_epoch(mts) if mts else 0.0
+                if ep > 0:
+                    last_msg_ep = ep
+                    if seg_start is None:
+                        seg_start = ep
+                if m.get("usage"):
+                    ctx_tok = _ctx_occupancy(m["usage"])
+                mv = real_model(m.get("model"))   # same "latest wins, skip the synthetic sentinel" rule as _tail_scan
+                if mv:
+                    model = mv
+                c = m.get("content")
+                _hb_agent_line(hbl, aid, o, m, c, seen_mid, use_t)
+                if not task and m.get("role") == "user" and isinstance(c, str):
+                    s = " ".join(c.split())
+                    if s and not s.startswith("<"):
+                        task = s[:160]
+                if isinstance(c, list):
+                    for b in c:
+                        if not isinstance(b, dict):
+                            continue
+                        if b.get("type") == "tool_use":
+                            tools += 1
+                            nm = b.get("name")
+                            if nm in ("Agent", "Task") and b.get("id"):
+                                spawned[b["id"]] = aid        # a child's sidecar toolUseId points here
+                            if nm == "Write" or nm in EDIT_TOOLS:   # agents write files too
+                                finp = b.get("input") or {}
+                                fp = finp.get("file_path") or finp.get("notebook_path")
+                                if fp and isinstance(fp, str):
+                                    fe = files.setdefault(
+                                        fp, {"path": fp, "ops": 0, "created": False, "agent": True})
+                                    fe["ops"] += 1
+                                    if last_ts:
+                                        fe["last"] = last_ts
+                                    if nm == "Write":
+                                        fe["created"] = True
+                            elif nm == "Bash":                      # agents open PRs too
+                                ac = (b.get("input") or {}).get("command", "")
+                                if PR_CREATE_RE.search(ac):
                                     pr_ids.add(b.get("id"))
-                                elif nm and "merge_pull_request" in nm:
-                                    pn = (b.get("input") or {}).get("pullNumber") or (b.get("input") or {}).get("pull_number")
-                                    if pn:
-                                        agent_pr_states[str(pn)] = "merged"
-                            elif b.get("type") == "tool_result":         # a `gh pr create` result carries the new URL
-                                cc = b.get("content")
-                                rtext = cc if isinstance(cc, str) else (json.dumps(cc) if cc else "")
-                                collect_prs(agent_prs, rtext, last_ts, b.get("tool_use_id") in pr_ids)
-                                note_pr_states(agent_pr_states, rtext)
-                            elif b.get("type") == "text" and b.get("text", "").strip():
-                                t = b["text"].strip()
-                                if not t.startswith("<"):
-                                    last_text = t
-        except OSError:
-            continue
-        wf = next((p for p in af.split(os.sep) if p.startswith("wf_")), "")
-        if hb is not None:
-            hb["labels"][aid] = (" ".join(task.split())[:60] or "agent " + aid[:7], model)
-        out.append({
-            "id": os.path.basename(af)[6:-6][:10],  # strip "agent-" / ".jsonl"
-            "aid": os.path.basename(af)[6:-6],       # full id, for the detail endpoint
+                                collect_prs(prs, ac, last_ts)
+                                note_pr_states(pst, ac)
+                            elif nm and "create_pull_request" in nm:   # GitHub MCP create in a subagent
+                                pr_ids.add(b.get("id"))
+                            elif nm and "merge_pull_request" in nm:
+                                pn = (b.get("input") or {}).get("pullNumber") or (b.get("input") or {}).get("pull_number")
+                                if pn:
+                                    pst[str(pn)] = "merged"
+                        elif b.get("type") == "tool_result":         # a `gh pr create` result carries the new URL
+                            cc = b.get("content")
+                            rtext = cc if isinstance(cc, str) else (json.dumps(cc) if cc else "")
+                            collect_prs(prs, rtext, last_ts, b.get("tool_use_id") in pr_ids)
+                            note_pr_states(pst, rtext)
+                        elif b.get("type") == "text" and b.get("text", "").strip():
+                            t = b["text"].strip()
+                            if not t.startswith("<"):
+                                last_text = t
+    except OSError:
+        return None
+    try:
+        with open(af[:-6] + ".meta.json", encoding="utf-8") as fh:
+            sc = json.load(fh)
+    except (OSError, ValueError):
+        sc = {}
+    if not isinstance(sc, dict):
+        sc = {}
+    s_str = lambda k: sc.get(k) if isinstance(sc.get(k), str) else ""
+    wf = next((p for p in af.split(os.sep) if p.startswith("wf_")), "")
+    hbl["labels"][aid] = (" ".join(task.split())[:60] or "agent " + aid[:7], model)
+    sd = sc.get("spawnDepth")
+    return {
+        "mt": mt, "aid": aid, "hb": hbl, "files": files, "prs": prs, "pst": pst, "spawned": spawned,
+        "segs": segs, "open_start": seg_start, "last_msg_ep": last_msg_ep,
+        "n_stop": n_stop, "stop_after": stop_after, "stop_ts": stop_ts, "last_ts": last_ts,
+        "finished": sc.get("finished") is True, "tuid": s_str("toolUseId"),
+        "sdepth": sd if isinstance(sd, int) and not isinstance(sd, bool) and sd > 0 else 0,
+        "row": {
+            "id": aid[:10],      # short id (aid is the full id, for the detail endpoint)
+            "aid": aid,
             "wf": wf,
             "task": task,
             "last": _first_line(last_text) if last_text else "",
             "ts": last_ts,
             "tools": tools,
-            "running": (now - mt) < LIVE_WINDOW,
             # this agent's OWN current model -- its own separate transcript, so it can (and
             # does, in the wild) differ from its parent session's model. "" if this agent's
             # transcript has no assistant turn with a real model id yet.
             "model": model,
-        })
+            "desc": s_str("description") or task[:80],
+            "type": s_str("agentType"),
+            "model_req": s_str("model"),       # the alias the parent asked for (sidecar), e.g. "opus"
+            "model_label": model_label(model or s_str("model")),
+            "ctx_tok": ctx_tok,
+            "started": first_ts,
+        },
+    }
+
+
+def _agent_entry(af):
+    """(entry|None) for one agent file, from the cache when (mtime_ns, size, sidecar mtime_ns) match."""
+    try:
+        st = os.stat(af)
+    except OSError:
+        return None
+    try:
+        sst = os.stat(af[:-6] + ".meta.json")
+        sk = (sst.st_mtime_ns, sst.st_size)
+    except OSError:
+        sk = (0, 0)
+    key = (st.st_mtime_ns, st.st_size, sk)
+    use = _agent_cache_on()
+    if use:
+        with _AGENT_CACHE_LOCK:
+            hit = _AGENT_CACHE.get(af)
+        if hit and hit[0] == key:
+            return hit[1]
+    e = _agent_file_pass(af, st.st_mtime)
+    if e is not None and use:
+        with _AGENT_CACHE_LOCK:
+            _AGENT_CACHE.pop(af, None)               # re-insert at the NEWEST position
+            _AGENT_CACHE[af] = (key, e)
+            if len(_AGENT_CACHE) > _AGENT_CACHE_MAX:
+                for k in list(_AGENT_CACHE)[:len(_AGENT_CACHE) // 2]:   # oldest half, off a snapshot
+                    _AGENT_CACHE.pop(k, None)
+    return e
+
+
+def parse_agents(path, hb=None):
+    """Parse background-agent transcripts: what each one is, doing, and whether it's live.
+    Also harvests PRs the agents generated (a `gh pr create`/MCP in a subagent) + their state,
+    so a PR opened by a background agent is attributed to the session — not lost with the subagent.
+    `hb` (optional out-param, a dict with turns/calls/iv/labels) is filled for the heartbeat from
+    the SAME per-file pass — no extra file read; the return value is unchanged in shape.
+    Each file is parsed once into a cached entry (see _agent_file_pass); this merges the entries in
+    sorted-path order into FRESH accumulators, so the cached entries are never mutated and the
+    result is identical to a cold parse. Cross-file / time-derived fields (parent, depth, running,
+    state, dur_s) are resolved here, from `now`, never cached."""
+    agent_files = {}      # path -> file entry : edits made by background agents (worktrees etc.)
+    agent_prs = {}        # url -> entry : PRs an agent created/worked (merged into the session's prs)
+    agent_pr_states = {}  # num -> state : merge/close signals seen in agent transcripts
+    newest = 0.0
+    now = time.time()
+    entries, spawned = [], {}
+    for af in sorted(_agent_files(path)):
+        e = _agent_entry(af)
+        if e is None:
+            continue
+        entries.append(e)
+        newest = max(newest, e["mt"])
+        spawned.update(e["spawned"])
+        if hb is not None:
+            h = e["hb"]
+            hb["turns"].extend(h["turns"])
+            hb["calls"].extend(h["calls"])
+            for nm, iv in h["iv"].items():
+                hb["iv"].setdefault(nm, []).extend(iv)
+            hb["labels"].update(h["labels"])
+        for fp, fe in e["files"].items():
+            cur = agent_files.get(fp)
+            if cur is None:
+                agent_files[fp] = dict(fe)
+                continue
+            cur["ops"] += fe["ops"]
+            cur["created"] = cur["created"] or fe["created"]
+            if "last" in fe:                  # the LATER-sorted file's value wins (not max)
+                cur["last"] = fe["last"]
+        for url, pe in e["prs"].items():
+            cur = agent_prs.get(url)
+            if cur is None:
+                agent_prs[url] = dict(pe)
+                continue
+            cur["created"] = cur["created"] or pe["created"]
+            cur["narr"] = cur["narr"] or pe["narr"]
+            if pe["t"] and (not cur["t"] or pe["t"] > cur["t"]):
+                cur["t"] = pe["t"]
+        for n, stt in e["pst"].items():
+            if stt == "merged" or agent_pr_states.get(n) != "merged":   # merged wins over closed
+                agent_pr_states[n] = stt
+    aids = {e["aid"] for e in entries}
+    parents = {}
+    for e in entries:
+        p = spawned.get(e["tuid"], "") if e["tuid"] else ""
+        parents[e["aid"]] = p if p in aids and p != e["aid"] else ""
+    out = []
+    for e in entries:
+        aid = e["aid"]
+        row = dict(e["row"])
+        running = (now - e["mt"]) < LIVE_WINDOW
+        if e["stop_after"]:
+            done, ended = True, e["stop_ts"]
+        elif not e["n_stop"] and e["finished"]:
+            done, ended = True, e["last_ts"]
+        else:
+            done, ended = not running, None
+        end_ep = e["last_msg_ep"] if done else now
+        dur = sum(b - a for a, b in e["segs"])
+        if e["open_start"] is not None:
+            dur += max(0.0, end_ep - e["open_start"])
+        depth = e["sdepth"]
+        if not depth:
+            depth, seen, p = 1, {aid}, parents[aid]
+            while p and p not in seen:
+                depth += 1
+                seen.add(p)
+                p = parents.get(p, "")
+        row.update({"running": running, "parent": parents[aid], "depth": depth, "ended": ended,
+                    "dur_s": int(round(dur)), "state": "done" if done else "running"})
+        out.append(row)
     for e in agent_prs.values():
         e["agent"] = True     # generated by a background agent — badge it in the panel
     out.sort(key=lambda a: (not a["running"], a["ts"] or ""), reverse=False)
@@ -1281,8 +1459,10 @@ def agent_detail(path, aid):
             running = (time.time() - os.path.getmtime(af)) < LIVE_WINDOW
         except OSError:
             pass
-        return {"task": task, "narration": "\n\n".join(texts)[:40000], "tools": tools, "running": running}
-    return {"task": "", "narration": "", "tools": 0, "running": False}
+        j = "\n\n".join(texts)
+        # `narration` is the HEAD (40k cap); `tail` is the END, so a long agent's final report survives the cap.
+        return {"task": task, "narration": j[:40000], "tail": j[-4000:], "tools": tools, "running": running}
+    return {"task": "", "narration": "", "tail": "", "tools": 0, "running": False}
 
 
 def parse_session(path):
@@ -1382,8 +1562,7 @@ def parse_session(path):
                 ep = _ts_epoch(ts)
                 hb_turns.append((ep, real_model(msg.get("model")) or "") + _hb_usage(u) + ("",))
             if u:  # a real usage block (not the {} default) -> this turn's occupancy; last one wins
-                ctx_current = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
-                               + u.get("cache_creation_input_tokens", 0))
+                ctx_current = _ctx_occupancy(u)
             mv = real_model(msg.get("model"))   # latest real model wins; a client-side error's
             if mv:                              # "<synthetic>" sentinel never overwrites (real_model)
                 meta["model"] = mv
@@ -1538,15 +1717,17 @@ def parse_session(path):
                             commits.append({"t": ts, "msg": (m.group(2) if m else c)[:120]})
                     elif name in ("Grep", "Glob"):
                         n_search += 1
-                    elif name == "Task":
+                    elif name in ("Task", "Agent"):    # the tool was renamed Task -> Agent; both occur in logs
                         agents.append({"t": ts, "type": inp.get("subagent_type") or "agent",
                                        "desc": (inp.get("description") or "")[:80],
-                                       # this is a DISPATCH record (the Task tool_use itself),
+                                       "tool": name,
+                                       # this is a DISPATCH record (the Agent/Task tool_use itself),
                                        # with no linkage to whichever transcript file the
                                        # spawned subagent actually wrote (unlike agents_bg,
-                                       # which parses that file directly) and no model key in
-                                       # its own tool input (confirmed against real transcripts)
-                                       # -- honestly "", never a guess.
+                                       # which parses that file directly). Its input can carry a
+                                       # requested model ALIAS ("opus"), not a resolved model id --
+                                       # so `model` stays honestly "", never a guess (the agents_bg
+                                       # rows carry model_req / model_label for that).
                                        "model": ""})
                     elif name == "AskUserQuestion":                # a decision the session asked the user for
                         qs = [{"q": (q.get("question") or "")[:500], "header": (q.get("header") or "")[:40],

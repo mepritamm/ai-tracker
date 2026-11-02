@@ -1056,6 +1056,7 @@
   gap: 2px;
 }
 .tracker-next .cr-rail-pin,
+.tracker-next .cr-rail-map,
 .tracker-next .cr-rail-rename {
   flex: 0 0 auto;
   border: 0;
@@ -1075,13 +1076,16 @@
 }
 .tracker-next .cr-rail-row:hover .cr-rail-pin,
 .tracker-next .cr-rail-row:focus-within .cr-rail-pin,
+.tracker-next .cr-rail-row:hover .cr-rail-map,
+.tracker-next .cr-rail-row:focus-within .cr-rail-map,
 .tracker-next .cr-rail-row:hover .cr-rail-rename,
 .tracker-next .cr-rail-row:focus-within .cr-rail-rename { opacity: .6; }
 .tracker-next .cr-rail-pin:hover,
+.tracker-next .cr-rail-map:hover,
 .tracker-next .cr-rail-rename:hover { opacity: 1 !important; background: var(--fill-row-hover); }
 .tracker-next .cr-rail-pin--on { opacity: 1; color: var(--text-agent); }
 @media (hover: none) {
-  .tracker-next .cr-rail-pin, .tracker-next .cr-rail-rename { opacity: .6; }
+  .tracker-next .cr-rail-pin, .tracker-next .cr-rail-map, .tracker-next .cr-rail-rename { opacity: .6; }
 }
 
 .tracker-next .cr-rail-agentrow {
@@ -1777,11 +1781,29 @@
   color: var(--text-on-action);
   cursor: pointer;
 }
+.tracker-next .cr-tile-map {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  margin-left: 4px;
+  padding: 0;
+  border: 1px solid var(--line-default);
+  border-radius: 50%;
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.tracker-next .cr-tile-map svg { width: calc(12px * var(--ico-scale)); height: calc(12px * var(--ico-scale)); }
+.tracker-next .cr-tile-map:hover { color: var(--text-primary); }
+.tracker-next .cr-tile-map:focus-visible { outline: 2px solid var(--line-focus); outline-offset: 2px; }
 .tracker-next .cr-tile-resume svg { width: calc(12px * var(--ico-scale)); height: calc(12px * var(--ico-scale)); }
 .tracker-next .cr-tile-resume:focus-visible { outline: 2px solid var(--line-focus); outline-offset: 2px; }
 /* 32px touch target on phones. */
 @media (max-width: 600px) {
-  .tracker-next .cr-tile-resume { width: 32px; height: 32px; }
+  .tracker-next .cr-tile-resume, .tracker-next .cr-tile-map { width: 32px; height: 32px; }
 }
 
 .tracker-next .cr-tile-pr {

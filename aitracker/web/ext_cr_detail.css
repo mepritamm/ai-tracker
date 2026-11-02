@@ -185,6 +185,30 @@
   margin-top: 6px;
 }
 
+.cr .crd-id-row3 {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  margin-top: 6px;
+}
+.cr .crd-mapbtn {
+  background: var(--surface-raised);
+  border: 1px solid var(--line-default);
+  border-radius: 999px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  height: 26px;
+  padding: 0 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.cr .crd-mapbtn:hover { border-color: var(--text-thinking); color: var(--text-primary); }
+.cr .crd-mapbtn .crd-ico { display: inline-flex; }
+.cr .crd-mapbtn-count { font-size: 11px; color: var(--text-muted); }
+
 .cr .crd-goal {
   font-family: var(--font-serif);
   font-size: 29px;
@@ -1290,6 +1314,17 @@
   font-size: 11px;
   font-weight: 600;
   cursor: pointer;
+}
+.cr .crd-map-link { display: block; padding: 0 0 6px; text-align: left; }
+.cr .crd-agent-sessions-head {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line-subtle);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
 }
 .cr .crd-show-finished {
   width: 100%;

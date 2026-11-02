@@ -195,7 +195,7 @@ def _list(kind, prefix, src_label):
                 "title": titles.get(gid) or title,
                 "prompt": (task.get("description") or "")[:200],
                 "source": src_label, "mtime": mt,
-                "agent": False, "group": "", "groupLabel": "", "parentId": "", "bg": 0, "first": 0,
+                "agent": False, "group": "", "groupLabel": "", "parentId": "", "bg": 0, "first": 0, "agent_files_n": 0,
                 "waiting": False, "ended": ended,
                 "todo_total": todo_total, "todo_done": todo_done, "todo_current": todo_current,
                 "todo_current_index": todo_current_index,

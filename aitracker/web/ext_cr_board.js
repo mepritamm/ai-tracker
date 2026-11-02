@@ -1235,9 +1235,9 @@ window.CR = window.CR || {};
       // if landing on the session top proves to be a nuisance.
       if (s.bg) groups.push([h('button', {
         class: 'cr-rail-badge cr-rail-badge--bg', type: 'button',
-        title: s.bg + ' background agent' + (s.bg === 1 ? '' : 's') + ' running now \u2014 click to open the session',
-        'aria-label': s.bg + ' background agents running, open the session',
-        onclick: function (e) { e.stopPropagation(); openSession(s.id); },
+        title: s.bg + ' background agent' + (s.bg === 1 ? '' : 's') + ' running now \u2014 Open agent map',
+        'aria-label': s.bg + ' background agents running, Open agent map',
+        onclick: function (e) { e.stopPropagation(); openMap(ctx, s); },
       }, [glyph('agent', ''), ' ' + s.bg + ' running'])]);
       // background SHELLS running now -- same badge idiom as the agent chip just above
       // (owner ruling: shells must surface "in the similar fashion like the agents").
@@ -2084,7 +2084,15 @@ window.CR = window.CR || {};
         'aria-label': s.note_count + ' note' + (s.note_count === 1 ? '' : 's') + ', open the session',
         onclick: function (e) { e.stopPropagation(); openSession(s.id); },
       }, [glyph('note', ''), ' ' + s.note_count]) : null;
+      // Agent map shortcut: only when the session has agent files AND no running-agent chip
+      // (that chip already carries the agent glyph and opens the map).
+      var mapBtn = (s.agent_files_n > 0 && !s.bg) ? h('button', {
+        class: 'cr-rail-map', type: 'button',
+        title: 'Open agent map', 'aria-label': 'Open agent map (' + s.agent_files_n + ' agent' + (s.agent_files_n === 1 ? '' : 's') + ')',
+        onclick: function (e) { e.stopPropagation(); openMap(ctx, s); }
+      }, [glyph('agent', '')]) : null;
       var actions = h('div', { class: 'cr-rail-actions' }, [
+        mapBtn,
         h('button', {
           class: 'cr-rail-pin' + (s.pinned ? ' cr-rail-pin--on' : ''), type: 'button',
           title: s.pinned ? 'Unpin' : 'Pin to top', 'aria-label': s.pinned ? 'Unpin' : 'Pin to top',
@@ -2199,6 +2207,17 @@ window.CR = window.CR || {};
         renderBoard(lastState);
         renderTriage(lastState);
       });
+    }
+
+    // Opens the session, then its agent map (the map fills in on the next poll tick).
+    function openMap(ctxArg, s) {
+      openSession(s.id);
+      if (ctxArg && typeof ctxArg.dialog === 'function') {
+        ctxArg.dialog('agent-map', {
+          sessionId: s.id, session: null,
+          onOpenSession: function (id) { if (ctxArg && typeof ctxArg.go === 'function') ctxArg.go('detail', id); }
+        });
+      }
     }
 
     function openSession(id) {
@@ -2845,6 +2864,13 @@ window.CR = window.CR || {};
           title: 'Resume this session to answer', 'aria-label': 'Resume this session to answer',
           onclick: function (e) { e.stopPropagation(); ctx && ctx.emit && ctx.emit('session:answer', answerPayload); }
         }, [icon('play', '<path d="M8 4.5l11.5 7.5L8 19.5z"/>')]));
+      }
+      if (s.agent_files_n > 0) {
+        head.appendChild(h('button', {
+          class: 'cr-tile-map', type: 'button', 'data-act': 'agent-map',
+          title: 'Open agent map', 'aria-label': 'Open agent map (' + s.agent_files_n + ' agent' + (s.agent_files_n === 1 ? '' : 's') + ')',
+          onclick: function (e) { e.stopPropagation(); openMap(ctx, s); }
+        }, [glyph('agent', '')]));
       }
       var body = [
         head,

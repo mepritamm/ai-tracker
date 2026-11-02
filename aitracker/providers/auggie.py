@@ -371,7 +371,7 @@ def list_auggie():
             "id": gid, "project": os.path.basename(cwd) if cwd else "Augment", "cwd": cwd,
             "title": titles.get(gid) or e["title"],
             "prompt": e["prompt"], "source": "auggie", "mtime": e["mtime"],
-            "agent": False, "group": "", "groupLabel": "", "parentId": "", "bg": 0, "first": 0,   # Auggie has no background-agent/SDK model
+            "agent": False, "group": "", "groupLabel": "", "parentId": "", "bg": 0, "first": 0, "agent_files_n": 0,   # Auggie has no background-agent/SDK model
             "shells_running": 0,   # Auggie has no background-shell concept either -- honest 0, not omitted
             "waiting": e.get("waiting", False), "ended": e.get("ended", False),
             "todo_total": todo_total, "todo_done": todo_done, "todo_current": todo_current,
