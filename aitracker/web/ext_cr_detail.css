@@ -202,6 +202,19 @@
   line-height: 1.4;
   color: var(--text-secondary);
   overflow-wrap: anywhere;
+  /* goal = the raw last prompt; after a compaction that's the whole multi-KB
+     summary. Clamp to 3 lines; click toggles .crd-goal-open (full text). */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  cursor: pointer;
+}
+.cr .crd-goalline.crd-goal-open {
+  display: block;
+  -webkit-line-clamp: unset;
+  max-height: 40vh;
+  overflow-y: auto;
 }
 
 /* title-local-only nudge -- slight/subtle, small muted text under the goal line.

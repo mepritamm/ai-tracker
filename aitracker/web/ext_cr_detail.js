@@ -1758,6 +1758,7 @@
           var e = qs(node, c); if (e) e.value = "";
         });
         node.classList.remove("crd-is-error"); node.removeAttribute("data-err");
+        var gl = qs(node, ".crd-goalline"); if (gl) gl.classList.remove("crd-goal-open");
         node.classList.add("crd-is-loading");
       });
     }
@@ -1771,6 +1772,10 @@
       switch (act) {
         case "back":
           ctx.go("board");
+          break;
+        case "toggle-goal":
+          // don't collapse while the user is selecting text to copy
+          if (!String(window.getSelection() || "")) t.classList.toggle("crd-goal-open");
           break;
         case "toggle-panel": {
           var key = t.getAttribute("data-panel");
@@ -2414,6 +2419,8 @@
     if (goalEl) {
       goalEl.hidden = !goalText;
       goalEl.textContent = goalText;
+      goalEl.setAttribute("data-act", "toggle-goal");
+      goalEl.title = "Click to expand / collapse";
     }
     paintTitleNote(node, session);
     qs(node, ".crd-rename .crd-ico").innerHTML = svgIcon(ctx, "edit");
