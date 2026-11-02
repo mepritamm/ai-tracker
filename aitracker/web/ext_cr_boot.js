@@ -711,6 +711,7 @@ window.CR = window.CR || {};
     var sid = payload && payload.sessionId;
     var argv = ((payload && payload.argv) || '').trim();
     if (!sid || !argv || typeof fetch !== 'function') return;
+    var tok = (typeof sessToken === 'function') ? sessToken() : null;
     fetch('/api/term/run', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session: sid, cmd: argv }),
@@ -723,6 +724,10 @@ window.CR = window.CR || {};
             (res.status === 404 ? 'Running commands isn’t available on this server.' :
               res.status === 403 ? 'Running commands is disabled.' : 'Couldn’t start that command.')
         });
+        return;
+      }
+      if (tok && typeof sessCurrent === 'function' && !sessCurrent(tok)) {
+        emit('notify', { text: 'Started in previous session' });
         return;
       }
       emit('notify', { text: 'Running: ' + argv });
@@ -1029,6 +1034,14 @@ window.CR = window.CR || {};
       }
     });
   }
+  // A failed switch to an uncached session: app.js dispatches ONE DOM event (no registry).
+  document.addEventListener('tracker:session-error', function (e) {
+    var dt = (e && e.detail) || {};
+    if (dt.cached) return;
+    if (window.CR.detail && typeof window.CR.detail.error === 'function') {
+      try { window.CR.detail.error(dt.id, dt.error); } catch (err) { console.error('[CR] detail.error threw', err); }
+    }
+  });
   // Session isolation: app.js's resetSession() runs this registry on a REAL selection change. Keep
   // state.sid in step, close session-bound dialogs, and tell every CR module (detail, run) to drop
   // its per-session state via 'session:reset'.

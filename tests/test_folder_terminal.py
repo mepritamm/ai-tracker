@@ -577,7 +577,7 @@ class TestCloseFolderBusyAndOverflow(unittest.TestCase):
         with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=7002), \
              mock.patch.object(pt, "kill") as kill_mock:
             h = _FakeHandler()
-            term_vt.close_pty(h, None, {"session": "", "tty": "busy1"})
+            term_vt.close_pty(h, None, {"session": "s", "tty": "busy1"})
             obj, code = h.calls[-1]
 
         self.assertEqual(code, 409)
@@ -595,7 +595,7 @@ class TestCloseFolderBusyAndOverflow(unittest.TestCase):
         with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=7004), \
              mock.patch.object(pt, "kill") as kill_mock:
             h = _FakeHandler()
-            term_vt.close_pty(h, None, {"session": "", "tty": "busy2", "force": True})
+            term_vt.close_pty(h, None, {"session": "s", "tty": "busy2", "force": True})
             obj, code = h.calls[-1]
 
         self.assertEqual(code, 200, obj)
@@ -870,6 +870,179 @@ class TestFolderOwnership(unittest.TestCase):
             self.assertTrue(term_vt._pty_owned(term_vt.PTYS[tid], "B"))
             self.assertFalse(term_vt._pty_owned(term_vt.PTYS[tid], "C"))
 
+    # ---- S1: while a session's claude is in the foreground, ownership is the claim's, not the
+    # ---- shell's accumulated grants.
+    def test_foreground_claim_excludes_a_granted_opener(self):
+        pt = self._folder("A")
+        pt.grants.update({"A", "B"})
+        pt.fg = {"session": "B", "mode": "resume", "grants": {"B"}}
+        obj, code = self._keys("A")
+        self.assertEqual(code, 409, obj)
+        self.assertEqual(self._keys("B")[1], 200)
+        pt.fg = None                       # the job exited: the shell-level rule is back
+        self.assertEqual(self._keys("A")[1], 200)
+
+    def test_launch_pad_claim_keeps_blank_session_after_the_session_latches(self):
+        pt = self._folder("")
+        pt.fg = {"session": "N", "mode": "new", "grants": {""}}   # fg["session"] latched to N
+        self.assertEqual(self._keys("")[1], 200)
+        self.assertEqual(self._keys("N")[1], 200)
+        self.assertEqual(self._keys("A")[1], 409)
+
+    def test_cwd_open_by_another_session_gets_its_own_shell_while_a_claude_runs(self):
+        pt = self._folder("A")
+        pt.cwd = self._tmpdir
+        pt.grants.add("A")
+        pt.fg = {"session": "B", "mode": "resume", "grants": {"B"}}
+        pt.fg_pending = True               # _refresh_fg leaves a pending claim alone
+        other = term_vt.Pty(tid="ov9", pid=42425, fd=98, cwd=self._tmpdir)
+        h = _FakeHandler()
+        with mock.patch.object(term_vt, "spawn", return_value=other) as sp, \
+             mock.patch.object(term_gate, "session_cwd", return_value=self._tmpdir):
+            term_vt.open_pty(h, None, {"session": "C", "mode": "cwd", "cwd": self._tmpdir,
+                                       "cols": 80, "rows": 24})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 200, obj)
+        self.assertNotEqual(obj["tty"], "fo1", "C must not be handed B's shared shell")
+        self.assertEqual(obj["tty"], "ov9")
+        self.assertNotIn("C", pt.grants)
+        self.assertEqual(sp.call_args[0][1], [os.environ.get("SHELL", "/bin/bash"), "-l"])
+
+    # ---- round 2: an UNNAMED app claim (fg session "") is still a claim
+    def test_unnamed_claim_excludes_a_shell_level_grantee(self):
+        pt = self._folder("")
+        pt.grants.update({"A", "C"})
+        pt.fg = {"session": "", "mode": "new", "grants": {"A"}}
+        obj, code = self._keys("C")
+        self.assertEqual(code, 409, obj)
+        self.assertEqual(self._keys("A")[1], 200)
+
+    def test_unnamed_launch_pad_claim_keeps_blank_and_excludes_others(self):
+        pt = self._folder("")
+        pt.grants.add("C")
+        pt.fg = {"session": "", "mode": "new", "grants": {""}}
+        self.assertEqual(self._keys("C")[1], 409)
+        self.assertEqual(self._keys("")[1], 200)
+
+    def test_cwd_open_during_an_unnamed_claim_gets_the_overflow_shell(self):
+        pt = self._folder("A")
+        pt.cwd = self._tmpdir
+        pt.fg = {"session": "", "mode": "new", "grants": {"A"}}
+        pt.fg_pending = True
+        other = term_vt.Pty(tid="ov8", pid=42426, fd=97, cwd=self._tmpdir)
+        h = _FakeHandler()
+        with mock.patch.object(term_vt, "spawn", return_value=other), \
+             mock.patch.object(term_gate, "session_cwd", return_value=self._tmpdir):
+            term_vt.open_pty(h, None, {"session": "C", "mode": "cwd", "cwd": self._tmpdir,
+                                       "cols": 80, "rows": 24})
+        obj, code = h.calls[-1]
+        self.assertEqual((code, obj["tty"]), (200, "ov8"), obj)
+        self.assertNotIn("C", pt.grants)
+
+    def test_cwd_open_never_types_into_the_shell_if_the_claude_exits_midway(self):
+        pt = self._folder("A")
+        pt.cwd, pt.startup_done = self._tmpdir, True
+        pt.fg = {"session": "B", "mode": "resume", "grants": {"B"}}
+        other = term_vt.Pty(tid="ov7", pid=42427, fd=96, cwd=self._tmpdir)
+        calls = []
+
+        def _refresh(p):                      # first call (cwd check) sees B; the second sees it gone
+            calls.append(1)
+            if len(calls) > 1:
+                p.fg = None
+        h = _FakeHandler()
+        with mock.patch.object(term_vt, "_refresh_fg", side_effect=_refresh), \
+             mock.patch.object(term_vt, "_fg_pgid", side_effect=lambda p: p.pid), \
+             mock.patch.object(term_vt, "_inject_argv", return_value=(True, "")) as inj, \
+             mock.patch.object(term_vt, "spawn", return_value=other) as sp, \
+             mock.patch.object(term_gate, "session_cwd", return_value=self._tmpdir):
+            term_vt.open_pty(h, None, {"session": "C", "mode": "cwd", "cwd": self._tmpdir,
+                                       "cols": 80, "rows": 24})
+        obj, code = h.calls[-1]
+        self.assertEqual((code, obj["tty"]), (200, "ov7"), obj)
+        inj.assert_not_called()
+        sp.assert_called_once()
+        self.assertIsNone(pt.fg)
+
+    def test_fg_public_keeps_grants_off_the_wire(self):
+        import json
+        pt = self._folder("A")
+        pt.fg = {"session": "B", "mode": "resume", "started": 1.0, "grants": {"B"}, "forked": True}
+        with term_vt._LOCK:
+            rows = term_vt._live_list("")
+        json.dumps(rows)                                   # a set in a row would raise
+        row = [r for r in rows if r.get("tty", r.get("id")) == "fo1"][0]
+        self.assertNotIn("grants", row["fg"])
+        with mock.patch.object(term_vt.os, "tcgetpgrp", return_value=pt.pid + 1), \
+             mock.patch.object(term_vt, "_refresh_fg"):
+            h = _FakeHandler()
+            term_vt.close_pty(h, None, {"session": "B", "tty": "fo1"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 409, obj)
+        json.dumps(obj)
+        self.assertNotIn("grants", obj["fg"])
+
+    def _idle_folder(self):
+        pt = self._folder("")
+        pt.cwd, pt.mode, pt.shell_cmd = self._tmpdir, "cwd", "sh"
+        pt.startup_done = True
+        return pt
+
+    def _open(self, body):
+        h = _FakeHandler()
+        with mock.patch.object(term_gate, "session_cwd", return_value=self._tmpdir), \
+             mock.patch.object(term_gate, "resume_argv", return_value=["claude", "--resume", "R"]), \
+             mock.patch.object(term_vt.gateway, "launcher", return_value="claude"), \
+             mock.patch.object(term_vt, "_fg_pgid", side_effect=lambda p: p.pid), \
+             mock.patch.object(term_vt, "_inject_argv", return_value=(True, "")), \
+             mock.patch.object(term_vt, "_start_backstop", return_value=False), \
+             mock.patch.object(term_vt, "resolve_spawned"):
+            term_vt.open_pty(h, None, dict(body, cols=80, rows=24))
+        return h.calls[-1]
+
+    def test_open_resume_claim_records_the_claimant_in_fg_grants(self):
+        pt = self._idle_folder()
+        obj, code = self._open({"session": "R", "mode": "resume"})
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(pt.fg["grants"], {"R"})
+
+    def test_open_new_claim_from_the_launch_pad_records_blank_in_fg_grants(self):
+        pt = self._idle_folder()
+        obj, code = self._open({"session": "", "mode": "new", "cwd": self._tmpdir})
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(pt.fg["grants"], {""})
+
+    def test_peek_adds_the_peeking_session_to_fg_grants(self):
+        pt = self._idle_folder()
+        pt.fg = {"session": "R", "mode": "resume", "started": time.time(), "grants": {"X"}}
+        pt.fg_pending = True
+        with mock.patch.object(term_vt, "_session_pty", return_value=None):
+            obj, code = self._open({"session": "R", "mode": "resume"})
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(pt.fg["grants"], {"X", "R"})
+
+    def test_folder_retype_claim_records_the_claimant_in_fg_grants(self):
+        pt = self._idle_folder()
+        with mock.patch.object(term_vt, "_folder_wait_prompt", return_value=True), \
+             mock.patch.object(term_vt, "_inject_argv", return_value=(True, "")):
+            self.assertTrue(term_vt._folder_retype(pt, "R", ["claude"]))
+        self.assertEqual(pt.fg["grants"], {"R"})
+
+    def test_inject_rechecks_ownership_after_the_quiescence_wait(self):
+        pt = self._folder("A")
+
+        def _flip(p):
+            p.fg = {"session": "B", "mode": "resume", "grants": {"B"}}
+            return True
+        h = _FakeHandler()
+        with mock.patch.object(term_vt, "_wait_for_quiescence", side_effect=_flip), \
+             mock.patch.object(term_vt, "_inject_write", return_value=True) as w:
+            term_vt.inject(h, None, {"tty": "fo1", "session": "A", "text": "ls"})
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 409, obj)
+        self.assertTrue(obj["mismatch"])
+        w.assert_not_called()
+
 
 class TestAttachedPtyForeground(unittest.TestCase):
     """registry._attached_pty reports the pty RUNNING the session, never its first opener."""
@@ -889,6 +1062,38 @@ class TestAttachedPtyForeground(unittest.TestCase):
         with mock.patch.object(term_vt, "_foreground_is_claude", return_value=True):
             self.assertIs(registry._attached_pty("B"), pt)
             self.assertIsNone(registry._attached_pty("A"))
+
+    def test_a_forked_folder_shell_still_reports_a_later_session_in_its_foreground(self):
+        """S2: the sticky `pt.forked` of an earlier fork retry must not hide the folder shell."""
+        from aitracker import registry
+        pt = term_vt.Pty(tid="af3", pid=42424, fd=99)
+        pt.folder, pt.session, pt.forked = True, "A", True
+        pt.fg, pt.fg_pending = {"session": "A", "mode": "resume"}, True
+        term_vt.PTYS["af3"] = pt
+        with mock.patch.object(term_vt, "_foreground_is_claude", return_value=True):
+            self.assertIs(registry._attached_pty("A"), pt)
+
+    def test_a_fork_tagged_claim_is_not_reported_as_the_session(self):
+        from aitracker import registry
+        pt = term_vt.Pty(tid="af4", pid=42424, fd=99)
+        pt.folder, pt.session, pt.forked = True, "A", True
+        pt.fg, pt.fg_pending = {"session": "A", "mode": "resume", "forked": True}, True
+        term_vt.PTYS["af4"] = pt
+        with mock.patch.object(term_vt, "_foreground_is_claude", return_value=True):
+            self.assertIsNone(registry._attached_pty("A"))
+
+    def test_folder_retype_tags_the_fork_inside_the_claim(self):
+        pt = term_vt.Pty(tid="af5", pid=42424, fd=99)
+        pt.folder = True
+        seen = {}
+
+        def _inj(p, argv):
+            seen["fg"] = dict(p.fg)
+            return True, ""
+        with mock.patch.object(term_vt, "_folder_wait_prompt", return_value=True), \
+             mock.patch.object(term_vt, "_inject_argv", side_effect=_inj):
+            self.assertTrue(term_vt._folder_retype(pt, "A", ["claude"], forked=True))
+        self.assertTrue(seen["fg"].get("forked"))
 
     def test_a_dedicated_new_pty_is_not_its_opener_sessions_terminal(self):
         from aitracker import registry

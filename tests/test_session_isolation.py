@@ -36,13 +36,15 @@ var cur = "", timer = null, lastData = null;
 var __renders = [], __fetches = [], __intervals = 0;
 var __els = {};
 var __main = { dataset: {} };
-var document = { querySelector: function (s) { return s === "main" ? __main : null; }, title: "" };
+var __events = [];
+var document = { querySelector: function (s) { return s === "main" ? __main : null; }, title: "",
+  dispatchEvent: function (e) { __events.push(e.detail); } };
 var localStorage = { setItem: function () {} };
 var uiState = { set: function () {} };
 function $(id) { return __els[id] || (__els[id] = { value: "", innerHTML: "", textContent: "", style: {} }); }
 function setInterval() { __intervals++; return 1; }
 function clearInterval() {}
-function render(d) { __renders.push({ id: d.id, sess: __main.dataset.sess }); }
+function render(d) { __renders.push({ id: d.id, sess: __main.dataset.sess, refreshing: sessRefreshing }); }
 function loadFlags() {}
 function checkCompletions() {}
 function esc(s) { return String(s); }
@@ -188,8 +190,84 @@ console.log(JSON.stringify({missMark: missMark, rendersAfterA: rendersAfterA, hi
         self.assertEqual(r["missMark"], "loading")
         self.assertEqual(r["rendersAfterA"], 0)
         self.assertEqual(r["hitMark"], "refreshing")
-        self.assertEqual(r["hit"], [{"id": "B", "sess": "refreshing"}])
+        self.assertEqual(r["hit"], [{"id": "B", "sess": "refreshing", "refreshing": True}])
         self.assertIsNone(r["finalMark"], "the fresh poll must clear the refreshing mark")
+
+    # (7) C1: an uncached pick that errors must NOT un-hide the previous session's DOM
+    def test_uncached_error_lands_as_error_state(self):
+        r = self._run("""
+__pick("A"); __ok(0, {id: "A", now: 1});
+await new Promise(function (r) { setTimeout(r, 20); });
+var afterA = __main.dataset.sess === undefined ? null : __main.dataset.sess;
+__pick("C");                                   // uncached
+__ok(1, {error: "not found"});
+await new Promise(function (r) { setTimeout(r, 20); });
+console.log(JSON.stringify({afterA: afterA, mark: __main.dataset.sess, err: __main.dataset.err, events: __events}));
+""")
+        self.assertIsNone(r["afterA"])
+        self.assertEqual(r["mark"], "error", "A's DOM must stay hidden under C's failed load")
+        self.assertEqual(r["err"], "not found")
+        self.assertEqual(r["events"][0]["id"], "C")
+
+    def test_cached_error_keeps_snapshot_and_next_land_clears_error(self):
+        r = self._run("""
+sessCachePut("B", {id: "B"});
+__pick("B"); __ok(0, {error: "boom"});
+await new Promise(function (r) { setTimeout(r, 20); });
+var cachedMark = __main.dataset.sess === undefined ? null : __main.dataset.sess;
+console.log(JSON.stringify({cachedMark: cachedMark}));
+""")
+        self.assertIsNone(r["cachedMark"], "a cached snapshot stays shown")
+        r2 = self._run("""
+__pick("C"); __ok(0, {error: "boom"});
+await new Promise(function (r) { setTimeout(r, 20); });
+var e1 = __main.dataset.sess;
+sessLanded("C", {id: "C", now: 1});
+console.log(JSON.stringify({e1: e1, after: __main.dataset.sess === undefined ? null : __main.dataset.sess, err: __main.dataset.err === undefined ? null : __main.dataset.err}));
+""")
+        self.assertEqual(r2["e1"], "error")
+        self.assertIsNone(r2["after"])
+        self.assertIsNone(r2["err"])
+
+    # (8) C2: the fresh render must not see refreshing:true; a mismatch must not clear it
+    def test_fresh_render_sees_refreshing_false(self):
+        r = self._run("""
+sessCachePut("B", {id: "B"});
+__pick("B");
+var painted = __renders.slice();
+__ok(0, {id: "B", now: 1});
+await new Promise(function (r) { setTimeout(r, 20); });
+console.log(JSON.stringify({painted: painted, last: __renders[__renders.length - 1]}));
+""")
+        self.assertTrue(r["painted"][0]["refreshing"])
+        self.assertFalse(r["last"]["refreshing"], "fresh data rendered while sessRefreshing still true")
+
+    def test_mismatched_land_does_not_clear_refreshing(self):
+        r = self._run("""
+sessCachePut("B", {id: "B"});
+__pick("B");
+var ok = sessLanded("B", {id: "X"});
+console.log(JSON.stringify({ok: ok, mark: __main.dataset.sess, refreshing: sessRefreshing}));
+""")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["mark"], "refreshing")
+        self.assertTrue(r["refreshing"])
+
+    # (9) C6: the classic reset hook empties the windowing counters
+    def test_classic_reset_hook_clears_win(self):
+        with open(os.path.join(ROOT, "aitracker", "web", "app.js"), encoding="utf-8") as fh:
+            src = fh.read()
+        hook = _block(src, "// Classic view's per-session state", "onSessionReset(function(){")
+        r = self._run("""
+var _win = {narr: 90, files: 60};
+var curModal, curFiles, curDiffFile, curDiffOps, diffExpand, curDiffText, diffAllExpanded;
+var curNarr, curCmds, curReqs, curOv, curShells, curAgents, curTodos, narrState, dSid, notifSession, notifRunning;
+function closeDiff() {} function closeMsg() {} function clearDetailSearch() {}
+""" + hook + ");" + """
+resetSession("B", "A");
+console.log(JSON.stringify({win: _win}));
+""")
+        self.assertEqual(r["win"], {})
 
 
 # ---------------------------------------------------------------------------------------------
@@ -254,6 +332,40 @@ class TestSessionIsolationStaticSweep(unittest.TestCase):
                 seen += 1
         self.assertGreater(seen, 4)
 
+    def test_every_cr_detail_dialog_is_session_bound(self):
+        code = _code_only(_web_src("ext_cr_detail.js"))
+        seen = 0
+        for m in re.finditer(r"ctx\.dialog\(", code):
+            seen += 1
+            window = code[m.end():m.end() + 1400]
+            end = window.find("});")
+            self.assertIn("sessionId", window[:end if end > 0 else 1400],
+                          "ctx.dialog without sessionId near: %r" % window[:80])
+        self.assertGreater(seen, 5)
+
+    def test_cr_session_reads_are_guarded(self):
+        pat = re.compile(r"/api/(narration|session_search|diff|output|shell|agent)\?id=")
+        seen = 0
+        for f in _web_js_files():
+            if not f.startswith("ext_cr_"):
+                continue
+            lines = _code_only(_web_src(f)).split("\n")
+            for i, line in enumerate(lines):
+                if not pat.search(line):
+                    continue
+                if "return '/api/" in line:                 # URL builder, fetched via sessJSON(urlFn(
+                    continue
+                seen += 1
+                ctx = "\n".join(lines[max(0, i - 3):i + 12])
+                self.assertTrue("sessJSON(" in line or "ui.sid !== sid" in ctx,
+                                "%s:%d unguarded session read: %s" % (f, i + 1, line.strip()[:140]))
+        self.assertGreater(seen, 0)
+        poll = _code_only(_web_src("app.js"))
+        i = poll.index("async function poll(){")
+        body = poll[i:i + 1600]
+        self.assertIn("sessAbort.signal", body)
+        self.assertIn("sessLanded(id", body)
+
     def test_cr_detail_reset_listener_clears_all_six_inputs(self):
         src = _web_src("ext_cr_detail.js")
         i = src.index('ctx.on("session:reset"')
@@ -302,6 +414,8 @@ function fakeNode(path) {
   };
   return n;
 }
+window.__docL = {};
+document.addEventListener = function (t, f) { (window.__docL[t] = window.__docL[t] || []).push(f); };
 var __origCE = document.createElement;
 document.createElement = function (tag) {
   if (tag === "template") {
@@ -327,7 +441,8 @@ class TestControlRoomSessionReset(unittest.TestCase):
         # boot.js's init() is a setTimeout(init, 0) queued before the later ext_cr_* files define
         # window.CR.*; run it only after the whole bundle has evaluated.
         run_init = "window.__q.splice(0).forEach(function (f) { f(); });"
-        tail = "console.log('===SI_JSON===');console.log(JSON.stringify(OUT));"
+        tail = ("(window.__wait || Promise.resolve()).then(function () {"
+                "console.log('===SI_JSON===');console.log(JSON.stringify(OUT));});")
         js = "\n".join([pre, defer, _CR_STUB, bundle, cv._JS_MID, "var OUT = {};", run_init, body_js, tail])
         rc, out, err = cv._run_node(js)
         self.assertEqual(rc, 0, "node failed\n%s\n%s" % (out, err))
@@ -366,6 +481,73 @@ D.closeSession("A");                                      // keep A's own dialog
 OUT.top = D.topName();
 """)
         self.assertEqual(r["top"], "rename")
+
+    # C3: a run-command POST that resolves after a switch must not open A's run pane under B
+    def test_run_command_resolving_after_switch_opens_nothing(self):
+        r = self._run(r"""
+window.EventSource = globalThis.EventSource = function () { this.close = function () {}; this.addEventListener = function () {}; };
+var D = window.CR.dialogs, ctx = window.CR.detail._ctx, pending = [];
+globalThis.fetch = window.fetch = function (url) {
+  return new Promise(function (res) { if (String(url).indexOf("/api/term/run") >= 0) pending.push(res); });
+};
+function pick(s) { document.getElementById("x").value = s; track(); }
+var notes = [];
+ctx.on("notify", function (p) { notes.push(p && p.text); });
+var opened = [];
+ctx.on("dialog:open", function (p) { opened.push(p && p.name); });
+pick("A");
+ctx.emit("cr:run-command", {sessionId: "A", argv: "ls"});
+pick("B");
+pending[0]({ok: true, status: 200, json: function () { return Promise.resolve({job: "j1"}); }});
+window.__wait = (async function () {
+  for (var i = 0; i < 10; i++) await Promise.resolve();
+  OUT.pending = pending.length;
+  OUT.notes = notes;
+  OUT.opened = opened;
+})();
+""")
+        self.assertEqual(r["pending"], 1)
+        # ponytail: no topName() check -- the harness has no MutationObserver, so run-output never
+        # reaches the stack and that assert could not fail; the dialog:open capture is the real proof.
+        self.assertNotIn("run-output", r["opened"], "A's run pane opened under B")
+        self.assertIn("Started in previous session", r["notes"])
+        self.assertNotIn("Running: ls", r["notes"])
+
+    # C1 (control room half): an error for the selection swaps loading for the error state
+    def test_session_error_event_clears_loading(self):
+        r = self._run(r"""
+var node = window.CR.detail._root._crDetail.node;
+function pick(s) { document.getElementById("x").value = s; track(); }
+pick("A"); pick("B");
+OUT.loadingBefore = !!node._cls["crd-is-loading"];
+(window.__docL["tracker:session-error"] || []).forEach(function (f) { f({detail: {id: "B", error: "boom", cached: false}}); });
+OUT.loading = !!node._cls["crd-is-loading"]; OUT.errored = !!node._cls["crd-is-error"];
+window.CR.detail.update({session: {id: "B", meta: {sessionId: "B"}}, sid: "B", now: 1700000001});
+OUT.errorAfterLand = !!node._cls["crd-is-error"];
+pick("C");
+(window.__docL["tracker:session-error"] || []).forEach(function (f) { f({detail: {id: "C", error: "not found", cached: false}}); });
+OUT.cErrored = !!node._cls["crd-is-error"];
+pick("B");
+OUT.errorAfterSwitch = !!node._cls["crd-is-error"];
+""")
+        self.assertTrue(r["loadingBefore"])
+        self.assertFalse(r["loading"])
+        self.assertTrue(r["errored"])
+        self.assertFalse(r["errorAfterLand"])
+        self.assertTrue(r["cErrored"])
+        self.assertFalse(r["errorAfterSwitch"], "C's error state leaked onto B's loading")
+
+    # C5: building a tty body must not rebind the page-wide tty->session map
+    def test_tty_body_for_does_not_mutate_binding(self):
+        r = self._run(r"""
+var X = window.ExtVT;
+X.bindTty("t", "");
+var body = window.CR.detail._internal.ttyBodyFor("t", "A", {text: "x"});
+OUT.bound = X.ttyBody("t").session; OUT.body = body;
+""")
+        self.assertEqual(r["bound"], "")
+        self.assertEqual(r["body"]["session"], "A")
+        self.assertEqual(r["body"]["text"], "x")
 
 
 if __name__ == "__main__":

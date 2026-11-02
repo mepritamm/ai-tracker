@@ -1436,11 +1436,20 @@ function renderFor(sid,d){
 // poll()'s landing step: cache, clear the loading/refreshing mark, render through renderFor.
 function sessLanded(id,d){
   const m=document.querySelector("main");
-  if(d&&d.error){ sessRefreshing=false; if(m)delete m.dataset.sess; return false; }
+  if(d&&d.error){
+    sessRefreshing=false;
+    if(id===cur){
+      // Uncached target that failed: keep A's DOM hidden behind an error state; a cached snapshot stays shown.
+      if(m&&!sessCacheGet(id)){ m.dataset.sess="error"; m.dataset.err=String(d.error); }
+      else if(m) delete m.dataset.sess;
+      document.dispatchEvent(new CustomEvent("tracker:session-error",{detail:{id:id,error:String(d.error),cached:!!sessCacheGet(id)}}));
+    }
+    return false;
+  }
   sessCachePut(id,d);
-  if(!renderFor(id,d)) return false;
-  sessRefreshing=false; if(m)delete m.dataset.sess;
-  return true;
+  if(!(id===cur&&d&&d.id===id)) return false;
+  sessRefreshing=false; if(m){ delete m.dataset.sess; delete m.dataset.err; }
+  return renderFor(id,d);
 }
 function resetSession(next, prev){
   sessEpoch++;
@@ -2216,7 +2225,7 @@ onSessionReset(function(){
   closeDiff(); closeMsg(); curModal=null;
   curFiles=[]; curDiffFile=null; curDiffOps=[]; diffExpand=[]; curDiffText=null; diffAllExpanded=false;
   curNarr=[]; curCmds=[]; curReqs=[]; curOv={}; curShells=[]; curAgents=[]; curTodos=[];
-  narrState={id:null,items:[],total:0};
+  narrState={id:null,items:[],total:0}; _win={};
   clearDetailSearch(); dSid=null; const c=$("dsearchcard"); if(c)c.style.display="none";
   const n=$("noteinput"); if(n)n.value="";
   notifSession=null; notifRunning=null;          // re-baseline: never announce A's completions under B

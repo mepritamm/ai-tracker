@@ -2214,4 +2214,6 @@
 /* Session switch: hide the previous session's panels until the new one paints (cache hit or fetch). */
 .cr .crd.crd-is-loading .crd-col-body, .cr .crd.crd-is-loading .crd-header { visibility: hidden; }
 .cr .crd.crd-is-loading::after { content: "Loading session…"; display: block; padding: 24px; color: var(--cr-muted, #888); }
+.cr .crd.crd-is-error .crd-col-body, .cr .crd.crd-is-error .crd-header { visibility: hidden; }
+.cr .crd.crd-is-error::after { content: attr(data-err); display: block; padding: 24px; color: var(--cr-bad, #c33); }
 .cr .crd.crd-is-refreshing .crd-header { opacity: .7; }

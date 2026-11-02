@@ -301,10 +301,61 @@ Bind sites (where a tty enters): `_openVTFresh`'s `/api/term/pty` response → `
 2. **No-cache switch hides the old column (loading state) rather than dimming it; cache is 8 entries, in memory only** (never written to localStorage — no transcript data at rest in the browser). View preferences (show-finished, timeline filter, per-sid panel collapse) persist across switches; only session data/drafts/dialogs reset. Also: forked ptys no longer report `term_tty` for the parent session (they run a different session id).
 
 ## Adversarial review
-_(opus reviewer — pending)_
 
-## Reconciliation
-_(pending)_
+Two opus reviewers (split server/client to avoid reviewer stall), both told to assume the reports false. Both returned **REFUTED**.
+
+**Server (opus):**
+- S1 MAJOR: folder-shell ownership (`p.grants` ∪ opener) lets A type into and read a shared shell while B's claude is in its foreground (repro'd inline: A→200). `mode="cwd"` open hands C the shared shell and a grant.
+- S2 MINOR: the sticky `pt.forked` on a folder shell hides it from `_session_ptys` forever after one fork retry. This is a regression from base.
+- S3 MINOR: 5 of 6 `grants.add` sites are untested.
+- S4 no change, document: ownership guards against stale bindings, not a hostile same-origin client (`/api/term/list` hands out session per tty). Auth (`term_gate`) stays the security boundary.
+- S5 no change, document: a hand-typed `claude` in a plain shell gets no `term_tty`.
+
+**Client (opus):**
+- C1 MAJOR: a cache-miss load error un-hides `main`, so A's DOM shows under C's header. The control board stays "Loading" forever.
+- C2 MAJOR: `sessLanded` renders before clearing `sessRefreshing`, so the control board marks fresh data "refreshing" for one extra poll.
+- C3 MAJOR: `cr:run-command` opens `run-output` for A after the switch to B.
+- C4 MAJOR: `narration-diagram` is opened without `sessionId`, so it survives a switch and its prev/next walk B's entries.
+- C5 MINOR: `_ttyBodyFor` rebinds the page-wide `TTY_SESS`.
+- C6 MINOR: A→B→A is not a fresh load (`_win`, `ui.narrAcc`, `ui.timelineEntries`).
+- C7 MINOR: the sweep misses ext_cr_* reads and poll's `(id)` form.
+
+### Reconciliation (main thread, each judged against the code)
+
+| # | Verdict | Note |
+|---|---|---|
+| S1 | **confirmed — accepted** | Supersedes P7 decision 1. Contract C8 ("no data leakage between sessions") outranks shared typing. Fix: foreground-scoped claim grants (`fg["grants"]` at the 3 claim sites), checked first in `_pty_owned`. `mode="cwd"` with a different session in the foreground spawns the overflow shell. `inject` re-checks ownership after the quiescence wait. Idle shells and dedicated ptys keep the current rule. |
+| S2 | confirmed — accepted | Tag the fork on `fg["forked"]`; skip `forked` only for dedicated ptys. |
+| S3 | confirmed — accepted | Folded into S1's tests. |
+| S4, S5 | accepted as doc-only | Goes in the PR/commit notes. |
+| C1 | confirmed (sessLanded error branch deletes `data-sess`) — **fix trimmed** | Set `main[data-sess=error]` with the message. For the control board, dispatch one `session-error` DOM event that boot forwards to `CR.detail`. The reviewer's second hook registry (`onSessionError`) is dropped: one consumer doesn't need a registry. |
+| C2 | confirmed (renderFor runs before `sessRefreshing=false`) | Accepted as written. |
+| C3 | confirmed (no token check before `dialog('run-output')`) | Accepted as written. |
+| C4 | confirmed (no `sessionId` in the payload) | Accepted, plus a sweep: every `ctx.dialog(` in ext_cr_detail.js carries `sessionId` or is allowlisted. |
+| C5 | confirmed (`X.bindTty(tty,sid)` mutates the map) | Accepted: build the body without touching the map. |
+| C6 | confirmed | Accepted (three one-line resets). Needed for the C8 idempotence clause. |
+| C7 | accepted (sweep extension only) | The string-existence tests stay; they aren't the defect. |
+| Missed by both | — | Neither reviewer checked the 8-entry cache's memory bound under many switches (bounded by the LRU, fine) or `dist/tracker.py` (generated, untouched by design). Nothing found. |
+
+Fixers: sonnet (server: S1-S3) and sonnet (client: C1-C7), on disjoint files. After that, each opus reviewer re-verifies its own findings.
+
+### Re-verification (same opus reviewers)
+- **Round 1 → client:** 6/7 fixed. New minor defect: the CR reset listener left `crd-is-error`, so C's error showed on B's loading. The C3 dialog assertion was vacuous (no EventSource in the harness). Both accepted and fixed in round 2.
+- **Round 1 → server:** S2/S3 fixed. **S1 NOT fixed:** an *unnamed* foreground claim (`mode="new"` before `fg.session` latches) still let a shell-level grantee type (C → 200). New S1b: a cwd open could reach the claim block and type `$SHELL -l` if the other claude exited between the two locks. S2 needed a negative test plus the fork tag set inside `_folder_retype`'s claim; S3 needed a `_fg_public` serialisation test. All accepted.
+- **Round 2 → client: SETTLED.** The `dialog:open` capture was validated with a positive control. The leftover `topName()` assertion is vacuous (no MutationObserver in the harness), so it was removed.
+- **Round 2 → server: SETTLED.** The fixer agent hung without reporting, so it was stopped; its edits were complete. The reviewer proved every round-2 test red by reverting each fix in memory (worktree untouched). Any app claim (`fg is not None`) is now exclusive; cwd never claims and goes to overflow; the fork tag is set inside the claim lock; `_fg_public` keeps sets off the wire.
+- **Known gap (no change, release note):** `_pty_owned` doesn't re-read the foreground, so for ≤ ~2s after a session's claude exits, the shell's other owners get 409 until the next `_refresh_fg` (the `attached` poll).
+
+| Contract clause | Verdict |
+|---|---|
+| C1 dashboard bleed | discharged (seam reset, sessJSON, renderFor, error state) |
+| C2 control-board bleed | discharged (reset hook, drill/run guards, dialog closeSession, listener) |
+| C3 server-enforced security | discharged (strict `(session, tty)` ownership on all 8 routes) |
+| C4 strict mode | discharged (missing → 400, mismatch → 409) |
+| C5 opus plan | discharged |
+| C6 adversarial review | discharged (1 round + 2 re-verifications, both SETTLED) |
+| C7 no stale / no 2s wait | discharged (immediate poll unblocked; sid-keyed cache paints instantly, marked refreshing) |
+| C8 idempotent, zero leakage | discharged (A→B→A resets; foreground-exclusive folder ownership) |
 
 ## Log
 - 2026-11-02 worktree cut; diagnosis recorded.

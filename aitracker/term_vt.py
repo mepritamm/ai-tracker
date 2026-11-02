@@ -1829,6 +1829,12 @@ def _refresh_fg(pt):
         pt.cmd = pt.shell_cmd or pt.cmd
 
 
+def _fg_public(fg):
+    """`fg` as the wire sees it: the claim's server-side bookkeeping (`grants`, a set; `forked`)
+    stays off the JSON rows."""
+    return None if fg is None else {k: v for k, v in fg.items() if k not in ("grants", "forked")}
+
+
 def _folder_pty(cwd):
     """The live folder shell for `cwd`, or None. Call under `_LOCK`. Equal-STRING match, on
     purpose: `cwd` arrives either verbatim from a session's transcript (`term_gate.session_cwd`)
@@ -2144,7 +2150,7 @@ def _live_list(orl=None):
              "session": p.spawned or p.session, "mode": p.mode,
              "suffix": _MODE_SUFFIX.get(p.mode, ""), "forked": p.forked,
              "title": _term_title(p, orl),
-             "folder": p.folder, "overflow": p.overflow, "fg": p.fg}
+             "folder": p.folder, "overflow": p.overflow, "fg": _fg_public(p.fg)}
             for p in sorted(PTYS.values(), key=lambda p: p.started) if not p.done]
 
 
@@ -2318,7 +2324,7 @@ def _feed_note(pt, text):
         pt.add_notice(text)
 
 
-def _folder_retype(pt, sid, argv):
+def _folder_retype(pt, sid, argv, forked=False):
     """The folder-pty half of both retries below: instead of `_fork_child`-ing a replacement
     child into the pty (a pid swap -- there is no pid to swap in a shared shell, and a second
     `claude` forked beside the shell would fight it for the tty), wait for the refused `claude`
@@ -2347,7 +2353,9 @@ def _folder_retype(pt, sid, argv):
         abandoned = pt.closing
         other = pt.fg if pt.fg is not None and pt.fg.get("session") != sid else None
         if not abandoned and other is None:
-            pt.fg = {"session": sid, "mode": "resume", "started": time.time()}
+            pt.fg = {"session": sid, "mode": "resume", "started": time.time(), "grants": {sid}}
+            if forked:
+                pt.fg["forked"] = True    # tagged IN the claim: no window where _session_ptys sees it untagged
             pt.fg_seen_child = False
             pt.fg_pending = True
     if abandoned:
@@ -2428,7 +2436,7 @@ def _retry_with_fork(pt, sid, cols, rows):
         # dedicated pty either): resolve_spawned()'s fork-transcript guard hangs off it, and a
         # wrong name on a row is worse than a stale ⑂ chip.
         # ponytail: the chip outlives the fork it describes on a folder row.
-        if not _folder_retype(pt, sid, argv):
+        if not _folder_retype(pt, sid, argv, forked=True):
             return
         with _LOCK:
             pt.forked = True
@@ -3105,9 +3113,18 @@ def open_pty(handler, parsed, body):
                 fp.startup_done = True   # no watcher: later opens take the old (settled) path
     if mode == "cwd":
         with _LOCK:
-            fp.grants.add(sid)
-        return handler._json({"tty": fp.id, "renderer": config.TERM_RENDERER, "forked": False,
-                              "notice": None, "starting": False, "reused": reused, "folder": True})
+            _refresh_fg(fp)
+            fgs = fp.fg.get("session") if fp.fg else ""
+            # Another session's claude holds the shared shell: hand this opener a shell of its
+            # own (the overflow path below) rather than a window onto that session.
+            taken = fp.fg is not None and sid != (fgs or None) and sid not in fp.fg.get("grants", ())
+            if not taken:
+                fp.grants.add(sid)
+        if not taken:
+            return handler._json({"tty": fp.id, "renderer": config.TERM_RENDERER, "forked": False,
+                                  "notice": None, "starting": False, "reused": reused,
+                                  "folder": True})
+        argv = shell_argv
     # ---- resume/new: type it into the shell if idle, peek if it is already this session, else
     # ---- fall through to a dedicated overflow pty
     busy_what = None
@@ -3115,7 +3132,9 @@ def open_pty(handler, parsed, body):
         _refresh_fg(fp)
         fg = fp.fg
         settled = reused and fp.startup_done
-        if fg is None and (not settled or _fg_pgid(fp) == fp.pid):
+        if mode == "cwd":      # only reachable when `taken`: never claim or type into the shared shell
+            busy_what = "another session holds the shared shell"
+        elif fg is None and (not settled or _fg_pgid(fp) == fp.pid):
             # (A shell whose startup has not SETTLED -- one THIS request just spawned, or a cwd
             # shell spawned moments ago (`startup_done` False) -- is claimed even while its rc
             # files still hold the foreground: that job is its own startup, and
@@ -3127,7 +3146,7 @@ def open_pty(handler, parsed, body):
             # the list poll's `_refresh_fg()` runs unlocked-to-us for those seconds and must not
             # mistake the shell's own startup job for this claim's.
             fp.fg = {"session": sid if mode == "resume" else "", "mode": mode,
-                     "started": time.time()}
+                     "started": time.time(), "grants": {sid}}   # the claimant: see _pty_owned
             fp.fg_seen_child = False
             fp.fg_pending = True
         elif mode == "resume" and fg is not None and fg.get("session") == sid:
@@ -3139,6 +3158,8 @@ def open_pty(handler, parsed, body):
     if busy_what == "":
         with _LOCK:
             fp.grants.add(sid)
+            if fp.fg is not None:
+                fp.fg.setdefault("grants", set()).add(sid)
         return handler._json({"tty": fp.id, "renderer": config.TERM_RENDERER, "forked": fp.forked,
                               "notice": None, "starting": False, "reused": True, "folder": True})
     if busy_what is None and not settled:
@@ -3242,10 +3263,10 @@ def _session_ptys(sid):
     if not sid:
         return
     for p in list(PTYS.values()):
-        if p.done or p.closing or p.forked:
+        if p.done or p.closing or (p.forked and not p.folder):
             continue
         if p.folder:
-            if p.fg and p.fg.get("session") == sid:
+            if p.fg and p.fg.get("session") == sid and not p.fg.get("forked"):
                 _refresh_fg(p)          # a stale label is not a hit; a PENDING claim is left alone -> still a hit
                 if p.fg and p.fg.get("session") == sid:
                     yield p
@@ -3275,6 +3296,12 @@ def _pty_owned(p, sid):
     (session), when `p` created `sid` (spawned -- the list row's own `session` field), or when
     `sid` is what the app typed into this folder shell's foreground (fg). The "" session (a
     Terminals-tab / launch-pad shell) may address only a pty that was opened session-less."""
+    if p.folder and p.fg is not None:
+        # An app claim is on the shell (named or not yet latched): only the claimed session
+        # (and whoever the claim granted) may type into or read it -- shell-level grants do not
+        # reach through.
+        fs = p.fg.get("session")
+        return (bool(fs) and sid == fs) or sid in p.fg.get("grants", ())
     if sid in p.grants:
         return True
     if sid == "":
@@ -3529,7 +3556,7 @@ def close_pty(handler, parsed, body):
                 fg = _fg_pgid(pt)
                 if fg != pt.pid:
                     if not body.get("force"):
-                        return handler._json({"busy": True, "fg": pt.fg, "tty": tid}, 409)
+                        return handler._json({"busy": True, "fg": _fg_public(pt.fg), "tty": tid}, 409)
                     targets.append(fg)
             # `closing` is set and `done` is read in ONE critical section, under the same lock
             # `_retry_with_fork` commits its swap beneath -- see the mutual-exclusion comment
@@ -4305,6 +4332,10 @@ def inject(handler, parsed, body):
     pt.touch()
     if not _wait_for_quiescence(pt):
         return handler._json({"ok": False, "reason": "terminal never went quiet"})
+    with _LOCK:      # the foreground may have changed hands during the wait
+        still = _pty_owned(pt, sid)
+    if not still:
+        return _mismatch(handler, tid)
 
     if clear_first:
         if not _inject_write(pt, b"\x05"):                    # Ctrl+E: end of line

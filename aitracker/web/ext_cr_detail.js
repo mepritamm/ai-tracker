@@ -1748,6 +1748,7 @@
         ui.sid = null; ui._boundSid = null;
         ui.lastSession = null; ui.lastState = null; ui.lastTitle = ""; ui.lastGoal = "";
         ui.spineSession = null; ui.spineNowMs = null;
+        ui.narrAcc = null; ui.timelineEntries = null;
         ui.diagramEntries = []; ui.timelineSeen = 0; ui.timelineStuckLatest = true;
         ui.flagOpen = ui.noteOpen = ui.searchOpen = false;
         [".crd-flagcard", ".crd-notecard", ".crd-searchcard"].forEach(function (c) {
@@ -1756,6 +1757,7 @@
         [".crd-flag-input", ".crd-note-queue-input", ".crd-phone-input", ".crd-plan-input", ".crd-run-input", ".crd-search-input"].forEach(function (c) {
           var e = qs(node, c); if (e) e.value = "";
         });
+        node.classList.remove("crd-is-error"); node.removeAttribute("data-err");
         node.classList.add("crd-is-loading");
       });
     }
@@ -2173,6 +2175,14 @@
     },
     update: function (state) {
       renderUpdate(this._root, this._ctx, state);
+    },
+    // A failed switch to an uncached session: replace the loading placeholder with the error.
+    error: function (id, msg) {
+      var root = this._root, n = root && root._crDetail && root._crDetail.node;
+      if (!n || (typeof cur !== "undefined" && id !== cur)) return;
+      n.classList.remove("crd-is-loading");
+      n.classList.add("crd-is-error");
+      n.setAttribute("data-err", String(msg || "error"));
     }
   };
 
@@ -2190,6 +2200,8 @@
     var firstMount = ui.sid == null;
     ui.sid = sid;
     node.classList.remove("crd-is-loading");
+    node.classList.remove("crd-is-error");
+    node.removeAttribute("data-err");
     node.classList.toggle("crd-is-refreshing", !!state.refreshing);
     ui.lastSession = session;
     ui.lastState = state;
@@ -2997,8 +3009,6 @@
   // otherwise). `sid` is the session whose detail this tty came from; bound through ExtVT's one
   // binding, with a literal-session fallback when ext_vt.js is not loaded.
   function _ttyBodyFor(tty, sid, extra) {
-    var X = window.ExtVT;
-    if (X && X.bindTty && X.ttyBody) { X.bindTty(tty, sid); return X.ttyBody(tty, extra); }
     return Object.assign({ tty: tty, session: sid || "" }, extra || {});
   }
   function _injectToTerminal(ctx, tty, text, failLabel, sid) {
@@ -3532,6 +3542,7 @@
     var entry = list[idx];
     if (!entry || !ctx || typeof ctx.dialog !== "function") return;
     ctx.dialog("narration-diagram", {
+      sessionId: ui.sid,
       time: fmtClock(entry.t),
       nodes: entry.nodes,
       family: entry.family,
@@ -3617,6 +3628,7 @@
 
   // Expose pure functions for testability / reuse by a future self-check.
   window.CR.detail._internal = {
+    ttyBodyFor: _ttyBodyFor,
     spineSegments: spineSegments,
     spineSpanChoices: spineSpanChoices,
     spineZoomPct: spineZoomPct,
