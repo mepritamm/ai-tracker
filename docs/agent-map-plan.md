@@ -11,14 +11,14 @@ Pipeline (global CLAUDE.md rule 3): plan (opus agent) → user agreement → imp
 
 | # | Clause | Verdict |
 |---|---|---|
-| 1a | Entire agent map in the control-room UI | not discharged |
-| 1b | Button available on every session | not discharged |
-| 1c | Cheaper models for agents, models always named | ongoing (process) |
-| 2a | Agents + sessions + Agents tab can be viewed in the map | not discharged |
-| 2b | "Open agent map" button right below the main session name | not discharged |
-| 3a | Correct design + all open questions first | in progress |
-| 3b | Then implement | not started — waits on user agreement |
-| 3c | Then adversarial review | not started |
+| 1a | Entire agent map in the control-room UI | **discharged** — `agent-map` dialog; nested tree verified in browser (depth-2 indented with connector) |
+| 1b | Button available on every session | **discharged** — header row on every session; board tiles + rail when the session has agent files |
+| 1c | Cheaper models for agents, models always named | **discharged (process)** — haiku explore/gate/sweeper, sonnet build/fix/visual, opus plan/review only; model chip + model-mix header in the map |
+| 2a | Agents + sessions + Agents tab can be viewed in the map | **discharged** — panel "View in agent map", per-row "map", Sessions group, Agent sessions in the map |
+| 2b | "Open agent map" button right below the main session name | **discharged** — `.crd-id-row3`, verified in browser |
+| 3a | Correct design + all open questions first | **discharged** — design + 11 questions asked and answered |
+| 3b | Then implement | **discharged** — commit on `worktree-agent-map` |
+| 3c | Then adversarial review | **discharged** — plan reviewed ×2 rounds, code reviewed (3 legs) + fix verification |
 
 ## Verified log shape (2026-10-01, probed on this machine)
 
@@ -153,10 +153,10 @@ Contract additions: clauses 4a–4d below are now in scope.
 
 | # | Clause | Verdict |
 |---|---|---|
-| 4a | Details pane inside the map | not discharged |
-| 4b | Map entry on board tiles + rail rows | not discharged |
-| 4c | Per-file parse cache for `parse_agents` | not discharged |
-| 4d | `Agent` dispatches reach the `agents` list | not discharged |
+| 4a | Details pane inside the map | **discharged** — verified in browser (facts, prompt, last output, full transcript; Esc closes pane then map) |
+| 4b | Map entry on board tiles + rail rows | **discharged** — verified in browser (tile button, rail chip/button → navigate + open map) |
+| 4c | Per-file parse cache for `parse_agents` | **discharged** — 132-agent session 3.5s → 0.003s warm; 0 diffs vs base on 119 real sessions |
+| 4d | `Agent` dispatches reach the `agents` list | **discharged** — `("Task","Agent")` + `tool` field + timeline verb |
 
 ## Plan addendum 4a–4d (Plan agent / opus, 2026-11-02) — builds on the reconciled plan
 
@@ -237,3 +237,16 @@ Where they conflict, the later table wins. Field names fixed: agent row `parent,
 | Gate | `test_icons` px rule | confirmed | Use the icon-scale var pattern the test requires. |
 
 **Wave 3 fixers:** Fix-D (sonnet) dialog file + UI test; Fix-E (sonnet) boot/detail/css + entry test + test_icons; Fix-S (sweeper/haiku) cache key + test.
+- Fix-S: reviewer's "same-length rewrite" test was untestable by any stat key (size and mtime both unchanged); replaced with `test_sidecar_growth_within_same_mtime_invalidates` (the real case: sidecar grows in place). Red under the old key. `ponytail:` comment records the same-length ceiling.
+- Gate after fixes: 91/91 + selfcheck ok. **Fix verification (reviewer/opus): 11/13 HOLD**; 2 new — V-F1 panel fallback focus no-op (no tabindex) and V-F2 errored done agent never retries — fixed (`tabindex=-1`; error retry after 10s) with red-proven tests, plus a `renderUpdate` `state.sid` test.
+
+**Wave 4 — ship**
+- Commit `c3c93c0` (hook gate green). `personal/main` had moved 5 commits (session isolation); rebase conflicted in `ext_cr_boot.js`, `ext_cr_detail.js`, `ext_cr_dialogs.js` — resolved by sonnet keeping both sides (map drills go through upstream's stale-sid guard; upstream's `renderUpdate` sid order kept; entry test stubs moved to `sessJSON`). Post-sync gate: **92/92 + selfcheck ok**. Pushed `worktree-agent-map` to `personal`.
+- Visual check (Chrome, sonnet, port 8797): button directly under the title; map, pane, Esc, panel links, tile/rail buttons, 132-agent map all PASS; depth-2 agent drawn indented with └─ connector; no console errors. A first re-check stalled on "Loading session…" only because the browser ran rebased JS against the pre-rebase server — restart fixed it.
+
+**Known gaps / follow-ups (not in this branch)**
+- Pane says "(no output yet)" for a finished agent that wrote no text (narration 0) — should read "No text output" when `state==done`.
+- Upstream (on `personal/main`, untouched here): `dialogs.closeSession` throws `_layer` null `setAttribute` when switching sessions in the classic UI before any dialog opened; boot catches it.
+- R1-F1: an unreadable agent file no longer contributes to `newest` (broken files only).
+- `agent_files_n` counts agent files only — a session whose only agents are SDK child sessions gets no tile/rail button (header button + panel still work).
+- Classic UI has no agent map (scope was the Control Room).
