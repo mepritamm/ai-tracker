@@ -443,6 +443,7 @@
   function open(name, payload) {
     var top = topEntry();
     if (top && top.name === name && typeof top.update === 'function') {
+      if (payload && payload.sessionId) top.sid = payload.sessionId;
       top.update(payload || {});
       return;
     }
@@ -459,7 +460,8 @@
     // (alongside backdrop/panel/update) to declare "feed me the poll broadcast".
     // update() below refuses to forward a poll-tagged payload to any dialog that
     // didn't opt in — see update()'s own comment for why this lives at the seam.
-    var entry = { name: name, wrap: wrap, panel: built.panel, opener: opener, untrap: untrap, update: built.update, wantsPoll: !!built.wantsPoll };
+    var entry = { name: name, wrap: wrap, panel: built.panel, opener: opener, untrap: untrap, update: built.update, wantsPoll: !!built.wantsPoll,
+      sid: (payload && payload.sessionId) || '' };   // '' = session-less (flags, help, config...)
     _stack.push(entry);
     // Focus the first focusable control, else the panel itself.
     var f = built.panel.querySelector(FOCUSABLE);
@@ -479,6 +481,20 @@
       try { entry.opener.focus({ preventScroll: true }); } catch (e) {}
     }
     if (_ctx && typeof _ctx.emit === 'function') _ctx.emit('dialog:closed', { name: entry.name });
+  }
+
+  // CR.dialogs.closeSession(keepSid) — session switch: tear down every dialog bound to a session
+  // other than keepSid (same teardown as close()). Session-less dialogs (sid '') stay open.
+  function closeSession(keepSid) {
+    for (var i = _stack.length - 1; i >= 0; i--) {
+      var entry = _stack[i];
+      if (!entry.sid || entry.sid === keepSid) continue;
+      _stack.splice(i, 1);
+      entry.untrap();
+      entry.wrap.remove();
+      if (_ctx && typeof _ctx.emit === 'function') _ctx.emit('dialog:closed', { name: entry.name });
+    }
+    if (!_stack.length) _layer.setAttribute('aria-hidden', 'true');
   }
 
   // CR.dialogs.update(state) — forwarded to the topmost dialog's own updater, if any.
@@ -2483,6 +2499,7 @@
     mount: mount,
     open: open,
     close: close,
+    closeSession: closeSession,
     update: update,
     emptyState: emptyState,
     errorState: errorState,

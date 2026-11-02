@@ -546,11 +546,11 @@ window.CR = window.CR || {};
     var urlFn = DRILL_URL[kind];
     if (!name || !urlFn || typeof fetch !== 'function') return;
     var sid = payload.sessionId, arg = payload.arg;
-    fetch(urlFn(sid, arg)).then(function (r) {
-      if (!r.ok) throw new Error('http ' + r.status);
-      return r.json();
-    }).then(function (d) {
-      if (!d || d.error) { dialog(name, { error: (d && d.error) || 'not found' }); return; }
+    // A drill request for any session other than the one selected is stale (switched away).
+    if (typeof cur !== 'undefined' && sid !== cur) return;
+    sessJSON(urlFn(sid, arg)).then(function (d) {
+      if (d === STALE) return;
+      if (!d || d.error) { dialog(name, { error: (d && d.error) || 'not found', sessionId: sid }); return; }
       if (kind === 'diff') {
         var ops = d.ops || [];
         var lastOp = ops.length ? ops[ops.length - 1] : null;
@@ -559,15 +559,15 @@ window.CR = window.CR || {};
         lines.forEach(function (l) { if (l.type === 'add') adds++; else if (l.type === 'del') dels++; });
         dialog(name, {
           path: d.file || arg, lines: lines, additions: adds, deletions: dels,
-          expandAboveLabel: false, belowCount: 0,
+          expandAboveLabel: false, belowCount: 0, sessionId: sid,
         });
       } else if (kind === 'output' || kind === 'shell') {
-        dialog(name, { text: d.out || '(no output captured)' });
+        dialog(name, { text: d.out || '(no output captured)', sessionId: sid });
       } else { // agent
-        dialog(name, { text: d.narration || '(no narration recorded)' });
+        dialog(name, { text: d.narration || '(no narration recorded)', sessionId: sid });
       }
     }).catch(function () {
-      dialog(name, { error: 'couldn’t reach the server' });
+      dialog(name, { error: 'couldn’t reach the server', sessionId: sid });
     });
   });
 
@@ -1025,8 +1025,20 @@ window.CR = window.CR || {};
       if (getUiMode() !== 'next' || !mounted) return;
       if (!d || d.error) return;
       if (window.CR.detail && typeof window.CR.detail.update === 'function') {
-        try { window.CR.detail.update({ session: d, now: d.now, triage: computeTriage(d) }); } catch (e) { console.error('[CR] detail.update threw', e); }
+        try { window.CR.detail.update({ session: d, sid: d.id, refreshing: (typeof sessRefreshing !== 'undefined' && sessRefreshing), now: d.now, triage: computeTriage(d) }); } catch (e) { console.error('[CR] detail.update threw', e); }
       }
+    });
+  }
+  // Session isolation: app.js's resetSession() runs this registry on a REAL selection change. Keep
+  // state.sid in step, close session-bound dialogs, and tell every CR module (detail, run) to drop
+  // its per-session state via 'session:reset'.
+  if (typeof onSessionReset === 'function') {
+    onSessionReset(function (next, prev) {
+      state.sid = next || null;
+      if (window.CR.dialogs && typeof window.CR.dialogs.closeSession === 'function') {
+        try { window.CR.dialogs.closeSession(next); } catch (e) { console.error('[CR] dialogs.closeSession threw', e); }
+      }
+      emit('session:reset', { id: next, prev: prev });
     });
   }
 

@@ -1740,6 +1740,26 @@
       });
     }
 
+    // Session isolation: ext_cr_boot.js emits 'session:reset' when the SELECTION changes (app.js
+    // resetSession registry). `ui` is created once per page load, so every per-session field and
+    // every typed-but-unsent input must be dropped here or it lands on the next session.
+    if (ctx && typeof ctx.on === "function") {
+      ctx.on("session:reset", function () {
+        ui.sid = null; ui._boundSid = null;
+        ui.lastSession = null; ui.lastState = null; ui.lastTitle = ""; ui.lastGoal = "";
+        ui.spineSession = null; ui.spineNowMs = null;
+        ui.diagramEntries = []; ui.timelineSeen = 0; ui.timelineStuckLatest = true;
+        ui.flagOpen = ui.noteOpen = ui.searchOpen = false;
+        [".crd-flagcard", ".crd-notecard", ".crd-searchcard"].forEach(function (c) {
+          var e = qs(node, c); if (e) e.hidden = true;
+        });
+        [".crd-flag-input", ".crd-note-queue-input", ".crd-phone-input", ".crd-plan-input", ".crd-run-input", ".crd-search-input"].forEach(function (c) {
+          var e = qs(node, c); if (e) e.value = "";
+        });
+        node.classList.add("crd-is-loading");
+      });
+    }
+
     // ---- single delegated click handler ----
     node.addEventListener("click", function (ev) {
       var t = ev.target.closest("[data-act]");
@@ -1995,7 +2015,10 @@
           // payload shape — instead of the old cr:term-controls-request notice, which
           // unconditionally claimed no terminal could be found even while this exact
           // button was visible and enabled.
+          // Snapshot at click time: the tty and the sid come from the SAME cached payload, so
+          // they name one session by construction; onPick refuses if the selection moved since.
           var ttyMe = ui.lastSession && ui.lastSession.term_tty;
+          var sidMe = ui.sid;
           if (!ttyMe) return; // disabled (renderTerminalPanel); a real click never reaches here
           var isModel = act === "terminal-model";
           var meta2 = ui.lastSession.meta || {};
@@ -2010,8 +2033,9 @@
             ladder: isModel ? (meta2.model_ladder || MODEL_LADDER) : EFFORT_LADDER,
             hints: isModel ? (meta2.model_hints || null) : undefined,
             onPick: function (val) {
+              if (ui.sid !== sidMe) { ctx.emit("notify", { text: "Session changed — not sent." }); return; }
               _injectToTerminal(ctx, ttyMe, "/" + (isModel ? "model" : "effort") + " " + val,
-                isModel ? "Couldn’t switch model" : "Couldn’t switch effort", sid);
+                isModel ? "Couldn’t switch model" : "Couldn’t switch effort", sidMe);
             }
           });
           break;
@@ -2160,9 +2184,13 @@
     if (!session) return;
     var nowSec = state.now || Math.floor(Date.now() / 1000);
     var nowMs = nowSec * 1000;
-    var sid = (session.meta && session.meta.sessionId) || session.id || ui.sid || "unknown";
+    // The server stamps d.id (the namespaced request id) on every detail payload -- authoritative;
+    // meta.sessionId is un-prefixed for Auggie, so it is only a fallback.
+    var sid = state.sid || session.id || (session.meta && session.meta.sessionId) || ui.sid || "unknown";
     var firstMount = ui.sid == null;
     ui.sid = sid;
+    node.classList.remove("crd-is-loading");
+    node.classList.toggle("crd-is-refreshing", !!state.refreshing);
     ui.lastSession = session;
     ui.lastState = state;
     ui.lastTitle = (session.meta && session.meta.title) || "";

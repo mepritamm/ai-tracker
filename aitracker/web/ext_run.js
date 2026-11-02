@@ -83,8 +83,21 @@
   }
   function closeStream() { if (es) { es.close(); es = null; } }
 
+  function curSid() { return (typeof cur === "string" ? cur : ""); }
+  // Session switch (app.js resetSession registry): the run pane, job and stream belong to ONE
+  // session -- two sessions in the same folder must not share them.
+  function resetRun() {
+    closeStream(); job = null; cwd = null; sid = "";
+    var pane = document.getElementById("runout"); if (pane) pane.innerHTML = "";
+    var rc = document.getElementById("runcmd"); if (rc) rc.value = "";
+    setState("");
+    var k = document.getElementById("runkill"); if (k) k.disabled = true;
+  }
+  if (typeof onSessionReset === "function") onSessionReset(resetRun);
+
   function start() {
     if (es) return;
+    var runSid = curSid();                  // read at CLICK time, not at the last render
     var cmd = (document.getElementById("runcmd").value || "").trim();
     if (!cmd) return;
     document.getElementById("runout").innerHTML = "";
@@ -92,9 +105,10 @@
     setState("starting…");
     fetch("/api/term/run", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session: sid, cmd: cmd })
+      body: JSON.stringify({ session: runSid, cmd: cmd })
     }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
       .then(function (res) {
+        if (curSid() !== runSid) return;    // selection moved while the POST was in flight
         if (!res.ok || !res.j.job) { setState(""); append("\x1b[31m" + (res.j.error || "failed") + "\x1b[0m\n"); return; }
         job = res.j.job;
         document.getElementById("runkill").disabled = false;
