@@ -30,6 +30,21 @@ class GoalLineClamp(unittest.TestCase):
         self.assertRegex(js, r'case "toggle-goal":[^;]*classList\.toggle\("crd-goal-open"\)')
         self.assertIn('gl.classList.remove("crd-goal-open")', js)
 
+    def test_empty_goal_stays_hidden(self):
+        # no goal (fresh session / Auggie without a prompt) -> line hidden, no empty clamp box
+        self.assertIn("goalEl.hidden = !goalText;", _read("ext_cr_detail.js"))
+
+    def test_served_page_carries_clamp_ungated(self):
+        # eval: the page the server actually serves (built from web/*) has the clamp + toggle,
+        # and nothing gates the goal line by host or viewport.
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(_WEB)))
+        from aitracker.page import build_page
+        page = build_page()
+        self.assertIn("-webkit-line-clamp: 3", page)
+        self.assertIn('case "toggle-goal":', page)
+        self.assertNotRegex(page, r"\.remote[^{]*\.crd-goalline|\.crd-goalline\s*\{\s*display:\s*none")
+
 
 if __name__ == "__main__":
     unittest.main()
