@@ -2593,6 +2593,7 @@
       facts: facts,
       prompt: (detail && detail.task) || node.task || '',
       lastOutput: tail,
+      emptyText: (node.state === 'done' && !(detail && detail.running)) ? 'No text output' : '(no output yet)',
       error: detail && detail.error ? String(detail.error) : '',
       loading: !detail,
       actions: [{ id: 'transcript', label: 'Full transcript' }],
@@ -2788,7 +2789,7 @@
       paneEl.appendChild(h('div', { class: 'cr-amap-label' }, ['Last output']));
       paneEl.appendChild(pm.error ? h('div', { class: 'cr-amap-hint', role: 'alert' }, ["Couldn't load: " + pm.error])
         : pm.loading ? h('div', { class: 'cr-amap-hint' }, ['Loading…'])
-        : h('pre', { class: 'cr-outputtext cr-amap-text' }, [pm.lastOutput || '(no output yet)']));
+        : h('pre', { class: 'cr-outputtext cr-amap-text' }, [pm.lastOutput || pm.emptyText]));
       pm.actions.forEach(function (act) {
         paneEl.appendChild(h('button', { class: 'cr-btn', type: 'button', 'data-act': act.id, onclick: function () {
           open('agent-transcript', { sessionId: sid, agentId: sel });

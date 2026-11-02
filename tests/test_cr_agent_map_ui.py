@@ -118,6 +118,9 @@ OUT.tail_end_kept = pm.lastOutput.slice(-30) === long.slice(-30);
 OUT.short_tail = agentPaneModel(row('a'), { tail: 'abc' }).lastOutput;
 OUT.prompt = pm.prompt;
 OUT.loading = agentPaneModel(row('a'), null).loading;
+OUT.empty_done = agentPaneModel(row('a', { state: 'done' }), { tail: '' }).emptyText;
+OUT.empty_running = agentPaneModel(row('a', { state: 'running' }), { tail: '' }).emptyText;
+OUT.empty_done_but_running = agentPaneModel(row('a', { state: 'done' }), { tail: '', running: true }).emptyText;
 
 // (c) paneNeedsFetch
 var T = 100000;
@@ -246,6 +249,12 @@ class TestAgentMapPure(unittest.TestCase):
         self.assertEqual(O["short_tail"], "abc")
         self.assertEqual(O["prompt"], "do it")
         self.assertTrue(O["loading"])
+
+    def test_pane_empty_text_by_state(self):
+        O = self.O
+        self.assertEqual(O["empty_done"], "No text output")
+        self.assertEqual(O["empty_running"], "(no output yet)")
+        self.assertEqual(O["empty_done_but_running"], "(no output yet)")
 
     def test_pane_needs_fetch(self):
         O = self.O
@@ -387,6 +396,13 @@ NOW += 4000;
 tick(d, [row('a', { state: 'running', ts: 't11' }), row('b')]);
 OUT.d_emit_11s = EMITS.length;
 
+// (i) G1: finished agent with no text says so
+d = mk();
+tick(d, [row('a', { state: 'done', ts: 't1' }), row('b')]);
+nodeBtn(d, 'a').click();
+d.update({ kind: 'agent-detail', sid: 'S', aid: 'a', seq: EMITS[0][1].seq, detail: { task: 'x', tail: '' } });
+OUT.i_text = paneEl(d).textContent;
+
 // (e) a tick for another session closes the dialog
 d = mk();
 d.update({ kind: 'session', sid: 'OTHER', session: sess([row('a')]) });
@@ -469,6 +485,10 @@ class TestAgentMapDialogBehaviour(unittest.TestCase):
     def test_h_errored_done_agent_retries_after_10s(self):
         self.assertEqual(self.o["h_3s"], 1)
         self.assertEqual(self.o["h_11s"], 2)
+
+    def test_i_done_agent_without_text_says_no_text_output(self):
+        self.assertIn("No text output", self.o["i_text"])
+        self.assertNotIn("(no output yet)", self.o["i_text"])
 
     def test_e_other_session_closes(self):
         self.assertEqual(self.o["e_closes"], 1)

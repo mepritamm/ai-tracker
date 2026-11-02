@@ -7,7 +7,7 @@ Real shipped text is brace-extracted from the source files and run under node
      agent_sessions render a Sessions group.
   3. boot drill handler: reply:'agent-map' routes success, {error} and a rejected
      fetch to CR.dialogs.update(kind:'agent-detail', seq) and NEVER to dialog().
-  4. rail/tile map buttons are gated on agent_files_n (rail also on !bg). railRow and
+  4. rail/tile map buttons are gated on agent_map_n (rail also on !bg). railRow and
      sessionTile close over all of createBoard(), so the gates are asserted on the
      shipped source text; openMap() itself is extracted and run.
 """
@@ -211,8 +211,8 @@ setTimeout(function(){ console.log('@@JSON@@' + JSON.stringify(calls)); }, 20);
 
     def test_rail_and_tile_gates(self):
         b = _src("ext_cr_board.js")
-        self.assertIn("(s.agent_files_n > 0 && !s.bg) ? h('button', {\n        class: 'cr-rail-map'", b)
-        t = b.index("if (s.agent_files_n > 0) {\n        head.appendChild(h('button', {\n          class: 'cr-tile-map'")
+        self.assertIn("(s.agent_map_n > 0 && !s.bg) ? h('button', {\n        class: 'cr-rail-map'", b)
+        t = b.index("if (s.agent_map_n > 0) {\n        head.appendChild(h('button', {\n          class: 'cr-tile-map'")
         self.assertLess(t, b.index("var body = [", t))
         i = b.index("cr-rail-badge--bg', type: 'button',\n        title: s.bg")
         self.assertIn("openMap(ctx, s)", b[i:i + 400])

@@ -250,3 +250,19 @@ Where they conflict, the later table wins. Field names fixed: agent row `parent,
 - R1-F1: an unreadable agent file no longer contributes to `newest` (broken files only).
 - `agent_files_n` counts agent files only — a session whose only agents are SDK child sessions gets no tile/rail button (header button + panel still work).
 - Classic UI has no agent map (scope was the Control Room).
+
+## Follow-up round via /tracker-gap (user: "implement the plan with /tracker-gap and then /tracker-push")
+
+Plan (Plan agent / opus); integrator accepted as written; product call: tile/rail count includes grouped child sessions (matches header).
+- **G1** no-text label — client only: `agentPaneModel` gains `emptyText` = "No text output" when `node.state==='done' && !(detail&&detail.running)`, else "(no output yet)"; `paintPaneBody` uses `pm.lastOutput || pm.emptyText`. Real case: aid a7e85fae652a1bb54 (only text block is the prompt). Tests: pure `test_pane_empty_text_by_state` + fake-DOM `test_i_done_agent_without_text_says_no_text_output`.
+- **G2** SDK-child-only sessions get map entry — `parentId` exists only inside `fs[:limit]`, so count children in a `list_sessions` pre-pass over ALL `fs` (`_pick_parent` reused via `parent_of[f]`), keyed by new `_child_key(fid, sm)` shared with `child_agent_sessions` (re-runs collapse identically). Claude row `agent_sessions_n`; seam `registry.all_sessions` backfills `agent_files_n`/`agent_sessions_n` = 0 and sets `agent_map_n` = sum (Auggie inherits). Board gates/aria read `agent_map_n`. `ponytail:` ceiling: same-dir `_pick_parent` heuristic. Tests: selfcheck orchestrator fixture; new `tests/test_agent_map_children.py` (outside-window child, re-run collapse, registry sum/backfill, Auggie 0); entry-test strings flipped first. Risk: `/api/list` hot path — time before/after.
+- **G3** unreadable file → `newest`: `_agent_entry` returns `(mt, entry|None)`; `parse_agents` advances `newest` before the None check. Test: directory named `agent-zzz.jsonl` newer than the real file; cold/warm/kill-switch. Eval: list row mtime == detail mtime.
+- Out of scope noted: non-UTF-8 agent file raises (`UnicodeDecodeError` not caught at ~1084) — same as base.
+
+**Result:** implemented by 2× sonnet (server G3+G2; client G1+G2 board), tests red-first. Gate (haiku): every module green + `selfcheck ok`. `/api/list` warm 0.16–0.24s vs 0.26s before; `parentId` byte-identical on 1,006 real sessions. Adversarial review (opus): **HOLDS** — 1 minor confirmed: same session id in two project dirs summed both dirs' children ⇒ fixed by keying `child_keys` on `(project dir, parent id)` (sweeper/haiku; `test_same_id_in_two_dirs_counts_per_dir` red 2≠1 → green). Evidence gap noted: no real parent with SDK children on this machine — G2 equality proven by synthetic tests + selfcheck fixture; 0 list/panel mismatches on the full real list.
+
+| # | Clause | Verdict |
+|---|---|---|
+| G1 | "No text output" for a finished agent with no text | **discharged** |
+| G2 | Tile/rail map entry for SDK-child-only sessions (`agent_map_n`, every provider) | **discharged** |
+| G3 | Unreadable agent file still advances `newest` | **discharged** |

@@ -107,6 +107,11 @@ def all_sessions():
         s.setdefault("shells_running", 0)
         # `needs` = the blocked-job question, "" unless a provider sets it.
         s.setdefault("needs", "")
+        # Agent-map entry count: in-transcript agent files + distinct SDK child sessions. Providers
+        # without the concept (Auggie) get an honest 0.
+        s.setdefault("agent_files_n", 0)
+        s.setdefault("agent_sessions_n", 0)
+        s["agent_map_n"] = s["agent_files_n"] + s["agent_sessions_n"]
     out.sort(key=lambda s: (not s.get("pinned"), -s.get("mtime", 0)))   # pinned first, then newest
     return out
 

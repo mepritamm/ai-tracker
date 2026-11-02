@@ -356,6 +356,9 @@ def _run():
     assert kb[0]["runs"] == 1, kb                    # a single-run agent reports runs=1
     assert [k["id"] for k in child_agent_sessions("orchA", d1)] == ["ag_mid"], "each orchestrator gets its own agents"
     assert [k["id"] for k in child_agent_sessions("orchR", d3)] == ["ag_root"], "repo-root orchestrator surfaces its agent"
+    for _o, _d in (("orchB", d1), ("orchA", d1), ("orchR", d3)):   # list count == panel count (same helper)
+        assert ls[_o]["agent_sessions_n"] == len(child_agent_sessions(_o, _d)) == 1, (_o, ls[_o]["agent_sessions_n"])
+    assert ls["ag_orphan"]["agent_sessions_n"] == 0, "an orphan agent has no children"
 
     # sidebar end-state (Claude): waiting = unanswered AskUserQuestion; ended = last real turn is assistant text
     d4 = os.path.join(pdir, "-repo-x-state"); os.makedirs(d4)   # PROJECTS/*/*.jsonl -> needs a subdir to be listed

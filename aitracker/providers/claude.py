@@ -519,6 +519,12 @@ def newest_session_in_cwd(cwd, after_ts, exclude=()):
         return ""
 
 
+def _child_key(fid, sm):
+    """Group key collapsing re-runs of the SAME agent session: its first prompt (else title, else id).
+    Shared by child_agent_sessions (the panel) and list_sessions (agent_sessions_n) so counts agree."""
+    return sm["prompt"] or sm["title"] or fid
+
+
 def child_agent_sessions(sid, projdir):
     """The agent (sdk-cli) sessions this session originated — same project dir, and this session
     won the _pick_parent attribution. Surfaced in the parent's background-agents panel to jump
@@ -537,7 +543,7 @@ def child_agent_sessions(sid, projdir):
             continue
         mt = _active_mtime(f)
         running = (time.time() - mt) < LIVE_WINDOW
-        key = sm["prompt"] or sm["title"] or fid
+        key = _child_key(fid, sm)
         g = groups.get(key)
         if g is None:
             groups[key] = {"id": fid, "title": titles.get(fid) or sm["title"], "wt": _worktree_name(sm["cwd"]),
@@ -627,6 +633,18 @@ def list_sessions(limit=200):
         sm = metas[f]
         if sm["source"] != "sdk-cli":
             humans_by_dir.setdefault(os.path.dirname(f), []).append((os.path.basename(f)[:-6], sm["first"]))
+    # ponytail: ceiling = the same-dir _pick_parent heuristic; costs one _pick_parent per sdk-cli file
+    # per list call (over ALL fs, so a child outside the `limit` window still counts for its parent).
+    parent_of, child_keys = {}, {}
+    for f in fs:
+        sm = metas[f]
+        if sm["source"] != "sdk-cli":
+            continue
+        cands = humans_by_dir.get(os.path.dirname(f))   # a repo-root orchestrator's file lives here too
+        p = _pick_parent(sm["first"], cands) if cands else ""
+        parent_of[f] = p
+        if p:
+            child_keys.setdefault((os.path.dirname(f), p), set()).add(_child_key(os.path.basename(f)[:-6], sm))
     out = []
     # Budget for _fill_pr() below: wall-clock, not a file count, so a run of small transcripts
     # drains more of the pending backlog in one poll while a few p95-sized (~28ms) ones still
@@ -636,11 +654,7 @@ def list_sessions(limit=200):
         sm = metas[f]
         sid = os.path.basename(f)[:-6]
         gkey, glabel = _agent_group(sm["cwd"], sm["source"])
-        parent = ""
-        if sm["source"] == "sdk-cli":
-            cands = humans_by_dir.get(os.path.dirname(f))   # a repo-root orchestrator's file lives here too
-            if cands:
-                parent = _pick_parent(sm["first"], cands)
+        parent = parent_of.get(f, "")
         mt, bg, agent_files_n = _mtime_bg_n(f)
         # Only a session both ENDED and still inside LIVE_WINDOW can ever render as a Landed
         # tile (ext_cr_board.js's sessionState()) — an idle session's PR data would never be
@@ -719,6 +733,7 @@ def list_sessions(limit=200):
             # ALL in-transcript agent files (live or not) -> the agent-map entry on board/rail. Distinct
             # from the heartbeat's `agents_n`; SDK-only child sessions have no agent files, so no button.
             "agent_files_n": agent_files_n,
+            "agent_sessions_n": len(child_keys.get((os.path.dirname(f), sid), ())),   # distinct SDK child sessions (re-runs collapsed)
             "shells_running": shells_running,        # background shell(s) still going -> same treatment as bg
             "waiting": sm["waiting"] or job_waiting,  # unanswered AskUserQuestion / blocked job -> ⏳ sidebar highlight
             "ended": sm["ended"],                    # last turn was the assistant finishing -> ✅ completed
@@ -1123,11 +1138,13 @@ def _agent_file_pass(af, mt):
 
 
 def _agent_entry(af):
-    """(entry|None) for one agent file, from the cache when (mtime_ns, size, sidecar mtime_ns) match."""
+    """(mtime, entry|None) for one agent file, from the cache when (mtime_ns, size, sidecar mtime_ns)
+    match. (None, None) when it can't be stat'ed; an unreadable file still reports its mtime so the
+    caller can advance `newest` (matches parse_session's own file-mtime based value)."""
     try:
         st = os.stat(af)
     except OSError:
-        return None
+        return None, None
     try:
         sst = os.stat(af[:-6] + ".meta.json")
         sk = (sst.st_mtime_ns, sst.st_size)
@@ -1139,7 +1156,7 @@ def _agent_entry(af):
         with _AGENT_CACHE_LOCK:
             hit = _AGENT_CACHE.get(af)
         if hit and hit[0] == key:
-            return hit[1]
+            return st.st_mtime, hit[1]
     e = _agent_file_pass(af, st.st_mtime)
     if e is not None and use:
         with _AGENT_CACHE_LOCK:
@@ -1148,7 +1165,7 @@ def _agent_entry(af):
             if len(_AGENT_CACHE) > _AGENT_CACHE_MAX:
                 for k in list(_AGENT_CACHE)[:len(_AGENT_CACHE) // 2]:   # oldest half, off a snapshot
                     _AGENT_CACHE.pop(k, None)
-    return e
+    return st.st_mtime, e
 
 
 def parse_agents(path, hb=None):
@@ -1168,11 +1185,13 @@ def parse_agents(path, hb=None):
     now = time.time()
     entries, spawned = [], {}
     for af in sorted(_agent_files(path)):
-        e = _agent_entry(af)
+        mt, e = _agent_entry(af)
+        if mt is None:
+            continue
+        newest = max(newest, mt)
         if e is None:
             continue
         entries.append(e)
-        newest = max(newest, e["mt"])
         spawned.update(e["spawned"])
         if hb is not None:
             h = e["hb"]

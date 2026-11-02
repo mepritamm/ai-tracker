@@ -2086,9 +2086,9 @@ window.CR = window.CR || {};
       }, [glyph('note', ''), ' ' + s.note_count]) : null;
       // Agent map shortcut: only when the session has agent files AND no running-agent chip
       // (that chip already carries the agent glyph and opens the map).
-      var mapBtn = (s.agent_files_n > 0 && !s.bg) ? h('button', {
+      var mapBtn = (s.agent_map_n > 0 && !s.bg) ? h('button', {
         class: 'cr-rail-map', type: 'button',
-        title: 'Open agent map', 'aria-label': 'Open agent map (' + s.agent_files_n + ' agent' + (s.agent_files_n === 1 ? '' : 's') + ')',
+        title: 'Open agent map', 'aria-label': 'Open agent map (' + s.agent_map_n + ' agent' + (s.agent_map_n === 1 ? '' : 's') + ')',
         onclick: function (e) { e.stopPropagation(); openMap(ctx, s); }
       }, [glyph('agent', '')]) : null;
       var actions = h('div', { class: 'cr-rail-actions' }, [
@@ -2865,10 +2865,10 @@ window.CR = window.CR || {};
           onclick: function (e) { e.stopPropagation(); ctx && ctx.emit && ctx.emit('session:answer', answerPayload); }
         }, [icon('play', '<path d="M8 4.5l11.5 7.5L8 19.5z"/>')]));
       }
-      if (s.agent_files_n > 0) {
+      if (s.agent_map_n > 0) {
         head.appendChild(h('button', {
           class: 'cr-tile-map', type: 'button', 'data-act': 'agent-map',
-          title: 'Open agent map', 'aria-label': 'Open agent map (' + s.agent_files_n + ' agent' + (s.agent_files_n === 1 ? '' : 's') + ')',
+          title: 'Open agent map', 'aria-label': 'Open agent map (' + s.agent_map_n + ' agent' + (s.agent_map_n === 1 ? '' : 's') + ')',
           onclick: function (e) { e.stopPropagation(); openMap(ctx, s); }
         }, [glyph('agent', '')]));
       }

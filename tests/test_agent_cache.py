@@ -252,6 +252,23 @@ class TestAgentCache(unittest.TestCase):
             claude._agent_entry(path("ggg"))       # overflow again: ddd+eee go, ccc333 survives
             self.assertEqual(keys(), ["ccc333", "fff", "ggg"])
 
+    def test_unopenable_agent_file_still_advances_newest(self):
+        bad = os.path.join(self._adir(), "agent-zzz.jsonl")
+        os.mkdir(bad)                                  # stat ok, open fails -> no entry
+        future = max(os.stat(os.path.join(self._adir(), f)).st_mtime
+                     for f in os.listdir(self._adir()) if f.endswith(".jsonl")) + 100
+        os.utime(bad, (future, future))
+        want = os.stat(bad).st_mtime
+        for env in (None, "1"):
+            with mock.patch.dict(os.environ, {"AITRACKER_NO_AGENT_CACHE": env} if env else {}):
+                if not env:
+                    os.environ.pop("AITRACKER_NO_AGENT_CACHE", None)
+                claude._AGENT_CACHE.clear()
+                for _ in range(2):                     # cold, then warm
+                    rows, newest = parse_agents(self.main)[:2]
+                    self.assertEqual(newest, want)
+                    self.assertFalse([r for r in rows if "zzz" in str(r.get("aid", ""))])
+
     def _touch_new(self, aid):
         _write(os.path.join(self._adir(), "agent-%s.jsonl" % aid),
                [_asst("2026-07-13T08:00:00Z", [{"type": "text", "text": aid}], "m" + aid)])
