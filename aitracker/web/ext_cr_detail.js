@@ -225,7 +225,9 @@
     if (ctx && typeof ctx.markdown === "function") {
       try { return ctx.markdown(text).innerHTML; } catch (e) {}
     }
-    return esc(text); // ctx.markdown absent (older bootstrap) — old esc()-only behaviour
+    // no ctx (renderDecisions/renderPhoneAwaiting) — app.js's global md(), the same thing ctx.markdown wraps
+    try { if (typeof md === "function") return md(text || ""); } catch (e) {}
+    return esc(text); // md absent (older app.js) — old esc()-only behaviour
   }
   // MACHINE-OUTPUT-SAFE variant, for text that is machine-authored rather than prose --
   // an agent's `task` label can legitimately read "delete the stray *.pyc" or similar,
@@ -1165,14 +1167,14 @@
     var d = open[0];
     var q0 = (d.questions && d.questions[0]) || { q: "", options: [] };
     var opts = (q0.options || []).map(function (o) {
-      return '<div class="crd-phone-awaiting-opt">' + esc(o) + "</div>";
+      return '<div class="crd-phone-awaiting-opt">' + mdHtml(null, o) + "</div>";
     }).join("");
     card.hidden = false;
     card.innerHTML =
       '<div class="crd-phone-awaiting-head"><span class="tn-emo-a" aria-hidden="true">' + ico('hourglass') + '</span> Waiting on you' +
         (open.length > 1 ? '<span class="crd-phone-awaiting-more mono"> +' + (open.length - 1) + " more</span>" : "") +
       "</div>" +
-      '<div class="crd-phone-awaiting-q">' + esc(q0.q) + "</div>" +
+      '<div class="crd-phone-awaiting-q">' + mdHtml(null, q0.q) + "</div>" +
       opts +
       '<div class="crd-phone-awaiting-foot">View-only — answer in the session itself.</div>';
   }
@@ -1779,7 +1781,8 @@
           break;
         case "toggle-goal":
           // don't collapse while the user is selecting text to copy
-          if (!String(window.getSelection() || "")) t.classList.toggle("crd-goal-open");
+          // ...nor when the click is on a link inside the goal (the link opens, the line stays put)
+          if (!ev.target.closest("a") && !String(window.getSelection() || "")) t.classList.toggle("crd-goal-open");
           break;
         case "toggle-panel": {
           var key = t.getAttribute("data-panel");
@@ -2438,7 +2441,8 @@
     var goalEl = qs(node, ".crd-goalline");
     if (goalEl) {
       goalEl.hidden = !goalText;
-      goalEl.textContent = goalText;
+      // inline md() (not mdHtml): the raw last prompt in a one-line clamp must never become a fence block
+      goalEl.innerHTML = typeof md === "function" ? md(goalText) : esc(goalText);
       goalEl.setAttribute("data-act", "toggle-goal");
       goalEl.title = "Click to expand / collapse";
     }
@@ -2732,11 +2736,11 @@
     function renderQ(d, isOpen) {
       var q0 = (d.questions && d.questions[0]) || { q: "", options: [] };
       var opts = (q0.options || []).map(function (o) {
-        return '<div class="crd-decision-opt">' + esc(o) + "</div>";
+        return '<div class="crd-decision-opt">' + mdHtml(null, o) + "</div>";
       }).join("");
-      var answer = !isOpen && d.answer ? '<div class="crd-decision-answer">Decided: ' + esc(d.answer) + "</div>" : "";
+      var answer = !isOpen && d.answer ? '<div class="crd-decision-answer">Decided: ' + mdHtml(null, d.answer) + "</div>" : "";
       return '<div class="crd-decision' + (isOpen ? " is-open" : "") + '">' +
-        '<div class="crd-decision-q">' + esc(q0.q) + "</div>" +
+        '<div class="crd-decision-q">' + mdHtml(null, q0.q) + "</div>" +
         (isOpen ? opts : "") + answer + "</div>";
     }
 
@@ -3709,6 +3713,8 @@
     heartbeatSummaryHtml: heartbeatSummaryHtml,
     heartbeatHtml: heartbeatHtml,
     renderHeartbeat: renderHeartbeat,
-    setPanelCollapsed: setPanelCollapsed
+    setPanelCollapsed: setPanelCollapsed,
+    mdHtml: mdHtml,
+    renderDecisions: renderDecisions
   };
 })();

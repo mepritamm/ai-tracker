@@ -1405,6 +1405,67 @@ class TestNarrationPagination(unittest.TestCase):
         self.assertEqual(r.status, 404)
 
 
+@unittest.skipUnless(shutil.which("node"), "node not available")
+class TestNarrationBareUrlsAreLinks(unittest.TestCase):
+    """Bare http(s) URLs in session text (a PR column in a narration table) render as
+    links, for BOTH providers, through the SERVED page's real bundle: the classic modal
+    (mdBlock) and the control room (mdHtml, decision panel)."""
+
+    PR = "https://github.com/o/r/pull/1106"
+
+    def setUp(self):
+        self.snap = _snap()
+        _empty_env()
+        d = os.path.join(config.PROJECTS, "proj"); os.makedirs(d, exist_ok=True)
+        lines = [{"type": "user", "cwd": "/x", "message": {"role": "user", "content": "go"}},
+                 {"type": "assistant", "timestamp": "2026-06-22T10:00:00Z", "message": {"content": [
+                     {"type": "text", "text": "| Ticket | PR |\n|---|---|\n| AIO-1 | %s |" % self.PR}]}}]
+        with open(os.path.join(d, "surl.jsonl"), "w") as fh:
+            fh.write("\n".join(json.dumps(o) for o in lines) + "\n")
+        _write_auggie("aurl", "t", resp="opened %s." % self.PR)
+        self.srv = _server.Server(("127.0.0.1", 0), _server.Handler)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown(); self.srv.server_close()
+        _restore(self.snap)
+
+    def _get(self, path):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", path); r = c.getresponse(); body = r.read().decode(); c.close()
+        self.assertEqual(r.status, 200, path)
+        return body
+
+    def test_bare_urls_render_as_links_on_every_path(self):
+        from tests.test_links_liveness import _JS_PREAMBLE, _JS_MID, _extract_script_content, _run_node
+        claude = json.loads(self._get("/api/session?id=surl"))["narrative"][0]["text"]
+        auggie = json.loads(self._get("/api/session?id=auggie:aurl"))["narrative"][0]["text"]
+        self.assertIn(self.PR, claude); self.assertIn(self.PR, auggie)
+        tail = r"""
+var C = %s, A = %s, I = window.CR.detail._internal, wrap = makeEl();
+I.renderDecisions(wrap, {decisions: [{open: true, questions: [{q: "merge " + %s + "?", options: [%s]}]}]});
+console.log("===URL_JSON_START===" + JSON.stringify({classic_claude: mdBlock(C), classic_auggie: mdBlock(A),
+  cr_claude: I.mdHtml(null, C), cr_auggie: I.mdHtml(null, A), decision: wrap.innerHTML}));
+""" % (json.dumps(claude), json.dumps(auggie), json.dumps(self.PR), json.dumps(self.PR))
+        js = "\n".join([_JS_PREAMBLE, _extract_script_content(self._get("/")), _JS_MID, tail])
+        rc, out, err = _run_node(js)
+        self.assertEqual(rc, 0, err)
+        got = json.loads(out[out.index("===URL_JSON_START===") + len("===URL_JSON_START==="):].strip())
+        link = '<a href="%s" target=_blank rel=noopener>%s</a>' % (self.PR, self.PR)
+        for k, html in got.items():
+            self.assertIn(link, html, "%s: bare URL not linked: %r" % (k, html))
+        self.assertIn("<td>" + link + "</td>", got["classic_claude"])   # the screenshot's table cell
+        self.assertIn(link + ".", got["classic_auggie"])                 # trailing period stays outside
+        self.assertEqual(got["decision"].count(link), 2)                 # question AND option
+
+    def test_goal_line_is_inline_markdown_and_link_clicks_do_not_toggle(self):
+        page = self._get("/")
+        self.assertIn('goalEl.innerHTML = typeof md === "function" ? md(goalText) : esc(goalText)', page)
+        self.assertNotIn("goalEl.textContent = goalText", page)
+        self.assertIn('if (!ev.target.closest("a") && !String(window.getSelection()', page)
+
+
 class TestTermIdleTtlEndToEnd(unittest.TestCase):
     """TERM_IDLE_TTL_MIN end to end: the real server's /api/config, and the served page's row."""
 
