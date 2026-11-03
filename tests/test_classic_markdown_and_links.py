@@ -571,5 +571,49 @@ class TestSupportingCssStillPresent(unittest.TestCase):
         self.assertIn(".linkgrp{", self.css, "the one small new group-label rule this pass adds")
 
 
+# Bare URLs (e.g. a PR column in a narration table) were plain text: md() only linked [text](url).
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestMdAutolinksBareUrls(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        driver = _APP_JS_STUB_PREAMBLE + _read_app_js() + r"""
+var OUT = {};
+OUT["table"] = mdBlock("| Ticket | PR |\n|---|---|\n| AIO-1 | https://github.com/o/r/pull/1106 |");
+OUT["trailing"] = md("see https://example.com/a?x=1&y=2.");
+OUT["mdlink"] = md("[PR](https://example.com/p)");
+OUT["code"] = md("`https://example.com/c`");
+OUT["quote"] = md('[x](https://a"onmouseover=alert(1))') + md('https://b"onmouseover=alert(1)');
+OUT["js"] = md("javascript:alert(1)");
+console.log("===AUTOLINK_JSON_START===");
+console.log(JSON.stringify(OUT));
+"""
+        returncode, stdout, stderr = _run_node(driver)
+        if returncode != 0:
+            raise AssertionError("autolink harness failed (exit %d)\n%s\n%s" % (returncode, stdout, stderr))
+        cls.OUT = _extract_after_marker(stdout, "===AUTOLINK_JSON_START===")
+
+    def test_bare_url_in_table_cell_is_a_link(self):
+        self.assertIn('<td><a href="https://github.com/o/r/pull/1106" target=_blank rel=noopener>'
+                      'https://github.com/o/r/pull/1106</a></td>', self.OUT["table"])
+
+    def test_trailing_punctuation_stays_outside_the_link(self):
+        self.assertIn('href="https://example.com/a?x=1&amp;y=2"', self.OUT["trailing"])
+        self.assertTrue(self.OUT["trailing"].endswith("</a>."), self.OUT["trailing"])
+
+    def test_markdown_link_is_not_double_linked(self):
+        self.assertEqual(self.OUT["mdlink"], '<a href="https://example.com/p" target=_blank rel=noopener>PR</a>')
+
+    def test_url_in_code_stays_inside_code(self):
+        self.assertIn("<code><a href=", self.OUT["code"])
+        self.assertIn("</a></code>", self.OUT["code"])
+
+    def test_quote_never_breaks_out_of_href(self):
+        self.assertNotRegex(self.OUT["quote"], r"<a [^>]*onmouseover")
+
+    def test_non_http_scheme_is_not_linked(self):
+        self.assertNotIn("<a ", self.OUT["js"])
+
+
 if __name__ == "__main__":
     unittest.main()

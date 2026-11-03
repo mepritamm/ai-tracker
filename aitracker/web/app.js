@@ -150,7 +150,15 @@ function md(s,safe){
   // and corrupting them (`*.py and *.js` -> `<em>.py and </em>.js`). `**bold**`, `code`,
   // and links above are unaffected -- they don't collide with real machine output.
   if(!safe)h=h.replace(/(^|[^*])\*(?!\s)([^*\n]+?)\*/g,"$1<em>$2</em>");
-  h=h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target=_blank rel=noopener>$1</a>');
+  // [text](url) AND bare http(s) URLs, in ONE pass so a link's own href is never re-linked.
+  // `"` never enters a URL (it would break out of href="..."). Bare URLs stop at whitespace,
+  // quotes and tags (`</code>`, `</strong>`) and shed trailing punctuation / an escaped `>`.
+  // ponytail: a trailing `)` is always shed (wiki-style `Foo_(bar)` loses it); balance parens if that bites.
+  h=h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)"]+)\)|https?:\/\/[^\s"'<]+/g,(m,t,u)=>{
+    if(t)return `<a href="${u}" target=_blank rel=noopener>${t}</a>`;
+    const tail=(m.match(/(?:&gt;|[.,;:!?)\]*])+$/)||[""])[0], url=m.slice(0,m.length-tail.length);
+    return url.split("//")[1]?`<a href="${url}" target=_blank rel=noopener>${url}</a>${tail}`:m;
+  });
   return h;
 }
 // Machine-output-safe variant of md() -- escape first (same as md()), keep inline code/
