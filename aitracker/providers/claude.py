@@ -649,6 +649,47 @@ def parked_job_id(pid, label):
         return ""
 
 
+_CONTINUED_MARK = b'"type":"continued-in"'
+
+
+def _continued_in(path):
+    """The job J when this transcript's newest conversational record is a `continued-in` marker
+    (written when the TUI is parked: the conversation moved to daemon job J), else "". Mirrors the
+    CLI's own tail read: a later user/assistant line voids the marker. 96 KB tail. Never raises."""
+    try:
+        with open(path, "rb") as fh:
+            size = fh.seek(0, 2)
+            fh.seek(max(0, size - 98304))
+            tail = fh.read()
+        if _CONTINUED_MARK not in tail:
+            return ""
+        for raw in reversed(tail.split(b"\n")):
+            if _CONTINUED_MARK in raw:
+                try:
+                    j = json.loads(raw).get("continuedInSessionId")
+                except (ValueError, AttributeError):
+                    return ""
+                return j if isinstance(j, str) and safe_path_component(j) else ""
+            if b'"type":"user"' in raw or b'"type":"assistant"' in raw:
+                return ""
+        return ""
+    except Exception:
+        return ""
+
+
+def background_id(sid):
+    """`sid` when a live daemon REPL hosts it, else the ONE job it continued in (one hop) when that is
+    hosted, else "". Never raises."""
+    try:
+        if daemon_repl_pid(sid) > 0:
+            return sid
+        path = find_session(sid)
+        j = _continued_in(path) if path else ""
+        return j if j and daemon_repl_pid(j) > 0 else ""
+    except Exception:
+        return ""
+
+
 def session_label(sid):
     """A session's title for a banner: its rename, else its transcript's title, else "". Never raises."""
     try:

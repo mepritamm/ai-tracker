@@ -2934,7 +2934,7 @@
         body: JSON.stringify({ session: sid, cols: m.cols, rows: m.rows, mode: mode })
       }).then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; }); })
         .then(function (res) {
-          if (res.j && res.j.tty) bindTty(res.j.tty, sid);   // the session this POST named
+          if (res.j && res.j.tty) bindTty(res.j.tty, res.j.session || sid);   // the session the server says runs there (a parked original resolves to its job)
           if (gen !== openGen) {
             // Superseded by a later open() while this was in flight — generation, not `activeSid`,
             // because a same-session supersede (two opens for one sid, or two modes) leaves
@@ -3844,7 +3844,7 @@
               body: JSON.stringify({ session: sid, cols: m.cols, rows: m.rows, mode: mode })
             }).then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; }); })
               .then(function (res) {
-                if (res.j && res.j.tty) bindTty(res.j.tty, sid);
+                if (res.j && res.j.tty) bindTty(res.j.tty, res.j.session || sid);   // the session the server says runs there
                 if (!res.ok || !res.j || !res.j.tty) {
                   if (destroyed) return;
                   fail((res.j && res.j.error) ||

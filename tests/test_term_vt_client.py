@@ -2900,11 +2900,28 @@ class TestTtyAddressedCallsCarryTheirSession(unittest.TestCase):
 
     def test_every_tty_entry_point_binds(self):
         src = _read("ext_vt.js")
-        for needle in ("bindTty(res.j.tty, sid)", "bindTty(target.tty, target.session, true)",
+        for needle in ("bindTty(res.j.tty, res.j.session || sid)", "bindTty(target.tty, target.session, true)",
                        "bindTty(tty, sid);", "bindTty(ttyId, sid, true)", "bindRows("):
             self.assertIn(needle, src)
         self.assertIn('bindTty(res.j.tty, "")', _read("ext_cr_term.js"))
         self.assertIn('bindTty(res.j.tty, "")', _read("ext_launch.js"))
+
+
+class TestRedirectedSessionBinds(unittest.TestCase):
+    """POST /api/term/pty answers `session` = what actually runs in the tty (a parked original
+    resolves to its job). Both open paths -- the modal's _openVTFresh and mountInto, which the
+    Control Room's terminal rides -- must bind to THAT, or the pane reads as someone else's (409)."""
+
+    def test_both_open_paths_bind_the_session_the_server_names(self):
+        src = _read("ext_vt.js")
+        self.assertEqual(src.count("bindTty(res.j.tty, res.j.session || sid)"), 2)
+        self.assertNotIn("bindTty(res.j.tty, sid)", src)
+
+    def test_control_room_terminal_rides_mountinto(self):
+        cr = _read("ext_cr_term.js")
+        self.assertIn("window.ExtVT.mountInto(container, target, opts)", cr)
+        self.assertNotIn("/api/term/pty\", { session", cr)      # no private session-scoped POST to bind separately
+        self.assertIn("res.j.notice", cr)                        # its session-less open shows the notice too
 
 
 class TestClosedStreamStatus(unittest.TestCase):

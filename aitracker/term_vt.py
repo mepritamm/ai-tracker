@@ -3003,6 +3003,9 @@ def open_pty(handler, parsed, body):
         `notice` names the displaced session. A PARKED pane (`parkedJobId` in its sessions file, no
         unseen work children) is taken the same way, with a longer wait for its graceful exit and
         no mode reset. Every refusal of the guards falls through to the dedicated pty below.
+      * `"resume"` of a session that was PARKED into a daemon job (its transcript ends in a
+        `continued-in` marker naming a live job) runs THAT job: `sid` is resolved once, at the top,
+        and the response's `session` names what actually runs in the tty so the client binds to it.
       * otherwise the shell is busy (some other session, a job the user typed, or the typed
         line could not be delivered) -- this falls through to the pre-folder behaviour: a
         DEDICATED pty for this one session, flagged `overflow` so it vanishes from the list the
@@ -3018,15 +3021,25 @@ def open_pty(handler, parsed, body):
     mode = body.get("mode", "cwd")
     if mode not in ("cwd", "resume", "new"):
         return handler._json({"error": "bad mode"}, 400)
+    req_sid, bg = sid, ""
     if sid:
         # Original, session-scoped form -- unchanged from before the cwd form existed.
         if mode == "resume" and not _is_claude(sid):
             return handler._json({"error": "resume is Claude-only"}, 400)
+        if mode == "resume":
+            # A session parked into a daemon job (the old row) runs AS that job: resume the live
+            # conversation, never a frozen copy beside it. Resolved once, here; every later line
+            # (argv, claim, response `session`) then speaks about the job. The cwd is still the
+            # REQUESTED id's: the job was forked from it (same folder), may have no transcript of its
+            # own yet (it gets one at its first turn), and a missing folder 404s exactly as before.
+            bg = _background_target(sid)
+            if bg and bg != sid:
+                sid = bg
         # resume=True: a removed worktree/folder shouldn't block resuming -- claude looks the
         # session up by id, so any existing ancestor directory works (term_gate.session_cwd).
         # Passed only on resume: cwd/new keep the old plain call (some tests stub session_cwd
         # with a one-arg lambda; unconditionally passing resume=False would break those too).
-        cwd = term_gate.session_cwd(sid, resume=True) if mode == "resume" else term_gate.session_cwd(sid)
+        cwd = term_gate.session_cwd(req_sid, resume=True) if mode == "resume" else term_gate.session_cwd(sid)
         if not cwd:
             return handler._json({"error": "session not found or its cwd no longer exists"}, 404)
     else:
@@ -3073,10 +3086,12 @@ def open_pty(handler, parsed, body):
         with _LOCK:
             _reap()
             if mode == "resume":
-                hit = _session_pty(sid)
+                hit, bound = _session_pty(sid), sid
+                if hit is None and req_sid != sid:
+                    hit, bound = _session_pty(req_sid), req_sid     # the pane that still runs the old id
                 if hit is not None:
-                    hit.grants.add(sid)
-                    return handler._json({"tty": hit.id, "renderer": config.TERM_RENDERER,
+                    hit.grants.add(bound)
+                    return handler._json({"tty": hit.id, "session": bound, "renderer": config.TERM_RENDERER,
                                           "forked": hit.forked, "notice": None,
                                           "starting": False, "reused": True,
                                           "folder": hit.folder})
@@ -3140,7 +3155,7 @@ def open_pty(handler, parsed, body):
             if not taken:
                 fp.grants.add(sid)
         if not taken:
-            return handler._json({"tty": fp.id, "renderer": config.TERM_RENDERER, "forked": False,
+            return handler._json({"tty": fp.id, "session": sid, "renderer": config.TERM_RENDERER, "forked": False,
                                   "notice": None, "starting": False, "reused": reused,
                                   "folder": True})
         argv = shell_argv
@@ -3179,7 +3194,7 @@ def open_pty(handler, parsed, body):
             fp.grants.add(sid)
             if fp.fg is not None:
                 fp.fg.setdefault("grants", set()).add(sid)
-        return handler._json({"tty": fp.id, "renderer": config.TERM_RENDERER, "forked": fp.forked,
+        return handler._json({"tty": fp.id, "session": sid, "renderer": config.TERM_RENDERER, "forked": fp.forked,
                               "notice": None, "starting": False, "reused": True, "folder": True})
     if busy_what is None and not settled:
         starting = mode == "resume"
@@ -3200,7 +3215,7 @@ def open_pty(handler, parsed, body):
             starting = False
         with _LOCK:
             fp.grants.add(sid)
-        return handler._json({"tty": fp.id, "renderer": config.TERM_RENDERER, "forked": forked,
+        return handler._json({"tty": fp.id, "session": sid, "renderer": config.TERM_RENDERER, "forked": forked,
                               "notice": None, "starting": starting, "reused": reused,
                               "folder": True})
     if busy_what is None:
@@ -3217,7 +3232,7 @@ def open_pty(handler, parsed, body):
                 starting = _start_backstop(fp, sid, forked, cols, rows)
             with _LOCK:
                 fp.grants.add(sid)
-            return handler._json({"tty": fp.id, "renderer": config.TERM_RENDERER, "forked": forked,
+            return handler._json({"tty": fp.id, "session": sid, "renderer": config.TERM_RENDERER, "forked": forked,
                                   "notice": None, "starting": starting, "reused": reused,
                                   "folder": True})
         # The shell would not take the line (never went quiet, or the write failed because it
@@ -3229,7 +3244,7 @@ def open_pty(handler, parsed, body):
             fp.starting = False
         busy_what = why
     # ---- an unwatched pane showing ANOTHER background session's daemon client is taken over
-    if mode == "resume" and busy_what and _background_target(sid):
+    if mode == "resume" and busy_what and bg:
         cand = _swap_candidate(fp, sid, cwd)
         reply = cand and _swap_in(fp, cand, sid, argv, forked, cols, rows)
         if reply:
@@ -3269,7 +3284,7 @@ def open_pty(handler, parsed, body):
     # and never touches the flag again), so a viewer attaching later already knows to expect
     # `_screen_stream_body()`'s rows-suppressed frames until the `starting` key in those frames
     # itself goes False.
-    handler._json({"tty": pt.id, "renderer": config.TERM_RENDERER, "forked": forked,
+    handler._json({"tty": pt.id, "session": sid, "renderer": config.TERM_RENDERER, "forked": forked,
                    "notice": None,
                    "starting": starting, "reused": False, "folder": False})
 
@@ -3301,11 +3316,12 @@ def _provider():
 
 
 def _background_target(sid):
-    """`sid` when a live Claude-daemon REPL hosts it (it is a BACKGROUND session), else "". Reads the
-    roster; never raises."""
+    """The id of the live daemon session that runs `sid`: `sid` itself when a daemon REPL hosts it, the
+    job it was parked into (one hop, via its `continued-in` marker) when that is hosted, else "".
+    Reads the roster and the transcript's tail; never raises."""
     try:
         c = _provider()
-        return sid if c is not None and c.daemon_repl_pid(sid) > 0 else ""
+        return c.background_id(sid) if c is not None else ""
     except Exception:
         return ""
 
@@ -3434,8 +3450,8 @@ def _swap_in(fp, cand, sid, argv, forked, cols, rows):
             '"%s"' % title if title else "session", cand["shown"][:8])
     with _LOCK:
         fp.grants.add(sid)
-    return {"tty": fp.id, "renderer": config.TERM_RENDERER, "forked": forked, "notice": notice,
-            "starting": starting, "reused": True, "folder": True}
+    return {"tty": fp.id, "session": sid, "renderer": config.TERM_RENDERER, "forked": forked,
+            "notice": notice, "starting": starting, "reused": True, "folder": True}
 
 
 def _session_pty(sid):
