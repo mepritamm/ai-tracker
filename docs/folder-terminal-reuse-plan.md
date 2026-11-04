@@ -543,6 +543,11 @@ User decisions on these (2026-11-04):
 - `claude stop <J>`: `--resume O` then starts a STANDALONE client on O (`claude --resume O`, no conversion, `parkedJobId` None). Stopping a job does NOT kill a `run_in_background` tool it started (orphaned `python3 time.sleep(400)` with ppid 1; killed by me after a cwd check).
 - **Unpark (deviation from the spec's assumption)**: Enter (or Right) in the parked agent view returns to the original prompt, but `sessions/<pid>.json` KEEPS `parkedJobId` (file untouched, mtime = park time), and a second Left parks again with the same id. The file cannot tell "parked view" from "returned view". Both are clients of the still-live job (SIGTERM-safe as measured), so the takeover treats them alike; the spec's "ineligible while unparked" cannot be implemented from the file and is not claimed.
 
+### Commit (b) parked branch — mutation log
+6 mutations on `term_vt.py` and 4 on `providers/claude.py` all RED, including `TZ=UTC` removal (caught by the plain real-`ps` test AND the explicit other-timezone test, since this machine runs IST). Logs: exp3/mut_b.log.
+
+Live finding (L7): right after a park, the pane's own hooks (iTerm `it2`, osascript) appear as non-pgid children for 1-2s, so the strict work check refused a perfectly idle parked pane about half the time. `_swap_candidate` now samples for up to `PARKED_WORK_SETTLE` (3s) until the children are gone (None = unreadable `ps` still refuses at once). Mutations: single sample, fail-open None: both RED.
+
 ### Commit (a) thin swap — mutation log
 11 mutations on `term_vt.py` all RED (viewer, short mismatch, standalone, displaced REPL dead, shell moved, foreground changed, no touch at claim, no mode reset, label not restored, target not background, no viewer grace); 3 on `ext_vt.js` all RED. Logs: exp3/mut_a.log, mut_js.log.
 

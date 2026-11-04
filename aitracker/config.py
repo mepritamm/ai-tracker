@@ -70,6 +70,7 @@ AUGMENT_DIR = os.path.expanduser("~/.augment")
 TASKS_DIR = os.path.expanduser("~/.claude/tasks")
 JOBS_DIR = os.path.expanduser("~/.claude/jobs")
 DAEMON_ROSTER = os.path.expanduser("~/.claude/daemon/roster.json")
+LIVE_SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")   # <pid>.json per live Claude TUI (parkedJobId, procStart)
 
 
 EDIT_TOOLS = {"Edit", "MultiEdit", "NotebookEdit"}

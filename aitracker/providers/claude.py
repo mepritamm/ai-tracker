@@ -1,4 +1,4 @@
-import glob, json, os, re, threading, time
+import glob, json, os, re, subprocess, threading, time
 from ..config import EDIT_TOOLS, NARRATION_CAP
 from .. import config
 from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, pr_summary, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase, real_model, model_label
@@ -606,6 +606,47 @@ def daemon_repl_pid(sid):
             rp = w.get("replPid")
             return rp if _pid_alive(rp) else 0
     return 0
+
+
+def _ps_lstart(pid):
+    """`ps -o lstart=` for `pid`, whitespace-normalised, "" on any failure. Run with LC_ALL=C TZ=UTC:
+    the CLI writes `procStart` that way, and the machine's own zone would never match it."""
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True,
+                             text=True, timeout=2, env=dict(os.environ, LC_ALL="C", TZ="UTC"))
+        return " ".join((out.stdout or "").split())
+    except Exception:
+        return ""
+
+
+def parked_job_id(pid, label):
+    """The job's session id when process `pid` is a PARKED TUI (Left arrow at an empty prompt: the
+    conversation moved to a daemon job, the TUI is just a client) running session `label` whose job
+    is live, else "". Reads only pid/kind/sessionId/parkedJobId/procStart from
+    LIVE_SESSIONS_DIR/<pid>.json. procStart must equal the process's real start time (a recycled pid
+    never matches; a missing procStart is "" -- fail closed). The file KEEPS parkedJobId after the
+    user returns to the prompt: both states are clients of the live job. Never raises."""
+    try:
+        if type(pid) is not int or pid <= 0 or not isinstance(label, str) or not label:
+            return ""
+        with open(os.path.join(config.LIVE_SESSIONS_DIR, "%d.json" % pid)) as fh:
+            d = json.load(fh)
+        if not isinstance(d, dict) or d.get("pid") != pid or d.get("kind") != "interactive" \
+                or d.get("sessionId") != label:
+            return ""
+        short = d.get("parkedJobId")
+        if not isinstance(short, str) or safe_path_component(short) is None:
+            return ""
+        started = d.get("procStart")
+        if not isinstance(started, str) or " ".join(started.split()) != _ps_lstart(pid):
+            return ""
+        w = _live_workers().get(short)
+        job = w.get("sessionId") if isinstance(w, dict) else None
+        if not isinstance(job, str) or safe_path_component(job) is None or not _pid_alive(w.get("replPid")):
+            return ""
+        return job
+    except Exception:
+        return ""
 
 
 def session_label(sid):

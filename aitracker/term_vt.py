@@ -3000,8 +3000,9 @@ def open_pty(handler, parsed, body):
         still in this folder -- the pane is TAKEN OVER (`_swap_candidate`/`_swap_in`): SIGTERM to the
         client's group (the session lives in the daemon; the client holds nothing), the terminal modes
         it left on are reset, the new resume is typed at the prompt it leaves, and the response
-        `notice` names the displaced session. Every refusal of the guards falls through to the
-        dedicated pty below.
+        `notice` names the displaced session. A PARKED pane (`parkedJobId` in its sessions file, no
+        unseen work children) is taken the same way, with a longer wait for its graceful exit and
+        no mode reset. Every refusal of the guards falls through to the dedicated pty below.
       * otherwise the shell is busy (some other session, a job the user typed, or the typed
         line could not be delivered) -- this falls through to the pre-folder behaviour: a
         DEDICATED pty for this one session, flagged `overflow` so it vanishes from the list the
@@ -3283,6 +3284,8 @@ def open_pty(handler, parsed, body):
 # in that folder and nobody is watching the pane, B takes the pane over instead of opening a new one.
 
 THIN_DETACH_WAIT = 2.0      # measured 0.05s: the client has no SIGTERM handler
+PARKED_DETACH_WAIT = 8.0    # measured 1-2.6s: a parked TUI exits gracefully and runs its SessionEnd hooks
+PARKED_WORK_SETTLE = 3.0    # a parked TUI's own hooks (iTerm `it2`, osascript) show as children for ~1-2s after each event
 VIEWER_GRACE = 0.5          # grid streams poll _peer_gone every 0.05s, raw ones every 0.2s
 _TERM_MODE_RESET = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?25h"
 """What a killed `claude attach` client leaves on: alt screen, mouse (1000/1002/1003 + SGR), focus
@@ -3362,7 +3365,20 @@ def _swap_candidate(fp, sid, cwd):
         short = _thin_client_short(pg)
         if len(short) >= 4 and shown.startswith(short) and c.daemon_repl_pid(shown) > 0:
             return {"fg": fg, "pg": pg, "kind": "thin", "shown": shown}
-        return None
+        # A PARKED pane (Left arrow at an empty prompt): its conversation lives in a daemon job, the
+        # TUI is only a client. Its args are unchanged, so identity comes from the sessions file;
+        # unseen work would show as non-standing children, and an unreadable `ps` is "unknown".
+        job = c.parked_job_id(pg, shown)
+        if not job:
+            return None
+        end = time.time() + PARKED_WORK_SETTLE       # hook children are transient: sample until clean
+        while True:
+            work = _claude_work_children(pg, strict=True)
+            if work == []:
+                return {"fg": fg, "pg": pg, "kind": "parked", "shown": job}
+            if work is None or time.time() >= end:
+                return None
+            time.sleep(0.25)
     except Exception:
         return None
 
@@ -3398,7 +3414,7 @@ def _swap_in(fp, cand, sid, argv, forked, cols, rows):
             os.killpg(pg, signal.SIGTERM)                # never SIGKILL: the client must leave cleanly
         except OSError:
             pass
-    if not _folder_wait_prompt(fp, THIN_DETACH_WAIT):
+    if not _folder_wait_prompt(fp, PARKED_DETACH_WAIT if kind == "parked" else THIN_DETACH_WAIT):
         release(True)
         return None
     if kind == "thin":
@@ -3833,18 +3849,21 @@ def resize_pty(handler, parsed, body):
     handler._json({"ok": True})
 
 
-def _claude_work_children(claude_pid):
+def _claude_work_children(claude_pid, strict=False):
     """Direct children of `claude_pid` that are Claude's TOOL WORK (Bash/background shells, which
     Claude Code runs setsid'd in their OWN process group). Children in Claude's own group -- stdio
     MCP servers (live as long as Claude), `caffeinate -t 300` -- are standing helpers and never
-    count. One `ps` fork; called only at idle-reap time. [] on any failure (= today's behaviour)."""
+    count. One `ps` fork; called only at idle-reap time. [] on any failure (= today's behaviour);
+    `strict=True` answers None instead, for callers that must FAIL CLOSED (the takeover's "no
+    unseen work" check: an unreadable process table is not "no work")."""
+    fail = None if strict else []
     try:
         out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid="],
                              capture_output=True, text=True, timeout=2)
     except Exception:
-        return []
+        return fail
     if out.returncode != 0:
-        return []
+        return fail
     kids = []
     for line in (out.stdout or "").splitlines():
         parts = line.split()

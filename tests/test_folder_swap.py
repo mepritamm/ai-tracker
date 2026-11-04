@@ -80,6 +80,7 @@ class _SwapBase(unittest.TestCase):
             mock.patch.object(term_vt, "VIEWER_GRACE", 0.0),
             mock.patch.object(term_vt, "THIN_DETACH_WAIT", 0.4),
             mock.patch.object(claude_provider, "daemon_repl_pid", lambda sid: self.live.get(sid, 0)),
+            mock.patch.object(claude_provider, "parked_job_id", lambda pid, label: ""),
             mock.patch.object(claude_provider, "session_label", lambda sid: {A: "Alpha"}.get(sid, "")),
             mock.patch.object(term_vt, "spawn", return_value=self.overflow),
         ):
