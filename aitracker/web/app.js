@@ -1415,7 +1415,10 @@ function track(){
   if(cur!==prev){
     resetSession(cur, prev);                         // synchronous: nothing of prev survives this line
     document.querySelector("main").dataset.sess=cur?"loading":"";
-    if(cur&&sessCacheGet(cur)) sessPaintSnapshot(sessToken());   // B's OWN snapshot, labelled, scrubbed of live fields
+    if(cur&&sessCacheGet(cur)){                      // B's OWN snapshot, labelled, scrubbed of live fields -- only if fresh data is slower than the grace
+      const t=sessToken();
+      sessSnapTimer=setTimeout(function(){ sessSnapTimer=null; sessPaintSnapshot(t); },SNAP_GRACE_MS);
+    }
   }
   if(!cur)return;
   poll();timer=setInterval(poll,2000);               // fires NOW -- pollBusy was cleared by resetSession
@@ -1430,6 +1433,9 @@ const SESS_CACHE=new Map(), SESS_CACHE_MAX=8;   // sid -> {d, at}: d.id===sid, a
 let snapTtlMin=0;                        // server-owned (config.SNAPSHOT_TTL_MIN), set from the X-Snapshot-TTL header by loadSide; 0 = not heard yet
 function sessSnapMaxAge(){ return snapTtlMin*60; }   // seconds; the ONLY reader of snapTtlMin
 let sessSnapLabel="";                    // label text; read by ext_cr_boot.js at render time
+const SNAP_GRACE_MS=50;                  // a snapshot paints only if fresh data has not landed within this
+let sessSnapTimer=null;                  // the pending grace timer, or null
+function sessSnapCancel(){ if(sessSnapTimer!==null){ clearTimeout(sessSnapTimer); sessSnapTimer=null; } }
 const STALE=Object.freeze({stale:true}); // identity sentinel: the selection moved mid-request
 function onSessionReset(fn){ SESSION_RESET.push(fn); }
 function sessToken(){ return {sid:cur, epoch:sessEpoch}; }
@@ -1488,6 +1494,8 @@ function sessPaintSnapshot(t){            // returns bool
 // One place for every failed poll. kind: "gone" (404), "auth" (401), "other" (500, 502, network).
 function sessFailed(id,kind,msg){
   const m=document.querySelector("main"); if(id!==cur) return;
+  const pending=sessSnapTimer!==null; sessSnapCancel();
+  if(pending && kind==="other" && !sessShown(id)) sessPaintSnapshot(sessToken());   // flush the grace so the branch below sees the final state
   if(kind==="gone") SESS_CACHE.delete(id);
   else if(kind==="auth") SESS_CACHE.clear();
   else if(sessShown(id)){
@@ -1518,6 +1526,7 @@ function sessLanded(id,d){
   }
   sessCachePut(id,d);
   if(!(id===cur&&d&&d.id===id)) return false;
+  sessSnapCancel();
   sessRefreshing=false; sessSetLabel(""); if(m){ delete m.dataset.sess; delete m.dataset.err; }
   return renderFor(id,d);
 }
@@ -1527,6 +1536,7 @@ function resetSession(next, prev){
   sessAbort=new AbortController();
   pollBusy=false;          // the aborted poll must not block the new session's first fetch
   lastData=null;
+  sessSnapCancel();
   sessRefreshing=false; sessSetLabel("");
   SESSION_RESET.forEach(f=>{ try{ f(next, prev); }catch(e){ console.error("session reset hook",e); } });
 }

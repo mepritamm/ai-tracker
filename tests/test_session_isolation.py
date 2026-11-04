@@ -73,6 +73,7 @@ function __status(i, status, body) {
 }
 function __reject(i, err) { __fetches[i].reject(err); }
 function __tick() { return new Promise(function (r) { setTimeout(r, 15); }); }
+function __grace() { return new Promise(function (r) { setTimeout(r, SNAP_GRACE_MS + 30); }); }   // past the snapshot grace timer
 function __st() { return { mark: __main.dataset.sess === undefined ? null : __main.dataset.sess, label: sessSnapLabel,
   refreshing: sessRefreshing, renders: __renders.length, nev: __events.length, ev: __events[__events.length - 1] || null }; }
 function __pick(sid) { $("sid").value = sid; track(); }
@@ -205,14 +206,17 @@ sessCachePut("B", {id: "B"});
 __pick("A");
 var missMark = __main.dataset.sess, rendersAfterA = __renders.length;
 __pick("B");
-var hitMark = __main.dataset.sess, hit = __renders.slice();   // painted synchronously, fetch unresolved
+var inGraceMark = __main.dataset.sess, inGraceRenders = __renders.length;   // nothing old inside the grace
+await __grace();
+var hitMark = __main.dataset.sess, hit = __renders.slice();   // painted after the grace, fetch unresolved
 __ok(1, {id: "B", now: 1});
 await new Promise(function (r) { setTimeout(r, 20); });
-console.log(JSON.stringify({missMark: missMark, rendersAfterA: rendersAfterA, hitMark: hitMark, hit: hit,
+console.log(JSON.stringify({missMark: missMark, rendersAfterA: rendersAfterA, hitMark: hitMark, hit: hit, inGraceMark: inGraceMark, inGraceRenders: inGraceRenders,
   finalMark: __main.dataset.sess === undefined ? null : __main.dataset.sess, nFetch: __fetches.length}));
 """)
         self.assertEqual(r["missMark"], "loading")
         self.assertEqual(r["rendersAfterA"], 0)
+        self.assertEqual((r["inGraceMark"], r["inGraceRenders"]), ("loading", 0), "the snapshot must not paint synchronously")
         self.assertEqual(r["hitMark"], "refreshing")
         self.assertEqual([(h["id"], h["sess"], h["refreshing"]) for h in r["hit"]], [("B", "refreshing", True)])
         self.assertTrue(r["hit"][0]["snapLabel"], "the snapshot must be painted with a label already set (board reads it inside render)")
@@ -260,7 +264,7 @@ console.log(JSON.stringify({e1: e1, after: __main.dataset.sess === undefined ? n
         r = self._run("""
 snapTtlMin = 30;
 sessCachePut("B", {id: "B"});
-__pick("B");
+__pick("B"); await __grace();
 var painted = __renders.slice();
 __ok(0, {id: "B", now: 1});
 await new Promise(function (r) { setTimeout(r, 20); });
@@ -273,7 +277,7 @@ console.log(JSON.stringify({painted: painted, last: __renders[__renders.length -
         r = self._run("""
 snapTtlMin = 30;
 sessCachePut("B", {id: "B"});
-__pick("B");
+__pick("B"); await __grace();
 var ok = sessLanded("B", {id: "X"});
 console.log(JSON.stringify({ok: ok, mark: __main.dataset.sess, refreshing: sessRefreshing}));
 """)
@@ -298,12 +302,42 @@ console.log(JSON.stringify({win: _win}));
         self.assertEqual(r["win"], {})
 
     # ---- honest snapshot (plan P4.2-P4.5, P7) -------------------------------------------------
+    def test_fresh_inside_grace_paints_no_snapshot(self):
+        r = self._run("""
+snapTtlMin = 30; sessCachePut("B", {id: "B", now: 1});
+__pick("B"); __ok(0, {id: "B", now: 2}); await __tick(); await __grace();
+console.log(JSON.stringify({renders: __renders.map(function (x) { return [x.id, x.refreshing, x.d.snapshot_age == null]; }), timer: sessSnapTimer}));
+""")
+        self.assertEqual(r["renders"], [["B", False, True]], "only the fresh paint, no snapshot")
+        self.assertIsNone(r["timer"])
+
+    def test_switch_during_grace_never_paints_old(self):
+        r = self._run("""
+snapTtlMin = 30; sessCachePut("B", {id: "B"}); sessCachePut("A", {id: "A", now: 1});
+__pick("B"); __pick("A"); __ok(1, {id: "A", now: 2}); await __tick(); await __grace();
+console.log(JSON.stringify({renders: __renders.map(function (x) { return [x.id, x.d.snapshot_age == null]; }), mark: __main.dataset.sess, timer: sessSnapTimer}));
+""")
+        self.assertEqual(r["renders"], [["A", True]], "B's timer must not paint a snapshot over A's fresh data")
+        self.assertIsNone(r.get("mark"))
+        self.assertIsNone(r["timer"])
+
+    def test_500_inside_grace_paints_then_keeps(self):
+        r = self._run("""
+snapTtlMin = 30; sessCachePut("B", {id: "B"});
+__pick("B"); __status(0, 500, {error: "boom"}); await __tick();
+console.log(JSON.stringify(Object.assign(__st(), {timer: sessSnapTimer})));
+await __grace();
+""")
+        self.assertEqual((r["renders"], r["mark"], r["refreshing"], r["ev"]["cached"]), (1, "refreshing", True, True))
+        self.assertIn("can't refresh", r["label"])
+        self.assertIsNone(r["timer"])
+
     def test_snapshot_strips_live_fields(self):
         r = self._run("""
 snapTtlMin = 30; __at(0);
 sessCachePut("B", {id: "B", now: 100, term_tty: "t1", term_attached: true, waiting: true,
   overview: {now: "working", now_kind: "k", goal: "g"}});
-__at(120); __pick("B");
+__at(120); __pick("B"); await __grace();
 var d = __renders[0].d, e = SESS_CACHE.get("B").d;
 console.log(JSON.stringify({tty: d.term_tty, att: d.term_attached, w: d.waiting, on: d.overview.now, ok: d.overview.now_kind,
   goal: d.overview.goal, now: d.now, age: d.snapshot_age, eTty: e.term_tty, eW: e.waiting, eNow: e.overview.now}));
@@ -417,7 +451,7 @@ console.log(JSON.stringify(out));
     def test_hung_fetch_still_expires(self):
         r = self._run("""
 snapTtlMin = 2; __at(0); sessCachePut("B", {id: "B"});
-__pick("B");                                  // snapshot painted; its fetch (0) never resolves
+__pick("B"); await __grace();                 // snapshot painted; its fetch (0) never resolves
 var f0 = __fetches.length;
 __at(60); poll(); var s1 = __st();
 __at(121); poll(); var s2 = __st();

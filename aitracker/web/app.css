@@ -619,7 +619,8 @@ mark{background:var(--amber-deep,rgba(245,180,67,.28));color:var(--text);border-
 /* Session switch: never show A's detail under B. loading = nothing cached; refreshing = B's own cached snapshot. */
 main[data-sess=loading]>*{visibility:hidden}
 main[data-sess=loading] #drawerBtn{visibility:visible}
-main[data-sess=loading]::before{content:"Loading session…";display:block;padding:24px;color:var(--muted,#888)}
+main[data-sess=loading]::before{content:"Loading session…";display:block;padding:24px;color:var(--muted,#888);animation:sessLoadShow 0s .15s both}
+@keyframes sessLoadShow{from{opacity:0}to{opacity:1}}   /* no flash of loading text while fresh data may land inside the grace */
 main[data-sess=error]>*{visibility:hidden}
 main[data-sess=error] #drawerBtn{visibility:visible}
 main[data-sess=error]::before{content:attr(data-err);display:block;padding:24px;color:var(--bad,#c33)}
