@@ -907,6 +907,16 @@ def _run():
     with mock.patch.object(term_vt.subprocess, "run", return_value=mock.Mock(returncode=0,
             stdout=" 100 1 100\n 200 100 200\n 201 100 100\n 300 999 300\n")):
         assert term_vt._claude_work_children(100) == [200], "only own-group-escaping tool shells are work"
+    # idle TTL vs a session live elsewhere: a Claude pty whose transcript was just written is held
+    _p = term_vt.Pty()
+    _p.mode, _p.session = "resume", "S"
+    assert term_vt._pty_session_ids(_p) == ("S",), "a resume pty runs its own session"
+    _p.fd, _p.screen = 0, object()
+    with mock.patch("aitracker.providers.claude.session_last_active", create=True, return_value=time.time()), \
+         mock.patch.object(term_vt, "_foreground_is_claude", return_value=True):
+        assert term_vt._session_live(_p, time.time()), "a live-elsewhere session must hold off the idle reap"
+        _p.forked = True
+        assert not term_vt._session_live(_p, time.time()), "a forked copy must not borrow its parent's liveness"
     assert "TRACKER_AUTH" not in config.EDITABLE, "TRACKER_AUTH must never be browser-writable"
     assert "NOT_A_REAL_KEY" not in config.EDITABLE, "a non-allowlisted key must never validate"
     # Same invariant, one level down: TUNNEL_ON (child-process-alive) must never be flippable

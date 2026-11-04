@@ -1,7 +1,7 @@
 import datetime, difflib, os, re, subprocess
 from urllib.parse import unquote, urlparse
 
-from .config import LIVE_WINDOW
+from . import config
 
 
 def safe_path_component(s):
@@ -392,7 +392,7 @@ def push_when(has_drain, mtime, now):
     """
     if not has_drain:
         return "none"
-    return "turn" if (now - mtime) < LIVE_WINDOW else "wake"
+    return "turn" if (now - mtime) < config.LIVE_WINDOW else "wake"
 
 
 def cmd_kind(c):

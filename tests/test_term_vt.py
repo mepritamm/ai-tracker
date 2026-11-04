@@ -5903,3 +5903,221 @@ class TestGatewayLaunch(_ResumeModeRoutes):
              mock.patch.object(term_vt.threading, "Thread"):
             term_vt._retry_with_fork(pt, "or-sid", 80, 24)
         self.assertEqual(fork.call_args[0][1], [self.launcher, "--resume", "or-sid", "--fork-session"])
+
+
+class TestIdleSessionLive(unittest.TestCase):
+    """Idle TTL vs a session that is still live elsewhere: a viewer-less pty whose foreground is a
+    Claude is HELD (not touched, not reaped) while its session's transcript was written within
+    max(LIVE_WINDOW, TTL), or its daemon REPL still has tool work. Real provider lookups against a
+    temp PROJECTS/roster; only `_foreground_is_claude` (the child is `sleep`) is patched."""
+
+    SID = "11111111-2222-3333-4444-555555555555"
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        self._saved = (config.TERM_IDLE_TTL_MIN, config.LIVE_WINDOW, config.PROJECTS,
+                       config.DAEMON_ROSTER, getattr(term_vt, "SESSION_LIVE_RECHECK", None))
+        self.tmp = tempfile.mkdtemp(prefix="idle-live-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        config.PROJECTS = os.path.join(self.tmp, "projects")
+        os.makedirs(os.path.join(config.PROJECTS, "proj"))
+        config.DAEMON_ROSTER = os.path.join(self.tmp, "no-roster.json")
+        config.LIVE_WINDOW = 60
+        term_vt.SESSION_LIVE_RECHECK = 0.2
+        self.transcript = os.path.join(config.PROJECTS, "proj", self.SID + ".jsonl")
+        self._stop = threading.Event()
+        self.addCleanup(self._stop.set)
+
+    def tearDown(self):
+        (config.TERM_IDLE_TTL_MIN, config.LIVE_WINDOW, config.PROJECTS, config.DAEMON_ROSTER,
+         recheck) = self._saved
+        if recheck is None:
+            if hasattr(term_vt, "SESSION_LIVE_RECHECK"):
+                del term_vt.SESSION_LIVE_RECHECK
+        else:
+            term_vt.SESSION_LIVE_RECHECK = recheck
+
+    def _write(self, age=0.0):
+        with open(self.transcript, "a") as fh:
+            fh.write("{}\n")
+        t = time.time() - age
+        os.utime(self.transcript, (t, t))
+
+    def _writer(self, every=0.3):
+        """Another terminal driving the session: keep touching the transcript."""
+        def run():
+            while not self._stop.is_set():
+                try:
+                    os.utime(self.transcript, None)
+                except OSError:
+                    pass
+                self._stop.wait(every)
+        self._write()
+        threading.Thread(target=run, daemon=True).start()
+
+    def _pty(self, session=SID, mode="resume"):
+        """A viewer-less `sleep` pty. TTL stays large until the labels are in place (the reader
+        would otherwise reap before they are set), then `_go` drops it to the test's real TTL."""
+        config.TERM_IDLE_TTL_MIN = 30
+        pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
+        pt.mode, pt.session = mode, session
+        self.addCleanup(lambda: (pt.kill(), _drain(pt, 5)))
+        return pt
+
+    def _go(self, ttl):
+        config.TERM_IDLE_TTL_MIN = ttl
+
+    def _fg(self, value=True):
+        p = mock.patch.object(term_vt, "_foreground_is_claude", return_value=value)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _roster(self):
+        me = os.getpid()
+        with open(config.DAEMON_ROSTER, "w") as fh:
+            json.dump({"supervisorPid": me,
+                       "workers": {"x": {"pid": me, "sessionId": self.SID, "replPid": me}}}, fh)
+
+    def _work(self, kids):
+        me = os.getpid()
+        p = mock.patch.object(term_vt, "_claude_work_children",
+                              side_effect=lambda pid: kids if pid == me else [])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_U1_live_elsewhere_session_holds_off_reap(self):
+        self._fg()
+        self._writer()
+        pt = self._pty()
+        self._go(0.001)
+        time.sleep(2.5)
+        self.assertFalse(pt.done, "a session written to in the last seconds was idle-reaped")
+
+    def test_U2_quiet_session_is_reaped(self):
+        self._fg()
+        self._write(age=config.LIVE_WINDOW + 5)
+        pt = self._pty()
+        self._go(0.001)
+        self.assertTrue(_drain(pt, 5).done, "a quiet session's pty was held forever")
+
+    def test_U3a_forked_dedicated_copy_ignores_parent_liveness(self):
+        self._fg()
+        self._writer()
+        pt = self._pty()
+        pt.forked = True
+        self._go(0.001)
+        self.assertTrue(_drain(pt, 5).done, "a forked copy was kept alive by its parent's writes")
+
+    def test_U3b_forked_folder_fg_ignores_parent_liveness(self):
+        self._fg()
+        self._writer()
+        pt = self._pty(session="", mode="")
+        pt.folder = True
+        pt.fg = {"session": self.SID, "mode": "resume", "started": time.time(), "forked": True}
+        self._go(0.001)
+        self.assertTrue(_drain(pt, 5).done, "a forked folder fg was kept alive by its parent's writes")
+
+    def test_U4_live_session_bare_shell_is_reaped(self):
+        self._fg(False)
+        self._writer()
+        pt = self._pty()
+        self._go(0.001)
+        self.assertTrue(_drain(pt, 5).done, "a bare shell was held by a live session id")
+
+    def test_U5a_daemon_repl_tool_work_holds_off_reap(self):
+        self._fg()
+        self._write(age=config.LIVE_WINDOW + 600)
+        self._roster()
+        self._work([1])
+        pt = self._pty()
+        self._go(0.001)
+        time.sleep(2.5)
+        self.assertFalse(pt.done, "a daemon REPL with tool work was idle-reaped")
+
+    def test_U5b_daemon_repl_idle_is_reaped(self):
+        self._fg()
+        self._write(age=config.LIVE_WINDOW + 600)
+        self._roster()
+        self._work([])
+        pt = self._pty()
+        self._go(0.001)
+        self.assertTrue(_drain(pt, 5).done, "an idle daemon REPL held the pty")
+
+    def test_U6_sessionless_pty_never_probes(self):
+        self._fg()
+        self._writer()
+        pt = self._pty(session="", mode="resume")
+        self._go(0.001)
+        with mock.patch("aitracker.providers.claude.session_last_active", create=True) as sla, \
+             mock.patch("aitracker.providers.claude.daemon_repl_pid", create=True) as drp:
+            self.assertTrue(_drain(pt, 5).done)
+        sla.assert_not_called()
+        drp.assert_not_called()
+
+    def test_U7_pty_session_ids_table(self):
+        S, X = "S", "X"
+
+        def mk(**kw):
+            p = term_vt.Pty()
+            for k, v in kw.items():
+                setattr(p, k, v)
+            return p
+        ids = term_vt._pty_session_ids
+        self.assertEqual(ids(mk(folder=True, fg={"session": S, "mode": "resume"})), (S,))
+        self.assertEqual(ids(mk(folder=True, spawned=X, fg={"session": "", "mode": "new"})), ())   # spawned is an EARLIER job's id: never fall back
+        self.assertEqual(ids(mk(folder=True, spawned=X, fg={"session": S, "forked": True})), ())
+        self.assertEqual(ids(mk(folder=True, spawned=X, fg=None)), (X,))
+        self.assertEqual(ids(mk(folder=True, session=S, mode="resume", fg=None)), ())   # never pt.session
+        self.assertEqual(ids(mk(mode="resume", session=S)), (S,))
+        self.assertEqual(ids(mk(mode="new", spawned=X, session="")), (X,))
+        self.assertEqual(ids(mk(mode="resume", session=S, spawned=S)), (S,))            # deduped
+        self.assertEqual(ids(mk(mode="resume", session=S, forked=True)), ())
+        self.assertEqual(ids(mk(mode="cwd")), ())
+
+    def test_U8a_window_uses_live_window(self):
+        self._fg()
+        config.LIVE_WINDOW = 5
+        self._write()
+        t0 = time.time()
+        pt = self._pty()
+        self._go(0.001)
+        time.sleep(max(0, t0 + 3 - time.time()))
+        self.assertFalse(pt.done, "reaped inside LIVE_WINDOW")
+        self.assertTrue(_wait_for(lambda: pt.done, max(0, t0 + 9 - time.time())),
+                        "still held long after LIVE_WINDOW")
+
+    def test_U8b_window_uses_ttl_when_larger(self):
+        self._fg()
+        config.LIVE_WINDOW = 1
+        self._write()
+        t0 = time.time()
+        pt = self._pty()
+        self._go(0.1)                                   # 6s TTL > LIVE_WINDOW
+        time.sleep(max(0, t0 + 4 - time.time()))
+        self._write()                                   # one write at t0+4
+        time.sleep(max(0, t0 + 7.5 - time.time()))
+        self.assertFalse(pt.done, "window ignored the larger TTL")
+        self.assertTrue(_wait_for(lambda: pt.done, max(0, t0 + 14 - time.time())))
+
+    def test_U9_hold_does_not_touch_idle_clock(self):
+        self._fg()
+        self._writer()
+        pt = self._pty()
+        self.assertTrue(_wait_for(lambda: pt._act_v is not None, 2))
+        before = pt.last_active
+        self._go(0.001)
+        time.sleep(1.5)
+        self.assertFalse(pt.done)
+        self.assertEqual(pt.last_active, before, "a hold must not reset the idle clock")
+
+    def test_session_live_probe_is_rate_limited(self):          # U10
+        self._fg()
+        self._writer()
+        term_vt.SESSION_LIVE_RECHECK = 30.0
+        with mock.patch.object(term_vt, "_session_live", side_effect=term_vt._session_live) as sl:
+            pt = self._pty()
+            self._go(0.001)
+            time.sleep(3.5)
+            self.assertFalse(pt.done)
+            self.assertEqual(sl.call_count, 1, "the held pty was re-probed inside SESSION_LIVE_RECHECK")

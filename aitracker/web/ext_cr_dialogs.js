@@ -1322,7 +1322,7 @@
         body.appendChild(cfgRow('Poll interval', null, 'How often the open session’s detail view re-polls the server. (The board/rail list poll stays fixed at 5s.)',
           segmented([[1000, '1s'], [2000, '2s'], [5000, '5s']], readPref(CFG_PREF_KEYS.pollMs, 2000), function (v) { writePref(CFG_PREF_KEYS.pollMs, v); })));
         body.appendChild(serverRow('Live window', 'LIVE_WINDOW',
-          'How long a session with no new activity still counts as "live" before it shows as done.',
+          'How long a session with no new activity still counts as "live" before it shows as done. Applies to the server at once; open pages pick it up on reload.',
           function (value, onCommit) {
             return sliderCtlCommit(30, 1800, value != null ? value : 300, onCommit, 's');
           }));
@@ -1337,7 +1337,7 @@
             return sliderCtlCommit(1, 64, value != null ? value : 12, onCommit, '');
           }));
         body.appendChild(serverRow('Idle terminal TTL', 'TERM_IDLE_TTL_MIN',
-          'A terminal nobody is watching or typing into is closed after this many minutes. The slider covers 5–240; env TRACKER_TERM_IDLE_TTL_MIN or config.json accept 1–1440.',
+          'A terminal nobody is watching or typing into is closed after this many minutes. The slider covers 5–240; env TRACKER_TERM_IDLE_TTL_MIN or config.json accept 1–1440. A Claude whose transcript was written recently is kept open, whether by another terminal or by this pane\'s own Claude, so a Claude pane never closes sooner than LIVE_WINDOW after its last write.',
           function (value, onCommit) {
             return sliderCtlCommit(5, 240, value != null ? value : 30, onCommit, ' min');
           }));

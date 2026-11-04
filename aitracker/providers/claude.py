@@ -1,5 +1,5 @@
 import glob, json, os, re, threading, time
-from ..config import EDIT_TOOLS, LIVE_WINDOW, NARRATION_CAP
+from ..config import EDIT_TOOLS, NARRATION_CAP
 from .. import config
 from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, pr_summary, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase, real_model, model_label
 from ..overview import build_overview, build_heartbeat
@@ -542,7 +542,7 @@ def child_agent_sessions(sid, projdir):
         if _pick_parent(sm["first"], humans) != sid:
             continue
         mt = _active_mtime(f)
-        running = (time.time() - mt) < LIVE_WINDOW
+        running = (time.time() - mt) < config.LIVE_WINDOW
         key = _child_key(fid, sm)
         g = groups.get(key)
         if g is None:
@@ -575,22 +575,37 @@ def _pid_alive(pid):
     return True
 
 
+def _live_workers():
+    """short -> worker dict for workers alive under a live supervisor. Roster holds secrets: only
+    pid/sessionId/replPid are read, nothing logged. {} on any missing/unparseable/wrong shape."""
+    try:
+        with open(config.DAEMON_ROSTER) as fh:
+            ro = json.load(fh)
+        if not isinstance(ro, dict) or not isinstance(ro.get("workers"), dict):
+            return {}
+        if not _pid_alive(ro.get("supervisorPid")):
+            return {}
+        return {k: w for k, w in ro["workers"].items()
+                if isinstance(k, str) and isinstance(w, dict) and _pid_alive(w.get("pid"))}
+    except Exception:
+        return {}
+
+
 def _live_daemon_shorts():
     """Set of daemon job shorts whose worker is alive under a live supervisor, from the roster.
     The roster holds secrets (ptyAuth/rvAuth/sockets): only pids are read, nothing is logged.
     Strict: missing/unparseable/wrong-shaped roster or a dead supervisor -> empty set.
     Residual: a recycled pid reads as alive."""
-    try:
-        with open(config.DAEMON_ROSTER) as fh:
-            ro = json.load(fh)
-        if not isinstance(ro, dict) or not isinstance(ro.get("workers"), dict):
-            return set()
-        if not _pid_alive(ro.get("supervisorPid")):
-            return set()
-        return {k for k, w in ro["workers"].items()
-                if isinstance(k, str) and isinstance(w, dict) and _pid_alive(w.get("pid"))}
-    except Exception:
-        return set()
+    return set(_live_workers())
+
+
+def daemon_repl_pid(sid):
+    """pid of the live Claude-daemon REPL hosting session `sid` (its tools are its children), or 0."""
+    for w in _live_workers().values():
+        if w.get("sessionId") == sid:
+            rp = w.get("replPid")
+            return rp if _pid_alive(rp) else 0
+    return 0
 
 
 def _blocked_jobs():
@@ -660,7 +675,7 @@ def list_sessions(limit=200):
         # tile (ext_cr_board.js's sessionState()) — an idle session's PR data would never be
         # shown, so it's left pending indefinitely rather than spending a scan on it. Bounded
         # by pr_deadline so a batch of sessions finishing together can't stall this poll.
-        if sm.get("_pr_pending") and (time.time() - mt) < LIVE_WINDOW and time.time() < pr_deadline:
+        if sm.get("_pr_pending") and (time.time() - mt) < config.LIVE_WINDOW and time.time() < pr_deadline:
             _fill_pr(sm, f)
         # load_tasks() is a listdir + a handful of small JSON reads under ~/.claude/tasks/<sid>/
         # (0 cost via a single failed listdir for the many sessions with no task store at all;
@@ -702,7 +717,7 @@ def list_sessions(limit=200):
         # 0 for any provider, like Auggie, with no shell concept).
         shells_running = sm.get("shells_running", 0)
         now_line = ""
-        if (time.time() - mt) < LIVE_WINDOW:
+        if (time.time() - mt) < config.LIVE_WINDOW:
             if not sm["ended"] and sm["waiting"]:
                 now_line = "⧖ waiting for your answer"
             elif bg and shells_running:
@@ -917,6 +932,15 @@ def _active_mtime(path):
     return m
 
 
+def session_last_active(sid):
+    """Newest write across the session's transcript and its agent files (= the list's mtime), or 0.0."""
+    try:
+        path = find_session(sid)
+        return _active_mtime(path) if path else 0.0
+    except Exception:
+        return 0.0
+
+
 def _mtime_bg_n(path):
     """(_active_mtime, # background-agent files live right now, # agent files in all). One
     glob+stat pass so the sidebar can badge a session with running in-transcript agents — those
@@ -931,7 +955,7 @@ def _mtime_bg_n(path):
             continue
         n += 1
         m = max(m, amt)
-        if now - amt < LIVE_WINDOW:
+        if now - amt < config.LIVE_WINDOW:
             bg += 1
     return m, bg, n
 
@@ -1230,7 +1254,7 @@ def parse_agents(path, hb=None):
     for e in entries:
         aid = e["aid"]
         row = dict(e["row"])
-        running = (now - e["mt"]) < LIVE_WINDOW
+        running = (now - e["mt"]) < config.LIVE_WINDOW
         if e["stop_after"]:
             done, ended = True, e["stop_ts"]
         elif not e["n_stop"] and e["finished"]:
@@ -1475,7 +1499,7 @@ def agent_detail(path, aid):
             break
         running = False
         try:
-            running = (time.time() - os.path.getmtime(af)) < LIVE_WINDOW
+            running = (time.time() - os.path.getmtime(af)) < config.LIVE_WINDOW
         except OSError:
             pass
         j = "\n\n".join(texts)

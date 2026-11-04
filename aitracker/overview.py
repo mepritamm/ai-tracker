@@ -1,6 +1,6 @@
 import os
 import re
-from .config import LIVE_WINDOW
+from . import config
 from .util import _dur, _names, _first_line, _short_title, _window
 
 
@@ -31,7 +31,7 @@ def build_overview(d, todos, files, cmds, commits, tests, agents, requests,
     elif ip:
         now = "▶ " + (ip.get("activeForm") or ip["content"])
         kind = "todo"
-    elif narrative and idle < LIVE_WINDOW:
+    elif narrative and idle < config.LIVE_WINDOW:
         now = _first_line(narrative[-1]["text"])
         kind = "narration"
     elif narrative:

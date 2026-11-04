@@ -1256,6 +1256,7 @@ MAX_STREAMS = 24         # concurrent SSE /api/term/screen connections, across a
                           # term_run.stream's docstring for the thread-exhaustion measurement this
                           # cap exists to prevent (same ThreadingHTTPServer, same failure mode).
 # Idle reap TTL is `config.TERM_IDLE_TTL_MIN` (minutes, live-tunable), read at check time in `_reader`.
+SESSION_LIVE_RECHECK = 30.0   # s between re-probes while an idle pty is HELD by _session_live (no touch: the idle clock keeps running)
 _REAP_LINGER = 600        # seconds a FINISHED pty's record (its final rc) lingers in PTYS before
                           # being dropped, mirroring term_run._reap_old's 10-minute window.
                           # An OVERFLOW pty (see `Pty.overflow`) gets NO linger at all -- it is
@@ -1506,6 +1507,7 @@ class Pty:
         self.last_active = self.started   # last keystroke, or last viewer leaving -- idle clock
         self._act_v = None        # last screen-activity version `_note_activity` saw (reader-only)
         self._act_t = 0.0         # when `_note_activity` last sampled (throttle; reader-only)
+        self.live_hold = 0.0   # reader-only: the idle reap re-checks _session_live no sooner than this
         self.last_output = self.started   # last time the CHILD actually produced bytes -- written
                                            # only by `_reader` (single-writer, no lock needed, same
                                            # informal style as `last_active`); this is what
@@ -1715,14 +1717,22 @@ def _reader(pt):
     timeout already wakes this thread once a second regardless of PTY activity -- a second thread
     would be more machinery than the bound is worth, exactly the reasoning term_run._reap_old uses
     for not running a background sweep.
+
+    The reap is deferred twice: `_claude_busy` (in-pty tool work: touch, re-probed one TTL later) and
+    `_session_live` (the session is live elsewhere: HOLD, re-probed every SESSION_LIVE_RECHECK,
+    never touching `last_active`, so the pane closes once the session goes quiet).
     """
     try:
         while True:
             if pt.screen is not None:
                 _note_activity(pt, time.time())
-            if pt.viewers <= 0 and (time.time() - pt.last_active) > config.TERM_IDLE_TTL_MIN * 60:
+            now = time.time()
+            if (pt.viewers <= 0 and now - pt.last_active > config.TERM_IDLE_TTL_MIN * 60
+                    and now >= pt.live_hold):
                 if _claude_busy(pt):
-                    pt.touch()       # background work counts as activity; re-probed one TTL later, not per second
+                    pt.touch()       # in-pty tool work counts as activity; re-probed one TTL later
+                elif _session_live(pt, now):
+                    pt.live_hold = now + SESSION_LIVE_RECHECK   # HOLD, not touch: reaped once the session goes quiet
                 else:
                     pt.kill()
                     break
@@ -3687,7 +3697,9 @@ def _claude_work_children(claude_pid):
 
 
 def _claude_busy(pt):
-    """True when the pty's foreground is a Claude with tool work still running. Plain shells: False."""
+    """True when the pty's foreground is a Claude with tool work still running. Plain shells: False.
+    Sees only tools that are children of the pty's own Claude; a daemon thin client's tools live under
+    the daemon REPL, and a session driven from elsewhere writes no children here -- that is `_session_live`."""
     if pt.fd < 0 or pt.screen is None:
         return False
     with pt.lock:                   # cheap screen check first: a reap must never fork `ps` for a
@@ -3699,6 +3711,54 @@ def _claude_busy(pt):
     except OSError:
         return False
     return pg > 0 and bool(_claude_work_children(pg))
+
+
+def _pty_session_ids(pt):
+    """Session id(s) this pty runs, for the idle reap. UNLOCKED snapshot (F5): plain attribute
+    reads, no _LOCK, no _refresh_fg. A stale label is only partly guarded: _foreground_is_claude
+    checks that SOME Claude is in the foreground, not that it is the one the label names, so a
+    different Claude started later can still be held by the old label's liveness. A folder pty with
+    an fg label uses only fg's session (never `spawned`, which may be an earlier job's; unlike
+    _session_ptys it does use `spawned` for a hand-typed claude, fg None). A forked copy runs under
+    an id we never learn -> ()."""
+    fg, spawned = pt.fg, pt.spawned
+    if pt.folder:
+        if fg is not None:
+            if fg.get("forked"):
+                return ()
+            s = fg.get("session")       # resolve_spawned sets spawned+fg.session together: "" here means
+            return (s,) if s else ()    # spawned names an EARLIER job's session, so never fall back to it
+        return (spawned,) if spawned else ()            # a `claude` typed by hand
+    if pt.forked:
+        return ()
+    return tuple(dict.fromkeys(s for s in (spawned, pt.session if pt.mode == "resume" else "") if s))
+
+
+def _session_live(pt, now):
+    """D1/D3: the idle pty's foreground Claude runs a session whose transcript (or agent files) was
+    written within max(LIVE_WINDOW, TTL), or whose Claude-daemon REPL still has tool work. Order:
+    ids (free) -> stat -> roster -> ps. Never raises (a raise would kill the reader thread).
+    Known gaps: a setsid'd child counts as work (`_claude_busy`); a launcher whose comm isn't
+    `claude` fails the fg gate; a pending permission dialog counts as idle after one window; a
+    later hand-typed Claude can be held by an old session's liveness. Also, a live session is held
+    whoever wrote the transcript last, including this pane's own Claude."""
+    try:
+        if pt.fd < 0 or pt.screen is None:
+            return False
+        sids = _pty_session_ids(pt)
+        if not sids:
+            return False                                 # plain shells: no fs, no ps
+        try:
+            _claude = __import__("%s.providers.claude" % __package__, fromlist=["claude"])  # same lazy-import idiom as the resume path
+        except Exception:
+            return False
+        window = max(config.LIVE_WINDOW, config.TERM_IDLE_TTL_MIN * 60)
+        if any(now - _claude.session_last_active(s) < window for s in sids):
+            return _foreground_is_claude(pt.fd)
+        hosts = [h for h in (_claude.daemon_repl_pid(s) for s in sids) if h > 0]
+        return bool(hosts) and _foreground_is_claude(pt.fd) and any(_claude_work_children(h) for h in hosts)
+    except Exception:
+        return False
 
 
 def _foreground_is_claude(fd):

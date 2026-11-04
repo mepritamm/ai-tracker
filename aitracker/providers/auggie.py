@@ -1,5 +1,5 @@
 import glob, json, os, re, time
-from ..config import LIVE_WINDOW, NARRATION_CAP
+from ..config import NARRATION_CAP
 from .. import config
 from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase
 from ..overview import build_overview, build_heartbeat, empty_heartbeat
@@ -360,7 +360,7 @@ def list_auggie():
         # No background-agent concept for Auggie (see the "bg": 0 field below), so that
         # branch is skipped entirely rather than faked.
         now_line = ""
-        if (time.time() - e["mtime"]) < LIVE_WINDOW and not e.get("ended"):
+        if (time.time() - e["mtime"]) < config.LIVE_WINDOW and not e.get("ended"):
             if e.get("waiting"):
                 now_line = "⧖ waiting for your answer"
             elif todo_current:

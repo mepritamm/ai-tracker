@@ -1470,7 +1470,8 @@ class TestTermIdleTtlEndToEnd(unittest.TestCase):
     """TERM_IDLE_TTL_MIN end to end: the real server's /api/config, and the served page's row."""
 
     def setUp(self):
-        self._saved = {k: getattr(config, k) for k in ("CONFIG_FILE", "TERM_IDLE_TTL_MIN", "AUTH")}
+        self._saved = {k: getattr(config, k) for k in ("CONFIG_FILE", "TERM_IDLE_TTL_MIN", "AUTH", "LIVE_WINDOW",
+                                                         "PROJECTS", "DAEMON_ROSTER", "TERMINAL")}
         self._tmpdir = tempfile.mkdtemp()
         config.CONFIG_FILE = os.path.join(self._tmpdir, "config.json")   # POST must never touch the real one
         config.AUTH = ""
@@ -1515,6 +1516,71 @@ class TestTermIdleTtlEndToEnd(unittest.TestCase):
         # not gated by host: nothing around the row reads location.hostname
         self.assertNotIn("location.hostname", page[max(0, i - 1500):i + 1500])
         self.assertNotIn("[overflow]", page)
+
+    def test_page_live_follows_live_window_override(self):
+        """I2: POST /api/config LIVE_WINDOW, then a fresh GET / serves that number as the SPA's LIVE."""
+        st, _ = self._req("POST", "/api/config", {"key": "LIVE_WINDOW", "value": 120})
+        self.assertEqual(st, 200)
+        st, data = self._req("GET", "/")
+        self.assertEqual(st, 200)
+        m = re.search(r"const\s+LIVE\s*=\s*(\d+)", data.decode("utf-8"))
+        self.assertIsNotNone(m, "LIVE const must be present in the served page")
+        self.assertEqual(int(m.group(1)), 120)
+
+    def _listed(self, tty):
+        st, data = self._req("GET", "/api/term/list")
+        self.assertEqual(st, 200)
+        return any(t.get("tty") == tty for t in json.loads(data)["terminals"])
+
+    def test_live_session_terminal_survives_ttl_until_quiet(self):
+        """I1: a viewer-less Claude pty whose session transcript keeps being written (another terminal
+        drives it) survives the idle TTL; once the transcript goes quiet it is reaped."""
+        from aitracker import term_vt
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        config.TERMINAL = True
+        config.LIVE_WINDOW = 60
+        config.PROJECTS = os.path.join(self._tmpdir, "projects")
+        os.makedirs(os.path.join(config.PROJECTS, "proj"))
+        config.DAEMON_ROSTER = os.path.join(self._tmpdir, "no-roster.json")
+        transcript = os.path.join(config.PROJECTS, "proj", sid + ".jsonl")
+        with open(transcript, "w") as fh:
+            fh.write("{}\n")
+        recheck0 = term_vt.SESSION_LIVE_RECHECK
+        term_vt.SESSION_LIVE_RECHECK = 0.3
+        config.TERM_IDLE_TTL_MIN = 30                       # labels first, then the short TTL
+        pt = term_vt.spawn(self._tmpdir, ["sleep", "60"], 80, 24)
+        pt.mode, pt.session = "resume", sid
+        with term_vt._LOCK:
+            term_vt.PTYS[pt.id] = pt
+        stop = threading.Event()
+
+        def writer():
+            while not stop.is_set():
+                os.utime(transcript, None)
+                stop.wait(0.5)
+        wt = threading.Thread(target=writer, daemon=True)
+        try:
+            with mock.patch.object(term_vt, "_foreground_is_claude", return_value=True):
+                wt.start()
+                config.TERM_IDLE_TTL_MIN = 0.02             # 1.2s
+                time.sleep(4)
+                self.assertFalse(pt.done)
+                self.assertTrue(self._listed(pt.id), "a live session's terminal was reaped by the idle TTL")
+                stop.set()
+                wt.join()
+                old = time.time() - (max(config.LIVE_WINDOW, 1.2) + 5)
+                os.utime(transcript, (old, old))
+                time.sleep(1.5)                             # > 1 TTL
+                end = time.time() + 8
+                while time.time() < end and self._listed(pt.id):
+                    time.sleep(0.25)
+                self.assertFalse(self._listed(pt.id), "a quiet session's terminal was never reaped")
+        finally:
+            stop.set()
+            term_vt.SESSION_LIVE_RECHECK = recheck0
+            pt.kill()
+            with term_vt._LOCK:
+                term_vt.PTYS.pop(pt.id, None)
 
 
 class TestBundle(unittest.TestCase):

@@ -3,7 +3,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from . import config                       # referenced live (config.AUTH) so tests/env see one source
 from . import tunnel                       # runtime tunnel switch -- see tunnel.py's module docstring
-from .config import LIVE_WINDOW, NARR_PAGE
+from .config import NARR_PAGE
 from .page import build_page
 from .gateway import openrouter_configured
 from .registry import all_sessions, parse_any, search_all, search_session, drill, _attached_pty

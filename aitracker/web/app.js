@@ -991,7 +991,7 @@ let liveOnly=uiState.get('liveOnly',false);   // thin accessor over uiState -- s
 // a phone/tablet over a tunnel or on any desktop with clock skew (conventions rule 5:
 // server owns policy, client renders it -- one clock for liveness, not two).
 let listNow=Date.now()/1000;   // seeded before the first poll lands; overwritten immediately after
-const LIVE=300; // seconds since last activity a session stays "live" (5 min)
+const LIVE=300/*__LIVE_WINDOW__*/; // seconds a session stays "live"; page.py serves config.LIVE_WINDOW here on every page load (300 = default, and the bundle's value)
 // SHARED SEAM (parity requirement: "the session markers/pinned and other pieces of
 // information must be same in both the UIs"): the ONE place "is this session still
 // working" is decided. A session is working when its own foreground turn hasn't

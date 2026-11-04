@@ -169,13 +169,8 @@ BIND_HOST = "127.0.0.1"
 # reading them) sees a browser-made change on its very next read, with zero changes to
 # those two files.
 #
-# LIVE_WINDOW's OTHER consumers (overview.py, util.py, providers/claude.py,
-# providers/auggie.py) all import LIVE_WINDOW directly out of config — a name binding evaluated
-# once, at THEIR OWN import time, which is a fixed snapshot regardless of how live this
-# module's own global is. That is unchanged by this feature (those files are out of scope
-# here) — LIVE_WINDOW is live for any caller that reads `config.LIVE_WINDOW` fresh (which is
-# exactly what GET /api/config does), but not retroactively for those four already-frozen
-# imports.
+# Every LIVE_WINDOW consumer reads `config.LIVE_WINDOW` at call time, so a browser change applies on the
+# next request; the SPA's `LIVE` is substituted into the page by `page.build_page()` on every page load.
 #
 # TERM_APP / TERM_ALLOW are a different shape again: term_launch.py / term_run.py read
 # `os.environ.get("TRACKER_TERM_APP"/"TRACKER_TERM_ALLOW", ...)` directly on every call —

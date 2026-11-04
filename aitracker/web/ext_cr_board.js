@@ -15,7 +15,7 @@ window.CR = window.CR || {};
   // meaning, per CLAUDE.md's "Liveness is one constant" rule. app.js's `LIVE`
   // IS reachable here: page.py concatenates every web/*.js file into ONE
   // <script> tag, app.js first (page.py: read("app.js") + read_ext(".js")),
-  // so its top-level `const LIVE = 300` sits in the same script-level scope
+  // so its top-level server-served `LIVE` (page.py) sits in the same script-level scope
   // this IIFE closes over — verified by reading page.py, not assumed (an
   // earlier version of this comment claimed app.js wasn't reachable; that was
   // false). Derived from it with a safe literal fallback only for the
