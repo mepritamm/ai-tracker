@@ -274,7 +274,7 @@ if _HAS_NODE:
     # harness that has nothing to do with them -- so it gets its own narrow span instead, bounded by
     # the next top-level function declared after it (`closeTty`).
     _peekterm_start = _SRC.index("function peekTerm(t) {")
-    _peekterm_end = _SRC.index("function closeTty(tty, force) {")
+    _peekterm_end = _SRC.index("function closeTty(tty, force, session) {")
     _PEEK_TERM_SRC = _SRC[_peekterm_start:_peekterm_end]
 
     # `mountInto`'s own find-existing-terminal scan (a deliberate SECOND copy of openVT's decision

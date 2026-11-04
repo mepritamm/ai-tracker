@@ -113,8 +113,7 @@ no longer the only one."""
 BG_REFUSAL_MARKERS = (
     REFUSAL_MARKER,
     "is running as a background session",
-    "is running in the background (",     # `${title} is running in the background (<job>).` -- keep the "(":
-)                                          # the bare phrase is common prose
+)
 """Every wording of the CLI's "still running elsewhere" refusal that `looks_like_bg_refusal()`
 matches. REFUSAL_MARKER (above) is the LEGACY wording; the CURRENT `claude` CLI instead prints
 (verbatim, from a real capture):
@@ -214,6 +213,12 @@ def _normalize_output(output) -> str:
     return " ".join(_ANSI_RE.sub(" ", output).split())
 
 
+_BG_RUNNING_IN_BG_RE = re.compile(r"is running in the background \([0-9a-f]{4,}\)\.")
+"""CLI 2.1.318's third wording: `${title} is running in the background (<job short>).` -- the title is
+free text, so only the tail is matched, and only with a hex job id in parentheses and the full stop:
+"the dev server is running in the background (PID 4242)." is ordinary prose and must not match."""
+
+
 def looks_like_bg_refusal(output) -> bool:
     """True if `output` (raw bytes/str captured from a `claude --resume` child) contains
     ANY of BG_REFUSAL_MARKERS -- the ONE signal Option C's backstop (term_vt.py) uses to
@@ -227,7 +232,7 @@ def looks_like_bg_refusal(output) -> bool:
     mitigation, not a fix that rules out recurrence -- a THIRD wording still degrades the
     same way (a bare refusal shown to the user, no retry) rather than raising."""
     normalized = _normalize_output(output)
-    return any(marker in normalized for marker in BG_REFUSAL_MARKERS)
+    return any(marker in normalized for marker in BG_REFUSAL_MARKERS) or bool(_BG_RUNNING_IN_BG_RE.search(normalized))
 
 
 def looks_like_missing_transcript(output) -> bool:

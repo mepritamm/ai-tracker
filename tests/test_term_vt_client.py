@@ -2533,7 +2533,7 @@ class TestTerminalManagerPanel(unittest.TestCase):
         close_all = _body_until(self.js, "function closeAll(", ["window.ExtVT ="])
         self.assertIn("killSeries(terminals,", close_all)
         kill_series = _body_until(self.js, "function killSeries(", ["function closeAll("])
-        self.assertIn("closeTty(t.tty)", kill_series)
+        self.assertIn("closeTty(t.tty, false, ", kill_series)
         self.assertIn('"/api/term/close"',
                       _body_until(self.js, "function closeTty(", ["function _latchManager("]))
 
@@ -2922,6 +2922,49 @@ class TestRedirectedSessionBinds(unittest.TestCase):
         self.assertIn("window.ExtVT.mountInto(container, target, opts)", cr)
         self.assertNotIn("/api/term/pty\", { session", cr)      # no private session-scoped POST to bind separately
         self.assertIn("res.j.notice", cr)                        # its session-less open shows the notice too
+
+
+class TestRowActionsAddressThePaneByWhatRunsInIt(unittest.TestCase):
+    """After a takeover the list row's `session` is still the OPENER; the server owns the pane for
+    the session in `fg`. So explicit row picks bind to / address the pane as `fg.session`."""
+
+    ROW = "(t.fg && t.fg.session) || t.session"
+
+    def test_closetty_takes_an_optional_session(self):
+        src = _read("ext_vt.js")
+        body = src[src.index("function closeTty("):]
+        body = body[:body.index("}).then(function (r)")]
+        self.assertIn("function closeTty(tty, force, session)", body)
+        self.assertIn("ttyBody(tty, force ? { force: true } : {}, session)", body)
+        tb = src[src.index("function ttyBody("):]
+        tb = tb[:tb.index("\n")]
+        self.assertIn('typeof session === "string" ? session : ttySession(tty)', tb)
+
+    def test_every_manager_row_caller_passes_the_row_session(self):
+        src = _read("ext_vt.js")
+        self.assertEqual(src.count("closeTty(t.tty, false, " + self.ROW + ")"), 2)
+        self.assertEqual(src.count("closeTty(t.tty, true, " + self.ROW + ")"), 2)
+        self.assertNotIn("closeTty(t.tty)", src)
+        self.assertNotIn("closeTty(t.tty, true)", src)
+
+    def test_control_room_manage_panel_passes_the_row_session(self):
+        cr = _read("ext_cr_term.js")
+        self.assertIn("vt.closeTty(t.tty, false, " + self.ROW + ")", cr)
+        self.assertIn("vt.closeTty(t.tty, true, " + self.ROW + ")", cr)
+        self.assertNotIn("vt.closeTty(t.tty)", cr)
+        self.assertNotIn("vt.closeTty(t.tty, true)", cr)
+
+    def test_picking_the_running_session_binds_the_pane_to_it(self):
+        src = _read("ext_vt.js")
+        i = src.index('if (mode === "resume" && t.fg && t.fg.session === sid) {\n')   # mountInto's find-existing (openVT's peeks in a new tab instead)
+        block = src[i:i + 400]
+        self.assertIn("bindTty(t.tty, sid);", block)
+        self.assertLess(block.index("bindTty(t.tty, sid);"), block.index("return t;"))
+
+    def test_bindrows_and_the_session_less_paths_are_untouched(self):
+        src = _read("ext_vt.js")
+        self.assertIn("bindTty(t.tty, t.session, true)", src)          # bindRows: onlyIfNew, the opener
+        self.assertIn('bindTty(res.j.tty, "")', _read("ext_cr_term.js"))
 
 
 class TestClosedStreamStatus(unittest.TestCase):

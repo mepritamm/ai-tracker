@@ -186,7 +186,13 @@ def open_terminal(handler, parsed, body) -> None:
     # session up by id, so any existing ancestor directory works (term_gate.session_cwd).
     # Passed only on resume: cwd keeps the old plain call (some tests stub session_cwd with a
     # one-arg lambda; unconditionally passing resume=False would break those too).
-    cwd = term_gate.session_cwd(sid, resume=True) if mode == "resume" else term_gate.session_cwd(sid)
+    req_sid = sid
+    if mode == "resume":
+        # An old row of a session parked into a daemon job opens the live job (as the in-browser
+        # terminal does: term_vt.open_pty); a provider failure leaves the request unchanged.
+        sid = _background_target(sid) or sid
+    cwd = (term_gate.session_cwd(sid, resume=True) or term_gate.session_cwd(req_sid, resume=True)
+           if mode == "resume" else term_gate.session_cwd(sid))
     if not cwd:
         handler._json({"error": "session not found or its cwd no longer exists"}, 404)
         return
@@ -209,6 +215,15 @@ def open_terminal(handler, parsed, body) -> None:
         handler._json({"error": "failed to launch terminal: %s" % e}, 500)
         return
     handler._json({"ok": True})
+
+
+def _background_target(sid):
+    """The daemon job that runs `sid` (itself, or the one it was parked into), else "". Never raises."""
+    try:
+        c = __import__("%s.providers.claude" % __package__, fromlist=["claude"])
+        return c.background_id(sid)
+    except Exception:
+        return ""
 
 
 server.EXTRA_POST["/api/term/open"] = open_terminal

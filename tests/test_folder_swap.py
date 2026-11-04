@@ -118,6 +118,17 @@ class TestThinSwap(_SwapBase):
         self.assertIn("keeps running in the background", obj["notice"])
         self.assertTrue(obj["reused"] and obj["folder"])
 
+    def test_after_a_swap_the_rows_foreground_session_owns_the_pane_not_the_opener(self):
+        """The list row keeps `session` = the opener (A); the pane belongs to what runs there (B). The
+        client therefore addresses it by `fg.session` (closeTty/bindTty) -- pinned here at the server."""
+        self.open()
+        with term_vt._LOCK:
+            row = [r for r in term_vt._live_list("") if r["tty"] == "folder-1"][0]
+            self.assertEqual(row["fg"]["session"], B)
+            self.assertTrue(term_vt._pty_owned(self.fp, row["fg"]["session"]))
+            self.assertEqual(row["session"], self.fp.session)
+            self.assertFalse(term_vt._pty_owned(self.fp, A), "the displaced opener is refused (409)")
+
     def test_notice_falls_back_to_the_short_without_a_title(self):
         self.short = "aaaaaaaa"
         with mock.patch.object(claude_provider, "session_label", lambda sid: ""):
@@ -323,6 +334,9 @@ class TestProbeHelpers(unittest.TestCase):
         with mock.patch.object(claude_provider, "daemon_repl_pid", lambda s: 7 if s == "x" else 0):
             self.assertEqual(real("x"), "x")
             self.assertEqual(real("y"), "")
+        with mock.patch.object(claude_provider, "background_id", lambda s: "J" if s == "O" else ""):
+            self.assertEqual(real("O"), "J", "the redirect's production wiring goes through background_id")
+            self.assertEqual(real("other"), "")
         with mock.patch.object(claude_provider, "daemon_repl_pid", side_effect=RuntimeError):
             self.assertEqual(real("x"), "")
 
@@ -366,6 +380,7 @@ exec cat
                   mock.patch.object(claude_provider, "daemon_repl_pid", lambda sid: self.live.get(sid, 0)),
                   mock.patch.object(claude_provider, "session_label", lambda sid: "Alpha"),
                   mock.patch.object(term_vt, "_resume_backstop"),
+                  mock.patch.object(term_vt, "THIN_DETACH_WAIT", 15),   # a loaded machine must not turn a slow exit into a flake
                   mock.patch.object(term_vt, "VIEWER_GRACE", 0.0)):
             p.start()
             self.addCleanup(p.stop)

@@ -8,5 +8,9 @@ original stays reachable as `term_vt._real_background_target`.
 """
 from aitracker import term_vt as _term_vt
 
+from aitracker import term_launch as _term_launch
+
 _term_vt._real_background_target = _term_vt._background_target
 _term_vt._background_target = lambda sid: ""
+_term_launch._real_background_target = _term_launch._background_target
+_term_launch._background_target = lambda sid: ""

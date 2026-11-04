@@ -86,8 +86,23 @@ class TestRedirect(_Base):
         self.assertIn(b"--resume " + J.encode(), b"".join(self.typed))
         self.assertEqual(obj["session"], J)
 
+    def test_job_that_moved_to_another_folder_opens_there(self):
+        """Sessions move into worktrees: when the job's transcript has a different cwd than the
+        original's, the shell opens in the JOB's."""
+        moved = "/tmp/redirect-moved-worktree"
+        self.cwds[J] = moved
+        moved_fp = term_vt.Pty(tid="folder-moved", pid=SHELL, fd=99, cwd=moved)
+        moved_fp.folder, moved_fp.mode, moved_fp.startup_done = True, "cwd", True
+        moved_fp.screen = term_vt.Screen(cols=80, rows=24)
+        term_vt.PTYS[moved_fp.id] = moved_fp
+        obj, code = self.open(O)
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(obj["tty"], "folder-moved", "the shell in the JOB's folder took it, not the original's")
+        self.assertIn(b"--resume " + J.encode(), b"".join(self.typed))
+
     def test_original_with_a_missing_folder_404s_like_today(self):
         del self.cwds[O]
+        del self.cwds[J]
         obj, code = self.open(O)
         self.assertEqual(code, 404, obj)
         self.assertEqual(self.typed, [])

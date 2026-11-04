@@ -541,7 +541,7 @@ User decisions on these (2026-11-04):
 - A foreground tool shows how the harness deals with a `sleep N; echo` (blocked by a hook that wants Monitor): use `python3 -c` to get a real long tool.
 - `continued-in` is written to O's transcript (`{"type":"continued-in",…,"continuedInSessionId":J}`) at park time. J has its OWN file (appears once J takes a turn), `fork:true`; O's file is not shared (O stayed 640731 bytes while J grew). `claude --resume <J>` after the pane is gone converted to `claude attach <J short>` in 2.0s. A turn typed in that client landed in J's file only.
 - `claude stop <J>`: `--resume O` then starts a STANDALONE client on O (`claude --resume O`, no conversion, `parkedJobId` None). Stopping a job does NOT kill a `run_in_background` tool it started (orphaned `python3 time.sleep(400)` with ppid 1; killed by me after a cwd check).
-- **Unpark (deviation from the spec's assumption)**: Enter (or Right) in the parked agent view returns to the original prompt, but `sessions/<pid>.json` KEEPS `parkedJobId` (file untouched, mtime = park time), and a second Left parks again with the same id. The file cannot tell "parked view" from "returned view". Both are clients of the still-live job (SIGTERM-safe as measured), so the takeover treats them alike; the spec's "ineligible while unparked" cannot be implemented from the file and is not claimed.
+- **Unpark (deviation from the spec's assumption)**: Enter (or Right) in the parked agent view returns to the original prompt, which is the TUI attached to the job IN-PROCESS (the binary's `a0e` unmounts the REPL, `KOo` attaches); the sessions file KEEPS `parkedJobId` (untouched, mtime = park time) and a second Left parks again with the same id. The file cannot tell the parked view from the returned view. Both are clients of the still-live job (SIGTERM-safe as measured), so the takeover treats them alike; the spec's "ineligible while unparked" cannot be implemented from the file and is not claimed.
 
 ### Commit (b) parked branch — mutation log
 6 mutations on `term_vt.py` and 4 on `providers/claude.py` all RED, including `TZ=UTC` removal (caught by the plain real-`ps` test AND the explicit other-timezone test, since this machine runs IST). Logs: exp3/mut_b.log.
@@ -556,6 +556,23 @@ Live finding (L7): right after a park, the pane's own hooks (iTerm `it2`, osascr
 
 ### Commit (a) thin swap — mutation log
 11 mutations on `term_vt.py` all RED (viewer, short mismatch, standalone, displaced REPL dead, shell moved, foreground changed, no touch at claim, no mode reset, label not restored, target not background, no viewer grace); 3 on `ext_vt.js` all RED. Logs: exp3/mut_a.log, mut_js.log.
+
+## Implementation review (opus, at 70b8a91) — DON'T LAND yet; reconciliation (main thread)
+Verified directly: ext_vt.js:3820 returns the row with no `bindTty`; `looks_like_bg_refusal("…running in the background (PID 4242).")` is True.
+
+| Finding | Verdict | Action |
+|---|---|---|
+| F1 after a swap, row binding is the displaced opener: Control Room open + Manage/cap kill get 409 | **Confirmed; land-blocker** | At ext_vt.js:3820 `bindTty(t.tty, sid)` when the user explicitly picks a row. `closeTty` takes an optional session; row callers pass `(t.fg && t.fg.session) \|\| t.session`, in `ext_vt.js` and `ext_cr_term.js`. `_pty_owned`, `_live_list.session` and `bindRows` unchanged |
+| F2 redirect's production wiring untested (dead-redirect mutation stayed green) | **Confirmed** | Add the real-seam assertion in `test_background_target_reads_the_roster` |
+| F3 new marker matches ordinary prose | **Confirmed** | Regex `is running in the background \([0-9a-f]{4,}\)\.`; keep older wordings |
+| F4 doc errors (README:100, `open_pty` docstring, plan Progress, ~3032 comment) | **Confirmed** | Fix text |
+| F5 stale cwd after J moves | **Accepted, one line** (sessions do move into worktrees here) | `session_cwd(sid, resume=True) or session_cwd(req_sid, resume=True)`; fresh-J case must keep working |
+| F6 External resume on an old row still opens the frozen copy | **Follows the user's "old row opens the live conversation"** | Resolve through `background_id` in `term_launch.open_terminal`; test it |
+| F7 real-signal test flake risk | **Confirmed** | Patch `THIN_DETACH_WAIT` to 15 in that class's setUp |
+| Item 1: returned-view harm | **False alarm**; screen gate would be overengineered (binary: `a0e` unmounts the REPL; `KOo` = attach). In-memory "space to reply" drafts die with the pane: known gap | Prove live on a scratch session |
+| Items 3, 4 | **False alarms** | None |
+| Item 7 | (c) reverts clean; (b) needs conflict resolution | Say so in the plan |
+| Live proofs required | Browser pass (session-row click, rendered banner, Control Room, both renderers) and a returned-view proof with a draft + mid-turn | Before landing |
 
 ## Reconciliation of the first review (main thread)
 Verified directly: `looks_like_bg_refusal(<mxe wording>)` returns False; no `line_dirty` exists; /api/term/list shows 3 terminals in 3 different folders.
@@ -576,3 +593,14 @@ Verified directly: `looks_like_bg_refusal(<mxe wording>)` returns False; no `lin
 | 16, 17 | **Confirmed** | Fold in |
 | User decisions (2026-11-04) | Experiments first, then decide (nothing built yet). If built: background sessions only. Cut items: handover in `docs/handover-terminal-input-guards.md` | — |
 | **Missed by both** | Unwatched thin-client panes are themselves reaped at the idle TTL (harmless, per E1), so the swap only fires inside that window: at most `max(LIVE_WINDOW, TTL)` after the last write. Combined with finding 3, the feature's real-world reach is small | Tell the user plainly before building |
+
+## Review fixes (implementer, one commit on top of 70b8a91)
+- F1 `ext_vt.js`: `closeTty(tty, force, session)` + `ttyBody(tty, extra, session)` (optional override of the page's binding); every row caller (`closeOneFromManager`, its busy-confirm retry, `killSeries` x2, `ext_cr_term.js` `_killTerminal` x2) passes `(t.fg && t.fg.session) || t.session`; `mountInto`'s find-existing binds `bindTty(t.tty, sid)` for a `fg.session === sid` row. `_pty_owned`, `_live_list.session`, `bindRows` unchanged. `_killCurrent` (ext_cr_term.js) kills `st.tty`, whose binding is already right (it came through `mountInto`).
+- F2 `test_background_target_reads_the_roster` asserts the real seam goes through `background_id` (RED with the old body). F3 regex `is running in the background \([0-9a-f]{4,}\)\.` (the bare "(" marker matched "…(PID 4242)."). F5 `cwd = session_cwd(J) or session_cwd(O)`. F6 `term_launch.open_terminal` resolves through `background_id` (External on an old row builds `--resume J`; provider failure = unchanged). F7 real-signal tests patch `THIN_DETACH_WAIT` to 15.
+- Reverting: (c) reverts cleanly; (b) needs conflict resolution (`_swap_candidate` and `open_pty`'s call site were later touched by (c) and this commit).
+- Known gap: an in-memory "space to reply" draft in the parked view dies with a taken-over pane.
+
+### Live proofs for the review fixes (claude 2.1.318, :8799, scratch sessions)
+- P1 real browser (claude-in-chrome), both renderers (xterm.js and grid): clicked the scratch rows A then B in the Control Room rail and "Resume": same tty, ONE terminal, the banner rendered in the dialog (screenshot) naming the displaced session, with a "See lineage" link. After a page reload, opening the displaced-to session from the Control Room is live (not "disconnected"; `ExtVT.ttySession(tty)` is the fg session, not the row's opener) - F1's repro. The Manage terminals dialog's kill of the switched row reached the server's busy confirm (not an ownership 409) and, confirmed, closed it (0 left), in both renderers. Not distinguished: whether the dialog used was the classic `ext_vt` manager or the Control Room's; both callers carry the fix.
+- P2 returned view: park (Left), Enter returned to the conversation prompt, a typed unsent draft survived a takeover and was present on `claude attach <J>` afterwards (the job holds it). A takeover mid-generation (400 numbers) and mid-tool (`time.sleep(50)`, auto mode, no dialog) both let J's turn finish: tool_result recorded, ENDMARK/TOOLDONE present, no "[Request interrupted". Lost: only in-memory "space to reply" drafts of the parked view.
+- Hazard noted: `mode:"new"` opens the AGENT VIEW (it lists the user's real sessions) on this config. Never type into a pane before its screen is confirmed; P2 gated every key on screen text.

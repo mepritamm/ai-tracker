@@ -2971,7 +2971,8 @@ def open_pty(handler, parsed, body):
     genuinely resumed -- is observable yet). So in this response: `forked` reflects ONLY the
     fast-path decision (term_gate.resume_argv, computed before spawning -- today that decision
     never forks proactively, see that function's docstring, so `forked` is always False here)
-    and `notice` is ALWAYS null. A `mode="resume"` spawn also starts `_resume_backstop` as a
+    and `notice` is null EXCEPT when a takeover just displaced another session (the response then
+    names it: see "Folder terminal" below). A `mode="resume"` spawn also starts `_resume_backstop` as a
     background daemon thread (see the section above) that can, seconds later, retry with
     --fork-session on a refusal or set a notice on a missing transcript -- but by definition
     AFTER this response was already sent. That late outcome is communicated the only way it can
@@ -3029,9 +3030,10 @@ def open_pty(handler, parsed, body):
         if mode == "resume":
             # A session parked into a daemon job (the old row) runs AS that job: resume the live
             # conversation, never a frozen copy beside it. Resolved once, here; every later line
-            # (argv, claim, response `session`) then speaks about the job. The cwd is still the
-            # REQUESTED id's: the job was forked from it (same folder), may have no transcript of its
-            # own yet (it gets one at its first turn), and a missing folder 404s exactly as before.
+            # (argv, claim, response `session`) then speaks about the job. The cwd is the JOB's when
+            # it has a transcript (a session can move into a worktree after the park), else the
+            # REQUESTED id's: a fresh job has no transcript until its first turn, and a missing
+            # folder 404s exactly as before.
             bg = _background_target(sid)
             if bg and bg != sid:
                 sid = bg
@@ -3039,7 +3041,8 @@ def open_pty(handler, parsed, body):
         # session up by id, so any existing ancestor directory works (term_gate.session_cwd).
         # Passed only on resume: cwd/new keep the old plain call (some tests stub session_cwd
         # with a one-arg lambda; unconditionally passing resume=False would break those too).
-        cwd = term_gate.session_cwd(req_sid, resume=True) if mode == "resume" else term_gate.session_cwd(sid)
+        cwd = (term_gate.session_cwd(sid, resume=True) or term_gate.session_cwd(req_sid, resume=True)
+               if mode == "resume" else term_gate.session_cwd(sid))
         if not cwd:
             return handler._json({"error": "session not found or its cwd no longer exists"}, 404)
     else:

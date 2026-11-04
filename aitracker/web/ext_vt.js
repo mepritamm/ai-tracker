@@ -317,7 +317,7 @@
   var TTY_SESS = {};
   function bindTty(tty, sid, onlyIfNew) { if (tty && !(onlyIfNew && tty in TTY_SESS)) TTY_SESS[tty] = sid || ""; return tty; }
   function ttySession(tty) { return (tty in TTY_SESS) ? TTY_SESS[tty] : null; }
-  function ttyBody(tty, extra) { var b = Object.assign({ tty: tty }, extra || {}), s = ttySession(tty); if (s !== null) b.session = s; return b; }
+  function ttyBody(tty, extra, session) { var b = Object.assign({ tty: tty }, extra || {}), s = typeof session === "string" ? session : ttySession(tty); if (s !== null) b.session = s; return b; }
   function ttyQuery(tty) { var s = ttySession(tty); return "tty=" + encodeURIComponent(tty) + (s === null ? "" : "&session=" + encodeURIComponent(s)); }
   // Row provenance: a GET /api/term/list (or 429) row carries the session that opened that tty.
   function bindRows(terms) {
@@ -3452,10 +3452,13 @@
   // is the smaller diff and the server already does the only dangerous part exactly once per tty.
   // `force` re-POSTs with {tty, force:true} -- the server contract for "yes, kill it anyway" once
   // a 409 busy confirm (below) has been answered.
-  function closeTty(tty, force) {
+  // `session` (optional) names who is asking: a list ROW's caller passes what runs in the pane
+  // (`(t.fg && t.fg.session) || t.session`), because after a takeover the page's binding for the
+  // tty is still the opener's and the server (rightly) refuses it. Omitted = the page's binding.
+  function closeTty(tty, force, session) {
     return fetch("/api/term/close", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(ttyBody(tty, force ? { force: true } : {}))
+      body: JSON.stringify(ttyBody(tty, force ? { force: true } : {}, session))
     }).then(function (r) {
       // 409 {busy:true, fg} -- the folder terminal has something running in its foreground and the
       // server refused to kill it silently. Surfaced as a distinguishable rejection (`err.busy`/
@@ -3495,7 +3498,7 @@
 
   function closeOneFromManager(t, terminals, max) {
     _latchManager(true);
-    closeTty(t.tty)
+    closeTty(t.tty, false, (t.fg && t.fg.session) || t.session)
       .then(function () {
         // Guarded like every other toast() in this file: `toast` lives in app.js, and this module
         // is also loaded by the standalone ?tty= tab, so it must never be the thing that throws.
@@ -3512,7 +3515,7 @@
           _armBusyConfirm(t, e.fg).then(function (proceed) {
             if (!proceed) return;
             _latchManager(true);
-            closeTty(t.tty, true)
+            closeTty(t.tty, true, (t.fg && t.fg.session) || t.session)
               .then(function () {
                 if (typeof toast === "function") toast("Terminal closed", t.cmd || t.tty);
                 _refreshAfterReap();
@@ -3544,11 +3547,11 @@
     var chain = Promise.resolve();
     (terminals || []).forEach(function (t) {
       chain = chain.then(function () {
-        return closeTty(t.tty).catch(function (e) {
+        return closeTty(t.tty, false, (t.fg && t.fg.session) || t.session).catch(function (e) {
           if (e && e.busy && typeof confirmBusy === "function") {
             return confirmBusy(t, e.fg).then(function (proceed) {
               if (!proceed) { failures++; return; }
-              return closeTty(t.tty, true).catch(function () { failures++; });
+              return closeTty(t.tty, true, (t.fg && t.fg.session) || t.session).catch(function () { failures++; });
             });
           }
           failures++;
@@ -3817,7 +3820,10 @@
             var t = terms[i];
             if (t.session === sid && t.mode === mode) return t;
             if (mode === "cwd" && targetCwd && t.folder && t.cwd === targetCwd) return t;
-            if (mode === "resume" && t.fg && t.fg.session === sid) return t;
+            if (mode === "resume" && t.fg && t.fg.session === sid) {
+              bindTty(t.tty, sid);   // the user picked THIS session: what runs here is theirs now, whoever opened the pane
+              return t;
+            }
           }
           return null;
         })

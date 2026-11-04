@@ -84,8 +84,8 @@ class TestRegressionEval(unittest.TestCase):
         for marker in term_gate.BG_REFUSAL_MARKERS:
             with self.subTest(marker=marker):
                 self.assertTrue(
-                    marker in CURRENT_MESSAGE or marker in LEGACY_MESSAGE or marker in MXE_MESSAGE,
-                    "marker %r is not a substring of any captured message" % (marker,))
+                    marker in CURRENT_MESSAGE or marker in LEGACY_MESSAGE,
+                    "marker %r is not a substring of either captured message" % (marker,))
 
 
 class TestBgRefusalMxeWording(unittest.TestCase):
@@ -94,8 +94,19 @@ class TestBgRefusalMxeWording(unittest.TestCase):
         self.assertTrue(term_gate.looks_like_bg_refusal(MXE_MESSAGE))
         self.assertTrue(term_gate.looks_like_bg_refusal(_fuse_words_with_column_jumps(MXE_MESSAGE)))
 
-    def test_bare_phrase_without_job_paren_is_not_a_refusal(self):
-        self.assertFalse(term_gate.looks_like_bg_refusal("the build is running in the background now"))
+    def test_ordinary_prose_is_not_a_refusal(self):
+        """The old marker matched any "...running in the background (..." -- including a Claude
+        session's own talk about a dev server -- and would have forked a healthy resume."""
+        for prose in ("the build is running in the background now",
+                      "The dev server is running in the background (PID 4242).",
+                      "The server is running in the background (port 8080).",
+                      "it is running in the background (abcd) and fine",
+                      "is running in the background (48a30864)"):          # no full stop: not the CLI's sentence
+            with self.subTest(prose):
+                self.assertFalse(term_gate.looks_like_bg_refusal(prose))
+
+    def test_attach_target_still_reads_the_third_wording(self):
+        self.assertEqual(term_gate.attach_target(MXE_MESSAGE, "48a30864-1111-2222-3333-444444444444"), "48a30864")
 
 
 class TestAttachTarget(unittest.TestCase):

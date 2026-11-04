@@ -847,7 +847,7 @@
     if (!vt) return Promise.reject(new Error("terminal support not loaded"));
     // vt.closeTty already throws on a non-2xx, so the caller's .catch sees a real failure rather
     // than a resolved promise carrying an error response.
-    return vt.closeTty(t.tty).then(function (r) {
+    return vt.closeTty(t.tty, false, (t.fg && t.fg.session) || t.session).then(function (r) {
       _refreshRunningList();
       return r;
     }).catch(function (e) {
@@ -861,7 +861,7 @@
           declined.cancelled = true;
           throw declined;
         }
-        return vt.closeTty(t.tty, true).then(function (r) {
+        return vt.closeTty(t.tty, true, (t.fg && t.fg.session) || t.session).then(function (r) {
           _refreshRunningList();
           return r;
         });

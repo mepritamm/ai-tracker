@@ -462,6 +462,46 @@ class TestSidShapeAtTheRoute(_TerminalEnabled):
         self.assertNotIn("abc-123.jsonl", script)
 
 
+class TestExternalResumeFollowsTheLiveJob(_TerminalEnabled):
+    """External on the OLD row of a session parked into a daemon job opens the live job, like the
+    in-browser terminal does (term_vt.open_pty): `--resume J`, not a frozen copy of O."""
+
+    O = "11111111-1111-4111-8111-111111111111"
+    J = "22222222-2222-4222-8222-222222222222"
+
+    def _run(self, background):
+        cwds = {self.O: "/tmp/o-folder", self.J: "/tmp/j-folder"}
+        with mock.patch.object(term_gate, "session_cwd", lambda s, resume=False: cwds.get(s, "")), \
+             mock.patch.object(term_launch, "_is_claude", return_value=True), \
+             mock.patch.object(term_launch, "_background_target", background), \
+             mock.patch.object(term_launch.subprocess, "run") as run:
+            h = _FakeHandler()
+            term_launch.open_terminal(h, None, {"session": self.O, "mode": "resume"})
+        return h.calls[-1], (run.call_args[0][0][-1] if run.called else "")
+
+    def test_old_row_builds_resume_of_the_live_job_in_the_jobs_folder(self):
+        call, script = self._run(lambda s: self.J)
+        self.assertEqual(call, ({"ok": True}, 200))
+        self.assertIn("claude --resume " + self.J, script)
+        self.assertNotIn("--resume " + self.O, script)
+        self.assertIn("/tmp/j-folder", script)
+
+    def test_dead_job_keeps_resume_of_the_original(self):
+        call, script = self._run(lambda s: "")
+        self.assertEqual(call, ({"ok": True}, 200))
+        self.assertIn("claude --resume " + self.O, script)
+        self.assertNotIn(self.J, script)
+
+    def test_provider_failure_leaves_the_request_unchanged(self):
+        with mock.patch("aitracker.providers.claude.background_id", side_effect=RuntimeError("boom")):
+            self.assertEqual(term_launch._real_background_target(self.O), "")
+
+    def test_the_real_seam_goes_through_background_id(self):
+        with mock.patch("aitracker.providers.claude.background_id", lambda s: self.J if s == self.O else ""):
+            self.assertEqual(term_launch._real_background_target(self.O), self.J)
+            self.assertEqual(term_launch._real_background_target("other"), "")
+
+
 class TestOpenTerminalGatewayError(_TerminalEnabled):
     def test_open_terminal_openrouter_unconfigured_is_400(self):
         with mock.patch.object(term_gate, "session_cwd", return_value="/tmp"), \
