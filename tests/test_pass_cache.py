@@ -78,6 +78,19 @@ class TestFilePass(_Env):
         self.assertEqual(len(calls), 1)
         self.assertEqual(a, b)
 
+    def test_same_size_rewrite_with_restored_mtime_misses(self):
+        p = self._file()
+        with open(p, "w") as fh:
+            fh.write("aa")
+        st = os.stat(p)
+        fn, calls = self._counting()
+        util.file_pass("k", p, fn)
+        with open(p, "w") as fh:
+            fh.write("bb")
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertEqual(util.file_pass("k", p, fn)["data"], "bb")
+        self.assertEqual(len(calls), 2)
+
     def test_hit_returns_a_fresh_object(self):
         p = self._file()
         fn, _ = self._counting()

@@ -1559,6 +1559,29 @@ class TestTermIdleTtlEndToEnd(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertNotIn("S", json.load(open(config.NOTES_FILE)))
 
+    def test_stale_out_of_range_index_with_text_is_refused(self):
+        config.NOTES_FILE = os.path.join(self._tmpdir, "notes.json")
+        with open(config.NOTES_FILE, "w") as fh:
+            json.dump({"S": [{"text": "n0", "pushed": True}, {"text": "n1", "pushed": False}]}, fh)
+        self._req("POST", "/api/notes/next", {"session": "S"})   # -> [n1]
+        for route in ("/api/notes/push", "/api/notes/delete"):
+            st, data = self._req("POST", route, {"session": "S", "index": 1, "text": "n1"})
+            self.assertEqual(st, 409, route)
+            self.assertEqual(json.loads(data)["error"], "notes changed")
+        self.assertEqual([n["text"] for n in json.load(open(config.NOTES_FILE))["S"]], ["n1"])
+
+    def test_duplicate_text_stale_push_is_refused_by_pushed_state(self):
+        config.NOTES_FILE = os.path.join(self._tmpdir, "notes.json")
+        start = [{"text": "X", "pushed": True}, {"text": "A", "pushed": False}, {"text": "A", "pushed": True}]
+        with open(config.NOTES_FILE, "w") as fh:
+            json.dump({"S": start}, fh)
+        self._req("POST", "/api/notes/next", {"session": "S"})   # drains X -> [A, A pushed]
+        for route in ("/api/notes/push", "/api/notes/delete"):
+            st, data = self._req("POST", route, {"session": "S", "index": 1, "text": "A", "pushed": False})
+            self.assertEqual(st, 409, route)
+        self.assertEqual(json.load(open(config.NOTES_FILE))["S"],
+                         [{"text": "A", "pushed": False}, {"text": "A", "pushed": True}])
+
     def test_served_page_has_row_ungated_and_no_overflow_tag(self):
         st, data = self._req("GET", "/")
         self.assertEqual(st, 200)
@@ -1933,7 +1956,10 @@ class TestPollerInFlightGuard(unittest.TestCase):
         body = self.src[i:body_end]
         self.assertIn("pollBusy", body)
         self.assertIn("pollSeq", body)   # sequence number guards stale/out-of-order responses
-        self.assertIn("finally{pollBusy=false;}", body)  # released unconditionally
+        # released by the LATEST poll only: an aborted/superseded poll's finally must not free the
+        # flag a newer request now holds (it would let every tick start a fetch and skip the
+        # hung-fetch expiry). pollSeq only advances right after that newer poll sets pollBusy.
+        self.assertIn("finally{ if(seq===pollSeq) pollBusy=false; }", body)
         # the two pollers must not share one flag -- a slow /api/list must not block /api/session
         self.assertNotIn("sideBusy", body)
 
@@ -1956,7 +1982,10 @@ class TestPollerInFlightGuard(unittest.TestCase):
             # the nearest `try{` after the flag's declaration must be closed by a `finally` that
             # clears the same flag, before any other top-level `let `/`function ` declaration.
             try_idx = self.src.index("try{", start)
-            finally_idx = self.src.index("finally{" + flag + "=false;}", try_idx)
+            # poll()'s release is conditional on being the latest request (seq===pollSeq)
+            fm = re.compile(r"finally\{\s*(?:if\(seq===pollSeq\)\s*)?" + flag + r"=false;\s*\}").search(self.src, try_idx)
+            self.assertIsNotNone(fm, "no finally releasing %s after its try{}" % flag)
+            finally_idx = fm.start()
             # sanity bound: the finally must be close to its try (same function body), not some
             # unrelated finally{} further down the file
             self.assertLess(finally_idx - try_idx, 500, "finally{%s=false} is not the release for this try{}" % flag)
@@ -2235,7 +2264,10 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         self.assertEqual(result["loadFlagsCalls"], 0)
         self.assertEqual(result["checkCompletionsCalls"], 0)
         self.assertIsNone(result["lastData"], "lastData must not be overwritten by an out-of-order reply")
-        self.assertFalse(result["busyAfter"], "the guard must still be released even though the response was discarded")
+        # The synthetic pollSeq++ stands for a newer request, and in real code that request set
+        # pollBusy itself (pollSeq only advances right after pollBusy=true) and releases it in
+        # its own finally. So the stale poll must leave the flag alone.
+        self.assertTrue(result["busyAfter"], "a superseded poll must not release the guard the newer request owns")
         self.assertEqual(result["pollSeqAfter"], 2, "sanity: the simulated newer request is still reflected in pollSeq")
 
     @unittest.skipUnless(_HAS_NODE, "node not available")

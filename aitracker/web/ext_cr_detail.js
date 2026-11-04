@@ -1988,7 +1988,7 @@
         case "note-remove":
           var rmIdx = parseInt(t.getAttribute("data-idx"), 10);
           var rmNote = (ui.lastSession && ui.lastSession.notes || [])[rmIdx];
-          ctx.emit("cr:note-remove", { sessionId: sid, index: rmIdx, text: rmNote && rmNote.text });
+          ctx.emit("cr:note-remove", { sessionId: sid, index: rmIdx, text: rmNote && rmNote.text, pushed: !!(rmNote && rmNote.pushed) });
           break;
         case "note-push": {
           var input = qs(node, ".crd-plan-input");

@@ -43,7 +43,10 @@ var localStorage = { setItem: function () {} };
 var uiState = { set: function () {} };
 function $(id) { return __els[id] || (__els[id] = { value: "", innerHTML: "", textContent: "", style: {}, dataset: {} }); }
 var __row = null, __added = [], __renderSideCalls = 0;
-__els.slist = { querySelector: function () { return __row; }, querySelectorAll: function () { return []; } };
+var __sels = [], __oldRemoved = 0;
+var __oldRow = { classList: { remove: function (c) { if (c === "active") __oldRemoved++; } } };
+__els.slist = { querySelector: function (q) { __sels.push(q); return __row; },
+  querySelectorAll: function (q) { __sels.push(q); return [__oldRow]; } };
 var sessions = [], selEntry = null, autoExpandedFor = null, searchResults = null;
 var CSS = { escape: function (s) { return String(s); } };
 function renderSide() { __renderSideCalls++; }
@@ -467,11 +470,40 @@ console.log(JSON.stringify({f0: f0, n: __fetches.length, s1: s1, s2: s2}));
 snapTtlMin = 2; __at(0);
 __pick("A"); __ok(0, {id: "A", now: 1}); await __tick();
 poll();                                       // hangs
-var a = __st(); __at(3 * 3600); poll(); var b = __st();
+var a = __st(); __at(119); poll(); var b = __st(); __at(121); poll(); var c = __st();
+console.log(JSON.stringify({a: a, b: b, c: c}));
+""")
+        self.assertEqual(r["a"], r["b"], "a slow healthy poll must not change anything before the TTL")
+        self.assertIsNone(r["b"]["mark"])
+        self.assertEqual((r["c"]["mark"], r["c"]["ev"]["cached"]), ("error", False))
+
+    def test_hung_fetch_on_fresh_data_unknown_ttl_changes_nothing(self):
+        # TTL not heard yet (first /api/list failed, or a NaN header): "unknown" counts as expired
+        # for painting snapshots, but must not turn a slow healthy poll on fresh data into an error.
+        r = self._run("""
+snapTtlMin = 0; __at(0);
+__pick("A"); __ok(0, {id: "A", now: 1}); await __tick();
+poll();                                       // hangs
+var a = __st(); __at(3); poll(); var b = __st();
 console.log(JSON.stringify({a: a, b: b}));
 """)
-        self.assertEqual(r["a"], r["b"])
+        self.assertEqual(r["a"], r["b"], "unknown TTL must leave fresh data alone")
         self.assertIsNone(r["b"]["mark"])
+
+    def test_aborted_old_poll_does_not_unblock_hung_check(self):
+        r = self._run("""
+snapTtlMin = 2; __at(0); sessCachePut("B", {id: "B"});
+__pick("A"); poll();
+__pick("B"); await __grace();                 // B's snapshot is up; B's fetch hangs
+var e = new Error("aborted"); e.name = "AbortError";
+__reject(0, e); await __tick();               // A's aborted poll settles late
+var f0 = __fetches.length;
+__at(121); poll();
+console.log(JSON.stringify({f0: f0, n: __fetches.length, s: __st(), sig: __fetches[0].opts.signal.aborted}));
+""")
+        self.assertTrue(r["sig"])
+        self.assertEqual(r["n"], r["f0"], "an aborted old poll must not free pollBusy and start a new fetch")
+        self.assertEqual((r["s"]["mark"], r["s"]["ev"]["cached"]), ("error", False))
 
     def test_refused_paint_resets_label_and_mark(self):
         r = self._run("""
@@ -508,22 +540,32 @@ console.log(JSON.stringify({a: sessCacheGet("auggie:abc").v, b: sessCacheGet("ab
 
     def test_position_note_senders_send_text(self):
         r = self._run("""
-cur = "A"; lastData = {notes: [{text: "n0"}, {text: "n1"}]};
+cur = "A"; lastData = {notes: [{text: "n0"}, {text: "n1", pushed: true}]};
 removeNote(1); pushNote(1);
 console.log(JSON.stringify(__fetches.map(function (f) { return [f.url, JSON.parse(f.opts.body)]; })));
 """)
-        self.assertEqual(r[0], ["/api/notes/delete", {"session": "A", "index": 1, "text": "n1"}])
-        self.assertEqual(r[1], ["/api/notes/push", {"session": "A", "index": 1, "text": "n1"}])
+        self.assertEqual(r[0], ["/api/notes/delete", {"session": "A", "index": 1, "text": "n1", "pushed": True}])
+        self.assertEqual(r[1], ["/api/notes/push", {"session": "A", "index": 1, "text": "n1", "pushed": True}])
 
     # ---- sidebar fast path (P4.1) -------------------------------------------------------------
     def test_pick_skips_full_sidebar_when_row_present(self):
         r = self._run("""
 __row = {classList: {add: function (c) { __added.push(c); }}}; sessions = [{id: "B"}];
 pick("B");
-console.log(JSON.stringify({calls: __renderSideCalls, added: __added}));
+console.log(JSON.stringify({calls: __renderSideCalls, added: __added, old: __oldRemoved}));
 """)
         self.assertEqual(r["calls"], 0)
         self.assertEqual(r["added"], ["active"])
+        self.assertEqual(r["old"], 1, "the previously active row must lose its class")
+
+    def test_fast_pick_selector_escapes_id(self):
+        r = self._run("""
+CSS.escape = function (s) { return String(s).replace(/"/g, String.fromCharCode(92) + '"'); };
+__row = {classList: {add: function () {}}}; sessions = [{id: 'a"b'}];
+pick('a"b');
+console.log(JSON.stringify({sels: __sels}));
+""")
+        self.assertIn('.sitem[data-sid="a\\"b"]', r["sels"])
 
     def test_pick_falls_back_when_row_absent(self):
         r = self._run("""
@@ -672,6 +714,9 @@ class TestSessionIsolationStaticSweep(unittest.TestCase):
         self.assertIn("snapLabel: (typeof sessSnapLabel", _web_src("ext_cr_boot.js"))
         self.assertIn("text: payload.text", _web_src("ext_cr_boot.js"))
         self.assertIn("text: rmNote && rmNote.text", _web_src("ext_cr_detail.js"))
+        self.assertIn("pushed: !!(rmNote && rmNote.pushed)", _web_src("ext_cr_detail.js"))
+        self.assertIn("pushed: !!payload.pushed", _web_src("ext_cr_boot.js"))
+        self.assertEqual(_web_src("app.js").count("pushed:!!("), 2, "app.js note senders must send pushed")
         app = _web_src("app.js")
         for fn in ("function sessLanded(", "function sessFailed("):
             i = app.index(fn)
@@ -712,6 +757,14 @@ function fakeNode(path) {
 window.__docL = {};
 document.addEventListener = function (t, f) { (window.__docL[t] = window.__docL[t] || []).push(f); };
 var __origCE = document.createElement;
+var __fetch0 = window.fetch;     // the board's first /api/list reply tells the page its snapshot TTL (30 min)
+window.fetch = function () {
+  return __fetch0.apply(this, arguments).then(function (r) {
+    var g = r.headers && r.headers.get ? r.headers.get.bind(r.headers) : function () { return null; };
+    r.headers = { get: function (k) { return k === "X-Snapshot-TTL" ? "30" : g(k); } };
+    return r;
+  });
+};
 document.createElement = function (tag) {
   if (tag === "template") {
     var t = { content: { firstChild: null } };
@@ -835,17 +888,31 @@ OUT.errorAfterSwitch = !!node._cls["crd-is-error"];
     # A failed poll on a view that is already shown: the board keeps it, labelled, instead of ignoring it
     def test_cached_error_event_labels_header(self):
         r = self._run(r"""
+window.__wait = new Promise(function (res) { setImmediate(res); }).then(function () {
 var node = window.CR.detail._root._crDetail.node;
 var hd = node.querySelector(".crd-header"); OUT.attrs = [];
 hd.setAttribute = function (k, v) { OUT.attrs.push([k, v]); };
 function pick(s) { document.getElementById("x").value = s; track(); }
+var __ivs = []; window.setInterval = function (fn) { __ivs.push(fn); return 1; };
+window.fetch = function () { return new Promise(function () {}); };          // every poll hangs
+var __now = Date.now(); Date.now = function () { return __now; };
+render = function () {};                      // the classic renderer is not under test here
+sessCachePut("B", {id: "B", now: 1, meta: {sessionId: "B"}, tokens: {in: 0, out: 0}, counts: {}, overview: {}});
 pick("B");
+window.__q.splice(0).forEach(function (f) { f(); });                          // snapshot grace -> snapshot painted
+OUT.attrs.length = 0; __now += 61000;
+__ivs[__ivs.length - 1]();                    // the hung-fetch pre-check re-ages the label and forwards it to the board
+OUT.hungSnap = OUT.attrs.slice();
 var fire = function (d) { (window.__docL["tracker:session-error"] || []).forEach(function (f) { f({detail: d}); }); };
 fire({id: "B", error: "boom", cached: true, snapLabel: "data from 2m ago · can't refresh"});
 OUT.refreshing = !!node._cls["crd-is-refreshing"]; OUT.errored = !!node._cls["crd-is-error"];
 fire({id: "B", error: "boom", cached: false});
 OUT.errored2 = !!node._cls["crd-is-error"];
+}).catch(function (e) { OUT.err = String(e && e.stack || e); });
 """)
+        self.assertNotIn("err", r, r.get("err"))
+        self.assertTrue(any(a[0] == "data-snap" and "snapshot from 1m ago" in a[1] for a in r["hungSnap"]),
+                        "the pre-check must forward its label to the board header" + repr(r["hungSnap"]))
         self.assertTrue(r["refreshing"])
         self.assertFalse(r["errored"], "a kept view must not show the error state")
         self.assertIn(["data-snap", "data from 2m ago · can't refresh"], r["attrs"])
@@ -862,6 +929,25 @@ OUT.bound = X.ttyBody("t").session; OUT.body = body;
         self.assertEqual(r["bound"], "")
         self.assertEqual(r["body"]["session"], "A")
         self.assertEqual(r["body"]["text"], "x")
+
+
+@unittest.skipUnless(shutil.which("node"), "node not available")
+class TestDialogsUnmounted(unittest.TestCase):
+    def test_close_session_before_mount_does_not_throw(self):
+        with open(os.path.join(WEB, "ext_cr_dialogs.js"), encoding="utf-8") as fh:
+            src = fh.read()
+        js = ("var window = {}; var document = {createElement: function () { return {style: {}, setAttribute: function () {}}; }, "
+              "addEventListener: function () {}};\n" + src +
+              "\ntry { window.CR.dialogs.closeSession('B'); console.log('ok'); } catch (e) { console.log('threw ' + e.message); }\n")
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as tf:
+            tf.write(js)
+            path = tf.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True, timeout=30)
+        finally:
+            os.unlink(path)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "ok", proc.stdout + proc.stderr)
 
 
 if __name__ == "__main__":

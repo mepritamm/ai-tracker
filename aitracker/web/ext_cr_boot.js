@@ -702,7 +702,7 @@ window.CR = window.CR || {};
     if (!sid || typeof idx !== 'number' || typeof fetch !== 'function') return;
     fetch('/api/notes/delete', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session: sid, index: idx, text: payload.text }),
+      body: JSON.stringify({ session: sid, index: idx, text: payload.text, pushed: !!payload.pushed }),
     }).then(function (r) { return { ok: r.ok, moved: r.status === 409 }; }).then(function (res) {
       var ok = res.ok;
       emit('notify', { text: ok ? 'Note removed.' : res.moved ? 'Notes changed — list refreshed' : 'Couldn’t remove that note.' });

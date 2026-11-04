@@ -1480,6 +1480,7 @@ function sessSetLabel(text){
   sessSnapLabel=text||"";
   const h=$("hmeta"); if(!h||!h.dataset) return;
   if(sessSnapLabel) h.dataset.snap=sessSnapLabel; else delete h.dataset.snap;
+  if(sessRefreshing&&typeof CR!=="undefined"&&CR.detail&&typeof CR.detail.stale==="function") CR.detail.stale(cur,sessSnapLabel);
 }
 function sessPaintSnapshot(t){            // returns bool
   if(!sessCurrent(t)) return false;
@@ -1617,7 +1618,7 @@ let pollBusy=false, pollSeq=0;
 async function poll(){
   // A fetch that never answers keeps pollBusy set, so sessFailed would never run: re-age (and finally
   // expire) a view already marked not-current from here. Fresh data with a slow poll is left alone.
-  if(cur&&pollBusy&&sessRefreshing&&sessShown(cur)){
+  if(cur&&pollBusy&&sessShown(cur)&&(sessRefreshing||(snapTtlMin>0&&sessExpired(sessCacheAge(cur))))){   // fresh data only expires against a TTL actually heard
     const age=sessCacheAge(cur);
     if(sessExpired(age)) sessFailed(cur,"other","can't refresh");
     else sessSetLabel(sessSnapText(age,false));
@@ -1633,7 +1634,7 @@ async function poll(){
     if(r.status===404) d.gone=true; else if(r.status===401) d.authfail=true;
   }
   catch(e){ if(seq!==pollSeq||id!==cur)return; d={error:"network error"}; }   // the guard first: a switch's AbortError is not a failure
-  finally{pollBusy=false;}
+  finally{ if(seq===pollSeq) pollBusy=false; }
   if(seq!==pollSeq||id!==cur)return;   // superseded by a newer poll, or the selection moved on — discard
   if(d.error){sessLanded(id,d);return}
   if(!sessLanded(id,d))return;
@@ -2426,7 +2427,7 @@ async function removeNote(idx){
   if(!cur)return;
   const sid=cur;
   const j=await sessJSON("/api/notes/delete",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({session:sid,index:idx,text:((lastData&&lastData.notes)||[])[idx]?.text})});
+    body:JSON.stringify({session:sid,index:idx,text:((lastData&&lastData.notes)||[])[idx]?.text,pushed:!!(((lastData&&lastData.notes)||[])[idx]&&((lastData&&lastData.notes)||[])[idx].pushed)})});
   if(j===STALE)return;
   if(j.error==="notes changed"){toast("Notes changed — list refreshed","");poll();return}
   if(j.error)return;
@@ -2436,7 +2437,7 @@ async function pushNote(idx){
   if(!cur)return;
   const sid=cur;
   const j=await sessJSON("/api/notes/push",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({session:sid,index:idx,text:((lastData&&lastData.notes)||[])[idx]?.text})});
+    body:JSON.stringify({session:sid,index:idx,text:((lastData&&lastData.notes)||[])[idx]?.text,pushed:!!(((lastData&&lastData.notes)||[])[idx]&&((lastData&&lastData.notes)||[])[idx].pushed)})});
   if(j===STALE)return;
   if(j.error==="notes changed"){toast("Notes changed — list refreshed","");poll();return}
   if(j.error)return;

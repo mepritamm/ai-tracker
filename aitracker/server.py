@@ -765,11 +765,18 @@ class Handler(BaseHTTPRequestHandler):
             sid, idx = body.get("session", ""), body.get("index")
             notes = load_notes()
             stack = notes.get(sid, [])
-            if not (isinstance(idx, int) and 0 <= idx < len(stack)):
+            want = body.get("text")   # optional: the note text the client saw at this position
+            wp = body.get("pushed")   # optional: the pushed state the client saw
+            # Known gap (predates this branch): load->save has no lock, so a push racing a drain can resurrect a delivered note.
+            in_range = isinstance(idx, int) and 0 <= idx < len(stack)
+            if isinstance(want, str) and not in_range:
+                self._json({"error": "notes changed", "notes": stack}, 409)
+                return
+            if not in_range:
                 self._json({"error": "session and index required"}, 400)
                 return
-            want = body.get("text")   # optional: the note text the client saw at this position
-            if isinstance(want, str) and stack[idx].get("text") != want:
+            if (isinstance(want, str) and stack[idx].get("text") != want) or \
+                    (isinstance(wp, bool) and bool(stack[idx].get("pushed")) != wp):
                 self._json({"error": "notes changed", "notes": stack}, 409)
                 return
             stack[idx]["pushed"] = not stack[idx].get("pushed")   # click again to un-queue
@@ -800,9 +807,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             notes = load_notes()
             stack = notes.get(sid, [])
-            if isinstance(idx, int) and 0 <= idx < len(stack):
-                want = body.get("text")   # optional: the note text the client saw at this position
-                if isinstance(want, str) and stack[idx].get("text") != want:
+            want = body.get("text")   # optional: the note text the client saw at this position
+            wp = body.get("pushed")   # optional: the pushed state the client saw
+            # Known gap (predates this branch): load->save has no lock, so a push racing a drain can resurrect a delivered note.
+            in_range = isinstance(idx, int) and 0 <= idx < len(stack)
+            if isinstance(want, str) and not in_range:
+                self._json({"error": "notes changed", "notes": stack}, 409)
+                return
+            if in_range:
+                if (isinstance(want, str) and stack[idx].get("text") != want) or \
+                        (isinstance(wp, bool) and bool(stack[idx].get("pushed")) != wp):
                     self._json({"error": "notes changed", "notes": stack}, 409)
                     return
                 stack.pop(idx)

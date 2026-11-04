@@ -566,6 +566,44 @@ All of B1, M1, M2, m1–m6 closed. The optional note `text` leaves no real hole:
 | F8 | accepted | Board label fix stays; 8→16 goes in the decisions list. |
 | Missed by both | — | Neither covered what a second browser tab does to the server cache's byte budget under concurrent polls; flagged for round 2. |
 
+## Implementation review (opus, two reviewers on the built code)
+
+Built as 7bc9899 (step 3), 5d02b48 (steps 1-2), a70e83a (step 4). Step 4's real-page check (headless Chromium, both views): no load errors, F1/m1 pass, 0 wrong-session renders in 28 cached switches, label only past 50ms, TTL edit live in under ~5s; a cache hit 4.9ms median. Side finding `/api/term/open` 400 on load: **false alarm** (both the control board's and the launch pad's probes send `session:""` and only read 403 as "disabled", since 2026-08-29).
+
+**Client (opus): NOT SETTLED.** No path paints A's data under B.
+
+| # | Verdict | Note |
+|---|---|---|
+| CF1 major | **confirmed**: accepted | `finally{pollBusy=false}` (`app.js:1636`) runs for aborted and superseded polls, so after a switch every tick starts a new fetch and the hung-fetch expiry never runs (reproduced: snapshot still up at 152s with a 2-minute TTL). Fix: `if(seq===pollSeq)`. |
+| CF2 major | **confirmed**: accepted | The hung-fetch check requires `sessRefreshing` (`:1620`), so fresh data whose updates hang stays up unlabelled forever. That contradicts the setting's own Config text ("how long a page whose updates are failing stays up") and the user's "no stale". Expire past the TTL; a slow healthy poll still never changes the label. Accepted under the user's decisions rather than re-asked. |
+| CF3 minor | accepted | The board's age label freezes during a hang; `sessSetLabel` forwards to `CR.detail.stale`. |
+| CF4 minor | **confirmed**: accepted | `closeSession` throws on every dashboard switch when the board's dialogs were never mounted (`_layer` null). It came from 5a97543 (session isolation, 2026-11-02); the only effect is a swallowed `console.error`. Guard `if(!_layer) return;`. |
+| CF5 minor | accepted | The sidebar fast-path tests survive their mutants; harden the `slist` stub. |
+
+**Server (opus): SETTLED.** It ran an AST walk, a text diff of the split, and a cached-vs-fresh comparison on 210 real transcripts (only clock-driven fields differ, as they do between two uncached runs). Warm runs mutating their results stayed byte-equal, so a hit is a fresh object.
+
+| # | Verdict | Note |
+|---|---|---|
+| SF1 minor | accepted | A stale delete past the end returns 200 and deletes nothing. With `text` sent, an out-of-range index returns 409. |
+| SF2 minor | accepted | With duplicate texts, a drain can make a push toggle the wrong note. Senders also send `pushed`; the server compares it when present. |
+| SF3 minor | accepted | Add `st_ctime_ns` to the `file_pass` key (same-size rewrite with restored mtime). |
+| Known gap | document, no change | The notes routes load and save with no lock, so a push racing a drain can bring back a delivered note. Predates this branch. |
+
+**Re-check (same reviewers, on the fixed tree).**
+- **Server: SETTLED.** SF1–SF3 closed, each test proven red against a reverted scratch copy. Senders send `pushed` as displayed, and there's no 409 loop (a 409 triggers one `poll()`, never an automatic re-send).
+- **Client: SETTLED on its stated condition.** CF1–CF5 hold, with tests red on revert. The `pollBusy` ownership reasoning was confirmed for every path (`resetSession`, abort, the pre-check's `sessFailed`, the board's calls): only a fetch that never settles keeps it set, which is the case the pre-check exists for. One new minor from the CF2 change: with the TTL not yet heard (`snapTtlMin<=0`), a slow healthy poll on fresh data showed an error. Fixed in the main thread with the reviewer's one-line guard (`snapTtlMin>0&&` in the pre-check) and `test_hung_fetch_on_fresh_data_unknown_ttl_changes_nothing`, proven red with the guard reverted.
+- Main thread also updated three `test_integration.py` tests that pinned the old unconditional `pollBusy` release, to the CF1 rule (the latest poll owns the release).
+
 ## Log
 - 2026-11-04 plan file opened.
 - 2026-11-04 plan written (opus). Round 1 review (fresh opus): REFUTED, 8 findings, all accepted; plan revised by the same opus author. Round 2 review (a different fresh opus): NOT SETTLED, 1 blocker + 2 majors + 6 minors, all accepted (B1 corrected the round-1 reconciliation); plan revised again. Round 2 re-check: SETTLED, with one minor (N1, hung fetch) recorded as an amendment. C1–C4 discharged; C5 (discuss before code) in progress; C6 covered by the plan's safety section and both reviews. No code written.
+- 2026-11-05 plan discussed with Mermaid diagrams; user decided (see User decisions); C5 discharged. Implemented on `feat/session-switch-cache`: 7bc9899 step 3, 5d02b48 steps 1-2, a70e83a step 4. Implementation review by two opus reviewers, fixes by two sonnet fixers plus a one-line main-thread guard; both reviewers SETTLED. C6 discharged: 0 wrong-session renders in 28 cached switches; no path paints one session's data under another (client review); cache hits are fresh objects (210-transcript comparison).
+
+| Contract clause | Verdict |
+|---|---|
+| C1 browser and/or system cache feeding a switch | discharged (page-memory snapshot + stat-validated server pass cache; storage, ETag, disk and prefetch rejected on measured grounds) |
+| C2 exactly what the user sees, including how stale | discharged (labelled with age, only past 50ms, expires at the configured TTL, default 30 min) |
+| C3 opus-authored plan | discharged |
+| C4 more than one run of opus review | discharged (2 plan rounds + re-check; 1 implementation round + re-check) |
+| C5 discussed before code | discharged |
+| C6 no leakage, idempotent | discharged |

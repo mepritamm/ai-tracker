@@ -488,6 +488,7 @@
   // CR.dialogs.closeSession(keepSid) — session switch: tear down every dialog bound to a session
   // other than keepSid (same teardown as close()). Session-less dialogs (sid '') stay open.
   function closeSession(keepSid) {
+    if (!_layer) return;
     for (var i = _stack.length - 1; i >= 0; i--) {
       var entry = _stack[i];
       if (!entry.sid || entry.sid === keepSid) continue;

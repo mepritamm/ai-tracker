@@ -555,7 +555,7 @@ def file_pass(kind, path, fn):
     if not _pass_cache_on():
         return fn(path)
     st = os.stat(path)   # BEFORE reading: a write during fn leaves a key older than the data -> next call misses
-    key = (st.st_mtime_ns, st.st_size, st.st_ino)
+    key = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
     ck = (kind, path)
     with _PASS_CACHE_LOCK:
         hit = _PASS_CACHE.get(ck)
