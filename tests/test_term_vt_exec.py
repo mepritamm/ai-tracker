@@ -2307,6 +2307,7 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         self.assertEqual(result["method"], "POST")
         self.assertEqual(result["body"], {
             "tty": "tty42", "session": "sid1", "text": "/model opus", "submit": True, "clear_first": True,
+            "require_claude": True,   # model/effort only type when claude is in the foreground
         })
         self.assertEqual(result["toasts"], [], "a successful inject must not surface a toast")
 
@@ -2348,6 +2349,7 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
         self.assertEqual(result["method"], "POST")
         self.assertEqual(result["body"], {
             "tty": "tty42", "session": "sid1", "text": "/effort xhigh", "submit": True, "clear_first": True,
+            "require_claude": True,
         })
         self.assertEqual(result["toasts"], [], "a successful inject must not surface a toast")
 

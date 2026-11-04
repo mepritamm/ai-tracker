@@ -984,7 +984,7 @@
   }
   function _injectSlash(text, failLabel) {
     if (!st.tty) { showToast(failLabel + ": no terminal attached"); return; }
-    post("/api/term/inject", window.ExtVT.ttyBody(st.tty, { text: text, submit: true, clear_first: true }))
+    post("/api/term/inject", window.ExtVT.ttyBody(st.tty, { text: text, submit: true, clear_first: true, require_claude: true }))
       .then(j).then(function (res) {
         if (res.ok && res.j && res.j.ok === true) return;
         var reason = (res.j && (res.j.error || res.j.reason)) ||

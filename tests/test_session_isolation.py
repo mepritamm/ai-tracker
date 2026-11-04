@@ -41,10 +41,22 @@ var document = { querySelector: function (s) { return s === "main" ? __main : nu
   dispatchEvent: function (e) { __events.push(e.detail); } };
 var localStorage = { setItem: function () {} };
 var uiState = { set: function () {} };
-function $(id) { return __els[id] || (__els[id] = { value: "", innerHTML: "", textContent: "", style: {} }); }
+function $(id) { return __els[id] || (__els[id] = { value: "", innerHTML: "", textContent: "", style: {}, dataset: {} }); }
+var __row = null, __added = [], __renderSideCalls = 0;
+__els.slist = { querySelector: function () { return __row; }, querySelectorAll: function () { return []; } };
+var sessions = [], selEntry = null, autoExpandedFor = null, searchResults = null;
+var CSS = { escape: function (s) { return String(s); } };
+function renderSide() { __renderSideCalls++; }
+function closeDrawer() {}
+function toast() {}
+function renderNotes() {}
+function pushSays() { return {toast: "", tip: "", chip: ""}; }
+var __t0 = 1700000000000;
+Date.now = function () { return __t0; };
+function __at(sec) { __t0 = 1700000000000 + sec * 1000; }
 function setInterval() { __intervals++; return 1; }
 function clearInterval() {}
-function render(d) { __renders.push({ id: d.id, sess: __main.dataset.sess, refreshing: sessRefreshing }); }
+function render(d) { __renders.push({ id: d.id, sess: __main.dataset.sess, refreshing: sessRefreshing, snapLabel: sessSnapLabel, d: d }); }
 function loadFlags() {}
 function checkCompletions() {}
 function esc(s) { return String(s); }
@@ -56,6 +68,13 @@ function fetch(url, opts) {
 function __ok(i, body) {
   __fetches[i].resolve({ ok: true, json: function () { return Promise.resolve(body); } });
 }
+function __status(i, status, body) {
+  __fetches[i].resolve({ ok: false, status: status, json: function () { return Promise.resolve(body); } });
+}
+function __reject(i, err) { __fetches[i].reject(err); }
+function __tick() { return new Promise(function (r) { setTimeout(r, 15); }); }
+function __st() { return { mark: __main.dataset.sess === undefined ? null : __main.dataset.sess, label: sessSnapLabel,
+  refreshing: sessRefreshing, renders: __renders.length, nev: __events.length, ev: __events[__events.length - 1] || null }; }
 function __pick(sid) { $("sid").value = sid; track(); }
 """
 
@@ -71,6 +90,10 @@ class TestSessionSeamExecuted(unittest.TestCase):
             + _block(src, "function track(){", "function track(){") + "\n"
             + _block(src, "let sessEpoch=0;", "function resetSession(") + "\n"
             + _block(src, "let pollBusy=false", "async function poll(){") + "\n"
+            + _block(src, "function sideMarkActive(", "function sideMarkActive(") + "\n"
+            + _block(src, "function pick(id)", "function pick(id)") + "\n"
+            + _block(src, "async function removeNote(", "async function removeNote(") + "\n"
+            + _block(src, "async function pushNote(", "async function pushNote(") + "\n"
         )
 
     def _run(self, body):
@@ -152,6 +175,7 @@ console.log(JSON.stringify({afterFirst: afterFirst, afterSame: afterSame, calls:
     # (5) renderFor / cache refuse mismatched ids; LRU caps at 8
     def test_renderFor_and_cache_refuse_mismatch(self):
         r = self._run("""
+snapTtlMin = 30;
 cur = "A";
 var okMatch = renderFor("A", {id: "A"});
 var badId = renderFor("A", {id: "B"});
@@ -176,7 +200,7 @@ console.log(JSON.stringify({okMatch: okMatch, badId: badId, badCur: badCur, noId
     # (6) cache hit paints before the fetch resolves, marked refreshing; miss is "loading"
     def test_cache_hit_paints_refreshing_miss_is_loading(self):
         r = self._run("""
-cur = "";
+cur = ""; snapTtlMin = 30;
 sessCachePut("B", {id: "B"});
 __pick("A");
 var missMark = __main.dataset.sess, rendersAfterA = __renders.length;
@@ -190,7 +214,8 @@ console.log(JSON.stringify({missMark: missMark, rendersAfterA: rendersAfterA, hi
         self.assertEqual(r["missMark"], "loading")
         self.assertEqual(r["rendersAfterA"], 0)
         self.assertEqual(r["hitMark"], "refreshing")
-        self.assertEqual(r["hit"], [{"id": "B", "sess": "refreshing", "refreshing": True}])
+        self.assertEqual([(h["id"], h["sess"], h["refreshing"]) for h in r["hit"]], [("B", "refreshing", True)])
+        self.assertTrue(r["hit"][0]["snapLabel"], "the snapshot must be painted with a label already set (board reads it inside render)")
         self.assertIsNone(r["finalMark"], "the fresh poll must clear the refreshing mark")
 
     # (7) C1: an uncached pick that errors must NOT un-hide the previous session's DOM
@@ -211,13 +236,14 @@ console.log(JSON.stringify({afterA: afterA, mark: __main.dataset.sess, err: __ma
 
     def test_cached_error_keeps_snapshot_and_next_land_clears_error(self):
         r = self._run("""
+snapTtlMin = 30;
 sessCachePut("B", {id: "B"});
 __pick("B"); __ok(0, {error: "boom"});
 await new Promise(function (r) { setTimeout(r, 20); });
 var cachedMark = __main.dataset.sess === undefined ? null : __main.dataset.sess;
 console.log(JSON.stringify({cachedMark: cachedMark}));
 """)
-        self.assertIsNone(r["cachedMark"], "a cached snapshot stays shown")
+        self.assertEqual(r["cachedMark"], "refreshing", "a failed refresh keeps the snapshot AND stays marked not-current")
         r2 = self._run("""
 __pick("C"); __ok(0, {error: "boom"});
 await new Promise(function (r) { setTimeout(r, 20); });
@@ -232,6 +258,7 @@ console.log(JSON.stringify({e1: e1, after: __main.dataset.sess === undefined ? n
     # (8) C2: the fresh render must not see refreshing:true; a mismatch must not clear it
     def test_fresh_render_sees_refreshing_false(self):
         r = self._run("""
+snapTtlMin = 30;
 sessCachePut("B", {id: "B"});
 __pick("B");
 var painted = __renders.slice();
@@ -244,6 +271,7 @@ console.log(JSON.stringify({painted: painted, last: __renders[__renders.length -
 
     def test_mismatched_land_does_not_clear_refreshing(self):
         r = self._run("""
+snapTtlMin = 30;
 sessCachePut("B", {id: "B"});
 __pick("B");
 var ok = sessLanded("B", {id: "X"});
@@ -268,6 +296,223 @@ resetSession("B", "A");
 console.log(JSON.stringify({win: _win}));
 """)
         self.assertEqual(r["win"], {})
+
+    # ---- honest snapshot (plan P4.2-P4.5, P7) -------------------------------------------------
+    def test_snapshot_strips_live_fields(self):
+        r = self._run("""
+snapTtlMin = 30; __at(0);
+sessCachePut("B", {id: "B", now: 100, term_tty: "t1", term_attached: true, waiting: true,
+  overview: {now: "working", now_kind: "k", goal: "g"}});
+__at(120); __pick("B");
+var d = __renders[0].d, e = SESS_CACHE.get("B").d;
+console.log(JSON.stringify({tty: d.term_tty, att: d.term_attached, w: d.waiting, on: d.overview.now, ok: d.overview.now_kind,
+  goal: d.overview.goal, now: d.now, age: d.snapshot_age, eTty: e.term_tty, eW: e.waiting, eNow: e.overview.now}));
+""")
+        self.assertEqual((r["tty"], r["att"], r["w"], r["on"], r["ok"]), (None, False, False, "", ""))
+        self.assertEqual((r["goal"], r["now"], r["age"]), ("g", 220, 120))
+        self.assertEqual((r["eTty"], r["eW"], r["eNow"]), ("t1", True, "working"), "the cached entry itself must not be edited")
+
+    def test_over_age_snapshot_not_painted(self):
+        r = self._run("""
+snapTtlMin = 30; sessCachePut("B", {id: "B"});
+SESS_CACHE.get("B").at -= (30 * 60 + 1) * 1000;
+__pick("B");
+console.log(JSON.stringify(Object.assign(__st(), {has: SESS_CACHE.has("B")})));
+""")
+        self.assertEqual(r["renders"], 0)
+        self.assertEqual(r["mark"], "loading")
+        self.assertFalse(r["has"], "an expired entry is deleted by the one reader")
+
+    def test_no_ttl_heard_paints_no_snapshot(self):
+        r = self._run("""
+snapTtlMin = 0; sessCachePut("B", {id: "B"});
+__pick("B");
+console.log(JSON.stringify(__st()));
+""")
+        self.assertEqual(r["renders"], 0)
+        self.assertEqual(r["mark"], "loading")
+
+    def test_404_purges_and_errors(self):
+        r = self._run("""
+snapTtlMin = 30; sessCachePut("B", {id: "B"}); sessCachePut("C", {id: "C"});
+__pick("B"); __status(0, 404, {error: "not found"}); await __tick();
+console.log(JSON.stringify(Object.assign(__st(), {hasB: SESS_CACHE.has("B"), hasC: SESS_CACHE.has("C")})));
+""")
+        self.assertEqual(r["mark"], "error")
+        self.assertFalse(r["hasB"], "a deleted session's snapshot must be purged")
+        self.assertTrue(r["hasC"])
+        self.assertFalse(r["ev"]["cached"])
+
+    def test_401_clears_everything(self):
+        r = self._run("""
+snapTtlMin = 30; sessCachePut("B", {id: "B"}); sessCachePut("C", {id: "C"});
+__pick("B"); __status(0, 401, {}); await __tick();
+console.log(JSON.stringify(Object.assign(__st(), {size: SESS_CACHE.size})));
+""")
+        self.assertEqual(r["mark"], "error")
+        self.assertEqual(r["size"], 0)
+        self.assertFalse(r["ev"]["cached"])
+
+    def test_500_keeps_labelled_snapshot_then_clears(self):
+        r = self._run("""
+snapTtlMin = 30; sessCachePut("B", {id: "B"});
+__pick("B"); __status(0, 500, {error: "boom"}); await __tick();
+var failed = __st();
+poll(); __ok(1, {id: "B", now: 1}); await __tick();
+console.log(JSON.stringify({failed: failed, after: __st()}));
+""")
+        f = r["failed"]
+        self.assertEqual((f["mark"], f["refreshing"], f["ev"]["cached"]), ("refreshing", True, True))
+        self.assertIn("can't refresh", f["label"])
+        self.assertEqual(f["ev"]["snapLabel"], f["label"])
+        self.assertEqual((r["after"]["mark"], r["after"]["label"], r["after"]["refreshing"]), (None, "", False))
+
+    def test_steady_state_500_and_network_error_keep_view(self):
+        r = self._run("""
+snapTtlMin = 30;
+__pick("A"); __ok(0, {id: "A", now: 1}); await __tick();
+var base = __st();
+poll(); __status(1, 500, {error: "boom"}); await __tick(); var s500 = __st();
+poll(); __reject(2, new TypeError("net")); await __tick(); var sNet = __st();
+poll(); __ok(3, {id: "A", now: 2}); await __tick(); var good = __st();
+console.log(JSON.stringify({base: base, s500: s500, sNet: sNet, good: good}));
+""")
+        for k in ("s500", "sNet"):
+            s = r[k]
+            self.assertEqual(s["renders"], r["base"]["renders"], k + ": a failure must not re-render")
+            self.assertEqual((s["mark"], s["refreshing"], s["ev"]["cached"]), ("refreshing", True, True), k)
+            self.assertIn("can't refresh", s["label"])
+        self.assertEqual((r["good"]["mark"], r["good"]["label"], r["good"]["refreshing"]), (None, "", False))
+        self.assertEqual(r["good"]["renders"], r["base"]["renders"] + 1)
+
+    def test_backdated_entry_and_500_stays_error(self):
+        r = self._run("""
+snapTtlMin = 30;
+__pick("A"); __ok(0, {id: "A", now: 1}); await __tick();
+sessCachePut("B", {id: "B"}); SESS_CACHE.get("B").at -= (snapTtlMin * 60 + 1) * 1000;
+var before = __renders.length;
+__pick("B"); __status(1, 500, {error: "boom"}); await __tick();
+console.log(JSON.stringify(Object.assign(__st(), {before: before})));
+""")
+        self.assertEqual(r["mark"], "error", "the previous session's DOM must stay hidden")
+        self.assertEqual(r["renders"], r["before"])
+        self.assertFalse(r["ev"]["cached"])
+
+    def test_outage_reages_then_expires(self):
+        for ttl in (30, 2):
+            r = self._run("""
+snapTtlMin = %d; __at(0);
+__pick("A"); __ok(0, {id: "A", now: 1}); await __tick();
+var out = [];
+__at(60); poll(); __status(1, 500, {error: "x"}); await __tick(); out.push(__st());
+__at(120); poll(); __status(2, 500, {error: "x"}); await __tick(); out.push(__st());
+__at(snapTtlMin * 60 + 1); poll(); __status(3, 500, {error: "x"}); await __tick(); out.push(__st());
+console.log(JSON.stringify(out));
+""" % ttl)
+            self.assertIn("1m ago", r[0]["label"])
+            self.assertIn("2m ago", r[1]["label"])
+            self.assertEqual((r[1]["mark"], r[1]["ev"]["cached"]), ("refreshing", True), "ttl=%d" % ttl)
+            self.assertEqual((r[2]["mark"], r[2]["ev"]["cached"]), ("error", False), "ttl=%d" % ttl)
+
+    def test_hung_fetch_still_expires(self):
+        r = self._run("""
+snapTtlMin = 2; __at(0); sessCachePut("B", {id: "B"});
+__pick("B");                                  // snapshot painted; its fetch (0) never resolves
+var f0 = __fetches.length;
+__at(60); poll(); var s1 = __st();
+__at(121); poll(); var s2 = __st();
+console.log(JSON.stringify({f0: f0, n: __fetches.length, s1: s1, s2: s2}));
+""")
+        self.assertEqual(r["n"], r["f0"], "no new fetch while one is in flight")
+        self.assertIn("1m ago", r["s1"]["label"])
+        self.assertEqual(r["s1"]["mark"], "refreshing")
+        self.assertEqual((r["s2"]["mark"], r["s2"]["ev"]["cached"]), ("error", False))
+
+    def test_hung_fetch_on_fresh_data_changes_nothing(self):
+        r = self._run("""
+snapTtlMin = 2; __at(0);
+__pick("A"); __ok(0, {id: "A", now: 1}); await __tick();
+poll();                                       // hangs
+var a = __st(); __at(3 * 3600); poll(); var b = __st();
+console.log(JSON.stringify({a: a, b: b}));
+""")
+        self.assertEqual(r["a"], r["b"])
+        self.assertIsNone(r["b"]["mark"])
+
+    def test_refused_paint_resets_label_and_mark(self):
+        r = self._run("""
+snapTtlMin = 30; cur = "B"; sessCachePut("B", {id: "B"});
+var t = sessToken();
+renderFor = function () { return false; };
+var ok = sessPaintSnapshot(t);
+console.log(JSON.stringify({ok: ok, refreshing: sessRefreshing, label: sessSnapLabel, mark: __main.dataset.sess}));
+""")
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["refreshing"])
+        self.assertEqual(r["label"], "")
+        self.assertEqual(r["mark"], "loading")
+
+    def test_abort_mid_flight_does_not_touch_new_session(self):
+        r = self._run("""
+snapTtlMin = 30;
+__pick("A"); __pick("B");
+var e = new Error("aborted"); e.name = "AbortError";
+__reject(0, e); await __tick();
+console.log(JSON.stringify(__st()));
+""")
+        self.assertEqual(r["mark"], "loading")
+        self.assertEqual(r["label"], "")
+        self.assertEqual(r["nev"], 0)
+
+    def test_prefixed_and_bare_ids_do_not_collide(self):
+        r = self._run("""
+snapTtlMin = 30;
+sessCachePut("auggie:abc", {id: "auggie:abc", v: 1}); sessCachePut("abc", {id: "abc", v: 2});
+console.log(JSON.stringify({a: sessCacheGet("auggie:abc").v, b: sessCacheGet("abc").v, size: SESS_CACHE.size}));
+""")
+        self.assertEqual((r["a"], r["b"], r["size"]), (1, 2, 2))
+
+    def test_position_note_senders_send_text(self):
+        r = self._run("""
+cur = "A"; lastData = {notes: [{text: "n0"}, {text: "n1"}]};
+removeNote(1); pushNote(1);
+console.log(JSON.stringify(__fetches.map(function (f) { return [f.url, JSON.parse(f.opts.body)]; })));
+""")
+        self.assertEqual(r[0], ["/api/notes/delete", {"session": "A", "index": 1, "text": "n1"}])
+        self.assertEqual(r[1], ["/api/notes/push", {"session": "A", "index": 1, "text": "n1"}])
+
+    # ---- sidebar fast path (P4.1) -------------------------------------------------------------
+    def test_pick_skips_full_sidebar_when_row_present(self):
+        r = self._run("""
+__row = {classList: {add: function (c) { __added.push(c); }}}; sessions = [{id: "B"}];
+pick("B");
+console.log(JSON.stringify({calls: __renderSideCalls, added: __added}));
+""")
+        self.assertEqual(r["calls"], 0)
+        self.assertEqual(r["added"], ["active"])
+
+    def test_pick_falls_back_when_row_absent(self):
+        r = self._run("""
+__row = null; pick("B");
+console.log(JSON.stringify({calls: __renderSideCalls}));
+""")
+        self.assertEqual(r["calls"], 1)
+
+    def test_fast_pick_keeps_sidebar_bookkeeping(self):
+        r = self._run("""
+__row = {classList: {add: function () {}}}; sessions = [{id: "B"}]; autoExpandedFor = "Z";
+pick("B");
+console.log(JSON.stringify({auto: autoExpandedFor, sel: selEntry && selEntry.id, calls: __renderSideCalls}));
+""")
+        self.assertEqual((r["auto"], r["sel"], r["calls"]), ("B", "B", 0))
+
+    def test_fast_pick_in_search_leaves_auto_expand_pending(self):
+        r = self._run("""
+__row = {classList: {add: function () {}}}; sessions = [{id: "B"}]; autoExpandedFor = "Z"; searchResults = [{id: "B"}];
+pick("B");
+console.log(JSON.stringify({auto: autoExpandedFor, sel: selEntry && selEntry.id}));
+""")
+        self.assertEqual((r["auto"], r["sel"]), ("Z", "B"))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -384,6 +629,22 @@ class TestSessionIsolationStaticSweep(unittest.TestCase):
         i = boot.index("on('cr:drill-request'")
         self.assertRegex(boot[i:i + 900], r"sid !== cur", "drill request is not gated on the selection")
         self.assertIn("sessJSON(urlFn(", boot)
+
+    def test_model_effort_senders_require_claude_and_note_senders_send_text(self):
+        for f, needle, n in (("ext_cr_detail.js", "clear_first: true, require_claude: true", 1),
+                             ("ext_cr_term.js", "clear_first: true, require_claude: true", 1),
+                             ("ext_vt.js", "clear_first: true, require_claude: true", 2)):
+            self.assertEqual(_web_src(f).count(needle), n, f + ": model/effort sender without require_claude")
+        self.assertIn("snapLabel: (typeof sessSnapLabel", _web_src("ext_cr_boot.js"))
+        self.assertIn("text: payload.text", _web_src("ext_cr_boot.js"))
+        self.assertIn("text: rmNote && rmNote.text", _web_src("ext_cr_detail.js"))
+        app = _web_src("app.js")
+        for fn in ("function sessLanded(", "function sessFailed("):
+            i = app.index(fn)
+            body = app[i:app.index("\nfunction ", i + 10)]
+            self.assertNotIn("sessCacheGet(", body, fn + " must not read the age-gated cache to decide error-or-keep")
+        code = _code_only(app)
+        self.assertNotRegex(code, r"(localStorage|sessionStorage|indexedDB)[^;]*SESS_CACHE")
 
     def test_run_command_sid_is_read_at_click_time(self):
         src = _web_src("ext_run.js")
@@ -536,6 +797,25 @@ OUT.errorAfterSwitch = !!node._cls["crd-is-error"];
         self.assertFalse(r["errorAfterLand"])
         self.assertTrue(r["cErrored"])
         self.assertFalse(r["errorAfterSwitch"], "C's error state leaked onto B's loading")
+
+    # A failed poll on a view that is already shown: the board keeps it, labelled, instead of ignoring it
+    def test_cached_error_event_labels_header(self):
+        r = self._run(r"""
+var node = window.CR.detail._root._crDetail.node;
+var hd = node.querySelector(".crd-header"); OUT.attrs = [];
+hd.setAttribute = function (k, v) { OUT.attrs.push([k, v]); };
+function pick(s) { document.getElementById("x").value = s; track(); }
+pick("B");
+var fire = function (d) { (window.__docL["tracker:session-error"] || []).forEach(function (f) { f({detail: d}); }); };
+fire({id: "B", error: "boom", cached: true, snapLabel: "data from 2m ago · can't refresh"});
+OUT.refreshing = !!node._cls["crd-is-refreshing"]; OUT.errored = !!node._cls["crd-is-error"];
+fire({id: "B", error: "boom", cached: false});
+OUT.errored2 = !!node._cls["crd-is-error"];
+""")
+        self.assertTrue(r["refreshing"])
+        self.assertFalse(r["errored"], "a kept view must not show the error state")
+        self.assertIn(["data-snap", "data from 2m ago · can't refresh"], r["attrs"])
+        self.assertTrue(r["errored2"])
 
     # C5: building a tty body must not rebind the page-wide tty->session map
     def test_tty_body_for_does_not_mutate_binding(self):

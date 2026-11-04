@@ -2265,3 +2265,4 @@
 .cr .crd.crd-is-error .crd-col-body, .cr .crd.crd-is-error .crd-header { visibility: hidden; }
 .cr .crd.crd-is-error::after { content: attr(data-err); display: block; padding: 24px; color: var(--cr-bad, #c33); }
 .cr .crd.crd-is-refreshing .crd-header { opacity: .7; }
+.cr .crd.crd-is-refreshing .crd-header::after { content: attr(data-snap); display: block; font-size: 11px; color: var(--cr-muted, #888); }

@@ -4581,6 +4581,7 @@ def inject(handler, parsed, body):
         return handler._json({"error": "text required"}, 400)
     submit = bool(body.get("submit", True))
     clear_first = bool(body.get("clear_first", False))
+    require_claude = bool(body.get("require_claude", False))   # model/effort senders: never type a slash command into a bare shell
     with _LOCK:
         _reap()
         pt = PTYS.get(tid)
@@ -4597,6 +4598,8 @@ def inject(handler, parsed, body):
         still = _pty_owned(pt, sid)
     if not still:
         return _mismatch(handler, tid)
+    if require_claude and not _foreground_is_claude(pt.fd):      # probe outside _LOCK, like the other callers
+        return handler._json({"ok": False, "reason": "claude not in foreground"})
 
     if clear_first:
         if not _inject_write(pt, b"\x05"):                    # Ctrl+E: end of line

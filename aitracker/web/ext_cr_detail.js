@@ -1986,7 +1986,9 @@
           break;
         }
         case "note-remove":
-          ctx.emit("cr:note-remove", { sessionId: sid, index: parseInt(t.getAttribute("data-idx"), 10) });
+          var rmIdx = parseInt(t.getAttribute("data-idx"), 10);
+          var rmNote = (ui.lastSession && ui.lastSession.notes || [])[rmIdx];
+          ctx.emit("cr:note-remove", { sessionId: sid, index: rmIdx, text: rmNote && rmNote.text });
           break;
         case "note-push": {
           var input = qs(node, ".crd-plan-input");
@@ -2204,6 +2206,17 @@
     update: function (state) {
       renderUpdate(this._root, this._ctx, state);
     },
+    // Data on screen is not current (a failed poll): keep the view, label its age, no render.
+    stale: function (id, label) {
+      var root = this._root, n = root && root._crDetail && root._crDetail.node;
+      if (!n || (typeof cur !== "undefined" && id !== cur)) return;
+      n.classList.remove("crd-is-loading");
+      n.classList.remove("crd-is-error");
+      n.removeAttribute("data-err");
+      n.classList.add("crd-is-refreshing");
+      var hd = n.querySelector(".crd-header");
+      if (hd) hd.setAttribute("data-snap", String(label || ""));
+    },
     // A failed switch to an uncached session: replace the loading placeholder with the error.
     error: function (id, msg) {
       var root = this._root, n = root && root._crDetail && root._crDetail.node;
@@ -2231,6 +2244,8 @@
     node.classList.remove("crd-is-error");
     node.removeAttribute("data-err");
     node.classList.toggle("crd-is-refreshing", !!state.refreshing);
+    var hd = node.querySelector(".crd-header");
+    if (hd) { if (state.refreshing && state.snapLabel) hd.setAttribute("data-snap", state.snapLabel); else hd.removeAttribute("data-snap"); }
     ui.lastSession = session;
     ui.lastState = state;
     ui.lastTitle = (session.meta && session.meta.title) || "";
@@ -3073,7 +3088,7 @@
   }
   function _injectToTerminal(ctx, tty, text, failLabel, sid) {
     if (!tty) { ctx.emit("notify", { text: failLabel + ": no terminal attached" }); return; }
-    _termPost("/api/term/inject", _ttyBodyFor(tty, sid, { text: text, submit: true, clear_first: true }))
+    _termPost("/api/term/inject", _ttyBodyFor(tty, sid, { text: text, submit: true, clear_first: true, require_claude: true }))
       .then(_termJson).then(function (res) {
         if (res.ok && res.j && res.j.ok === true) { ctx.emit("notify", { text: "Switched." }); return; }
         var reason = (res.j && (res.j.error || res.j.reason)) ||

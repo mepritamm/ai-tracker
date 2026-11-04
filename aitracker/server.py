@@ -260,6 +260,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")   # transcripts must not sit in a browser or proxy cache
             self.send_header("Content-Length", str(len(body)))
             for k, v in (headers or {}).items():
                 self.send_header(k, v)
@@ -395,6 +396,8 @@ class Handler(BaseHTTPRequestHandler):
             # X-Term-Count rides the same header-not-body trick, for the same reason -- see
             # _term_count()'s docstring above for why a header, and why it degrades to None/omitted.
             headers = {"X-Server-Now": str(time.time())}
+            # served live (read at request time), so a Config edit reaches every open page on its next list poll
+            headers["X-Snapshot-TTL"] = str(config.SNAPSHOT_TTL_MIN)
             if ro:
                 headers["X-Read-Only"] = "1"    # the SPA hides write controls; the 403s are the real gate
             else:
@@ -765,6 +768,10 @@ class Handler(BaseHTTPRequestHandler):
             if not (isinstance(idx, int) and 0 <= idx < len(stack)):
                 self._json({"error": "session and index required"}, 400)
                 return
+            want = body.get("text")   # optional: the note text the client saw at this position
+            if isinstance(want, str) and stack[idx].get("text") != want:
+                self._json({"error": "notes changed", "notes": stack}, 409)
+                return
             stack[idx]["pushed"] = not stack[idx].get("pushed")   # click again to un-queue
             save_notes(notes)
             self._json({"ok": True, "notes": stack})
@@ -794,6 +801,10 @@ class Handler(BaseHTTPRequestHandler):
             notes = load_notes()
             stack = notes.get(sid, [])
             if isinstance(idx, int) and 0 <= idx < len(stack):
+                want = body.get("text")   # optional: the note text the client saw at this position
+                if isinstance(want, str) and stack[idx].get("text") != want:
+                    self._json({"error": "notes changed", "notes": stack}, 409)
+                    return
                 stack.pop(idx)
                 if stack:
                     notes[sid] = stack

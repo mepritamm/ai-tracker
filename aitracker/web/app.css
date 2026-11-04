@@ -623,7 +623,7 @@ main[data-sess=loading]::before{content:"Loading session…";display:block;paddi
 main[data-sess=error]>*{visibility:hidden}
 main[data-sess=error] #drawerBtn{visibility:visible}
 main[data-sess=error]::before{content:attr(data-err);display:block;padding:24px;color:var(--bad,#c33)}
-main[data-sess=refreshing] #hmeta::after{content:" · refreshing…"}
+main[data-sess=refreshing] #hmeta::after{content:" · " attr(data-snap)}
 
 /* Read-only view: cosmetic hide of classic-UI write controls (server still 403s). */
 html.tracker-readonly .ren,html.tracker-readonly .pin:not(.on),html.tracker-readonly .addflag,html.tracker-readonly .addnote{display:none!important}

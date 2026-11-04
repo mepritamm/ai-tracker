@@ -1054,7 +1054,7 @@ function renderSide(){
     $("livecount").textContent=`${searchResults.length} match${searchResults.length==1?"":"es"}`;
     $("slist").innerHTML=searchResults.length?searchResults.map(s=>{
       const live=now-s.mtime<LIVE;
-      return `<div class="sitem ${s.id===cur?'active':''}" onclick="pick('${s.id}')" title="${esc(s.title||'')}">`+
+      return `<div class="sitem ${s.id===cur?'active':''}" data-sid="${esc(s.id)}" onclick="pick('${s.id}')" title="${esc(s.title||'')}">`+
         `<div class=srow1><span class="dot ${live?'live':''}"></span><span class=nm>${s.agent?ico('agent')+' ':''}${esc(s.title||s.project||s.id.slice(0,8))}</span>`+
         `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename">${ico('edit')}</span></div>`+
         `<div class=smeta><span class=proj>${esc(s.project)}</span>${s.inQuery?' · <span class=smatch>your query</span>':''} · <span>${s.matches}×</span></div>`+
@@ -1178,7 +1178,7 @@ function sessionRow(s,now,ex){
   const statusBadge=status==="waiting"
     ?`<span class="statusbadge waiting" title="waiting for your answer — respond in the session">${ico('hourglass')} answer</span>`
     :status==="done"?`<span class="statusbadge done" title="completed its last run">${ico('check')} done</span>`:"";
-  return `<div class="sitem ${s.id===cur?'active':''}${s.pinned?' pinned':''}${s.agent?' agentrow':''}${ex?' hasagents':''}${status?' '+status:''}${s.open_flags?' flagged':''}" onclick="${onclick}" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
+  return `<div class="sitem ${s.id===cur?'active':''}${s.pinned?' pinned':''}${s.agent?' agentrow':''}${ex?' hasagents':''}${status?' '+status:''}${s.open_flags?' flagged':''}" data-sid="${esc(s.id)}" onclick="${onclick}" title="${esc((s.prompt||s.title||'(no prompt)')+'\n'+(s.cwd||''))}">`+
     `<div class=srow1>${chev}<span class="dot ${live?'live':''}"></span><span class=nm>${s.agent?ico('agent')+' ':''}${esc(label)}</span>`+
     `${statusBadge}${failBadge}${flagBadge}${noteBadge}${todoBadge}`+
     (s._runs>1?`<span class="agentbadge runs" title="ran ${s._runs}× — collapsed; opens the latest">×${s._runs}</span>`:"")+
@@ -1282,6 +1282,7 @@ async function loadSide(){
     if(t)listNow=+t;
     const tc=res.headers.get("X-Term-Count");   // absent -> null -> no badge (see termCount above)
     termCount=tc!==null?+tc:null;
+    const st=res.headers.get("X-Snapshot-TTL"); if(st!==null)snapTtlMin=+st;   // server-owned age limit, live
     applyReadOnly(res);
     sessions=await res.json();
   }catch(e){return}
@@ -1290,7 +1291,22 @@ async function loadSide(){
   SIDE_EXT.forEach(f=>{try{f()}catch(e){console.error("side ext render",e)}});
   loadFlags();   // flags were only fetched by poll(), i.e. never until a session was selected
 }
-function pick(id){$("sid").value=id;track();renderSide();closeDrawer();}   // renderSide auto-expands the selected agent's container; closeDrawer no-ops off-phone
+// Fast path: when the picked row is already in the DOM, move the active mark instead of rebuilding the
+// whole sidebar (~200ms at 1000 sessions). Returns false when the row is absent (collapsed agent group,
+// top-N cap, live filter) so pick() falls back to renderSide(), whose auto-expand then fires.
+function sideMarkActive(id){
+  const l=$("slist"), q=typeof CSS!=="undefined"&&CSS.escape?CSS.escape(id):id, row=l&&l.querySelector('.sitem[data-sid="'+q+'"]');
+  if(!row) return false;
+  l.querySelectorAll(".sitem.active").forEach(e=>e.classList.remove("active"));
+  row.classList.add("active");
+  // the two pieces of renderSide's bookkeeping a skipped render would otherwise leave behind
+  const found=sessions.find(s=>s.id===id); if(found) selEntry=found;
+  // the row is visible, so its container is already open. Not in search mode: renderSide returns
+  // before auto-expand there, so the expand must still run when the search is cleared.
+  if(searchResults===null) autoExpandedFor=id;
+  return true;
+}
+function pick(id){$("sid").value=id;track();sideMarkActive(id)||renderSide();closeDrawer();}   // renderSide auto-expands the selected agent's container; closeDrawer no-ops off-phone
 // mobile Sessions drawer (phones only; CSS gates the affordances to ≤600px)
 function toggleDrawer(){document.querySelector(".app").classList.toggle("draweropen");}
 function closeDrawer(){document.querySelector(".app").classList.remove("draweropen");}
@@ -1398,10 +1414,8 @@ function track(){
   if(timer)clearInterval(timer);
   if(cur!==prev){
     resetSession(cur, prev);                         // synchronous: nothing of prev survives this line
-    const hit=cur&&sessCacheGet(cur);
-    sessRefreshing=!!hit;
-    document.querySelector("main").dataset.sess=hit?"refreshing":(cur?"loading":"");
-    if(hit) renderFor(cur, hit);                     // B's OWN snapshot, marked refreshing
+    document.querySelector("main").dataset.sess=cur?"loading":"";
+    if(cur&&sessCacheGet(cur)) sessPaintSnapshot(sessToken());   // B's OWN snapshot, labelled, scrubbed of live fields
   }
   if(!cur)return;
   poll();timer=setInterval(poll,2000);               // fires NOW -- pollBusy was cleared by resetSession
@@ -1410,9 +1424,12 @@ let lastData=null;
 // ---- Session isolation seam: ONE teardown both views use (classic + control room) ----
 let sessEpoch=0;                         // bumped on every selection change
 let sessAbort=new AbortController();     // aborts every in-flight session-scoped READ on a switch
-let sessRefreshing=false;                // true while the shown detail is a cached snapshot
+let sessRefreshing=false;                // true while the shown data is not known to be current: a snapshot, or fresh data whose latest poll failed (drives the label only)
 const SESSION_RESET=[];                  // fn(next, prev) -- per-session state MUST register here
-const SESS_CACHE=new Map(), SESS_CACHE_MAX=8;   // sid -> detail dict (d.id===sid), in-memory LRU
+const SESS_CACHE=new Map(), SESS_CACHE_MAX=8;   // sid -> {d, at}: d.id===sid, at = Date.now() at landing; in-memory LRU
+let snapTtlMin=0;                        // server-owned (config.SNAPSHOT_TTL_MIN), set from the X-Snapshot-TTL header by loadSide; 0 = not heard yet
+function sessSnapMaxAge(){ return snapTtlMin*60; }   // seconds; the ONLY reader of snapTtlMin
+let sessSnapLabel="";                    // label text; read by ext_cr_boot.js at render time
 const STALE=Object.freeze({stale:true}); // identity sentinel: the selection moved mid-request
 function onSessionReset(fn){ SESSION_RESET.push(fn); }
 function sessToken(){ return {sid:cur, epoch:sessEpoch}; }
@@ -1432,10 +1449,61 @@ async function sessJSON(url, opts){
 }
 function sessCachePut(sid,d){
   if(!sid||!d||d.error||d.id!==sid) return;
-  SESS_CACHE.delete(sid); SESS_CACHE.set(sid,d);
+  SESS_CACHE.delete(sid); SESS_CACHE.set(sid,{d:d,at:Date.now()});
   while(SESS_CACHE.size>SESS_CACHE_MAX) SESS_CACHE.delete(SESS_CACHE.keys().next().value);
 }
-function sessCacheGet(sid){ const d=SESS_CACHE.get(sid); return d&&d.id===sid?d:null; }
+function sessExpired(age){ return snapTtlMin<=0 || !(age<=sessSnapMaxAge()); }   // ttl not heard yet counts as expired
+// The age limit lives here, so no caller can bypass it: null when absent, mismatched, or too old.
+function sessCacheGet(sid){
+  const e=SESS_CACHE.get(sid);
+  if(!e||!e.d||e.d.id!==sid) return null;
+  if(sessExpired(sessCacheAge(sid))){ if(snapTtlMin>0) SESS_CACHE.delete(sid); return null; }
+  return e.d;
+}
+function sessCacheAge(sid){ const e=SESS_CACHE.get(sid); return e?Math.max(0,Math.floor((Date.now()-e.at)/1000)):Infinity; }
+// A COPY for painting while fresh data loads: the cached entry is never edited. Live-terminal and
+// "working now" fields are scrubbed so no control or status claims more than the snapshot knows.
+function sessSnapshot(d,age){
+  return Object.assign({},d,{now:d.now+age, term_tty:null, term_attached:false, waiting:false,
+    overview:Object.assign({},d.overview,{now:"",now_kind:""}), snapshot_age:age});
+}
+function sessShown(id){ return !!(lastData && lastData.id===id); }   // something of id (fresh or snapshot) is painted
+function sessAgeText(age){ return age<60?Math.floor(age)+"s ago":age<3600?Math.floor(age/60)+"m ago":Math.floor(age/3600)+"h ago"; }
+function sessSnapText(age,failed){ return failed?("data from "+sessAgeText(age)+" \u00b7 can't refresh"):("snapshot from "+sessAgeText(age)+" \u00b7 updating\u2026"); }
+function sessSetLabel(text){
+  sessSnapLabel=text||"";
+  const h=$("hmeta"); if(!h||!h.dataset) return;
+  if(sessSnapLabel) h.dataset.snap=sessSnapLabel; else delete h.dataset.snap;
+}
+function sessPaintSnapshot(t){            // returns bool
+  if(!sessCurrent(t)) return false;
+  const d=sessCacheGet(cur); if(!d) return false;
+  const age=sessCacheAge(cur), m=document.querySelector("main");
+  // flag, label and mark BEFORE the paint: the board reads them synchronously inside render()
+  sessRefreshing=true; sessSetLabel(sessSnapText(age,false)); m.dataset.sess="refreshing";
+  if(renderFor(cur, sessSnapshot(d,age))) return true;
+  sessRefreshing=false; sessSetLabel(""); m.dataset.sess="loading";   // refused: undo
+  return false;
+}
+// One place for every failed poll. kind: "gone" (404), "auth" (401), "other" (500, 502, network).
+function sessFailed(id,kind,msg){
+  const m=document.querySelector("main"); if(id!==cur) return;
+  if(kind==="gone") SESS_CACHE.delete(id);
+  else if(kind==="auth") SESS_CACHE.clear();
+  else if(sessShown(id)){
+    const age=sessCacheAge(id);          // from the entry's landing time, so an outage keeps counting
+    if(!sessExpired(age)){
+      sessRefreshing=true; sessSetLabel(sessSnapText(age,true));
+      if(m){ m.dataset.sess="refreshing"; delete m.dataset.err; }
+      document.dispatchEvent(new CustomEvent("tracker:session-error",{detail:{id:id,error:String(msg||"error"),cached:true,snapLabel:sessSnapLabel}}));
+      return;
+    }
+  }
+  sessRefreshing=false; sessSetLabel("");
+  if(m){ m.dataset.sess="error"; m.dataset.err=String(msg||"error"); }
+  $("hmeta").innerHTML=`<span class=dot></span> ${esc(msg||"error")}: ${esc(id)}`;
+  document.dispatchEvent(new CustomEvent("tracker:session-error",{detail:{id:id,error:String(msg||"error"),cached:false,snapLabel:""}}));
+}
 // The ONLY way a detail dict reaches render(): refuses a payload for any other session.
 function renderFor(sid,d){
   if(!sid||sid!==cur||!d||d.id!==sid) return false;
@@ -1445,18 +1513,12 @@ function renderFor(sid,d){
 function sessLanded(id,d){
   const m=document.querySelector("main");
   if(d&&d.error){
-    sessRefreshing=false;
-    if(id===cur){
-      // Uncached target that failed: keep A's DOM hidden behind an error state; a cached snapshot stays shown.
-      if(m&&!sessCacheGet(id)){ m.dataset.sess="error"; m.dataset.err=String(d.error); }
-      else if(m) delete m.dataset.sess;
-      document.dispatchEvent(new CustomEvent("tracker:session-error",{detail:{id:id,error:String(d.error),cached:!!sessCacheGet(id)}}));
-    }
+    if(id===cur) sessFailed(id, d.gone?"gone":d.authfail?"auth":"other", d.error);
     return false;
   }
   sessCachePut(id,d);
   if(!(id===cur&&d&&d.id===id)) return false;
-  sessRefreshing=false; if(m){ delete m.dataset.sess; delete m.dataset.err; }
+  sessRefreshing=false; sessSetLabel(""); if(m){ delete m.dataset.sess; delete m.dataset.err; }
   return renderFor(id,d);
 }
 function resetSession(next, prev){
@@ -1465,6 +1527,7 @@ function resetSession(next, prev){
   sessAbort=new AbortController();
   pollBusy=false;          // the aborted poll must not block the new session's first fetch
   lastData=null;
+  sessRefreshing=false; sessSetLabel("");
   SESSION_RESET.forEach(f=>{ try{ f(next, prev); }catch(e){ console.error("session reset hook",e); } });
 }
 // ---- completion notifications: agent/shell running -> done ----
@@ -1542,15 +1605,27 @@ function checkCompletions(d){
 // clobber a newer one either). Anything else is a stale reply and is silently dropped.
 let pollBusy=false, pollSeq=0;
 async function poll(){
+  // A fetch that never answers keeps pollBusy set, so sessFailed would never run: re-age (and finally
+  // expire) a view already marked not-current from here. Fresh data with a slow poll is left alone.
+  if(cur&&pollBusy&&sessRefreshing&&sessShown(cur)){
+    const age=sessCacheAge(cur);
+    if(sessExpired(age)) sessFailed(cur,"other","can't refresh");
+    else sessSetLabel(sessSnapText(age,false));
+  }
   if(!cur||pollBusy)return;
   pollBusy=true;
   const seq=++pollSeq, id=cur;
   let d;
-  try{d=await(await fetch("/api/session?id="+encodeURIComponent(id),{signal:sessAbort.signal})).json()}
-  catch(e){return}
+  try{
+    const r=await fetch("/api/session?id="+encodeURIComponent(id),{signal:sessAbort.signal});
+    d=await r.json().catch(()=>({error:"http "+r.status}));
+    if(!r.ok&&!d.error) d.error="http "+r.status;
+    if(r.status===404) d.gone=true; else if(r.status===401) d.authfail=true;
+  }
+  catch(e){ if(seq!==pollSeq||id!==cur)return; d={error:"network error"}; }   // the guard first: a switch's AbortError is not a failure
   finally{pollBusy=false;}
   if(seq!==pollSeq||id!==cur)return;   // superseded by a newer poll, or the selection moved on — discard
-  if(d.error){sessLanded(id,d);$("hmeta").innerHTML=`<span class=dot></span> ${esc(d.error)}: ${esc(cur)}`;return}
+  if(d.error){sessLanded(id,d);return}
   if(!sessLanded(id,d))return;
   loadFlags();checkCompletions(d);
 }
@@ -1769,7 +1844,10 @@ function render(d){
   // isn't idle, and calling it "idle 26m ago" is what hid that it needed an answer.
   $("htitle").textContent=title;
   $("activebadge").style.display="inline-flex";
-  if(d.waiting){
+  if(d.snapshot_age!=null){
+    $("activebadge").innerHTML='<span class=dot></span>snapshot';
+    $("activebadge").style.color="var(--muted)";$("activebadge").style.background="var(--chipbg)";$("activebadge").style.borderColor="var(--line3)";
+  }else if(d.waiting){
     $("activebadge").innerHTML='<span class="dot amber"></span>'+ico("hourglass")+' waiting on you · '+ago(idle).replace(" ago","");
     $("activebadge").style.color="var(--amber)";$("activebadge").style.background="var(--amber-deep)";$("activebadge").style.borderColor="var(--amber-line)";
   }else if(!live){
@@ -2338,16 +2416,20 @@ async function removeNote(idx){
   if(!cur)return;
   const sid=cur;
   const j=await sessJSON("/api/notes/delete",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({session:sid,index:idx})});
-  if(j===STALE||j.error)return;
+    body:JSON.stringify({session:sid,index:idx,text:((lastData&&lastData.notes)||[])[idx]?.text})});
+  if(j===STALE)return;
+  if(j.error==="notes changed"){toast("Notes changed — list refreshed","");poll();return}
+  if(j.error)return;
   if(lastData)lastData.notes=j.notes||[];renderNotes((lastData&&lastData.notes)||[]);renderSide();
 }
 async function pushNote(idx){
   if(!cur)return;
   const sid=cur;
   const j=await sessJSON("/api/notes/push",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({session:sid,index:idx})});
-  if(j===STALE||j.error)return;
+    body:JSON.stringify({session:sid,index:idx,text:((lastData&&lastData.notes)||[])[idx]?.text})});
+  if(j===STALE)return;
+  if(j.error==="notes changed"){toast("Notes changed — list refreshed","");poll();return}
+  if(j.error)return;
   if(lastData)lastData.notes=j.notes||[];
   renderNotes(lastData?lastData.notes||[]:[]);renderSide();
   const now=(j.notes||[])[idx];

@@ -33,6 +33,18 @@ Standing requirement from the same thread (session isolation work, `docs/session
 - Only the selected session is polled, so a cached snapshot is as old as the user's last look at that session.
 - Server parse time, 12 most recent sessions: first parse median 88ms, worst 1554ms; second parse median 31ms, worst 623ms. Payload median 47KB, worst 433KB. Network and render time were not measured.
 
+## User decisions (2026-11-05, verbatim answers)
+
+> Decision 1 (what a switch shows): "Labelled snapshot (Recommended)"
+>
+> Decision 2 (snapshot age): "3 and the snapshot is always refreshed with the new data, also session snapshot cached is always comes up with a ttl of 30minutes, that can be configurable from the config settings like the ttl config settings we have it for terminals"
+>
+> Decision 3 (scope): "All four steps (Recommended)"
+>
+> Decision 4 (reload): "Leave reload as is (Recommended)"
+
+Interpretation recorded by the main thread: decision 2 sets the snapshot age limit to a **config setting, default 30 minutes**, built the same way as `TERM_IDLE_TTL_MIN` (`config.py:201, 248, 268, 464-473, 482, 499, 511`) and editable from Config. The leading "3" is ambiguous (the third option offered was 15 minutes); since the value is configurable, a different default is a one-line change. "Always refreshed with the new data" matches the plan: a snapshot is always replaced when live data lands.
+
 ## Plan
 _Authored by the opus plan agent against f43e04e. Line numbers read with grep + `sed -n`; treat them as ±5 because other sessions edit these files._
 
@@ -112,7 +124,7 @@ In the dashboard view the existing snapshot gives nothing today: it is painted i
 | localStorage | Reload, shared across tabs | The above, plus synchronous across all tabs | Same | **No** |
 | HTTP cache, ETag/304 | Body bytes only: 0.4ms on loopback, about 140ms on the emulated link | `now` and agent durations change every response, so the ETag must exclude them or never match. It still parses unless backed by the pass cache. Keeps the body in the browser's disk cache, which JS cannot clear | Not on loopback. Small remotely, and the snapshot already covers that time | **No**, and send `no-store` (P4.5) |
 | On-disk server cache | First parse after a restart only (121 / 4617ms); restarts are rare | **Conflicts with conventions rule 6** (app-writable state stays in `flags.json`/`titles.json`); a second copy of transcripts on disk; pickle files would be an unpickling risk; schema versioning | Only the first switch after a restart | **No** |
-| Prefetching likely-next sessions | First visit in a tab | Background parses competing for the GIL for sessions never opened; to keep snapshots under the 5-minute limit it must re-fetch about 14 sessions continually; live sessions miss anyway | Marginally, after the pass cache | **Not now**; re-measure after P6 step 3 |
+| Prefetching likely-next sessions | First visit in a tab | Background parses competing for the GIL for sessions never opened; to keep snapshots inside the age limit it must re-fetch the recent sessions continually; live sessions miss anyway. (Written against the original 5-minute limit; the decided 30-minute default weakens this point but does not change the verdict.) | Marginally, after the pass cache | **Not now**; re-measure after P6 step 3 |
 
 The user asked about "browser cache or system cache". The answer: **both, in memory only**. The browser keeps a bounded snapshot `Map` and the server keeps a pass cache.
 
@@ -185,12 +197,14 @@ A missing row (collapsed agent group, top-N cap, live filter) falls back to `ren
 
 ```js
 const SESS_CACHE=new Map(), SESS_CACHE_MAX=8;   // unchanged size; sid -> {d, at}, at = Date.now() at landing
-const SNAP_MAX_AGE=LIVE;                        // seconds; one constant, no new knob or page.py mark
+let snapTtlMin=0;                               // server-owned (config.SNAPSHOT_TTL_MIN), set from the
+                                                // X-Snapshot-TTL header by loadSide; 0 = not heard yet
+function sessSnapMaxAge(){ return snapTtlMin*60; }   // seconds; the ONLY reader of snapTtlMin
 const SNAP_GRACE_MS=50;
 let sessSnapTimer=null, sessSnapLabel="";       // label text; read by ext_cr_boot.js at render time
 function sessCachePut(sid,d)      // as today, stores {d, at:Date.now()}
 function sessCacheGet(sid)        // the d, or null when absent, e.d.id!==sid, OR older than
-                                  // SNAP_MAX_AGE (an expired entry is deleted here) -- the age
+                                  // sessSnapMaxAge() (an expired entry is deleted here) -- the age
                                   // limit lives in this one function, so no caller can bypass it
 function sessCacheAge(sid)        // seconds since landed, Infinity when absent (for the label)
 function sessSnapshot(d,age){     // a COPY: the cached entry is never edited
@@ -238,15 +252,27 @@ All failures go through one `function sessFailed(id, kind)` in the seam span, `k
 |---|---|---|
 | 404, session deleted | Snapshot stays, **mark cleared, shown as if current**, for ever | `SESS_CACHE.delete(id)`, error state in both views |
 | 401, auth lapsed | Same defect | `SESS_CACHE.clear()`, error state |
-| Other failure, `sessShown(id)`, age ≤ `SNAP_MAX_AGE` (snapshot **or** fresh data) | Snapshot: 500 clears the mark; network leaves "refreshing…" with no age. Fresh: kept, but the error text overwrites the meta line | View kept; `sessRefreshing=true`, `data-sess=refreshing`, label "data from 2m ago · can't refresh"; the next good poll clears all three |
-| Other failure, `sessShown(id)`, age > `SNAP_MAX_AGE` | Kept for ever | Error state |
+| Other failure, `sessShown(id)`, age ≤ `sessSnapMaxAge()` (snapshot **or** fresh data) | Snapshot: 500 clears the mark; network leaves "refreshing…" with no age. Fresh: kept, but the error text overwrites the meta line | View kept; `sessRefreshing=true`, `data-sess=refreshing`, label "data from 2m ago · can't refresh"; the next good poll clears all three |
+| Other failure, `sessShown(id)`, age > `sessSnapMaxAge()` | Kept for ever | Error state |
 | Other failure, nothing shown (no entry, or one too old to paint) | Mark cleared on a 500 when an entry exists, uncovering the previous session | Error state; the previous session's DOM stays hidden |
+
+**A fetch that never answers (round-2 re-check N1).** A hung request keeps `pollBusy` true (`app.js:1545`), so every later tick returns early, `sessFailed` never runs, and the label would freeze and never expire. So `poll()` does this **before** its `if(!cur||pollBusy)return;`:
+
+```js
+if(pollBusy && sessRefreshing && sessShown(cur)){
+  const age=sessCacheAge(cur);
+  if(age>sessSnapMaxAge()){ sessFailed(cur,"other"); }        // expires: error state, cached:false
+  else sessSetLabel(sessSnapText(age, false));                 // keeps counting while it waits
+}
+```
+
+It only touches a view already marked as not current, so a slow but healthy poll on fresh data never changes the label. When the hung request finally lands, the normal seq/id guard decides as before. `sessFailed` on the expired path skips its grace-flush step, because `sessShown(cur)` already holds.
 
 **Error state:** `sessRefreshing=false`, `sessSetLabel("")`, `data-sess=error`, `data-err`, and only here the `$("hmeta").innerHTML` error line that `poll()` writes today on every error (`app.js:1553`); on the kept-view path that write would erase the meta line under the label.
 
 **The event:** `tracker:session-error` carries `{id, error, cached, snapLabel}`, where `cached` is true only on the kept-view row. The board listener (`ext_cr_boot.js:1054`) today returns when `cached` is true, so the board never says "can't refresh". It now calls `CR.detail.stale(dt.id, dt.snapLabel)` when `cached` is true, and `CR.detail.error` otherwise.
 
-**Fresh data kept after a failure is not scrubbed.** Its `term_tty` is as old as the label says, at most `SNAP_MAX_AGE`. The terminal controls stay usable, because the user has already been looking at that data rather than being switched onto it, and the server still checks ownership and, for model and effort, that Claude is in the foreground (P4.5).
+**Fresh data kept after a failure is not scrubbed.** Its `term_tty` is as old as the label says, at most the configured TTL (P4.6). The terminal controls stay usable, because the user has already been looking at that data rather than being switched onto it, and the server still checks ownership and, for model and effort, that Claude is in the foreground (P4.5).
 
 **P4.5 Actions on a snapshot.** No global click guard (round-1 F3: a capture listener misses property and listener handlers and keyboard actions, blocks navigation and read-only UI, and has no end while the server is unreachable), and no client guard on notes either (round-2 m4). Instead:
 
@@ -266,6 +292,36 @@ All failures go through one `function sessFailed(id, kind)` in the seam span, `k
 - Other inject callers are unchanged: the server-side `/rename` sync (`server.py:192`) only runs after `_attached_pty` has confirmed Claude in the foreground, and terminal-tab sends type into whatever is there by design.
 
 **`aitracker/server.py`:** `Handler._json` sends `Cache-Control: no-store` on every JSON response. One line, default-safe for new routes. `_RenameSyncCapture._json` (`server.py:155`) writes no headers and is unaffected.
+
+**P4.6 Snapshot TTL setting (user decision 2).** `SNAPSHOT_TTL_MIN`, default **30 minutes**, built exactly like `TERM_IDLE_TTL_MIN`. It is one value for both limits that P4.4 uses: how old a snapshot may be and still be painted, and how long a view whose polls fail stays on screen, labelled, before it goes to the error state.
+
+`aitracker/config.py`, one line next to each `TERM_IDLE_TTL_MIN` entry:
+
+| Where | Add |
+|---|---|
+| `EDITABLE` (`:201`) | `"SNAPSHOT_TTL_MIN"` |
+| `VALIDATORS` (`:248`) | `"SNAPSHOT_TTL_MIN": _v_int(1, 1440),   # minutes; 1 min .. 24h` |
+| `_ENV_NAME` (`:268`) | `"SNAPSHOT_TTL_MIN": "TRACKER_SNAPSHOT_TTL_MIN"` |
+| Resolver (after `:464-473`) | `def resolve_snapshot_ttl_min(overrides)`: config.json > `TRACKER_SNAPSHOT_TTL_MIN` > 30, clamped to [1, 1440], bad values fall through, the same body as `resolve_term_idle_ttl_min` |
+| `_RESOLVERS` (`:482`) | `"SNAPSHOT_TTL_MIN": resolve_snapshot_ttl_min` |
+| `_PLAIN_ATTR_KEYS` (`:499`) | `"SNAPSHOT_TTL_MIN"` |
+| Module value (`:511`) | `SNAPSHOT_TTL_MIN = resolve_snapshot_ttl_min({})` |
+
+Not in `RESTART_REQUIRED`. **Clamp [1, 1440], with reasons:** it matches the terminal TTL's validator, so one rule covers both settings. The floor is 1 minute, not 0, because the same value bounds how long fresh data survives a failed poll: 0 would blank a fresh page on any single network blip, and the strict "never show old data" behaviour was not chosen (decision 1). The ceiling of 24h is generous. The 8-entry `Map` dies with the tab, and the label always states the age, so a long TTL can mislead no one.
+
+**How the value reaches the page: live, on a response header, not substituted by `page.py`.** The terminal TTL is late-bound: `term_vt` reads `config.TERM_IDLE_TTL_MIN` at check time (`term_vt.py:1259, 1731`), so a Config edit applies at once without a restart. This setting does the same. `/api/list` already carries `X-Server-Now` and `X-Term-Count` (`server.py:395-403`), and adds `headers["X-Snapshot-TTL"] = str(config.SNAPSHOT_TTL_MIN)`. `loadSide()` (`app.js:1281-1284`) reads it next to `X-Term-Count`: `const st=res.headers.get("X-Snapshot-TTL"); if(st!==null) snapTtlMin=+st;`. `apply_overrides` already runs on every GET or POST `/api/config`, so **a Config edit reaches every open page within one 5s list poll, with no restart and no reload**. `page.py` substitution like `LIVE` was rejected because it applies only on the next page load. `/api/list` is in `_RO_GET_ALLOW`, so read-only tunnel viewers get the value too; it is not sensitive.
+
+**Before the first list poll** `snapTtlMin` is 0: no snapshot paints, and a failure shows the error state. `start()` awaits `loadSide()` before `track()` (`app.js:1386-1389`), so in practice the value is always there before the first switch. The client holds no default of its own (conventions rule 5).
+
+**Config UI:** `ext_cr_dialogs.js` adds `SNAPSHOT_TTL_MIN: 'TRACKER_SNAPSHOT_TTL_MIN'` to `_ENVCHIP` (`:864`), next to the terminal TTL's chip. The row is built the same way as "Idle terminal TTL" (`:1339`, `serverRow` + `sliderCtlCommit`). It does **not** go in the Terminal tab, though: that tab is about terminals and is irrelevant to someone with terminals switched off. It goes directly after "Live window" on the Board tab (`ext_cr_dialogs.js` about 1323), the other session-freshness setting:
+
+```js
+body.appendChild(serverRow('Session snapshot TTL', 'SNAPSHOT_TTL_MIN',
+  'How old a cached session may be and still show, labelled, while it refreshes after a switch — and how long a page whose updates are failing stays up before it says so. The slider covers 5–240; env TRACKER_SNAPSHOT_TTL_MIN or config.json accept 1–1440.',
+  function (value, onCommit) { return sliderCtlCommit(5, 240, value != null ? value : 30, onCommit, ' min'); }));
+```
+
+The `value != null ? value : 30` fallback only places the slider before the server answers, exactly as the terminal row does; the server value always wins.
 
 ### P5. Safety
 
@@ -310,6 +366,7 @@ All failures go through one `function sessFailed(id, kind)` in the seam span, `k
 | Server restart | Cache empty. In-process means **no schema versioning**: a code change needs a restart anyway (CLAUDE.md), and the page's `Map` is only ever read by the JS that wrote it |
 | Title, flag, pin, note edits | Those files are read per request, untouched by the cache. Snapshot may show the old value for one round trip, labelled; another tab's edit likewise |
 | `LIVE_WINDOW` changed in Config | Baked in at page load like `LIVE` |
+| `SNAPSHOT_TTL_MIN` changed in Config | Reaches every open page with the next `/api/list` poll, within 5s (P4.6); entries already in the `Map` are judged against the new value at their next use |
 
 **Multiple tabs.** Each tab has its own `Map` and polls its own selection, with no coordination needed. The server cache is shared; P3 "Several tabs polling at once" covers its byte budget and lock.
 
@@ -320,9 +377,23 @@ All failures go through one `function sessFailed(id, kind)` in the seam span, `k
 Everything goes on one feature branch and one set of commits, from a fresh worktree per conventions rule 13, each commit leaving `make check` green.
 
 1. **Sidebar (P4.1).** Biggest dashboard win, no semantics change, nothing depends on it, and it unmasks whether a snapshot paints.
-2. **Honest snapshot without the timer (P4.2 minus grace, P4.3, P4.4, P4.5 including its two server changes, `require_claude` and the note text check, and `no-store`).** Fixes real defects whether or not anything gets faster, and must land before snapshots get more common.
+2. **Honest snapshot without the timer (P4.2 minus grace, P4.3, P4.4 including the hung-fetch check, P4.5 including its two server changes, `require_claude` and the note text check, `no-store`, and the P4.6 TTL setting).** Fixes real defects whether or not anything gets faster, and must land before snapshots get more common. The TTL setting belongs here because P4.4's expiry reads it.
 3. **Server pass cache (P3).** The only risky step, alone so it can be reverted or switched off.
 4. **Grace timer.** The grace only makes sense once step 3 makes fresh data fast. Re-run the P1 measurements in both views and record them in the Log; this is the only place a speed claim, the board's above all, is allowed to come from. If the real hit is not within about 20ms of server time, stop and report rather than tune.
+
+**Files per step, so step 3 can be built in parallel with steps 1–2:**
+
+| Step | Source files | Test files |
+|---|---|---|
+| 1 | `aitracker/web/app.js` | `tests/test_session_isolation.py` |
+| 2 | `aitracker/web/app.js`, `app.css`, `ext_cr_boot.js`, `ext_cr_detail.js`, `ext_cr_detail.css`, `ext_cr_dialogs.js`, `ext_cr_term.js`, `ext_vt.js`; `aitracker/server.py`, `aitracker/term_vt.py`, `aitracker/config.py` | `tests/test_session_isolation.py`, `tests/test_inject_footer_quiet.py`, `tests/test_integration.py`, `tests/test_cr_routes.py`, `tests/test_selfcheck.py` |
+| 3 | `aitracker/util.py`, `aitracker/providers/claude.py`, `scripts/bundle.py` | `tests/test_pass_cache.py` (new) |
+| 4 | `aitracker/web/app.js` | `tests/test_session_isolation.py` |
+
+- **Step 3 shares no file with steps 1–2.** It does not need `config.py`: its kill switch `AITRACKER_NO_PASS_CACHE` is an environment variable read in `util.py`, like `AITRACKER_NO_AGENT_CACHE` (`claude.py:1111`), not a Config key. To keep it that way, step 3's bundle check lives in `tests/test_pass_cache.py`, not `tests/test_integration.py`, and step 2's `no-store` test moves the other way, into `tests/test_integration.py` (P7).
+- **Steps 1 and 2 share `app.js` and `tests/test_session_isolation.py`,** so one agent does 1 then 2.
+- **Step 3 runs in its own worktree,** branched from `feat/session-switch-cache`, and merges back before step 4. Two agents committing in one worktree would interleave, and the commit hook runs the full gate.
+- **Step 4 waits for 2 and 3,** because the grace only makes sense once fresh data is fast.
 
 `make check` needs `unset TRACKER_AUTH;`, and the gate misses load-time JS and CSS errors, so also load the real page once in Playwright in both views. In the same Playwright pass, check F1 on the real sidebar: pick an agent child inside an open group, collapse the group, wait for one 5s `loadSide`, and confirm the group is still collapsed. Then do the same pick from search results and clear the search; the child's group must open (m1).
 
@@ -344,11 +415,11 @@ Everything goes on one feature branch and one set of commits, from a fresh workt
 | `test_concurrent_misses_keep_byte_count_exact`: 8 threads × 50 calls over 4 files that are appended to meanwhile; afterwards the counter equals the sum of stored lengths and is ≤ the bound. **A smoke test, not a red-before-fix test:** under the GIL it cannot reliably catch a counter update outside the lock; `test_replace_keeps_byte_count_exact` is the one that proves F6 | Gross accounting errors only |
 | `test_unpicklable_fails_open` (a local `lambda` in the result) | No `except` around `dumps` |
 | `test_other_errors_in_dumps_propagate`: patch `pickle.dumps` to raise `NameError`; it reaches the caller | `except` widened beyond the four types |
-| `test_json_responses_are_no_store` on `/api/session`, `/api/narration`, `/api/list` (in-process `Server` idiom, `test_integration.py:280`) | Header missing |
+| `test_bundle_pass_cache_hits` (below) | `pickle` missing from `HEADER` |
 
-**`tests/test_integration.py`, extend the bundle test (about line 1587):** it runs `dist/tracker.py` with `--version`, `--help` and a stubbed `--selfcheck`, none of which reach a parse, so a missing `pickle` in `HEADER` would pass today. Add a step that loads the bundle with `runpy` and calls `file_pass` twice on a temp file with a counting `fn`, asserting `fn` ran **once** (a real hit, not just "no crash"). Red when `pickle` is left out of `HEADER`: the narrowed `except` lets the `NameError` through, and a fail-open path would show up as two runs.
+**The bundle check, in `tests/test_pass_cache.py` (step 3 owns that file; see P6):** the existing bundle test (`test_integration.py` about line 1587) runs `dist/tracker.py` with `--version`, `--help` and a stubbed `--selfcheck`, none of which reach a parse, so a missing `pickle` in `HEADER` would pass today. `test_bundle_pass_cache_hits` runs `scripts/bundle.py` the way that test does, loads the bundle with `runpy`, and calls `file_pass` twice on a temp file with a counting `fn`, asserting `fn` ran **once** (a real hit, not just "no crash"). Red when `pickle` is left out of `HEADER`: the narrowed `except` lets the `NameError` through, and a fail-open path would show up as two runs.
 
-**`tests/test_session_isolation.py`, extend `TestSessionSeamExecuted`** (node, same `_block` harness). `_MOCKS` gains `var LIVE=300`, a settable `Date.now`, and a `render` that records the whole `d` plus `refreshing: sessRefreshing` and `snapLabel: sessSnapLabel` **at render time**. The harness also extracts `function pick(id)` and `function sideMarkActive(`, with `$("slist")` stubbed so `querySelector` returns a row stub or `null` on demand, and `sessions`, `selEntry`, `autoExpandedFor`, `searchResults`, `CSS.escape` and a counting `renderSide` in `_MOCKS`. That replaces round 1's real-page F1 test, which could not go red because the stub DOM matches class names only (round-2 m2).
+**`tests/test_session_isolation.py`, extend `TestSessionSeamExecuted`** (node, same `_block` harness). `snapTtlMin` lives in the extracted seam span, so each test sets it explicitly (never a constant). `_MOCKS` gains a settable `Date.now`, and a `render` that records the whole `d` plus `refreshing: sessRefreshing` and `snapLabel: sessSnapLabel` **at render time**. The harness also extracts `function pick(id)` and `function sideMarkActive(`, with `$("slist")` stubbed so `querySelector` returns a row stub or `null` on demand, and `sessions`, `selEntry`, `autoExpandedFor`, `searchResults`, `CSS.escape` and a counting `renderSide` in `_MOCKS`. That replaces round 1's real-page F1 test, which could not go red because the stub DOM matches class names only (round-2 m2).
 
 | Test | Red when |
 |---|---|
@@ -359,9 +430,12 @@ Everything goes on one feature branch and one set of commits, from a fresh workt
 | `test_404_purges_and_errors`, `test_401_clears_everything` | Today's behaviour |
 | `test_500_keeps_labelled_snapshot_then_clears` | Today's behaviour |
 | `test_steady_state_500_and_network_error_keep_view`: land fresh A, then a 500, then a rejected fetch (`TypeError`), then a good landing. After each failure: no new render, mark `refreshing`, label contains "can't refresh", event `cached:true`; after the good landing all three are cleared | Error-or-keep keyed on `sessRefreshing` (B1) |
-| `test_backdated_entry_and_500_stays_error`: cache B with `at` 301s ago, pick B from A, land a 500; mark is `error`, no render of B, event `cached:false` | Branch keyed on cache presence (F2) |
+| `test_backdated_entry_and_500_stays_error`: `snapTtlMin=30`; cache B with `at` backdated to `snapTtlMin*60+1` seconds, pick B from A, land a 500; mark is `error`, no render of B, event `cached:false` | Branch keyed on cache presence (F2) |
 | `test_500_inside_grace_paints_then_keeps`: fresh entry, 500 lands before the timer; snapshot painted, mark stays `refreshing`, `cached:true` | Pending timer not flushed before the branch |
-| `test_outage_reages_then_expires`: land fresh A at t0; failures at t0+60s and t0+120s give labels "1m ago" then "2m ago"; a failure at t0+301s gives mark `error` and `cached:false` | Age computed only at paint (M2) |
+| `test_outage_reages_then_expires`: run twice, with `snapTtlMin` 30 and then 2. Land fresh A at t0; failures at t0+60s and t0+120s give labels "1m ago" then "2m ago"; a failure at `t0+snapTtlMin*60+1` gives mark `error` and `cached:false`, and with `snapTtlMin=2` the t0+120s failure is the last one kept | Age computed only at paint (M2), or a fixed limit instead of the configured one |
+| `test_hung_fetch_still_expires` (N1): `snapTtlMin=2`; a snapshot is on screen and its fetch never resolves; move `Date.now` to t0+60s and fire the interval: label "1m ago", no new fetch; move to t0+121s and fire again: mark `error`, `cached:false` | Re-age only inside `sessFailed`, behind the `pollBusy` return |
+| `test_hung_fetch_on_fresh_data_changes_nothing`: fresh A on screen, its next fetch hangs; firing the interval past the TTL leaves mark and label unchanged | Check not limited to `sessRefreshing` |
+| `test_no_ttl_heard_paints_no_snapshot`: `snapTtlMin=0`, fresh cache entry; a switch paints nothing old | A client-side default |
 | `test_refused_paint_resets_label_and_mark`: make `renderFor` return false; after `sessPaintSnapshot`, `sessRefreshing` false, label `""`, mark `loading` | No undo (M1) |
 | `test_abort_mid_flight_does_not_touch_new_session`: pick A, pick B while A's fetch is pending, reject A's fetch with an `AbortError`; B's mark and label unchanged, no event | No seq/id guard in `catch` (F5) |
 | `test_position_note_senders_send_text`: `removeNote(1)` and `pushNote(1)` post `{session, index:1, text}` with the text of note 1 on screen | Text not sent (m4) |
@@ -384,6 +458,15 @@ The collapse-stays-collapsed behaviour itself is checked in the P6 Playwright pa
 | `test_require_claude_passes_when_claude_is_foreground`: patch `term_vt._foreground_is_claude` to `True`; `ok` | Check inverted or run before the wait |
 | `test_without_flag_inject_is_unchanged`: same bare shell, no flag, text delivered | Flag made the default |
 
+**The TTL setting (P4.6), following the `TERM_IDLE_TTL_MIN` tests line for line:**
+
+| File, test | Checks | Red when |
+|---|---|---|
+| `tests/test_selfcheck.py`, beside the terminal TTL block (`:890-906`) | `SNAPSHOT_TTL_MIN` in `EDITABLE`, not in `RESTART_REQUIRED`; `resolve_snapshot_ttl_min`: config.json beats `TRACKER_SNAPSHOT_TTL_MIN`, env beats default, default 30, clamped to 1 and 1440, junk env falls back to 30 | Key, resolver or order missing |
+| `tests/test_cr_routes.py` (add the key to `_CFG_ATTRS`, `:40`): `test_snapshot_ttl_post_validates_and_applies_live` | POST 45 gives `{"ok":true, …, "restart":false}`, GET reports it overridden, `config.SNAPSHOT_TTL_MIN==45`; POST 0, 1441, `"x"` give `{"error":"invalid value for SNAPSHOT_TTL_MIN"}` | Validator missing or wrong range |
+| `tests/test_integration.py`, beside the `TERM_IDLE_TTL_MIN` end-to-end test (`:1470`): `test_snapshot_ttl_reaches_the_client_live` | Real server: `/api/list` sends `X-Snapshot-TTL: 30`; POST `/api/config` 45; the **next** `/api/list` sends `45`, with no restart; the served page contains `serverRow('Session snapshot TTL', 'SNAPSHOT_TTL_MIN'` and `res.headers.get("X-Snapshot-TTL")` | Header missing, value cached at startup, or no UI row |
+| `tests/test_integration.py`: `test_json_responses_are_no_store` on `/api/session`, `/api/narration`, `/api/list` (in-process `Server` idiom, `:280`) | `Cache-Control: no-store` | Header missing |
+
 Static sweep: all four model/effort senders pass `require_claude: true`; the three position-addressed note senders (`removeNote`, `pushNote`, the board's `note-remove` and its `cr:note-remove` handler) carry `text`.
 
 **Tests that must change, on purpose:** `test_cache_hit_paints_refreshing_miss_is_loading`: the paint now arrives after the grace; it keeps asserting `refreshing: True` at render time and also asserts a non-empty `snapLabel` then (M1). `test_cached_error_keeps_snapshot_and_next_land_clears_error`: the mark now stays `refreshing`, which is the defect being fixed. Static sweep: `ext_cr_boot.js` passes `snapLabel`; `sessLanded` and `sessFailed` contain no `sessCacheGet` call; no `localStorage`/`sessionStorage`/`indexedDB` write receives a detail dict.
@@ -396,21 +479,23 @@ Static sweep: all four model/effort senders pass `require_claude: true`; the thr
 
 **Third: 50ms is a judgement, not a measurement of perception.** Prototype hits were mostly 1–7ms to first byte on Claude sessions (occasionally 13–40ms), and uncached Auggie was 15–75ms, so some Auggie switches will show a snapshot where a Claude one would not. It is one constant.
 
-### P9. Decisions you may want to overrule
+### P9. Decisions (all decided 2026-11-05; see "User decisions")
 
-**1. What a switch shows, and the "no stale" tension.** You asked for two things that pull apart: show stale data then refresh, and "there shouldn't be any stale". The plan reads them together as: never unlabelled, never acted on, never another session's, and not shown at all when fresh data can arrive at once.
+**1. What a switch shows: DECIDED, labelled snapshot.** Answer: "Labelled snapshot (Recommended)". You had asked for two things that pull apart: show stale data then refresh, and "there shouldn't be any stale". The plan reads them together as: never unlabelled, never another session's, no terminal controls on it, and not shown at all when fresh data can arrive at once.
 
-| | Recommended: labelled snapshot | Alternative: strict, no old data ever |
+| | Decided: labelled snapshot | Not chosen: strict, no old data ever |
 |---|---|---|
 | Unchanged session | Fresh as soon as the server answers (prototype: about 70ms, to be re-measured), nothing old shown | Same |
-| Changed session (median 48ms parse, up to about 1s) or remote | Blank up to 50ms, then the snapshot if under 5 minutes old, labelled "snapshot from 3m ago · updating…", read-only, no terminal controls, replaced automatically | "Loading session…" until fresh, up to about 1s locally and about 1.5s on the emulated link |
-| Snapshot over 5 minutes old | Loading state | Same |
-| Server unreachable or erroring | Whatever is on screen, snapshot or fresh, stays, labelled "data from 2m ago · can't refresh" with the age counting, until it is 5 minutes old, then the error state | Fresh data: same. A snapshot is never shown, so a switch goes to the error state |
-| Code | P4.2–P4.5 | Removes the snapshot paint; step 1, step 3, the failure handling and `require_claude` remain |
+| Changed session (median 48ms parse, up to about 1s) or remote | Blank up to 50ms, then the snapshot if younger than the TTL (default 30 minutes), labelled "snapshot from 3m ago · updating…", no terminal controls, replaced automatically when live data lands | "Loading session…" until fresh, up to about 1s locally and about 1.5s on the emulated link |
+| Snapshot older than the TTL | Loading state | Same |
+| Server unreachable or erroring | Whatever is on screen, snapshot or fresh, stays, labelled "data from 2m ago · can't refresh" with the age counting, until it is older than the TTL, then the error state | Fresh data: same. A snapshot is never shown, so a switch goes to the error state |
+| Code | P4.2–P4.6 | Removes the snapshot paint; step 1, step 3, the failure handling and `require_claude` remain |
 
-Other values for the limit are one line: 0 is the strict column, and removing the check means any age, always labelled.
+**Snapshot age: DECIDED, configurable, default 30 minutes.** Answer: "… session snapshot cached is always comes up with a ttl of 30minutes, that can be configurable from the config settings like the ttl config settings we have it for terminals". Built in P4.6. The leading "3" in that answer is ambiguous (the third option offered was 15 minutes); the default is one line in `resolve_snapshot_ttl_min` if 15 was meant.
 
-**2. No persistence across a page reload.** Reload stays at 1.3–1.9s to first detail. Persisting would need IndexedDB, a new logout route, clearing, and would reverse your earlier decision that no transcript data sits at rest in the browser. If reload speed matters, moving `track()` ahead of `await loadSide()` in `start()` is probably the cheaper fix; that is a separate change, not in this plan.
+**Scope: DECIDED, all four steps (P6).** Answer: "All four steps (Recommended)".
+
+**2. No persistence across a page reload: DECIDED, no change.** Answer: "Leave reload as is (Recommended)". Reload stays at 1.3–1.9s to first detail, and no transcript data sits at rest in the browser. Moving `track()` ahead of `await loadSide()` in `start()` stays a possible separate change, not in this plan. Note that it would then need the snapshot TTL from somewhere other than the first `/api/list`; until then, with no value, the first switch simply shows no snapshot (P4.6).
 
 ## Adversarial review
 

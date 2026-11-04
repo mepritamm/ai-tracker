@@ -1470,8 +1470,9 @@ class TestTermIdleTtlEndToEnd(unittest.TestCase):
     """TERM_IDLE_TTL_MIN end to end: the real server's /api/config, and the served page's row."""
 
     def setUp(self):
-        self._saved = {k: getattr(config, k) for k in ("CONFIG_FILE", "TERM_IDLE_TTL_MIN", "AUTH", "LIVE_WINDOW",
-                                                         "PROJECTS", "DAEMON_ROSTER", "TERMINAL")}
+        self._saved = {k: getattr(config, k) for k in ("CONFIG_FILE", "TERM_IDLE_TTL_MIN", "SNAPSHOT_TTL_MIN", "AUTH",
+                                                         "LIVE_WINDOW", "PROJECTS", "DAEMON_ROSTER", "TERMINAL",
+                                                         "NOTES_FILE")}
         self._tmpdir = tempfile.mkdtemp()
         config.CONFIG_FILE = os.path.join(self._tmpdir, "config.json")   # POST must never touch the real one
         config.AUTH = ""
@@ -1507,6 +1508,56 @@ class TestTermIdleTtlEndToEnd(unittest.TestCase):
         st, data = self._req("GET", "/api/config")
         self.assertEqual(json.loads(data)["TERM_IDLE_TTL_MIN"]["value"], 45)
         self.assertEqual(config.TERM_IDLE_TTL_MIN, 45)
+
+    def _hdrs(self, path):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", path)
+        r = c.getresponse()
+        r.read()
+        h = dict((k.lower(), v) for k, v in r.getheaders())
+        c.close()
+        return r.status, h
+
+    def test_snapshot_ttl_reaches_the_client_live(self):
+        st, h = self._hdrs("/api/list")
+        self.assertEqual(h.get("x-snapshot-ttl"), "30")
+        st, data = self._req("POST", "/api/config", {"key": "SNAPSHOT_TTL_MIN", "value": 45})
+        self.assertEqual(st, 200)
+        st, h = self._hdrs("/api/list")
+        self.assertEqual(h.get("x-snapshot-ttl"), "45", "a Config edit must reach the next list poll, no restart")
+        st, data = self._req("GET", "/")
+        page = data.decode("utf-8")
+        self.assertIn("serverRow('Session snapshot TTL', 'SNAPSHOT_TTL_MIN'", page)
+        self.assertIn('res.headers.get("X-Snapshot-TTL")', page)
+
+    def test_json_responses_are_no_store(self):
+        for path in ("/api/session?id=nope", "/api/narration?id=nope", "/api/list"):
+            st, h = self._hdrs(path)
+            self.assertEqual(h.get("cache-control"), "no-store", path)
+
+    def test_drain_then_stale_push_and_delete_are_refused(self):
+        config.NOTES_FILE = os.path.join(self._tmpdir, "notes.json")
+        with open(config.NOTES_FILE, "w") as fh:
+            json.dump({"S": [{"text": "n0", "pushed": True}, {"text": "n1", "pushed": False},
+                             {"text": "n2", "pushed": False}]}, fh)
+        st, data = self._req("POST", "/api/notes/next", {"session": "S"})
+        self.assertEqual(json.loads(data), {"note": "n0"})       # drains n0 -> [n1, n2]
+        for route in ("/api/notes/push", "/api/notes/delete"):
+            st, data = self._req("POST", route, {"session": "S", "index": 1, "text": "n1"})   # the position seen before the drain
+            self.assertEqual(st, 409, route)
+            self.assertEqual(json.loads(data)["error"], "notes changed")
+        stack = json.load(open(config.NOTES_FILE))["S"]
+        self.assertEqual([n["text"] for n in stack], ["n1", "n2"], "n2 must be neither deleted nor toggled")
+        self.assertFalse(stack[1].get("pushed"))
+        st, data = self._req("POST", "/api/notes/push", {"session": "S", "index": 0, "text": "n1"})
+        self.assertEqual(st, 200)
+        st, data = self._req("POST", "/api/notes/push", {"session": "S", "index": 0})        # no text: as before
+        self.assertEqual(st, 200)
+        st, data = self._req("POST", "/api/notes/delete", {"session": "S", "index": 0, "text": "n1"})
+        self.assertEqual(st, 200)
+        st, data = self._req("POST", "/api/notes/delete", {"session": "S", "index": 0})      # no text: as before
+        self.assertEqual(st, 200)
+        self.assertNotIn("S", json.load(open(config.NOTES_FILE)))
 
     def test_served_page_has_row_ungated_and_no_overflow_tag(self):
         st, data = self._req("GET", "/")
@@ -1908,7 +1959,7 @@ class TestPollerInFlightGuard(unittest.TestCase):
             finally_idx = self.src.index("finally{" + flag + "=false;}", try_idx)
             # sanity bound: the finally must be close to its try (same function body), not some
             # unrelated finally{} further down the file
-            self.assertLess(finally_idx - try_idx, 400, "finally{%s=false} is not the release for this try{}" % flag)
+            self.assertLess(finally_idx - try_idx, 500, "finally{%s=false} is not the release for this try{}" % flag)
 
     def test_intervals_unchanged(self):
         # rule 4 of the task: 5000/2000 and LIVE/liveness semantics are server policy -- the
@@ -1981,6 +2032,8 @@ function loadFlags(){ __loadFlagsCalls++; }
 function render(d){ __renderCalls++; }
 function checkCompletions(d){ __checkCompletionsCalls++; }
 var sessAbort = { signal: undefined };   // poll() rides it; resetSession swaps it on a switch
+var sessRefreshing = false, snapTtlMin = 0;   // poll()'s hung-fetch check / loadSide()'s TTL header read
+function sessShown(){ return false; }
 function sessLanded(id, d){ lastData = d; render(d); return true; }   // app.js: cache + renderFor + clear loading mark
 function esc(s){ return String(s); }
 var termCount = null;   // loadSide()'s X-Term-Count read target -- see app.js's own declaration
@@ -1999,7 +2052,7 @@ function __resolveList(i) {
   __fetchCalls[i].resolve({ headers: { get: function () { return null; } }, json: function () { return Promise.resolve([]); } });
 }
 function __resolveSession(i) {
-  __fetchCalls[i].resolve({ json: function () { return Promise.resolve({}); } });
+  __fetchCalls[i].resolve({ ok: true, status: 200, json: function () { return Promise.resolve({}); } });
 }
 """
 
@@ -2110,7 +2163,7 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
 async function main() {
   cur = "sess1";
   var p1 = poll();
-  __fetchCalls[0].resolve({ json: function () { return Promise.resolve({ marker: "sess1-payload" }); } });
+  __fetchCalls[0].resolve({ ok: true, status: 200, json: function () { return Promise.resolve({ marker: "sess1-payload" }); } });
   await p1;
   console.log(JSON.stringify({
     renderCalls: __renderCalls, loadFlagsCalls: __loadFlagsCalls, checkCompletionsCalls: __checkCompletionsCalls,
@@ -2136,7 +2189,7 @@ async function main() {
   cur = "sess1";
   var p1 = poll();                 // fetch issued for sess1
   cur = "sess2";                   // user selects a different session before it resolves
-  __fetchCalls[0].resolve({ json: function () { return Promise.resolve({ marker: "stale-sess1-payload" }); } });
+  __fetchCalls[0].resolve({ ok: true, status: 200, json: function () { return Promise.resolve({ marker: "stale-sess1-payload" }); } });
   await p1;
   console.log(JSON.stringify({
     renderCalls: __renderCalls, loadFlagsCalls: __loadFlagsCalls, checkCompletionsCalls: __checkCompletionsCalls,
@@ -2168,7 +2221,7 @@ async function main() {
   cur = "sess1";
   var p1 = poll();          // captures seq=1, id="sess1"
   pollSeq++;                 // simulate a newer request having been issued in the meantime
-  __fetchCalls[0].resolve({ json: function () { return Promise.resolve({ marker: "stale-seq-payload" }); } });
+  __fetchCalls[0].resolve({ ok: true, status: 200, json: function () { return Promise.resolve({ marker: "stale-seq-payload" }); } });
   await p1;
   console.log(JSON.stringify({
     renderCalls: __renderCalls, loadFlagsCalls: __loadFlagsCalls, checkCompletionsCalls: __checkCompletionsCalls,

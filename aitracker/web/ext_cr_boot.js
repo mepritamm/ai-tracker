@@ -702,9 +702,11 @@ window.CR = window.CR || {};
     if (!sid || typeof idx !== 'number' || typeof fetch !== 'function') return;
     fetch('/api/notes/delete', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session: sid, index: idx }),
-    }).then(function (r) { return r.ok; }).then(function (ok) {
-      emit('notify', { text: ok ? 'Note removed.' : 'Couldn’t remove that note.' });
+      body: JSON.stringify({ session: sid, index: idx, text: payload.text }),
+    }).then(function (r) { return { ok: r.ok, moved: r.status === 409 }; }).then(function (res) {
+      var ok = res.ok;
+      emit('notify', { text: ok ? 'Note removed.' : res.moved ? 'Notes changed — list refreshed' : 'Couldn’t remove that note.' });
+      if (res.moved && typeof cur !== 'undefined' && sid === cur && typeof poll === 'function') poll();
       if (typeof loadSide === 'function') loadSide();
       if (ok && typeof cur !== 'undefined' && sid === cur && typeof poll === 'function') poll();
     }).catch(function () {
@@ -1043,7 +1045,7 @@ window.CR = window.CR || {};
       if (!d || d.error) return;
       var tickSid = (typeof cur !== 'undefined' && cur) || (d.meta && d.meta.sessionId) || d.id;
       if (window.CR.detail && typeof window.CR.detail.update === 'function') {
-        try { window.CR.detail.update({ session: d, sid: tickSid, refreshing: (typeof sessRefreshing !== 'undefined' && sessRefreshing), now: d.now, triage: computeTriage(d) }); } catch (e) { console.error('[CR] detail.update threw', e); }
+        try { window.CR.detail.update({ session: d, sid: tickSid, refreshing: (typeof sessRefreshing !== 'undefined' && sessRefreshing), snapLabel: (typeof sessSnapLabel !== 'undefined' ? sessSnapLabel : ""), now: d.now, triage: computeTriage(d) }); } catch (e) { console.error('[CR] detail.update threw', e); }
       }
       if (window.CR.dialogs && typeof window.CR.dialogs.update === 'function') {
         try { window.CR.dialogs.update({ kind: 'session', sid: tickSid, session: d }); } catch (e) { console.error('[CR] dialogs.update threw', e); }
@@ -1053,7 +1055,12 @@ window.CR = window.CR || {};
   // A failed switch to an uncached session: app.js dispatches ONE DOM event (no registry).
   document.addEventListener('tracker:session-error', function (e) {
     var dt = (e && e.detail) || {};
-    if (dt.cached) return;
+    if (dt.cached) {
+      if (window.CR.detail && typeof window.CR.detail.stale === 'function') {
+        try { window.CR.detail.stale(dt.id, dt.snapLabel); } catch (err) { console.error('[CR] detail.stale threw', err); }
+      }
+      return;
+    }
     if (window.CR.detail && typeof window.CR.detail.error === 'function') {
       try { window.CR.detail.error(dt.id, dt.error); } catch (err) { console.error('[CR] detail.error threw', err); }
     }

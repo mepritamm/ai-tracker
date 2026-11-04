@@ -2400,7 +2400,7 @@
     this._focusTerminal();
     fetch("/api/term/inject", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(ttyBody(this.ttyId, { text: "/model " + name, submit: true, clear_first: true }))
+      body: JSON.stringify(ttyBody(this.ttyId, { text: "/model " + name, submit: true, clear_first: true, require_claude: true }))
     }).then(function (r) {
       return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
     }).then(function (res) {
@@ -2422,7 +2422,7 @@
     this._focusTerminal();
     fetch("/api/term/inject", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(ttyBody(this.ttyId, { text: "/effort " + level, submit: true, clear_first: true }))
+      body: JSON.stringify(ttyBody(this.ttyId, { text: "/effort " + level, submit: true, clear_first: true, require_claude: true }))
     }).then(function (r) {
       return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
     }).then(function (res) {

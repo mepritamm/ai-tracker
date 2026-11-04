@@ -326,6 +326,34 @@ class TestInjectFooterQuiet(unittest.TestCase):
         self.assertIn("ok", result)
         self.assertTrue(result.get("ok"), "inject() failed on a tiny (rows<=IGNORE) screen: %r" % (result,))
 
+    def _inject_to_quiet_child(self, extra):
+        pt = self._spawn_script(QUIET_ECHO_CHILD, rows=24, cols=80)
+        self.assertTrue(_wait_for(lambda: any("ready" in t for t in self._snapshot_text(pt)), 5),
+                         "child never printed its initial prompt")
+        h = _FakeHandler()
+        body = {"session": "", "tty": pt.id, "text": "hello", "submit": True}
+        body.update(extra)
+        term_vt.inject(h, None, body)
+        self.assertEqual(len(h.calls), 1)
+        return pt, h.calls[-1][0]
+
+    def test_require_claude_refuses_a_bare_shell(self):
+        """The model/effort senders opt in: a foreground that is not Claude gets nothing typed."""
+        pt, result = self._inject_to_quiet_child({"require_claude": True})
+        self.assertEqual(result, {"ok": False, "reason": "claude not in foreground"})
+        time.sleep(0.5)
+        self.assertFalse(any("GOT:hello" in t for t in self._snapshot_text(pt)), "text reached a non-Claude foreground")
+
+    def test_require_claude_passes_when_claude_is_foreground(self):
+        with mock.patch.object(term_vt, "_foreground_is_claude", return_value=True):
+            pt, result = self._inject_to_quiet_child({"require_claude": True})
+        self.assertTrue(result.get("ok"), result)
+
+    def test_without_flag_inject_is_unchanged(self):
+        pt, result = self._inject_to_quiet_child({})
+        self.assertTrue(result.get("ok"), result)
+        self.assertTrue(_wait_for(lambda: any("GOT:hello" in t for t in self._snapshot_text(pt)), 5))
+
 
 if __name__ == "__main__":
     unittest.main()

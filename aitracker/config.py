@@ -198,7 +198,7 @@ CONFIG_FILE = os.path.join(_HERE, "config.json")
 # TRACKER_AUTH is deliberately not a member.
 EDITABLE = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL",
             "TERM_APP", "TERM_ALLOW", "PORT", "HOST", "ICON_STYLE", "ICON_SCALE",
-            "TERM_IDLE_TTL_MIN", "GATEWAY", "OPENROUTER_LAUNCHER", "OPENROUTER_SLOTS_FILE")
+            "TERM_IDLE_TTL_MIN", "SNAPSHOT_TTL_MIN", "GATEWAY", "OPENROUTER_LAUNCHER", "OPENROUTER_SLOTS_FILE")
 
 # Keys that only bind at process startup -- the dialog labels these "takes effect on
 # restart" and never claims a live apply for them.
@@ -246,6 +246,7 @@ VALIDATORS = {
     "MAX_TERMS":     _v_int(1, 64),             # same clamp term_vt.py has always enforced
     "TERMINAL":      _v_bool,
     "TERM_IDLE_TTL_MIN": _v_int(1, 1440),   # minutes; 1 min .. 24h
+    "SNAPSHOT_TTL_MIN": _v_int(1, 1440),    # minutes; 1 min .. 24h
     "TERM_APP":      _v_enum(("Terminal", "iTerm")),
     "TERM_ALLOW":    _v_str(4000),              # one argv prefix per line; a generous cap, not a real limit
     "PORT":          _v_int(1, 65535),
@@ -266,6 +267,7 @@ _ENV_NAME = {
     "TERM_RENDERER": "TRACKER_TERM_RENDERER",
     "MAX_TERMS": "TRACKER_MAX_TERMS",
     "TERM_IDLE_TTL_MIN": "TRACKER_TERM_IDLE_TTL_MIN",
+    "SNAPSHOT_TTL_MIN": "TRACKER_SNAPSHOT_TTL_MIN",
     "TERMINAL": "TRACKER_TERMINAL",
     "TERM_APP": "TRACKER_TERM_APP",
     "TERM_ALLOW": "TRACKER_TERM_ALLOW",
@@ -475,11 +477,26 @@ def resolve_term_idle_ttl_min(overrides):
         return 30
 
 
+def resolve_snapshot_ttl_min(overrides):
+    """Minutes a cached session snapshot may be shown (labelled) after a switch, and how long a view
+    whose polls fail stays up. config.json > TRACKER_SNAPSHOT_TTL_MIN > 30; clamped to [1, 1440]."""
+    if "SNAPSHOT_TTL_MIN" in overrides:
+        try:
+            return max(1, min(1440, int(overrides["SNAPSHOT_TTL_MIN"])))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(1, min(1440, int(os.environ.get("TRACKER_SNAPSHOT_TTL_MIN", 30))))
+    except (TypeError, ValueError):
+        return 30
+
+
 _RESOLVERS = {
     "LIVE_WINDOW": resolve_live_window,
     "TERM_RENDERER": resolve_term_renderer,
     "MAX_TERMS": resolve_max_terms,
     "TERM_IDLE_TTL_MIN": resolve_term_idle_ttl_min,
+    "SNAPSHOT_TTL_MIN": resolve_snapshot_ttl_min,
     "TERMINAL": resolve_terminal,
     "TERM_APP": resolve_term_app,
     "TERM_ALLOW": resolve_term_allow,
@@ -496,7 +513,7 @@ _RESOLVERS = {
 # big module comment above for why these specifically, and why a PEP 562 dynamic
 # attribute was reverted in favour of this).
 _PLAIN_ATTR_KEYS = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL",
-                    "TERM_IDLE_TTL_MIN", "GATEWAY", "OPENROUTER_LAUNCHER",
+                    "TERM_IDLE_TTL_MIN", "SNAPSHOT_TTL_MIN", "GATEWAY", "OPENROUTER_LAUNCHER",
                     "OPENROUTER_SLOTS_FILE")
 
 # Seeded here from env/default ONLY (an explicit `{}`, never a file read) -- this module has
@@ -509,6 +526,7 @@ TERM_RENDERER = resolve_term_renderer({})
 MAX_TERMS = resolve_max_terms({})
 TERMINAL = resolve_terminal({})
 TERM_IDLE_TTL_MIN = resolve_term_idle_ttl_min({})
+SNAPSHOT_TTL_MIN = resolve_snapshot_ttl_min({})
 GATEWAY = resolve_gateway({})
 OPENROUTER_LAUNCHER = resolve_openrouter_launcher({})
 OPENROUTER_SLOTS_FILE = resolve_openrouter_slots_file({})

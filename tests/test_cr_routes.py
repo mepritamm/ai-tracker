@@ -37,7 +37,7 @@ _PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "VSCODE_WS_ROOT", "CURSO
           "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "NOTES_FILE", "TASKS_DIR", "PORT_FILE",
           "TOKEN_FILE", "CONFIG_FILE", "FORKS_FILE")
 
-_CFG_ATTRS = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL", "TERM_IDLE_TTL_MIN",
+_CFG_ATTRS = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL", "TERM_IDLE_TTL_MIN", "SNAPSHOT_TTL_MIN",
               "GATEWAY", "OPENROUTER_LAUNCHER", "OPENROUTER_SLOTS_FILE")
 
 
@@ -238,6 +238,18 @@ class TestApiConfigWrite(_ServerCase):
         self.assertEqual(j["TERM_IDLE_TTL_MIN"], {"value": 45, "overridden": True, "restart": False})
         self.assertEqual(json.load(open(config.CONFIG_FILE))["TERM_IDLE_TTL_MIN"], 45)
         self.assertEqual(config.TERM_IDLE_TTL_MIN, 45)
+
+    def test_snapshot_ttl_post_validates_and_applies_live(self):
+        st, j = self._post("/api/config", {"key": "SNAPSHOT_TTL_MIN", "value": 45})
+        self.assertEqual(st, 200)
+        self.assertEqual(j, {"ok": True, "key": "SNAPSHOT_TTL_MIN", "value": 45, "restart": False})
+        st, j = self._get_json("/api/config")
+        self.assertEqual(j["SNAPSHOT_TTL_MIN"], {"value": 45, "overridden": True, "restart": False})
+        self.assertEqual(config.SNAPSHOT_TTL_MIN, 45)
+        for bad in (0, 1441, "x"):
+            st, j = self._post("/api/config", {"key": "SNAPSHOT_TTL_MIN", "value": bad})
+            self.assertEqual(st, 400)
+            self.assertEqual(j, {"error": "invalid value for SNAPSHOT_TTL_MIN"})
 
     def test_term_idle_ttl_min_out_of_range_is_400(self):
         for bad in (0, 1441):

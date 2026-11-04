@@ -862,6 +862,7 @@
     TERM_RENDERER: 'TRACKER_TERM_RENDERER',
     MAX_TERMS: 'TRACKER_MAX_TERMS',
     TERM_IDLE_TTL_MIN: 'TRACKER_TERM_IDLE_TTL_MIN',
+    SNAPSHOT_TTL_MIN: 'TRACKER_SNAPSHOT_TTL_MIN',
     TERMINAL: 'TRACKER_TERMINAL',
     TERM_APP: 'TRACKER_TERM_APP',
     GATEWAY: null,       // ditto — no env var, config.json > built-in default
@@ -1326,6 +1327,9 @@
           function (value, onCommit) {
             return sliderCtlCommit(30, 1800, value != null ? value : 300, onCommit, 's');
           }));
+        body.appendChild(serverRow('Session snapshot TTL', 'SNAPSHOT_TTL_MIN',
+          'How old a cached session may be and still show, labelled, while it refreshes after a switch — and how long a page whose updates are failing stays up before it says so. The slider covers 5–240; env TRACKER_SNAPSHOT_TTL_MIN or config.json accept 1–1440.',
+          function (value, onCommit) { return sliderCtlCommit(5, 240, value != null ? value : 30, onCommit, ' min'); }));
       } else if (active === 'Terminal') {
         body.appendChild(serverRow('Terminal renderer', 'TERM_RENDERER',
           'Default for newly-opened terminals — already switchable live per-terminal from its own toolbar.',
