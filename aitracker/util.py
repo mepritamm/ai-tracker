@@ -1,4 +1,4 @@
-import datetime, difflib, os, re, subprocess
+import datetime, difflib, os, pickle, re, subprocess, threading
 from urllib.parse import unquote, urlparse
 
 from . import config
@@ -533,3 +533,50 @@ def model_label(mid):
         return mid
     family, version = mv
     return "%s %s%s" % (family[:1].upper() + family[1:], ".".join(str(n) for n in version), tag)
+
+
+# --- pass cache: an in-process cache of the part of a parse that is a pure function of ONE file ---
+_PASS_CACHE = {}                     # (kind, path) -> (stat key, pickled bytes); dict order = LRU
+_PASS_CACHE_LOCK = threading.Lock()  # guards get/set/evict + the counter ONLY, never a parse or pickle
+_PASS_CACHE_BYTES = 0
+PASS_CACHE_MAX_BYTES = 32 * 1024 * 1024
+
+
+def _pass_cache_on():
+    """Late-bound kill-switch: AITRACKER_NO_PASS_CACHE=1 runs every pass uncached."""
+    return not os.environ.get("AITRACKER_NO_PASS_CACHE")
+
+
+def file_pass(kind, path, fn):
+    """fn(path) must be a pure function of this one file's bytes: no clock, no config, no other
+    file. Returns a FRESH object every call (stored pickled), so callers may mutate it. Validated
+    against os.stat on every call. Raises what os.stat raises."""
+    global _PASS_CACHE_BYTES
+    if not _pass_cache_on():
+        return fn(path)
+    st = os.stat(path)   # BEFORE reading: a write during fn leaves a key older than the data -> next call misses
+    key = (st.st_mtime_ns, st.st_size, st.st_ino)
+    ck = (kind, path)
+    with _PASS_CACHE_LOCK:
+        hit = _PASS_CACHE.get(ck)
+        if hit is not None and hit[0] == key:
+            _PASS_CACHE[ck] = _PASS_CACHE.pop(ck)   # touch LRU
+            blob = hit[1]
+        else:
+            blob = None
+    if blob is not None:
+        return pickle.loads(blob)
+    out = fn(path)
+    try:
+        blob = pickle.dumps(out, -1)
+    except (pickle.PicklingError, TypeError, AttributeError, RecursionError):
+        return out   # fail open: uncached
+    with _PASS_CACHE_LOCK:
+        old = _PASS_CACHE.pop(ck, None)
+        if old is not None:
+            _PASS_CACHE_BYTES -= len(old[1])
+        _PASS_CACHE[ck] = (key, blob)
+        _PASS_CACHE_BYTES += len(blob)
+        while _PASS_CACHE_BYTES > PASS_CACHE_MAX_BYTES and _PASS_CACHE:
+            _PASS_CACHE_BYTES -= len(_PASS_CACHE.pop(next(iter(_PASS_CACHE)))[1])
+    return out

@@ -1,7 +1,7 @@
 import glob, json, os, re, subprocess, threading, time
 from ..config import EDIT_TOOLS, NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, pr_summary, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase, real_model, model_label
+from ..util import file_pass, _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, pr_summary, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase, real_model, model_label
 from ..overview import build_overview, build_heartbeat
 from ..store import load_titles, load_tasks, load_notes, _TSTATUS
 from .base import Provider
@@ -1468,17 +1468,10 @@ SHELL_RE = re.compile(r"running in background with ID:\s*(\S+?)\.\s*"
 TASKDONE_RE = re.compile(r"<task-id>([^<]+)</task-id>")
 
 
-def parse_shells(path):
-    """Background shells: a Bash run_in_background launch + its result naming the
-    shell id and live .output file. A shell is running until a <task-notification>
-    for its id appears (the harness' completion signal) — the .output file's mtime
-    is NOT reliable, since commands often redirect their output to their own log."""
+def _shells_pass(path):
+    """Scan half of parse_shells: a pure function of the transcript's bytes (cached by file_pass)."""
     launches, results, done = {}, {}, set()
-    try:
-        fh = open(path, encoding="utf-8")
-    except OSError:
-        return []
-    with fh:
+    with open(path, encoding="utf-8") as fh:
         for line in fh:
             if "<task-notification>" in line:
                 done.update(TASKDONE_RE.findall(line))
@@ -1502,6 +1495,18 @@ def parse_shells(path):
                     mt = SHELL_RE.search(_result_text(b.get("content")))
                     if mt:
                         results[b["tool_use_id"]] = (mt.group(1), mt.group(2))
+    return launches, results, done
+
+
+def parse_shells(path):
+    """Background shells: a Bash run_in_background launch + its result naming the
+    shell id and live .output file. A shell is running until a <task-notification>
+    for its id appears (the harness' completion signal) — the .output file's mtime
+    is NOT reliable, since commands often redirect their output to their own log."""
+    try:
+        launches, results, done = file_pass("claude.shells", path, _shells_pass)
+    except OSError:
+        return []
     out = []
     for lid, info in launches.items():
         shell_id, outpath = results.get(lid, ("", ""))
@@ -1602,9 +1607,18 @@ def agent_detail(path, aid):
     return {"task": "", "narration": "", "tail": "", "tools": 0, "running": False}
 
 
-def parse_session(path):
-    # ponytail: full re-parse per poll. Fine to a few MB; switch to
-    # offset-tailing if session files ever get huge.
+# The names that cross the split (derived with an `ast` walk: free in the assembly half, bound in
+# the pass half; `todos` is bound in both, the pass value survives when neither branch rebinds it).
+_PASS_NAMES = ("agents", "asks", "cmds", "commits", "ctx_current", "fail_cmd", "files", "hb_calls",
+               "hb_desc", "hb_iv", "hb_turns", "meta", "n_search", "narrative", "parse_error",
+               "pr_states", "prs", "reads", "requests", "t_first", "t_last", "task_defs",
+               "task_order", "task_status", "task_times", "tests", "text_last", "todos", "tok_in",
+               "tok_out")
+
+
+def _transcript_pass(path):
+    """The part of parse_session that is a pure function of ONE transcript file's bytes: no clock,
+    no config, no other file. Cached by util.file_pass; everything live is assembled in parse_session."""
     todos = []
     task_times = {}        # taskId (str, == the task-store file's stem) -> {"started": ts, "ended": ts}
                             # filled from TaskUpdate tool calls below — the transcript is already
@@ -1876,6 +1890,15 @@ def parse_session(path):
     for c in cmds:
         c["ok"] = not errors_by_id.get(c["id"], False)
     tests = [c for c in cmds if c["kind"] == "test"]
+    return {k: v for k, v in locals().items() if k in _PASS_NAMES}
+
+
+def parse_session(path):
+    _p = file_pass("claude.transcript", path, _transcript_pass)
+    (agents, asks, cmds, commits, ctx_current, fail_cmd, files, hb_calls, hb_desc, hb_iv, hb_turns,
+     meta, n_search, narrative, parse_error, pr_states, prs, reads, requests, t_first, t_last,
+     task_defs, task_order, task_status, task_times, tests, text_last, todos, tok_in, tok_out) = (
+        _p[k] for k in _PASS_NAMES)
     sid = meta.get("sessionId") or os.path.basename(path)[:-6]
     tasks = load_tasks(sid)  # newer sessions use the task store, not in-transcript TodoWrite
     # Reconstructed from the TaskCreate/TaskUpdate calls just walked above — the fallback for
