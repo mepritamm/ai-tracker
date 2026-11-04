@@ -608,6 +608,18 @@ def daemon_repl_pid(sid):
     return 0
 
 
+def session_label(sid):
+    """A session's title for a banner: its rename, else its transcript's title, else "". Never raises."""
+    try:
+        t = load_titles().get(sid)
+        if t:
+            return str(t)
+        path = find_session(sid)
+        return (_session_meta(path).get("title") or "") if path else ""
+    except Exception:
+        return ""
+
+
 def _blocked_jobs():
     """session id -> question text for LIVE Claude Code background jobs whose state.json says
     "blocked" (Needs input). Both sessionId and resumeSessionId map, as either may be the

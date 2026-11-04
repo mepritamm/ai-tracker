@@ -917,6 +917,11 @@ def _run():
         assert term_vt._session_live(_p, time.time()), "a live-elsewhere session must hold off the idle reap"
         _p.forked = True
         assert not term_vt._session_live(_p, time.time()), "a forked copy must not borrow its parent's liveness"
+    # taking over an unwatched daemon-client pane: only an exact `claude attach <short>` qualifies
+    for _args, _want in (("/x/.local/bin/claude attach ab12cd34", "ab12cd34"),
+                         ("claude --resume ab12cd34", ""), ("claude attach ab12cd34 5", "")):
+        with mock.patch.object(term_vt.subprocess, "run", return_value=mock.Mock(stdout=_args + "\n")):
+            assert term_vt._thin_client_short(1) == _want, "thin-client detection: %r" % _args
     assert "TRACKER_AUTH" not in config.EDITABLE, "TRACKER_AUTH must never be browser-writable"
     assert "NOT_A_REAL_KEY" not in config.EDITABLE, "a non-allowlisted key must never validate"
     # Same invariant, one level down: TUNNEL_ON (child-process-alive) must never be flippable

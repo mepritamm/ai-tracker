@@ -113,7 +113,8 @@ no longer the only one."""
 BG_REFUSAL_MARKERS = (
     REFUSAL_MARKER,
     "is running as a background session",
-)
+    "is running in the background (",     # `${title} is running in the background (<job>).` -- keep the "(":
+)                                          # the bare phrase is common prose
 """Every wording of the CLI's "still running elsewhere" refusal that `looks_like_bg_refusal()`
 matches. REFUSAL_MARKER (above) is the LEGACY wording; the CURRENT `claude` CLI instead prints
 (verbatim, from a real capture):

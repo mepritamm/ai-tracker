@@ -2544,7 +2544,7 @@ class TestTerminalManagerPanel(unittest.TestCase):
         both ride along so the peeked terminal gets its full context bar, not a degraded one."""
         peek = _body_until(self.js, "function peekTerm(", ["function closeTty("])
         self.assertIn('"?tty=" + encodeURIComponent(t.tty)', peek)
-        self.assertIn('"&sid=" + encodeURIComponent(t.session || "")', peek)
+        self.assertIn('"&sid=" + encodeURIComponent((t.fg && t.fg.session) || t.session || "")', peek)
         self.assertIn('"&mode=" + encodeURIComponent(t.mode || "")', peek)
         # The query-string builder moved into peekUrl() (still inside this slice) so the Control
         # Room can CALL it instead of retyping the params -- the drift this test's own sid/mode
@@ -2905,6 +2905,37 @@ class TestTtyAddressedCallsCarryTheirSession(unittest.TestCase):
             self.assertIn(needle, src)
         self.assertIn('bindTty(res.j.tty, "")', _read("ext_cr_term.js"))
         self.assertIn('bindTty(res.j.tty, "")', _read("ext_launch.js"))
+
+
+class TestClosedStreamStatus(unittest.TestCase):
+    """A stream the browser has given up on (CLOSED: the server 409'd because another session took
+    the pane over) must not read "reconnecting..." forever, in either renderer."""
+
+    def test_both_renderers_report_closed_stream(self):
+        src = _read("ext_vt.js")
+        self.assertEqual(src.count("self._onStatusChange(_streamErrorStatus(self.es))"), 2,
+                         "grid and xterm terminals both use the helper")
+        self.assertNotIn('self._onStatusChange("reconnecting…")', src)
+        helper = src[src.index("function _streamErrorStatus("):]
+        helper = helper[:helper.index("\n  }") + 4]
+        self.assertIn("readyState === 2", helper)
+        self.assertIn("disconnected — reopen this terminal", helper)
+        self.assertIn("reconnecting…", helper)
+
+    def test_closed_status_never_rebinds_to_the_new_session(self):
+        src = _read("ext_vt.js")
+        helper = src[src.index("function _streamErrorStatus("):]
+        helper = helper[:helper.index("\n  }") + 4]
+        self.assertNotIn("bindTty", helper)
+        self.assertNotIn("fetch(", helper)
+
+    def test_peek_url_names_the_session_running_in_the_pane(self):
+        """After a takeover the list row still carries the opener in `session`; the peek must name
+        what runs there now (`fg.session`) or the stream 409s."""
+        src = _read("ext_vt.js")
+        url = src[src.index("function peekUrl("):]
+        url = url[:url.index("\n  }") + 4]
+        self.assertIn("(t.fg && t.fg.session) || t.session", url)
 
 
 if __name__ == "__main__":

@@ -33,6 +33,12 @@ LEGACY_MESSAGE = (
 machine may still emit exactly this (see term_gate.REFUSAL_MARKER's docstring)."""
 
 
+MXE_MESSAGE = ("vida-sprint-board is running in the background (48a30864). Run `claude attach "
+               "48a30864` to open it, or `claude stop 48a30864` first to resume it here.")
+"""The third wording (CLI 2.1.318's `mxe`, from its binary): `${title} is running in the background
+(${jobId}).` -- the title is free text, so only the tail is matched."""
+
+
 def _fuse_words_with_column_jumps(text):
     """Rejoins `text.split(" ")` with `\\x1b[<n>G` cursor-jump escapes instead of literal
     spaces -- approximates how Ink actually renders this message on a real pty (see
@@ -78,8 +84,18 @@ class TestRegressionEval(unittest.TestCase):
         for marker in term_gate.BG_REFUSAL_MARKERS:
             with self.subTest(marker=marker):
                 self.assertTrue(
-                    marker in CURRENT_MESSAGE or marker in LEGACY_MESSAGE,
-                    "marker %r is not a substring of either captured message" % (marker,))
+                    marker in CURRENT_MESSAGE or marker in LEGACY_MESSAGE or marker in MXE_MESSAGE,
+                    "marker %r is not a substring of any captured message" % (marker,))
+
+
+class TestBgRefusalMxeWording(unittest.TestCase):
+    def test_bg_refusal_matches_current_cli_wording(self):
+        """RED before the marker was added: this wording matched nothing, so no recovery fired."""
+        self.assertTrue(term_gate.looks_like_bg_refusal(MXE_MESSAGE))
+        self.assertTrue(term_gate.looks_like_bg_refusal(_fuse_words_with_column_jumps(MXE_MESSAGE)))
+
+    def test_bare_phrase_without_job_paren_is_not_a_refusal(self):
+        self.assertFalse(term_gate.looks_like_bg_refusal("the build is running in the background now"))
 
 
 class TestAttachTarget(unittest.TestCase):

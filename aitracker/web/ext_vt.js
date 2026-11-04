@@ -664,6 +664,14 @@
   // button still renders something sane, and switching is a harmless no-op rather than a throw.
   var _noopRendererSwitch = { getActive: function () { return "grid"; }, switchTo: function () { } };
 
+  // A stream error is "reconnecting" only while the browser is still retrying (CONNECTING). CLOSED
+  // (readyState 2) means it will not: the server answered 409 because the pane changed hands
+  // (another session took the folder shell over), and the old view must not pretend to be live nor
+  // rebind itself to whatever runs there now.
+  function _streamErrorStatus(es) {
+    return es && es.readyState === 2 ? "disconnected — reopen this terminal" : "reconnecting…";
+  }
+
   // ===== Terminal: one live grid + key capture, mounted into any container =====
   // Third constructor arg is the renderer-switch interface -- see buildToolbar's own comment. It
   // used to be read via `arguments[2]` instead of a named parameter, because this file's own
@@ -918,7 +926,7 @@
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       self._applyPatch(msg);
     };
-    self.es.onerror = function () { if (self._onStatusChange) self._onStatusChange("reconnecting…"); };
+    self.es.onerror = function () { if (self._onStatusChange) self._onStatusChange(_streamErrorStatus(self.es)); };
   };
 
   Terminal.prototype._applyPatch = function (msg) {
@@ -1952,7 +1960,7 @@
       self._onNotice(n);
     };
     self.es.addEventListener("notice", self._onNoticeEvent);
-    self.es.onerror = function () { if (self._onStatusChange) self._onStatusChange("reconnecting…"); };
+    self.es.onerror = function () { if (self._onStatusChange) self._onStatusChange(_streamErrorStatus(self.es)); };
   };
 
   // Closes `this.es` AND removes the named-event listener wired onto it above. One helper because
@@ -3435,7 +3443,7 @@
   // `sid`/`mode`/`forked` params silently drift apart and a peeked terminal loses its context bar.
   function peekUrl(t) {
     return location.origin + location.pathname + "?tty=" + encodeURIComponent(t.tty) +
-      "&sid=" + encodeURIComponent(t.session || "") +
+      "&sid=" + encodeURIComponent((t.fg && t.fg.session) || t.session || "") +
       "&mode=" + encodeURIComponent(t.mode || "") +
       "&forked=" + (t.forked ? "1" : "0");
   }

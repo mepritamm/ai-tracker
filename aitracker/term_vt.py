@@ -176,6 +176,7 @@ import json
 import os
 import pty
 import queue
+import re
 import select
 import shlex
 import signal
@@ -1857,12 +1858,12 @@ def _folder_pty(cwd):
     return None
 
 
-def _folder_wait_prompt(pt):
+def _folder_wait_prompt(pt, wait=None):
     """Block until the folder shell is back at its prompt (foreground group == the shell), or
-    give up after BACKSTOP_WINDOW. The backstop's folder counterpart of "the refused child has
+    give up after `wait` (BACKSTOP_WINDOW by default). The backstop's folder counterpart of "the refused child has
     exited": a dedicated pty is simply `done` at that point, a folder pty is idle. False when
     the pty died or was closed meanwhile -- nothing to type into."""
-    deadline = time.time() + BACKSTOP_WINDOW
+    deadline = time.time() + (BACKSTOP_WINDOW if wait is None else wait)
     while time.time() < deadline:
         if pt.done or pt.closing:
             return False
@@ -2994,6 +2995,13 @@ def open_pty(handler, parsed, body):
         prompt, idle, in its original state -- nothing to reap, nothing to respawn.
       * `"resume"` while the shell is already running THAT session -- a peek: the same tty,
         nothing typed.
+      * `"resume"` of a BACKGROUND session (one a live Claude-daemon REPL hosts) while the shell shows
+        ANOTHER background session's `claude attach` client, nobody is watching it, and the shell is
+        still in this folder -- the pane is TAKEN OVER (`_swap_candidate`/`_swap_in`): SIGTERM to the
+        client's group (the session lives in the daemon; the client holds nothing), the terminal modes
+        it left on are reset, the new resume is typed at the prompt it leaves, and the response
+        `notice` names the displaced session. Every refusal of the guards falls through to the
+        dedicated pty below.
       * otherwise the shell is busy (some other session, a job the user typed, or the typed
         line could not be delivered) -- this falls through to the pre-folder behaviour: a
         DEDICATED pty for this one session, flagged `overflow` so it vanishes from the list the
@@ -3219,6 +3227,12 @@ def open_pty(handler, parsed, body):
         with fp.lock:
             fp.starting = False
         busy_what = why
+    # ---- an unwatched pane showing ANOTHER background session's daemon client is taken over
+    if mode == "resume" and busy_what and _background_target(sid):
+        cand = _swap_candidate(fp, sid, cwd)
+        reply = cand and _swap_in(fp, cand, sid, argv, forked, cols, rows)
+        if reply:
+            return handler._json(reply)
     # ---- overflow: the pre-folder behaviour, verbatim, plus the `overflow` flag
     with _LOCK:
         _reap()
@@ -3257,6 +3271,155 @@ def open_pty(handler, parsed, body):
     handler._json({"tty": pt.id, "renderer": config.TERM_RENDERER, "forked": forked,
                    "notice": None,
                    "starting": starting, "reused": False, "folder": False})
+
+
+# ------------------------------------------------------ taking over an unwatched daemon-client pane
+#
+# A folder's shell can be showing a THIN CLIENT of a background session A (`claude --resume A` on
+# a session the Claude daemon hosts makes the CLI turn itself into `claude attach <short>`). The
+# session lives in the daemon, not in that pane, so SIGTERM to the client costs A nothing (measured
+# on 2.1.318: the REPL, its tools and its transcript are unaffected; the client exits in ~0.05s and
+# does no terminal cleanup, hence _TERM_MODE_RESET). When someone opens ANOTHER background session B
+# in that folder and nobody is watching the pane, B takes the pane over instead of opening a new one.
+
+THIN_DETACH_WAIT = 2.0      # measured 0.05s: the client has no SIGTERM handler
+VIEWER_GRACE = 0.5          # grid streams poll _peer_gone every 0.05s, raw ones every 0.2s
+_TERM_MODE_RESET = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?25h"
+"""What a killed `claude attach` client leaves on: alt screen, mouse (1000/1002/1003 + SGR), focus
+reporting, a hidden cursor. Fed to the Screen and the raw viewers before the next line is typed."""
+
+
+def _provider():
+    """The Claude provider module, or None (the flattened bundle has no package to import from)."""
+    try:
+        return __import__("%s.providers.claude" % __package__, fromlist=["claude"])
+    except Exception:
+        return None
+
+
+def _background_target(sid):
+    """`sid` when a live Claude-daemon REPL hosts it (it is a BACKGROUND session), else "". Reads the
+    roster; never raises."""
+    try:
+        c = _provider()
+        return sid if c is not None and c.daemon_repl_pid(sid) > 0 else ""
+    except Exception:
+        return ""
+
+
+def _thin_client_short(pgid):
+    """<short> when `ps -o args= -p pgid` is exactly three tokens `*/claude attach <short>`, else "".
+    Forks: never call under _LOCK. A path with spaces or a quoted name reads as "" (the safe answer)."""
+    try:
+        out = subprocess.run(["ps", "-o", "args=", "-p", str(int(pgid))],
+                             capture_output=True, text=True, timeout=2)
+    except Exception:
+        return ""
+    toks = (out.stdout or "").split()
+    if len(toks) != 3 or toks[1] != "attach" or os.path.basename(toks[0]) != "claude":
+        return ""
+    return toks[2] if re.fullmatch(r"[0-9a-f]{4,64}", toks[2]) else ""
+
+
+def _shell_cwd(pid):
+    """The process's real cwd, or "" when unknown. Never raises. Forks: never call under _LOCK."""
+    try:
+        return os.readlink("/proc/%d/cwd" % pid)
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["lsof", "-a", "-d", "cwd", "-p", str(pid), "-Fn"],
+                             capture_output=True, text=True, timeout=2).stdout
+    except Exception:
+        return ""
+    return next((l[1:] for l in out.splitlines() if l.startswith("n")), "")
+
+
+def _swap_candidate(fp, sid, cwd):
+    """-> {fg, pg, kind, shown} when folder pty `fp` may be taken over for background session `sid`,
+    else None. Forks ps/lsof: never call under _LOCK. Every check runs BEFORE any signal and any
+    failure is None (= a dedicated pty, as before)."""
+    try:
+        end = time.time() + VIEWER_GRACE
+        while fp.viewers > 0 and time.time() < end:    # a just-closed pane's stream takes a beat to drop
+            time.sleep(0.05)
+        with _LOCK:
+            _refresh_fg(fp)
+            fg = fp.fg
+            if (fg is None or not fg.get("session") or fg.get("session") == sid or fg.get("forked")
+                    or fp.done or fp.closing or fp.starting or fp.fg_pending or fp.viewers > 0):
+                return None
+        pg = _fg_pgid(fp)
+        if pg <= 0 or pg == fp.pid:
+            return None
+        real = _shell_cwd(fp.pid)
+        if real and os.path.realpath(real) != os.path.realpath(cwd):
+            return None                                  # the shell has cd'd away: not this folder
+        c = _provider()
+        if c is None:
+            return None
+        shown = fg["session"]
+        short = _thin_client_short(pg)
+        if len(short) >= 4 and shown.startswith(short) and c.daemon_repl_pid(shown) > 0:
+            return {"fg": fg, "pg": pg, "kind": "thin", "shown": shown}
+        return None
+    except Exception:
+        return None
+
+
+def _swap_in(fp, cand, sid, argv, forked, cols, rows):
+    """Take `fp` over for `sid`: claim, SIGTERM the displaced client, type `argv` at the prompt it
+    leaves. -> the open_pty response dict, or None (nothing typed; the caller opens a dedicated pty)."""
+    old, pg, kind = cand["fg"], cand["pg"], cand["kind"]
+    with _LOCK:
+        if (fp.fg is not old or fp.viewers > 0 or fp.closing or fp.done or _fg_pgid(fp) != pg):
+            return None
+        # The claim names the target at once, so a concurrent open of it peeks instead of racing us,
+        # and `fg_pending` stops the list poll's _refresh_fg from latching the dying client.
+        fp.fg = {"session": sid, "mode": "resume", "started": time.time(), "grants": {sid}}
+        fp.fg_seen_child = False
+        fp.fg_pending = True
+        fp.touch()                  # the idle reap must not take the shell mid-swap
+        with fp.lock:
+            fp.starting = True
+
+    def release(restore):
+        with _LOCK:
+            fp.fg_pending = False
+            if restore and not fp.closing and not fp.done:
+                fp.fg, fp.fg_seen_child = old, True
+            elif not restore:
+                fp.fg, fp.fg_seen_child = None, False
+        with fp.lock:
+            fp.starting = False
+
+    if pg > 0 and pg != fp.pid and pg != os.getpgrp():
+        try:
+            os.killpg(pg, signal.SIGTERM)                # never SIGKILL: the client must leave cleanly
+        except OSError:
+            pass
+    if not _folder_wait_prompt(fp, THIN_DETACH_WAIT):
+        release(True)
+        return None
+    if kind == "thin":
+        with fp.lock:
+            fp.screen.feed(_TERM_MODE_RESET)
+            _tee_raw(fp, _TERM_MODE_RESET)
+    ok, _why = _inject_argv(fp, argv)
+    if not ok:
+        release(False)
+        return None
+    starting = _start_backstop(fp, sid, forked, cols, rows)
+    notice = None
+    if cand["shown"] != sid:
+        c = _provider()
+        title = c.session_label(cand["shown"]) if c is not None else ""
+        notice = '%s (%s) keeps running in the background. Reopen it from the dashboard.' % (
+            '"%s"' % title if title else "session", cand["shown"][:8])
+    with _LOCK:
+        fp.grants.add(sid)
+    return {"tty": fp.id, "renderer": config.TERM_RENDERER, "forked": forked, "notice": notice,
+            "starting": starting, "reused": True, "folder": True}
 
 
 def _session_pty(sid):
