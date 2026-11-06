@@ -4943,6 +4943,27 @@ console.log(JSON.stringify({ result: result }));
         result = self._term_tab_origin(True, loc, "")
         self.assertEqual(result, "http://localhost:8790")
 
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_opening_a_tab_from_an_already_subdomained_tab_gets_its_own_fresh_subdomain(self):
+        # A new tab opened from WITHIN a tab already on t<tty1>.localhost must get its OWN
+        # t<tty2>.localhost -- not reuse tty1's subdomain, which would partially defeat the fix
+        # for this nested case.
+        loc = {"hostname": "tabc.localhost", "port": "8790", "protocol": "http:",
+               "origin": "http://tabc.localhost:8790"}
+        result = self._term_tab_origin(True, loc, "xyz")
+        self.assertEqual(result, "http://txyz.localhost:8790")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_location_with_no_hostname_at_all_does_not_throw(self):
+        # Regression: the ".localhost"-suffix check added for the nested-tab case above calls
+        # .slice() on the hostname -- a `location` object that omits `hostname` entirely (real
+        # browsers never do this, but several Node-harness tests elsewhere in this module mock a
+        # bare `location = {origin, pathname}`) must fall through to the safe default instead of
+        # throwing a TypeError.
+        loc = {"port": "8790", "protocol": "http:", "origin": "http://tracker.test"}
+        result = self._term_tab_origin(True, loc, "xyz")
+        self.assertEqual(result, "http://tracker.test")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -49,13 +49,26 @@ def _run_module(module):
     return module, proc.returncode, proc.stdout, proc.stderr
 
 
-def _is_benign_empty_module(code, combined):
-    """True for a module that is intentionally test-free on its own (its logic is exercised via
-    import from another module's TestCase, under the real `discover` run) -- see this file's own
-    module docstring. Narrow on purpose: only the exact "collected nothing, nothing else went
-    wrong" shape counts, so a real import error (a traceback, a different exit code) still fails
-    the gate like it should."""
-    return code == 5 and "NO TESTS RAN" in combined and "Traceback" not in combined
+# The ONE module known to define no TestCase of its own by design -- see this file's own module
+# docstring. Deliberately a short, explicit allow-list, not inferred from the exit-code shape
+# alone: without naming it, ANY module that happens to collect zero tests (e.g. a test method
+# accidentally renamed without its `test_` prefix) would also exit 5 with "NO TESTS RAN" and get
+# silently waved through as "benign" instead of failing the gate like it should.
+BENIGN_EMPTY_MODULES = {"tests.test_selfcheck"}
+
+
+def _is_benign_empty_module(module, code, combined):
+    """True only for a module that is BOTH named in BENIGN_EMPTY_MODULES AND shows the exact
+    "collected nothing, nothing else went wrong" shape (its logic is exercised via import from
+    another module's TestCase, under the real `discover` run). Any other module hitting this
+    exit-code shape is a real "no tests collected" problem and must still fail the gate -- a real
+    import error (a traceback, a different exit code) fails it too, regardless of the name."""
+    return (
+        module in BENIGN_EMPTY_MODULES
+        and code == 5
+        and "NO TESTS RAN" in combined
+        and "Traceback" not in combined
+    )
 
 
 def main():
@@ -65,7 +78,7 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=JOBS) as pool:
         for module, code, out, err in pool.map(_run_module, modules):
             combined = (out or "") + (err or "")
-            if code != 0 and _is_benign_empty_module(code, combined):
+            if code != 0 and _is_benign_empty_module(module, code, combined):
                 print("--- %s: no tests of its own (exercised via another module's import) ---" % module)
             elif code != 0:
                 failures.append(module)

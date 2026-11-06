@@ -351,7 +351,10 @@
         // deliberately omitted: there is none for a session-less terminal, and
         // ext_vt.js's bootStandalone() already treats a missing ?sid= as "no context bar",
         // not an error.
-        var url = location.origin + location.pathname + "?tty=" + encodeURIComponent(res.j.tty) +
+        // F9: per-tab hostname via ext_vt.js's termTabOrigin -- NOT location.origin -- so this
+        // tab gets its own Chrome per-host connection budget. Same helper as ext_vt.js/
+        // ext_cr_term.js, no second copy.
+        var url = (window.ExtVT && window.ExtVT.termTabOrigin ? window.ExtVT.termTabOrigin(res.j.tty) : location.origin) + location.pathname + "?tty=" + encodeURIComponent(res.j.tty) +
           "&mode=" + encodeURIComponent(mode) +
           "&renderer=" + encodeURIComponent(res.j.renderer || "grid") +
           "&forked=" + (res.j.forked ? "1" : "0") +

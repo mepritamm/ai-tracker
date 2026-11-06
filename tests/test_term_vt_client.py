@@ -59,6 +59,19 @@ def _body_until(src, start_marker, end_markers):
     return src[start: min(ends) if ends else len(src)]
 
 
+def _src_excluding_term_tab_origin(src):
+    """ext_vt.js's full source with ONLY termTabOrigin's own function body cut out -- the one,
+    reviewed exception to "no control anywhere in this file may read location.hostname" (F9: it
+    reads the hostname to pick a per-tab origin for connection-pool routing, not to gate a
+    control's visibility). Every "no host gating" check below runs against THIS, not a
+    function-scoped slice narrowed to just the one control each test happens to be about --
+    narrowing per-function previously let a host-gated control slip in ANYWHERE ELSE in the file
+    (e.g. buildTermRow) without any of these tests catching it; see this fix's own review."""
+    start = src.index("function termTabOrigin(")
+    end = src.index("\n  }", start) + 4
+    return src[:start] + src[end:]
+
+
 class TestAssetsAreInlined(unittest.TestCase):
     """Step 0's page.build_page() must pick up ext_vt.js/css the same way it already picks up
     ext_launch.*/ext_run.* -- confirmed against the actually-served page, not just the source
@@ -1053,12 +1066,10 @@ class TestCapReclaimBlock(unittest.TestCase):
         self.assertIn("text-overflow: ellipsis;", self.css)
         self.assertIn(".vtcapx {", self.css)
         self.assertIn("min-height: 28px;", self.css)      # a real tap target
-        # Scoped to the reclaim block itself (not the whole file): F9's termTabOrigin elsewhere
-        # in ext_vt.js legitimately reads location.hostname for a wholly unrelated reason (per-
-        # tab connection-pool routing, not UI visibility) -- this test's own rule is about THIS
-        # block never being host-gated, not a file-wide ban on the string.
-        block = _body_until(self.js, "function renderCapBlock(", ["function openVT("])
-        self.assertNotIn("location.hostname", block)
+        # Whole-file check minus the one reviewed exception (termTabOrigin itself legitimately
+        # reads location.hostname for connection-pool routing, not UI visibility) -- see
+        # _src_excluding_term_tab_origin's own docstring for why this stays file-wide.
+        self.assertNotIn("location.hostname", _src_excluding_term_tab_origin(self.js))
 
     def test_reclaim_block_survives_into_the_served_page(self):
         page = build_page()
@@ -1489,12 +1500,9 @@ class TestMouseReportingToggle(unittest.TestCase):
     def test_control_is_not_hidden_by_host_or_viewport(self):
         # hard project rule: no control is gated on location.hostname; and requirement 5 says this
         # toggle must work on desktop/tablet/phone alike -- no @media rule may hide .vtmousebtn.
-        # Scoped to the shared toolbar (not the whole file): F9's termTabOrigin elsewhere in
-        # ext_vt.js legitimately reads location.hostname for a wholly unrelated reason (per-tab
-        # connection-pool routing, not UI visibility) -- this rule is about controls, not a
-        # file-wide ban on the string.
-        toolbar = _function_body(self.src, "function buildToolbar(")
-        self.assertNotIn("location.hostname", toolbar)
+        # Whole-file check minus the one reviewed exception (termTabOrigin itself) -- see
+        # _src_excluding_term_tab_origin's own docstring.
+        self.assertNotIn("location.hostname", _src_excluding_term_tab_origin(self.src))
         css = self.css
         idx = 0
         while True:
@@ -1862,12 +1870,10 @@ class TestRendererSwitchControl(unittest.TestCase):
     def test_control_is_not_hidden_by_host_or_viewport(self):
         # Hard project rule (same as TestMouseReportingToggle.test_control_is_not_hidden_by_
         # host_or_viewport): no location.hostname gate on this control, and no @media rule may
-        # hide .vtrendererbtn behind display:none at any breakpoint. Scoped to the shared toolbar
-        # (not the whole file) for the same reason that test documents: F9's termTabOrigin
-        # elsewhere in ext_vt.js legitimately reads location.hostname for connection-pool
-        # routing, not UI visibility.
-        toolbar = _function_body(self.src, "function buildToolbar(")
-        self.assertNotIn("location.hostname", toolbar)
+        # hide .vtrendererbtn behind display:none at any breakpoint. Whole-file check minus the
+        # one reviewed exception (termTabOrigin itself) -- see
+        # _src_excluding_term_tab_origin's own docstring.
+        self.assertNotIn("location.hostname", _src_excluding_term_tab_origin(self.src))
         css = self.css
         idx = 0
         while True:
@@ -2046,11 +2052,10 @@ class TestThemeFlipperInTerminal(unittest.TestCase):
 
     def test_control_is_not_hidden_by_host_or_viewport(self):
         # hard project rule, same as TestMouseReportingToggle/TestRendererSwitchControl's own
-        # checks: no control here may be gated on location.hostname. Scoped to the shared
-        # toolbar (not the whole file): F9's termTabOrigin elsewhere in ext_vt.js legitimately
-        # reads location.hostname for connection-pool routing, not UI visibility.
-        toolbar = _function_body(self.src, "function buildToolbar(")
-        self.assertNotIn("location.hostname", toolbar)
+        # checks: no control here may be gated on location.hostname. Whole-file check minus the
+        # one reviewed exception (termTabOrigin itself) -- see
+        # _src_excluding_term_tab_origin's own docstring.
+        self.assertNotIn("location.hostname", _src_excluding_term_tab_origin(self.src))
 
     def test_reaches_the_browser(self):
         page = build_page()
@@ -2463,12 +2468,10 @@ class TestTerminalManagerPanel(unittest.TestCase):
         body = self._side_controls()
         self.assertNotIn("localOnly", body)
         self.assertNotIn("location.hostname", body)
-        # ... and the terminal module it drives gained no host gate either. Scoped to the manager
-        # panel section itself (not the whole file): F9's termTabOrigin elsewhere in ext_vt.js
-        # legitimately reads location.hostname for connection-pool routing, not UI visibility.
-        mgr_start = self.js.index('// ===== "Manage terminals" panel')
-        mgr_end = self.js.index("window.ExtVT =", mgr_start)
-        self.assertNotIn("location.hostname", self.js[mgr_start:mgr_end])
+        # ... and the terminal module it drives gained no host gate either. Whole-file check
+        # minus the one reviewed exception (termTabOrigin itself) -- see
+        # _src_excluding_term_tab_origin's own docstring.
+        self.assertNotIn("location.hostname", _src_excluding_term_tab_origin(self.js))
 
     def test_button_calls_the_terminal_module_instead_of_reimplementing_it(self):
         """ext_launch.js adds the button; ext_vt.js owns the terminal domain — the same seam the
@@ -3021,17 +3024,29 @@ class TestClosedStreamStatus(unittest.TestCase):
 
 class TestTermTabOriginIsTheOnlyTabOpeningPath(unittest.TestCase):
     """F9: the old "same window.origin for every tab" pattern must be gone from every call site
-    that opens a terminal tab -- openNewTab/peekUrl in ext_vt.js, and both _openNewTab-shaped
-    call sites in ext_cr_term.js -- so a future call site can't silently bypass termTabOrigin
-    and bring back the Chrome per-host connection-pool exhaustion this fix closes."""
+    that opens a terminal tab -- openNewTab/peekUrl in ext_vt.js, both _openNewTab-shaped call
+    sites in ext_cr_term.js, AND ext_launch.js's pickDirectory folder-picker flow -- so a future
+    call site can't silently bypass termTabOrigin and bring back the Chrome per-host
+    connection-pool exhaustion this fix closes. test_old_same_origin_tab_pattern_is_gone_anywhere
+    loops over every aitracker/web/*.js file (not just the two this class used to name) precisely
+    because ext_launch.js:354 was missed once already by a test that only checked two files --
+    see this fix's own review for that regression."""
 
-    def test_old_same_origin_tab_pattern_is_gone_from_ext_vt(self):
-        src = _read("ext_vt.js")
-        self.assertNotIn('location.origin + location.pathname + "?tty="', src)
+    def test_old_same_origin_tab_pattern_is_gone_anywhere(self):
+        offenders = []
+        for name in sorted(os.listdir(_WEB)):
+            if not name.endswith(".js"):
+                continue
+            if 'location.origin + location.pathname + "?tty="' in _read(name):
+                offenders.append(name)
+        self.assertEqual(offenders, [],
+                          "a tab-opening call site still shares location.origin instead of "
+                          "routing through termTabOrigin: %s" % offenders)
 
-    def test_old_same_origin_tab_pattern_is_gone_from_ext_cr_term(self):
-        src = _read("ext_cr_term.js")
-        self.assertNotIn('location.origin + location.pathname + "?tty="', src)
+    def test_ext_launch_folder_picker_routes_through_term_tab_origin(self):
+        src = _read("ext_launch.js")
+        body = _body_until(src, "function pickDirectory(", ["function render(d) {"])
+        self.assertIn("window.ExtVT.termTabOrigin(", body)
 
     def test_peek_url_routes_through_term_tab_origin(self):
         src = _read("ext_vt.js")

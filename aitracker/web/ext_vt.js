@@ -332,8 +332,16 @@
   // refetched per distinct hostname since the browser cache is partitioned by site.
   var TERM_TAB_HOSTS = false/*__TERM_TAB_HOSTS__*/;   // page.py serves the server's decision
   function termTabOrigin(tty) {
-    var h = location.hostname;
-    if (!TERM_TAB_HOSTS || !tty || (h !== "localhost" && h !== "127.0.0.1")) return location.origin;
+    // "|| """ -- real browsers always give location.hostname a string, but a test harness that
+    // mocks a bare `location` object (several in tests/test_term_vt_exec.py's peek/openVT
+    // scenarios) may omit it entirely; .slice() below must not throw on that.
+    var h = location.hostname || "";
+    // Also matches an existing "t<tty1>.localhost" -- a tab opened from WITHIN an already-
+    // subdomained tab (e.g. opening a second terminal from inside one's own UI) still gets its
+    // OWN fresh "t<tty2>.localhost" below, rather than inheriting tty1's subdomain and partially
+    // defeating the fix for that nested case.
+    var onTabHost = h === "localhost" || h === "127.0.0.1" || h.slice(-10) === ".localhost";
+    if (!TERM_TAB_HOSTS || !tty || !onTabHost) return location.origin;
     var label = "t" + String(tty).toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 40);
     return location.protocol + "//" + label + ".localhost" + (location.port ? ":" + location.port : "");
   }
