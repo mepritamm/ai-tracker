@@ -308,6 +308,9 @@ tests/test_cr_parse_error.py  the `parse_error` field on the detail dict — pre
                                for every provider; Claude's carries a line number, Auggie's doesn't
 hooks/pre-commit               runs the gate before every commit, one module per process, OOM-retry (make hooks)
 hooks/drain-notes.py           optional Claude Code hook: delivers pushed notes (3 events)
+scripts/run_tests_parallel.py  make check/test's runner: one subprocess per tests/test_*.py module,
+                               fanned out over a JOBS-bounded thread pool (default 4)
+scripts/bundle.py              make bundle -> dist/tracker.py (standalone single-file build)
 Makefile                       make serve / stop / check / test / hooks
 docs/screenshot.png            the dashboard screenshot in this README
 CLAUDE.md / AGENTS.md          context for AI agents working in this repo
@@ -334,7 +337,10 @@ make check     # run both — must be green before anything lands
 make hooks     # once per clone: install the pre-commit hook that runs `make check`
 ```
 
-With the hook installed, a commit is **blocked** until the gate passes. The hook runs each test module in its own process (the whole suite in one process can get OOM-killed) and retries a module once if it was OOM-killed (rc 137). Add a test alongside any new
+`make check` (and `make test`) run each `tests/test_*.py` module as its own subprocess via
+[`scripts/run_tests_parallel.py`](scripts/run_tests_parallel.py), fanned out over a `JOBS`-bounded
+thread pool (default 4 — `make check JOBS=8` to change it) instead of one sequential
+`unittest discover` process. With the hook installed, a commit is **blocked** until the gate passes; the hook retries a module once if it was OOM-killed (rc 137). Add a test alongside any new
 parser branch, helper, or provider (mirror the fixtures already in `_selfcheck()` / `tests/`).
 
 ---
