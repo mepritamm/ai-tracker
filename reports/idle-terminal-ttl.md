@@ -14,7 +14,7 @@ Branch `worktree-term-idle-ttl`, base `personal/main` @ 0aecc02.
 | 1. TTL overrun resolved | not discharged |
 | 2. Diagnosis, plan, adversarial review, reconciled plan (opus) | discharged (this report) |
 | 3. Implemented via /tracker-gap | implemented and unit/eval/acceptance-tested in the worktree; not pushed; pending post-fix review (clause 4) |
-| 4. Post-fix adversarial review and fixes (opus), /tracker-push, /branch-sync on conflict | not discharged |
+| 4. Post-fix adversarial review and fixes (opus), /tracker-push, /branch-sync on conflict | review and fixes done (see "Post-fix adversarial review"); /tracker-push and /branch-sync pending |
 
 ## Diagnosis
 
@@ -417,4 +417,115 @@ Not verified here: restart of 8790 (left to the user); A6 daemon survival (post-
 
 ## Post-fix adversarial review
 
-Pending.
+Stance: the implementation report on a489710 is false. Probes are in `/Users/pritammondal/.claude/jobs/925e866e/tmp/` (`r1` to `r13`). The installed binary is 2.1.319; its JS was read with `r2` to `r10`. The live daemon and panes were only read, never signalled. Fixes are in the commit that adds this section.
+
+### A6: the daemon survives its spawner. Exclusion kept.
+
+Three independent lines of evidence:
+
+1. **It happened during this review.** At 22:59:07 IST (17:29:07Z) somebody restarted 8790 from `ttys000`; this review did not. The new server is PID 38371. Every old pane went down with its pty, including 71855, the Claude that spawned the daemon. Afterwards:
+   - `ps` shows `71881 PPID=1 PGID=71881 ?? Ss`, elapsed 06:48:27.
+   - `daemon.log` keeps working after the death: `17:31:52Z bg retire 54e8d58b`, `17:31:53Z bg settled`.
+   - 11 `bg-pty-host` workers were still alive, and jobs 99480 and 99644 kept running.
+2. **History.** A transcript from 2026-11-03 captured `35947 PPID=1 … claude daemon run --origin transient --spawned-by {"label":"claude --bg"…` at age 00:23. `daemon.log` shows that daemon hosting job 309a7af3 for 9 more minutes, and it exited only with `idle 5s with no clients`, `cause=idle_exit, uptime=538s`, after the job was stopped.
+3. **Mechanism.**
+   - `os.getsid(71881)` was 71881, so the daemon has its own session. Its tty was `??` and TPGID 0, so it has no controlling terminal and no hangup can reach it.
+   - Its stdio is `/dev/null` plus a stderr file (`lsof`), so there is no pipe to the parent.
+   - `Pty.kill` signals only the pty's foreground group and the shell's group.
+   - In the binary, `spawnedBy` is only stored in `daemon.lock`, shown in status text and sent in telemetry. Nothing checks its liveness.
+   - `armOrphanCheck` returns early unless `process.stdin.isTTY`, and the daemon's stdin is `/dev/null`.
+   - The transient daemon exits only when `leaseCount + liveHandleCount == 0`.
+
+**Verdict: safe.** The fallback was not applied. e40-type panes now close at TTL, and the daemon reparents to launchd and keeps its jobs.
+
+Limit: the spawner deaths observed were a pty hangup and a normal exit, not a SIGKILL of a real spawner. The kernel treats a child the same for any parent death, and the code has no liveness watch, so I do not count this as a gap.
+
+### Live path: `tcgetpgrp` against `sessions/<pid>.json`
+
+Real binary through the real `term_vt.spawn`/`_reader`, on a scratch haiku session (torn down):
+
+| Launch | pg vs pid in file | fg Claude | `_repl_is_local` | Touches in a turn |
+|---|---|---|---|---|
+| `zsh -l` then `claude --resume` (`r12` B) | 59813 = 59813 | True | True | 15 in 15s, 1 when idle |
+| `claude -p` typed in `zsh -l` (`r13`) | 67859 = 67859 | True | True (`kind: interactive`) | 2 in 10s |
+| exec'd `claude --resume` (e3, earlier) | equal | True | True | 7 in 15s |
+| `sh -c 'claude …; echo bye'`, no exec (`r12` E) | 60320 is `/bin/sh` | False | not asked | 11 in 15s: the any-change path, safe side |
+| **inherited `CLAUDE_CODE_CHILD_SESSION`, before the fix** (`r12` C) | **no file** | True | **False** | **0 in 15s, on a working local REPL** |
+| same env after the fix, plus other CLAUDE* vars (`r13`) | 64869 = 64869 | True | True | 5 in 15s, no "Transcript saving is off" |
+| real `claude agents`, TTL 30s (e2 rerun) | no file | True | False | `done=True` at 30s, touches 0, rc -9 |
+
+Read-only, before the restart: `claude`, `claude agents` and `claude attach` panes had no file (22947, 73632, 12322). The OpenRouter launcher `claude-or` ends in `exec "$claude_bin"`, so its pid is the Claude's pid.
+
+### Findings
+
+| # | Finding | Verdict | Action |
+|---|---|---|---|
+| P1 | Inherited child-session marker: a working local REPL reads as a client | **confirmed** | Fixed |
+| P2 | No test tells `tcgetpgrp` from `pt.pid` | confirmed | Test added |
+| P3 | Eval test and U9 have load-sensitive bounds | confirmed | Widened |
+| P4 | `test_plain_shell_activity_never_forks_ps` docstring is false; the `ps` rate is untested | confirmed | Docstring and test |
+| P5 | `create=True` left on the new mocks; `__main__` guard above `TestReplIsLocal` | confirmed, small | Removed and moved |
+| P6 | Help text "a screen that only redraws does not count" contradicts the local-Claude rule | confirmed, small | Reworded |
+| R1 | A local REPL's pgrp differs from its file pid in real launches | false alarm | Table above |
+| R2 | Wrapper that does not exec | overstated | Safe side unless the wrapper's own comm is `claude`; no instance. Known gap |
+| R3 | `CLAUDE_CONFIG_DIR` elsewhere puts the file out of reach | overstated | Not set on this machine; the tracker only reads `~/.claude`. Known gap |
+| R4 | Other registration gates: diskless, teammate agent id, a failed write | overstated | None reach a pane on this path. Named risk, one-line fallback in the plan |
+| R5 | Local Claude between file rewrites | false alarm | A miss costs one 1 Hz sample; unreadable answers True |
+| R6 | Long silent turn, compaction | false alarm | The spinner is in a body row: 15 touches in 15s |
+| R7 | `/resume` and other idle local screens | overstated | No work is running; this is decision 3 |
+| R8 | A pane in a swap | false alarm | `_swap_in` touches first; shortest TTL is 1 min |
+| R9 | A client whose only output is progress | by design | Decision 1 |
+| R10 | `claude update`, `remote-control` and similar have no file, so their output no longer counts | overstated | Silent ones were already reaped. Known gap |
+| R11 | Unlabelled local REPL in a dialog with a background shell | overstated | `_claude_busy` still answers False, as it did before the commit for a static dialog. Known gap |
+| R12 | `ps` or `open` stalls the reader | overstated | `ps` has a 1s timeout and a 5s cache, one per pane per 5s (now tested); `open` is a local regular file |
+| R13 | Still overruns: window, one-TTL overshoot, viewer, labelled client whose job keeps writing | by design | Documented |
+| R14 | `finish()` | false alarm | See below |
+| R15 | Row released at 5s misleads | overstated | `close_pty` still needs `os.kill(pid, 0)` to raise, so `confirmed` stays false. A healthy child that closed its tty (`exec nohup job`) loses its row and keeps running, and the print names it; killing it would be worse |
+| R16 | New list keys, tunnel, bundle | false alarm | See below |
+| R17 | **Pre-existing, found here:** the idle clock is wall time, so a sleeping laptop wakes with every pane past TTL | not fixed: pre-existing, not widened by this commit, and wider than this contract | Decision for the user |
+
+**P1 detail.**
+- Defect: `term_vt.py::_fork_child` passes the server's environment to panes. `CLAUDE_CODE_CHILD_SESSION` is set in every Claude Bash tool (present in this agent's env). The memory note `tracker-server-lifecycle` tells agents to relaunch 8790 detached, so this path is real.
+- Binary: `a_()` is `!diskless && no agent id && !R_t()`, and `R_t` is true when that marker is set in an interactive run. Registration then returns false: no `sessions/<pid>.json`, and the screen shows `Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker`.
+- Repro: `r12` C. Actual: `_repl_is_local` False, 0 touches in a turn. With no transcript, `_session_live` cannot protect it either, so it is closed at TTL mid-turn. Expected: local, touched.
+- Direction: remove only that marker from the pane's environment. Do not change `repl_is_local`, and do not strip other CLAUDE* vars.
+- Way: one `os.environ.pop` in `_fork_child`. This also fixes the lost transcripts of such panes.
+- Test: `test_pane_does_not_inherit_the_child_session_marker`.
+- The current 8790 (from a terminal) has no CLAUDE* keys, so nothing is broken right now.
+
+**P2.** Every unit and eval test used a dedicated pty, where pid equals pgid. `c.repl_is_local(pt.pid)` passed them all and would read every local Claude in a folder shell as a client. Added `test_repl_is_local_asks_the_foreground_group_not_the_shell`, with a real foreground job in its own group.
+
+**P3.** The eval test ran at TTL 1.2s, with a 1 Hz sampler and a python child, so one stall on a loaded machine would reap `local`. It is now 6s, with a 20s budget. U9's 3s bound is now 10s, still under the child's 20s. Its cleanup now uses `_kill_group`, which never raises.
+
+**P4.** The test's child is a silent `sleep`, so it says nothing about activity. A4's claim of one `ps` per `FG_CACHE_TTL` had no test. Added `test_printing_program_forks_ps_at_most_once_per_cache_ttl`.
+
+**R14, `finish()`.**
+- Exactly one successful `waitpid`: the polling loop or `_late_reap`, on a local `pid`, so `_retry_with_fork` reassigning `pt.pid` is safe.
+- The rc mapping is unchanged.
+- rc stays None only past the wait, and `_resume_backstop` treats None as not failed. A refused resume exits inside the wait.
+- `_folder_pty` opening a new shell past a stuck row is the intended fix.
+- `_reap`, `_live_count` and `_swap_in` only want the row gone.
+- A `print` failing on a closed stdout during a stuck-child give-up would skip `done`. That needs two rare events together, so no change.
+
+**R16.**
+- `idle_s`, `viewers` and `last_hold` are additive, and nothing in `web/` reads them.
+- `/api/term/*` is outside the read-only tunnel allow-list and behind `term_gate.guard`. The numbers are harmless where the terminal itself is already reachable.
+- `scripts/bundle.py` writes and parses. `term_vt` is not in the bundle (`_repl_is_local` is absent, `repl_is_local` is present and unused), so `_provider()` returning None cannot happen on the bundled path.
+
+**R17 detail, for the user.** `_reader` compares `time.time()` with `last_active`, and wall time includes sleep. This machine slept repeatedly during this review (`pmset -g log`), and two test runs failed on wall-clock `_drain` bounds until sleep was held off with `caffeinate`. They were green once it was: 52 tests OK, no code change. From the code, not tested: after a sleep longer than TTL, the first loop reaps any viewer-less pane that has no tool work and no recent transcript. That includes a local REPL frozen mid-turn. Moving the idle clock to a sleep-excluding source touches every `last_active` user, so it was left out.
+
+### Proof
+
+- RED with each fix reverted by scoped Edit, then restored (no `REVERT-PROOF` left):
+  - `test_pane_does_not_inherit_the_child_session_marker`: `'marker=[] cc=[1]' not found in 'marker=[1] cc=[1]'`.
+  - `test_repl_is_local_asks_the_foreground_group_not_the_shell` with `pt.pid`: `True is not false : the shell's file answered for its job`.
+- GREEN: `tests.test_term_vt.TestIdleTimeout` + `tests.test_folder_swap_parked` + `tests.test_integration.TestTermIdleTtlEndToEnd`: 52 tests OK (sleep held off).
+- Real binary on the final code: e2 `done=True after 30s touches=0 rc=-9`; e1 `done at 5.2s rc None`; `r13` as in the table. Scratch session, its transcript folder and `/tmp/tt-scratch-925r` were removed; roster has no entry for it.
+
+### Not verified
+
+- A SIGKILL of a real spawner (see A6). Hangup and normal exit were observed.
+- `_foreground_is_claude` on a real `claude attach`: inferred from `claude agents`, which has the same argv shape and is proven by e2. The pane was gone after the restart.
+- A real parked pane through `_note_activity`: file shape from the diagnosis only.
+- A real run of the OpenRouter launcher: script read only; it is not configured here.
+- **The fix is not live.** 8790 was restarted at 22:59 from the primary checkout, which does not contain this branch. The panes diagnosed above no longer exist. Push and restart remain.

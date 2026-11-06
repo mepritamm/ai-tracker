@@ -1665,6 +1665,10 @@ def _fork_child(cwd, argv, cols, rows):
             # see term_run.strip_git_env's docstring for the concrete failure this closes.
             term_run.strip_git_env(os.environ)
             os.environ["GIT_TERMINAL_PROMPT"] = "0"
+            # A server started from a Claude's Bash tool would hand this marker on. A pane's Claude is
+            # no child of that one, and with it set writes no sessions/<pid>.json and no transcript,
+            # so `_repl_is_local` reads a working local REPL as a client and the idle reap closes it.
+            os.environ.pop("CLAUDE_CODE_CHILD_SESSION", None)
             os.execvp(argv[0], argv)                     # <-- the only exec on this path
         except Exception:
             pass

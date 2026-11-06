@@ -1628,15 +1628,15 @@ class TestTermIdleTtlEndToEnd(unittest.TestCase):
         try:
             with mock.patch.object(term_vt, "_foreground_is_claude", return_value=True), \
                  mock.patch.object(term_vt, "_claude_work_children", return_value=[]):
-                config.TERM_IDLE_TTL_MIN = 0.02            # 1.2s
-                end = time.time() + 8
+                config.TERM_IDLE_TTL_MIN = 0.1             # 6s: a redraw stalled by a loaded machine must not reap `local`
+                end = time.time() + 20
                 while time.time() < end and self._listed(client.id):
                     time.sleep(0.25)
                 self.assertFalse(self._listed(client.id), "a Claude client's redraws kept its pane open")
                 self.assertTrue(self._listed(local.id), "a local REPL mid-turn was reaped")
                 st, data = self._req("GET", "/api/term/list")
                 row = [t for t in json.loads(data)["terminals"] if t["tty"] == local.id][0]
-                self.assertLess(row["idle_s"], 3)
+                self.assertLess(row["idle_s"], 6)
         finally:
             config.LIVE_SESSIONS_DIR = saved
             for pt in (client, local):

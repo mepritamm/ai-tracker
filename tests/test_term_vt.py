@@ -2056,7 +2056,7 @@ class TestIdleTimeout(unittest.TestCase):
         return term_vt.spawn(os.getcwd(), [sys.executable, "-c", script], 80, 24)
 
     # the child is python, not claude: pretend Claude is the foreground so the footer rule applies
-    @mock.patch.object(term_vt, "_repl_is_local", return_value=True, create=True)
+    @mock.patch.object(term_vt, "_repl_is_local", return_value=True)
     @mock.patch.object(term_vt, "_claude_work_children", return_value=[])
     @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
     def test_claude_footer_redraw_does_not_hold_off_reap(self, _fg, _kids, _loc):
@@ -2070,7 +2070,7 @@ class TestIdleTimeout(unittest.TestCase):
             pt.kill()
 
     # the child is python, not claude: pretend Claude is the foreground so the footer rule applies
-    @mock.patch.object(term_vt, "_repl_is_local", return_value=True, create=True)
+    @mock.patch.object(term_vt, "_repl_is_local", return_value=True)
     @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
     def test_body_output_holds_off_reap(self, _fg, _loc):
         config.TERM_IDLE_TTL_MIN = 0.05           # 3s
@@ -2105,8 +2105,74 @@ class TestIdleTimeout(unittest.TestCase):
             pt.kill()
             _drain(pt, 5)
 
+    def test_printing_program_forks_ps_at_most_once_per_cache_ttl(self):
+        """A program that keeps printing pays `_foreground_is_claude`'s cached probe, not a `ps` a second:
+        this runs on the reader loop, once per pane."""
+        calls = []
+        real = term_vt.subprocess.run
+
+        def counting(cmd, *a, **k):
+            if cmd and cmd[0] == "ps":
+                calls.append(cmd)
+            return real(cmd, *a, **k)
+
+        term_vt._FG_CACHE.clear()
+        script = "import time\nwhile True:\n    print('x', flush=True)\n    time.sleep(0.2)\n"
+        with mock.patch.object(term_vt.subprocess, "run", counting):
+            pt = term_vt.spawn(os.getcwd(), [sys.executable, "-c", script], 80, 24)
+            try:
+                time.sleep(7)                      # 7 one-second samples, > FG_CACHE_TTL (5s)
+                self.assertLessEqual(len(calls), 3, "the reader forked ps on every sample")
+            finally:
+                pt.kill()
+                _drain(pt, 5)
+
+    def test_repl_is_local_asks_the_foreground_group_not_the_shell(self):
+        """A folder pane's Claude is a job in its own process group. Asking about `pt.pid` (the shell)
+        would read every local Claude in a folder shell as a client and close it mid-turn."""
+        from tests.test_folder_terminal import _FOLDER_SHELL_SCRIPT
+        with tempfile.TemporaryDirectory() as sess, mock.patch.object(config, "LIVE_SESSIONS_DIR", sess):
+            pidfile = os.path.join(sess, "job.pid")
+            pt = term_vt.spawn(os.getcwd(), [sys.executable, "-c", _FOLDER_SHELL_SCRIPT, pidfile], 80, 24)
+            pt.folder = True                       # kill() also takes the foreground job
+            try:
+                self.assertTrue(_wait_for(lambda: os.path.exists(pidfile) and os.path.getsize(pidfile) > 0
+                                          and os.tcgetpgrp(pt.fd) != pt.pid, 10), "no foreground job")
+                with open(pidfile) as fh:
+                    job = int(fh.read())
+                self.assertEqual(os.tcgetpgrp(pt.fd), job)
+                shell_file = os.path.join(sess, "%d.json" % pt.pid)
+                with open(shell_file, "w") as fh:
+                    json.dump({"pid": pt.pid, "kind": "interactive"}, fh)
+                self.assertFalse(term_vt._repl_is_local(pt), "the shell's file answered for its job")
+                os.remove(shell_file)
+                with open(os.path.join(sess, "%d.json" % job), "w") as fh:
+                    json.dump({"pid": job, "kind": "interactive"}, fh)
+                self.assertTrue(term_vt._repl_is_local(pt))
+            finally:
+                pt.kill()
+                _drain(pt, 5)
+
+    def test_pane_does_not_inherit_the_child_session_marker(self):
+        """A server started from a Claude's Bash tool has CLAUDE_CODE_CHILD_SESSION. A pane's Claude that
+        inherits it writes no sessions/<pid>.json (real binary: file absent, `Transcript saving is off`),
+        so a working local REPL reads as a client. Only that marker goes."""
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_CHILD_SESSION": "1", "CLAUDECODE": "1"}):
+            pt = term_vt.spawn(os.getcwd(), ["sh", "-c",
+                                             'echo "marker=[$CLAUDE_CODE_CHILD_SESSION] cc=[$CLAUDECODE]"; sleep 30'],
+                               80, 24)
+        try:
+            def line():
+                with pt.lock:
+                    return " ".join(Screen._encode_row(r)[0] for r in pt.screen.grid)
+            self.assertTrue(_wait_for(lambda: "marker=[" in line(), 10), "the child never printed")
+            self.assertIn("marker=[] cc=[1]", line())
+        finally:
+            pt.kill()
+            _drain(pt, 5)
+
     def test_plain_shell_activity_never_forks_ps(self):
-        """`_note_activity` must only probe `ps` when the screen already looks like Claude."""
+        """An idle plain pty (no screen change) never forks `ps` from `_note_activity`."""
         calls = []
         real = term_vt.subprocess.run
 
@@ -2220,7 +2286,7 @@ class TestIdleTimeout(unittest.TestCase):
 
     # ---- a Claude CLIENT's redraws are not work; a local REPL's body rows still are ----
 
-    @mock.patch.object(term_vt, "_repl_is_local", return_value=False, create=True)
+    @mock.patch.object(term_vt, "_repl_is_local", return_value=False)
     @mock.patch.object(term_vt, "_claude_work_children", return_value=[])
     @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
     def test_client_body_redraw_does_not_hold_off_reap(self, _fg, _kids, _loc):
@@ -2233,7 +2299,7 @@ class TestIdleTimeout(unittest.TestCase):
         finally:
             pt.kill()
 
-    @mock.patch.object(term_vt, "_repl_is_local", return_value=False, create=True)
+    @mock.patch.object(term_vt, "_repl_is_local", return_value=False)
     @mock.patch.object(term_vt, "_claude_work_children", return_value=[])
     @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
     def test_client_without_input_box_is_reaped(self, _fg, _kids, _loc):
@@ -2246,7 +2312,7 @@ class TestIdleTimeout(unittest.TestCase):
         finally:
             pt.kill()
 
-    @mock.patch.object(term_vt, "_repl_is_local", return_value=True, create=True)
+    @mock.patch.object(term_vt, "_repl_is_local", return_value=True)
     @mock.patch.object(term_vt, "_claude_work_children", return_value=[])
     @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
     def test_local_dialog_footer_redraw_does_not_hold_off_reap(self, _fg, _kids, _loc):
@@ -2259,12 +2325,12 @@ class TestIdleTimeout(unittest.TestCase):
         finally:
             pt.kill()
 
-    @mock.patch.object(term_vt, "_repl_is_local", return_value=False, create=True)
+    @mock.patch.object(term_vt, "_repl_is_local", return_value=False)
     @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
     def test_work_in_a_dialog_keeps_labelled_pane(self, _fg, _loc):
         """U8: no band, but the pane is labelled with a session: _claude_busy must still probe."""
         config.TERM_IDLE_TTL_MIN = 0.05
-        with mock.patch.object(term_vt, "_claude_work_children", return_value=[1], create=True):
+        with mock.patch.object(term_vt, "_claude_work_children", return_value=[1]):
             pt = term_vt.spawn(os.getcwd(), [sys.executable, "-c", _NO_BAND_STATIC_CHILD], 80, 24)
             pt.mode, pt.session = "resume", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
             try:
@@ -2292,12 +2358,14 @@ class TestIdleTimeout(unittest.TestCase):
     def test_finish_does_not_pin_on_child_that_outlives_pty(self):
         """U9: a child that closed its tty and never exits must not hold the reader thread forever."""
         script = "import os,time; [os.close(i) for i in (0,1,2)]; time.sleep(20)"
-        p = mock.patch.object(term_vt, "FINISH_REAP_WAIT", 0.3, create=True)
+        p = mock.patch.object(term_vt, "FINISH_REAP_WAIT", 0.3)
         p.start()
         self.addCleanup(p.stop)
         pt = term_vt.spawn(os.getcwd(), [sys.executable, "-c", script], 80, 24)
-        self.addCleanup(lambda: os.kill(pt.pid, signal.SIGKILL))
-        self.assertTrue(_wait_for(lambda: pt.done, 3), "finish() pinned on a child that outlived its pty")
+        self.addCleanup(term_vt._kill_group, pt.pid)
+        # 10s stays under the child's 20s, so an unbounded wait is still RED, and a loaded machine's
+        # slow python start is not.
+        self.assertTrue(_wait_for(lambda: pt.done, 10), "finish() pinned on a child that outlived its pty")
         self.assertIsNone(pt.rc)
 
     def test_finish_still_records_rc(self):

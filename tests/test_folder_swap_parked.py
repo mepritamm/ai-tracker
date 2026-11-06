@@ -234,10 +234,6 @@ class TestParkedJobId(unittest.TestCase):
         self.assertIsInstance(claude_provider.parked_job_id(self.pid, A), str)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestReplIsLocal(unittest.TestCase):
     """`repl_is_local` reads LIVE_SESSIONS_DIR/<pid>.json: only an interactive, unparked Claude hosts its own conversation."""
 
@@ -264,3 +260,7 @@ class TestReplIsLocal(unittest.TestCase):
         self.assertTrue(f(4242), "unreadable mid-write: err toward keeping a working Claude")
         self.write("[1, 2]")
         self.assertFalse(f(4242), "non-dict")
+
+
+if __name__ == "__main__":
+    unittest.main()
