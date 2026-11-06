@@ -1606,6 +1606,44 @@ class TestTermIdleTtlEndToEnd(unittest.TestCase):
         self.assertEqual(st, 200)
         return any(t.get("tty") == tty for t in json.loads(data)["terminals"])
 
+    def test_client_pane_reaped_local_repl_kept(self):
+        """A Claude CLIENT's redrawing body is not work and is reaped; a local REPL's is, and stays listed
+        with a fresh idle clock. Over the real /api/term/list."""
+        from aitracker import term_vt
+        from tests.test_term_vt import _CLAUDE_LAYOUT_CHILD
+        sessions = os.path.join(self._tmpdir, "sessions")
+        os.makedirs(sessions)
+        saved = config.LIVE_SESSIONS_DIR
+        config.LIVE_SESSIONS_DIR = sessions
+        config.TERMINAL = True
+        config.TERM_IDLE_TTL_MIN = 30
+        script = _CLAUDE_LAYOUT_CHILD % {"body": "True"}
+        client = term_vt.spawn(self._tmpdir, [sys.executable, "-c", script], 80, 24)
+        local = term_vt.spawn(self._tmpdir, [sys.executable, "-c", script], 80, 24)
+        with open(os.path.join(sessions, "%d.json" % local.pid), "w") as fh:
+            json.dump({"pid": local.pid, "kind": "interactive"}, fh)
+        with term_vt._LOCK:
+            term_vt.PTYS[client.id] = client
+            term_vt.PTYS[local.id] = local
+        try:
+            with mock.patch.object(term_vt, "_foreground_is_claude", return_value=True), \
+                 mock.patch.object(term_vt, "_claude_work_children", return_value=[]):
+                config.TERM_IDLE_TTL_MIN = 0.02            # 1.2s
+                end = time.time() + 8
+                while time.time() < end and self._listed(client.id):
+                    time.sleep(0.25)
+                self.assertFalse(self._listed(client.id), "a Claude client's redraws kept its pane open")
+                self.assertTrue(self._listed(local.id), "a local REPL mid-turn was reaped")
+                st, data = self._req("GET", "/api/term/list")
+                row = [t for t in json.loads(data)["terminals"] if t["tty"] == local.id][0]
+                self.assertLess(row["idle_s"], 3)
+        finally:
+            config.LIVE_SESSIONS_DIR = saved
+            for pt in (client, local):
+                pt.kill()
+                with term_vt._LOCK:
+                    term_vt.PTYS.pop(pt.id, None)
+
     def test_live_session_terminal_survives_ttl_until_quiet(self):
         """I1: a viewer-less Claude pty whose session transcript keeps being written (another terminal
         drives it) survives the idle TTL; once the transcript goes quiet it is reaped."""

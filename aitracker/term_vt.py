@@ -1257,6 +1257,7 @@ MAX_STREAMS = 24         # concurrent SSE /api/term/screen connections, across a
                           # term_run.stream's docstring for the thread-exhaustion measurement this
                           # cap exists to prevent (same ThreadingHTTPServer, same failure mode).
 # Idle reap TTL is `config.TERM_IDLE_TTL_MIN` (minutes, live-tunable), read at check time in `_reader`.
+FINISH_REAP_WAIT = 5.0   # s finish() waits for the child after closing the pty; past this the row is released
 SESSION_LIVE_RECHECK = 30.0   # s between re-probes while an idle pty is HELD by _session_live (no touch: the idle clock keeps running)
 _REAP_LINGER = 600        # seconds a FINISHED pty's record (its final rc) lingers in PTYS before
                           # being dropped, mirroring term_run._reap_old's 10-minute window.
@@ -1505,9 +1506,11 @@ class Pty:
                                     # "monotonic for the life of the object" rule).
         self.ended = 0.0           # time.time() when finish() ran; 0.0 while still live
         self.started = time.time()
-        self.last_active = self.started   # last keystroke, or last viewer leaving -- idle clock
+        self.last_active = self.started   # last keystroke, last viewer leaving, or a screen change `_note_activity` counts -- idle clock
         self._act_v = None        # last screen-activity version `_note_activity` saw (reader-only)
+        self._act_raw = None   # last screen.v _note_activity sampled (reader-only)
         self._act_t = 0.0         # when `_note_activity` last sampled (throttle; reader-only)
+        self.last_hold = ""   # reader-only: what the idle reap last deferred on: "busy", "live" or ""
         self.live_hold = 0.0   # reader-only: the idle reap re-checks _session_live no sooner than this
         self.last_output = self.started   # last time the CHILD actually produced bytes -- written
                                            # only by `_reader` (single-writer, no lock needed, same
@@ -1570,7 +1573,9 @@ class Pty:
 
     def finish(self):
         """Close the master fd and reap the child -- always called from the reader thread, so
-        `waitpid()` happens exactly once and nothing is left as a zombie."""
+        `waitpid()` happens exactly once and nothing is left as a zombie. The wait is bounded
+        (FINISH_REAP_WAIT): a child that outlives its pty must not pin the row, so the one waitpid
+        then moves to `_late_reap` on a thread of its own."""
         if self.fd >= 0:
             try:
                 os.close(self.fd)
@@ -1578,11 +1583,20 @@ class Pty:
                 pass
             self.fd = -1
         if self.pid > 0:
-            try:
-                _, status = os.waitpid(self.pid, 0)
-                self.rc = -os.WTERMSIG(status) if os.WIFSIGNALED(status) else os.WEXITSTATUS(status)
-            except (ChildProcessError, OSError):
-                pass
+            pid, end = self.pid, time.time() + FINISH_REAP_WAIT
+            while True:
+                try:
+                    got, status = os.waitpid(pid, os.WNOHANG)
+                except (ChildProcessError, OSError):
+                    break
+                if got:
+                    self.rc = -os.WTERMSIG(status) if os.WIFSIGNALED(status) else os.WEXITSTATUS(status)
+                    break
+                if time.time() >= end:      # stuck in the kernel's exit, or outlived its tty: never pin the row on it
+                    print("[ai-tracker] terminal %s: pid %d still not reaped %gs after its pty closed" % (self.id, pid, FINISH_REAP_WAIT))
+                    threading.Thread(target=_late_reap, args=(pid,), daemon=True).start()
+                    break
+                time.sleep(0.05)
         # DELIBERATELY does NOT clear `starting`. The refused child exiting is the NORMAL middle
         # of a recovery, not the end of one: it exits(1) at ~2.61s and `_retry_with_fork` then
         # revives this same Pty with a --fork-session child. Clearing here would reveal the
@@ -1593,6 +1607,14 @@ class Pty:
         # examined. See open_pty()'s readiness-state section.
         self.done = True
         self.ended = time.time()
+
+
+def _late_reap(pid):
+    """finish() gave up waiting: keep the one waitpid, on a thread of its own, so it never becomes a zombie."""
+    try:
+        os.waitpid(pid, 0)
+    except (ChildProcessError, OSError):
+        pass
 
 
 def _kill_group(pid):
@@ -1685,25 +1707,38 @@ def _tee_raw(pt, data):
                 pass
 
 
+def _repl_is_local(pt):
+    """Does the pty's foreground Claude host its conversation here? True when there is no provider
+    (the flattened bundle), which keeps the body-rows rule. A dead pty is False."""
+    c = _provider()
+    if c is None:
+        return True
+    try:
+        return c.repl_is_local(os.tcgetpgrp(pt.fd))
+    except OSError:
+        return False
+
+
 def _note_activity(pt, now):
-    """Footer-aware idle clock: touch `pt` only when real screen content changed. A Claude footer
-    redraws on a timer, so touching on every output chunk meant a viewer-less Claude pty was never
-    reaped; here a recognisable Claude layout is judged by `_body_rows_version` (footer band
-    excluded), any other program by `screen.v` (any change counts). Sampled at most once per
-    second; `_reader` calls this at the top of EVERY loop iteration (each chunk, and the 1s
-    select timeout), so a change is noticed within ~1s even if output then stops."""
+    """Idle clock: touch `pt` only when the screen changed in a way that means work. Any change for
+    a non-Claude program. For a Claude that hosts its own conversation, a change above the footer
+    band (`_body_rows_version`). For a Claude CLIENT (thin, `claude agents`, `claude attach`,
+    parked), never: the agents board animates a body row for every session working anywhere on the
+    machine, and closing a client does not stop its job. Sampled at most once a second; `_reader`
+    calls this every loop. No `ps` unless the screen changed, and none on the first sample."""
     if now - pt._act_t < 1.0:
         return
     pt._act_t = now
-    # Footer-only rule applies only when Claude really is the foreground: a shell prompt with a
-    # `─` rule (powerlevel10k lean) also matches the anchor band, and would hide a `\r` progress bar.
-    # Cheap screen check first; only a Claude-looking screen pays for the (cached) `ps` probe.
     with pt.lock:
-        band = _footer_anchor_band(pt.screen)
-        v = pt.screen.v
-    claude = band is not None and _foreground_is_claude(pt.fd)   # outside pt.lock
-    if claude:
-        v = _body_rows_version(pt)       # takes pt.lock itself, so called outside the block above
+        raw = pt.screen.v
+    if raw == pt._act_raw:
+        return
+    first, pt._act_raw = pt._act_raw is None, raw
+    v = raw
+    if not first and _foreground_is_claude(pt.fd):   # outside pt.lock
+        if not _repl_is_local(pt):
+            return
+        v = _body_rows_version(pt)                  # takes pt.lock itself
     if v != pt._act_v:
         pt.touch()                       # touch BEFORE publishing _act_v: a waiter on _act_v then
         pt._act_v = v                    # never has its backdated last_active overwritten
@@ -1732,8 +1767,10 @@ def _reader(pt):
                     and now >= pt.live_hold):
                 if _claude_busy(pt):
                     pt.touch()       # in-pty tool work counts as activity; re-probed one TTL later
+                    pt.last_hold = "busy"
                 elif _session_live(pt, now):
                     pt.live_hold = now + SESSION_LIVE_RECHECK   # HOLD, not touch: reaped once the session goes quiet
+                    pt.last_hold = "live"
                 else:
                     pt.kill()
                     break
@@ -2155,13 +2192,16 @@ def _live_list(orl=None):
     this only reports. `orl` is `gateway.or_launcher()[0]`, computed by the caller BEFORE taking
     `_LOCK` (it stats the filesystem); `None` falls back to computing it here (direct callers only).
 
-    `title` is the server's browser-tab label, always a str (see `_term_title`)."""
+    `title` is the server's browser-tab label, always a str (see `_term_title`). `idle_s`/`viewers`/
+    `last_hold` expose the idle clock (seconds idle, attached viewers, what the reap last deferred on)."""
     orl = gateway.or_launcher()[0] if orl is None else orl   # fallback for callers not under _LOCK
+    now = time.time()
     return [{"tty": p.id, "cmd": p.cmd, "cwd": p.cwd, "started": p.started,
              "session": p.spawned or p.session, "mode": p.mode,
              "suffix": _MODE_SUFFIX.get(p.mode, ""), "forked": p.forked,
              "title": _term_title(p, orl),
-             "folder": p.folder, "overflow": p.overflow, "fg": _fg_public(p.fg)}
+             "folder": p.folder, "overflow": p.overflow, "fg": _fg_public(p.fg),
+             "idle_s": int(now - p.last_active), "viewers": p.viewers, "last_hold": p.last_hold}
             for p in sorted(PTYS.values(), key=lambda p: p.started) if not p.done]
 
 
@@ -3868,16 +3908,22 @@ def resize_pty(handler, parsed, body):
     handler._json({"ok": True})
 
 
+def _is_claude_daemon(args):
+    """The background-session supervisor a Claude may have spawned: long-lived in its own group, but not this Claude's tool work."""
+    toks = args.split(None, 3)
+    return len(toks) >= 3 and toks[1:3] == ["daemon", "run"] and "claude" in toks[0]
+
+
 def _claude_work_children(claude_pid, strict=False):
     """Direct children of `claude_pid` that are Claude's TOOL WORK (Bash/background shells, which
     Claude Code runs setsid'd in their OWN process group). Children in Claude's own group -- stdio
     MCP servers (live as long as Claude), `caffeinate -t 300` -- are standing helpers and never
-    count. One `ps` fork; called only at idle-reap time. [] on any failure (= today's behaviour);
+    count; nor does the `claude daemon run` supervisor (`_is_claude_daemon`; `args` is never logged). One `ps` fork; called only at idle-reap time. [] on any failure (= today's behaviour);
     `strict=True` answers None instead, for callers that must FAIL CLOSED (the takeover's "no
     unseen work" check: an unreadable process table is not "no work")."""
     fail = None if strict else []
     try:
-        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid="],
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,args="],
                              capture_output=True, text=True, timeout=2)
     except Exception:
         return fail
@@ -3885,14 +3931,15 @@ def _claude_work_children(claude_pid, strict=False):
         return fail
     kids = []
     for line in (out.stdout or "").splitlines():
-        parts = line.split()
-        if len(parts) != 3:
+        parts = line.split(None, 3)
+        if len(parts) < 3:
             continue
         try:
-            pid, ppid, pgid = (int(x) for x in parts)
+            pid, ppid, pgid = (int(x) for x in parts[:3])
         except ValueError:
             continue
-        if ppid == claude_pid and pgid != claude_pid:
+        if (ppid == claude_pid and pgid != claude_pid
+                and not _is_claude_daemon(parts[3] if len(parts) > 3 else "")):
             kids.append(pid)
     return kids
 
@@ -3905,7 +3952,9 @@ def _claude_busy(pt):
         return False
     with pt.lock:                   # cheap screen check first: a reap must never fork `ps` for a
         band = _footer_anchor_band(pt.screen)     # screen that doesn't look like Claude
-    if band is None or not _foreground_is_claude(pt.fd):   # probe outside pt.lock
+    # a labelled pane (session id) may sit behind a dialog with no input box (band None); a plain shell
+    # has no label, so it still never forks at reap
+    if (band is None and not _pty_session_ids(pt)) or not _foreground_is_claude(pt.fd):   # probe outside pt.lock
         return False
     try:
         pg = os.tcgetpgrp(pt.fd)    # Claude leads its fg group (dedicated: pt.pid; folder: the job)

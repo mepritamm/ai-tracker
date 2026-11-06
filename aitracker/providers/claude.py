@@ -619,6 +619,21 @@ def _ps_lstart(pid):
         return ""
 
 
+def repl_is_local(pid):
+    """True when process `pid` hosts its conversation itself: LIVE_SESSIONS_DIR/<pid>.json says kind
+    "interactive" and no parkedJobId. A thin client, `claude attach` and `claude agents` have no file,
+    and a parked TUI has parkedJobId: their work lives in a daemon job, so closing them stops nothing.
+    An unreadable file (mid-write) answers True: one extra touch beats closing a working Claude."""
+    try:
+        with open(os.path.join(config.LIVE_SESSIONS_DIR, "%d.json" % pid)) as fh:
+            d = json.load(fh)
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+    return isinstance(d, dict) and d.get("kind") == "interactive" and not d.get("parkedJobId")
+
+
 def parked_job_id(pid, label):
     """The job's session id when process `pid` is a PARKED TUI (Left arrow at an empty prompt: the
     conversation moved to a daemon job, the TUI is just a client) running session `label` whose job

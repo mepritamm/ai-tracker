@@ -1342,7 +1342,7 @@
             return sliderCtlCommit(1, 64, value != null ? value : 12, onCommit, '');
           }));
         body.appendChild(serverRow('Idle terminal TTL', 'TERM_IDLE_TTL_MIN',
-          'A terminal nobody is watching or typing into is closed after this many minutes. The slider covers 5–240; env TRACKER_TERM_IDLE_TTL_MIN or config.json accept 1–1440. A Claude whose transcript was written recently is kept open, whether by another terminal or by this pane\'s own Claude, so a Claude pane never closes sooner than LIVE_WINDOW after its last write.',
+          'A terminal nobody is watching or typing into is closed after this many minutes. The slider covers 5–240; env TRACKER_TERM_IDLE_TTL_MIN or config.json accept 1–1440. A screen that only redraws does not count: a Claude client or the agents board closes even while its spinners move. A Claude is kept open while its tool or background shells run, and while its transcript was written within the larger of LIVE_WINDOW and this TTL, whether by another terminal or by this pane\'s own Claude.',
           function (value, onCommit) {
             return sliderCtlCommit(5, 240, value != null ? value : 30, onCommit, ' min');
           }));

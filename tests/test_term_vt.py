@@ -1268,7 +1268,10 @@ class TestRoutes(unittest.TestCase):
         row = obj["terminals"][0]
         self.assertEqual(set(row.keys()),
                          {"tty", "cmd", "cwd", "started", "session", "mode", "suffix", "forked",
-                          "folder", "overflow", "fg", "title"})
+                          "folder", "overflow", "fg", "title", "idle_s", "viewers", "last_hold"})
+        self.assertEqual(row["last_hold"], "")
+        self.assertEqual(row["viewers"], 0)
+        self.assertIsInstance(row["idle_s"], int)
         self.assertEqual(row["title"], "proj - Anthropic models - Claude Code")
         self.assertEqual(row["tty"], "p1")
         self.assertEqual(row["cwd"], "/tmp/proj")
@@ -1967,6 +1970,37 @@ while True:
 '''
 
 
+_NO_BAND_CHILD = r'''
+import sys, time
+W = sys.stdout.write
+W("\x1b[2;1Hbody start"); sys.stdout.flush()
+n = 0
+while True:
+    n += 1
+    W("\x1b[%d;1Hspin %d" % (3 + n % 10, n)); sys.stdout.flush()
+    time.sleep(0.2)
+'''
+
+_NO_BAND_STATIC_CHILD = r'''
+import sys, time
+sys.stdout.write("\x1b[2;1Hdialog: allow this tool?"); sys.stdout.flush()
+time.sleep(60)
+'''
+
+_NO_BAND_FOOTER_CHILD = r'''
+import sys, time
+W = sys.stdout.write
+W("\x1b[2;1Hbody start"); sys.stdout.flush()
+n = 0
+while True:
+    n += 1
+    for row in (22, 23, 24):
+        W("\x1b[%d;1H\x1b[2Kstatus %d" % (row, n))
+    sys.stdout.flush()
+    time.sleep(0.2)
+'''
+
+
 class TestIdleTimeout(unittest.TestCase):
     """No keystrokes AND no viewers for the idle TTL -> the reader thread reaps the PTY."""
 
@@ -2022,9 +2056,10 @@ class TestIdleTimeout(unittest.TestCase):
         return term_vt.spawn(os.getcwd(), [sys.executable, "-c", script], 80, 24)
 
     # the child is python, not claude: pretend Claude is the foreground so the footer rule applies
+    @mock.patch.object(term_vt, "_repl_is_local", return_value=True, create=True)
     @mock.patch.object(term_vt, "_claude_work_children", return_value=[])
     @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
-    def test_claude_footer_redraw_does_not_hold_off_reap(self, _fg, _kids):
+    def test_claude_footer_redraw_does_not_hold_off_reap(self, _fg, _kids, _loc):
         config.TERM_IDLE_TTL_MIN = 0.05           # 3s
         pt = self._claude(body=False)
         try:
@@ -2035,8 +2070,9 @@ class TestIdleTimeout(unittest.TestCase):
             pt.kill()
 
     # the child is python, not claude: pretend Claude is the foreground so the footer rule applies
+    @mock.patch.object(term_vt, "_repl_is_local", return_value=True, create=True)
     @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
-    def test_body_output_holds_off_reap(self, _fg):
+    def test_body_output_holds_off_reap(self, _fg, _loc):
         config.TERM_IDLE_TTL_MIN = 0.05           # 3s
         pt = self._claude(body=True)
         try:
@@ -2119,6 +2155,16 @@ class TestIdleTimeout(unittest.TestCase):
                 self.assertTrue(_wait_for(lambda: pt.screen.v > 3, 5), "fake Claude never drew")
                 time.sleep(6)                      # > 2x the TTL
                 self.assertFalse(pt.done, "a Claude with tool work still running was reaped")
+                self.assertEqual(pt.last_hold, "busy")
+                with term_vt._LOCK:
+                    term_vt.PTYS[pt.id] = pt
+                try:
+                    with term_vt._LOCK:
+                        rows = term_vt._live_list(orl=None)
+                    self.assertEqual([r["last_hold"] for r in rows if r["tty"] == pt.id], ["busy"])
+                finally:
+                    with term_vt._LOCK:
+                        term_vt.PTYS.pop(pt.id, None)
             finally:
                 pt.kill()
                 _drain(pt, 5)
@@ -2170,6 +2216,99 @@ class TestIdleTimeout(unittest.TestCase):
         with mock.patch.object(term_vt.subprocess, "run",
                                return_value=mock.Mock(returncode=1, stdout=out)):
             self.assertEqual(term_vt._claude_work_children(100), [])
+
+
+    # ---- a Claude CLIENT's redraws are not work; a local REPL's body rows still are ----
+
+    @mock.patch.object(term_vt, "_repl_is_local", return_value=False, create=True)
+    @mock.patch.object(term_vt, "_claude_work_children", return_value=[])
+    @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
+    def test_client_body_redraw_does_not_hold_off_reap(self, _fg, _kids, _loc):
+        """U1: the agents board / a thin client animates body rows for jobs running elsewhere."""
+        config.TERM_IDLE_TTL_MIN = 0.05           # 3s
+        pt = self._claude(body=True)
+        try:
+            self.assertTrue(_wait_for(lambda: pt.screen.v > 3, 5), "fake Claude never drew")
+            self.assertTrue(_drain(pt, 12).done, "a Claude client's body redraws held the pane open")
+        finally:
+            pt.kill()
+
+    @mock.patch.object(term_vt, "_repl_is_local", return_value=False, create=True)
+    @mock.patch.object(term_vt, "_claude_work_children", return_value=[])
+    @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
+    def test_client_without_input_box_is_reaped(self, _fg, _kids, _loc):
+        """U2: no rule row (band None), a spinner in a body row: still a client, still reaped."""
+        config.TERM_IDLE_TTL_MIN = 0.05
+        pt = term_vt.spawn(os.getcwd(), [sys.executable, "-c", _NO_BAND_CHILD], 80, 24)
+        try:
+            self.assertTrue(_wait_for(lambda: pt.screen.v > 3, 5), "child never drew")
+            self.assertTrue(_drain(pt, 12).done, "a band-less client pane was held by the v-path")
+        finally:
+            pt.kill()
+
+    @mock.patch.object(term_vt, "_repl_is_local", return_value=True, create=True)
+    @mock.patch.object(term_vt, "_claude_work_children", return_value=[])
+    @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
+    def test_local_dialog_footer_redraw_does_not_hold_off_reap(self, _fg, _kids, _loc):
+        """U4: a local REPL with no recognisable input box redrawing only its bottom rows."""
+        config.TERM_IDLE_TTL_MIN = 0.05
+        pt = term_vt.spawn(os.getcwd(), [sys.executable, "-c", _NO_BAND_FOOTER_CHILD], 80, 24)
+        try:
+            self.assertTrue(_wait_for(lambda: pt.screen.v > 3, 5), "child never drew")
+            self.assertTrue(_drain(pt, 12).done, "footer-only redraws without a band held the pane open")
+        finally:
+            pt.kill()
+
+    @mock.patch.object(term_vt, "_repl_is_local", return_value=False, create=True)
+    @mock.patch.object(term_vt, "_foreground_is_claude", return_value=True)
+    def test_work_in_a_dialog_keeps_labelled_pane(self, _fg, _loc):
+        """U8: no band, but the pane is labelled with a session: _claude_busy must still probe."""
+        config.TERM_IDLE_TTL_MIN = 0.05
+        with mock.patch.object(term_vt, "_claude_work_children", return_value=[1], create=True):
+            pt = term_vt.spawn(os.getcwd(), [sys.executable, "-c", _NO_BAND_STATIC_CHILD], 80, 24)
+            pt.mode, pt.session = "resume", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            try:
+                self.assertTrue(_wait_for(lambda: pt.screen.v > 0, 5), "child never drew")
+                time.sleep(6)
+                self.assertFalse(pt.done, "tool work behind a dialog (no band) was reaped")
+            finally:
+                pt.kill()
+                _drain(pt, 5)
+
+    def test_claude_work_children_skips_the_daemon(self):
+        """U7: `claude daemon run` is long-lived in its own group but is not this Claude's tool work."""
+        out = (" 100 1 100 claude\n 200 100 200 /x/bin/claude daemon run --origin transient\n"
+               " 201 100 201 /bin/zsh -c sleep 9\n 202 100 100 node mcp\n")
+        with mock.patch.object(term_vt.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout=out)):
+            self.assertEqual(term_vt._claude_work_children(100), [201])
+        other = " 100 1 100 claude\n 300 100 300 docker daemon run\n"
+        with mock.patch.object(term_vt.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout=other)):
+            self.assertEqual(term_vt._claude_work_children(100), [300])
+
+    # ---- finish() never pins the row on a child that outlives its pty ----
+
+    def test_finish_does_not_pin_on_child_that_outlives_pty(self):
+        """U9: a child that closed its tty and never exits must not hold the reader thread forever."""
+        script = "import os,time; [os.close(i) for i in (0,1,2)]; time.sleep(20)"
+        p = mock.patch.object(term_vt, "FINISH_REAP_WAIT", 0.3, create=True)
+        p.start()
+        self.addCleanup(p.stop)
+        pt = term_vt.spawn(os.getcwd(), [sys.executable, "-c", script], 80, 24)
+        self.addCleanup(lambda: os.kill(pt.pid, signal.SIGKILL))
+        self.assertTrue(_wait_for(lambda: pt.done, 3), "finish() pinned on a child that outlived its pty")
+        self.assertIsNone(pt.rc)
+
+    def test_finish_still_records_rc(self):
+        """U10: the bounded wait still records the exit status (green before and after)."""
+        pt = term_vt.spawn(os.getcwd(), ["sh", "-c", "exit 3"], 80, 24)
+        self.assertTrue(_drain(pt, 5).done)
+        self.assertEqual(pt.rc, 3)
+        pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
+        pt.kill()
+        self.assertTrue(_drain(pt, 5).done)
+        self.assertEqual(pt.rc, -9)
 
 
 class TestEviction(unittest.TestCase):
@@ -6110,6 +6249,7 @@ class TestIdleSessionLive(unittest.TestCase):
         time.sleep(1.5)
         self.assertFalse(pt.done)
         self.assertEqual(pt.last_active, before, "a hold must not reset the idle clock")
+        self.assertEqual(pt.last_hold, "live")
 
     def test_session_live_probe_is_rate_limited(self):          # U10
         self._fg()

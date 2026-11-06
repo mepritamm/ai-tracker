@@ -236,3 +236,31 @@ class TestParkedJobId(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReplIsLocal(unittest.TestCase):
+    """`repl_is_local` reads LIVE_SESSIONS_DIR/<pid>.json: only an interactive, unparked Claude hosts its own conversation."""
+
+    def setUp(self):
+        self.sess = tempfile.mkdtemp()
+        p = mock.patch.object(config, "LIVE_SESSIONS_DIR", self.sess)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def write(self, raw):
+        with open(os.path.join(self.sess, "4242.json"), "w") as fh:
+            fh.write(raw if isinstance(raw, str) else json.dumps(raw))
+
+    def test_cases(self):
+        f = claude_provider.repl_is_local
+        self.assertFalse(f(4242), "no file: a thin client / attach / agents board")
+        self.write({"pid": 4242, "kind": "interactive"})
+        self.assertTrue(f(4242))
+        self.write({"pid": 4242, "kind": "interactive", "parkedJobId": "cccccccc"})
+        self.assertFalse(f(4242), "parked: the work lives in a daemon job")
+        self.write({"pid": 4242, "kind": "bg"})
+        self.assertFalse(f(4242))
+        self.write("{not json")
+        self.assertTrue(f(4242), "unreadable mid-write: err toward keeping a working Claude")
+        self.write("[1, 2]")
+        self.assertFalse(f(4242), "non-dict")
