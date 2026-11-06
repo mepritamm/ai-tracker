@@ -1,5 +1,6 @@
 PORT ?= 8790
 TUNNEL_PORT ?= 8790
+JOBS ?= 4
 .PHONY: help serve stop tunnel check test hooks bundle
 
 help:
@@ -30,9 +31,11 @@ tunnel:
 	for i in $$(seq 1 20); do url=$$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/aitracker-cf.log 2>/dev/null | head -1); [ -n "$$url" ] && break; printf "."; sleep 2; done; echo; \
 	if [ -n "$$url" ]; then echo "  -> $$url   (log in with your TRACKER_AUTH)"; else echo "  (no URL yet; see /tmp/aitracker-cf.log — this network may block Cloudflare)"; fi
 
-# the mandatory gate — the whole suite (unit + evals + server + selfcheck smoke)
+# the mandatory gate — the whole suite (unit + evals + server + selfcheck smoke), one subprocess
+# per tests/test_*.py module, fanned out over JOBS (default 4 -- see scripts/run_tests_parallel.py
+# for why this is deliberately NOT unbounded/cpu_count()).
 check test:
-	@python3 -m unittest discover -s tests -t .
+	@JOBS=$(JOBS) python3 scripts/run_tests_parallel.py
 
 # install the pre-commit gate (blocks commits that fail `make check`)
 hooks:

@@ -1053,7 +1053,12 @@ class TestCapReclaimBlock(unittest.TestCase):
         self.assertIn("text-overflow: ellipsis;", self.css)
         self.assertIn(".vtcapx {", self.css)
         self.assertIn("min-height: 28px;", self.css)      # a real tap target
-        self.assertNotIn("location.hostname", self.js)
+        # Scoped to the reclaim block itself (not the whole file): F9's termTabOrigin elsewhere
+        # in ext_vt.js legitimately reads location.hostname for a wholly unrelated reason (per-
+        # tab connection-pool routing, not UI visibility) -- this test's own rule is about THIS
+        # block never being host-gated, not a file-wide ban on the string.
+        block = _body_until(self.js, "function renderCapBlock(", ["function openVT("])
+        self.assertNotIn("location.hostname", block)
 
     def test_reclaim_block_survives_into_the_served_page(self):
         page = build_page()
@@ -1484,7 +1489,12 @@ class TestMouseReportingToggle(unittest.TestCase):
     def test_control_is_not_hidden_by_host_or_viewport(self):
         # hard project rule: no control is gated on location.hostname; and requirement 5 says this
         # toggle must work on desktop/tablet/phone alike -- no @media rule may hide .vtmousebtn.
-        self.assertNotIn("location.hostname", self.src)
+        # Scoped to the shared toolbar (not the whole file): F9's termTabOrigin elsewhere in
+        # ext_vt.js legitimately reads location.hostname for a wholly unrelated reason (per-tab
+        # connection-pool routing, not UI visibility) -- this rule is about controls, not a
+        # file-wide ban on the string.
+        toolbar = _function_body(self.src, "function buildToolbar(")
+        self.assertNotIn("location.hostname", toolbar)
         css = self.css
         idx = 0
         while True:
@@ -1851,9 +1861,13 @@ class TestRendererSwitchControl(unittest.TestCase):
 
     def test_control_is_not_hidden_by_host_or_viewport(self):
         # Hard project rule (same as TestMouseReportingToggle.test_control_is_not_hidden_by_
-        # host_or_viewport): no location.hostname gate anywhere, and no @media rule may hide
-        # .vtrendererbtn behind display:none at any breakpoint.
-        self.assertNotIn("location.hostname", self.src)
+        # host_or_viewport): no location.hostname gate on this control, and no @media rule may
+        # hide .vtrendererbtn behind display:none at any breakpoint. Scoped to the shared toolbar
+        # (not the whole file) for the same reason that test documents: F9's termTabOrigin
+        # elsewhere in ext_vt.js legitimately reads location.hostname for connection-pool
+        # routing, not UI visibility.
+        toolbar = _function_body(self.src, "function buildToolbar(")
+        self.assertNotIn("location.hostname", toolbar)
         css = self.css
         idx = 0
         while True:
@@ -2032,8 +2046,11 @@ class TestThemeFlipperInTerminal(unittest.TestCase):
 
     def test_control_is_not_hidden_by_host_or_viewport(self):
         # hard project rule, same as TestMouseReportingToggle/TestRendererSwitchControl's own
-        # checks: no control here may be gated on location.hostname.
-        self.assertNotIn("location.hostname", self.src)
+        # checks: no control here may be gated on location.hostname. Scoped to the shared
+        # toolbar (not the whole file): F9's termTabOrigin elsewhere in ext_vt.js legitimately
+        # reads location.hostname for connection-pool routing, not UI visibility.
+        toolbar = _function_body(self.src, "function buildToolbar(")
+        self.assertNotIn("location.hostname", toolbar)
 
     def test_reaches_the_browser(self):
         page = build_page()
@@ -2446,8 +2463,12 @@ class TestTerminalManagerPanel(unittest.TestCase):
         body = self._side_controls()
         self.assertNotIn("localOnly", body)
         self.assertNotIn("location.hostname", body)
-        # ... and the terminal module it drives gained no host gate either
-        self.assertNotIn("location.hostname", self.js)
+        # ... and the terminal module it drives gained no host gate either. Scoped to the manager
+        # panel section itself (not the whole file): F9's termTabOrigin elsewhere in ext_vt.js
+        # legitimately reads location.hostname for connection-pool routing, not UI visibility.
+        mgr_start = self.js.index('// ===== "Manage terminals" panel')
+        mgr_end = self.js.index("window.ExtVT =", mgr_start)
+        self.assertNotIn("location.hostname", self.js[mgr_start:mgr_end])
 
     def test_button_calls_the_terminal_module_instead_of_reimplementing_it(self):
         """ext_launch.js adds the button; ext_vt.js owns the terminal domain — the same seam the
@@ -2996,6 +3017,48 @@ class TestClosedStreamStatus(unittest.TestCase):
         url = src[src.index("function peekUrl("):]
         url = url[:url.index("\n  }") + 4]
         self.assertIn("(t.fg && t.fg.session) || t.session", url)
+
+
+class TestTermTabOriginIsTheOnlyTabOpeningPath(unittest.TestCase):
+    """F9: the old "same window.origin for every tab" pattern must be gone from every call site
+    that opens a terminal tab -- openNewTab/peekUrl in ext_vt.js, and both _openNewTab-shaped
+    call sites in ext_cr_term.js -- so a future call site can't silently bypass termTabOrigin
+    and bring back the Chrome per-host connection-pool exhaustion this fix closes."""
+
+    def test_old_same_origin_tab_pattern_is_gone_from_ext_vt(self):
+        src = _read("ext_vt.js")
+        self.assertNotIn('location.origin + location.pathname + "?tty="', src)
+
+    def test_old_same_origin_tab_pattern_is_gone_from_ext_cr_term(self):
+        src = _read("ext_cr_term.js")
+        self.assertNotIn('location.origin + location.pathname + "?tty="', src)
+
+    def test_peek_url_routes_through_term_tab_origin(self):
+        src = _read("ext_vt.js")
+        url = src[src.index("function peekUrl("):]
+        url = url[:url.index("\n  }") + 4]
+        self.assertIn("termTabOrigin(", url)
+
+    def test_open_new_tab_routes_through_term_tab_origin(self):
+        src = _read("ext_vt.js")
+        body = _body_until(src, "function openNewTab(", ["function closeVT("])
+        self.assertIn("termTabOrigin(", body)
+
+    def test_term_tab_origin_is_exported_for_ext_cr_term_to_reuse(self):
+        src = _read("ext_vt.js")
+        self.assertIn("window.ExtVT.termTabOrigin = termTabOrigin;", src)
+
+    def test_ext_cr_term_calls_the_shared_helper_not_a_second_copy(self):
+        """Both ext_cr_term.js call sites must go through window.ExtVT.termTabOrigin -- never a
+        retyped hostname-rewriting helper of its own (conventions rule 4)."""
+        src = _read("ext_cr_term.js")
+        self.assertEqual(
+            src.count("window.ExtVT.termTabOrigin("), 2,
+            "exactly the two window.open call sites (_openNewTab and the new-terminal-at-path "
+            "handler) must CALL the shared ext_vt.js helper",
+        )
+        self.assertNotIn("function termTabOrigin", src,
+                          "ext_cr_term.js must not define its own copy of the helper")
 
 
 if __name__ == "__main__":

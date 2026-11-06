@@ -572,7 +572,9 @@
   // ===== ⤢ New tab — same query-string scheme ext_vt.js's own openNewTab()/peekTerm() build ===
   function _openNewTab() {
     if (!st.tty) return;
-    var url = location.origin + location.pathname + "?tty=" + encodeURIComponent(st.tty) +
+    // F9: per-tab hostname via ext_vt.js's termTabOrigin -- NOT location.origin -- so this tab
+    // gets its own Chrome per-host connection budget. Same helper as ext_vt.js, no second copy.
+    var url = (window.ExtVT && window.ExtVT.termTabOrigin ? window.ExtVT.termTabOrigin(st.tty) : location.origin) + location.pathname + "?tty=" + encodeURIComponent(st.tty) +
       "&sid=" + encodeURIComponent((window.ExtVT && window.ExtVT.ttySession(st.tty) !== null) ? window.ExtVT.ttySession(st.tty) : (st.sessionId || "")) +
       "&mode=" + encodeURIComponent(st.mode || "") +
       "&renderer=" + encodeURIComponent(st.renderer || "grid") +
@@ -649,7 +651,8 @@
         return;
       }
       showToast((mode === "new" ? "Starting a new Claude session" : "Terminal opened") + " — " + path);
-      var url = location.origin + location.pathname + "?tty=" + encodeURIComponent(res.j.tty) +
+      // F9: per-tab hostname via ext_vt.js's termTabOrigin -- see _openNewTab's comment above.
+      var url = (window.ExtVT && window.ExtVT.termTabOrigin ? window.ExtVT.termTabOrigin(res.j.tty) : location.origin) + location.pathname + "?tty=" + encodeURIComponent(res.j.tty) +
         "&mode=" + encodeURIComponent(mode) +
         "&renderer=" + encodeURIComponent(res.j.renderer || "grid") +
         "&forked=" + (res.j.forked ? "1" : "0") +

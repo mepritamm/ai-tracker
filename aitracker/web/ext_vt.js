@@ -319,6 +319,24 @@
   function ttySession(tty) { return (tty in TTY_SESS) ? TTY_SESS[tty] : null; }
   function ttyBody(tty, extra, session) { var b = Object.assign({ tty: tty }, extra || {}), s = typeof session === "string" ? session : ttySession(tty); if (s !== null) b.session = s; return b; }
   function ttyQuery(tty) { var s = ttySession(tty); return "tty=" + encodeURIComponent(tty) + (s === null ? "" : "&session=" + encodeURIComponent(s)); }
+  // F9: give each terminal tab its own "t<tty>.localhost" hostname so Chrome allocates it a
+  // SEPARATE per-host connection-pool budget, instead of every tab sharing localhost's 6-connection
+  // limit (which was stalling the whole dashboard once a few terminal tabs were open). Known gaps,
+  // deliberately not covered by this fix: no effect when TRACKER_AUTH is set (page.py forces the
+  // flag off then -- the login cookie is host-only, so a *.localhost subdomain would hit the login
+  // page); no effect when reached via a LAN IP/Tailscale/tunnel hostname (a tunnel is HTTP/2
+  // already, unaffected by the per-host-6-connections HTTP/1.1 limit this works around); terminals
+  // embedded in the dashboard page (Control Room mounts) and other EventSource users
+  // (ext_cr_boot.js, ext_cr_dialogs.js, ext_run.js) still share localhost's pool; each tab gets its
+  // own localStorage, so dashboard-wide prefs (theme etc.) won't sync to it; xterm.js (~480KB) gets
+  // refetched per distinct hostname since the browser cache is partitioned by site.
+  var TERM_TAB_HOSTS = false/*__TERM_TAB_HOSTS__*/;   // page.py serves the server's decision
+  function termTabOrigin(tty) {
+    var h = location.hostname;
+    if (!TERM_TAB_HOSTS || !tty || (h !== "localhost" && h !== "127.0.0.1")) return location.origin;
+    var label = "t" + String(tty).toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 40);
+    return location.protocol + "//" + label + ".localhost" + (location.port ? ":" + location.port : "");
+  }
   // Row provenance: a GET /api/term/list (or 429) row carries the session that opened that tty.
   function bindRows(terms) {
     if (!terms || !terms.length) return terms;
@@ -3094,7 +3112,9 @@
     // — bootStandalone() also has its own fallback (GET /api/term/renderer) for a bookmarked
     // ?tty= link with no renderer param at all. `forked` and `notice` are similarly relayed so
     // the new tab can display the same fork chip and advisory notice as the opening modal.
-    var url = location.origin + location.pathname + "?tty=" + encodeURIComponent(activeTty) +
+    // F9: per-tab hostname (termTabOrigin) -- NOT location.origin -- so this tab gets its own
+    // Chrome per-host connection budget instead of sharing localhost's with every other tab.
+    var url = termTabOrigin(activeTty) + location.pathname + "?tty=" + encodeURIComponent(activeTty) +
       "&sid=" + encodeURIComponent(ttySession(activeTty) !== null ? ttySession(activeTty) : (activeSid || "")) + "&mode=" + encodeURIComponent(activeMode || "") +
       "&renderer=" + encodeURIComponent(activeRenderer || "grid") +
       "&forked=" + (activeForked ? "1" : "0") +
@@ -3442,7 +3462,8 @@
   // THIS function rather than its own retyped copy (conventions rule 4). A second copy is how the
   // `sid`/`mode`/`forked` params silently drift apart and a peeked terminal loses its context bar.
   function peekUrl(t) {
-    return location.origin + location.pathname + "?tty=" + encodeURIComponent(t.tty) +
+    // F9: per-tab hostname (termTabOrigin) -- see openNewTab's comment above.
+    return termTabOrigin(t.tty) + location.pathname + "?tty=" + encodeURIComponent(t.tty) +
       "&sid=" + encodeURIComponent((t.fg && t.fg.session) || t.session || "") +
       "&mode=" + encodeURIComponent(t.mode || "") +
       "&forked=" + (t.forked ? "1" : "0");
@@ -3886,6 +3907,7 @@
   window.ExtVT.ttyBody = ttyBody;
   window.ExtVT.ttyQuery = ttyQuery;
   window.ExtVT.ttySession = ttySession;
+  window.ExtVT.termTabOrigin = termTabOrigin;
   // Same reasoning again: the model/effort ladders and their two helper functions (defined above,
   // ~line 2071-2127) were previously reachable only from inside this IIFE, so ext_cr_term.js held
   // byte-identical copies that could silently desync from these. Widen the export, don't move or

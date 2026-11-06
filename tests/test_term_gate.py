@@ -182,6 +182,44 @@ class TestGuard(unittest.TestCase):
         self.assertEqual(h.calls, [])
 
 
+class TestSubdomainOriginMatching(unittest.TestCase):
+    """F9: aitracker/web/ext_vt.js's termTabOrigin gives each terminal tab its own
+    t<tty>.localhost hostname. Pins that guard()'s existing origin-matching check (_origin_ok)
+    is untouched by this -- a per-tab subdomain is accepted when Host and Origin AGREE on it,
+    and still rejected when they don't, exactly like the plain-localhost case TestGuard above
+    already covers. This is the regression guard that a subdomain never weakens the check."""
+
+    def setUp(self):
+        self._terminal0 = config.TERMINAL
+        self._auth0 = config.AUTH
+        self._bind0 = config.BIND_HOST
+        config.TERMINAL = True
+        config.AUTH = ""
+        config.BIND_HOST = "127.0.0.1"
+
+    def tearDown(self):
+        config.TERMINAL = self._terminal0
+        config.AUTH = self._auth0
+        config.BIND_HOST = self._bind0
+
+    def test_matching_subdomain_on_both_host_and_origin_passes(self):
+        h = _FakeHandler({"Origin": "http://tabc123def456.localhost:8790",
+                           "Host": "tabc123def456.localhost:8790"})
+        self.assertTrue(term_gate.guard(h))
+        self.assertEqual(h.calls, [])
+
+    def test_subdomain_host_with_a_wholly_different_origin_403s(self):
+        """A per-tab subdomain on Host must NOT weaken the cross-origin check: Origin still has
+        to match Host exactly, so a request claiming a tab subdomain Host but a different Origin
+        entirely is still refused."""
+        h = _FakeHandler({"Origin": "http://evil.example",
+                           "Host": "tabc123def456.localhost:8790"})
+        self.assertFalse(term_gate.guard(h))
+        obj, code = h.calls[-1]
+        self.assertEqual(code, 403)
+        self.assertIn("cross-origin", obj.get("error", ""))
+
+
 class TestIsLoopback(unittest.TestCase):
     """Direct tests for the host-classification helper the gate relies on."""
 

@@ -113,6 +113,14 @@ CURSOR_WS_ROOT = os.environ.get(
 AUTH = os.environ.get("TRACKER_AUTH", "")
 
 
+# Give each terminal tab its own "t<tty>.localhost" hostname so Chrome allocates it a separate
+# per-host connection-pool budget, instead of every tab sharing localhost's 6-connection limit
+# (which stalls the whole dashboard once a few terminal tabs are open). Env-only, like AUTH
+# above: it is a behavior switch that only takes effect on restart, not a live-editable setting,
+# so it is deliberately NOT in EDITABLE/VALIDATORS below. Set TRACKER_TERM_TAB_HOSTS=0 to disable.
+TERM_TAB_HOSTS = os.environ.get("TRACKER_TERM_TAB_HOSTS", "1") != "0"
+
+
 # The address the server is actually bound to, written by server.run() once the real bind host
 # is known (default here is the loopback fallback for anything that reads this before run() has
 # executed, e.g. tests, or a caller that imports the package without ever serving). term_gate

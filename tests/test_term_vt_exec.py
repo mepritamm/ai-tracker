@@ -4865,5 +4865,84 @@ console.log(JSON.stringify({ anth: click(ANTH), or: click(OR), ornull: click(ORN
         self.assertIsNone(r["old"]["hints"])
 
 
+class TestTermTabOriginExecuted(unittest.TestCase):
+    """F9, executed: aitracker/web/ext_vt.js's termTabOrigin, extracted verbatim out of the raw
+    source (not retyped). The raw file still carries page.py's unbaked marker
+    (`false/*__TERM_TAB_HOSTS__*/`), so each scenario performs the exact same string
+    substitution page.py's build_page() does (see page.py's TERM_TAB_MARK) to flip the flag for
+    that run, instead of hand-writing a second copy of the function with the flag baked in."""
+
+    @staticmethod
+    def _extracted_src():
+        src = _read_src()
+        start = src.index("var TERM_TAB_HOSTS = ")
+        end = src.index("function bindRows(")
+        return src[start:end]
+
+    def _term_tab_origin(self, flag, location, tty):
+        body = self._extracted_src().replace(
+            "false/*__TERM_TAB_HOSTS__*/", "true" if flag else "false", 1
+        )
+        script = _HARNESS_PRELUDE + body + """
+var location = """ + json.dumps(location) + """;
+var result = termTabOrigin(""" + json.dumps(tty) + """);
+console.log(JSON.stringify({ result: result }));
+"""
+        return _run_node(script)["result"]
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_localhost_flag_on_rewrites_to_per_tab_subdomain(self):
+        loc = {"hostname": "localhost", "port": "8790", "protocol": "http:",
+               "origin": "http://localhost:8790"}
+        result = self._term_tab_origin(True, loc, "ABC123def456")
+        self.assertEqual(result, "http://tabc123def456.localhost:8790")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_loopback_ip_flag_on_still_outputs_dot_localhost(self):
+        # location.hostname is only read to DECIDE whether to rewrite -- the output hostname is
+        # always "<label>.localhost", never "<label>.127.0.0.1".
+        loc = {"hostname": "127.0.0.1", "port": "8790", "protocol": "http:",
+               "origin": "http://127.0.0.1:8790"}
+        result = self._term_tab_origin(True, loc, "ABC123def456")
+        self.assertEqual(result, "http://tabc123def456.localhost:8790")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_non_loopback_hostname_returns_origin_unchanged(self):
+        loc = {"hostname": "192.168.1.5", "port": "8790", "protocol": "http:",
+               "origin": "http://192.168.1.5:8790"}
+        result = self._term_tab_origin(True, loc, "ABC123def456")
+        self.assertEqual(result, "http://192.168.1.5:8790")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_flag_off_returns_origin_unchanged(self):
+        loc = {"hostname": "localhost", "port": "8790", "protocol": "http:",
+               "origin": "http://localhost:8790"}
+        result = self._term_tab_origin(False, loc, "ABC123def456")
+        self.assertEqual(result, "http://localhost:8790")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_tty_label_is_lowercased_and_stripped_to_alnum(self):
+        loc = {"hostname": "localhost", "port": "8790", "protocol": "http:",
+               "origin": "http://localhost:8790"}
+        result = self._term_tab_origin(True, loc, "AB-12_cd!!")
+        self.assertEqual(result, "http://tab12cd.localhost:8790")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_long_tty_label_is_capped_at_41_chars_total(self):
+        loc = {"hostname": "localhost", "port": "8790", "protocol": "http:",
+               "origin": "http://localhost:8790"}
+        result = self._term_tab_origin(True, loc, "a" * 60)
+        label = result.split("//")[1].split(".localhost")[0]
+        self.assertEqual(label, "t" + "a" * 40)
+        self.assertEqual(len(label), 41)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_empty_tty_returns_origin_unchanged(self):
+        loc = {"hostname": "localhost", "port": "8790", "protocol": "http:",
+               "origin": "http://localhost:8790"}
+        result = self._term_tab_origin(True, loc, "")
+        self.assertEqual(result, "http://localhost:8790")
+
+
 if __name__ == "__main__":
     unittest.main()

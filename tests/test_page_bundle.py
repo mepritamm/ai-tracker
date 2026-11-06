@@ -16,6 +16,8 @@ import subprocess
 import tempfile
 import unittest
 
+from aitracker import config
+
 _AITRACKER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "aitracker")
 _WEB = os.path.join(_AITRACKER, "web")
 _HAS_NODE = shutil.which("node") is not None
@@ -300,6 +302,43 @@ class TestPageBundle(unittest.TestCase):
             f"<script> and breaks every module after it:\n" +
             "\n".join(f"  {f}" for f in failed_files)
         )
+
+
+class TestTermTabHostsMark(unittest.TestCase):
+    """F9: page.build_page() must always replace page.TERM_TAB_MARK with a real boolean literal
+    -- see aitracker/config.py's TERM_TAB_HOSTS and page.py's chained .replace() next to
+    LIVE_MARK. Forced to "false" whenever config.AUTH is set (the login cookie is host-only, so
+    a *.localhost subdomain would hit the login page -- see page.py's own comment), regardless
+    of the flag."""
+
+    def setUp(self):
+        self._auth0 = config.AUTH
+        self._flag0 = config.TERM_TAB_HOSTS
+
+    def tearDown(self):
+        config.AUTH = self._auth0
+        config.TERM_TAB_HOSTS = self._flag0
+
+    def test_flag_on_no_auth_serves_true(self):
+        config.AUTH = ""
+        config.TERM_TAB_HOSTS = True
+        self.assertIn("var TERM_TAB_HOSTS = true;", _read_page())
+
+    def test_auth_set_forces_false_even_with_flag_on(self):
+        config.AUTH = "user:pass"
+        config.TERM_TAB_HOSTS = True
+        self.assertIn("var TERM_TAB_HOSTS = false;", _read_page())
+
+    def test_flag_off_serves_false(self):
+        config.AUTH = ""
+        config.TERM_TAB_HOSTS = False
+        self.assertIn("var TERM_TAB_HOSTS = false;", _read_page())
+
+    def test_marker_never_survives_in_any_case(self):
+        for auth, flag in (("", True), ("x", True), ("", False), ("x", False)):
+            config.AUTH = auth
+            config.TERM_TAB_HOSTS = flag
+            self.assertNotIn("/*__TERM_TAB_HOSTS__*/", _read_page())
 
 
 if __name__ == "__main__":
