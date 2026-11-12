@@ -11,10 +11,10 @@ Branch `worktree-term-idle-ttl`, base `personal/main` @ 0aecc02.
 
 | Clause | Verdict |
 |---|---|
-| 1. TTL overrun resolved | not discharged |
+| 1. TTL overrun resolved | fixed in code; live only after `make serve` on 8790, which closes every open terminal, so the user restarts it |
 | 2. Diagnosis, plan, adversarial review, reconciled plan (opus) | discharged (this report) |
-| 3. Implemented via /tracker-gap | implemented and unit/eval/acceptance-tested in the worktree; not pushed; pending post-fix review (clause 4) |
-| 4. Post-fix adversarial review and fixes (opus), /tracker-push, /branch-sync on conflict | review and fixes done (see "Post-fix adversarial review"); /tracker-push and /branch-sync pending |
+| 3. Implemented via /tracker-gap | discharged: commits 601b8b5 and 65352dd (were a489710 and 7e88d1a before the rebase) |
+| 4. Post-fix adversarial review and fixes (opus), /tracker-push, /branch-sync on conflict | review and fixes done; /branch-sync rebased onto personal/main a2d9263 with no conflicts; post-sync gate failure was a timing flake (see review section); shipped by /tracker-push from this commit, landed when `git merge-base --is-ancestor <this commit> personal/main` holds |
 
 ## Diagnosis
 
@@ -529,3 +529,5 @@ Read-only, before the restart: `claude`, `claude agents` and `claude attach` pan
 - A real parked pane through `_note_activity`: file shape from the diagnosis only.
 - A real run of the OpenRouter launcher: script read only; it is not configured here.
 - **The fix is not live.** 8790 was restarted at 22:59 from the primary checkout, which does not contain this branch. The panes diagnosed above no longer exist. Push and restart remain.
+
+**Gate flake: `test_inject_footer_quiet.test_body_redraw_still_blocks_inject` (not a regression).** One failure in a full gate after the rebase (`inject()` returned ok against a body redraw). Inject's quiescence (`_wait_for_quiet`, term_vt.py ~4531-4545) calls `_body_rows_version(pt)` directly and never reads `_act_v` or `last_active`, so `_note_activity` cannot affect it; the test's child is a plain python script, not a Claude foreground, so the new client rule is never reached. Inject's behaviour is unchanged for every pane, clients included. The test is timing-bound: the child redraws every 0.4 s and `INJECT_QUIET_WINDOW` is 1.5 s, so a >1.1 s scheduler stall (load average 20-32 while measured) lets inject see a quiet window. Isolated runs of the single test: HEAD 19 pass / 1 fail of 20 (module run: 1 of 5 modules runs failed), base `personal/main` 20 pass / 0 fail of 20 under similar load. Base's 0 of 20 does not distinguish 1-in-20 from 0, and no code on the path changed, so nothing was edited. Assertion left as is.
