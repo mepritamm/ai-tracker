@@ -260,7 +260,7 @@ VALIDATORS = {
     "PORT":          _v_int(1, 65535),
     "HOST":          _v_str(255),
     "ICON_STYLE":    _v_enum(("icons", "emoji", "text")),
-    "HEADER_LINE":   _v_enum(("summary", "narration")),  # the detail header's one line; read live per request
+    "HEADER_LINE":   _v_enum(("summary", "narration")),  # the session line (header, board, rails); read live per request
     "GATEWAY":       _v_enum(("anthropic", "openrouter")),  # launcher for NEW sessions only; resumes keep their own
     "OPENROUTER_LAUNCHER":   _v_str(1024),      # empty string clears (= not configured)
     "OPENROUTER_SLOTS_FILE": _v_str(1024),

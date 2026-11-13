@@ -19,6 +19,25 @@ def headline(d, mode):
             "band": None, "label": None, "state": None, "updated": nar[0].get("t")}
 
 
+LIST_HL_MAX = 200   # one-line rows / 2-line tiles; keeps /api/list's added payload ~10%
+
+
+def list_headline(s, mode):
+    """A session-LIST row's headline: headline() itself over the row's cheap facts (the job index
+    entry + the cached tail narration). Same policy and keys as the detail header, flattened to one
+    line and clipped, plus covers_needs: True when the text already says the blocked job's question,
+    so a tile need not repeat it. None when there is nothing to say."""
+    job = s.get("job") or {}
+    hl = headline({"job": job, "message": s.get("last_text") or ""}, mode)
+    if hl["source"] == "none":
+        return None
+    t = " ".join(hl["text"].split())
+    hl["text"] = t if len(t) <= LIST_HL_MAX else t[:LIST_HL_MAX - 1].rstrip() + "\u2026"
+    q = " ".join((job.get("needs") or "").split())[:100]
+    hl["covers_needs"] = bool(q) and hl["source"] == "job" and q in hl["text"]
+    return hl
+
+
 def build_overview(d, todos, files, cmds, commits, tests, agents, requests,
                    narrative, agents_bg, idle, t_first, t_last):
     """Concrete Goal / Now / So-far that a cold reader can understand at a glance."""

@@ -974,6 +974,9 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.tracker-next .cr-rail-hl { display:block; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  font: var(--fw-body) 12px/1.4 var(--font-sans); color: var(--text-secondary); }
+.tracker-next .cr-rail-hl .crd-hl-band { padding: 1px 6px; font-size: 10px; vertical-align: 0; }
 .tracker-next .cr-rail-dir {
   min-width: 0;
   font: var(--fw-trace) var(--fs-trace-min)/var(--lh-trace) var(--font-mono);

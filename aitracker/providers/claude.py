@@ -771,6 +771,19 @@ def _job_band(f):
     return "blocked" if f["tempo"] == "blocked" else "working"
 
 
+def _job_shape(short, f, live):
+    """The header job shape for one parsed state.json (f = _job_fields) found under dir `short`.
+    A non-"done" band whose job dir isn't live loses its pill; text always stays."""
+    band = _job_band(f)
+    label = BAND_LABEL[band]
+    if band != "done" and short not in live:
+        band = label = None
+    elif f["state"] in ("failed", "stopped"):
+        label += " \u00b7 " + f["state"]
+    return {"band": band, "label": label, "detail": f["detail"], "needs": f["needs"],
+            "result": f["result"], "state": f["state"], "updated": f["updated"] or None}
+
+
 def job_for(sid, live):
     """The background job whose sessionId OR resumeSessionId is `sid`, as the header shape, else None.
     Direct dir sid[:8] first (the common case, O(1)); else scan JOBS_DIR (resumed jobs). `live` is
@@ -807,15 +820,30 @@ def job_for(sid, live):
                 break
     if not hit:
         return None
-    short, f = hit
-    band = _job_band(f)
-    label = BAND_LABEL[band]
-    if band != "done" and short not in live:
-        band = label = None
-    elif f["state"] in ("failed", "stopped"):
-        label += " \u00b7 " + f["state"]
-    return {"band": band, "label": label, "detail": f["detail"], "needs": f["needs"],
-            "result": f["result"], "state": f["state"], "updated": f["updated"] or None}
+    return _job_shape(*hit, live)
+
+
+def job_index(live):
+    """{session id: job shape} for EVERY job, from ONE listdir of JOBS_DIR. Same file_pass cache and
+    the same precedence as job_for: the job whose dir == sid[:8] wins, else the first dir in sorted
+    order whose sessionId/resumeSessionId is sid. For the session LIST, where a per-row
+    job_for() miss (a full scan) would cost ~5 ms x every non-job row. Never raises."""
+    root, hits = config.JOBS_DIR, {}
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return {}
+    for short in names:
+        if not safe_path_component(short):
+            continue
+        try:
+            f = file_pass("claude.jobstate", os.path.join(root, short, "state.json"), _job_fields)
+        except (OSError, ValueError):
+            continue
+        for sid in (f or {}).get("ids", ()):
+            if sid not in hits or sid[:8] == short:      # direct dir beats an earlier resume match
+                hits[sid] = (short, f)
+    return {sid: _job_shape(short, f, live) for sid, (short, f) in hits.items()}
 
 
 def list_sessions(limit=200):
@@ -823,6 +851,7 @@ def list_sessions(limit=200):
     fs.sort(key=os.path.getmtime, reverse=True)
     titles = load_titles()
     blocked = _blocked_jobs()
+    jobs = job_index(_live_daemon_shorts())
     metas = {f: _session_meta(f) for f in fs}   # cached; cheap on repeat
     # candidate orchestrators per project dir, over ALL sessions (not just the top-N shown) so the
     # sidebar nesting and each session's agent_sessions panel attribute from the identical set.
@@ -956,6 +985,8 @@ def list_sessions(limit=200):
             # Bash command's name, off the SAME bounded tail read as waiting/ended/model
             # above (zero extra I/O); honestly None when nothing failed, never omitted.
             "fail_cmd": sm.get("fail_cmd"),
+            "job": jobs.get(sid),                    # header job shape or None (seam -> headline, then dropped)
+            "last_text": sm.get("last_text") or "",  # newest tail narration (same cached tail read)
         })
     return out
 

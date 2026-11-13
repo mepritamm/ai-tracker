@@ -1225,6 +1225,7 @@ function sessionRow(s,now,ex){
     (s._runs>1?`<span class="agentbadge runs" title="ran ${s._runs}× — collapsed; opens the latest">×${s._runs}</span>`:"")+
     `<span class="pin${s.pinned?' on':''}" onclick="togglePin(event,'${s.id}')" title="${s.pinned?'Unpin':'Pin to top'}">${ico('pin')}</span>`+
     `<span class=ren onclick="renameSession(event,'${s.id}')" title="Rename this session">${ico('edit')}</span></div>`+
+    `${s.headline?'<div class=shline>'+hlHtml(s.headline,true)+'</div>':''}`+
     `<div class=smeta>${s.agent?'<span class=agentbadge>'+ico('agent')+' Agent</span> · ':''}${bits.join(" · ")}${kidchip}${bgchip}${shchip}</div></div>`;
 }
 // collapse agent sessions that are re-runs of the same task (first prompt) into one row, newest as
@@ -2307,8 +2308,11 @@ window.openCostModal=openCostModal; window.costChipText=costChipText;
 function paintHeadline(d){
   const hl=d.headline||{};
   $("ov_hlrow").style.display=hl.text?"":"none";
-  $("ov_hl").innerHTML=(hl.label?'<span class="hlband hl-'+esc(hl.band||"")+(hl.state==="failed"?" hl-failed":"")+'">'+esc(hl.label)+'</span> ':'')+md(hl.text||"");
+  $("ov_hl").innerHTML=hlHtml(hl);
 }
+// the server's headline -> band pill + inline-md text; no policy here (server owns mode/text/label).
+// inline=true (session rows): anchors unwrapped -- a row is one click/Enter target, no inner tab stops.
+function hlHtml(hl,inline){let t=md(hl.text||"");if(inline)t=t.replace(/<a [^>]*>([\s\S]*?)<\/a>/g,"$1");return (hl.label?'<span class="hlband hl-'+esc(hl.band||"")+(hl.state==="failed"?" hl-failed":"")+'">'+esc(hl.label)+'</span> ':'')+t;}
 function openMsg(i){const n=curNarr[i]; if(!n)return; _setNav(openMsg,i,curNarr.length,{len:()=>curNarr.length,live:true}); openText("Narration",tago(n.t),n.text);}
 // the Now banner → jump to the panel that reflects the CURRENT activity (server says which via
 // now_kind), flash it so you see WHERE it's happening, AND open that item's live dialog.

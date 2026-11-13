@@ -550,6 +550,9 @@ def _run():
     assert byid["s_wait"]["open_flags"] == 2, byid["s_wait"]            # resolved ones don't count
     assert byid["auggie:sess1"]["open_flags"] == 1, byid["auggie:sess1"]  # namespaced id matches too
     assert byid["s_done"]["open_flags"] == 0, byid["s_done"]            # unflagged -> 0, never missing
+    for _r in byid.values():     # list headline (board tile / both rails): present on EVERY provider's row, raw inputs dropped
+        assert "headline" in _r and "job" not in _r and "last_text" not in _r, ("headline key / raw inputs", _r["id"])
+        assert _r["headline"] is None or _r["headline"]["source"] in ("job", "narration"), _r["headline"]
     os.unlink(config.FLAGS_FILE)
     config.FLAGS_FILE = _flag_snap
     assert all_sessions()[0].get("open_flags") == 0, "no flags file -> every session still reports 0"

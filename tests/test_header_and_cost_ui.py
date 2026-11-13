@@ -194,7 +194,7 @@ console.log(JSON.stringify(OUT));
 class ClassicHeadlineTests(unittest.TestCase):
     def test_classic_overview_renders_headline(self):
         b = _bundle()
-        rc, out, err = _run_node(CLASSIC_DRIVER % {"fn": _extract_function(b, "paintHeadline")})
+        rc, out, err = _run_node(CLASSIC_DRIVER % {"fn": _extract_function(b, "hlHtml") + "\n" + _extract_function(b, "paintHeadline")})
         self.assertEqual(rc, 0, err)
         o = _extract_after_marker(out, "===CL_JSON_START===")
         self.assertEqual(o["on"][0], "")

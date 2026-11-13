@@ -382,6 +382,7 @@ def list_auggie():
             # board "failing" tile signal (ext_cr_board.js's sessionState()) — honestly
             # None when nothing failed, never omitted. See _auggie_fail_cmd.
             "fail_cmd": e.get("fail_cmd"),
+            "last_text": e.get("last_text") or "",   # newest narration (seam -> headline, then dropped)
         })
     return out
 

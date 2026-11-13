@@ -10,8 +10,8 @@ from .providers.augment_ext import AugmentVscodeProvider, AugmentCursorProvider
 # `make bundle` emits a file that won't parse.
 from .store import load_pins, load_notes, load_flags, load_forks, resolve_fork_child, fork_parent_of, load_model_keep, load_titles, load_title_sync
 from .gateway import gateway_of, model_meta, or_launcher
-from .util import annotate_liveness, model_version, model_label, cost_summary
-from .overview import empty_heartbeat, headline
+from .util import annotate_liveness, model_version, model_label, cost_summary, now_phrase
+from .overview import empty_heartbeat, headline, list_headline
 
 
 PROVIDERS = [ClaudeProvider(), AuggieProvider(),
@@ -86,6 +86,7 @@ def all_sessions():
         parent = fork_parent_of(sid, forks)
         if parent:
             continued_from[sid] = parent
+    mode = config.HEADER_LINE
     for s in out:
         sid = s.get("id", "")
         s["pinned"] = sid in pins
@@ -113,6 +114,16 @@ def all_sessions():
         s.setdefault("agent_files_n", 0)
         s.setdefault("agent_sessions_n", 0)
         s["agent_map_n"] = s["agent_files_n"] + s["agent_sessions_n"]
+        # The headline the detail header shows (job summary / narration, config HEADER_LINE), from the
+        # row's cheap facts. A live row's now_line that merely repeats the headline's narration is
+        # blanked so a tile never says the same sentence twice (structural phrases stay). Raw inputs
+        # are then dropped so the wire doesn't carry the same text twice.
+        lt = s.get("last_text") or ""
+        s["headline"] = list_headline(s, mode)
+        if s["headline"] and s["headline"]["source"] == "narration" and lt and s.get("now_line") == now_phrase(lt):
+            s["now_line"] = ""
+        s.pop("job", None)
+        s.pop("last_text", None)
     out.sort(key=lambda s: (not s.get("pinned"), -s.get("mtime", 0)))   # pinned first, then newest
     return out
 

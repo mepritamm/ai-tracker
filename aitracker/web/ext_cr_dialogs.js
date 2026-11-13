@@ -1330,7 +1330,7 @@
             return sliderCtlCommit(30, 1800, value != null ? value : 300, onCommit, 's');
           }));
         body.appendChild(serverRow('Header line', 'HEADER_LINE',
-          'What the line under the session name shows: a background job\'s one-line status (falls back to the latest narration when the session isn\'t a job), or always the latest narration.',
+          'What the session\'s one-line status shows, in the header, on board cards and in both session lists: a background job\'s one-line status (falls back to the latest narration when the session isn\'t a job), or always the latest narration.',
           function (value, onCommit) {
             return segmented([['summary', 'Job summary'], ['narration', 'Narration']], value || 'summary', onCommit);
           }));

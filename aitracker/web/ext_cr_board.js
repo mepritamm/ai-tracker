@@ -2154,6 +2154,7 @@ window.CR = window.CR || {};
           }, ['\u00d7' + s._runs]) : null,
           actions,
         ]),
+        headlineEl(s.headline, 'cr-rail-hl'),
         h('span', { class: 'cr-rail-meta' },
           // The project name and source label are the classic sidebar's own meta
           // line (app.js sessionRow's `bits`); `agentChip` leads, matching
@@ -2822,13 +2823,33 @@ window.CR = window.CR || {};
     //
     // 'awaiting' (hero or plain) is untouched — the owner's explicit "leave
     // that state alone" exception — so it alone still shows the prompt.
+    // Returns an ARRAY of elements (nulls allowed). With a server headline the headline leads and
+    // today's structural line stays beneath it: the waiting question on an awaiting tile (unless
+    // the headline already says it -- covers_needs), the live now_line otherwise (the server
+    // already dropped a now_line that merely repeats the headline). No headline -> today's tile.
     function tileLine(s, state) {
-      if (state === 'awaiting') {
-        return h('div', { class: 'cr-tile-line' }, [s.needs || s.prompt || '']);
+      var hl = headlineEl(s.headline, 'cr-tile-line cr-tile-line--hl');
+      if (!hl) {
+        if (state === 'awaiting') return [h('div', { class: 'cr-tile-line' }, [s.needs || s.prompt || ''])];
+        var nowLine = (typeof s.now_line === 'string') ? s.now_line.trim() : '';
+        // no now_line -> no second line at all, never s.prompt
+        return [nowLine ? h('div', { class: 'cr-tile-line cr-tile-line--now' }, [nowLine]) : null];
       }
-      var nowLine = (typeof s.now_line === 'string') ? s.now_line.trim() : '';
-      if (!nowLine) return null;   // no now_line -> no second line at all, never s.prompt
-      return h('div', { class: 'cr-tile-line cr-tile-line--now' }, [nowLine]);
+      var sub = (state === 'awaiting')
+        ? ((s.needs && !s.headline.covers_needs) ? '⧖ ' + s.needs : '')
+        : ((typeof s.now_line === 'string') ? s.now_line.trim() : '');
+      return [hl, sub ? h('div', { class: 'cr-tile-line cr-tile-line--now' }, [sub]) : null];
+    }
+
+    // The server's headline as one element: pill (the detail header's own .crd-hl-band classes,
+    // which apply under #nextRoot.cr) + inline md text with anchors unwrapped (a rail row / tile
+    // is a single click+Enter target -- no inner tab stops). Renders; decides nothing. null -> null.
+    function headlineEl(hl, cls) {
+      if (!hl || !hl.text) return null;
+      var pill = hl.label ? '<span class="crd-hl-band crd-hl-' + esc(hl.band || '') +
+        (hl.state === 'failed' ? ' crd-hl-failed' : '') + '">' + esc(hl.label) + '</span> ' : '';
+      var body = (typeof md === 'function' ? md(hl.text) : esc(hl.text)).replace(/<a [^>]*>([\s\S]*?)<\/a>/g, '$1');
+      return h('div', { class: cls, title: (hl.label ? hl.label + ' · ' : '') + hl.text, html: pill + body });
     }
 
     function sessionTile(t, now) {
@@ -2882,8 +2903,7 @@ window.CR = window.CR || {};
       // (which had cited the artboard's three-div markup over the doc); the
       // doc wins now, restored to all states.
       body.push(h('div', { class: 'cr-tile-sub' }, [(s.project || '') + ' · ' + toolLabel(s.source)]));
-      var line = tileLine(s, state);
-      if (line) body.push(line);
+      tileLine(s, state).forEach(function (el) { if (el) body.push(el); });
       var ticks = todoTicks(s);
       if (ticks) body.push(ticks);
       var pr = tilePr(s, state);
