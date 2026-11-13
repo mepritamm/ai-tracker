@@ -528,6 +528,15 @@ def _sub_agent_usd(d):
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
 
 
+def _recorded(cost_tok, rec_usd, n_billed, d):
+    """The `recorded` arg for cost_summary: None when nothing was recorded at all (no $ chip);
+    main $ None when there was usage but no parseable billing (unpriced, never $0)."""
+    sub = _sub_agent_usd(d)
+    if not (cost_tok or n_billed or sub):
+        return None
+    return (rec_usd if n_billed else None, sub if (sub or n_billed) else None)
+
+
 def parse_auggie(session_id):
     d, f = _load_auggie(session_id)
     if d is None:
@@ -554,7 +563,7 @@ def parse_auggie(session_id):
     task_times = {}   # chat-side task id -> {"started","ended"} (ISO), from update_tasks' own
                        # tool_use input — the name-matched fallback for started_at/ended_at (~ Claude's task_times)
     tok_in = tok_out = 0
-    cost_tok, rec_usd = {}, 0.0   # cost: priced token acc (savings/breakdown) + what Augment BILLED
+    cost_tok, rec_usd, n_billed = {}, 0.0, 0   # cost: priced token acc (savings/breakdown) + what Augment BILLED
     hb_turns, hb_calls = [], []   # heartbeat inputs: one turn per token_usage block, one call per tool_use
     ctx_current = ctx_limit = None  # LATEST turn's occupancy + the session's own context-window size
     def _cprs(text, narr=False):  # collect PRs + note which exchange each URL first showed up in
@@ -598,6 +607,7 @@ def parse_auggie(session_id):
             if isinstance(bm, dict):
                 try:
                     rec_usd += float(bm.get("cost_usd") or 0)
+                    n_billed += 1
                 except (TypeError, ValueError):
                     pass                            # a non-numeric string contributes 0, never raises
             tu = rn.get("token_usage")
@@ -782,7 +792,7 @@ def parse_auggie(session_id):
         "tokens": {"in": tok_in, "out": tok_out},
         # what Augment BILLED (~1.3x Anthropic list price) + the sub-agents' own recorded total;
         # cache savings stay at Anthropic list price (cost_summary).
-        "cost": cost_summary(cost_tok, {}, [], recorded=(rec_usd, _sub_agent_usd(d)),
+        "cost": cost_summary(cost_tok, {}, [], recorded=_recorded(cost_tok, rec_usd, n_billed, d),
                              note="Billed by Augment (about 1.3\u00d7 Anthropic list price). Cache savings are at Anthropic list price."),
         "heartbeat": build_heartbeat(hb_turns, hb_calls, None, None,
                                      "Auggie logs no per-tool timing — tools ranked by calls."),

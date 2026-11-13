@@ -176,8 +176,6 @@ def parse_any(sid):
     # with no extra round trip.
     d["continued_as"] = resolve_fork_child(sid)
     d["continued_from"] = fork_parent_of(sid)
-    if d["continued_from"]:   # a fork copies its parent's history, so its transcript $ includes it
-        d["cost"]["note"] = ((d["cost"].get("note") or "") + " Includes history copied from the session it continues.").strip()
     # Links-panel liveness: mark each `files` entry with `alive` (local path still on
     # disk, or unconditionally True for a remote URL) and de-dupe by normalized path --
     # see util.annotate_liveness for why this lives HERE (the one seam both providers'
@@ -210,6 +208,8 @@ def parse_any(sid):
     # a provider that never sets it, not a second implementation of the check itself.
     d.setdefault("parse_error", None)
     d.setdefault("cost", cost_summary({}, {}, [], note="No per-turn usage recorded for this source."))
+    if d["continued_from"]:   # a fork copies its parent's history, so its transcript $ includes it
+        d["cost"]["note"] = ((d["cost"].get("note") or "") + " Includes history copied from the session it continues.").strip()
     d.setdefault("job", None)   # Auggie/Augment ext: no background-job concept -> honest None
     d["headline"] = headline(d, config.HEADER_LINE)   # the detail header's one line (server owns the policy)
     # pinned/open_flags/note_count: same shared seam as all_sessions() above, same store.py

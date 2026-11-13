@@ -23,7 +23,12 @@ OUT["fence_alone"] = mdBlock("```\ncode\n```");
 OUT["both"] = mdBlock(BHARADWAJ + "\n\n```\ncode\n```");
 OUT["fence_in_draft"] = mdBlock("**Draft reply**\n> text\n> ```\n> code\n> ```");
 OUT["has"] = [hasDraftQuote(BHARADWAJ), hasDraftQuote("**Draft plan:**\n1. x"), hasDraftQuote("> quote"),
-              hasDraftQuote("**Draft**\n```\n> not a quote\n```")];
+              hasDraftQuote("**Draft**\n```\n> not a quote\n```"),
+              hasDraftQuote("> **Draft x**\n> > inner"), hasDraftQuote("> plain\n> > nested")];
+OUT["nested_md"] = mdBlock("> **Draft x**\n> > inner");
+OUT["multi_para_noblank"] = mdBlock("**Draft reply:**\n\n> Hi team,\n\n> Second para.");
+OUT["quote_then_prose"] = mdBlock("**Draft reply:**\n\n> Hi team,\n\nplain prose after");
+OUT["plain_split_quotes"] = mdBlock("> one\n\n> two");
 
 // copyCode under stubs: a fake button whose parent holds a .cpsrc textarea
 function fakeBtn(srcValue, codeText) {
@@ -40,13 +45,25 @@ window.navigator.clipboard = { writeText: function (t) { copied.push(t); return 
 copyCode(fakeBtn("No direct ViDA impact.\nHappy to pair.", "ignored"));
 copyCode(fakeBtn(null, "plain code"));
 OUT["copied_clipboard"] = copied.slice();
-// non-secure context: no navigator.clipboard -> execCommand("copy") on the un-hidden, select()ed textarea
+// non-secure context: no navigator.clipboard -> execCommand("copy") on a FRESH, non-readonly off-screen
+// textarea (iOS cannot select() a readonly one); "Copied" only when execCommand returns true.
 window.navigator.clipboard = undefined;
-var exec = [], ta = { value: "draft text", tagName: "TEXTAREA", hidden: true, select() { exec.push("select:hidden=" + ta.hidden); } };
-document.execCommand = function (c) { exec.push(c + ":hidden=" + ta.hidden); return true; };
-var b2 = { classList: { add() {}, remove() {} }, innerHTML: "x", parentNode: { querySelector(sel) { return sel === ".cpsrc" ? ta : null; } } };
-copyCode(b2);
-OUT["fallback"] = exec; OUT["fallback_rehidden"] = ta.hidden;
+var made = [], execLog = [], execRet = true;
+document.createElement = function (tag) {
+  var t = { tagName: tag.toUpperCase(), value: "", readOnly: false, style: {}, setAttribute: function (k, v) { if (k === "readonly") this.readOnly = true; },
+            select: function () { execLog.push("select"); }, setSelectionRange: function () {} };
+  made.push(t); return t;
+};
+document.body.appendChild = function (c) { execLog.push("append"); return c; };
+document.body.removeChild = function (c) { execLog.push("remove"); return c; };
+document.execCommand = function (c) { execLog.push(c); return execRet; };
+var ta = { value: "draft text", tagName: "TEXTAREA", hidden: true, readOnly: true, select() { execLog.push("SRC-select"); } };
+function mkBtn() { return { classList: { add() {}, remove() {} }, innerHTML: "x", parentNode: { querySelector(sel) { return sel === ".cpsrc" ? ta : null; } } }; }
+var b2 = mkBtn(); copyCode(b2);
+OUT["fallback"] = execLog.slice(); OUT["fallback_value"] = made[0].value; OUT["fallback_readonly"] = made[0].readOnly;
+OUT["fallback_ok_html"] = b2.innerHTML; OUT["fallback_src_hidden"] = ta.hidden;
+execRet = false; var b3 = mkBtn(); copyCode(b3);
+OUT["fallback_fail_html"] = b3.innerHTML;
 console.log("===DRAFT_JSON_START===");
 console.log(JSON.stringify(OUT));
 """ % {"bharadwaj": json.dumps(BHARADWAJ)}
@@ -103,12 +120,32 @@ class DraftCopyTests(unittest.TestCase):
 
     def test_copycode_uses_cpsrc_and_textarea_fallback(self):
         self.assertEqual(self.OUT["copied_clipboard"], ["No direct ViDA impact.\nHappy to pair.", "plain code"])
-        # no clipboard API: the textarea is un-hidden for select()+execCommand, then re-hidden
-        self.assertEqual(self.OUT["fallback"], ["select:hidden=false", "copy:hidden=false"])
-        self.assertTrue(self.OUT["fallback_rehidden"])
+        # no clipboard API: a fresh NON-readonly textarea is selected + copied, then removed (CF5)
+        self.assertEqual(self.OUT["fallback"], ["append", "select", "copy", "remove"])
+        self.assertEqual(self.OUT["fallback_value"], "draft text")
+        self.assertFalse(self.OUT["fallback_readonly"])
+        self.assertTrue(self.OUT["fallback_src_hidden"])           # the hidden readonly source is never touched
+        self.assertIn("Copied", self.OUT["fallback_ok_html"])
+        self.assertNotIn("Copied", self.OUT["fallback_fail_html"])  # execCommand returned false -> no false success
 
     def test_has_draft_quote_predicate(self):
-        self.assertEqual(self.OUT["has"], [True, False, False, False])
+        self.assertEqual(self.OUT["has"], [True, False, False, False, True, False])
+
+
+    def test_multi_paragraph_draft_copies_every_paragraph(self):
+        o = self.OUT["multi_para_noblank"]
+        self.assertEqual(self.n("multi_para_noblank", 'class="cblock dq"'), 1)
+        self.assertIn("<textarea class=cpsrc hidden readonly>Hi team,\n\nSecond para.</textarea>", o)
+        # a draft quote followed by prose, and an unlabelled split quote, keep their old shape
+        self.assertEqual(self.n("quote_then_prose", 'class="cblock dq"'), 1)
+        self.assertIn("<textarea class=cpsrc hidden readonly>Hi team,</textarea>", self.OUT["quote_then_prose"])
+        self.assertEqual(self.n("plain_split_quotes", "<blockquote class=mdq>"), 2)
+        self.assertEqual(self.n("plain_split_quotes", "cblock dq"), 0)
+
+    def test_has_draft_quote_agrees_with_mdblock_for_nested(self):
+        self.assertEqual(self.n("nested_md", "cblock dq"), 1)        # mdBlock renders a button...
+        self.assertTrue(self.OUT["has"][4])                          # ...so the predicate must say so
+        self.assertFalse(self.OUT["has"][5])
 
 
 class WiringTests(unittest.TestCase):

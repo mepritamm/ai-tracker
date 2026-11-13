@@ -184,7 +184,13 @@ function hasDraftQuote(s){
   let fence=false;
   for(let i=0;i<L.length;i++){
     if(/^\s*```/.test(L[i])){ fence=!fence; continue; }
-    if(!fence&&/^\s*>/.test(L[i])&&(i===0||!/^\s*>/.test(L[i-1]))&&draftLabelBefore(L,i)) return true;
+    if(!fence&&/^\s*>/.test(L[i])&&(i===0||!/^\s*>/.test(L[i-1]))){
+      if(draftLabelBefore(L,i)) return true;
+      const q=[]; let j=i;   // like mdBlock: look inside the quote for a nested draft
+      while(j<L.length&&/^\s*>/.test(L[j])){ q.push(L[j].replace(/^\s*>\s?/,"")); j++; }
+      if(hasDraftQuote(q.join("\n"))) return true;
+      i=j-1;
+    }
   }
   return false;
 }
@@ -228,11 +234,18 @@ function mdBlock(s){
     if(/^\s*\d+\.\s+/.test(l)){ const it=[];
       while(i<L.length&&/^\s*\d+\.\s+/.test(L[i])){ it.push(`<li>${md(L[i].replace(/^\s*\d+\.\s+/,""))}</li>`); i++; }
       out.push("<ol class=mdul>"+it.join("")+"</ol>"); continue; }
-    if(/^\s*>/.test(l)){ const start=i, q=[];
-      while(i<L.length&&/^\s*>/.test(L[i])){ q.push(L[i].replace(/^\s*>\s?/,"")); i++; }
+    if(/^\s*>/.test(l)){ const start=i, q=[], isDraft=draftLabelBefore(L,start);
+      while(i<L.length){
+        if(/^\s*>/.test(L[i])){ q.push(L[i].replace(/^\s*>\s?/,"")); i++; continue; }
+        if(isDraft&&!L[i].trim()){   // a draft split by bare blank lines is still ONE draft: keep collecting
+          let j=i; while(j<L.length&&!L[j].trim()) j++;
+          if(j<L.length&&/^\s*>/.test(L[j])){ q.push(""); i=j; continue; }
+        }
+        break;
+      }
       const raw=q.join("\n"), inner=mdBlock(raw);
       // a quote under a "draft" label (a drafted Slack/Jira/email reply) gets the code-block copy button
-      out.push(draftLabelBefore(L,start)
+      out.push(isDraft
         ? `<div class="cblock dq"><button class=codecopy onclick="copyCode(this)" title="Copy this draft">${ico('copy')} Copy</button><textarea class=cpsrc hidden readonly>${esc(raw)}</textarea><blockquote class=mdq>${inner}</blockquote></div>`
         : `<blockquote class=mdq>${inner}</blockquote>`); continue; }
     if(!l.trim()){ i++; continue; }
@@ -2401,15 +2414,20 @@ function copyModal(bodyId,btn){
   }else{fallbackCopy(el,done);}
 }
 function fallbackCopy(el,done){
-  if(el.tagName==="TEXTAREA"){   // hidden draft source: a Range can't select a hidden node, so un-hide + select() it (copyNote's technique)
-    el.hidden=false; el.select();
-    try{document.execCommand("copy");done();}catch(e){}
-    el.hidden=true; return;
+  let ok=false;
+  if(el.tagName==="TEXTAREA"){   // hidden readonly draft source: copy a FRESH non-readonly off-screen textarea (copyNote's technique) -- iOS can't select() a readonly one
+    const t=document.createElement("textarea"); t.value=el.value;
+    t.style.cssText="position:fixed;left:-9999px;top:0;opacity:0";
+    document.body.appendChild(t); t.select(); try{t.setSelectionRange(0,t.value.length);}catch(e){}
+    try{ok=document.execCommand("copy");}catch(e){}
+    document.body.removeChild(t);
+  }else{
+    const r=document.createRange();r.selectNodeContents(el);
+    const s=getSelection();s.removeAllRanges();s.addRange(r);
+    try{ok=document.execCommand("copy");}catch(e){}
+    s.removeAllRanges();
   }
-  const r=document.createRange();r.selectNodeContents(el);
-  const s=getSelection();s.removeAllRanges();s.addRange(r);
-  try{document.execCommand("copy");done();}catch(e){}
-  s.removeAllRanges();
+  if(ok)done();   // "Copied" only when the copy really happened
 }
 // per-code-block copy button (like docs sites) — copies just that block's raw text
 function copyCode(btn){

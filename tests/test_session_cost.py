@@ -109,6 +109,22 @@ class ClaudeCostTests(unittest.TestCase):
         self.assertEqual((row["in"], row["out"]), (10, 387))       # 287 (last wins) + the id-less line
         self.assertEqual(d["tokens"]["out"], 101)                   # existing count keeps first-seen (1 + 100)
 
+    def test_agent_last_usage_per_message_id_wins(self):
+        """SF1: the agent pass dedupes by message id, last usage wins (key at claude.py ~1265)."""
+        _write(self.main, self.rows(_asst("m1", {"input_tokens": 0, "output_tokens": 1})))
+        adir = os.path.join(self.d, "sess1", "subagents")
+        os.makedirs(adir)
+        _write(os.path.join(adir, "agent-x.jsonl"), [
+            {"type": "user", "message": {"role": "user", "content": "task x"}},
+            _asst("a1", {"input_tokens": 0, "output_tokens": 1}),
+            _asst("a1", {"input_tokens": 0, "output_tokens": 120}),
+            _asst("a1", {"input_tokens": 0, "output_tokens": 287}),
+            _asst(None, {"input_tokens": 0, "output_tokens": 100})])
+        c = C.parse_session(self.main)["cost"]
+        row = [r for r in c["models"] if r["who"] == "agents"][0]
+        self.assertEqual(row["out"], 387)                           # 287 (last wins) + the id-less line
+        self.assertAlmostEqual(c["agents_usd"], 387 * 20.0 / 1e6, places=4)   # opus out price per 1M
+
     def test_cost_state_reported_only_when_after_last_usage(self):
         cs = lambda usd, unk=False: {"type": "cost-state", "sessionId": "s", "totalCostUSD": usd,
                                      "hasUnknownModelCost": unk}
@@ -183,7 +199,26 @@ class AuggieCostTests(unittest.TestCase):
     def test_auggie_bad_cost_string_skipped(self):
         self.session(cost="n/a", sub=None)
         c = A.parse_auggie("c1")["cost"]
-        self.assertEqual((c["main_usd"], c["agents_usd"], c["total_usd"]), (0.0, 0.0, 0.0))
+        self.assertIsNone(c["main_usd"])          # usage but no parseable billing: unpriced, never $0
+        self.assertIsNone(c["total_usd"])
+
+    def test_auggie_no_usage_no_sub_total_is_null(self):
+        """CF1: a session with no exchanges and no subAgentCostUsd must not report $0.00."""
+        with open(os.path.join(config.AUGGIE_SESSIONS, "c1.json"), "w") as fh:
+            json.dump({"sessionId": "c1", "modified": "2026-06-27T05:48:03Z", "chatHistory": []}, fh)
+        A._AUGGIE_LIST_CACHE.clear()
+        c = A.parse_auggie("c1")["cost"]
+        self.assertIsNone(c["total_usd"])
+        self.assertIsNone(c["main_usd"])
+
+    def test_auggie_sub_only_still_priced(self):
+        with open(os.path.join(config.AUGGIE_SESSIONS, "c1.json"), "w") as fh:
+            json.dump({"sessionId": "c1", "modified": "2026-06-27T05:48:03Z", "chatHistory": [],
+                       "subAgentCostUsd": 1.5}, fh)
+        A._AUGGIE_LIST_CACHE.clear()
+        c = A.parse_auggie("c1")["cost"]
+        self.assertIsNone(c["main_usd"])
+        self.assertEqual(c["total_usd"], 1.5)
 
 
 class SeamTests(unittest.TestCase):
@@ -201,6 +236,21 @@ class SeamTests(unittest.TestCase):
         self.assertIn("No per-turn usage", d["cost"]["note"])
         self.assertIsNone(d["job"])
         self.assertEqual(d["headline"]["mode"], config.HEADER_LINE)
+
+    def test_fork_note_on_provider_without_cost(self):
+        """SF2: a provider with no `cost` key + a truthy continued_from must not KeyError."""
+        from tests.test_augment_ext import _mk_workspace
+        snap = config.VSCODE_WS_ROOT
+        config.VSCODE_WS_ROOT = tempfile.mkdtemp()
+        self.addCleanup(setattr, config, "VSCODE_WS_ROOT", snap)
+        self.addCleanup(shutil.rmtree, config.VSCODE_WS_ROOT, True)
+        _mk_workspace(config.VSCODE_WS_ROOT, "wshash1", "file:///Users/me/proj",
+                      tasks=[{"uuid": "root", "name": "Current Task List", "state": "NOT_STARTED", "subTasks": []}])
+        orig = registry.fork_parent_of
+        registry.fork_parent_of = lambda sid: "p"
+        self.addCleanup(setattr, registry, "fork_parent_of", orig)
+        d = registry.parse_any("augment-vscode:wshash1:root")
+        self.assertIn("copied", d["cost"]["note"])
 
     def test_continued_session_cost_note(self):
         d = tempfile.mkdtemp()
