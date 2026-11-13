@@ -1,7 +1,7 @@
 import glob, json, os, re, time
 from ..config import NARRATION_CAP
 from .. import config
-from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase
+from ..util import _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, push_when, PR_CREATE_RE, unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase, cost_add, cost_summary
 from ..overview import build_overview, build_heartbeat, empty_heartbeat
 from ..store import load_titles, load_tasks, load_notes
 from .base import Provider
@@ -523,6 +523,11 @@ def _degraded_auggie_detail(session_id, f):
     }
 
 
+def _sub_agent_usd(d):
+    v = d.get("subAgentCostUsd")
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+
+
 def parse_auggie(session_id):
     d, f = _load_auggie(session_id)
     if d is None:
@@ -549,6 +554,7 @@ def parse_auggie(session_id):
     task_times = {}   # chat-side task id -> {"started","ended"} (ISO), from update_tasks' own
                        # tool_use input — the name-matched fallback for started_at/ended_at (~ Claude's task_times)
     tok_in = tok_out = 0
+    cost_tok, rec_usd = {}, 0.0   # cost: priced token acc (savings/breakdown) + what Augment BILLED
     hb_turns, hb_calls = [], []   # heartbeat inputs: one turn per token_usage block, one call per tool_use
     ctx_current = ctx_limit = None  # LATEST turn's occupancy + the session's own context-window size
     def _cprs(text, narr=False):  # collect PRs + note which exchange each URL first showed up in
@@ -588,8 +594,15 @@ def parse_auggie(session_id):
                     if n:
                         name_to_ids.setdefault(n, set()).add(tid)
         for rn in ex.get("response_nodes") or []:
+            bm = rn.get("billing_metadata")         # billed $ sits on a DIFFERENT node than token_usage
+            if isinstance(bm, dict):
+                try:
+                    rec_usd += float(bm.get("cost_usd") or 0)
+                except (TypeError, ValueError):
+                    pass                            # a non-numeric string contributes 0, never raises
             tu = rn.get("token_usage")
             if isinstance(tu, dict):                # tokens: mirror Claude (input + cache)
+                cost_add(cost_tok, ex.get("model_id") or "", tu)
                 tok_in += ((tu.get("input_tokens") or 0) + (tu.get("cache_read_input_tokens") or 0)
                            + (tu.get("cache_creation_input_tokens") or 0))
                 tok_out += tu.get("output_tokens") or 0
@@ -767,6 +780,10 @@ def parse_auggie(session_id):
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": latest[:2000],
         "tokens": {"in": tok_in, "out": tok_out},
+        # what Augment BILLED (~1.3x Anthropic list price) + the sub-agents' own recorded total;
+        # cache savings stay at Anthropic list price (cost_summary).
+        "cost": cost_summary(cost_tok, {}, [], recorded=(rec_usd, _sub_agent_usd(d)),
+                             note="Billed by Augment (about 1.3\u00d7 Anthropic list price). Cache savings are at Anthropic list price."),
         "heartbeat": build_heartbeat(hb_turns, hb_calls, None, None,
                                      "Auggie logs no per-tool timing — tools ranked by calls."),
         "context": context_window(ctx_current, ctx_limit),

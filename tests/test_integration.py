@@ -1461,7 +1461,7 @@ console.log("===URL_JSON_START===" + JSON.stringify({classic_claude: mdBlock(C),
 
     def test_goal_line_is_inline_markdown_and_link_clicks_do_not_toggle(self):
         page = self._get("/")
-        self.assertIn('goalEl.innerHTML = typeof md === "function" ? md(goalText) : esc(goalText)', page)
+        self.assertIn('var body = typeof md === "function" ? md(goalText) : esc(goalText);', page)
         self.assertNotIn("goalEl.textContent = goalText", page)
         self.assertIn('if (!ev.target.closest("a") && !String(window.getSelection()', page)
 

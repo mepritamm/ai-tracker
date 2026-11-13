@@ -217,7 +217,7 @@
     // upgradeMermaidIn() — see setPanelBody() below and renderTimelineEntries()
     // above, which already call it. Fence-free text keeps the original
     // inline-only path, unchanged.
-    if (text && text.indexOf("```") !== -1) {
+    if (text && (text.indexOf("```") !== -1 || (typeof hasDraftQuote === "function" && hasDraftQuote(text)))) {
       try {
         if (typeof mdBlock === "function") return mdBlock(text);
       } catch (e) {}
@@ -1025,9 +1025,14 @@
     // .crd-cmd-text mono, …) rather than each .crd-* rule redeclaring it.
     var cls = "crd-statchip mono" + (opts.tint ? " crd-statchip-" + opts.tint : "");
     var title = opts.title ? ' title="' + esc(opts.title) + '"' : "";
-    return '<span class="' + cls + '"' + title + '>' +
-      '<span class="crd-statchip-label">' + esc(label) + "</span> " +
-      '<span class="crd-statchip-val">' + esc(value) + "</span></span>";
+    var inner = '<span class="crd-statchip-label">' + esc(label) + "</span> " +
+      '<span class="crd-statchip-val">' + esc(value) + "</span>";
+    // opts.act: a real <button> (keyboard + touch), same look as its sibling spans
+    if (opts.act) {
+      return '<button type="button" class="' + cls + ' crd-statchip-' + esc(opts.act) + '" data-act="' +
+        esc(opts.act) + '"' + title + ">" + inner + "</button>";
+    }
+    return '<span class="' + cls + '"' + title + ">" + inner + "</span>";
   }
 
   function statChipsHtml(session) {
@@ -1056,6 +1061,8 @@
       testsVal = String(testsTotal);
     }
 
+    // cost: the server owns the number; the chip only exists when there was usage to price
+    var costTxt = (typeof costChipText === "function") ? costChipText(session.cost) : "";
     return [
       statChip("files", filesN != null ? String(filesN) : STAT_CHIP_MISSING),
       statChip("commands", cmdsN != null ? String(cmdsN) : STAT_CHIP_MISSING),
@@ -1063,6 +1070,7 @@
       statChip("commits", commitsN != null ? String(commitsN) : STAT_CHIP_MISSING),
       statChip("tests", testsVal, testsFailing ? { tint: "failing" } : {}),
       statChip("tokens", tokTotal != null ? fmtNum(tokTotal) : STAT_CHIP_MISSING),
+      costTxt ? statChip("cost", costTxt, { act: "cost", title: "Cost breakdown: burned, saved by caching, agents" }) : "",
       statChip("branch", branch || STAT_CHIP_MISSING)
     ].join("");
   }
@@ -1227,6 +1235,22 @@
   // blocked site data) and the note must still render correctly without it.
   function titleNoteKey(sid, title) {
     return "cr.titleNote." + sid + "." + (title || "");
+  }
+
+  // The line under the name: the server's `headline` (a background job's own one-line summary, else the
+  // latest narration -- config HEADER_LINE) with its band pill ("Needs input" / "Working" / "Completed").
+  function paintGoalLine(node, session) {
+    var hl = session.headline || {};
+    var goalText = hl.text || "";
+    var goalEl = qs(node, ".crd-goalline");
+    if (!goalEl) return;
+    goalEl.hidden = !goalText;
+    // inline md() (not mdHtml): a one-line clamp must never become a fence block
+    var body = typeof md === "function" ? md(goalText) : esc(goalText);
+    goalEl.innerHTML = (hl.label ? '<span class="crd-hl-band crd-hl-' + esc(hl.band || "") +
+      (hl.state === "failed" ? " crd-hl-failed" : "") + '">' + esc(hl.label) + "</span> " : "") + body;
+    goalEl.setAttribute("data-act", "toggle-goal");
+    goalEl.title = "Click to expand / collapse" + (hl.label ? " \u00b7 " + hl.label : "");
   }
 
   function paintTitleNote(node, session) {
@@ -1778,6 +1802,9 @@
       switch (act) {
         case "back":
           ctx.go("board");
+          break;
+        case "cost":
+          if (typeof openCostModal === "function") openCostModal((ui.lastSession || {}).cost || {});
           break;
         case "toggle-goal":
           // don't collapse while the user is selecting text to copy
@@ -2452,15 +2479,7 @@
     // there's nothing to show, same honest-degrade convention as the rest of
     // this header.
     qs(node, ".crd-goal").textContent = sessionName;
-    var goalText = (session.overview && session.overview.goal) || "";
-    var goalEl = qs(node, ".crd-goalline");
-    if (goalEl) {
-      goalEl.hidden = !goalText;
-      // inline md() (not mdHtml): the raw last prompt in a one-line clamp must never become a fence block
-      goalEl.innerHTML = typeof md === "function" ? md(goalText) : esc(goalText);
-      goalEl.setAttribute("data-act", "toggle-goal");
-      goalEl.title = "Click to expand / collapse";
-    }
+    paintGoalLine(node, session);
     paintTitleNote(node, session);
     qs(node, ".crd-rename .crd-ico").innerHTML = svgIcon(ctx, "edit");
     var mapIco = qs(node, ".crd-mapbtn .crd-ico");

@@ -48,7 +48,7 @@ def _run():
         # "effort" is a TOP-LEVEL field of the record, a sibling of "message" -- never nested
         # inside it (confirmed against a real ~/.claude/projects/*/*.jsonl transcript).
         {"type": "assistant", "timestamp": "2026-06-22T10:00:00.000Z", "effort": "high",
-         "message": {"usage": {"input_tokens": 100, "output_tokens": 20},
+         "message": {"usage": {"input_tokens": 100, "output_tokens": 20}, "model": "claude-opus-5-5",
                      "content": [
                          {"type": "text", "text": "starting"},
                          {"type": "tool_use", "name": "TodoWrite",
@@ -75,6 +75,8 @@ def _run():
         f.write("garbage not json\n")  # must be skipped, not crash
         path = f.name
     d = parse_session(path)
+    # cost: the fixture's one usage block, priced at opus-5-5 list (100 in * $4 + 20 out * $20, per MTok)
+    assert abs(d["cost"]["total_usd"] - 0.0008) < 1e-9 and d["cost"]["agents_usd"] is None, d["cost"]
     df = file_diffs(path, "/x/proj/foo.py")  # before unlink — reads the file again
     co = command_output(path, "t1")
     os.unlink(path)
@@ -431,12 +433,14 @@ def _run():
                    "chatHistory": [{"finishedAt": "2026-06-27T05:47:50Z",
                                     "exchange": {"request_message": "list the dir",
                                                  "response_text": "I'll list it. " + "Z" * 2000,
+                                                 "model_id": "claude-opus-4-7-500k",
                                                  "request_nodes": [{"ide_state_node": {"current_terminal": {
                                                      "current_working_directory": "/work/dw-stack"}}}],
                                                  "response_nodes": [
                                                      {"token_usage": {"input_tokens": 10, "output_tokens": 20,
                                                                       "cache_read_input_tokens": 100,
                                                                       "max_context_tokens": 550}},
+                                                     {"billing_metadata": {"cost_usd": "1.5"}},
                                                      # input_json is a JSON *string* in every real log (0/3882
                                                      # nodes on this machine carry it as a dict) — these three
                                                      # match that real shape like the edit-tool nodes below do.
@@ -475,6 +479,7 @@ def _run():
         (2, 1, "step two", 1), al[0]  # s2 is in_progress at index 1, not 0 -- pins the index, not just the label
     assert al[0]["title"] == "List Home Dir", al                       # customTitle wins
     pa = parse_auggie("sess1")
+    assert pa["cost"]["total_usd"] == 1.5 and pa["cost"]["basis"] == "Billed by Augment, USD", pa["cost"]   # billed $, not a recompute
     assert pa and pa["counts"]["done"] == 1 and pa["counts"]["todos"] == 2, pa   # todos via rootTaskUuid
     assert [r["text"] for r in pa["requests"]] == ["list the dir"], pa["requests"]
     _narr = next((n for n in pa["narrative"] if "list it" in n["text"].lower()), None)
@@ -1215,6 +1220,12 @@ def _run():
     dft_auggie = parse_any("auggie:sess1")
     assert dft_auggie["flag_text"] == "auggie flag text", dft_auggie["flag_text"]
     dft_done = parse_any("s_done")
+    # header line: both providers carry `headline` + `cost` from the shared seam (default mode "summary";
+    # neither fixture is a background job, so both fall back to their newest narration)
+    for _hd in (dft_wait, dft_auggie):
+        assert _hd["headline"]["mode"] == "summary" and _hd["headline"]["source"] in ("narration", "none"), _hd["headline"]
+        assert "total_usd" in _hd["cost"] and _hd["job"] is None
+    assert dft_auggie["headline"]["source"] == "narration" and dft_auggie["headline"]["text"], dft_auggie["headline"]
     assert dft_done["flag_text"] is None, "detail dict: no open flag -> honestly None"
     os.unlink(config.FLAGS_FILE)
 

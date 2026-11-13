@@ -1,7 +1,7 @@
 import glob, json, os, re, subprocess, threading, time
 from ..config import EDIT_TOOLS, NARRATION_CAP
 from .. import config
-from ..util import file_pass, _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, pr_summary, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase, real_model, model_label
+from ..util import file_pass, _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, pr_summary, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase, real_model, model_label, cost_add, cost_summary, _cost_merge, _acc_usd
 from ..overview import build_overview, build_heartbeat
 from ..store import load_titles, load_tasks, load_notes, _TSTATUS
 from .base import Provider
@@ -744,6 +744,80 @@ def _blocked_jobs():
     return out
 
 
+BAND_LABEL = {"done": "Completed", "blocked": "Needs input", "working": "Working"}
+
+
+def _job_fields(path):
+    """Pure fn of one state.json (cached via util.file_pass): only the fields the header needs."""
+    with open(path) as fh:
+        st = json.load(fh)
+    if not isinstance(st, dict):
+        return None
+    n = st.get("needs")
+    if isinstance(n, dict):
+        n = n.get("question")
+    res = (st.get("output") or {}).get("result") if isinstance(st.get("output"), dict) else None
+    s = lambda v: v.strip() if isinstance(v, str) and v.strip() else ""
+    return {"ids": [x for x in (st.get("sessionId"), st.get("resumeSessionId")) if isinstance(x, str) and x],
+            "state": s(st.get("state")), "tempo": s(st.get("tempo")), "detail": s(st.get("detail"))[:400],
+            "needs": s(n)[:400], "result": s(res)[:400], "updated": s(st.get("updatedAt"))}
+
+
+def _job_band(f):
+    """Claude Code's job-list group, minus the two inputs that aren't on disk ("Ready for review"
+    needs live GitHub PR checks; the live worker's busy/waiting status). Never returns "review"."""
+    if f["state"] in ("done", "failed", "stopped") and f["tempo"] != "active":
+        return "done"
+    return "blocked" if f["tempo"] == "blocked" else "working"
+
+
+def job_for(sid, live):
+    """The background job whose sessionId OR resumeSessionId is `sid`, as the header shape, else None.
+    Direct dir sid[:8] first (the common case, O(1)); else scan JOBS_DIR (resumed jobs). `live` is
+    _live_daemon_shorts(): a non-"done" band whose job dir isn't live loses its pill (the text
+    stays: a dead job's detail is still its right summary). Never raises."""
+    if not isinstance(sid, str) or not sid:
+        return None
+    root = config.JOBS_DIR
+    hit = None
+
+    def read(short):
+        if not safe_path_component(short):
+            return None
+        try:
+            f = file_pass("claude.jobstate", os.path.join(root, short, "state.json"), _job_fields)
+        except (OSError, ValueError):
+            return None
+        return f if f and sid in f["ids"] else None
+
+    f = read(sid[:8])
+    if f:
+        hit = (sid[:8], f)
+    else:
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            names = []
+        for short in names:
+            if short == sid[:8]:
+                continue
+            f = read(short)
+            if f:
+                hit = (short, f)
+                break
+    if not hit:
+        return None
+    short, f = hit
+    band = _job_band(f)
+    label = BAND_LABEL[band]
+    if band != "done" and short not in live:
+        band = label = None
+    elif f["state"] in ("failed", "stopped"):
+        label += " \u00b7 " + f["state"]
+    return {"band": band, "label": label, "detail": f["detail"], "needs": f["needs"],
+            "result": f["result"], "state": f["state"], "updated": f["updated"] or None}
+
+
 def list_sessions(limit=200):
     fs = glob.glob(os.path.join(config.PROJECTS, "*", "*.jsonl"))
     fs.sort(key=os.path.getmtime, reverse=True)
@@ -1128,6 +1202,14 @@ def _agent_cache_on():
     return not os.environ.get("AITRACKER_NO_AGENT_CACHE")
 
 
+def _cost_acc(cost_last):
+    """{message.id: (model, speed, usage)} -> a cost acc (util.cost_add), last usage per id."""
+    acc = {}
+    for m_, sp_, u_ in cost_last.values():
+        cost_add(acc, m_, u_, sp_)
+    return acc
+
+
 def _agent_file_pass(af, mt):
     """One agent transcript -> a self-contained entry holding ONLY that file's data (never
     anything cross-file or time-derived), so it can be cached by (mtime, size, sidecar mtime)
@@ -1140,6 +1222,7 @@ def _agent_file_pass(af, mt):
     pr_ids = set()    # tool_use_ids of `gh pr create`/MCP-create in THIS agent → its result URL = created
     aid = os.path.basename(af)[6:-6]
     seen_mid, use_t = set(), {}       # heartbeat: per-file usage dedup + tool_use id -> (name, epoch)
+    cost_last = {}                    # message.id -> (model, speed, usage): LAST line wins (cost)
     hbl = {"turns": [], "calls": [], "iv": {}, "labels": {}}
     files, prs, pst, spawned = {}, {}, {}, {}
     segs, seg_start, last_msg_ep = [], None, 0.0
@@ -1179,6 +1262,7 @@ def _agent_file_pass(af, mt):
                         seg_start = ep
                 if m.get("usage"):
                     ctx_tok = _ctx_occupancy(m["usage"])
+                    cost_last[m.get("id") or ("_%d" % len(cost_last))] = (m.get("model"), m["usage"].get("speed"), m["usage"])
                 mv = real_model(m.get("model"))   # same "latest wins, skip the synthetic sentinel" rule as _tail_scan
                 if mv:
                     model = mv
@@ -1243,7 +1327,7 @@ def _agent_file_pass(af, mt):
     hbl["labels"][aid] = (" ".join(task.split())[:60] or "agent " + aid[:7], model)
     sd = sc.get("spawnDepth")
     return {
-        "mt": mt, "aid": aid, "hb": hbl, "files": files, "prs": prs, "pst": pst, "spawned": spawned,
+        "mt": mt, "aid": aid, "hb": hbl, "cost": _cost_acc(cost_last), "files": files, "prs": prs, "pst": pst, "spawned": spawned,
         "segs": segs, "open_start": seg_start, "last_msg_ep": last_msg_ep,
         "n_stop": n_stop, "stop_after": stop_after, "stop_ts": stop_ts, "last_ts": last_ts,
         "finished": sc.get("finished") is True, "tuid": s_str("toolUseId"),
@@ -1301,12 +1385,13 @@ def _agent_entry(af):
     return st.st_mtime, e
 
 
-def parse_agents(path, hb=None):
+def parse_agents(path, hb=None, cost=None):
     """Parse background-agent transcripts: what each one is, doing, and whether it's live.
     Also harvests PRs the agents generated (a `gh pr create`/MCP in a subagent) + their state,
     so a PR opened by a background agent is attributed to the session — not lost with the subagent.
     `hb` (optional out-param, a dict with turns/calls/iv/labels) is filled for the heartbeat from
     the SAME per-file pass — no extra file read; the return value is unchanged in shape.
+    `cost` (optional out-param, {"tok": acc, "per": []}) gets each agent's priced usage the same way.
     Each file is parsed once into a cached entry (see _agent_file_pass); this merges the entries in
     sorted-path order into FRESH accumulators, so the cached entries are never mutated and the
     result is identical to a cold parse. Cross-file / time-derived fields (parent, depth, running,
@@ -1326,6 +1411,9 @@ def parse_agents(path, hb=None):
             continue
         entries.append(e)
         spawned.update(e["spawned"])
+        if cost is not None:
+            _cost_merge(cost["tok"], e["cost"])
+            cost["per"].append((e["aid"], e["row"]["desc"], _acc_usd(e["cost"])))
         if hb is not None:
             h = e["hb"]
             hb["turns"].extend(h["turns"])
@@ -1624,7 +1712,7 @@ def agent_detail(path, aid):
 
 # The names that cross the split (derived with an `ast` walk: free in the assembly half, bound in
 # the pass half; `todos` is bound in both, the pass value survives when neither branch rebinds it).
-_PASS_NAMES = ("agents", "asks", "cmds", "commits", "ctx_current", "fail_cmd", "files", "hb_calls",
+_PASS_NAMES = ("agents", "asks", "cmds", "commits", "cost_state", "cost_tok", "ctx_current", "fail_cmd", "files", "hb_calls",
                "hb_desc", "hb_iv", "hb_turns", "meta", "n_search", "narrative", "parse_error",
                "pr_states", "prs", "reads", "requests", "t_first", "t_last", "task_defs",
                "task_order", "task_status", "task_times", "tests", "text_last", "todos", "tok_in",
@@ -1675,6 +1763,8 @@ def _transcript_pass(path):
     # EACH carrying the whole message's usage block -> summing per line overcounts 2-4x. Add a
     # message's usage once per message.id (id-less lines still sum). Gates ONLY the usage add.
     seen_mid = set()
+    cost_last = {}    # message.id -> (model, speed, usage): LAST line wins (cost; `tokens` keeps first-seen)
+    cost_state = None  # Claude Code's own exit-time cost line, valid only if written after the last usage
     hb_desc = {}   # agentId -> Agent-call description (from toolUseResult)
     hb_turns, hb_calls, hb_iv, use_t = [], [], {}, {}   # heartbeat inputs (see overview.build_heartbeat)
     n_search = 0
@@ -1713,11 +1803,18 @@ def _transcript_pass(path):
             r_ = o.get("toolUseResult")
             if isinstance(r_, dict) and r_.get("agentId") and r_.get("description"):
                 hb_desc[r_["agentId"]] = r_["description"]   # the Agent call's short label (heartbeat by_agent)
+            if o.get("type") == "cost-state":
+                tc_ = o.get("totalCostUSD")
+                cost_state = {"usd": tc_ if isinstance(tc_, (int, float)) and not isinstance(tc_, bool) else None,
+                              "unknown": bool(o.get("hasUnknownModelCost"))}
             msg = o.get("message")
             if not isinstance(msg, dict):
                 continue
             u = msg.get("usage") or {}
             mid = msg.get("id")
+            if u:
+                cost_last[mid or ("_%d" % line_no)] = (msg.get("model"), u.get("speed"), u)
+                cost_state = None
             ep = None     # this line's epoch, computed at most once and only when something needs it
             if u and not (mid and mid in seen_mid):
                 if mid:
@@ -1905,12 +2002,13 @@ def _transcript_pass(path):
     for c in cmds:
         c["ok"] = not errors_by_id.get(c["id"], False)
     tests = [c for c in cmds if c["kind"] == "test"]
+    cost_tok = _cost_acc(cost_last)
     return {k: v for k, v in locals().items() if k in _PASS_NAMES}
 
 
 def parse_session(path):
     _p = file_pass("claude.transcript", path, _transcript_pass)
-    (agents, asks, cmds, commits, ctx_current, fail_cmd, files, hb_calls, hb_desc, hb_iv, hb_turns,
+    (agents, asks, cmds, commits, cost_state, cost_tok, ctx_current, fail_cmd, files, hb_calls, hb_desc, hb_iv, hb_turns,
      meta, n_search, narrative, parse_error, pr_states, prs, reads, requests, t_first, t_last,
      task_defs, task_order, task_status, task_times, tests, text_last, todos, tok_in, tok_out) = (
         _p[k] for k in _PASS_NAMES)
@@ -1952,7 +2050,8 @@ def parse_session(path):
         t["ended_at"] = _ts_epoch(tt["ended"]) if tt and tt["ended"] and t.get("status") == "completed" else None
     done_todos = [t for t in todos if t.get("status") == "completed"]
     hb_ag = {"turns": hb_turns, "calls": hb_calls, "iv": hb_iv, "labels": {}}   # parse_agents appends who=aid rows
-    agents_bg, newest_agent, agent_files, agent_prs, agent_pr_states = parse_agents(path, hb_ag)
+    agent_cost = {"tok": {}, "per": []}
+    agents_bg, newest_agent, agent_files, agent_prs, agent_pr_states = parse_agents(path, hb_ag, agent_cost)
     for aid_, d_ in hb_desc.items():   # prefer the short Agent description over the prompt-prefix label
         if aid_ in hb_ag["labels"] and " ".join(d_.split()):
             hb_ag["labels"][aid_] = (" ".join(d_.split())[:60], hb_ag["labels"][aid_][1])
@@ -2040,6 +2139,11 @@ def parse_session(path):
         "narrative": narrative[::-1],   # full, newest-first; /api/session pages it, /api/narration serves the tail
         "message": text_last[:2000],
         "tokens": {"in": tok_in, "out": tok_out},
+        # the background job (~/.claude/jobs/<sid8>/state.json) this session is, or None; see job_for
+        "job": job_for(sid, _live_daemon_shorts()),
+        # $ burned: main transcript + its background agents (list-price recompute), plus Claude Code's own
+        # exit-time figure when one trails the last usage line. See util.cost_summary for the shape.
+        "cost": cost_summary(cost_tok, agent_cost["tok"], agent_cost["per"], reported=cost_state),
         # current context occupancy (this turn), not cumulative — Claude's JSONL usage
         # blocks never state a context-window size, so `limit`/`pct` stay honestly None.
         "context": context_window(ctx_current, None),

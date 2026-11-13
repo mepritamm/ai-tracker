@@ -1,4 +1,5 @@
 import shlex
+from . import config
 import time
 
 from .providers.claude import ClaudeProvider
@@ -9,8 +10,8 @@ from .providers.augment_ext import AugmentVscodeProvider, AugmentCursorProvider
 # `make bundle` emits a file that won't parse.
 from .store import load_pins, load_notes, load_flags, load_forks, resolve_fork_child, fork_parent_of, load_model_keep, load_titles, load_title_sync
 from .gateway import gateway_of, model_meta, or_launcher
-from .util import annotate_liveness, model_version, model_label
-from .overview import empty_heartbeat
+from .util import annotate_liveness, model_version, model_label, cost_summary
+from .overview import empty_heartbeat, headline
 
 
 PROVIDERS = [ClaudeProvider(), AuggieProvider(),
@@ -175,6 +176,8 @@ def parse_any(sid):
     # with no extra round trip.
     d["continued_as"] = resolve_fork_child(sid)
     d["continued_from"] = fork_parent_of(sid)
+    if d["continued_from"]:   # a fork copies its parent's history, so its transcript $ includes it
+        d["cost"]["note"] = ((d["cost"].get("note") or "") + " Includes history copied from the session it continues.").strip()
     # Links-panel liveness: mark each `files` entry with `alive` (local path still on
     # disk, or unconditionally True for a remote URL) and de-dupe by normalized path --
     # see util.annotate_liveness for why this lives HERE (the one seam both providers'
@@ -206,6 +209,9 @@ def parse_any(sid):
     # this setdefault is the seam's defensive guarantee that the key ALWAYS exists even for
     # a provider that never sets it, not a second implementation of the check itself.
     d.setdefault("parse_error", None)
+    d.setdefault("cost", cost_summary({}, {}, [], note="No per-turn usage recorded for this source."))
+    d.setdefault("job", None)   # Auggie/Augment ext: no background-job concept -> honest None
+    d["headline"] = headline(d, config.HEADER_LINE)   # the detail header's one line (server owns the policy)
     # pinned/open_flags/note_count: same shared seam as all_sessions() above, same store.py
     # helpers, one implementation for every provider. Without this the detail header (pinned
     # pill, 🚩 count) has nothing to read and hides — these three small JSON files are already

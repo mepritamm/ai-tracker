@@ -395,6 +395,14 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid var(--line)}
 .msgbody .cblock .mdpre{margin:0}
 .codecopy{position:absolute;top:6px;right:6px;z-index:2;font:600 11px/1 'JetBrains Mono',monospace;color:var(--muted);background:var(--card);border:1px solid var(--line3);border-radius:6px;padding:5px 8px;cursor:pointer;opacity:.9}
 .codecopy:hover{opacity:1;border-color:var(--blue);color:var(--head)}
+.msgbody .mdq{margin:0 0 11px;padding:2px 0 2px 10px;border-left:3px solid var(--line3);color:var(--muted)}
+.msgbody .mdq .mdp:last-child{margin-bottom:0}
+.msgbody .cblock.dq .mdq{padding-right:72px;margin-bottom:0}
+/* the job-summary / narration headline line in the Overview card: band pill */
+.hlband{display:inline-block;font:600 10.5px/1 'JetBrains Mono',monospace;padding:3px 7px;border-radius:999px;border:1px solid var(--line3);color:var(--muted);vertical-align:1px}
+.hlband.hl-blocked{color:var(--amber);border-color:var(--amber-line);background:var(--amber-bg)}
+.hlband.hl-working{color:var(--green);border-color:var(--green-line);background:var(--green-bg)}
+.hlband.hl-failed{color:var(--red);border-color:var(--red-line);background:var(--red-bg)}
 .codecopy.ok{color:var(--green);border-color:var(--green-line);opacity:1}
 /* mermaid flowcharts rendered inline (mermaidSvg in app.js) — themed via tokens so
    light/dark both read; a classDef fill/stroke/color in the diagram overrides them */

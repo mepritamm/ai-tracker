@@ -234,6 +234,14 @@
   overflow: hidden;
   cursor: pointer;
 }
+/* the job-summary band pill sits INSIDE the goal line (wraps/clamps with it) */
+.cr .crd-hl-band {
+  display: inline-block; font: 600 10.5px/1 var(--font-mono); padding: 3px 7px; border-radius: 999px;
+  border: 1px solid var(--line-subtle); color: var(--text-muted); vertical-align: 1px;
+}
+.cr .crd-hl-band.crd-hl-blocked { background: var(--surface-awaiting); border-color: var(--line-awaiting); color: var(--text-awaiting); }
+.cr .crd-hl-band.crd-hl-working { background: var(--surface-agent-quiet); border-color: var(--line-agent); color: var(--text-thinking); }
+.cr .crd-hl-band.crd-hl-failed { background: var(--surface-failed); border-color: var(--line-failed); color: var(--text-failed); }
 .cr .crd-goalline.crd-goal-open {
   display: block;
   -webkit-line-clamp: unset;
@@ -317,6 +325,9 @@
   border: 1px solid var(--line-subtle);
   font-size: 11.5px;
 }
+/* the cost chip is a real <button> (keyboard + touch) that looks like its siblings */
+.cr button.crd-statchip-cost { font: inherit; font-size: 11.5px; color: inherit; cursor: pointer; }
+.cr button.crd-statchip-cost:hover { border-color: var(--text-link); }
 .cr .crd-statchip-label { color: var(--text-muted); }
 .cr .crd-statchip-val { color: var(--text-primary); }
 /* doc: "tests is the only chip that changes colour — brick surface/border/text
@@ -1526,6 +1537,9 @@
   border-color: var(--line-default);
 }
 .cr .codecopy:hover { border-color: var(--text-link); color: var(--text-primary); }
+.cr .mdq { margin: 0 0 9px; padding: 2px 0 2px 10px; border-left: 3px solid var(--line-subtle); color: var(--text-muted); }
+.cr .mdq .mdp:last-child { margin-bottom: 0; }
+.cr .cblock.dq .mdq { padding-right: 72px; margin-bottom: 0; }
 .cr .codecopy.ok { color: var(--text-link); border-color: var(--text-link); }
 .cr .mmd { background: var(--surface-sunken); border: 1px solid var(--line-default); }
 
@@ -1876,7 +1890,8 @@
      the desktop header. Row 3 is desktop/tablet only; follow the doc and hide
      it below the phone breakpoint rather than let it show through the
      (unhidden, pre-existing) desktop header on phone. */
-  .cr .crd-statchips { display: none; }
+  .cr .crd-statchips > .crd-statchip:not(.crd-statchip-cost) { display: none; }
+  .cr .crd-statchip-cost { cursor: pointer; min-height: 44px; }
 
   /* The window chips stay on EVERY viewport -- they are the control that makes a
      long session readable, and a phone is exactly where you triage one. They

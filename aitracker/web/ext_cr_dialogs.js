@@ -858,6 +858,7 @@
   // matches the exact env var name each key falls back to per config.py's own _ENV_NAME.
   var _ENVCHIP = {
     LIVE_WINDOW: null,   // never had an env var of its own — config.json > built-in default
+    HEADER_LINE: null,   // ditto
     ICON_STYLE: null,    // ditto — no env var, config.json > built-in default
     ICON_SCALE: null,    // ditto — no env var, config.json > built-in default
     TERM_RENDERER: 'TRACKER_TERM_RENDERER',
@@ -1327,6 +1328,11 @@
           'How long a session with no new activity still counts as "live" before it shows as done. Applies to the server at once; open pages pick it up on reload.',
           function (value, onCommit) {
             return sliderCtlCommit(30, 1800, value != null ? value : 300, onCommit, 's');
+          }));
+        body.appendChild(serverRow('Header line', 'HEADER_LINE',
+          'What the line under the session name shows: a background job\'s one-line status (falls back to the latest narration when the session isn\'t a job), or always the latest narration.',
+          function (value, onCommit) {
+            return segmented([['summary', 'Job summary'], ['narration', 'Narration']], value || 'summary', onCommit);
           }));
         body.appendChild(serverRow('Session snapshot TTL', 'SNAPSHOT_TTL_MIN',
           'How old a cached session may be and still show, labelled, while it refreshes after a switch — and how long a page whose updates are failing stays up before it says so. The slider covers 5–240; env TRACKER_SNAPSHOT_TTL_MIN or config.json accept 1–1440.',

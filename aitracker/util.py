@@ -535,6 +535,133 @@ def model_label(mid):
     return "%s %s%s" % (family[:1].upper() + family[1:], ".".join(str(n) for n in version), tag)
 
 
+# --- cost: one price table + one pricing function, shared by every provider -------------------
+# $/MTok: (input, write_5m, write_1h, cache_read, output). Source: platform.claude.com/docs/en/
+# about-claude/pricing, fetched 2026-11-13 -- standard tier, global geo. Cache-read is NOT a fixed
+# 0.1x (Opus/Sonnet 5.5 0.05x, Fable 5.1 0.025x), so every column is explicit.
+PRICE_TABLE = {
+    ("opus", (5, 5)): (4, 5, 8, 0.20, 20),
+    ("opus", (5,)): (5, 6.25, 10, 0.50, 25),
+    ("opus", (4, 8)): (5, 6.25, 10, 0.50, 25), ("opus", (4, 7)): (5, 6.25, 10, 0.50, 25),
+    ("opus", (4, 6)): (5, 6.25, 10, 0.50, 25), ("opus", (4, 5)): (5, 6.25, 10, 0.50, 25),
+    ("sonnet", (5, 5)): (2, 2.50, 4, 0.10, 10), ("sonnet", (5,)): (2, 2.50, 4, 0.20, 10),
+    ("sonnet", (4, 6)): (3, 3.75, 6, 0.30, 15), ("sonnet", (4, 5)): (3, 3.75, 6, 0.30, 15),
+    ("haiku", (5, 5)): (0.10, 0.125, 0.20, 0.01, 0.50),
+    ("haiku", (4, 5)): (1, 1.25, 2, 0.10, 5),
+    ("fable", (5, 1)): (10, 12.50, 20, 0.25, 50),
+}
+PRICE_HAIKU55_LONG = (0.50, 0.625, 1, 0.05, 2.50)   # a request whose prompt (in+reads+writes) > 100,000
+PRICE_BASIS = "API list price, USD, standard tier \u2014 not your plan's bill"
+_COST_CTX_TAG_RE = re.compile(r"-\d+k$")           # Auggie context-size suffix, e.g. "-500k"
+
+
+def _price_for(model):
+    """The PRICE_TABLE row for a raw model id, or None (unknown / OpenRouter / bare alias).
+    Retries once with a trailing "-500k"-style context tag stripped (Auggie's model_id)."""
+    mv = model_version(model)
+    if mv is None and isinstance(model, str):
+        mv = model_version(_COST_CTX_TAG_RE.sub("", model))
+    return PRICE_TABLE.get(mv) if mv else None
+
+
+def cost_usage(u):
+    """(in, w5m, w1h, read, out) ints off one usage block; the 5m/1h breakdown wins when
+    non-zero, else the top-level cache_creation figure is charged as 5m (OpenRouter rows)."""
+    def n(v):
+        return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else 0
+    cc = u.get("cache_creation")
+    w5 = n(cc.get("ephemeral_5m_input_tokens")) if isinstance(cc, dict) else 0
+    w1 = n(cc.get("ephemeral_1h_input_tokens")) if isinstance(cc, dict) else 0
+    if w5 + w1 == 0:
+        w5 = n(u.get("cache_creation_input_tokens"))
+    return n(u.get("input_tokens")), w5, w1, n(u.get("cache_read_input_tokens")), n(u.get("output_tokens"))
+
+
+def cost_add(acc, model, u, speed=None):
+    """Fold ONE request into acc = {model_id: [in, w5m, w1h, read, out, usd|None, n_long]}.
+    Haiku 5.5 is priced per request by its prompt size, so the $ is accumulated here per
+    request, not derived from the totals later. An unknown model or a speed not in
+    (None, "standard") -> usd None (unpriced, never $0); fast rows get their own "<id> (fast)" key."""
+    if not real_model(model) or not isinstance(u, dict):
+        return
+    i, w5, w1, rd, o = cost_usage(u)
+    fast = speed not in (None, "standard")
+    p = None if fast else _price_for(model)
+    key = model + " (fast)" if fast else model
+    e = acc.get(key)
+    if e is None:
+        e = acc[key] = [0, 0, 0, 0, 0, 0.0, 0]
+    for k, v in enumerate((i, w5, w1, rd, o)):
+        e[k] += v
+    if p is None:
+        e[5] = None
+        return
+    long_ = model_version(_COST_CTX_TAG_RE.sub("", model)) == ("haiku", (5, 5)) and i + w5 + w1 + rd > 100000
+    if long_:
+        p = PRICE_HAIKU55_LONG
+        e[6] += 1
+    if e[5] is not None:
+        e[5] += (i * p[0] + w5 * p[1] + w1 * p[2] + rd * p[3] + o * p[4]) / 1e6
+
+
+def _cost_merge(dst, src):
+    """Sum acc `src` into acc `dst` element-wise; usd stays None once either side is None."""
+    for m, e in (src or {}).items():
+        d = dst.get(m)
+        if d is None:
+            dst[m] = list(e)
+            continue
+        for k in (0, 1, 2, 3, 4, 6):
+            d[k] += e[k]
+        d[5] = None if d[5] is None or e[5] is None else d[5] + e[5]
+
+
+def _acc_usd(acc):
+    """Sum of the priced usd in an acc, None when nothing in it is priced."""
+    v = [e[5] for e in (acc or {}).values() if e[5] is not None]
+    return sum(v) if v else None
+
+
+def cost_summary(main_acc, agent_acc, agent_costs, note=None, reported=None, recorded=None):
+    """The detail dict's `cost`. Savings = read_tokens*(input-read) per model; write_premium =
+    w5m*(w5m_price-input) + w1h*(w1h_price-input); net = gross - premium (all list price).
+    `agent_costs` = [(aid, label, usd|None)]. `reported` = Claude's last cost-state
+    {"usd","unknown"} or None. `recorded` = (main_usd, agents_usd) a provider BILLED (Auggie):
+    it overrides main/agents/total and switches `basis`; savings stay list-price."""
+    r4 = lambda v: None if v is None else round(v, 4)
+    models, unpriced, gross, prem, reads = [], {}, 0.0, 0.0, 0
+    for who, acc in (("main", main_acc or {}), ("agents", agent_acc or {})):
+        for m, e in acc.items():
+            models.append({"model": m, "label": model_label(m) or m, "who": who, "usd": r4(e[5]),
+                           "in": e[0], "w5m": e[1], "w1h": e[2], "read": e[3], "out": e[4], "long": e[6]})
+            if e[5] is None:
+                u_ = unpriced.setdefault(m, 0)
+                unpriced[m] = u_ + e[0] + e[1] + e[2] + e[3] + e[4]
+            p = _price_for(m)
+            if p:
+                reads += e[3]
+                gross += e[3] * (p[0] - p[3]) / 1e6
+                prem += (e[1] * (p[1] - p[0]) + e[2] * (p[2] - p[0])) / 1e6
+    models.sort(key=lambda r: (r["usd"] is None, -(r["usd"] or 0)))
+    main_usd, agents_usd = _acc_usd(main_acc), _acc_usd(agent_acc)
+    basis = PRICE_BASIS
+    if recorded is not None:
+        main_usd, agents_usd, basis = recorded[0], recorded[1], "Billed by Augment, USD"
+    parts = [v for v in (main_usd, agents_usd) if v is not None]
+    ag = sorted(agent_costs or [], key=lambda t: (t[2] is None, -(t[2] or 0)))[:10]
+    rep = reported or {}
+    return {"basis": basis, "total_usd": r4(sum(parts)) if parts else None,
+            "main_usd": r4(main_usd), "agents_usd": r4(agents_usd),
+            "reported_usd": r4(rep.get("usd")) if rep.get("usd") is not None else None,
+            "reported_unknown": bool(rep.get("unknown")),
+            "cache": {"read_tokens": reads, "saved_gross_usd": r4(gross), "write_premium_usd": r4(prem),
+                      "saved_net_usd": r4(gross - prem)},
+            "models": models,
+            "agents": [{"aid": a, "label": l, "usd": r4(u)} for a, l, u in ag],
+            "unpriced": [{"model": m, "tokens": t} for m, t in unpriced.items()],
+            "note": note}
+
+
 # --- pass cache: an in-process cache of the part of a parse that is a pure function of ONE file ---
 _PASS_CACHE = {}                     # (kind, path) -> (stat key, pickled bytes); dict order = LRU
 _PASS_CACHE_LOCK = threading.Lock()  # guards get/set/evict + the counter ONLY, never a parse or pickle

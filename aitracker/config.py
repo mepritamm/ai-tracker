@@ -206,7 +206,7 @@ CONFIG_FILE = os.path.join(_HERE, "config.json")
 # TRACKER_AUTH is deliberately not a member.
 EDITABLE = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL",
             "TERM_APP", "TERM_ALLOW", "PORT", "HOST", "ICON_STYLE", "ICON_SCALE",
-            "TERM_IDLE_TTL_MIN", "SNAPSHOT_TTL_MIN", "GATEWAY", "OPENROUTER_LAUNCHER", "OPENROUTER_SLOTS_FILE")
+            "TERM_IDLE_TTL_MIN", "SNAPSHOT_TTL_MIN", "GATEWAY", "OPENROUTER_LAUNCHER", "OPENROUTER_SLOTS_FILE", "HEADER_LINE")
 
 # Keys that only bind at process startup -- the dialog labels these "takes effect on
 # restart" and never claims a live apply for them.
@@ -260,6 +260,7 @@ VALIDATORS = {
     "PORT":          _v_int(1, 65535),
     "HOST":          _v_str(255),
     "ICON_STYLE":    _v_enum(("icons", "emoji", "text")),
+    "HEADER_LINE":   _v_enum(("summary", "narration")),  # the detail header's one line; read live per request
     "GATEWAY":       _v_enum(("anthropic", "openrouter")),  # launcher for NEW sessions only; resumes keep their own
     "OPENROUTER_LAUNCHER":   _v_str(1024),      # empty string clears (= not configured)
     "OPENROUTER_SLOTS_FILE": _v_str(1024),
@@ -433,6 +434,14 @@ def resolve_icon_style(overrides):
     return "icons"
 
 
+def resolve_header_line(overrides):
+    """What the detail header's one line shows: "summary" (a background job's own one-line
+    status from ~/.claude/jobs, falling back to narration when the session has no job) or
+    "narration" (the latest narration message, always). config.json > built-in "summary"."""
+    v = overrides.get("HEADER_LINE")
+    return v if v in ("summary", "narration") else "summary"
+
+
 def resolve_gateway(overrides):
     """Which launcher a NEW Claude session uses: "anthropic" (`claude`) or "openrouter" (the
     configured OpenRouter launcher). Resumes follow the session's own recorded gateway
@@ -513,6 +522,7 @@ _RESOLVERS = {
     "ICON_STYLE": resolve_icon_style,
     "ICON_SCALE": resolve_icon_scale,
     "GATEWAY": resolve_gateway,
+    "HEADER_LINE": resolve_header_line,
     "OPENROUTER_LAUNCHER": resolve_openrouter_launcher,
     "OPENROUTER_SLOTS_FILE": resolve_openrouter_slots_file,
 }
@@ -522,7 +532,7 @@ _RESOLVERS = {
 # attribute was reverted in favour of this).
 _PLAIN_ATTR_KEYS = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL",
                     "TERM_IDLE_TTL_MIN", "SNAPSHOT_TTL_MIN", "GATEWAY", "OPENROUTER_LAUNCHER",
-                    "OPENROUTER_SLOTS_FILE")
+                    "OPENROUTER_SLOTS_FILE", "HEADER_LINE")
 
 # Seeded here from env/default ONLY (an explicit `{}`, never a file read) -- this module has
 # no filesystem access of its own (see the big comment above), so at its own import time
@@ -536,6 +546,7 @@ TERMINAL = resolve_terminal({})
 TERM_IDLE_TTL_MIN = resolve_term_idle_ttl_min({})
 SNAPSHOT_TTL_MIN = resolve_snapshot_ttl_min({})
 GATEWAY = resolve_gateway({})
+HEADER_LINE = resolve_header_line({})
 OPENROUTER_LAUNCHER = resolve_openrouter_launcher({})
 OPENROUTER_SLOTS_FILE = resolve_openrouter_slots_file({})
 

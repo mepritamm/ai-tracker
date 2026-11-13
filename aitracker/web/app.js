@@ -168,6 +168,27 @@ function md(s,safe){
 // (narration, notes, summary goal/now/sofar, ask questions), which keep full md()/mdHtml().
 function mdSafe(s){ return md(s,true); }
 window.mdSafe=mdSafe;
+// A draft label is the nearest non-blank line above a quote: a **bold** lead or a # heading whose
+// text says "draft". Requiring the quote itself is what keeps "**Draft plan:**" + a list a non-draft.
+function draftLabel(line){
+  const m=/^\s*(?:\*\*([^*\n]*)\*\*|#{1,6}\s+(.*))/.exec(line||"");
+  return !!m&&/\bdraft\b/i.test(m[1]||m[2]||"");
+}
+function draftLabelBefore(L,start){
+  let j=start-1; while(j>=0&&!L[j].trim()) j--;
+  return j>=0&&!/^\s*>/.test(L[j])&&draftLabel(L[j]);
+}
+// does this text hold a draft quote? (the CR timeline routes such text through mdBlock)
+function hasDraftQuote(s){
+  const L=(s||"").replace(/\r/g,"").split("\n");
+  let fence=false;
+  for(let i=0;i<L.length;i++){
+    if(/^\s*```/.test(L[i])){ fence=!fence; continue; }
+    if(!fence&&/^\s*>/.test(L[i])&&(i===0||!/^\s*>/.test(L[i-1]))&&draftLabelBefore(L,i)) return true;
+  }
+  return false;
+}
+window.hasDraftQuote=hasDraftQuote;
 // block-level markdown for the full-text modal: headers, tables, lists, code fences
 function mdBlock(s){
   const L=(s||"").replace(/\r/g,"").split("\n"), out=[]; let i=0;
@@ -207,9 +228,16 @@ function mdBlock(s){
     if(/^\s*\d+\.\s+/.test(l)){ const it=[];
       while(i<L.length&&/^\s*\d+\.\s+/.test(L[i])){ it.push(`<li>${md(L[i].replace(/^\s*\d+\.\s+/,""))}</li>`); i++; }
       out.push("<ol class=mdul>"+it.join("")+"</ol>"); continue; }
+    if(/^\s*>/.test(l)){ const start=i, q=[];
+      while(i<L.length&&/^\s*>/.test(L[i])){ q.push(L[i].replace(/^\s*>\s?/,"")); i++; }
+      const raw=q.join("\n"), inner=mdBlock(raw);
+      // a quote under a "draft" label (a drafted Slack/Jira/email reply) gets the code-block copy button
+      out.push(draftLabelBefore(L,start)
+        ? `<div class="cblock dq"><button class=codecopy onclick="copyCode(this)" title="Copy this draft">${ico('copy')} Copy</button><textarea class=cpsrc hidden readonly>${esc(raw)}</textarea><blockquote class=mdq>${inner}</blockquote></div>`
+        : `<blockquote class=mdq>${inner}</blockquote>`); continue; }
     if(!l.trim()){ i++; continue; }
     const p=[];
-    while(i<L.length&&L[i].trim()&&!/^#{1,6}\s/.test(L[i])&&!/^\s*[-*+]\s+/.test(L[i])&&!/^\s*\d+\.\s+/.test(L[i])&&!/^\s*```/.test(L[i])&&!(L[i].includes("|")&&i+1<L.length&&sep(L[i+1]))){ p.push(L[i]); i++; }
+    while(i<L.length&&L[i].trim()&&!/^\s*>/.test(L[i])&&!/^#{1,6}\s/.test(L[i])&&!/^\s*[-*+]\s+/.test(L[i])&&!/^\s*\d+\.\s+/.test(L[i])&&!/^\s*```/.test(L[i])&&!(L[i].includes("|")&&i+1<L.length&&sep(L[i+1]))){ p.push(L[i]); i++; }
     out.push(`<p class=mdp>${md(p.join(" "))}</p>`);
   }
   return out.join("");
@@ -1888,7 +1916,8 @@ function render(d){
     chip(ico('check')+" done",`${c.done}/${c.todos}`,"good","card_todos")+chip(ico('plus')+" created",c.created,"blue","card_files")+chip(ico('edit')+" edited",c.edited,"","card_files")+
     chip(ico('eye')+" read",c.read,"","card_files")+chip(ico('branch')+" commits",c.commits,"","card_cmds")+chip("tests",c.tests,"","card_cmds")+
     chip(ico('x')+" failed",c.tests_failed,"bad","card_cmds")+chip(ico('alert')+" errors",c.errors,"bad","card_cmds")+
-    bgchip(ico('agent')+" agents",nAgents,"agents",nAgentsRun)+bgchip(ico('keyboard')+" shells",nShells,"shells",nShellsRun)+chip("searches",c.searches);
+    bgchip(ico('agent')+" agents",nAgents,"agents",nAgentsRun)+bgchip(ico('keyboard')+" shells",nShells,"shells",nShellsRun)+chip("searches",c.searches)+
+    (costChipText(d.cost)?`<span class="chip clk" onclick="openCostModal(lastData.cost)" title="Cost breakdown"><span class=lbl>cost</span><b>${esc(costChipText(d.cost))}</b></span>`:"");
 
   // background agents (click to read full narration)
   // background agents — running shown; finished tucked behind a disclosure
@@ -1976,6 +2005,7 @@ function render(d){
   // summary (markdown + click to read full)
   const ov=d.overview||{};
   curOv=ov;
+  paintHeadline(d);
   $("ov_goal").innerHTML=md(ov.goal||"—");
   $("ov_now").innerHTML=ico('play')+" "+md(ov.now||(live?"working…":"idle"));
   $("ov_sofar").innerHTML=md(ov.sofar||"—");
@@ -2232,6 +2262,40 @@ function openText(title,when,text){
   upgradeMermaidIn($("msgbody"));
   $("msgmodal").style.display="flex";
 }
+// ---- cost chip + modal (the server owns every number; this only formats and lays out) ----
+function _usd(v){ return v==null?"?":"$"+v.toFixed(Math.abs(v)<0.01&&v!==0?4:2); }
+function _ntok(n){ n=n||0; return n>=1e6?(n/1e6).toFixed(1)+"M":n>=1e3?Math.round(n/1e3)+"k":String(n); }
+function costChipText(c){
+  if(!c) return "";
+  const un=(c.unpriced||[]).length;
+  if(c.total_usd!=null) return "$"+c.total_usd.toFixed(2)+(un?"+?":"");
+  return un?"unpriced":"";
+}
+function costModalMd(c){
+  c=c||{}; const ch=c.cache||{}, rows=[];
+  rows.push("| | USD |","|---|---|");
+  rows.push("| **Burned (this session)** | **"+_usd(c.total_usd)+"** |");
+  rows.push("| Main session | "+_usd(c.main_usd)+" |");
+  rows.push("| Agents (background sub-agents) | "+_usd(c.agents_usd)+" |");
+  rows.push("| **Saved by prompt caching (net)** | **"+_usd(ch.saved_net_usd)+"** ("+_usd(ch.saved_gross_usd)+" on "+_ntok(ch.read_tokens)+" cache-read tokens, less "+_usd(ch.write_premium_usd)+" cache-write premium) |");
+  let o=rows.join("\n");
+  if((c.agents||[]).length) o+="\n\n**Agents**\n\n| Agent | USD |\n|---|---|\n"+c.agents.map(a=>"| "+String(a.label||a.aid).replace(/\|/g,"/")+" | "+_usd(a.usd)+" |").join("\n");
+  if((c.models||[]).length) o+="\n\n**By model**\n\n| Model | Who | USD | In | Cache write | Cache read | Out |\n|---|---|---|---|---|---|---|\n"+
+    c.models.map(m=>"| "+String(m.label||m.model).replace(/\|/g,"/")+" | "+m.who+" | "+_usd(m.usd)+" | "+_ntok(m.in)+" | "+_ntok((m.w5m||0)+(m.w1h||0))+" | "+_ntok(m.read)+" | "+_ntok(m.out)+" |").join("\n");
+  if((c.unpriced||[]).length) o+="\n\n**Unpriced (not in the total):** "+c.unpriced.map(u=>u.model+" ("+_ntok(u.tokens)+" tokens)").join(", ");
+  if(c.reported_usd!=null) o+="\n\nClaude Code reported "+_usd(c.reported_usd)+" at last exit (includes sub-agents)"+(c.reported_unknown?" — some models unpriced by Claude Code":"")+".";
+  if(c.note) o+="\n\n"+c.note;
+  o+="\n\nAgents here are the session's background agents; separate agent sessions are not included.";
+  return o;
+}
+function openCostModal(c){ openText("Cost",(c&&c.basis)||"",costModalMd(c)); }
+window.openCostModal=openCostModal; window.costChipText=costChipText;
+// classic Overview card: the header line the server chose (job summary or latest narration), with its band pill
+function paintHeadline(d){
+  const hl=d.headline||{};
+  $("ov_hlrow").style.display=hl.text?"":"none";
+  $("ov_hl").innerHTML=(hl.label?'<span class="hlband hl-'+esc(hl.band||"")+(hl.state==="failed"?" hl-failed":"")+'">'+esc(hl.label)+'</span> ':'')+md(hl.text||"");
+}
 function openMsg(i){const n=curNarr[i]; if(!n)return; _setNav(openMsg,i,curNarr.length,{len:()=>curNarr.length,live:true}); openText("Narration",tago(n.t),n.text);}
 // the Now banner → jump to the panel that reflects the CURRENT activity (server says which via
 // now_kind), flash it so you see WHERE it's happening, AND open that item's live dialog.
@@ -2337,6 +2401,11 @@ function copyModal(bodyId,btn){
   }else{fallbackCopy(el,done);}
 }
 function fallbackCopy(el,done){
+  if(el.tagName==="TEXTAREA"){   // hidden draft source: a Range can't select a hidden node, so un-hide + select() it (copyNote's technique)
+    el.hidden=false; el.select();
+    try{document.execCommand("copy");done();}catch(e){}
+    el.hidden=true; return;
+  }
   const r=document.createRange();r.selectNodeContents(el);
   const s=getSelection();s.removeAllRanges();s.addRange(r);
   try{document.execCommand("copy");done();}catch(e){}
@@ -2344,9 +2413,11 @@ function fallbackCopy(el,done){
 }
 // per-code-block copy button (like docs sites) — copies just that block's raw text
 function copyCode(btn){
-  const code=btn.parentNode.querySelector("code")||btn.parentNode.querySelector(".mdpre");
+  // a draft quote carries its clean paste-ready text in a hidden textarea (.cpsrc); a fence copies its <code>
+  const src=btn.parentNode.querySelector(".cpsrc");
+  const code=src||btn.parentNode.querySelector("code")||btn.parentNode.querySelector(".mdpre");
   if(!code)return;
-  const text=code.innerText||code.textContent||"";
+  const text=src?src.value:(code.innerText||code.textContent||"");
   const done=()=>{const o=btn.innerHTML;btn.classList.add("ok");btn.innerHTML=ico('check')+" Copied";setTimeout(()=>{btn.innerHTML=o;btn.classList.remove("ok");},1200);};
   if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(()=>fallbackCopy(code,done));}
   else fallbackCopy(code,done);

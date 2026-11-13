@@ -4,6 +4,21 @@ from . import config
 from .util import _dur, _names, _first_line, _short_title, _window
 
 
+def headline(d, mode):
+    """The detail header's one line, per config HEADER_LINE. Server policy; the SPA only renders it.
+    "summary" = a background job's own one-line status (detail, else needs, else result), falling
+    back to the newest narration when the session has no job; "narration" = newest narration always."""
+    j = d.get("job") or {}
+    text = j.get("detail") or j.get("needs") or j.get("result") or ""
+    if mode == "summary" and text:
+        return {"mode": mode, "source": "job", "text": text, "band": j.get("band"), "label": j.get("label"),
+                "state": j.get("state") or None, "updated": j.get("updated") or None}
+    nar = d.get("narrative") or [{}]
+    n = nar[0].get("text") or d.get("message") or ""
+    return {"mode": mode, "source": "narration" if n else "none", "text": n[:2000],
+            "band": None, "label": None, "state": None, "updated": nar[0].get("t")}
+
+
 def build_overview(d, todos, files, cmds, commits, tests, agents, requests,
                    narrative, agents_bg, idle, t_first, t_last):
     """Concrete Goal / Now / So-far that a cold reader can understand at a glance."""
