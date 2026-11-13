@@ -11,11 +11,11 @@ Builds on `reports/job-summary-header.md` (the session-detail `headline` + `HEAD
 
 | # | Clause | Status |
 |---|---|---|
-| R1 | Board view: each session card shows the summary headline | implemented — pending final review (tests: test_list_headline.*; test_list_headline_ui.CrHeadlineRenderTests awaiting/covers_needs/working tile tests) |
-| R2 | Session side panel (rail), Board/Control Room view: summary headline as the row's 2nd line | implemented — pending final review (tests: CrHeadlineRenderTests rail order/pill/narration-safe) |
-| R3 | Session side panel, classic dashboard view: summary headline as the row's 2nd line | implemented — pending final review (tests: ClassicHeadlineRowTests order/url/auggie-null) |
-| R4 | Same `HEADER_LINE` policy (summary default / narration) as the header — server-owned | implemented — pending final review (tests: ListHeadlineTests.test_narration_mode_ignores_job, test_list_and_detail_agree_on_job_row, ListHeadlineHttpTests.test_http_list_headline_and_live_flip) |
-| P1 | Pipeline: opus plan → opus review → plan revised → sonnet implement → opus final review → fix all → /tracker-gap discipline → /tracker-push | not discharged |
+| R1 | Board view: each session card shows the summary headline | discharged — final review fixes applied (tests: test_list_headline.*; test_list_headline_ui.CrHeadlineRenderTests awaiting/covers_needs/working tile tests) |
+| R2 | Session side panel (rail), Board/Control Room view: summary headline as the row's 2nd line | discharged — final review fixes applied (tests: CrHeadlineRenderTests rail order/pill/narration-safe) |
+| R3 | Session side panel, classic dashboard view: summary headline as the row's 2nd line | discharged — final review fixes applied (tests: ClassicHeadlineRowTests order/url/auggie-null) |
+| R4 | Same `HEADER_LINE` policy (summary default / narration) as the header — server-owned | discharged — final review fixes applied (tests: ListHeadlineTests.test_narration_mode_ignores_job, test_list_and_detail_agree_on_job_row, ListHeadlineHttpTests.test_http_list_headline_and_live_flip) |
+| P1 | Pipeline: opus plan → opus review → plan revised → sonnet implement → opus final review → fix all → /tracker-gap discipline → /tracker-push | discharged — pipeline completed, fixes CF1-CF2/SF1-SF4 applied |
 
 ## Plan
 
@@ -537,3 +537,24 @@ D2 (narration on idle rows) stays as planned — the ask is a 2nd line on every 
 
 ### Reconciled plan
 The reconciled plan is the revised ## Plan above (revision 2, 2026-11-13); deltas: F1 — tile = headline + kept structural line beneath (`⧖ needs` on awaiting unless `headline.covers_needs`, else `now_line`); seam blanks a `now_line` equal to `now_phrase(last_text)` when the headline is narration (§3a/§3b/§5); F2 — rail/tile/classic-row lines unwrap `md()` anchors, the three pointer-events rules are gone, headers keep links (§4/§5); F3 — clip test moved to a job row, narration test asserts flattening only (§7); F4 — CSS test scans every @media block (§7); F6 — §0 cites `app.js:1449` for the 5 s poll and ~1.2 ms roster read; F5 — cut (no pill-markup refactor); planner addition — `covers_needs` (15/53 real blocked jobs would otherwise show the question twice; blanking `needs` server-side is ruled out by `test_selfcheck.py:995-1005`).
+
+
+## Final adversarial review (opus) on 2900707 — findings to fix (all confirmed by orchestrator)
+
+### Client half (verdict: holds; all 4 skipped red-proofs confirmed red)
+- **CF1 Low** — anchor-strip regex `/<a [^>]*>([\s\S]*?)<\/a>/` in `hlHtml` (app.js ~:2315) and `headlineEl` (ext_cr_board.js ~:2851) stops at a `>` that md() generated inside the href (from em/strong/code), leaving garbled attribute text. Repro: `Updated *.py files, see [log](https://ci/job/*/123) ok` → `…/123" target=_blank rel=noopener>log ok`. FIX: use `/<a href="[^"]*"[^>]*>([\s\S]*?)<\/a>/g` in BOTH places; do not touch md() or the header path. TEST: add that input to test_narration_safe_no_anchor_url_text_kept and test_row_url_not_linked_header_url_linked; assert no `target=_blank` and contains `log ok` (red today).
+- **CF2 Low** — `.cr-tile-line { flex:1 }` (ext_cr_board.css ~:1686) applies to both `--hl` and `--now`, splitting stretch space between them on short tiles. FIX: add `.tracker-next .cr-tile-line--hl + .cr-tile-line--now { flex: 0 0 auto; }`; null-headline tile untouched. TEST: LayoutTests regex asserts the rule.
+
+### Server half (verdict: holds on real data; one code defect, three test gaps)
+- **SF1 Low-Med** — `job_index` (claude.py ~:841) catches only (OSError, ValueError); a deep-nested state.json raises RecursionError, escaping list_sessions → registry swallows it → ALL Claude rows vanish. FIX: `except Exception: continue` there, and `except Exception: return None` in job_for.read() (~:802); precedence/cache unchanged; _blocked_jobs untouched. TEST: deep-nested state.json in a second job dir → job_index doesn't raise and row(SID) keeps its headline (red before).
+- **SF2 Med (test only)** — dropping `source == "narration"` from registry.py ~:123 stays green. TEST: live mid-turn transcript + working job detail="Running the gate", HEADER_LINE=summary → now_line == the narration, headline source == "job".
+- **SF3 Low (test only)** — precedence mutation (`if sid not in hits:`) stays green. TEST: add job short="0000aaaa" resumeSessionId=SID detail="early" beside the direct job → idx[SID] == job_for(SID), detail == "direct".
+- **SF4 Low (test only)** — dropping `source=="job"` from overview.py ~:37 stays green. TEST: HEADER_LINE=narration, narration containing NEEDS, blocked job → covers_needs is False. (M8 clip-boundary: documented only.)
+
+### Fix status (final review)
+- CF1: fixed — test_narration_safe_no_anchor_url_text_kept + test_row_url_not_linked_header_url_linked (red before, green after; SF2-SF4 red proven by temporary mutation, restored)
+- CF2: fixed — HeadlineCssTests.test_now_line_after_hl_does_not_flex (red before, green after; SF2-SF4 red proven by temporary mutation, restored)
+- SF1: fixed — FinalReviewTests.test_deep_nested_state_json_does_not_hide_rows (red before, green after; SF2-SF4 red proven by temporary mutation, restored)
+- SF2: fixed — FinalReviewTests.test_narration_source_blanks_now_line_but_job_does_not (red before, green after; SF2-SF4 red proven by temporary mutation, restored)
+- SF3: fixed — FinalReviewTests.test_direct_dir_beats_resume_match (red before, green after; SF2-SF4 red proven by temporary mutation, restored)
+- SF4: fixed — FinalReviewTests.test_covers_needs_false_for_narration_headline (red before, green after; SF2-SF4 red proven by temporary mutation, restored)

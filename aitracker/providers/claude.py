@@ -799,7 +799,7 @@ def job_for(sid, live):
             return None
         try:
             f = file_pass("claude.jobstate", os.path.join(root, short, "state.json"), _job_fields)
-        except (OSError, ValueError):
+        except Exception:
             return None
         return f if f and sid in f["ids"] else None
 
@@ -838,7 +838,7 @@ def job_index(live):
             continue
         try:
             f = file_pass("claude.jobstate", os.path.join(root, short, "state.json"), _job_fields)
-        except (OSError, ValueError):
+        except Exception:       # e.g. RecursionError on a deep-nested file must not drop every row
             continue
         for sid in (f or {}).get("ids", ()):
             if sid not in hits or sid[:8] == short:      # direct dir beats an earlier resume match

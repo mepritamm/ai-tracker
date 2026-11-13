@@ -132,6 +132,43 @@ class ListHeadlineTests(_Base):
         self.assertIn(NEEDS[:20], r["needs"])
 
 
+class FinalReviewTests(_Base):
+    def test_deep_nested_state_json_does_not_hide_rows(self):
+        self.transcript()
+        self.job(state="working", tempo="active", detail="Running the gate")
+        os.makedirs(os.path.join(self.jdir, "deep0001"))
+        with open(os.path.join(self.jdir, "deep0001", "state.json"), "w") as fh:
+            fh.write("[" * 200000 + "]" * 200000)
+        C.job_index({SHORT})                      # must not raise
+        self.assertEqual(row()["headline"]["text"], "Running the gate")
+
+    def test_narration_source_blanks_now_line_but_job_does_not(self):
+        self.transcript(narration="Running the tests now")
+        with open(os.path.join(self.pdir, "-p", SID + ".jsonl"), "a") as fh:     # mid-turn: a tool call is pending
+            fh.write(json.dumps({"type": "assistant", "timestamp": "2026-11-13T10:00:01Z", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]}}) + "\n")
+        self.job(state="working", tempo="active", detail="Running the gate")
+        r = row()
+        self.assertEqual(r["headline"]["source"], "job")
+        self.assertEqual(r["now_line"], "Running the tests now")
+
+    def test_direct_dir_beats_resume_match(self):
+        live = {SHORT, "0000aaaa"}
+        self.job(short="0000aaaa", sessionId="other-sid", resumeSessionId=SID, state="working", tempo="active", detail="early")
+        self.job(state="working", tempo="active", detail="direct")
+        idx = C.job_index(live)
+        self.assertEqual(idx[SID], C.job_for(SID, live))
+        self.assertEqual(idx[SID]["detail"], "direct")
+
+    def test_covers_needs_false_for_narration_headline(self):
+        self.transcript(narration="I NEED " + NEEDS)
+        self.job(state="blocked", tempo="blocked", detail="x", needs=NEEDS)
+        config.HEADER_LINE = "narration"
+        h = row()["headline"]
+        self.assertEqual(h["source"], "narration")
+        self.assertIs(h["covers_needs"], False)
+
+
 class DedupeTests(_Base):
     def test_live_narration_now_line_blanked_on_wire(self):
         sid = "plainnar-0000-4000-8000-000000000009"

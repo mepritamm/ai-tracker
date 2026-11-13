@@ -1698,6 +1698,7 @@
   padding: 6px 8px;
   color: var(--text-flagged);
 }
+.tracker-next .cr-tile-line--hl + .cr-tile-line--now { flex: 0 0 auto; }
 /* Decision 3 (revised) — the `s.now_line` second line: small, secondary,
  * single-line-truncated (never wraps to a second line the way the awaiting
  * tile's prompt line still does above). Overrides the base rule's 2-line

@@ -28,7 +28,7 @@ def _hl(text, **kw):
 SCEN = {
     "job_await": make_session("job_await", NOW - 5, waiting=True, needs="provide a username",
                               headline=_hl("Reviewing the patch", band="blocked", label="Needs input")),
-    "nar": make_session("nar", NOW - 5, headline=_hl("**bold** <img src=x> opened " + URL, source="narration", mode="summary")),
+    "nar": make_session("nar", NOW - 5, headline=_hl("**bold** <img src=x> opened " + URL + ' Updated *.py files, see [log](https://ci/job/*/123) ok', source="narration", mode="summary")),
     "work_bg": make_session("work_bg", NOW - 5, bg=2, now_line="⚙ 2 background agents",
                             headline=_hl("Running the gate", band="working", label="Working")),
     "covers": make_session("covers", NOW - 5, waiting=True, needs="pick A or B",
@@ -98,6 +98,8 @@ class CrHeadlineRenderTests(unittest.TestCase):
         self.assertNotIn("<img", h)
         self.assertNotIn("<a ", h)
         self.assertIn(URL, h)
+        self.assertNotIn("target=_blank", h)
+        self.assertIn("log ok", h)
         self.assertNotIn("crd-hl-band", h)
 
     def test_null_headline_has_no_rail_hl_and_todays_tile_lines(self):
@@ -139,7 +141,7 @@ console.log(JSON.stringify(out));
 class ClassicHeadlineRowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        nar_hl = _hl("see " + URL, source="narration")
+        nar_hl = _hl("see " + URL + ' Updated *.py files, see [log](https://ci/job/*/123) ok', source="narration")
         tail = _CLASSIC_TAIL % {
             "now": NOW, "nar_hl": json.dumps(nar_hl),
             "job": json.dumps(VP.make_session("cj", NOW - 5, headline=_hl("Needs a pick", band="blocked", label="Needs input"))),
@@ -161,6 +163,8 @@ class ClassicHeadlineRowTests(unittest.TestCase):
     def test_row_url_not_linked_header_url_linked(self):
         shline = re.search(r"<div class=shline>(.*?)</div>", self.O["nar"], re.S).group(1)
         self.assertNotIn("<a ", shline)
+        self.assertNotIn("target=_blank", shline)
+        self.assertIn("log ok", shline)
         self.assertIn(URL, shline)
         self.assertIn("<a ", self.O["header"])          # the header keeps its real links
 
@@ -176,6 +180,9 @@ def _css():
 
 
 class HeadlineCssTests(unittest.TestCase):
+    def test_now_line_after_hl_does_not_flex(self):
+        self.assertRegex(_css(), r"\.tracker-next \.cr-tile-line--hl \+ \.cr-tile-line--now\s*\{[^}]*flex:\s*0 0 auto")
+
     def test_one_line_ellipsis_rules(self):
         css = _css()
         for sel in (".cr-rail-hl", ".shline"):

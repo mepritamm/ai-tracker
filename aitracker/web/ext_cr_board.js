@@ -2848,7 +2848,7 @@ window.CR = window.CR || {};
       if (!hl || !hl.text) return null;
       var pill = hl.label ? '<span class="crd-hl-band crd-hl-' + esc(hl.band || '') +
         (hl.state === 'failed' ? ' crd-hl-failed' : '') + '">' + esc(hl.label) + '</span> ' : '';
-      var body = (typeof md === 'function' ? md(hl.text) : esc(hl.text)).replace(/<a [^>]*>([\s\S]*?)<\/a>/g, '$1');
+      var body = (typeof md === 'function' ? md(hl.text) : esc(hl.text)).replace(/<a href="[^"]*"[^>]*>([\s\S]*?)<\/a>/g, '$1');
       return h('div', { class: cls, title: (hl.label ? hl.label + ' · ' : '') + hl.text, html: pill + body });
     }
 

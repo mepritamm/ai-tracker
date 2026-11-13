@@ -2312,7 +2312,7 @@ function paintHeadline(d){
 }
 // the server's headline -> band pill + inline-md text; no policy here (server owns mode/text/label).
 // inline=true (session rows): anchors unwrapped -- a row is one click/Enter target, no inner tab stops.
-function hlHtml(hl,inline){let t=md(hl.text||"");if(inline)t=t.replace(/<a [^>]*>([\s\S]*?)<\/a>/g,"$1");return (hl.label?'<span class="hlband hl-'+esc(hl.band||"")+(hl.state==="failed"?" hl-failed":"")+'">'+esc(hl.label)+'</span> ':'')+t;}
+function hlHtml(hl,inline){let t=md(hl.text||"");if(inline)t=t.replace(/<a href="[^"]*"[^>]*>([\s\S]*?)<\/a>/g,"$1");return (hl.label?'<span class="hlband hl-'+esc(hl.band||"")+(hl.state==="failed"?" hl-failed":"")+'">'+esc(hl.label)+'</span> ':'')+t;}
 function openMsg(i){const n=curNarr[i]; if(!n)return; _setNav(openMsg,i,curNarr.length,{len:()=>curNarr.length,live:true}); openText("Narration",tago(n.t),n.text);}
 // the Now banner → jump to the panel that reflects the CURRENT activity (server says which via
 // now_kind), flash it so you see WHERE it's happening, AND open that item's live dialog.
