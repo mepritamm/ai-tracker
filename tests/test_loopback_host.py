@@ -34,6 +34,19 @@ class TestIsLoopbackHost(unittest.TestCase):
             self.assertFalse(is_loopback_host(h), h)
 
 
+class TestOriginMatchesHost(unittest.TestCase):
+    def test_table(self):
+        from aitracker.util import origin_matches_host
+        ok = [{}, {"Host": "h:1"}, {"Origin": "http://h:1", "Host": "h:1"}, {"Origin": "https://h:1", "Host": "h:1"}]
+        bad = [{"Origin": "http://evil.example", "Host": "h:1"}, {"Origin": "null", "Host": "h:1"},
+               {"Origin": "http://h:2", "Host": "h:1"}, {"Origin": "http://h:1"}]
+        for h in ok:
+            self.assertTrue(origin_matches_host(_H(h)), h)
+        for h in bad:
+            self.assertFalse(origin_matches_host(_H(h)), h)
+            self.assertFalse(term_gate._origin_ok(_Handler(h)), h)
+
+
 class TestGuardHost(unittest.TestCase):
     def setUp(self):
         self._s = (config.TERMINAL, config.AUTH, config.BIND_HOST)

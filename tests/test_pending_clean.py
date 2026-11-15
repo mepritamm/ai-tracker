@@ -123,11 +123,13 @@ class CleanTests(unittest.TestCase):
         self.assertIn("squash-merged", rep["deleted"][0]["note"])
 
     # -- TOCTOU: the item changes between the scan and the clean
-    def toctou(self, mutate):
+    def toctou(self, mutate, reage=False):
         wt = self.merged_worktree()
         rep = self.scan()
         self.assertTrue(pending.reclaimable(self.item(wt), self.now))        # the scan said "reclaimable"
         mutate(wt)
+        if reage:
+            self.fx.age(wt, 8)          # the mutation bumped mtimes: re-age so the idle grace is NOT what refuses
         pending.clean(rep, "safe", self.now)
         return wt, rep
 
@@ -146,14 +148,19 @@ class CleanTests(unittest.TestCase):
         def new(wt):
             with open(os.path.join(wt, "notes.txt"), "w") as fh:
                 fh.write("n")
-        wt, rep = self.toctou(new)
+        wt, rep = self.toctou(new, reage=True)
         self.assertTrue(os.path.isfile(os.path.join(wt, "notes.txt")))
         self.assertEqual(rep["deleted"], [])
+        self.assertIn("re-inspection", rep["refused"][0]["reason"])
+        self.assertIn("untracked", rep["refused"][0]["reason"])      # the guard named, not the idle grace
 
     def test_toctou_head_moved_survives(self):
-        wt, rep = self.toctou(lambda w: self.fx.commit(w, "late.txt", "late"))
+        # move the branch back to an OLDER, already-pushed commit: still an ancestor with nothing unpushed
+        # and aged, so ONLY the head-moved guard can refuse
+        wt, rep = self.toctou(lambda w: self.fx.git(w, "reset", "--hard", "HEAD~1"), reage=True)
         self.assertTrue(os.path.isdir(wt))
         self.assertEqual(rep["deleted"], [])
+        self.assertIn("HEAD or branch moved", rep["refused"][0]["reason"])
 
     def test_toctou_live_session_survives(self):
         wt, rep = self.toctou(lambda w: self.fx.live(os.getpid(), w))
@@ -331,6 +338,7 @@ class CleanTests(unittest.TestCase):
         self.assertEqual(rep["deleted"], [])
 
     def test_L_scratch_symlink_root_sibling_kept(self):
+        # a symlinked SCRATCH_ROOT is not trusted (E1-F6): nothing under it is deleted, nor its sibling
         real = os.path.join(self.fx.root, "real-scratch")
         sid = os.path.join(real, "slug", "sid1")
         os.makedirs(sid)
@@ -344,7 +352,7 @@ class CleanTests(unittest.TestCase):
         self.fx.age_tree(sib, 8)
         with mock.patch.object(config, "SCRATCH_ROOT", link):
             self.scan_clean("safe")
-        self.assertFalse(os.path.exists(sid))
+        self.assertTrue(os.path.isfile(os.path.join(sid, "f")))
         self.assertTrue(os.path.isfile(os.path.join(sib, "f")))
 
     def test_tmp_leaf_symlink_not_followed(self):

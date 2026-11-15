@@ -4,7 +4,7 @@ from urllib.parse import urlparse, parse_qs
 from . import config                       # referenced live (config.AUTH) so tests/env see one source
 from . import tunnel                       # runtime tunnel switch -- see tunnel.py's module docstring
 from .config import NARR_PAGE
-from .util import is_loopback_host
+from .util import is_loopback_host, origin_matches_host
 from .page import build_page
 from .gateway import openrouter_configured
 from .registry import all_sessions, parse_any, search_all, search_session, drill, _attached_pty
@@ -227,6 +227,8 @@ def _local_caller(handler):
     hdr = _proxy_header(handler)
     if hdr:
         return False, "refused: request appears to be proxied (%s)%s" % (hdr, _NOT_LOCAL)
+    if not origin_matches_host(handler.headers):   # CSRF: a cross-site page's fetch carries its own Origin
+        return False, "refused: cross-origin request%s" % _NOT_LOCAL
     peer = handler.client_address[0]
     if peer != "127.0.0.1":
         return False, "refused: caller is not on this machine (%s)%s" % (peer, _NOT_LOCAL)
@@ -348,6 +350,14 @@ class Handler(BaseHTTPRequestHandler):
         if tunnel.via_tunnel(self.headers):
             return tunnel.cred()
         return config.AUTH
+
+    def _tunnel_route_ok(self):
+        """Gate for the two routes that can reveal tunnel credentials. With a credential in force
+        for this request (TRACKER_AUTH, or the tunnel's own) nothing changes -- the login is the
+        protection. With none, the DNS-rebinding + CSRF check applies: loopback Host, same Origin."""
+        if self._cred():
+            return True
+        return is_loopback_host(self.headers.get("Host", "")) and origin_matches_host(self.headers)
 
     def _authok(self):
         """True if the request may proceed: no auth configured, a valid signed cookie, or valid HTTP
@@ -507,6 +517,8 @@ class Handler(BaseHTTPRequestHandler):
             # the dialog's explicit "Show" action, already gated by the same _authok() check
             # every other route in do_GET goes through (see the top of this method) -- an
             # unauthenticated caller never reaches this line at all.
+            if not self._tunnel_route_ok():
+                return self._json({"error": "refused: not a same-origin loopback request"}, 403)
             overrides = _load_json(config.CONFIG_FILE, {})
             self._json(config.tunnel_reveal(overrides))
         elif p.path == "/api/search":
@@ -660,9 +672,11 @@ class Handler(BaseHTTPRequestHandler):
             code, out = update_apply(body.get("confirm_terminals") is True)
             if code == 409 and out.get("needs_confirm"):
                 out = _update_body(out)
-            self._json(out, code)
-            if code == 202:        # response is flushed; the apply + pending locks stay held for the restart
-                start_restart(self.server.server_address[1])
+            try:
+                self._json(out, code)
+            finally:               # a failed write must not strand the held apply + pending locks
+                if code == 202:    # response is flushed; the locks stay held for the restart
+                    start_restart(self.server.server_address[1])
             return
         if p.path == "/api/pending/run":
             ok, err = _local_caller(self)
@@ -759,6 +773,8 @@ class Handler(BaseHTTPRequestHandler):
             # (config.tunnel_public() + tunnel.status()) so the dialog can render off either
             # response uniformly, plus -- ONLY when a credential was just (re)generated --
             # the one-time user/pass/share_url the browser could otherwise never learn.
+            if not self._tunnel_route_ok():
+                return self._json({"error": "refused: not a same-origin loopback request"}, 403)
             action = body.get("action")
             if action not in ("start", "stop", "rotate", "rotate_creds"):
                 self._json({"error": "unknown action"}, 400)

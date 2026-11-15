@@ -71,6 +71,22 @@ class GhTests(unittest.TestCase):
         self.assertEqual(it["gh"]["state"], "skipped")
         self.assertFalse(pending.reclaimable(it, time.time()))
 
+    def test_N3_merged_plus_each_guard_not_reclaimable(self):
+        """A real gh-merged item is reclaimable; flipping any ONE guard on it makes it not (each guard
+        proven on its own, with gh.state == "merged" actually set)."""
+        wt, sha = self.branch("n3b")
+        self.fx.fake_gh({"n3b": [pr(sha)]})
+        it = self.item(wt) if self.scan() else None
+        self.assertEqual(it["gh"]["state"], "merged")
+        now = time.time()
+        self.assertTrue(pending.reclaimable(it, now))
+        for key, val in (("deletable", False), ("verdict", "pending"), ("busy_job", True), ("live", True),
+                         ("last_activity", now)):
+            with self.subTest(guard=key):
+                self.assertFalse(pending.reclaimable(dict(it, **{key: val}), now))
+        # and the merged answer must be for the exact head: a different state is not enough
+        self.assertFalse(pending.reclaimable(dict(it, gh={"state": "none"}, ancestor=False), now))
+
     def test_N4_gh_missing_is_unavailable_zero_calls(self):
         wt, sha = self.branch("n4")
         real = pending.shutil.which

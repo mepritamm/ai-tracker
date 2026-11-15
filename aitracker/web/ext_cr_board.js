@@ -2678,7 +2678,8 @@ window.CR = window.CR || {};
       attrs.class = 'cr-tile cr-tile--pending cr-tile--span2';
       return h('div', attrs, [
         h('div', { class: 'cr-tile-title' }, [card.title || 'Pending work']),
-        h('div', { class: 'cr-tile-line' }, [card.summary || ''])
+        h('div', { class: 'cr-tile-line' }, [card.summary || '']),
+        card.as_of ? h('div', { class: 'cr-tile-line' }, ['as of ' + card.as_of]) : null
       ]);
     }
 

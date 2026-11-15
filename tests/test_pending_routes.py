@@ -2,7 +2,9 @@
 (/api/pending, /api/pending/item, /api/pending/run, /api/config PENDING_CLEAN=safe gate, run()).
 No test scans this machine: paths are temp (pending_fixture) and run_once/run_async are stubbed."""
 import http.client
+import inspect
 import json
+import re
 import os
 import tempfile
 import threading
@@ -95,10 +97,53 @@ class RouteTests(_Base):
         with mock.patch.object(_server, "bind", return_value=srv), mock.patch.object(_server, "publish_endpoint"), \
                 mock.patch.object(_server.tunnel, "autostart"), \
                 mock.patch.object(_server.tunnel, "status", return_value={"on": False}), \
-                mock.patch.object(_server.signal, "signal"), mock.patch.object(_server, "start_worker") as sw:
+                mock.patch.object(_server.signal, "signal"), mock.patch.object(_server, "start_worker") as sw, \
+                mock.patch.object(_server, "autoinstall_once", return_value={"action": "skipped"}):
             with self.assertRaises(SystemExit):
                 _server.run(open_browser=False)
         sw.assert_called_once_with()
+
+    # -- T16: the 5 s list path and the page's polls never reach the scan / clean / update / scheduler code
+    def _boom(self, *names):
+        for owner, name in names:
+            p = mock.patch.object(owner, name, side_effect=AssertionError("%s must not run on this path" % name))
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_list_and_session_never_touch_pending_update_scheduler(self):
+        self._boom((pending, "scan"), (pending, "run_once"), (pending, "run_async"), (pending, "clean"),
+                   (pending, "load_report"), (pending, "item_detail"), (pending, "_git"),
+                   (_server, "run_async"), (_server, "update_status"), (_server, "update_fetch"),
+                   (_server, "sched_status"), (_server, "sched_install"), (_server, "autoinstall_once"),
+                   (_server, "load_report"), (_server, "item_detail"))
+        proj = os.path.join(config.PROJECTS, "p")
+        os.makedirs(proj)
+        sid = "11111111-2222-3333-4444-555555555555"
+        with open(os.path.join(proj, sid + ".jsonl"), "w") as fh:
+            fh.write(json.dumps({"type": "user", "cwd": "/tmp", "sessionId": sid, "timestamp": "2026-11-01T00:00:00Z",
+                                 "message": {"role": "user", "content": "hi"}}) + "\n")
+        st, j = self.req("GET", "/api/list")
+        self.assertEqual(st, 200)
+        self.assertIn(sid, [r.get("id") for r in j])
+        self.assertEqual(self.req("GET", "/api/session?id=" + sid)[0], 200)
+        self.assertEqual(self.req("GET", "/api/session?id=" + sid, headers=FWD)[0], 200)   # a tunnel visitor too
+
+    def test_get_pending_never_scans(self):
+        self._boom((pending, "scan"), (pending, "run_once"), (pending, "run_async"), (pending, "clean"),
+                   (pending, "_git"), (_server, "run_async"))
+        st, j = self.req("GET", "/api/pending")
+        self.assertEqual((st, j["running"]), (200, False))
+        self.assertEqual(self.req("GET", "/api/pending/item?id=nope")[0], 404)
+
+    def test_list_handler_source_has_no_pending_code(self):
+        src = inspect.getsource(_server.Handler.do_GET)
+        a = src.index('p.path == "/api/list"')
+        branch = src[a:src.index("elif p.path ==", a + 10)]
+        for word in ("pending", "load_report", "update_", "sched", "run_async", "autoinstall"):
+            self.assertNotIn(word, branch)
+        from aitracker import registry
+        self.assertIsNone(re.search(r"(?m)^\s*(from|import)\s.*\b(pending|schedule|update)\b",
+                                    inspect.getsource(registry)))
 
 
 class WorkerTests(unittest.TestCase):
@@ -126,6 +171,7 @@ class WorkerTests(unittest.TestCase):
             return "x"
         with mock.patch.object(config, "PENDING_INTERVAL", "off"), \
                 mock.patch.object(config, "PENDING_FILE", os.path.join(d, "p.json")), \
+                mock.patch.object(pending, "_scan_here_ok", lambda: True), \
                 mock.patch.object(pending, "tick", fake_tick):
             with self.assertRaises(KeyboardInterrupt):
                 pending._worker_loop(sleep=fake_sleep, clock=lambda: 1000.0)
@@ -174,6 +220,84 @@ class DetailTests(unittest.TestCase):
         d = pending.item_detail(t["id"])
         self.assertEqual(d["resume"]["cwd"], os.path.expanduser("~"))
         self.assertIn("cleanup skill", d["resume"]["prompt"])
+
+
+class ReportStateTests(unittest.TestCase):
+    """G2: stable report, memoised parse, foreign-lock card, as_of, containment fast path."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        for k, v in (("PENDING_FILE", os.path.join(d, "pending.json")), ("PENDING_LOCK", os.path.join(d, "p.lock")),
+                     ("PENDING_LOG", os.path.join(d, "p.log")), ("PENDING_INTERVAL", "90d")):
+            p = mock.patch.object(config, k, v)
+            p.start()
+            self.addCleanup(p.stop)
+        pending._REPORT_MEMO.clear()
+
+    def _write(self, **kw):
+        with open(config.PENDING_FILE, "w") as fh:
+            json.dump(kw, fh)
+
+    def test_unchanged_file_gives_identical_json(self):
+        for kw in ({}, {"items": [], "generated_at": 5}, {"scheduled_at": 100.0}):
+            self._write(**kw)
+            a = json.dumps(pending.load_report(), sort_keys=True)
+            time.sleep(0.01)
+            b = json.dumps(pending.load_report(), sort_keys=True)
+            self.assertEqual(a, b)
+        self._write()
+        self.assertIsNone(pending.load_report()["next_due"])
+        self._write(scheduled_at=100.0)
+        self.assertEqual(pending.load_report()["next_due"], 100.0 + 90 * 86400)
+        with mock.patch.object(config, "PENDING_INTERVAL", "off"):
+            self.assertIsNone(pending.load_report()["next_due"])
+
+    def test_card_as_of_derived_on_read(self):
+        # a report written before build_card added as_of: the age comes from generated_at at READ time
+        self._write(items=[], generated_at=1700000000, card={"show": True, "title": "Pending work", "summary": "x", "count": 1})
+        want = time.strftime("%Y-%m-%d", time.localtime(1700000000))
+        self.assertEqual(pending.load_report()["card"]["as_of"], want)
+        self.assertEqual(pending.build_card({"generated_at": 1700000000})["as_of"], want)
+        self._write(items=[], card={"show": False, "title": "Pending work", "summary": "", "count": 0})
+        self.assertNotIn("as_of", pending.load_report()["card"])
+        self._write(items=[])                                  # no card, no generated_at: no crash, no as_of
+        self.assertNotIn("as_of", pending.load_report()["card"])
+
+    def test_parse_is_memoised_and_rewrite_invalidates(self):
+        self._write(items=[], generated_at=1)
+        with mock.patch.object(pending, "_load_json", wraps=pending._load_json) as lj:
+            pending.load_report()
+            pending.load_report()
+            pending.item_detail("nope")
+            self.assertEqual(lj.call_count, 1)
+            self._write(items=[], generated_at=123456789, pad="x" * 40)   # size changes
+            self.assertEqual(pending.load_report()["generated_at"], 123456789)
+            self.assertEqual(lj.call_count, 2)
+
+    def test_foreign_lock_does_not_pop_hidden_card_in(self):
+        self._write(items=[])
+        with pending._pending_lock() as got:
+            self.assertTrue(got)
+            r = pending.load_report()
+        self.assertTrue(r["running"])
+        self.assertFalse(r["card"]["show"])
+        pending._RUNNING.set()
+        self.addCleanup(pending._RUNNING.clear)
+        r = pending.load_report()
+        self.assertTrue(r["card"]["show"])
+        self.assertEqual(r["card"]["summary"], "scanning\u2026")
+
+    def test_card_as_of_is_fixed_at_scan_time(self):
+        t = 1_700_000_000
+        c = pending.build_card({"items": [], "tmp": [], "generated_at": t}, now=t + 999 * 86400)
+        self.assertEqual(c["as_of"], time.strftime("%Y-%m-%d", time.localtime(t)))
+
+    def test_under_rp_matches_commonpath_semantics(self):
+        self.assertTrue(pending._under_rp("/a/b", "/a/b"))
+        self.assertTrue(pending._under_rp("/a/b/c", "/a/b"))
+        self.assertFalse(pending._under_rp("/a/b0", "/a/b"))
+        self.assertFalse(pending._under_rp("/a", "/a/b"))
+        self.assertTrue(pending._under_rp("/a", "/"))
 
 
 if __name__ == "__main__":

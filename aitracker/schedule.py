@@ -86,7 +86,8 @@ def _under_test():
     """True in a test run or a --selfcheck. Patchable (tests flip it off to reach the later guards)."""
     argv = sys.argv or [""]
     return bool(os.environ.get("AITRACKER_NO_AUTOINSTALL") or os.environ.get("PYTEST_CURRENT_TEST")
-                or "--selfcheck" in argv or "unittest" in (argv[0] or ""))
+                or "--selfcheck" in argv or "unittest" in (argv[0] or "")
+                or os.path.basename(argv[0] or "").startswith("test_"))
 
 
 def _is_temp(path):
@@ -107,6 +108,14 @@ def _read_plist():
         return None
 
 
+def _sched_run(run, argv):
+    """One bounded OS-scheduler call. A hang returns None (callers treat it as failure), never raises."""
+    try:
+        return run(argv, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return None
+
+
 def sched_install(run=subprocess.run):
     plat = sys.platform
     if plat not in ("darwin", "win32"):
@@ -122,10 +131,10 @@ def sched_install(run=subprocess.run):
         if len(argv[-1]) > _TR_MAX:
             print("ai-tracker: scheduled command exceeds %d chars; checkout path too long." % _TR_MAX)
             return 2
-        r = run(argv, capture_output=True, text=True)
-        if r.returncode == 0:
+        r = _sched_run(run, argv)
+        if r is not None and r.returncode == 0:
             _set_optout(False)
-        return 0 if r.returncode == 0 else 1
+        return 0 if r is not None and r.returncode == 0 else 1
     old = _read_plist()
     if old and old.get("WorkingDirectory") not in (None, _root()):
         print("replacing job that pointed at %s" % old.get("WorkingDirectory"))
@@ -135,14 +144,14 @@ def sched_install(run=subprocess.run):
     with open(path, "wb") as f:
         f.write(launchd_plist())
     os.chmod(path, 0o644)
-    run(["launchctl", "bootout", _target()], capture_output=True, text=True)
-    r = run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), path], capture_output=True, text=True)
-    if r.returncode != 0:
+    _sched_run(run, ["launchctl", "bootout", _target()])
+    r = _sched_run(run, ["launchctl", "bootstrap", "gui/%d" % os.getuid(), path])
+    if r is None or r.returncode != 0:
         try:
             os.remove(path)
         except OSError:
             pass
-        print("ai-tracker: launchctl bootstrap failed (rc %s)" % r.returncode)
+        print("ai-tracker: launchctl bootstrap failed (rc %s)" % (r.returncode if r is not None else "timeout"))
         return 1
     _set_optout(False)
     return 0
@@ -150,9 +159,9 @@ def sched_install(run=subprocess.run):
 
 def sched_uninstall(run=subprocess.run):
     if sys.platform == "win32":
-        run(["schtasks", "/Delete", "/TN", TASK, "/F"], capture_output=True, text=True)
+        _sched_run(run, ["schtasks", "/Delete", "/TN", TASK, "/F"])
     elif sys.platform == "darwin":
-        run(["launchctl", "bootout", _target()], capture_output=True, text=True)
+        _sched_run(run, ["launchctl", "bootout", _target()])
         try:
             os.remove(plist_path())
         except OSError:
@@ -165,14 +174,18 @@ def sched_status(run=subprocess.run):
     st = {"kind": None, "installed": False, "last_exit": None, "root": None, "root_exists": False}
     if sys.platform == "win32":
         st["kind"] = "schtasks"
-        st["installed"] = run(["schtasks", "/Query", "/TN", TASK],
-                              capture_output=True, text=True).returncode == 0
+        r = _sched_run(run, ["schtasks", "/Query", "/TN", TASK])
+        st["installed"] = r is not None and r.returncode == 0
+        if r is None:
+            st["error"] = "timeout"
         return st
     if sys.platform != "darwin":
         return st
     st["kind"] = "launchd"
-    r = run(["launchctl", "print", _target()], capture_output=True, text=True)
-    st["installed"] = r.returncode == 0
+    r = _sched_run(run, ["launchctl", "print", _target()])
+    if r is None:
+        st["error"] = "timeout"
+    st["installed"] = r is not None and r.returncode == 0
     if st["installed"]:
         m = re.search(r"last exit code = (-?\d+)", r.stdout or "")
         if m:

@@ -140,12 +140,13 @@ class TickTests(unittest.TestCase):
             sleeps.append(s)
             if len(sleeps) >= 4:
                 raise Stop()
-        with mock.patch.object(pending, "tick", side_effect=RuntimeError("boom")):
+        with mock.patch.object(pending, "_scan_here_ok", lambda: True), \
+                mock.patch.object(pending, "tick", side_effect=RuntimeError("boom")):
             with self.assertRaises(Stop):
                 pending._worker_loop(sleep=fake_sleep, clock=lambda: 1000.0)
         self.assertEqual(len(sleeps), 4)
         self.assertEqual(sleeps[0], 60)                                          # boot delay
-        self.assertTrue(all(60 <= s <= 3600 for s in sleeps))
+        self.assertTrue(all(60 <= s <= 86400 for s in sleeps))
         self.assertIn("worker error", open(config.PENDING_LOG).read())
 
     def test_worker_loop_sleeps_until_next_due(self):
@@ -157,7 +158,8 @@ class TickTests(unittest.TestCase):
             sleeps.append(s)
             if len(sleeps) >= 2:
                 raise KeyboardInterrupt
-        with mock.patch.object(pending, "tick", return_value="idle"):
+        with mock.patch.object(pending, "_scan_here_ok", lambda: True), \
+                mock.patch.object(pending, "tick", return_value="idle"):
             with self.assertRaises(KeyboardInterrupt):
                 pending._worker_loop(sleep=fake_sleep, clock=lambda: now + 90 * DAY - 7200)
         self.assertEqual(sleeps[1], 3600)                                        # capped at an hour
@@ -224,6 +226,66 @@ class LockPathTests(unittest.TestCase):
             outs.append(subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, cwd=root).stdout.strip())
         self.assertEqual(outs[0], outs[1])
         self.assertTrue(outs[0].startswith(os.path.expanduser("~")))
+
+
+class WorkerGuardBackoffTests(unittest.TestCase):
+    """G2: the in-server worker scans only from a primary, non-temp, non-test checkout; a failing scan
+    backs off exponentially (cap 86400 s) and a good one resets it."""
+
+    def _run(self, ticks, n_sleeps, ok=True):
+        sleeps, calls = [], []
+
+        def fake_sleep(s):
+            sleeps.append(s)
+            if len(sleeps) >= n_sleeps:
+                raise KeyboardInterrupt
+
+        def fake_tick(now=None):
+            calls.append(1)
+            r = ticks[min(len(calls) - 1, len(ticks) - 1)]
+            if isinstance(r, Exception):
+                raise r
+            return r
+        d = tempfile.mkdtemp()
+        with mock.patch.object(config, "PENDING_FILE", os.path.join(d, "p.json")), \
+                mock.patch.object(config, "PENDING_LOG", os.path.join(d, "p.log")), \
+                mock.patch.object(pending, "_scan_here_ok", lambda: ok), \
+                mock.patch.object(pending, "tick", fake_tick):
+            with self.assertRaises(KeyboardInterrupt):
+                pending._worker_loop(sleep=fake_sleep, clock=lambda: 1000.0)
+        return sleeps, calls
+
+    def test_worker_does_not_scan_when_checkout_not_eligible(self):
+        sleeps, calls = self._run(["idle"], 3, ok=False)
+        self.assertEqual(calls, [])
+        self.assertTrue(all(s == 3600 for s in sleeps[1:]))
+
+    def test_guard_is_false_under_test_and_in_linked_worktree_and_temp(self):
+        self.assertFalse(pending._scan_here_ok())                       # this IS a test run
+        with mock.patch.object(pending, "_under_test", lambda: False):
+            with mock.patch.object(pending, "_is_linked_worktree", lambda: True):
+                self.assertFalse(pending._scan_here_ok())
+            with mock.patch.object(pending, "_is_linked_worktree", lambda: False), \
+                    mock.patch.object(pending, "_root", lambda: tempfile.mkdtemp()):
+                self.assertFalse(pending._scan_here_ok())
+            with mock.patch.object(pending, "_is_linked_worktree", lambda: False), \
+                    mock.patch.object(pending, "_is_temp", lambda p: False), \
+                    mock.patch.object(pending, "_root", lambda: "/home/u/proj"):
+                self.assertTrue(pending._scan_here_ok())
+
+    def test_failing_scan_backs_off_exponentially_capped_and_resets(self):
+        boom = RuntimeError("boom")
+        sleeps, _ = self._run([boom] * 9, 10)
+        waits = sleeps[1:]
+        self.assertEqual(waits[0], 3600)
+        self.assertEqual(waits[1], 7200)
+        self.assertEqual(waits[2], 14400)
+        self.assertEqual(max(waits), 86400)
+        self.assertEqual(waits[-1], 86400)
+        sleeps, _ = self._run([boom, boom, "idle", boom], 5)
+        self.assertEqual(sleeps[1:3], [3600, 7200])
+        self.assertLess(sleeps[3], 3600 + 1)                           # reset after a success
+        self.assertEqual(sleeps[4], 3600)                              # first failure again
 
 
 if __name__ == "__main__":

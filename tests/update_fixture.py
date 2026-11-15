@@ -2,6 +2,7 @@
 a `checkout` clone (what the "running dashboard" is), and a `second` clone that pushes new commits.
 config._HERE / CONFIG_FILE / PENDING_LOCK are patched to temp; nothing outside one mkdtemp is touched.
 Never fetches, execs or restarts anything real. Import `make_update_fixture(testcase)`."""
+import atexit
 import os
 import shutil
 import subprocess
@@ -30,6 +31,26 @@ STUB = {
 }
 
 
+_TEMPLATE = []          # [root]: remote.git + checkout + second with the stub package pushed; built once, copied per test
+
+
+def _template(fx):
+    if not _TEMPLATE:
+        root = os.path.realpath(tempfile.mkdtemp(prefix="update-tpl-"))
+        atexit.register(shutil.rmtree, root, True)
+        remote, second, repo = (os.path.join(root, n) for n in ("remote.git", "second", "checkout"))
+        fx.git(root, "init", "--bare", "-b", "main", remote)
+        fx.git(root, "clone", "-q", remote, second)
+        for rel, text in STUB.items():
+            fx.write(second, rel, text)
+        fx.git(second, "add", "-A")
+        fx.git(second, "commit", "-q", "-m", "stub package")
+        fx.git(second, "push", "-q", "-u", "origin", "main")
+        fx.git(root, "clone", "-q", remote, repo)
+        _TEMPLATE.append(root)
+    return _TEMPLATE[0]
+
+
 class UFx:
     def __init__(self, tc):
         self.tc = tc
@@ -44,14 +65,11 @@ class UFx:
         self.remote, self.repo, self.second = j("remote.git"), j("checkout"), j("second")
         self.cfg = j("config.json")
         self.lock = j("pending.lock")
-        self.git(self.root, "init", "--bare", "-b", "main", self.remote)
-        self.git(self.root, "clone", "-q", self.remote, self.second)
-        for rel, text in STUB.items():
-            self.write(self.second, rel, text)
-        self.git(self.second, "add", "-A")
-        self.git(self.second, "commit", "-q", "-m", "stub package")
-        self.git(self.second, "push", "-q", "-u", "origin", "main")
-        self.git(self.root, "clone", "-q", self.remote, self.repo)
+        tpl = _template(self)
+        for n, dst in (("remote.git", self.remote), ("second", self.second), ("checkout", self.repo)):
+            shutil.copytree(os.path.join(tpl, n), dst, symlinks=True)
+        for clone in (self.second, self.repo):
+            self.git(clone, "remote", "set-url", "origin", self.remote)
         for k, v in (("_HERE", os.path.join(self.repo, "aitracker")), ("CONFIG_FILE", self.cfg),
                      ("PENDING_LOCK", self.lock)):
             p = mock.patch.object(config, k, v)

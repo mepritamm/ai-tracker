@@ -4,12 +4,14 @@ Stages (plan v3.1 section 3): discover -> inspect -> gh -> classify -> clean -> 
 This part is READ-ONLY: git status/rev-list/merge-base, disk stat, and `gh pr list`. The clean
 stage, tick/worker and CLI are added below by later steps. Every git/gh call has a timeout and
 fails closed: an error means the item is kept / "unknown", never deletable."""
+import concurrent.futures
 import contextlib
 import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -19,11 +21,13 @@ from .store import _load_json, _save_json
 from .registry import all_cwds
 from .providers.claude import _pid_alive, _session_meta
 from .schedule import sched_install, sched_uninstall, sched_status
+from .schedule import _under_test, _is_temp, _is_linked_worktree, _root
 
 GIT_TIMEOUT = 10                 # s per git call; timeout -> verdict "unknown", not deletable
 SCAN_ENTRY_CAP = 50_000          # dirents per tmp tree; exceeded -> keep
 PENDING_GRACE = 7 * 86400        # deletion idle-grace; DECOUPLED from PENDING_INTERVAL
 SLACK = 3600                     # due() tolerance (used by tick)
+ITEM_GIT_BYTES = 256 * 1024      # per git call in item_detail (the modal shows a few hundred lines)
 GH_TIMEOUT = 15                  # s per gh call
 GH_MAX_CALLS = 20                # gh calls per scan, hard cap
 GH_BUDGET_S = 120                # wall-clock budget for all gh calls in one scan
@@ -45,15 +49,53 @@ def _nice():
     return ["nice", "-n", "10"] if os.name == "posix" and shutil.which("nice") else []
 
 
+_GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+                 "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX")
+
+
+def _git_env():
+    """Scan env: every git call addresses only its `-C` path (a GIT_DIR-style var would redirect it)."""
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_DROP}
+    return dict(env, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
+
+
 def _git(cwd, *args):
     """(rc, stdout) of `git -C cwd args`. rc is None on timeout / spawn failure (fail closed)."""
-    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
+    env = _git_env()
     try:
         p = subprocess.run([*_nice(), "git", "--no-optional-locks", "-C", cwd, *args], capture_output=True,
                            timeout=GIT_TIMEOUT, env=env)
     except (subprocess.TimeoutExpired, OSError, ValueError):
         return None, ""
     return p.returncode, p.stdout.decode("utf-8", "replace")
+
+
+def _git_capped(cwd, max_bytes, *args):
+    """(rc, text) of `git -C cwd args`, reading at most max_bytes of stdout (the child is killed past that)
+    and at most GIT_TIMEOUT seconds. rc None on timeout / spawn failure."""
+    try:
+        p = subprocess.Popen([*_nice(), "git", "--no-optional-locks", "-C", cwd, *args], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, env=_git_env())
+    except (OSError, ValueError):
+        return None, ""
+    timed_out = []
+    timer = threading.Timer(GIT_TIMEOUT, lambda: (timed_out.append(1), p.kill()))
+    timer.start()
+    try:
+        data = p.stdout.read(max_bytes + 1)
+        truncated = len(data) > max_bytes
+        if truncated:
+            p.kill()
+        p.wait()
+    except (OSError, ValueError):
+        p.kill()
+        return None, ""
+    finally:
+        timer.cancel()
+        p.stdout.close()
+    if timed_out:
+        return None, ""
+    return (0 if truncated else p.returncode), data[:max_bytes].decode("utf-8", "replace")
 
 
 def _gh(cwd, *args):
@@ -96,6 +138,11 @@ def _under(path, root, depth=None):
         return True
     rel = os.path.relpath(rp, rr)
     return rel != "." and len(rel.split(os.sep)) == depth
+
+
+def _under_rp(child_rp, root_rp):
+    """_under for two paths that are ALREADY _rp'd (ctx keys): a string prefix test, no syscalls."""
+    return child_rp == root_rp or child_rp.startswith(root_rp.rstrip(os.sep) + os.sep)
 
 
 def _alive(pid):
@@ -174,7 +221,7 @@ def build_ctx():
         p = st.get("worktreePath") or st.get("cwd")
         if isinstance(p, str) and p:
             jobs.append((_rp(p), st))
-    live = set()
+    live, live_sids = set(), set()
     try:
         sess = os.listdir(config.LIVE_SESSIONS_DIR)
     except OSError:
@@ -185,6 +232,8 @@ def build_ctx():
         d = _load_json(os.path.join(config.LIVE_SESSIONS_DIR, n), None)
         if isinstance(d, dict) and isinstance(d.get("cwd"), str) and d["cwd"] and _alive(d.get("pid")):
             live.add(_rp(d["cwd"]))
+            if isinstance(d.get("sessionId"), str) and d["sessionId"]:
+                live_sids.add(d["sessionId"])
     tx, tx_sid = {}, {}
     try:
         projs = os.listdir(config.PROJECTS)
@@ -205,7 +254,7 @@ def build_ctx():
                 k = _rp(cwd)
                 tx[k] = max(mt, tx.get(k, 0))
     return {"jobs": jobs, "job_by_id": job_by_id, "job_by_sid": job_by_sid, "live": live,
-            "tx": tx, "tx_sid": tx_sid, "bases": {}}
+            "live_sids": live_sids, "tx": tx, "tx_sid": tx_sid, "bases": {}}
 
 
 # ---------------------------------------------------------------- discovery
@@ -285,6 +334,13 @@ def discover_repos(now=None, extra_seeds=(), prev=None):
             continue
         rc, out = _git(d, "rev-parse", "--path-format=absolute", "--git-common-dir")
         if rc != 0 or not out.strip():
+            if is_cwd and d == seed:             # an existing non-repo cwd (a parent folder): its child repos, one level
+                try:
+                    kids = sorted(os.listdir(d))[:200]
+                except OSError:
+                    kids = []
+                seeds += [(os.path.join(d, n), False) for n in kids
+                          if not os.path.islink(os.path.join(d, n)) and os.path.exists(os.path.join(d, n, ".git"))]
             continue
         common = os.path.realpath(out.strip())
         ent = repos.get(common)
@@ -336,37 +392,48 @@ def _base_ref(cwd, ctx):
     return base
 
 
+_OP_MARKERS = ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG")
+
+
+def _admin_dir(wt, repo):
+    """The worktree's git admin dir (the common dir for the primary). A relative `gitdir:` is relative
+    to the worktree (git >= 2.48 worktree.useRelativePaths)."""
+    path = wt["path"]
+    if wt["primary"]:
+        return repo["common"]
+    admin = None
+    try:
+        with open(os.path.join(path, ".git"), encoding="utf-8") as fh:
+            line = fh.read().strip()
+        if line.startswith("gitdir:"):
+            admin = os.path.normpath(os.path.join(path, line[7:].strip()))
+    except OSError:
+        admin = None
+    return admin or os.path.join(repo["common"], "worktrees", os.path.basename(path.rstrip(os.sep)))
+
+
 def _last_activity(wt, repo, ctx):
     """max mtime of the worktree's admin files + dir + newest transcript whose cwd is under it."""
     path = wt["path"]
     t = _mtime(path)
-    admin = None
-    if wt["primary"]:
-        admin = repo["common"]
-    else:
-        try:
-            with open(os.path.join(path, ".git"), encoding="utf-8") as fh:
-                line = fh.read().strip()
-            if line.startswith("gitdir:"):
-                admin = line[7:].strip()
-        except OSError:
-            admin = None
-        if not admin:
-            admin = os.path.join(repo["common"], "worktrees", os.path.basename(path.rstrip(os.sep)))
+    admin = _admin_dir(wt, repo)
     for f in ("HEAD", "index", os.path.join("logs", "HEAD")):
         t = max(t, _mtime(os.path.join(admin, f)))
+    rp = _rp(path)
     for cwd, mt in ctx["tx"].items():
-        if _under(cwd, path):
+        if _under_rp(cwd, rp):
             t = max(t, mt)
     return int(t)
 
 
 def _job_busy(path, ctx):
-    return any(_under(jp, path) and st.get("state") not in _DONE_STATES for jp, st in ctx["jobs"])
+    rp = _rp(path)
+    return any(_under_rp(jp, rp) and st.get("state") not in _DONE_STATES for jp, st in ctx["jobs"])
 
 
 def _live_under(path, ctx):
-    return any(_under(c, path) for c in ctx["live"])
+    rp = _rp(path)
+    return any(_under_rp(c, rp) for c in ctx["live"])
 
 
 def inspect_worktree(wt, repo, ctx):
@@ -379,12 +446,14 @@ def inspect_worktree(wt, repo, ctx):
             "files": [], "ignored_files": [], "unpushed": 0, "ahead": 0, "behind": 0, "ancestor": False,
             "locked": wt["locked"], "primary": wt["primary"], "bare": wt["bare"], "missing": False,
             "contained": True, "last_activity": 0, "busy_job": False, "live": False,
+            "unborn": False, "hidden": 0, "op": False,
             "gh": {"state": "skipped", "pr": None, "checked_at": 0},
             "verdict": "unknown", "deletable": False, "reason": "", "label": "", "error": None}
     try:
         item["busy_job"] = _job_busy(path, ctx)
         item["live"] = _live_under(path, ctx)
         item["last_activity"] = _last_activity(wt, repo, ctx)
+        item["op"] = any(os.path.exists(os.path.join(_admin_dir(wt, repo), m)) for m in _OP_MARKERS)
         if wt["bare"]:
             return item
         if wt["prunable"] or not os.path.isdir(path):
@@ -403,6 +472,15 @@ def inspect_worktree(wt, repo, ctx):
         item["files"] = [p for _, p in ents][:50]
         item["ignored"] = len(ign)
         item["ignored_files"] = ign[:20]
+        rc, _o = _git(path, "rev-parse", "-q", "--verify", "HEAD")
+        if rc is None:
+            raise _GitErr("git rev-parse: timeout/spawn failure")
+        if rc != 0:                              # unborn HEAD: no commits yet, nothing to compare against
+            item["unborn"] = True
+            return item
+        if not (item["dirty"] or item["untracked"] or item["ignored"]):
+            # assume-unchanged / skip-worktree entries hide edits from `git status`: never delete those
+            item["hidden"] = sum(1 for ln in _need(path, "ls-files", "-v").splitlines() if ln[:1].islower() or ln[:1] == "S")
         item["unpushed"] = int(_need(path, "rev-list", "--count", "HEAD", "--not", "--remotes").strip() or 0)
         rc, up = _git(path, "rev-parse", "--abbrev-ref", "@{u}")
         if rc == 0 and up.strip():
@@ -427,34 +505,77 @@ def inspect_worktree(wt, repo, ctx):
 
 def _walk_tree(root):
     """(newest mtime, bytes, entries, capped, git_roots) of a tree; never follows symlinks and does
-    not descend into `.git`. git_roots: dirs holding a `.git` file or directory."""
+    not descend into `.git`. git_roots: dirs holding a `.git` file or directory. `capped` is falsy, or
+    the reason the tree cannot be verified (too many entries / an unreadable directory)."""
     newest, size, n, capped, gits = _mtime(root), 0, 0, False, []
-    for dp, dns, fns in os.walk(root, followlinks=False):
+    errs = []
+    for dp, dns, fns in os.walk(root, followlinks=False, onerror=errs.append):
         if ".git" in dns or ".git" in fns:
             gits.append(dp)
             dns[:] = [d for d in dns if d != ".git"]
         for nm in dns + fns:
             n += 1
             if n > SCAN_ENTRY_CAP:
-                capped = True
-                return newest, size, n, capped, gits
+                return newest, size, n, "too many entries to verify", gits
             try:
                 st = os.lstat(os.path.join(dp, nm))
             except OSError:
                 continue
             newest = max(newest, st.st_mtime)
             size += st.st_size
+    if errs:
+        capped = "unreadable entries"
     return newest, size, n, capped, gits
+
+
+def _scratch_root_ok(sr):
+    """SCRATCH_ROOT is trusted only as a real directory (not a symlink) owned by this user and not
+    group/world-writable: /tmp is shared, so another account could plant the path first."""
+    try:
+        st = os.lstat(sr)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022
+
+
+def _tmp_entry(path, root, sid, jid, ctx, now):
+    """(entry dict, git_roots) for ONE tmp candidate, or None when it is not a depth-2 dir under root.
+    `stale` (== deletable) only when every guard holds; anything uncertain is `keep`."""
+    if not os.path.isdir(path) or not _under(path, root, 2):   # SCRATCH_ROOT/<slug>/<sid>; JOBS_DIR/<id>/tmp
+        return None
+    reason = None
+    newest, size, _n, capped, gits = _walk_tree(path)
+    job = ctx["job_by_id"].get(jid) if jid else ctx["job_by_sid"].get(sid)
+    live_sids = ctx.get("live_sids") or ()
+    if os.path.islink(path):
+        reason = "symlink"
+    elif gits:
+        reason = "holds a git repo"
+    elif capped:
+        reason = capped
+    elif (sid and sid in live_sids) or (job and job.get("sessionId") in live_sids):
+        reason = "live session"
+    elif job is not None and job.get("state") not in _DONE_STATES:
+        reason = "job %s" % job.get("state")
+    elif job is None and ctx["tx_sid"].get(sid or "", 0) > now - PENDING_GRACE:
+        reason = "recent transcript"
+    elif newest >= now - PENDING_GRACE:
+        reason = "active < grace"
+    elif _live_under(path, ctx):
+        reason = "live session"
+    return {"id": _item_id(path), "kind": "scratch", "path": path, "session": sid or (job or {}).get("sessionId"),
+            "job": jid, "bytes": size, "age_s": int(now - newest),
+            "verdict": "keep" if reason else "stale", "deletable": reason is None,
+            "reason": reason or "stale tmp tree"}, gits
 
 
 def scan_tmp(ctx, now=None):
     """([tmp entry dicts], git_roots). Candidates: SCRATCH_ROOT/<slug>/<sid> (depth 2, POSIX) and
-    JOBS_DIR/<id>/tmp (depth 2). An entry is `stale` (== deletable) only when every guard holds;
-    anything uncertain is `keep`. Never deletes."""
+    JOBS_DIR/<id>/tmp (depth 2). Never deletes."""
     now = time.time() if now is None else now
     cands = []                                   # (path, root, session, job_id)
     sr = config.SCRATCH_ROOT
-    if sr and os.path.isdir(sr):
+    if sr and os.path.isdir(sr) and _scratch_root_ok(sr):
         try:
             slugs = os.listdir(sr)
         except OSError:
@@ -476,30 +597,10 @@ def scan_tmp(ctx, now=None):
             cands.append((tp, config.JOBS_DIR, None, jid))
     out, roots = [], []
     for path, root, sid, jid in cands:
-        if not os.path.isdir(path) or not _under(path, root, 2):   # SCRATCH_ROOT/<slug>/<sid>; JOBS_DIR/<id>/tmp
-            continue
-        reason = None
-        newest, size, _n, capped, gits = _walk_tree(path)
-        roots += gits
-        job = ctx["job_by_id"].get(jid) if jid else ctx["job_by_sid"].get(sid)
-        if os.path.islink(path):
-            reason = "symlink"
-        elif gits:
-            reason = "holds a git repo"
-        elif capped:
-            reason = "too many entries to verify"
-        elif job is not None and job.get("state") not in _DONE_STATES:
-            reason = "job %s" % job.get("state")
-        elif job is None and ctx["tx_sid"].get(sid or "", 0) > now - PENDING_GRACE:
-            reason = "recent transcript"
-        elif newest >= now - PENDING_GRACE:
-            reason = "active < grace"
-        elif _live_under(path, ctx):
-            reason = "live session"
-        out.append({"id": _item_id(path), "kind": "scratch", "path": path, "session": sid or (job or {}).get("sessionId"),
-                    "job": jid, "bytes": size, "age_s": int(now - newest),
-                    "verdict": "keep" if reason else "stale", "deletable": reason is None,
-                    "reason": reason or "stale tmp tree"})
+        r = _tmp_entry(path, root, sid, jid, ctx, now)
+        if r is not None:
+            out.append(r[0])
+            roots += r[1]
     return out, roots
 
 
@@ -514,6 +615,7 @@ def _is_candidate(it, now):
     return (it["kind"] in ("worktree", "repo") and not it["primary"] and not it["detached"] and not it["locked"]
             and not it["bare"] and not it["missing"] and not it["error"] and not _own_tracker(it)
             and it["branch"] and it["dirty"] == it["untracked"] == it["ignored"] == 0 and not it["ancestor"]
+            and not it.get("hidden") and not it.get("op")
             and now - it["last_activity"] >= PENDING_GRACE and not it["busy_job"] and not it["live"])
 
 
@@ -591,8 +693,8 @@ def classify(wt, ctx, now):
         reason = ("%d orphan commits" % n if not it["contained"] else
                   "branch has %d unpushed" % n if n else "worktree directory gone")
         return {"verdict": "missing", "deletable": False, "reason": reason, "label": reason}
-    elif it["dirty"] or it["untracked"] or (it["unpushed"] > 0 and not merged):
-        bits = []
+    elif it["dirty"] or it["untracked"] or it.get("unborn") or (it["unpushed"] > 0 and not merged):
+        bits = ["no commits yet"] if it.get("unborn") else []
         if it["dirty"]:
             bits.append("%d uncommitted" % it["dirty"])
         if it["untracked"]:
@@ -609,8 +711,10 @@ def classify(wt, ctx, now):
     else:
         verdict, reason = "clean", "pushed; not merged into %s" % (it["base"] or "any base")
     deletable = (verdict == "clean" and not it["primary"] and not it["bare"] and not it["locked"]
-                 and it["ignored"] == 0 and not _own_tracker(it))
-    label = reason + (" · %d ignored files" % it["ignored"] if it["ignored"] else "")
+                 and it["ignored"] == 0 and not it.get("hidden") and not it.get("op") and not _own_tracker(it))
+    label = (reason + (" · %d ignored files" % it["ignored"] if it["ignored"] else "")
+             + (" · %d assume-unchanged/skip-worktree" % it["hidden"] if it.get("hidden") else "")
+             + (" · operation in progress" if it.get("op") else ""))
     if deletable and reclaimable(dict(it, verdict=verdict, deletable=True), now):
         label += " · worktree reclaimable" + ("; branch kept" if merged else "")
     return {"verdict": verdict, "deletable": deletable, "reason": reason, "label": label}
@@ -626,20 +730,28 @@ def reclaimable(it, now):
     return bool(merged_ok and now - it["last_activity"] >= PENDING_GRACE and not it["busy_job"] and not it["live"])
 
 
+def _as_of(ts):
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
 def build_card(report, now=None):
     """Server-built card: counts verdict pending/missing items plus stale tmp entries; the SPA never
     derives a verdict or threshold."""
     now = time.time() if now is None else now
     hot = [i for i in report.get("items", []) if i.get("verdict") in ("pending", "missing")]
     stale = [t for t in report.get("tmp", []) if t.get("verdict") == "stale"]
-    count = len(hot) + len(stale)
+    unknown = [i for i in report.get("items", []) if i.get("verdict") == "unknown"]
+    count = len(hot) + len(stale) + len(unknown)
     parts = []
     if hot:
         oldest = max(max(0, now - i["last_activity"]) for i in hot) // 86400
         parts.append("%d worktree%s with unfinished work (oldest idle %dd)" % (len(hot), "" if len(hot) == 1 else "s", oldest))
     if stale:
         parts.append("%d stale tmp tree%s" % (len(stale), "" if len(stale) == 1 else "s"))
-    return {"show": count > 0, "title": "Pending work", "summary": "; ".join(parts), "count": count}
+    if unknown:
+        parts.append("%d could not be checked" % len(unknown))
+    return {"show": count > 0, "title": "Pending work", "summary": "; ".join(parts), "count": count,
+            "as_of": _as_of(report.get("generated_at") or now)}
 
 
 def scan(now=None):
@@ -717,12 +829,14 @@ def _remove_worktree(it, now, report):
         rec = {"id": it["id"], "kind": "worktree", "path": it["path"], "branch": it["branch"],
                "branch_deleted": False, "note": ""}
         short = (fresh["base"] or "").split("/", 1)[-1]
-        if it["branch"] and not it["detached"] and it["branch"] != short:
+        if it["branch"] and not it["detached"] and it["branch"] != short and it["branch"] not in ("develop", "main", "master"):
             rc, _o = _git(it["top"], "branch", "-d", it["branch"])      # never -D
             rec["branch_deleted"] = rc == 0
             if rc != 0:
                 rec["note"] = ("branch kept (squash-merged; delete with -D yourself)"
                                if (it.get("gh") or {}).get("state") == "merged" else "branch kept (git branch -d refused)")
+            elif (it.get("gh") or {}).get("state") == "merged":
+                rec["note"] = "branch deleted (fully pushed to upstream)"
         report["deleted"].append(rec)
         _log("DELETED worktree %s branch=%s branch_deleted=%s %s" % (it["path"], it["branch"], rec["branch_deleted"], rec["note"]))
     except Exception as e:                      # any exception => keep
@@ -738,6 +852,11 @@ def _prune_repo(repo_common, top, report, safe):
             return
         ctx = build_ctx()
         for w in prunable:
+            near = _nearest_existing(w["path"])
+            if near is None or os.path.dirname(near) == near or near == "/Volumes":     # volume not mounted
+                report["refused"].append({"id": _item_id(w["path"]), "path": w["path"],
+                                          "reason": "prune skipped: its volume is not mounted"})
+                return
             f = inspect_worktree(w, repo, ctx)
             if f["error"] or not f["contained"]:
                 report["refused"].append({"id": f["id"], "path": f["path"], "reason": "prune skipped: %s" % (
@@ -763,11 +882,14 @@ def _remove_tmp(t, now, report):
         report["refused"].append({"id": t["id"], "path": t["path"], "reason": why})
         _log("REFUSED tmp %s: %s" % (t["path"], why))
     try:
-        fresh = {e["path"]: e for e in scan_tmp(build_ctx(), now)[0]}.get(t["path"])
+        jid = t.get("job")
+        root = config.JOBS_DIR if jid else config.SCRATCH_ROOT
+        fresh = None
+        if root and (jid or _scratch_root_ok(root)):       # re-check ONLY this candidate (guards identical to scan_tmp)
+            r = _tmp_entry(t["path"], root, None if jid else t.get("session"), jid, build_ctx(), now)
+            fresh = r[0] if r else None
         if fresh is None or not fresh["deletable"]:
             return refuse("no longer stale on re-scan (%s)" % (fresh or {}).get("reason", "gone"))
-        if os.path.islink(t["path"]) or any(_walk_tree(t["path"])[4]):
-            return refuse("symlink or contains a git repo")
         errs = []
         shutil.rmtree(t["path"], onerror=lambda f, p, e: errs.append(p))
         if errs or os.path.exists(t["path"]):
@@ -842,10 +964,27 @@ def run_once(mode=None, now=None, scheduled=False):
             _RUNNING.clear()
 
 
+_START = threading.Lock()
+
+
 def run_async(mode="dry-run"):
-    if _RUNNING.is_set():
-        return False
-    threading.Thread(target=lambda: run_once(mode), daemon=True, name="pending-scan").start()
+    """Start a scan thread. _RUNNING is set BEFORE the thread starts, so the client's immediate follow-up
+    GET sees running and load_report does not probe (and steal) the scan's own lock."""
+    with _START:
+        if _RUNNING.is_set():
+            return False
+        _RUNNING.set()
+
+    def target():
+        try:
+            run_once(mode)
+        finally:
+            _RUNNING.clear()
+    try:
+        threading.Thread(target=target, daemon=True, name="pending-scan").start()
+    except BaseException:
+        _RUNNING.clear()
+        raise
     return True
 
 
@@ -870,16 +1009,33 @@ def _next_wait(now):
     return sa + secs - SLACK - now
 
 
+def _scan_here_ok():
+    """The in-server worker scans only from a primary, non-temp checkout outside a test run (the same
+    guards as the scheduler auto-install). The CLI --pending and the Scan-now route work anywhere."""
+    try:
+        root = _root()
+        return not (_under_test() or _is_linked_worktree()
+                    or (os.sep + ".claude" + os.sep + "worktrees" + os.sep) in root + os.sep
+                    or _is_temp(root))
+    except Exception:
+        return False
+
+
 def _worker_loop(sleep=time.sleep, clock=time.time):
     sleep(60)
+    fails = 0
     while True:
         wait = 3600
-        try:
-            tick(clock())
-            wait = _next_wait(clock())
-        except Exception as e:
-            _log("worker error: %s" % e)
-        sleep(max(60, min(3600, wait)))
+        if _scan_here_ok():
+            try:
+                tick(clock())
+                wait = _next_wait(clock())
+                fails = 0
+            except Exception as e:
+                fails += 1
+                wait = min(86400, 3600 * 2 ** min(fails - 1, 5))
+                _log("worker error: %s" % e)
+        sleep(max(60, min(86400 if fails else 3600, wait)))
 
 
 def start_worker():
@@ -895,12 +1051,29 @@ def start_worker():
 
 # ---------------------------------------------------------------- report / item detail / resume (routes)
 
+_REPORT_MEMO = {}
+
+
+def _read_report():
+    """The parsed pending.json, memoised on (mtime_ns, size) so the 2 s poll does not re-parse ~1 MB.
+    Shared and READ-ONLY: callers copy before changing. A rewrite changes the key."""
+    try:
+        st = os.stat(config.PENDING_FILE)
+        key = (config.PENDING_FILE, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {}
+    if _REPORT_MEMO.get("key") != key:
+        r = _load_json(config.PENDING_FILE, {})
+        _REPORT_MEMO.clear()
+        _REPORT_MEMO.update(key=key, val=r if isinstance(r, dict) else {})
+    return _REPORT_MEMO["val"]
+
+
 def load_report():
     """pending.json normalised for the API: always items/tmp/card, `running` true while a scan runs in
     this process or another one holds the lock, `next_due` (epoch or None when off). gh_cache is
     internal and dropped. Never scans."""
-    r = _load_json(config.PENDING_FILE, {})
-    r = dict(r) if isinstance(r, dict) else {}
+    r = dict(_read_report())
     r.pop("gh_cache", None)
     for k in ("items", "tmp", "deleted", "would_delete", "refused", "errors", "repos"):
         if not isinstance(r.get(k), list):
@@ -909,14 +1082,22 @@ def load_report():
     if not running:
         with _pending_lock() as got:
             running = not got
+    rank = {"pending": 0, "missing": 1, "unknown": 2}
+    r["items"] = sorted((i for i in r["items"] if isinstance(i, dict)),
+                        key=lambda i: (rank.get(i.get("verdict"), 3), -(i.get("last_activity") or 0)))
+    r["tmp"] = sorted((t for t in r["tmp"] if isinstance(t, dict)), key=lambda t: t.get("verdict") != "stale")
     r["running"] = running
     card = r.get("card") if isinstance(r.get("card"), dict) else {"show": False, "title": "Pending work",
                                                                    "summary": "", "count": 0}
+    ga = r.get("generated_at")
+    if "as_of" not in card and isinstance(ga, (int, float)) and ga:     # reports written before build_card added it
+        card = dict(card, as_of=_as_of(ga))
     if running:
-        card = dict(card, show=True, summary="scanning\u2026")
+        card = dict(card, show=bool(card.get("show")) or _RUNNING.is_set(), summary="scanning\u2026")
     r["card"] = card
     secs = config.interval_seconds(config.PENDING_INTERVAL)
-    r["next_due"] = None if secs is None else (r.get("scheduled_at") or time.time()) + secs
+    sa = r.get("scheduled_at")
+    r["next_due"] = sa + secs if secs is not None and isinstance(sa, (int, float)) else None
     return r
 
 
@@ -934,7 +1115,12 @@ def _cap(text, n):
 
 
 def resume_prompt(item):
-    """Server-owned prompt text (D2): worktree-cleanup first, then cleanup. git runs via `git -C`."""
+    """Server-owned prompt text (D2): worktree-cleanup first, then cleanup. git runs via `git -C`.
+    One line, no control characters: it is typed into a shell."""
+    return re.sub(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+", " ", _resume_prompt(item))
+
+
+def _resume_prompt(item):
     path = item.get("path") or ""
     if item.get("kind") == "scratch":
         return "Use the cleanup skill for session %s scratch at %s." % (item.get("session") or item.get("job") or "(unknown)", path)
@@ -942,20 +1128,17 @@ def resume_prompt(item):
     ghs = gh.get("state") or "unknown"
     if gh.get("pr"):
         ghs += " " + (gh["pr"].get("url") if isinstance(gh["pr"], dict) else str(gh["pr"]))
-    sids = ", ".join(item.get("sids") or []) or "(any session that used it)"
     return ("Use the worktree-cleanup skill on %s (repo %s, branch %s; %d uncommitted, %d unpushed as of last fetch; "
             "gh: %s; operate with `git -C %s`, do not cd into it). Commit/push or discard only as I decide; ask "
-            "before anything destructive. Then use the cleanup skill for stray processes and scratch files of "
-            "session(s) %s." % (path, item.get("top") or item.get("repo"), item.get("branch") or "(detached)",
+            "before anything destructive. Then use the cleanup skill for stray processes and scratch files." % (path, item.get("top") or item.get("repo"), item.get("branch") or "(detached)",
                                 (item.get("dirty") or 0) + (item.get("untracked") or 0), item.get("unpushed") or 0,
-                                ghs, path, sids))
+                                ghs, path))
 
 
 def item_detail(item_id):
     """Live detail for one reported item, or None for an unknown id. {title, when, md, resume:{cwd,prompt}}.
     git output is computed now (not from the report) and fenced; no scan, no gh call."""
-    r = _load_json(config.PENDING_FILE, {})
-    r = r if isinstance(r, dict) else {}
+    r = _read_report()
     it = next((i for i in (r.get("items") or []) + (r.get("tmp") or [])
                if isinstance(i, dict) and i.get("id") == item_id), None)
     if it is None:
@@ -975,11 +1158,24 @@ def item_detail(item_id):
     md.append("**gh** %s%s" % (gh.get("state") or "unknown",
                                " " + str((gh.get("pr") or {}).get("url") if isinstance(gh.get("pr"), dict) else gh.get("pr") or "")))
     if os.path.isdir(path):
-        for head, args, cap in (("git status --short", ("status", "--short"), 200),
-                                ("git diff --stat", ("diff", "--stat"), 200),
-                                ("git diff", ("diff",), 400),
-                                ("git log --oneline HEAD --not --remotes", ("log", "--oneline", "HEAD", "--not", "--remotes"), 50)):
-            rc, out = _git(path, *args)
+        quiet = ("--no-ext-diff", "--no-textconv", "--no-color")
+        unborn = _git(path, "rev-parse", "-q", "--verify", "HEAD")[0] != 0
+        stat_a, diff_a = (("diff", "--cached", "--stat"), ("diff", "--cached")) if unborn else (("diff", "HEAD", "--stat"), ("diff", "HEAD"))
+        jobs = (("git status --short", ("status", "--short"), 200),
+                ("git diff HEAD --stat", stat_a[:-1] + quiet + stat_a[-1:], 200),
+                ("git diff HEAD", diff_a + quiet, 400),
+                ("git log --oneline HEAD --not --remotes", ("log", "--no-color", "--oneline", "HEAD", "--not", "--remotes"), 50))
+
+        def run(args):
+            try:
+                return _git_capped(path, ITEM_GIT_BYTES, *args)
+            except Exception:
+                return None, ""
+        # independent read-only calls: run concurrently, assemble in the original order
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            futs = [ex.submit(run, a) for _, a, _ in jobs]
+        for (head, _, cap), fut in zip(jobs, futs):
+            rc, out = fut.result()
             md.append("**%s**\n%s" % (head, _fence(_cap(out, cap) if rc == 0 else "(git failed)")))
     else:
         md.append("The worktree directory is missing from disk (prunable).")

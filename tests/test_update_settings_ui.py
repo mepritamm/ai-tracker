@@ -43,6 +43,7 @@ global.fetch = (url, opt) => {
     sched = Object.assign({}, sched, SCEN.afterPost[body.action]);
     return json(sched);
   }
+  if (url === '/api/pending/run') { posts.push([url, body]); return json({started: true}); }
   if (url === '/api/update' && method === 'GET') {
     updateGets++;
     const seq = SCEN.updateSeq;
@@ -134,30 +135,37 @@ class ScheduledScanBlock(unittest.TestCase):
     def test_four_status_texts_and_buttons(self):
         r = self.go(_sched(installed=True, last_exit=0, root="/here", root_exists=True))
         self.assertIn("Installed (launchd) · last exit 0 · runs from /here", r["before"]["text"])
-        self.assertEqual(r["before"]["buttons"], ["Reinstall", "Uninstall"])
+        self.assertEqual(r["before"]["buttons"], ["Reinstall", "Uninstall", "Scan now"])
         r = self.go(_sched())
         self.assertIn("Not installed", r["before"]["text"])
-        self.assertEqual(r["before"]["buttons"], ["Install"])
+        self.assertEqual(r["before"]["buttons"], ["Install", "Scan now"])
         r = self.go(_sched(opted_out=True))
         self.assertIn("Turned off (you uninstalled it)", r["before"]["text"])
-        self.assertEqual(r["before"]["buttons"], ["Install"])
+        self.assertEqual(r["before"]["buttons"], ["Install", "Scan now"])
         r = self.go(_sched(installed=True, root="/gone", root_exists=False))
         self.assertIn("Points at a missing checkout", r["before"]["text"])
-        self.assertEqual(r["before"]["buttons"], ["Reinstall", "Uninstall"])
+        self.assertEqual(r["before"]["buttons"], ["Reinstall", "Uninstall", "Scan now"])
 
     def test_buttons_post_enum_action_and_rerender_from_response(self):
         r = self.go(_sched(), ["Install"], {"install": {"installed": True, "last_exit": 0, "root": "/x", "root_exists": True}})
         self.assertEqual(r["posts"], [["/api/scheduler", {"action": "install"}]])
-        self.assertEqual(r["after_Install"]["buttons"], ["Reinstall", "Uninstall"])
+        self.assertEqual(r["after_Install"]["buttons"], ["Reinstall", "Uninstall", "Scan now"])
         r = self.go(_sched(installed=True, root="/x", root_exists=True), ["Uninstall"],
                     {"uninstall": {"installed": False, "opted_out": True}})
         self.assertEqual(r["posts"], [["/api/scheduler", {"action": "uninstall"}]])
         self.assertIn("Turned off", r["after_Uninstall"]["text"])
-        self.assertEqual(r["after_Uninstall"]["buttons"], ["Install"])
+        self.assertEqual(r["after_Uninstall"]["buttons"], ["Install", "Scan now"])
+
+    def test_scan_now_posts_pending_run(self):
+        r = self.go(_sched(), ["Scan now"])
+        self.assertEqual(r["posts"], [["/api/pending/run", {}]])
 
     def test_hidden_when_unsupported_or_read_only(self):
-        r = self.go(_sched(supported=False))
-        self.assertTrue(r["before"]["hidden"])
+        r = self.go(_sched(supported=False), ["Scan now"])
+        self.assertFalse(r["before"]["hidden"])
+        self.assertEqual(r["before"]["buttons"], ["Scan now"])
+        self.assertIn("not available on this platform", r["before"]["text"])
+        self.assertEqual(r["posts"], [["/api/pending/run", {}]])
         r = self.go(_sched(), ro=True)
         self.assertFalse(r["hasSched"])
 
@@ -202,8 +210,9 @@ class UpdateBlock(unittest.TestCase):
         self.assertEqual(r["reloads"], 1)
 
     def test_known_open_terminals_ask_before_posting(self):
-        r = self.go(_git(terminals=3), ["Update and restart"])
-        self.assertEqual(r["posts"], [])
+        r = self.go(_git(terminals=1), ["Update and restart"],
+                    applyReplies=[{"status": 409, "body": {"error": "3 open terminals will close", "needs_confirm": True}}])
+        self.assertEqual(r["posts"], [["/api/update/apply", {"confirm_terminals": False}]])
         self.assertIn("3 open terminals will close", r["after_Update and restart"]["text"])
 
     def test_refusal_shown_verbatim(self):

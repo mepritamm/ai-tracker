@@ -1759,7 +1759,7 @@ class TestBundle(unittest.TestCase):
                        [t.id for t in n.targets if isinstance(t, ast.Name)] if isinstance(n, ast.Assign) else []):
                 names[nm] = names.get(nm, 0) + 1
         for nm in ("sched_install", "sched_status", "sched_uninstall", "cli_main", "tick", "clean", "_pending_lock", "_lock",
-                   "update_status", "update_fetch", "update_apply", "start_restart", "restart_in_place"):
+                   "_sched_run", "_run", "update_status", "update_fetch", "update_apply", "start_restart", "restart_in_place"):
             self.assertEqual(names.get(nm), 1, nm)
         self.assertEqual(names.get("_root"), 2)   # schedule.py and update.py: identical bodies, last wins
 
@@ -2371,6 +2371,221 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
 """
         result = self._run(script)
         self.assertEqual(result["callsWhileBothPending"], 2, "loadSide() and poll() must guard independently, not share one flag")
+
+
+# ---------------------------------------------------------------------------------------------
+# T15: pending-work worker, end to end on a realistic fake machine (all temp; real gh/~/.claude untouched)
+# ---------------------------------------------------------------------------------------------
+import contextlib as _contextlib
+import hashlib as _hashlib
+import io as _io
+from aitracker import pending as _pending
+from aitracker import registry as _registry
+from tests.pending_fixture import make_fixture as _make_fixture, requires_git as _requires_git
+from tests.test_cr_routes import _ServerCase as _CrServerCase
+
+
+def _tree_digest(root):
+    """{relative path: sha1 | symlink target | 'dir'} for a tree; a `.git` DIRECTORY (a primary repo's admin
+    area, which git itself touches) is skipped, a linked worktree's `.git` file is included."""
+    out = {}
+    for dp, dns, fns in os.walk(root):
+        dns[:] = [d for d in dns if not (d == ".git" and not os.path.islink(os.path.join(dp, d)))]
+        for n in dns + fns:
+            fp = os.path.join(dp, n)
+            rel = os.path.relpath(fp, root)
+            if os.path.islink(fp):
+                out[rel] = "-> " + os.readlink(fp)
+            elif os.path.isdir(fp):
+                out[rel] = "dir"
+            else:
+                with open(fp, "rb") as fh:
+                    out[rel] = _hashlib.sha1(fh.read()).hexdigest()
+    return out
+
+
+@_requires_git
+class TestPendingWorkEndToEnd(_CrServerCase):
+    """CLI list-only pass, then the HTTP routes, then a Safe-delete pass, over one fake machine."""
+
+    def _transcript(self, slug, sid, cwd, age_days=0):
+        d = os.path.join(config.PROJECTS, slug)
+        os.makedirs(d, exist_ok=True)
+        fp = os.path.join(d, sid + ".jsonl")
+        with open(fp, "w") as fh:
+            fh.write(json.dumps({"type": "user", "cwd": cwd, "sessionId": sid, "timestamp": "2026-11-01T10:00:00Z",
+                                 "message": {"role": "user", "content": "work on " + os.path.basename(cwd)}}) + "\n")
+        if age_days:
+            t = time.time() - age_days * 86400
+            os.utime(fp, (t, t))
+
+    def _put(self, path, text="x\n", age_days=10):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(text)
+        t = time.time() - age_days * 86400
+        os.utime(path, (t, t))
+
+    def _age_dirs(self, root, days=10):
+        t = time.time() - days * 86400
+        for dp, dns, _fns in os.walk(root):
+            for d in dns:
+                os.utime(os.path.join(dp, d), (t, t))
+            os.utime(dp, (t, t))
+
+    def setUp(self):
+        super().setUp()
+        fx = self.fx = _make_fixture(self)
+        for name in ("PENDING_CLEAN", "PENDING_INTERVAL"):
+            p = mock.patch.object(config, name, getattr(config, name))
+            p.start()
+            self.addCleanup(p.stop)
+        # the REAL registry, but only the Claude provider and only the fake ~/.claude/projects
+        for target, attr, val in ((_registry, "PROVIDERS", [_registry.ClaudeProvider()]),
+                                  (_pending, "all_cwds", _registry.all_cwds)):
+            p = mock.patch.object(target, attr, val)
+            p.start()
+            self.addCleanup(p.stop)
+        # --- repo A: primary checkout (clean) with linked worktrees in several states
+        self.dirty = fx.worktree("feat-dirty")
+        self._write(self.dirty, "a.txt", "one\nedited line\n")
+        self._write(self.dirty, "notes.md", "scratch notes\n")
+        self.unpushed = fx.worktree("feat-unpushed")
+        fx.commit(self.unpushed, "feature.py", "print('hi')\n", msg="add feature")
+        self.merged = fx.worktree("feat-merged")
+        fx.age(self.merged, 10)
+        self.gone = fx.worktree("feat-gone")
+        shutil.rmtree(self.gone)
+        # --- repo B: no commits yet; repo C lives one level below a plain parent-folder cwd
+        self.nocommit = os.path.join(fx.root, "fresh")
+        fx.git(fx.root, "init", "-b", "main", self.nocommit)
+        self.parent = os.path.join(fx.root, "parent")
+        self.child = os.path.join(self.parent, "child")
+        os.makedirs(self.parent)
+        fx.git(self.parent, "init", "-b", "main", self.child)
+        fx.commit(self.child, "c.txt", "child\n")
+        # --- transcripts of the fake ~/.claude (the merged worktree's is old)
+        self._transcript("-repo", "sess-primary", fx.repo)
+        self._transcript("-dirty", "sess-dirty", self.dirty)
+        self._transcript("-unpushed", "sess-unpushed", self.unpushed)
+        self._transcript("-merged", "sess-merged", self.merged, age_days=10)
+        self._transcript("-gone", "sess-gone", self.gone)
+        self._transcript("-fresh", "sess-fresh", self.nocommit)
+        self._transcript("-parent", "sess-parent", self.parent)
+        # --- jobs: one working, one done (plain tmp), one done whose tmp holds a .git dir
+        jobs = fx.paths["JOBS_DIR"]
+        fx.job("job-working", "running", cwd=self.unpushed, sessionId="sess-unpushed")
+        self._put(os.path.join(jobs, "job-working", "tmp", "wip.txt"))
+        fx.job("job-done", "done", cwd=fx.repo, sessionId="sess-job-done")
+        self._put(os.path.join(jobs, "job-done", "tmp", "out", "result.txt"), "result\n")
+        fx.job("job-git", "done", cwd=fx.repo, sessionId="sess-job-git")
+        self._put(os.path.join(jobs, "job-git", "tmp", "proj", ".git", "HEAD"), "ref: refs/heads/x\n")
+        self.t_working, self.t_done, self.t_git = (os.path.join(jobs, j, "tmp") for j in ("job-working", "job-done", "job-git"))
+        for t in (self.t_working, self.t_done, self.t_git):
+            self._age_dirs(t)
+        # --- scratch root: an old tree whose session still has a recent transcript
+        self.scratch = os.path.join(fx.paths["SCRATCH_ROOT"], "-repo", "sess-dirty")
+        self._put(os.path.join(self.scratch, "tool-results", "big.txt"), "data\n")
+        self._age_dirs(self.scratch)
+        os.chmod(fx.paths["SCRATCH_ROOT"], 0o700)
+
+    @staticmethod
+    def _write(cwd, name, text):
+        with open(os.path.join(cwd, name), "w") as fh:
+            fh.write(text)
+
+    def _cli(self, *argv):
+        buf = _io.StringIO()
+        with _contextlib.redirect_stdout(buf):
+            rc = _pending.cli_main(list(argv))
+        self.assertEqual(rc, 0)
+        return buf.getvalue()
+
+    def test_t15_machine_cli_then_routes_then_safe_delete(self):
+        fx = self.fx
+        trees = {"primary": fx.repo, "dirty": self.dirty, "unpushed": self.unpushed, "merged": self.merged,
+                 "fresh": self.nocommit, "child": self.child, "t_working": self.t_working, "t_done": self.t_done,
+                 "t_git": self.t_git, "scratch": self.scratch, "projects": config.PROJECTS}
+        before = {k: _tree_digest(v) for k, v in trees.items()}
+        wt_list_before = fx.git(fx.repo, "worktree", "list", "--porcelain")
+
+        # ---- pass 1: the CLI, list-only
+        rep = json.loads(self._cli("--dry-run", "--json"))
+        self.assertEqual(rep["mode"], "dry-run")
+        names = {os.path.basename(i["path"]): i for i in rep["items"]}
+        self.assertEqual(sorted(names), sorted(["repo", "feat-dirty", "feat-unpushed", "feat-merged", "feat-gone",
+                                                "fresh", "child"]))
+        self.assertEqual({n: i["verdict"] for n, i in names.items()},
+                         {"repo": "clean", "feat-dirty": "pending", "feat-unpushed": "pending", "feat-merged": "clean",
+                          "feat-gone": "missing", "fresh": "pending", "child": "pending"})
+        self.assertEqual(names["feat-dirty"]["reason"], "1 uncommitted, 1 untracked")
+        self.assertEqual(names["feat-unpushed"]["reason"], "1 unpushed")
+        self.assertEqual(names["feat-gone"]["reason"], "worktree directory gone")
+        self.assertEqual(names["fresh"]["reason"], "no commits yet")
+        self.assertEqual(names["child"]["reason"], "1 unpushed")
+        self.assertEqual(names["feat-merged"]["reason"], "merged into origin/main")
+        self.assertEqual([n for n, i in names.items() if i["deletable"]], ["feat-merged"])
+        tmp = {os.path.relpath(t["path"], fx.root): t for t in rep["tmp"]}
+        self.assertEqual(sorted(tmp), ["jobs/job-done/tmp", "jobs/job-git/tmp", "jobs/job-working/tmp",
+                                       "scratch/-repo/sess-dirty"])
+        self.assertEqual(tmp["jobs/job-done/tmp"]["verdict"], "stale")
+        self.assertEqual(tmp["jobs/job-git/tmp"]["reason"], "holds a git repo")
+        self.assertEqual(tmp["jobs/job-working/tmp"]["reason"], "job running")
+        self.assertEqual(tmp["scratch/-repo/sess-dirty"]["reason"], "recent transcript")
+        self.assertEqual(sorted(w["path"] for w in rep["would_delete"]), sorted([self.merged, self.t_done, fx.repo]))
+        self.assertEqual((rep["deleted"], rep["refused"]), ([], []))
+        # nothing deleted in list-only mode
+        self.assertEqual({k: _tree_digest(v) for k, v in trees.items()}, before)
+        self.assertEqual(fx.git(fx.repo, "worktree", "list", "--porcelain"), wt_list_before)
+
+        # ---- the server routes
+        st, got = self._get_json("/api/pending")
+        self.assertEqual(st, 200)
+        self.assertEqual(sorted(i["path"] for i in got["items"]), sorted(i["path"] for i in rep["items"]))
+        order = [i["verdict"] for i in got["items"]]
+        self.assertEqual(order[:5], ["pending"] * 4 + ["missing"])      # unfinished work first
+        card = got["card"]
+        self.assertTrue(card["show"])
+        self.assertEqual(card["count"], 6)                               # 4 pending + 1 missing + 1 stale tmp
+        self.assertRegex(card["summary"], r"^5 worktrees with unfinished work \(oldest idle \d+d\); 1 stale tmp tree$")
+        self.assertEqual(card["as_of"], time.strftime("%Y-%m-%d"))
+        self.assertFalse(got["running"])
+
+        st, d = self._get_json("/api/pending/item?id=" + names["feat-dirty"]["id"])
+        self.assertEqual(st, 200)
+        self.assertIn("edited line", d["md"])                            # the uncommitted diff content
+        self.assertIn("notes.md", d["md"])                               # the untracked file
+        self.assertEqual(d["resume"]["cwd"], fx.repo)
+        self.assertNotRegex(d["resume"]["prompt"], r"[\x00-\x1f]")       # a single line
+        self.assertIn(self.dirty, d["resume"]["prompt"])
+        st, u = self._get_json("/api/pending/item?id=" + names["feat-unpushed"]["id"])
+        self.assertEqual(st, 200)
+        self.assertIn("add feature", u["md"])                            # the unpushed commit
+        self.assertEqual(u["resume"]["cwd"], fx.repo)
+        self.assertIn("1 unpushed", u["resume"]["prompt"])
+        self.assertNotRegex(u["resume"]["prompt"], r"[\x00-\x1f]")
+        self.assertEqual(self._get_json("/api/pending/item?id=nope")[0], 404)
+        self.assertEqual({k: _tree_digest(v) for k, v in trees.items()}, before)    # reading is read-only too
+
+        # ---- pass 2: Safe delete (config file, then the CLI entry the scheduler uses)
+        with open(config.CONFIG_FILE, "w") as fh:
+            json.dump({"PENDING_CLEAN": "safe"}, fh)
+        self._cli()
+        st, after = self._get_json("/api/pending")
+        self.assertEqual(after["mode"], "safe")
+        self.assertEqual(after["refused"], [])
+        removed = {(r["kind"], r["path"]) for r in after["deleted"]}
+        # the clean merged idle worktree, the finished job's plain tmp, and the stale registration of the gone one
+        self.assertEqual(removed, {("worktree", self.merged), ("scratch", self.t_done), ("prune", fx.repo)})
+        self.assertFalse(os.path.exists(self.merged))
+        self.assertFalse(os.path.exists(self.t_done))
+        self.assertEqual(fx.git(fx.repo, "branch", "--list", "feat-merged"), "")
+        self.assertNotIn(self.merged, fx.git(fx.repo, "worktree", "list", "--porcelain"))
+        survivors = [k for k in trees if k not in ("merged", "t_done")]
+        self.assertEqual({k: _tree_digest(trees[k]) for k in survivors}, {k: before[k] for k in survivors})
+        for b in ("feat-dirty", "feat-unpushed", "feat-gone"):
+            self.assertNotEqual(fx.git(fx.repo, "branch", "--list", b), "", b + " branch must survive")
+        self.assertNotIn("stale tmp", after["card"]["summary"])
 
 
 if __name__ == "__main__":

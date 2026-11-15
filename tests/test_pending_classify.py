@@ -149,7 +149,7 @@ class ClassifyTests(unittest.TestCase):
             it = self.item(wt, self.run_scan())
         self.assertEqual((it["verdict"], it["deletable"]), ("unknown", False))
         self.assertFalse(pending.reclaimable(it, time.time()))
-        self.assertEqual(self.rep["card"]["count"], 0)
+        self.assertEqual(self.rep["card"]["count"], 2)         # both items (primary + worktree) unverifiable work is never invisible (E1-F2)
 
     def test_card_show_hide(self):
         self.merged_worktree()
@@ -209,24 +209,59 @@ class TmpTests(unittest.TestCase):
         self.assertEqual((it["kind"], it["verdict"], it["unpushed"], it["deletable"]), ("repo", "pending", 1, False))
 
     def test_L_scratch_root_symlink_and_sibling(self):
+        # a symlinked SCRATCH_ROOT is never trusted (E1-F6): nothing under it, or its siblings, is listed
         real = os.path.join(self.fx.root, "real-scratch")
         os.makedirs(os.path.join(real, "slug"))
+        os.chmod(real, 0o700)
         link = os.path.join(self.fx.root, "scr-link")
         os.symlink(real, link)
         self.make_tree(os.path.join(real, "slug", "sid1"))
         sib = self.make_tree(os.path.join(self.fx.root, "scr-link0", "slug", "sid2"))
         with mock.patch.object(config, "SCRATCH_ROOT", link):
             ents, _ = self.tmp()
+        self.assertEqual([e for e in ents if e["kind"] == "scratch"], [])
+        # a real private root works; a slug that is a symlink escaping the root is never listed
+        outside = self.make_tree(os.path.join(self.fx.root, "outside", "sid3"))
+        os.symlink(os.path.join(self.fx.root, "outside"), os.path.join(real, "esc"))
+        with mock.patch.object(config, "SCRATCH_ROOT", real):
+            ents, _ = self.tmp()
         paths = [os.path.realpath(e["path"]) for e in ents]
         self.assertEqual(paths, [os.path.realpath(os.path.join(real, "slug", "sid1"))])
         self.assertEqual(ents[0]["verdict"], "stale")
         self.assertNotIn(os.path.realpath(sib), paths)
-        # a slug that is a symlink escaping the root is never listed
-        outside = self.make_tree(os.path.join(self.fx.root, "outside", "sid3"))
-        os.symlink(os.path.join(self.fx.root, "outside"), os.path.join(real, "esc"))
-        with mock.patch.object(config, "SCRATCH_ROOT", link):
-            ents, _ = self.tmp()
-        self.assertNotIn(os.path.realpath(outside), [os.path.realpath(e["path"]) for e in ents])
+        self.assertNotIn(os.path.realpath(outside), paths)
+
+    def _scratch_root(self):
+        root = os.path.join(self.fx.root, "scratch")
+        os.makedirs(os.path.join(root, "slug"), exist_ok=True)
+        os.chmod(root, 0o700)
+        return root
+
+    def test_scratch_recent_transcript_keeps(self):
+        # no job owns the sid; the transcript was written just now, so an 8-day-old tree is still kept
+        sid = "sidT"
+        d = os.path.join(self.fx.paths["PROJECTS"], "p")
+        os.makedirs(d)
+        with open(os.path.join(d, sid + ".jsonl"), "w") as fh:
+            fh.write("{}\n")
+        root = self._scratch_root()
+        self.make_tree(os.path.join(root, "slug", sid), days=8)
+        e = next(e for e in self.tmp()[0] if e["kind"] == "scratch")
+        self.assertEqual((e["verdict"], e["deletable"], e["reason"]), ("keep", False, "recent transcript"))
+        # control: same tree with an aged transcript is stale, so the transcript is what kept it
+        t = time.time() - 9 * 86400
+        os.utime(os.path.join(d, sid + ".jsonl"), (t, t))
+        e = next(e for e in self.tmp()[0] if e["kind"] == "scratch")
+        self.assertEqual((e["verdict"], e["deletable"]), ("stale", True))
+
+    def test_scratch_sid_symlink_keeps(self):
+        root = self._scratch_root()
+        self.make_tree(os.path.join(root, "slug", "real"), days=8)
+        os.symlink(os.path.join(root, "slug", "real"), os.path.join(root, "slug", "sidL"))
+        by = {os.path.basename(e["path"]): e for e in self.tmp()[0] if e["kind"] == "scratch"}
+        self.assertEqual((by["sidL"]["verdict"], by["sidL"]["deletable"], by["sidL"]["reason"]),
+                         ("keep", False, "symlink"))
+        self.assertEqual(by["real"]["verdict"], "stale")
 
     def test_entry_cap_keeps(self):
         d = self.fx.job("done4", "done")

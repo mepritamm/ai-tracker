@@ -147,6 +147,7 @@
   color: var(--text-on-action, #FBFAF7);
   border-color: transparent;
 }
+.cr .cr-btn[disabled] { opacity: .5; cursor: not-allowed; }
 .cr .cr-btn-danger { color: var(--text-failed, #8A2F1B); border-color: var(--line-failed, #E0A491); }
 
 .cr .cr-link { color: var(--text-link, #3B5747); font: 600 12px var(--font-sans, sans-serif); text-decoration: none; }

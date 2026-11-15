@@ -29,7 +29,7 @@ _DRIVER = r"""
 var __o = {};
 var __opened = [];
 openPendingList = function (r) { __opened.push(r); };   // app.js's real function, replaced to observe the call
-pendingCache = { card: { show: true, title: 'Pending work', summary: '3 items' } };
+pendingCache = { card: { show: true, title: 'Pending work', summary: '3 items', as_of: '2026-11-01' } };
 var __sess = __SESSIONS__;
 var __emitted = [];
 var ctx = { emit: function (n, p) { __emitted.push([n, p]); }, readOnly: function () { return false; } };
@@ -67,6 +67,8 @@ try {
   __kd({ key: 't', target: tiles()[0], preventDefault: function () {} });
   __o.termOnPending = __emitted.filter(function (e) { return e[0] === 'terminal:open'; }).length;
 
+  render({ card: { show: true, title: 'Pending work', summary: '3 items' } });
+  __o.textNoAsOf = allTextIn(tiles()[0]);
   render({ card: { show: false, title: 'x', summary: 'y' } });
   __o.hiddenWhenNotShow = tiles().filter(function (t) { return t._classes.has('cr-tile--pending'); }).length;
   render(null);
@@ -107,6 +109,8 @@ class TestPendingBoardTile(unittest.TestCase):
         self.assertIn("Pending work", self.O["text"])
         self.assertIn("3 items", self.O["text"])
         self.assertEqual(self.O["pendingCount"], 1)
+        self.assertIn("as of 2026-11-01", self.O["text"])
+        self.assertNotIn("as of", self.O["textNoAsOf"])
         self.assertEqual(self.O["sessionTiles"], 3)
 
     def test_click_opens_shared_list_modal(self):
@@ -134,8 +138,51 @@ class TestPendingTokensAndHook(unittest.TestCase):
         self.assertNotIn("color-mix", self._read("ext_cr_board.css"))
         self.assertNotIn("grid-column", re.search(r"\.cr-tile--pending\s*\{[^}]*\}", self._read("ext_cr_board.css")).group(0))
 
-    def test_boot_hook_passes_pending(self):
-        self.assertIn("pending:", self._read("ext_cr_boot.js"))
+
+
+_SIDE_PRE = _PRE + r"""
+var __nr = makeReal('div'); __nr.id = 'nextRoot'; docBody.appendChild(__nr);   // the page's #nextRoot the boot file mounts into
+var __timers = [];
+window.setTimeout = function (f) { __timers.push(f); return 0; };   // let ext_cr_boot.js's deferred init() run on demand
+"""
+
+_SIDE_DRIVER = r"""
+var __o = {};
+try {
+  while (__timers.length) { (__timers.shift())(); }                // init() -> real mount of the Control Room
+  sessions = __SESSIONS__; listNow = __NOW__;
+  function pend() { return queryAllReal(docBody, '.cr-tile--pending'); }
+  __o.tilesBefore = pend().length;                                // nothing fetched yet
+  trackerReadOnly = false;
+  pendingCache = { card: { show: true, title: 'Pending work', summary: '7 items', as_of: '2026-11-02' } };
+  SIDE_EXT.forEach(function (f) { f(); });                        // the REAL loadSide() hook list, ext_cr_boot.js's closure included
+  __o.tilesAfter = pend().length;
+  __o.text = pend()[0] ? allTextIn(pend()[0]) : '';
+  pendingCache = { card: { show: false, title: 'x', summary: 'y' } };
+  SIDE_EXT.forEach(function (f) { f(); });
+  __o.tilesHidden = pend().length;
+  console.log(__MARK__);
+  console.log(JSON.stringify(__o));
+} catch (e) { console.error('DRIVER-THREW: ' + (e && e.stack || e)); process.exit(1); }
+"""
+
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestPendingThroughSideHook(unittest.TestCase):
+    """E3-N10: replaces a source grep for "pending:" -- drives the real SIDE_EXT hook and asserts the tile."""
+
+    def test_side_hook_renders_pending_tile(self):
+        sess = [make_session("s%d" % i, NOW - 10 - i, title="T%d" % i, waiting=True, ended=False) for i in range(2)]
+        drv = _SIDE_DRIVER.replace("__SESSIONS__", json.dumps(sess)).replace("__NOW__", str(NOW)).replace("__MARK__", json.dumps(MARK))
+        rc, out, err = _run_node("\n".join([_REAL_DOM_PREAMBLE, _SIDE_PRE, _bundle_js(), drv, _MID]))
+        if rc != 0:
+            raise AssertionError("node failed (%d)\n%s\n%s" % (rc, out, err))
+        o = _extract_marker_json(out, MARK)
+        self.assertEqual(o["tilesBefore"], 0)
+        self.assertEqual(o["tilesAfter"], 1)
+        self.assertIn("7 items", o["text"])
+        self.assertIn("as of 2026-11-02", o["text"])
+        self.assertEqual(o["tilesHidden"], 0)
 
 
 if __name__ == "__main__":

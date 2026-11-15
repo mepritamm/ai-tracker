@@ -262,9 +262,9 @@ Add its source label to the `SRC` map in the page (e.g. `"mytool": "◆ MyTool"`
 
 A scheduled scan finds work that sessions left behind and writes a report to `pending.json` (git-ignored). The board shows it as a **Pending work** card; the classic view has no card.
 
-- **What is scanned.** Repos, found from the first working directory of each Claude transcript plus the repos from the previous report. For each repo: its git worktrees. Also scratch trees under `~/.claude/jobs/<id>/tmp/` and `/tmp/claude-<uid>/` for sessions that are no longer live. Transcripts are read, never changed.
-- **How the job runs.** The server runs a scan every `PENDING_INTERVAL` (default `90d`; accepts `Nd`, `Nw`, `Nm` for 30-day months, or `off`). One interval governs the whole run. Between runs the card shows the age of the last report. **Scan now** on the card, or `make pending`, refreshes it. A change to the interval applies within an hour.
-- **First run.** A new install runs about 60 seconds after the first server start, because there is no report yet.
+- **What is scanned.** Repos, found from the first working directory of each Claude transcript plus the repos from the previous report. For each repo: its git worktrees. Also scratch trees under `~/.claude/jobs/<id>/tmp/` and any directory two levels under `/tmp/claude-<uid>/` for sessions that are no longer live. Transcripts are read, never changed.
+- **How the job runs.** The server runs a scan every `PENDING_INTERVAL` (default `90d`; accepts `Nd`, `Nw`, `Nm` for 30-day months, or `off`). One interval governs the whole run. Between runs the card shows the age of the last report. **Scan now** on the card, or `make pending`, refreshes it. A change to the interval applies within an hour. The in-server worker does not scan from a linked-worktree checkout, a temp dir or a test run. **Scan now** and `make pending` work from any checkout.
+- **First run.** A new install runs about 60 seconds after the first server start, because there is no report yet. The first scan runs in the background and takes about 4 minutes; the card appears when it finishes.
 - **Modes (`PENDING_CLEAN`).** `off` changes nothing. `dry-run` (default) lists what would be deleted. `safe` deletes only what the rules below allow.
 - **What `safe` may delete.**
   - A linked worktree whose branch is merged, clean, and not ahead of its upstream. It is removed with `git worktree remove` (never `--force`), then `git branch -d` (never `-D`).
@@ -273,6 +273,7 @@ A scheduled scan finds work that sessions left behind and writes a report to `pe
   - Any file git ignores (for example `.env`) blocks removal of its worktree.
   - Transcripts (`*.jsonl`), `state.json`, `~/.claude/tasks`, `file-history` and shell-snapshots are never touched.
   - Any git refusal or error keeps the item, and it is logged to `pending.log`.
+  - Safe delete never removes: uncommitted, unpushed or gitignored work; files hidden with assume-unchanged or skip-worktree; a worktree with a rebase, merge, cherry-pick, revert or bisect in progress; a live session's scratch folder; anything under a symlinked scratch root.
 - **The `gh` call.** To detect squash merges, the scan runs `gh pr list --head <branch> --state merged` read-only from each repo, with bounded calls and time. A `gh` failure keeps the item. Nothing else is sent over the network.
 - **Scheduler (the only command is the first `make serve`).** The daily OS job (launchd on macOS, Task Scheduler on Windows) only asks whether a scan is due, so `PENDING_INTERVAL` stays the single setting. On server start the server installs it when it is missing, or when the checkout it points at is gone. It does nothing when the job is already installed with its checkout present, when running from a `.claude/worktrees/` checkout, a temp dir, the flattened bundle or a test run, when `TRACKER_SCHEDULER_AUTOINSTALL=0` is set, or after you opted out. A failed install is logged and never stops the server.
   - **Opt-out.** The **Scheduled scan** block on the Control Room Board tab shows the status and has Install (or Reinstall) and Uninstall buttons. Uninstall removes the job and records an opt-out, so the server does not install it again. Install clears the opt-out. `make pending-install` and `make pending-uninstall` are thin aliases for the same actions.
@@ -284,11 +285,20 @@ A scheduled scan finds work that sessions left behind and writes a report to `pe
   - Before anything is written, the target commit is imported and its page built from a temp copy, using your real `config.json`. A failure leaves the checkout untouched.
   - If the dashboard does not come back, run the recovery command the page shows. It is also printed to the `make serve` terminal: `git -C <root> checkout --detach <old>`, then `make serve`.
   - **Refused when:** the checkout is detached; it has no upstream (`git branch -u`); it has uncommitted changes (commit or discard local edits first); it has local commits that cannot be fast-forwarded; it is already up to date; it is a standalone bundle (`make bundle` from a clone); it is an installed package (reinstall with uv). A scan or another update in progress also refuses. Only a local caller can check or update. Tunnel and read-only viewers get 403.
-- **Host check.** Local-only routes (terminal, pending, scheduler and update) refuse a request whose `Host` is not `localhost`, `127.0.0.1` or `::1`. This is the DNS-rebinding guard. It applies when no `TRACKER_AUTH` credential is set and the server binds to loopback. A request with no Host header is allowed. With `TRACKER_AUTH` set, the normal 401 applies instead. A no-auth server reached through a custom local hostname gets 403, so use `TRACKER_AUTH` or a loopback name.
+  - **Windows:** Update is disabled there.
+- **Host check.** Local-only routes (terminal, pending, scheduler, update, Safe-delete setting, and the two tunnel routes when no login or credential is in force) refuse a request whose `Host` is not `localhost`, `127.0.0.1` or `::1`. This is the DNS-rebinding guard. It applies when no `TRACKER_AUTH` credential is set and the server binds to loopback. A request with no Host header is allowed. With `TRACKER_AUTH` set, the normal 401 applies instead. A no-auth server reached through a custom local hostname gets 403, so use `TRACKER_AUTH` or a loopback name.
+  - **Origin check.** Those local-only routes also refuse any request carrying an `Origin` header that does not match the request's own `Host`, with or without a login. Requests with no `Origin` header (non-browser clients) are unaffected.
 - **Known gaps.**
   - Only the first working directory of each transcript is used for discovery. A session that starts outside a repo and then `cd`s into one is found only through its jobs, its scratch, or another session.
   - A moved worktree can lose its index at prune. Recover with Resume, then `git worktree repair`.
   - Windows: untested. The Task Scheduler job and the scheduler buttons are planned but have not been run on Windows.
+  - A Scan now click can, about once in a million polls, be refused as busy for about 100 µs. The button shows the refusal; a scheduled run retries in 60 s.
+  - Stopping the server mid-scan can leave a git child running for up to 10 s. A kill during a save can leave a temp file; `pending.json` itself stays intact.
+  - An in-app restart leaves an estimated 2-second window in which requests are refused. The page's poll swallows them.
+  - A remote tab with auth that is not read-only gets a 403 from `/api/pending` every 60 s. This is harmless.
+  - The pending-work page weight grows by 18.3 KB, within the 20 KB budget.
+  - Local-only routes refuse a foreign Host or a cross-site Origin. Other routes are unchanged.
+  - The standalone bundle (`dist/tracker.py`) ships without the terminal features.
 - **Spare-port test servers** should run with `TRACKER_PENDING_INTERVAL=off`, so they never scan.
 
 ---

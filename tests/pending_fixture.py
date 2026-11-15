@@ -1,6 +1,7 @@
 """Shared fixture for the pending-work tests: a temp bare `remote.git` + `repo` (all git state lives in
 one mkdtemp), config paths patched to temp, aging via os.utime. Never touches real repos, ~/.claude
 or the real gh. Import `make_fixture(testcase)`; skip the module with `@requires_git`."""
+import atexit
 import json
 import os
 import shutil
@@ -17,6 +18,24 @@ requires_git = unittest.skipUnless(shutil.which("git"), "git not installed")
 _ID = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
 _CFG = ("PENDING_FILE", "PENDING_LOG", "PENDING_LOCK", "JOBS_DIR", "SCRATCH_ROOT", "LIVE_SESSIONS_DIR",
         "PROJECTS", "CONFIG_FILE")
+
+
+_TEMPLATE = []          # [root]: a bare remote.git + repo with one pushed commit, built once per process
+
+
+def _template(fx):
+    """Build the base remote+repo once and reuse it by copying (git init/commit/push cost ~8 subprocesses a test).
+    Only the origin URL inside the copy has to be repointed."""
+    if not _TEMPLATE:
+        root = os.path.realpath(tempfile.mkdtemp(prefix="pending-tpl-"))
+        atexit.register(shutil.rmtree, root, True)
+        fx.git(root, "init", "--bare", "-b", "main", os.path.join(root, "remote.git"))
+        fx.git(root, "init", "-b", "main", os.path.join(root, "repo"))
+        fx.commit(os.path.join(root, "repo"), "a.txt", "one")
+        fx.git(os.path.join(root, "repo"), "remote", "add", "origin", os.path.join(root, "remote.git"))
+        fx.git(os.path.join(root, "repo"), "push", "-u", "origin", "main")
+        _TEMPLATE.append(root)
+    return _TEMPLATE[0]
 
 
 class Fx:
@@ -47,11 +66,13 @@ class Fx:
         p = mock.patch.object(pending, "all_cwds", lambda: set(self.cwds))
         p.start()
         tc.addCleanup(p.stop)
-        self.git(self.root, "init", "--bare", "-b", "main", self.remote)
-        self.git(self.root, "init", "-b", "main", self.repo)
-        self.commit(self.repo, "a.txt", "one")
-        self.git(self.repo, "remote", "add", "origin", self.remote)
-        self.git(self.repo, "push", "-u", "origin", "main")
+        tpl = _template(self)
+        shutil.copytree(os.path.join(tpl, "remote.git"), self.remote, symlinks=True)
+        shutil.copytree(os.path.join(tpl, "repo"), self.repo, symlinks=True)
+        self.git(self.repo, "remote", "set-url", "origin", self.remote)
+        p = mock.patch.object(pending, "_nice", lambda: [])      # one fewer exec per git call; test_pending_nice covers _nice
+        p.start()
+        tc.addCleanup(p.stop)
         self.cwds.add(self.repo)
         self.fake_gh({})        # never the real gh: default fake answers "no merged PR"
 

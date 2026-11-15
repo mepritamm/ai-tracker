@@ -181,10 +181,12 @@ function draftLabelBefore(L,start){
 // does this text hold a draft quote? (the CR timeline routes such text through mdBlock)
 function hasDraftQuote(s){
   const L=(s||"").replace(/\r/g,"").split("\n");
-  let fence=false;
+  let fence=0;   // length of the open fence's backtick run (0 = none); closes only on a run at least as long
   for(let i=0;i<L.length;i++){
-    if(/^\s*```/.test(L[i])){ fence=!fence; continue; }
-    if(!fence&&/^\s*>/.test(L[i])&&(i===0||!/^\s*>/.test(L[i-1]))){
+    const fo=L[i].match(/^\s*(`{3,})/);
+    if(fence){ if(fo&&fo[1].length>=fence&&/^\s*`+\s*$/.test(L[i])) fence=0; continue; }
+    if(fo){ fence=fo[1].length; continue; }
+    if(/^\s*>/.test(L[i])&&(i===0||!/^\s*>/.test(L[i-1]))){
       if(draftLabelBefore(L,i)) return true;
       const q=[]; let j=i;   // like mdBlock: look inside the quote for a nested draft
       while(j<L.length&&/^\s*>/.test(L[j])){ q.push(L[j].replace(/^\s*>\s?/,"")); j++; }
@@ -202,10 +204,10 @@ function mdBlock(s){
   const cells=l=>l.trim().replace(/^\|/,"").replace(/\|$/,"").split("|").map(c=>c.trim());
   while(i<L.length){
     const l=L[i];
-    const fm=l.match(/^\s*```\s*([A-Za-z0-9_+-]*)/);
-    if(fm){ i++; const b=[]; while(i<L.length&&!/^\s*```/.test(L[i])){b.push(L[i]);i++;} i++;
+    const fm=l.match(/^\s*(`{3,})\s*([A-Za-z0-9_+-]*)/);
+    if(fm){ i++; const b=[], close=new RegExp("^\\s*`{"+fm[1].length+",}\\s*$"); while(i<L.length&&!close.test(L[i])){b.push(L[i]);i++;} i++;
       const src=b.join("\n");
-      if(/^mermaid$/i.test(fm[1])){ const g=mermaidSvg(src);
+      if(/^mermaid$/i.test(fm[2])){ const g=mermaidSvg(src);
         // Render the hand-rolled fallback SYNCHRONOUSLY first (so the page is correct
         // immediately, even offline, before the vendored asset loads) — g is the SVG when
         // this diagram's family is one of the 8 covered above, or null for a family only
@@ -291,8 +293,8 @@ function _mmdLines(s){
 }
 function _mmdStyle(s){
   const o={};
-  (s||"").split(",").forEach(kv=>{ const j=kv.indexOf(":"); if(j>0)o[kv.slice(0,j).trim().toLowerCase()]=kv.slice(j+1).trim(); });
-  return o;
+  (s||"").split(",").forEach(kv=>{ const j=kv.indexOf(":"); if(j>0){ const v=kv.slice(j+1).trim(); if(/^[#\w(),.%\s-]+$/.test(v))o[kv.slice(0,j).trim().toLowerCase()]=v; } });
+  return o;   // values are spliced into style="..." attributes: anything outside the safe charset is dropped
 }
 function _mmdNode(tok,nodes,order){
   tok=(tok||"").trim(); if(!tok)return null;
@@ -1346,7 +1348,14 @@ function serverRestarted(res){
   if(!ss)return false;
   if(serverStarted===null){serverStarted=ss;return false}
   if(ss===serverStarted)return false;
+  if(_typing())return false;   // keep serverStarted stale: the next poll with nothing being typed reloads
   serverStarted=ss; location.reload(); return true;
+}
+// a focused text field, or any textarea holding unsent text, defers the reload-after-restart (no banner)
+function _typing(){
+  const a=document.activeElement;
+  if(a&&(a.tagName==="INPUT"||a.tagName==="TEXTAREA"||a.isContentEditable))return true;
+  return Array.from(document.querySelectorAll("textarea")).some(t=>t.value&&t.value.trim());
 }
 // Fast path: when the picked row is already in the DOM, move the active mark instead of rebuilding the
 // whole sidebar (~200ms at 1000 sessions). Returns false when the row is absent (collapsed agent group,
@@ -2350,11 +2359,13 @@ function renderPendingSide(){
   const c=pendingCache&&pendingCache.card;
   if(trackerReadOnly||!(c&&c.show)){el.hidden=true;el.innerHTML="";return;}
   el.hidden=false;
-  el.innerHTML='<div class=pt>'+esc(c.title||"Pending work")+'</div><div class=ps>'+esc(c.summary||"")+'</div>';
+  el.innerHTML='<div class=pt>'+esc(c.title||"Pending work")+'</div><div class=ps>'+esc(c.summary||"")+'</div>'+
+    (c.as_of?'<div class="ps pasof">as of '+esc(c.as_of)+'</div>':"");
   el.onclick=()=>openPendingList(pendingCache);
+  el.onkeydown=e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); openPendingList(pendingCache); } };
 }
 function pendingListShown(){ return $("msgmodal").style.display==="flex"&&$("msgtitle").textContent==="Pending work"; }
-function _pendBtn(label,fn){ const b=document.createElement("span"); b.className="mdbtn pendbtn"; b.textContent=label; b.onclick=fn; return b; }
+function _pendBtn(label,fn){ const b=document.createElement("button"); b.type="button"; b.className="mdbtn pendbtn"; b.textContent=label; b.onclick=fn; return b; }
 function _pendBodyReset(){ curModal=null;const n=$("msgnav"); if(n)n.textContent=""; }   // else syncModal's live re-render overwrites our body
 function openPendingList(p){
   p=p||pendingCache; if(!p||trackerReadOnly)return;
@@ -2367,7 +2378,13 @@ function openPendingList(p){
     scan.textContent="scanning…";
     pendingDirty=true; if(pendingCache)pendingCache.running=true;
     Promise.resolve().then(()=>fetch("/api/pending/run",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}))
-      .then(()=>loadPending()).catch(()=>{});
+      .then(r=>{
+        if(r&&r.ok===false){   // refused/failed: say so instead of showing "scanning…" forever
+          if(pendingCache)pendingCache.running=false;
+          return Promise.resolve(r.json&&r.json()).catch(()=>null).then(j=>{scan.textContent=(j&&j.error)||"scan refused";});
+        }
+        return loadPending();
+      }).catch(()=>{scan.textContent="scan failed";});
   });
   bar.appendChild(scan); body.appendChild(bar);
   const rows=(p.items||[]).concat(p.tmp||[]);
@@ -2377,7 +2394,9 @@ function openPendingList(p){
     const t=document.createElement("div"); t.className="pt"; t.textContent=it.label||it.reason||it.verdict||it.path||"";
     const s=document.createElement("div"); s.className="ps"; s.textContent=[it.path,it.branch].filter(Boolean).join("  ·  ");
     r.appendChild(t); r.appendChild(s);
-    if(it.id){r.onclick=()=>openPendingItem(it.id); r.className+=" click";}
+    if(it.id){r.onclick=()=>openPendingItem(it.id); r.className+=" click";
+      r.tabIndex=0; r.setAttribute("role","button");
+      r.onkeydown=e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); openPendingItem(it.id); } };}
     body.appendChild(r);
   });
 }

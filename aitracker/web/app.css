@@ -647,6 +647,8 @@ main[data-sess=refreshing] #hmeta::after{content:" · " attr(data-snap)}
 .pendrow.click{cursor:pointer}
 .pendrow.click:hover{border-color:var(--violet)}
 .pendbar .pendbtn{cursor:pointer;color:var(--muted);font-size:11px;border:1px solid var(--line3);border-radius:6px;padding:3px 9px;white-space:nowrap}
+.pendbar .pendbtn{background:none;font:inherit;font-size:11px}
+.pendside .pasof{opacity:.7}
 .pendbar .pendbtn:hover{color:var(--text);border-color:var(--violet)}
 /* Read-only view: cosmetic hide of classic-UI write controls (server still 403s). */
 html.tracker-readonly .ren,html.tracker-readonly .pin:not(.on),html.tracker-readonly .addflag,html.tracker-readonly .addnote{display:none!important}

@@ -2951,8 +2951,10 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
 def _with_prompt(argv, p):
     """Append the optional `mode=new` body `prompt` as claude's positional [prompt] argument (an
     interactive session that starts on it). Ignored when not a string, blank, over 4000 chars, or
-    starting with `-` (it would parse as a flag); `shlex.join` in `_inject_argv` quotes it."""
-    if isinstance(p, str) and p.strip() and len(p) <= 4000 and not p.lstrip().startswith("-"):
+    starting with `-` (it would parse as a flag), or holding a control character (typed into a shell:
+    ^U/^C/an early bracketed-paste end); `shlex.join` in `_inject_argv` quotes the rest."""
+    if (isinstance(p, str) and p.strip() and len(p) <= 4000 and not p.lstrip().startswith("-")
+            and not any(ord(c) < 32 or c == "\x7f" for c in p)):
         return argv + [p]
     return argv
 
@@ -3123,7 +3125,7 @@ def open_pty(handler, parsed, body):
             argv = [gateway.launcher(gw if gw in (gateway.ANTHROPIC, gateway.OPENROUTER) else config.GATEWAY)]
         except gateway.GatewayError as e:
             return handler._json({"error": str(e), "openrouter_configured": False}, 400)
-            argv = _with_prompt(argv, body.get("prompt"))
+        argv = _with_prompt(argv, body.get("prompt"))
     else:
         argv = None                          # "cwd" IS the folder shell; nothing to type into it
     shell_argv = [os.environ.get("SHELL", "/bin/bash"), "-l"]

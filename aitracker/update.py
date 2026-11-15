@@ -25,6 +25,7 @@ from .pending import _pending_lock, _RUNNING
 FETCH_TIMEOUT = 60            # s, git fetch
 PREFLIGHT_TIMEOUT = 90        # s, import + startup smoke test of the fetched tree
 _APPLY = threading.Lock()     # single-flight apply
+_FETCH = threading.Lock()     # single-flight git fetch
 _RESTART_ERROR = None         # str set when exec fails; surfaced in update_status()
 _STARTED_AT = time.time()     # module import = process start
 _HELD = None                  # {"cm": <pending lock cm>, "recover": str} while an apply owns both locks
@@ -158,6 +159,8 @@ def update_status():
         st["reason"] = "Local commits — not fast-forwardable"
     elif st["behind"] == 0:
         st["reason"] = "Up to date"
+    elif os.name == "nt":      # os.execv on Windows spawns a new PID and does not quote argv
+        st["reason"] = "Windows: in-app restart is not supported — `git pull` and restart manually"
     else:
         st["can_update"] = True
     return st
@@ -173,7 +176,12 @@ def update_fetch():
     rc, remote = _g("config", "branch.%s.remote" % b)
     rc2, merge = _g("config", "branch.%s.merge" % b)
     if rc == 0 and rc2 == 0 and remote and remote != "." and merge.startswith("refs/heads/"):
-        rc, msg = _g("fetch", "--quiet", "--no-tags", remote, merge[len("refs/heads/"):], timeout=FETCH_TIMEOUT)
+        if not _FETCH.acquire(blocking=False):          # one git fetch at a time on this repo
+            return dict(update_status(), fetch_error="a fetch is already running")
+        try:
+            rc, msg = _g("fetch", "--quiet", "--no-tags", remote, merge[len("refs/heads/"):], timeout=FETCH_TIMEOUT)
+        finally:
+            _FETCH.release()
         out = update_status()
         if rc != 0:
             out["fetch_error"] = (msg or "fetch failed")[-400:]
@@ -224,6 +232,7 @@ def _preflight(target):
         except (ValueError, tarfile.TarError, OSError) as e:
             return False, "pre-flight: bad archive: %s" % e
         cfg = config.CONFIG_FILE if os.path.isfile(config.CONFIG_FILE) else ""
+        # belt and braces only: the smoke test never calls run(), and config.json outranks these env vars
         env = _git_env({"TRACKER_PENDING_INTERVAL": "off", "TRACKER_SCHEDULER_AUTOINSTALL": "0"})
         rc, out, err = _run([sys.executable, "-I", "-c", _PREFLIGHT_CODE, tmp, cfg], PREFLIGHT_TIMEOUT, env=env)
         if rc != 0:
@@ -292,9 +301,21 @@ def _apply_locked(confirm_terminals, held):
     ok, msg = _preflight(target)
     if not ok:
         return 409, {"error": msg}
+    # the pre-flight can take ~90 s: re-check what the earlier gates saw, right before the only write
+    rc, br = _g("symbolic-ref", "--short", "-q", "HEAD")
+    rc2, head = _g("rev-parse", "HEAD")
+    rc3, porc = _g("status", "--porcelain", "--untracked-files=no")
+    if (br if rc == 0 else None) != st["branch"] or rc2 != 0 or head != old or rc3 != 0 or porc:
+        return 409, {"error": "the checkout changed during the pre-flight — try again"}
+    n2 = _term_live()
+    if n2 > n and not confirm_terminals:
+        return 409, {"error": "%d open terminal%s will close" % (n2, "" if n2 == 1 else "s"),
+                     "needs_confirm": True, "terminals": n2}
     rc, msg = _g("merge", "--ff-only", target, timeout=60)
     if rc != 0:
-        return 409, {"error": "fast-forward refused: %s" % (msg or "git merge failed")}
+        rc2, head = _g("rev-parse", "HEAD")           # a slow post-merge hook can time out AFTER the merge landed
+        if not (rc2 == 0 and head == target):
+            return 409, {"error": "fast-forward refused: %s" % (msg or "git merge failed")}
     recover = _recover_line(old, st["branch"])
     held["recover"] = recover
     return 202, {"restarting": True, "from": old, "to": target, "recover": recover}
@@ -321,27 +342,26 @@ def _cloexec_all():
 
 def restart_in_place(port, held=None):
     """exec the dashboard again (same PID, cwd). Called from a thread after the 202 was flushed.
-    On OSError the tunnel is brought back, restart_error is recorded, the locks are released."""
+    On any failure before/at exec the tunnel is brought back, restart_error is recorded, the locks are released."""
     global _RESTART_ERROR
     h = held if held is not None else _HELD
     recover = (h or {}).get("recover", "")
-    tunnel.stop(keep_on=True)
-    os.environ["PORT"] = str(port)
-    os.environ["TRACKER_NO_BROWSER"] = "1"
-    os.environ.pop("TRACKER_RESTARTED", None)
-    argv = getattr(sys, "orig_argv", None) or [sys.executable, "-m", "aitracker", *sys.argv[1:]]
     try:
-        sys.stdout.flush()
-        sys.stderr.flush()
-    except Exception:
-        pass
-    if recover:
-        print(recover, flush=True)
-    _cloexec_all()
-    try:
+        tunnel.stop(keep_on=True)
+        os.environ["PORT"] = str(port)
+        os.environ["TRACKER_NO_BROWSER"] = "1"
+        argv = getattr(sys, "orig_argv", None) or [sys.executable, "-m", "aitracker", *sys.argv[1:]]
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            if recover:
+                print(recover, flush=True)
+        except Exception:                      # a dead stdout must not block the exec
+            pass
+        _cloexec_all()
         os.execv(sys.executable, argv)
-    except OSError as e:
-        _RESTART_ERROR = str(e)
+    except BaseException as e:                 # exec or anything before it failed: stay up, report, unlock
+        _RESTART_ERROR = str(e) or type(e).__name__
         try:
             tunnel.autostart(port, config.BIND_HOST)
         except Exception:

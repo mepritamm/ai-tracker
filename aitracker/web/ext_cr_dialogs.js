@@ -1175,9 +1175,9 @@
     var wrap = h('div', { class: 'cr-cfg-row cr-sched-block' });
     var st = null, err = '', busy = false;
     function paint() {
-      if (st && st.supported === false) { wrap.style.display = 'none'; return; }
+      var unsup = !!(st && st.supported === false);
       var ctl = h('div', { class: 'cr-cfg-row-control' });
-      if (st && !busy) {
+      if (st && !busy && !unsup) {
         if (st.installed) {
           ctl.appendChild(crBtn('Reinstall', function () { act('install'); }));
           ctl.appendChild(crBtn('Uninstall', function () { act('uninstall'); }, 'cr-btn-danger'));
@@ -1185,12 +1185,19 @@
           ctl.appendChild(crBtn('Install', function () { act('install'); }));
         }
       }
+      if (st && !busy) ctl.appendChild(crBtn('Scan now', scanNow));
       wrap.innerHTML = '';
       wrap.appendChild(h('div', { class: 'cr-cfg-row-label' }, [
         h('div', { class: 'cr-cfg-row-name' }, ['Scheduled scan']),
-        h('div', { class: 'cr-cfg-row-sub cr-sched-status' }, [err || (st ? schedulerText(st) : 'Loading…')]),
+        h('div', { class: 'cr-cfg-row-sub cr-sched-status' }, [err || (unsup ? 'Scheduled scans are not available on this platform.' : st ? schedulerText(st) : 'Loading…')]),
       ]));
       wrap.appendChild(ctl);
+    }
+    function scanNow() {
+      crCall('/api/pending/run', 'POST', {}).then(function (r) {
+        if (!r.ok) { err = (r.body && r.body.error) || 'scan refused'; paint(); return; }
+        if (typeof window.loadPending === 'function') window.loadPending();
+      });
     }
     function act(action) {
       busy = true; err = ''; paint();
@@ -1268,11 +1275,7 @@
       });
     }
     function startApply() {
-      var n = st && st.terminals || 0;
-      if (n > 0) {
-        confirmText = n + ' open terminal' + (n === 1 ? '' : 's') + ' will close. Update and restart now?';
-        paint();
-      } else applyNow(false);
+      applyNow(false);   // the server's 409 needs_confirm carries the live terminal count
     }
     function applyNow(confirmed) {
       busy = true; msg = ''; paint();

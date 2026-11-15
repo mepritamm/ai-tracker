@@ -73,6 +73,21 @@ class RouteTests(_Base):
             sr.assert_called_once()
         self.assertEqual(calls, [False, False, True])
 
+    def test_202_whose_write_raises_still_schedules_the_restart(self):
+        real_json = _server.Handler._json
+
+        def boom(self, obj, code=200, headers=None):
+            if code == 202:
+                raise ConnectionAbortedError("peer gone")
+            return real_json(self, obj, code, headers)
+        with mock.patch.object(_server, "update_apply", return_value=(202, {"restarting": True})), \
+                mock.patch.object(_server, "start_restart") as sr, mock.patch.object(_server.Handler, "_json", boom):
+            try:
+                self.req("POST", "/api/update/apply", {"confirm_terminals": True})
+            except Exception:
+                pass            # the server drops the connection; only the restart matters
+        sr.assert_called_once()
+
     def test_scheduler_enum_and_actions(self):
         stat = {"kind": "launchd", "installed": True, "root": "/r", "root_exists": True, "last_exit": 0}
         with mock.patch.object(_server, "sched_status", return_value=dict(stat)), \

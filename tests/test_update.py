@@ -6,6 +6,7 @@ import os
 import stat
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -209,6 +210,94 @@ class UpdateTests(unittest.TestCase):
             time.sleep(0.1)
         else:
             self.fail("fake ssh survived the timeout (process group not killed)")
+
+    # -- review fixes (E2-N1, E2-N2, E2-F6, F-F11)
+    def test_state_change_during_preflight_refuses_before_merge(self):          # E2-N1
+        self.fx.push_change()
+        old = self.fx.head()
+        orig = update._preflight
+
+        def pf(target):
+            self.fx.git(self.fx.repo, "commit", "--allow-empty", "-m", "local during preflight")
+            return orig(target)
+        with mock.patch.object(update, "_preflight", pf):
+            code, body = update.update_apply()
+        self.assertEqual(code, 409, body)
+        self.assertIn("changed", body["error"])
+        self.assertNotEqual(self.fx.head(), old)                       # only the test's own commit
+        self.assertFalse([a for a in self.argv if "merge" in a])      # merge never ran
+        self.assertIsNone(update._HELD)
+
+    def test_terminal_opened_during_preflight_needs_confirm(self):               # E2-N1
+        self.fx.push_change()
+        old = self.fx.head()
+        count = [0]
+        fake = types.SimpleNamespace(_live_count=lambda: count[0])
+        orig = update._preflight
+
+        def pf(target):
+            count[0] = 1
+            return orig(target)
+        with mock.patch.dict(sys.modules, {"aitracker.term_run": fake}), mock.patch.object(update, "_preflight", pf):
+            code, body = update.update_apply()
+        self.assertEqual((code, body.get("needs_confirm")), (409, True), body)
+        self.assertEqual(self.fx.head(), old)
+        self.assertFalse([a for a in self.argv if "merge" in a])
+
+    def test_merge_timeout_after_completed_merge_still_restarts(self):          # E2-N2
+        x = self.fx.push_change()
+        real = update._g
+
+        def g(*args, **kw):
+            if args and args[0] == "merge":
+                real(*args, **kw)                                      # the merge really lands...
+                return None, "timeout"                                 # ...but git reports a timeout
+            return real(*args, **kw)
+        with mock.patch.object(update, "_g", g):
+            code, body = update.update_apply()
+        self.assertEqual(code, 202, body)
+        self.assertEqual(self.fx.head(), x)
+
+    def test_merge_refused_without_head_move_stays_409(self):                   # E2-N2 (guard)
+        self.fx.push_change()
+        real = update._g
+        with mock.patch.object(update, "_g", lambda *a, **k: (1, "nope") if a and a[0] == "merge" else real(*a, **k)):
+            code, body = update.update_apply()
+        self.assertEqual(code, 409, body)
+        self.assertIn("refused", body["error"])
+
+    def test_windows_cannot_update(self):                                       # E2-F6
+        self.fx.push_change()
+        update.update_fetch()
+        self.assertTrue(update.update_status()["can_update"])
+        with mock.patch("os.name", "nt"):
+            st = update.update_status()
+        self.assertFalse(st["can_update"])
+        self.assertIn("Windows", st["reason"])
+
+    def test_fetch_is_single_flight(self):                                      # F-F11
+        self.fx.push_change()
+        real = update._run
+        started, release, fetches = threading.Event(), threading.Event(), []
+
+        def slow(argv, *a, **k):
+            if "fetch" in argv:
+                fetches.append(list(argv))
+                started.set()
+                release.wait(20)
+            return real(argv, *a, **k)
+        res = {}
+        with mock.patch.object(update, "_run", slow):
+            t = threading.Thread(target=lambda: res.update(first=update.update_fetch()))
+            t.start()
+            self.assertTrue(started.wait(20))
+            second = update.update_fetch()
+            release.set()
+            t.join(30)
+        self.assertEqual(len(fetches), 1)
+        self.assertIn("already running", second["fetch_error"])
+        self.assertNotIn("fetch_error", res["first"])
+        self.assertEqual(update.update_fetch()["behind"], 1)           # lock released afterwards
 
 
 if __name__ == "__main__":

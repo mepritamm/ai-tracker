@@ -1,5 +1,6 @@
 import os
 import plistlib
+import subprocess
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -126,6 +127,23 @@ class ScheduleTest(unittest.TestCase):
         self.assertIn("0 10 * * *", str(pr.call_args_list))
 
 
+def _hang(argv, **kw):
+    assert kw.get("timeout"), "every OS-scheduler call needs a timeout"
+    raise subprocess.TimeoutExpired(argv, kw["timeout"])
+
+
+class TimeoutTest(ScheduleTest):
+    def test_timeouts_never_raise(self):
+        for p in ("darwin", "win32"):
+            with mock.patch.object(schedule.sys, "platform", p):
+                st = schedule.sched_status(_hang)
+                self.assertFalse(st["installed"])
+                self.assertEqual(st.get("error"), "timeout")
+                self.assertEqual(schedule.sched_install(_hang), 1)
+                self.assertEqual(schedule.sched_uninstall(_hang), 0)
+        self.assertFalse(os.path.exists(schedule.plist_path()))
+
+
 class AutoInstallTest(ScheduleTest):
     _real = staticmethod(schedule._under_test)
 
@@ -184,6 +202,17 @@ class AutoInstallTest(ScheduleTest):
         self.assertTrue(schedule._under_test())  # we are running under unittest
         with mock.patch.object(schedule.sys, "argv", ["x", "--selfcheck"]):
             self.assertTrue(schedule._under_test())
+
+    def test_under_test_direct_test_file_run(self):
+        q = mock.patch.object(schedule, "_under_test", self._real)
+        q.start(); self.addCleanup(q.stop)
+        with mock.patch.dict(os.environ, {}, clear=False) as env:
+            env.pop("AITRACKER_NO_AUTOINSTALL", None)
+            env.pop("PYTEST_CURRENT_TEST", None)
+            with mock.patch.object(schedule.sys, "argv", ["tests/test_x.py"]):
+                self.assertTrue(schedule._under_test())
+            with mock.patch.object(schedule.sys, "argv", ["/usr/bin/ai-tracker"]):
+                self.assertFalse(schedule._under_test())
 
     def test_failure_returns_reason(self):
         r = schedule.autoinstall_once(Rec({"print": 113, "bootstrap": 5}))

@@ -148,6 +148,41 @@ _DRIVER = r"""
   ROUTES["/api/list"] = () => okJson([], { "X-Server-Started": started[Math.min(n++, 3)] });
   for (var i = 0; i < 4; i++) { await loadSide(); await flush(); }
   OUT.reloads = RELOADS;
+  // S1: real buttons + keyboard on the card and rows
+  REPORT.running = false; pendingCache = REPORT; renderPendingSide(); openPendingList(REPORT);
+  OUT.scan_is_button = find($("msgbody"), (e) => e.textContent === "Scan now").tagName === "BUTTON";
+  var row = find($("msgbody"), (e) => e.className.indexOf("pendrow") >= 0);
+  OUT.row_focusable = row.tabIndex === 0;
+  CALLS.length = 0;
+  if (row.onkeydown) row.onkeydown({ key: "Enter", preventDefault() {} }); await flush(); await flush();
+  OUT.row_key_fetches_item = CALLS.some((c) => c.url.indexOf("/api/pending/item") === 0);
+  OUT.item_btns = ["Resume", "Copy prompt"].map((t) => { var b = find($("msgbody"), (e) => e.textContent === t); return b ? b.tagName : null; });
+  $("msgmodal").style.display = "none";
+  if ($("pendside").onkeydown) $("pendside").onkeydown({ key: "Enter", preventDefault() {} });
+  OUT.card_key_opens = $("msgmodal").style.display === "flex";
+
+  // N5: a refused scan shows the server's error
+  ROUTES["/api/pending/run"] = () => ({ ok: false, headers: { get: () => null }, json: () => Promise.resolve({ error: "scan refused: tmp checkout" }) });
+  REPORT.running = false; openPendingList(REPORT);
+  var sb = find($("msgbody"), (e) => e.textContent === "Scan now");
+  sb.onclick(); await flush(); await flush(); await flush();
+  OUT.scan_refused_text = sb.textContent;
+
+  // as_of rendered when present, absent otherwise
+  pendingCache = { items: [], card: { show: true, title: "Pending work", summary: "s", as_of: "2026-11-15" } }; renderPendingSide();
+  OUT.as_of_shown = $("pendside").innerHTML.indexOf("2026-11-15") >= 0;
+  pendingCache = REPORT; renderPendingSide();
+  OUT.as_of_absent = $("pendside").innerHTML.indexOf("as of") < 0;
+
+  // F10: restart reload deferred while a text field has focus, done once the user stops typing
+  var before = RELOADS;
+  document.activeElement = { tagName: "TEXTAREA" };
+  ROUTES["/api/list"] = () => okJson([], { "X-Server-Started": "300" });
+  await loadSide(); await flush();
+  OUT.deferred_while_typing = RELOADS === before;
+  document.activeElement = null;
+  await loadSide(); await flush();
+  OUT.reloaded_after_typing = RELOADS === before + 1;
   console.log("@@OUT@@" + JSON.stringify(OUT));
 })().catch((e) => { console.log("@@ERR@@" + (e && e.stack || e)); });
 """
@@ -205,6 +240,24 @@ class TestPendingUiClassic(unittest.TestCase):
 
     def test_server_started_change_reloads_once(self):
         self.assertEqual(self.O["reloads"], 1)
+
+    def test_keyboard_reachable_controls(self):
+        self.assertTrue(self.O["scan_is_button"])
+        self.assertEqual(self.O["item_btns"], ["BUTTON", "BUTTON"])
+        self.assertTrue(self.O["row_focusable"])
+        self.assertTrue(self.O["row_key_fetches_item"])
+        self.assertTrue(self.O["card_key_opens"])
+
+    def test_refused_scan_shows_server_error(self):
+        self.assertEqual(self.O["scan_refused_text"], "scan refused: tmp checkout")
+
+    def test_card_as_of_shown_only_when_present(self):
+        self.assertTrue(self.O["as_of_shown"])
+        self.assertTrue(self.O["as_of_absent"])
+
+    def test_restart_reload_deferred_while_typing(self):
+        self.assertTrue(self.O["deferred_while_typing"])
+        self.assertTrue(self.O["reloaded_after_typing"])
 
     def test_pendside_survives_build_page(self):
         from aitracker import page

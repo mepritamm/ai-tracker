@@ -36,10 +36,15 @@ class HostTests(_ServerCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def req(self, method, path, host, payload=None):
+    def req(self, method, path, host, payload=None, origin=None):
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         body = json.dumps(payload or {}).encode() if method == "POST" else None
         h = {"Host": host}
+        if origin is not None:
+            h["Origin"] = origin
+        if config.AUTH:
+            import base64
+            h["Authorization"] = "Basic " + base64.b64encode(config.AUTH.encode()).decode()
         if body is not None:
             h.update({"Content-Type": "application/json", "Content-Length": str(len(body))})
         c.request(method, path, body=body, headers=h)
@@ -60,6 +65,53 @@ class HostTests(_ServerCase):
         for host in ("localhost:%d" % self.port, "127.0.0.1:%d" % self.port):
             for m, p in ROUTES:
                 self.assertNotEqual(self.req(m, p, host, {"action": "install"}), 403, (host, p))
+
+    def _origins(self):
+        hp = "127.0.0.1:%d" % self.port
+        return hp, ("http://evil.example", "null", "http://localhost:9999", "http://127.0.0.1:%d" % (self.port + 1),
+                    "http://evil.example:%d" % self.port)
+
+    def test_cross_origin_refused_everywhere(self):
+        hp, bad = self._origins()
+        for auth in ("", "u:p"):
+            with mock.patch.object(config, "AUTH", auth):
+                for o in bad:
+                    for m, p in ROUTES:
+                        self.assertEqual(self.req(m, p, hp, {"action": "install"}, origin=o), 403, (auth, o, p))
+                    self.assertEqual(self.req("POST", "/api/config", hp,
+                                              {"key": "PENDING_CLEAN", "value": "safe"}, origin=o), 403, (auth, o))
+        self.assertFalse(os.path.exists(config.CONFIG_FILE))
+
+    def test_same_origin_and_absent_origin_allowed(self):
+        hp, _bad = self._origins()
+        for o in (None, "http://" + hp):
+            for m, p in ROUTES:
+                self.assertNotEqual(self.req(m, p, hp, {"action": "install"}, origin=o), 403, (o, p))
+            self.assertEqual(self.req("POST", "/api/config", hp, {"key": "PENDING_CLEAN", "value": "safe"},
+                                      origin=o), 200, o)
+
+    def test_tunnel_routes_cross_origin_and_foreign_host(self):
+        hp, bad = self._origins()
+        routes = (("GET", "/api/tunnel/reveal"), ("POST", "/api/tunnel/ctl"))
+        with mock.patch.object(_server.tunnel, "stop"):
+            for m, p in routes:
+                for o in bad:
+                    self.assertEqual(self.req(m, p, hp, {"action": "stop"}, origin=o), 403, (p, o))
+                self.assertEqual(self.req(m, p, "evil.example", {"action": "stop"}), 403, p)
+                for o in (None, "http://" + hp):
+                    self.assertNotEqual(self.req(m, p, hp, {"action": "stop"}, origin=o), 403, (p, o))
+
+    def test_tunnel_routes_unchanged_with_login(self):
+        with mock.patch.object(config, "AUTH", "u:p"), mock.patch.object(_server.tunnel, "stop"):
+            h = {"Host": "x.trycloudflare.com", "Authorization": "Basic dTpw"}
+            for m, p in (("GET", "/api/tunnel/reveal"), ("POST", "/api/tunnel/ctl")):
+                c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+                body = b'{"action":"stop"}' if m == "POST" else None
+                c.request(m, p, body=body, headers=h)
+                r = c.getresponse()
+                r.read()
+                c.close()
+                self.assertNotEqual(r.status, 403, p)
 
     def test_with_login_foreign_host_not_refused_by_the_host_check(self):
         with mock.patch.object(config, "AUTH", "u:p"):

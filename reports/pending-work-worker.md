@@ -23,6 +23,26 @@ Follow-up: "If I want to implement this, how should I plan this"
 | C8 | First `make serve` auto-installs the scheduler job (R6) | not discharged | Plan addendum A.1, part A: A2 (auto-install), A5 (`/api/scheduler`), A6 ("Scheduled scan" buttons, H4). The live proof (A7) is PARKED (H6). |
 | C9 | In-app Update: a Settings section that runs git pull and restarts the dashboard (R6) | not discharged | Plan addendum A.1, part B: A3a, A3b, A5, A6, with the Host gate A8a/A8b (H2). The live proof (A7) is PARKED. |
 
+## Status at end of implementation (main thread, 2026-11-16)
+
+Legend: BUILT+TESTED = implemented, covered by tests proven red-first, and seen working in the live smoke check or the T15 end-to-end eval. NOT PROVEN LIVE = the real action has not been performed on this machine.
+
+| # | Clause | Status |
+|---|---|---|
+| C1 | Lists pending work in worktrees across all sessions | BUILT+TESTED. Real list-only scan: 479 worktrees/repos, 353 tmp trees; card shows 95 worktrees with unfinished work + 70 stale tmp trees. |
+| C2 | Interval in days/months, controlled by config | BUILT+TESTED. `PENDING_INTERVAL` (`7d`/`2w`/`3m`/`off`, default `90d`), Settings row, live-editable. |
+| C3 | Separate, differently coloured card on the main board | BUILT+TESTED in both views; seen in a real browser (classic card and violet Control Room tile). |
+| C4 | Click shows uncommitted / unpushed content | BUILT+TESTED; seen in a real browser. Largest worktree's detail takes ~3 s (budget 2 s) — parked decision. |
+| C5 | Resume opens a Claude session that runs the cleanup skills | BUILT+TESTED at route level (prompt reaches the injected command; worktree-cleanup then cleanup). NOT PROVEN LIVE: the Resume button was never pressed on this machine. |
+| C6 | Safely deletes stale items / tmp files | BUILT+TESTED (T15 eval: only the merged idle worktree and a finished session's plain tmp are removed). Default is list-only; Safe delete has NOT been run on the real machine, by design. |
+| C7 | Deterministic scripts, Claude only on demand | BUILT+TESTED: `python -m aitracker --pending`, in-server worker, launchd/Task Scheduler installer. NOT PROVEN LIVE: no real launchd job installed (parked for the user). Windows path untested. |
+| C8 | First `make serve` auto-installs the scan job; managed by buttons | BUILT+TESTED with stubs. NOT PROVEN LIVE (never installs from a worktree checkout; needs the primary checkout). |
+| C9 | In-app Update (pull + restart) from Settings | BUILT+TESTED; restart measured on a throwaway clone (new server up 1.16 s after the request). NOT PROVEN LIVE on a real checkout. Disabled on Windows. |
+
+Evidence: reviews `pending-work-worker-review-E1/E2/E3/F.md`, verdicts in `pending-work-worker-impl-reconciliation.md`, numbers in `pending-work-worker-measurements.md` (9 of 11 measurements pass; M8 item-detail latency and M10 test wall-time fail).
+
+Parked for the user: landing on `personal/main`; installing and proving the launchd job on this Mac; widening the Host/Origin check to every route; trimming the item view to meet 2 s; the added gate time from the new test modules; rotating the GITHUB_PAT that an agent's `launchctl print` exposed in its transcript.
+
 ## (superseded) Technical plan (v1)
 
 Author: opus plan leg, 2026-11-15. Every symbol below was checked with grep/sed in this worktree at b3d6230; anything marked **(new)** does not exist yet.

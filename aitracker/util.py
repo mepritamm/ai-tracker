@@ -712,6 +712,14 @@ def file_pass(kind, path, fn):
     return out
 
 
+def origin_matches_host(headers):
+    """CSRF guard: False only when an Origin header is present and its host:port differs from the
+    request's Host (incl. `Origin: null`). An absent Origin is allowed -- browsers always send one
+    on a cross-origin POST, so only non-browser clients omit it."""
+    o = headers.get("Origin", "")
+    return not o or urlparse(o).netloc == headers.get("Host", "")
+
+
 def is_loopback_host(host_header):
     """True only if an HTTP Host header names this machine: localhost, 127.0.0.0/8 or [::1],
     each with or without a port, case-insensitive. Anything else (a LAN/tunnel name, a

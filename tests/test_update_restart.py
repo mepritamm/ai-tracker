@@ -104,7 +104,6 @@ class RestartTests(unittest.TestCase):
 
     def test_exec_args_env_and_recovery_line_before_exec(self):
         held = self._hold("RECOVER ME")
-        os.environ["TRACKER_RESTARTED"] = "1"
         out = FlushLog()
         seen = {}
 
@@ -121,7 +120,6 @@ class RestartTests(unittest.TestCase):
         self.assertTrue(seen["locked"])                                 # locks held right up to exec
         self.assertEqual(os.environ["PORT"], "8791")
         self.assertEqual(os.environ["TRACKER_NO_BROWSER"], "1")
-        self.assertNotIn("TRACKER_RESTARTED", os.environ)
         self.m_stop.assert_called_once_with(keep_on=True)
 
     def test_fallback_argv_without_orig_argv(self):
@@ -139,6 +137,45 @@ class RestartTests(unittest.TestCase):
             if had:
                 sys.orig_argv = saved
         self.assertEqual(seen["argv"], [sys.executable, "-m", "aitracker", "--serve"])
+
+    def _assert_recovered(self, execv):                                         # E2-F4
+        execv.assert_not_called()
+        self.assertTrue(update.update_status()["restart_error"])
+        self.m_auto.assert_called_once_with(8790, config.BIND_HOST)
+        self.assertIsNone(update._HELD)
+        with pending._pending_lock() as got:                            # a later scan is accepted
+            self.assertTrue(got)
+        with mock.patch.object(update, "_apply_locked", return_value=(409, {"error": "x"})):
+            self.assertEqual(update.update_apply()[1]["error"], "x")    # a later apply is accepted too
+        self.assertIsNone(update._HELD)
+
+    def test_tunnel_stop_failure_releases_both_locks(self):
+        held = self._hold()
+        execv = mock.Mock()
+        self.m_stop.side_effect = PermissionError("nope")
+        with mock.patch.object(update.os, "execv", execv), mock.patch.object(update, "_cloexec_all"):
+            update.restart_in_place(8790, held)
+        self._assert_recovered(execv)
+
+    def test_cloexec_failure_releases_both_locks(self):
+        held = self._hold()
+        execv = mock.Mock()
+        with mock.patch.object(update.os, "execv", execv), \
+                mock.patch.object(update, "_cloexec_all", side_effect=RuntimeError("boom")):
+            update.restart_in_place(8790, held)
+        self._assert_recovered(execv)
+
+    def test_dead_stdout_does_not_block_exec(self):                             # E2-F4
+        held = self._hold("RECOVER ME")
+
+        class Dead(io.StringIO):
+            def write(self, s):
+                raise OSError(5, "EIO")
+        execv = mock.Mock()
+        with mock.patch.object(sys, "stdout", Dead()), mock.patch.object(update.os, "execv", execv), \
+                mock.patch.object(update, "_cloexec_all"):
+            update.restart_in_place(8790, held)
+        execv.assert_called_once()
 
     def test_start_restart_runs_on_a_thread(self):
         done = threading.Event()

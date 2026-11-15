@@ -14,7 +14,7 @@ import re
 from urllib.parse import urlparse
 
 from . import config
-from .util import is_loopback_host
+from .util import is_loopback_host, origin_matches_host
 
 _LOOPBACK_NAMES = {"localhost"}
 
@@ -49,11 +49,7 @@ def _origin_ok(handler):
     """Reject cross-site POSTs. The signed cookie is SameSite=Lax, which already blocks
     cross-site form POSTs, but this is the belt to that braces -- a shell is not a place to
     rely on one mechanism."""
-    origin = handler.headers.get("Origin", "")
-    if not origin:
-        return True                     # same-origin fetch / curl: no Origin header
-    host = handler.headers.get("Host", "")
-    return urlparse(origin).netloc == host
+    return origin_matches_host(handler.headers)   # absent Origin = same-origin fetch / curl
 
 def guard(handler):
     """Call first in every terminal route. Returns True if the request may proceed;
