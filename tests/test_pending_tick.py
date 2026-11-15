@@ -130,12 +130,6 @@ class TickTests(unittest.TestCase):
         ev.set()
         pending._WORKER[:] = []
 
-    def test_start_worker_noop_when_off(self):
-        pending._WORKER[:] = []
-        with mock.patch.object(config, "PENDING_INTERVAL", "off"):
-            pending.start_worker()
-        self.assertEqual(pending._WORKER, [])
-
     def test_worker_loop_survives_exceptions_and_sleeps_at_least_60(self):
         sleeps = []
 

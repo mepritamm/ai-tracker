@@ -2604,7 +2604,7 @@ window.CR = window.CR || {};
       pinned: 'No sessions are pinned.'
     };
 
-    function tileId(t) { return t.kind === 'session' ? t.session.id : 'group:' + t.group; }
+    function tileId(t) { return t.kind === 'session' ? t.session.id : t.kind === 'pending' ? 'pending' : 'group:' + t.group; }
 
     // NOTE: the old in-closure passesFilter(t, now) is gone — its logic is now
     // the module-level tileMatches() above, which boardTiles() calls directly
@@ -2629,6 +2629,10 @@ window.CR = window.CR || {};
       var scrollTop = paneScroll('board', els.boardScroll);
 
       els.board.innerHTML = '';
+      // Pending-work card: prepended OUTSIDE boardTiles() so the cap and filters never see it.
+      // Policy (show/title/summary) is the server's `card`; nothing is derived here.
+      var pcard = state.pending && state.pending.card;
+      if (pcard && pcard.show && !activeFilter) els.board.appendChild(pendingTile(pcard));
       if (!tiles.length) {
         // TASK 2(a): name the empty bucket instead of one generic sentence for every
         // filter — the no-filter copy ('Nothing needs you right now.') is untouched.
@@ -2666,8 +2670,22 @@ window.CR = window.CR || {};
       };
     }
 
+    // Single violet span2 tile for the shared pending-work card. The list modal is app.js's
+    // openPendingList (guarded: absent in a build without it); it reads the report itself.
+    function pendingTile(card) {
+      var t = { kind: 'pending', card: card };
+      var attrs = tileBaseAttrs(t);
+      attrs.class = 'cr-tile cr-tile--pending cr-tile--span2';
+      return h('div', attrs, [
+        h('div', { class: 'cr-tile-title' }, [card.title || 'Pending work']),
+        h('div', { class: 'cr-tile-line' }, [card.summary || ''])
+      ]);
+    }
+
     function activateTile(t) {
-      if (t.kind === 'session') openSession(t.session.id);
+      if (t.kind === 'pending') {
+        if (typeof openPendingList === 'function') openPendingList(typeof pendingCache !== 'undefined' ? pendingCache : null);
+      } else if (t.kind === 'session') openSession(t.session.id);
       else ctx && ctx.emit && ctx.emit('rail:expandAgents', { group: t.group });
     }
 
@@ -3091,10 +3109,12 @@ window.CR = window.CR || {};
           if (ctx && ctx.readOnly && ctx.readOnly()) return;   // terminals are refused for read-only visitors
           if (idx >= 0) {
             e.preventDefault();
+            // Resolve by id, not DOM index: the pending tile is prepended outside boardTiles(), so
+            // DOM index and boardTiles index differ by one while it shows.
             // Mirrors what's actually on screen (renderBoard's own call, just above) — if
             // showAll is on, the focused tile at `idx` came from the uncapped list too.
             var tiles = boardTiles(lastState.sessions || [], lastState.now, activeFilter, uiState.get('showAll', false));
-            var t = tiles[idx];
+            var t = tiles.filter(function (x) { return tileId(x) === focusedTileId; })[0];
             if (t && t.kind === 'session') ctx && ctx.emit && ctx.emit('terminal:open', { id: t.session.id });
           }
         }

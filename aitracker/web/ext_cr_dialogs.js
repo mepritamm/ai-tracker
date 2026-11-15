@@ -865,6 +865,8 @@
     MAX_TERMS: 'TRACKER_MAX_TERMS',
     TERM_IDLE_TTL_MIN: 'TRACKER_TERM_IDLE_TTL_MIN',
     SNAPSHOT_TTL_MIN: 'TRACKER_SNAPSHOT_TTL_MIN',
+    PENDING_INTERVAL: 'TRACKER_PENDING_INTERVAL',
+    PENDING_CLEAN: 'TRACKER_PENDING_CLEAN',
     TERMINAL: 'TRACKER_TERMINAL',
     TERM_APP: 'TRACKER_TERM_APP',
     GATEWAY: null,       // ditto — no env var, config.json > built-in default
@@ -1129,6 +1131,176 @@
   // fetch()" note above fetchServerConfig) and merged over the payload defaults the instant
   // it lands — `srv` below is reassigned in place, never a fresh object, so closures that
   // already captured it keep seeing the latest merge.
+  // ---------------------------------------------------------------------------
+  // Settings -> Board "Scheduled scan" and Server "Update" blocks. Each is a self-contained
+  // widget: it fetches its own status, repaints itself, and is hidden (null) for read-only
+  // visitors -- the server's 403 is the real gate. Server owns policy (can_update/reason).
+  // ---------------------------------------------------------------------------
+  function crReadOnly() {
+    return !!(_ctx && typeof _ctx.readOnly === 'function' && _ctx.readOnly());
+  }
+
+  // Resolves {ok, status, body}; never rejects.
+  function crCall(url, method, body) {
+    var opt = { method: method || 'GET' };
+    if (body !== undefined) {
+      opt.headers = { 'Content-Type': 'application/json' };
+      opt.body = JSON.stringify(body);
+    }
+    return fetch(url, opt).then(function (r) {
+      return r.json().then(function (d) { return { ok: !!r.ok, status: r.status, body: d || {} }; },
+        function () { return { ok: !!r.ok, status: r.status, body: {} }; });
+    }).catch(function (e) { return { ok: false, status: 0, body: { error: String((e && e.message) || e) } }; });
+  }
+
+  function crBtn(text, onClick, extra) {
+    var b = h('button', { class: 'cr-btn cr-btn-quiet' + (extra ? ' ' + extra : ''), type: 'button', text: text });
+    b.addEventListener('click', onClick);
+    return b;
+  }
+
+  function schedulerText(st) {
+    if (st.root && !st.root_exists) return 'Points at a missing checkout (' + st.root + ')';
+    if (st.installed) {
+      return 'Installed (' + (st.kind || 'scheduler') + ')' +
+        (st.last_exit != null ? ' · last exit ' + st.last_exit : '') +
+        (st.root ? ' · runs from ' + st.root : '');
+    }
+    if (st.opted_out) return 'Turned off (you uninstalled it)';
+    return 'Not installed';
+  }
+
+  function schedulerBlock() {
+    if (crReadOnly()) return null;
+    var wrap = h('div', { class: 'cr-cfg-row cr-sched-block' });
+    var st = null, err = '', busy = false;
+    function paint() {
+      if (st && st.supported === false) { wrap.style.display = 'none'; return; }
+      var ctl = h('div', { class: 'cr-cfg-row-control' });
+      if (st && !busy) {
+        if (st.installed) {
+          ctl.appendChild(crBtn('Reinstall', function () { act('install'); }));
+          ctl.appendChild(crBtn('Uninstall', function () { act('uninstall'); }, 'cr-btn-danger'));
+        } else {
+          ctl.appendChild(crBtn('Install', function () { act('install'); }));
+        }
+      }
+      wrap.innerHTML = '';
+      wrap.appendChild(h('div', { class: 'cr-cfg-row-label' }, [
+        h('div', { class: 'cr-cfg-row-name' }, ['Scheduled scan']),
+        h('div', { class: 'cr-cfg-row-sub cr-sched-status' }, [err || (st ? schedulerText(st) : 'Loading…')]),
+      ]));
+      wrap.appendChild(ctl);
+    }
+    function act(action) {
+      busy = true; err = ''; paint();
+      crCall('/api/scheduler', 'POST', { action: action }).then(function (r) {
+        busy = false;
+        if (r.ok && r.body && !r.body.error) st = r.body; else err = (r.body && r.body.error) || 'request failed';
+        paint();
+      });
+    }
+    paint();
+    crCall('/api/scheduler').then(function (r) {
+      if (r.ok) st = r.body; else err = (r.body && r.body.error) || 'request failed';
+      paint();
+    });
+    return wrap;
+  }
+
+  function updateBlock() {
+    if (crReadOnly()) return null;
+    var wrap = h('div', { class: 'cr-cfg-row cr-update-block' });
+    var st = null, msg = '', confirmText = '', busy = false, restarting = false, recover = '';
+    function age(t) {
+      if (!t) return 'never fetched';
+      var d = Math.max(0, Math.round(Date.now() / 1000 - t));
+      return d < 60 ? 'just now' : d < 3600 ? Math.round(d / 60) + ' min ago' : d < 86400 ? Math.round(d / 3600) + ' h ago' : Math.round(d / 86400) + ' d ago';
+    }
+    function paint() {
+      var lines = [], ctl = h('div', { class: 'cr-cfg-row-control' });
+      if (!st) {
+        lines.push(msg || 'Loading…');
+      } else if (st.kind !== 'git') {
+        lines.push('Version ' + (st.version || '?') + ' — not a git checkout, so it cannot update itself.');
+        if (st.reason) lines.push(st.reason);
+      } else {
+        lines.push((st.branch || '(detached)') + ' @ ' + String(st.head || '').slice(0, 7) + (st.head_subject ? ' — ' + st.head_subject : ''));
+        lines.push((st.behind || 0) + ' behind ' + (st.upstream || 'its upstream') + (st.ahead ? ', ' + st.ahead + ' ahead' : '') + ' (checked ' + age(st.fetched_at) + ')');
+        lines.push(st.dirty && st.dirty.length ? 'Local changes: ' + st.dirty.join(', ') : 'No local changes');
+        if (!st.can_update && st.reason) lines.push(st.reason);
+        if (st.restart_error) lines.push('Restart failed: ' + st.restart_error + ' — run make stop && make serve.');
+        if (!restarting && !confirmText) {
+          var check = crBtn('Check for updates', function () { post('/api/update/fetch'); });
+          var go = crBtn('Update and restart', startApply, 'cr-update-go');
+          if (!st.can_update || busy) go.setAttribute('disabled', 'disabled');
+          if (busy) check.setAttribute('disabled', 'disabled');
+          ctl.appendChild(check); ctl.appendChild(go);
+        }
+      }
+      if (msg && st) lines.push(msg);
+      wrap.innerHTML = '';
+      wrap.appendChild(h('div', { class: 'cr-cfg-row-label' }, [
+        h('div', { class: 'cr-cfg-row-name' }, ['Update']),
+        h('div', { class: 'cr-cfg-row-sub cr-update-status' }, lines.map(function (l) { return h('div', {}, [l]); })),
+      ]));
+      if (confirmText) {
+        ctl.appendChild(h('div', { class: 'cr-update-confirm', role: 'alertdialog' }, [
+          h('span', { class: 'cr-update-confirm-text' }, [confirmText]),
+          crBtn('Update anyway', function () { confirmText = ''; applyNow(true); }, 'cr-btn-danger cr-update-yes'),
+          crBtn('Cancel', function () { confirmText = ''; paint(); }, 'cr-update-no'),
+        ]));
+      }
+      wrap.appendChild(ctl);
+    }
+    function load() {
+      crCall('/api/update').then(function (r) {
+        if (r.ok) st = r.body; else msg = (r.body && r.body.error) || 'request failed';
+        paint();
+      });
+    }
+    function post(url) {
+      busy = true; msg = ''; paint();
+      crCall(url, 'POST', {}).then(function (r) {
+        busy = false;
+        if (r.ok && !r.body.error) st = r.body; else msg = (r.body && r.body.error) || 'request failed';
+        paint();
+      });
+    }
+    function startApply() {
+      var n = st && st.terminals || 0;
+      if (n > 0) {
+        confirmText = n + ' open terminal' + (n === 1 ? '' : 's') + ' will close. Update and restart now?';
+        paint();
+      } else applyNow(false);
+    }
+    function applyNow(confirmed) {
+      busy = true; msg = ''; paint();
+      crCall('/api/update/apply', 'POST', { confirm_terminals: confirmed }).then(function (r) {
+        busy = false;
+        if (r.status === 202 || (r.ok && r.body.restarting)) {
+          restarting = true; recover = r.body.recover || '';
+          msg = 'Restarting…'; paint(); waitForRestart(Date.now(), st && st.started_at);
+        } else if (r.status === 409 && r.body.needs_confirm && !confirmed) {
+          confirmText = r.body.error || 'Open terminals will close.'; paint();
+        } else { msg = (r.body && r.body.error) || 'request failed'; paint(); }
+      });
+    }
+    function waitForRestart(t0, started) {
+      setTimeout(function () {
+        if (wrap.isConnected === false) return;
+        crCall('/api/update').then(function (r) {
+          if (r.ok && r.body.restart_error) { restarting = false; st = r.body; msg = ''; paint(); return; }
+          if (r.ok && r.body.started_at !== started) { window.location.reload(); return; }
+          if (Date.now() - t0 >= 60000) { msg = 'The dashboard did not come back. ' + recover; paint(); return; }
+          waitForRestart(t0, started);
+        });
+      }, 1000);
+    }
+    paint(); load();
+    return wrap;
+  }
+
   function renderConfig(payload) {
     var srv = (payload && payload.server) || {};
     // Header subtitle: 5c gives Config the real server address (its mock shows
@@ -1337,6 +1509,18 @@
         body.appendChild(serverRow('Session snapshot TTL', 'SNAPSHOT_TTL_MIN',
           'How old a cached session may be and still show, labelled, while it refreshes after a switch — and how long a page whose updates are failing stays up before it says so. The slider covers 5–240; env TRACKER_SNAPSHOT_TTL_MIN or config.json accept 1–1440.',
           function (value, onCommit) { return sliderCtlCommit(5, 240, value != null ? value : 30, onCommit, ' min'); }));
+        body.appendChild(serverRow('Pending-work scan', 'PENDING_INTERVAL',
+          'Scan every <interval>, e.g. 7d, 2w, 3m, or off. m means months. Default 90d. A change applies within an hour.',
+          function (value, onCommit) {
+            return textFieldCtl(value != null && value !== '' ? value : '90d', function (v) { onCommit(String(v).trim()); });
+          }));
+        body.appendChild(serverRow('Pending-work cleanup', 'PENDING_CLEAN',
+          'What a scan does with what it finds. Off: no cleanup. List only: reports what it would delete and deletes nothing. Safe delete: removes merged, clean, idle worktrees and finished sessions\' scratch folders. Turning on Safe delete is only accepted from this machine.',
+          function (value, onCommit) {
+            return segmented([['off', 'Off'], ['dry-run', 'List only'], ['safe', 'Safe delete']], value || 'dry-run', onCommit);
+          }));
+        var schedEl = schedulerBlock();
+        if (schedEl) body.appendChild(schedEl);
       } else if (active === 'Terminal') {
         body.appendChild(serverRow('Terminal renderer', 'TERM_RENDERER',
           'Default for newly-opened terminals — already switchable live per-terminal from its own toolbar.',
@@ -1403,6 +1587,8 @@
           readonlyField(String((srv.cfg && srv.cfg.PORT && srv.cfg.PORT.value != null) ? srv.cfg.PORT.value : 8790)), true));
         body.appendChild(cfgRow('Host', 'HOST', 'Same as Port — read-only.',
           readonlyField(String((srv.cfg && srv.cfg.HOST && srv.cfg.HOST.value) || '127.0.0.1')), true));
+        var updEl = updateBlock();
+        if (updEl) body.appendChild(updEl);
       } else if (active === 'Tunnel') {
         // The one-line, always-visible disclosure the security review this feature was
         // built under calls for: never hidden behind the reveal action, never a lecture.

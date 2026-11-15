@@ -14,6 +14,7 @@ import re
 from urllib.parse import urlparse
 
 from . import config
+from .util import is_loopback_host
 
 _LOOPBACK_NAMES = {"localhost"}
 
@@ -65,6 +66,13 @@ def guard(handler):
         return False
     if not _origin_ok(handler):
         handler._json({"error": "cross-origin refused"}, 403)
+        return False
+    # DNS-rebinding guard: with no login configured the terminal is allowed only because the
+    # server is bound to loopback, and a rebinding page reaches it from loopback with an
+    # attacker Host. With TRACKER_AUTH set, the login (a host-scoped cookie) is the protection
+    # and tunnel/LAN Hosts are legitimate, so this check does not apply.
+    if not config.AUTH and not is_loopback_host(handler.headers.get("Host", "")):
+        handler._json({"error": "refused: Host is not loopback"}, 403)
         return False
     return True
 

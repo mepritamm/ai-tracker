@@ -710,3 +710,30 @@ def file_pass(kind, path, fn):
         while _PASS_CACHE_BYTES > PASS_CACHE_MAX_BYTES and _PASS_CACHE:
             _PASS_CACHE_BYTES -= len(_PASS_CACHE.pop(next(iter(_PASS_CACHE)))[1])
     return out
+
+
+def is_loopback_host(host_header):
+    """True only if an HTTP Host header names this machine: localhost, 127.0.0.0/8 or [::1],
+    each with or without a port, case-insensitive. Anything else (a LAN/tunnel name, a
+    rebinding hostname, empty, missing) is False."""
+    import ipaddress
+    h = (host_header or "").strip().lower()
+    if not h:
+        return False
+    if h.startswith("["):
+        end = h.find("]")
+        if end < 0 or (h[end + 1:] and not re.fullmatch(r":\d{1,5}", h[end + 1:])):
+            return False
+        h = h[1:end]
+    elif h.count(":") == 1:
+        h, port = h.split(":")
+        if not port.isdigit():
+            return False
+    elif h.count(":") > 1:
+        return False        # bare IPv6 must be bracketed in a Host header
+    if h == "localhost" or h.endswith(".localhost"):    # RFC 6761; the SPA uses t<tty>.localhost per terminal tab
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False

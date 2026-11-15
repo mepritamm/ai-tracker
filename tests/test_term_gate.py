@@ -177,7 +177,7 @@ class TestGuard(unittest.TestCase):
 
     def test_no_origin_header_passes(self):
         """guard() returns True when there is no Origin header (same-origin fetch or curl)."""
-        h = _FakeHandler()   # curl / same-origin fetch: no Origin header at all
+        h = _FakeHandler({"Host": "localhost:8790"})   # curl / same-origin fetch: no Origin header at all
         self.assertTrue(term_gate.guard(h))
         self.assertEqual(h.calls, [])
 

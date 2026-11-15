@@ -6,6 +6,7 @@ import plistlib
 import re
 import subprocess
 import sys
+import tempfile
 
 from . import config
 
@@ -65,6 +66,35 @@ def _is_linked_worktree():
     return os.path.isfile(os.path.join(_root(), ".git"))
 
 
+def _optout_path():
+    return os.path.join(os.path.expanduser("~"), ".ai-tracker-sched-optout")
+
+
+def _set_optout(on):
+    """Uninstall records the opt-out, install clears it. Best effort: never raises."""
+    try:
+        if on:
+            with open(_optout_path(), "w") as f:
+                f.write("uninstalled\n")
+        else:
+            os.remove(_optout_path())
+    except OSError:
+        pass
+
+
+def _under_test():
+    """True in a test run or a --selfcheck. Patchable (tests flip it off to reach the later guards)."""
+    argv = sys.argv or [""]
+    return bool(os.environ.get("AITRACKER_NO_AUTOINSTALL") or os.environ.get("PYTEST_CURRENT_TEST")
+                or "--selfcheck" in argv or "unittest" in (argv[0] or ""))
+
+
+def _is_temp(path):
+    p = os.path.realpath(path)
+    roots = {os.path.realpath(tempfile.gettempdir()), os.path.realpath("/tmp"), os.path.realpath("/var/folders")}
+    return any(p == r or p.startswith(r + os.sep) for r in roots)
+
+
 def _target():
     return "gui/%d/%s" % (os.getuid(), LABEL)
 
@@ -93,6 +123,8 @@ def sched_install(run=subprocess.run):
             print("ai-tracker: scheduled command exceeds %d chars; checkout path too long." % _TR_MAX)
             return 2
         r = run(argv, capture_output=True, text=True)
+        if r.returncode == 0:
+            _set_optout(False)
         return 0 if r.returncode == 0 else 1
     old = _read_plist()
     if old and old.get("WorkingDirectory") not in (None, _root()):
@@ -112,6 +144,7 @@ def sched_install(run=subprocess.run):
             pass
         print("ai-tracker: launchctl bootstrap failed (rc %s)" % r.returncode)
         return 1
+    _set_optout(False)
     return 0
 
 
@@ -124,6 +157,7 @@ def sched_uninstall(run=subprocess.run):
             os.remove(plist_path())
         except OSError:
             pass
+    _set_optout(True)
     return 0
 
 
@@ -148,3 +182,31 @@ def sched_status(run=subprocess.run):
         st["root"] = p["WorkingDirectory"]
         st["root_exists"] = os.path.isdir(st["root"])
     return st
+
+
+def autoinstall_once(run=subprocess.run):
+    """Server-start decision. Returns {"action": "skipped"|"present"|"installed"|"failed", "reason": str}.
+    Installs only when the job is missing or its root is gone, and no opt-out is recorded. Never raises."""
+    try:
+        root = _root()
+        if sys.platform not in ("darwin", "win32"):
+            return {"action": "skipped", "reason": "no OS scheduler support on %s" % sys.platform}
+        if _under_test():
+            return {"action": "skipped", "reason": "test run or selfcheck"}
+        if not os.path.isfile(os.path.join(config._HERE, "__init__.py")):
+            return {"action": "skipped", "reason": "not a package checkout (bundle)"}
+        if _is_linked_worktree() or (os.sep + ".claude" + os.sep + "worktrees" + os.sep) in root + os.sep:
+            return {"action": "skipped", "reason": "linked worktree checkout"}
+        if _is_temp(root):
+            return {"action": "skipped", "reason": "temp directory"}
+        if os.path.exists(_optout_path()):
+            return {"action": "skipped", "reason": "opted out"}
+        st = sched_status(run)
+        if st.get("installed") and (st.get("kind") != "launchd" or st.get("root_exists")):
+            return {"action": "present", "reason": "job installed"}
+        rc = sched_install(run)
+        if rc == 0:
+            return {"action": "installed", "reason": "repointed" if st.get("installed") else "job was missing"}
+        return {"action": "failed", "reason": "install returned %s" % rc}
+    except Exception as e:  # a failed install must never stop the server
+        return {"action": "failed", "reason": "%s: %s" % (type(e).__name__, e)}

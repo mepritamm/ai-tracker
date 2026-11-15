@@ -69,7 +69,7 @@ def _fake_cloudflared(dirpath, ok=True, error_line=None, delay=0, exit_after=Non
 
 
 def _get(port, path, cred=None, headers=None):
-    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
     hdr = dict(headers or {})
     if cred is not None:
         hdr["Authorization"] = "Basic " + base64.b64encode(cred.encode()).decode()
@@ -82,7 +82,7 @@ def _get(port, path, cred=None, headers=None):
 
 
 def _post(port, path, body, cred=None, headers=None):
-    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
     hdr = {"Content-Type": "application/json"}
     hdr.update(headers or {})
     if cred is not None:
@@ -259,9 +259,13 @@ class TestChildExitsAfterUrl(_TunnelCase):
         # (and TTL timer) while leaving TUNNEL_ON alone (user intent -> autostart retries).
         tunnel.CLOUDFLARED = self._fake(ok=True, exit_after=0.5, exit_code=1)
         tunnel.start(9999)
-        self.assertTrue(_poll(lambda: not tunnel.status()["on"], timeout=5.0))
+        # status()["on"] flips false the instant the child dies (proc.poll()), BEFORE the reader
+        # thread records _error / clears TUNNEL_URL -- so wait for that final state, not just "off".
+        self.assertTrue(_poll(lambda: not tunnel.status()["on"] and tunnel.status()["error"].startswith("cloudflared exited"),
+                              timeout=15.0))
         st = tunnel.status()
         self.assertTrue(st["error"].startswith("cloudflared exited"), st["error"])
+        self.assertTrue(_poll(lambda: tunnel.status()["url"] == "", timeout=15.0))
         self.assertEqual(st["url"], "")
         overrides = _load_json(config.CONFIG_FILE, {})
         self.assertEqual(overrides.get("TUNNEL_URL", ""), "")

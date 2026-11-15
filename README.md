@@ -274,11 +274,21 @@ A scheduled scan finds work that sessions left behind and writes a report to `pe
   - Transcripts (`*.jsonl`), `state.json`, `~/.claude/tasks`, `file-history` and shell-snapshots are never touched.
   - Any git refusal or error keeps the item, and it is logged to `pending.log`.
 - **The `gh` call.** To detect squash merges, the scan runs `gh pr list --head <branch> --state merged` read-only from each repo, with bounded calls and time. A `gh` failure keeps the item. Nothing else is sent over the network.
-- **CLI.** `make pending` runs a scan now, in the mode from `PENDING_CLEAN`. It works with the server down. `make pending-install` adds a daily OS job that only asks whether a scan is due, so `PENDING_INTERVAL` stays the single setting. `make pending-uninstall` removes it. If the OS job runs, it reads only the installed checkout's `config.json`, not `TRACKER_PENDING_*` environment variables.
+- **Scheduler (the only command is the first `make serve`).** The daily OS job (launchd on macOS, Task Scheduler on Windows) only asks whether a scan is due, so `PENDING_INTERVAL` stays the single setting. On server start the server installs it when it is missing, or when the checkout it points at is gone. It does nothing when the job is already installed with its checkout present, when running from a `.claude/worktrees/` checkout, a temp dir, the flattened bundle or a test run, when `TRACKER_SCHEDULER_AUTOINSTALL=0` is set, or after you opted out. A failed install is logged and never stops the server.
+  - **Opt-out.** The **Scheduled scan** block on the Control Room Board tab shows the status and has Install (or Reinstall) and Uninstall buttons. Uninstall removes the job and records an opt-out, so the server does not install it again. Install clears the opt-out. `make pending-install` and `make pending-uninstall` are thin aliases for the same actions.
+  - The buttons are local-only and hidden for read-only viewers. If the OS job runs, it reads only the installed checkout's `config.json`, not `TRACKER_PENDING_*` environment variables.
+- **CLI.** `make pending` runs a scan now, in the mode from `PENDING_CLEAN`. It works with the server down.
+- **In-app Update (Control Room Server tab).** Shows the branch, the head commit, and how far it is behind its upstream. The remote and branch come from git config, never from the request.
+  - **Check for updates** runs a `git fetch` of that upstream, and only when you press it.
+  - **Update and restart** fast-forwards the checkout with `git merge --ff-only`, then restarts the server in place. Open terminals are counted, and you confirm before they close. Their conversations stay resumable.
+  - Before anything is written, the target commit is imported and its page built from a temp copy, using your real `config.json`. A failure leaves the checkout untouched.
+  - If the dashboard does not come back, run the recovery command the page shows. It is also printed to the `make serve` terminal: `git -C <root> checkout --detach <old>`, then `make serve`.
+  - **Refused when:** the checkout is detached; it has no upstream (`git branch -u`); it has uncommitted changes (commit or discard local edits first); it has local commits that cannot be fast-forwarded; it is already up to date; it is a standalone bundle (`make bundle` from a clone); it is an installed package (reinstall with uv). A scan or another update in progress also refuses. Only a local caller can check or update. Tunnel and read-only viewers get 403.
+- **Host check.** Local-only routes (terminal, pending, scheduler and update) refuse a request whose `Host` is not `localhost`, `127.0.0.1` or `::1`. This is the DNS-rebinding guard. It applies when no `TRACKER_AUTH` credential is set and the server binds to loopback. A request with no Host header is allowed. With `TRACKER_AUTH` set, the normal 401 applies instead. A no-auth server reached through a custom local hostname gets 403, so use `TRACKER_AUTH` or a loopback name.
 - **Known gaps.**
   - Only the first working directory of each transcript is used for discovery. A session that starts outside a repo and then `cd`s into one is found only through its jobs, its scratch, or another session.
   - A moved worktree can lose its index at prune. Recover with Resume, then `git worktree repair`.
-  - Windows (Task Scheduler) is planned but not tested.
+  - Windows: untested. The Task Scheduler job and the scheduler buttons are planned but have not been run on Windows.
 - **Spare-port test servers** should run with `TRACKER_PENDING_INTERVAL=off`, so they never scan.
 
 ---

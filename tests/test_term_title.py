@@ -68,7 +68,7 @@ class TermTitleTest(unittest.TestCase):
         calls = []
 
         class H:
-            headers = type("Hd", (), {"get": lambda self, k, d="": d})()
+            headers = type("Hd", (), {"get": lambda self, k, d="": "localhost:8790" if k == "Host" else d})()
             def _json(self, obj, code=200):
                 calls.append((obj, code))
 

@@ -1326,16 +1326,27 @@ async function loadSide(){
     const res=await fetch("/api/list");
     const t=res.headers.get("X-Server-Now");   // the same clock /api/session's `now` uses
     if(t)listNow=+t;
-    const tc=res.headers.get("X-Term-Count");   // absent -> null -> no badge (see termCount above)
+    const tc=res.headers.get("X-Term-Count");   // absent -> no badge
     termCount=tc!==null?+tc:null;
     const st=res.headers.get("X-Snapshot-TTL"); if(st!==null)snapTtlMin=+st;   // server-owned age limit, live
     applyReadOnly(res);
+    if(serverRestarted(res))return;
     sessions=await res.json();
   }catch(e){return}
   finally{sideBusy=false;}
   renderSide();
   SIDE_EXT.forEach(f=>{try{f()}catch(e){console.error("side ext render",e)}});
   loadFlags();   // flags were only fetched by poll(), i.e. never until a session was selected
+  try{loadPending();}catch(e){}   // fire-and-forget: never delays or fails the 5s poll
+}
+let serverStarted=null;
+// every open tab reloads after a server restart, not just the one that pressed Update
+function serverRestarted(res){
+  const ss=res.headers.get("X-Server-Started");
+  if(!ss)return false;
+  if(serverStarted===null){serverStarted=ss;return false}
+  if(ss===serverStarted)return false;
+  serverStarted=ss; location.reload(); return true;
 }
 // Fast path: when the picked row is already in the DOM, move the active mark instead of rebuilding the
 // whole sidebar (~200ms at 1000 sessions). Returns false when the row is absent (collapsed agent group,
@@ -2309,6 +2320,93 @@ function costModalMd(c){
 }
 function openCostModal(c){ openText("Cost",(c&&c.basis)||"",costModalMd(c)); }
 window.openCostModal=openCostModal; window.costChipText=costChipText;
+// ---- pending work (ONE client for the classic card AND the Control Room tile) ----
+// GET /api/pending is fetched here only (<=1/60s, 5s while a scan runs, never for read-only visitors);
+// the server owns every verdict/label/summary -- this file only draws them. Control Room reads the globals
+// pendingCache / openPendingList (guarded with typeof) so there is no second fetch or modal.
+let pendingCache=null, pendingDirty=false, pendingAt=0, pendingBusy=false;
+async function loadPending(){
+  if(pendingBusy||trackerReadOnly)return;
+  const now=Date.now(), every=(pendingCache&&pendingCache.running)?5000:60000;
+  if(!pendingDirty&&pendingAt&&now-pendingAt<every)return;
+  pendingBusy=true; pendingDirty=false; pendingAt=now;
+  try{
+    const res=await fetch("/api/pending");
+    if(res&&res.ok){
+      const j=await res.json();
+      const changed=JSON.stringify(j)!==JSON.stringify(pendingCache);
+      pendingCache=j;
+      if(changed){
+        renderPendingSide();
+        if(pendingListShown())openPendingList(pendingCache);   // a finished scan refreshes an open list
+        SIDE_EXT.forEach(f=>{try{f()}catch(e){console.error("side ext render",e)}});   // hand the Control Room board the new report now
+      }
+    }
+  }catch(e){}
+  finally{pendingBusy=false;}
+}
+function renderPendingSide(){
+  const el=$("pendside"); if(!el)return;
+  const c=pendingCache&&pendingCache.card;
+  if(trackerReadOnly||!(c&&c.show)){el.hidden=true;el.innerHTML="";return;}
+  el.hidden=false;
+  el.innerHTML='<div class=pt>'+esc(c.title||"Pending work")+'</div><div class=ps>'+esc(c.summary||"")+'</div>';
+  el.onclick=()=>openPendingList(pendingCache);
+}
+function pendingListShown(){ return $("msgmodal").style.display==="flex"&&$("msgtitle").textContent==="Pending work"; }
+function _pendBtn(label,fn){ const b=document.createElement("span"); b.className="mdbtn pendbtn"; b.textContent=label; b.onclick=fn; return b; }
+function _pendBodyReset(){ curModal=null;const n=$("msgnav"); if(n)n.textContent=""; }   // else syncModal's live re-render overwrites our body
+function openPendingList(p){
+  p=p||pendingCache; if(!p||trackerReadOnly)return;
+  _pendBodyReset();
+  const c=p.card||{};
+  openText("Pending work",c.summary||"","");
+  const body=$("msgbody"); body.innerHTML="";
+  const bar=document.createElement("div"); bar.className="pendbar";
+  const scan=_pendBtn(p.running?"scanning…":"Scan now",()=>{
+    scan.textContent="scanning…";
+    pendingDirty=true; if(pendingCache)pendingCache.running=true;
+    Promise.resolve().then(()=>fetch("/api/pending/run",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}))
+      .then(()=>loadPending()).catch(()=>{});
+  });
+  bar.appendChild(scan); body.appendChild(bar);
+  const rows=(p.items||[]).concat(p.tmp||[]);
+  if(!rows.length){const e=document.createElement("div"); e.className="muted"; e.textContent="(nothing pending)"; body.appendChild(e);}
+  rows.forEach(it=>{
+    const r=document.createElement("div"); r.className="pendrow";
+    const t=document.createElement("div"); t.className="pt"; t.textContent=it.label||it.reason||it.verdict||it.path||"";
+    const s=document.createElement("div"); s.className="ps"; s.textContent=[it.path,it.branch].filter(Boolean).join("  ·  ");
+    r.appendChild(t); r.appendChild(s);
+    if(it.id){r.onclick=()=>openPendingItem(it.id); r.className+=" click";}
+    body.appendChild(r);
+  });
+}
+function pendingResume(r,say){
+  const L=window.ExtLaunch;
+  if(!L||typeof L.openAt!=="function"){say("Resume unavailable in this build — use Copy prompt");return;}
+  let pr; try{pr=L.openAt(r.cwd,"new",r.prompt);}catch(e){say("Resume failed: "+e);return;}
+  Promise.resolve(pr).then(x=>{if(x&&x.ok===false)say("Resume failed: "+(x.error||"unknown error"));}).catch(e=>say("Resume failed: "+e));
+}
+function pendingCopyPrompt(text,btn){
+  const old=btn.textContent, done=()=>{btn.textContent="Copied";setTimeout(()=>{btn.textContent=old;},1200);};
+  const fb=()=>{const t=document.createElement("textarea");t.value=text;fallbackCopy(t,done);};
+  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(fb);}else{fb();}
+}
+async function openPendingItem(id){
+  if(trackerReadOnly)return;
+  let d=null;
+  try{ const res=await fetch("/api/pending/item?id="+encodeURIComponent(id)); if(res&&res.ok)d=await res.json(); }catch(e){}
+  _pendBodyReset();
+  if(!d){openText("Pending work","","Could not load this item (it may be gone — Scan now to refresh).");return;}
+  openText(d.title||"Pending work",d.when||"",d.md||"");
+  const body=$("msgbody"), r=d.resume||{}, bar=document.createElement("div"); bar.className="pendbar";
+  const msg=document.createElement("span"); msg.className="muted pendmsg";
+  bar.appendChild(_pendBtn("Resume",()=>pendingResume(r,t=>{msg.textContent=t;})));
+  const cp=_pendBtn("Copy prompt",()=>pendingCopyPrompt(r.prompt||"",cp));   // ALWAYS shown: fallback when a launcher drops the prompt
+  bar.appendChild(cp); bar.appendChild(msg);
+  body.insertBefore(bar,body.firstChild||null);
+}
+window.openPendingList=openPendingList; window.openPendingItem=openPendingItem; window.loadPending=loadPending;
 // classic Overview card: the header line the server chose (job summary or latest narration), with its band pill
 function paintHeadline(d){
   const hl=d.headline||{};

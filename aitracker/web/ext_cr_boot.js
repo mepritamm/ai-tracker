@@ -1000,7 +1000,7 @@ window.CR = window.CR || {};
       var now = (typeof listNow === 'number') ? listNow : Date.now() / 1000;
       var list = (typeof sessions !== 'undefined' && Array.isArray(sessions)) ? sessions : [];
       if (window.CR.board && typeof window.CR.board.update === 'function') {
-        try { window.CR.board.update({ sessions: list, now: now }); } catch (e) { console.error('[CR] board.update threw', e); }
+        try { window.CR.board.update({ sessions: list, now: now, pending: (typeof pendingCache !== 'undefined') ? pendingCache : null }); } catch (e) { console.error('[CR] board.update threw', e); }
       }
       if (window.CR.dialogs && typeof window.CR.dialogs.update === 'function') {
         // kind:'poll' tags this as the generic poll broadcast (not a dialog's own

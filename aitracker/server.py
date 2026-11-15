@@ -1,12 +1,16 @@
-import json, os, re, sys, errno, webbrowser, base64, hmac, hashlib, time, traceback, signal
+import json, os, re, sys, errno, threading, webbrowser, base64, hmac, hashlib, time, traceback, signal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from . import config                       # referenced live (config.AUTH) so tests/env see one source
 from . import tunnel                       # runtime tunnel switch -- see tunnel.py's module docstring
 from .config import NARR_PAGE
+from .util import is_loopback_host
 from .page import build_page
 from .gateway import openrouter_configured
 from .registry import all_sessions, parse_any, search_all, search_session, drill, _attached_pty
+from .pending import start_worker, load_report, item_detail, run_async
+from .schedule import sched_install, sched_uninstall, sched_status, autoinstall_once, _optout_path
+from .update import update_status, update_fetch, update_apply, start_restart
 from .store import load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, save_model_keep, load_title_sync, save_title_sync, _load_json, _save_json
 # TITLES_FILE/PINS_FILE (below) are referenced live as config.TITLES_FILE/config.PINS_FILE at
 # their write sites, never imported by name -- a copied name freezes the value at import
@@ -226,7 +230,50 @@ def _local_caller(handler):
     peer = handler.client_address[0]
     if peer != "127.0.0.1":
         return False, "refused: caller is not on this machine (%s)%s" % (peer, _NOT_LOCAL)
+    # DNS-rebinding guard, same policy as term_gate.guard: with no login configured a rebinding
+    # page reaches us from loopback with an attacker Host. With TRACKER_AUTH set the login cookie
+    # is the protection and tunnel/LAN Hosts are legitimate, so the check does not apply.
+    if not config.AUTH and not is_loopback_host(handler.headers.get("Host", "")):
+        return False, "refused: Host is not loopback%s" % _NOT_LOCAL
     return True, ""
+
+
+_STARTED = "%.6f" % time.time()   # per-process; an in-place restart re-imports this, so open tabs see it change
+
+
+def _run_jobs():
+    """Open term_run jobs (optional module: absent from the bundle). Already included in update's `terminals`."""
+    m = sys.modules.get("aitracker.term_run")
+    try:
+        return int(m._live_count()) if m is not None else 0
+    except Exception:
+        return 0
+
+
+def _update_body(st):
+    """update_status()/update_fetch() body plus the run-job part of its `terminals` total."""
+    st = dict(st)
+    st["run_jobs"] = _run_jobs()
+    return st
+
+
+def _sched_body(rc=None):
+    st = sched_status()
+    st["supported"] = sys.platform in ("darwin", "win32")
+    st["opted_out"] = os.path.exists(_optout_path())
+    if rc:
+        st["error"] = ("scheduler is not available here (no OS scheduler, or a linked worktree checkout)"
+                       if rc == 2 else "scheduler install failed")
+    return st
+
+
+def _autoinstall_thread():
+    try:
+        r = autoinstall_once()
+        if r.get("action") != "skipped":
+            print("ai-tracker: scheduled scan %s (%s)" % (r.get("action"), r.get("reason")), flush=True)
+    except BaseException as e:      # never stop the server over the scheduler
+        print("ai-tracker: scheduled-scan auto-install failed: %s" % e, flush=True)
 
 
 def _load_config_strict():
@@ -395,7 +442,7 @@ class Handler(BaseHTTPRequestHandler):
             # pane does (see .claude/rules/conventions.md rule 5 -- server owns policy, client renders it).
             # X-Term-Count rides the same header-not-body trick, for the same reason -- see
             # _term_count()'s docstring above for why a header, and why it degrades to None/omitted.
-            headers = {"X-Server-Now": str(time.time())}
+            headers = {"X-Server-Now": str(time.time()), "X-Server-Started": _STARTED}
             # served live (read at request time), so a Config edit reaches every open page on its next list poll
             headers["X-Snapshot-TTL"] = str(config.SNAPSHOT_TTL_MIN)
             if ro:
@@ -407,6 +454,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json(all_sessions(), headers=headers)
         elif p.path == "/api/flags":
             self._json(load_flags())
+        elif p.path in ("/api/pending", "/api/pending/item"):
+            # worktree paths / diffs: this machine only (never in _RO_GET_ALLOW; tunnel callers are refused here too)
+            ok, err = _local_caller(self)
+            if not ok:
+                return self._json({"error": err}, 403)
+            if p.path == "/api/pending":
+                return self._json(load_report())
+            d = item_detail(parse_qs(p.query).get("id", [""])[0])
+            self._json(d if d is not None else {"error": "unknown item"}, 200 if d is not None else 404)
+        elif p.path in ("/api/update", "/api/scheduler"):
+            # checkout path / git state / scheduler job: this machine only (never in _RO_GET_ALLOW)
+            ok, err = _local_caller(self)
+            if not ok:
+                return self._json({"error": err}, 403)
+            return self._json(_update_body(update_status()) if p.path == "/api/update" else _sched_body())
         elif p.path == "/api/config":
             # The Config dialog's live read: every config.json-overridable setting's current
             # effective value (config.json > env > default -- see config.py's big module
@@ -582,6 +644,32 @@ class Handler(BaseHTTPRequestHandler):
                     _save_json(config.TITLE_SYNC_FILE, sync)
             self._json({"ok": True, "synced": synced})
             return
+        if p.path in ("/api/update/fetch", "/api/update/apply", "/api/scheduler"):
+            # acts on the checkout / OS scheduler: this machine only; takes no value that reaches git or a shell
+            ok, err = _local_caller(self)
+            if not ok:
+                return self._json({"error": err}, 403)
+            if p.path == "/api/update/fetch":
+                return self._json(_update_body(update_fetch()))
+            if p.path == "/api/scheduler":
+                act = body.get("action")
+                if act not in ("install", "uninstall"):
+                    return self._json({"error": "action must be install or uninstall"}, 400)
+                rc = sched_install() if act == "install" else sched_uninstall()
+                return self._json(_sched_body(rc))
+            code, out = update_apply(body.get("confirm_terminals") is True)
+            if code == 409 and out.get("needs_confirm"):
+                out = _update_body(out)
+            self._json(out, code)
+            if code == 202:        # response is flushed; the apply + pending locks stay held for the restart
+                start_restart(self.server.server_address[1])
+            return
+        if p.path == "/api/pending/run":
+            ok, err = _local_caller(self)
+            if not ok:
+                return self._json({"error": err}, 403)
+            run_async("dry-run")        # list-only, off the request thread; False = a scan is already running
+            return self._json({"running": True}, 202)
         if p.path == "/api/config":
             # Writes a runtime setting into config.json (see config.py's big module comment
             # for the precedence/liveness contract). ALLOWLIST-ONLY: `key` must be a member of
@@ -610,6 +698,10 @@ class Handler(BaseHTTPRequestHandler):
             # out (config.apply_overrides repoints the plain LIVE_WINDOW/TERM_RENDERER/
             # MAX_TERMS/TERMINAL globals and refreshes the TERM_APP/TERM_ALLOW os.environ
             # mirror -- see that function's docstring).
+            if key == "PENDING_CLEAN" and coerced == "safe":
+                ok, err = _local_caller(self)
+                if not ok:
+                    return self._json({"error": "safe delete can only be enabled from this machine"}, 403)
             overrides = _load_json(config.CONFIG_FILE, {})
             overrides[key] = coerced
             _save_json(config.CONFIG_FILE, overrides)
@@ -920,6 +1012,9 @@ def run(host="127.0.0.1", port=8790, open_browser=True):
     srv = bind(host, port)
     actual = srv.server_address[1]
     publish_endpoint(actual)
+    start_worker()
+    if os.environ.get("TRACKER_SCHEDULER_AUTOINSTALL") != "0":
+        threading.Thread(target=_autoinstall_thread, name="sched-autoinstall", daemon=True).start()
     tunnel.autostart(actual, host)   # config.json TUNNEL_ON=true from a previous run -> bring it back up
     if tunnel.status()["on"]:
         print("Tunnel restored from last run (TUNNEL_ON in config.json) — flip it off in "
@@ -941,7 +1036,12 @@ def run(host="127.0.0.1", port=8790, open_browser=True):
 # import. Listed by name (not globbed) so a stray file can't mount a route. A module that isn't
 # present yet is skipped -- that's what lets the three terminal tiers be built in parallel.
 # Ceiling: only a genuinely-absent module is swallowed; a real ImportError inside one still raises.
-for _m in ("term_launch", "term_run", "term_vt"):
+def _term_modules():
+    # the term modules import `pty` at top level, which Windows lacks (re-raised below otherwise)
+    return () if os.name == "nt" else ("term_launch", "term_run", "term_vt")
+
+
+for _m in _term_modules():
     try:
         __import__("%s.%s" % (__package__, _m))
     except ModuleNotFoundError as e:

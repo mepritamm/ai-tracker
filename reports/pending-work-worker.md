@@ -20,8 +20,8 @@ Follow-up: "If I want to implement this, how should I plan this"
 | C5 | Resume button opens a Claude session that uses the `cleanup` skill | not discharged | v3 plans it: worktree-cleanup then cleanup, through one shared Resume path (`ExtLaunch.openAt`). It depends on the step-0 proof (M3). |
 | C6 | Worker safely deletes stale pending items / tmp files for sessions not needed | not discharged | v3 deletes **only once the user picks Safe delete** (default List only). Squash-merged worktrees are removed with the branch kept. Needs the D4 and D5 rule-6 exceptions. |
 | C7 | Deterministic part = scripts in the app, runs without a Claude session; Claude only on demand | not discharged | v3.1 plans it: `pending.py` + CLI + server thread **and** an installed launchd/Task Scheduler job, both deduped by `tick()`; Claude runs only on Resume. The launchd run is proven only post-landing (step 17). The Windows CLI path is planned but untested, not discharged. |
-| C8 | First `make serve` auto-installs the scheduler job (R6) | not discharged | Plan addendum A, part A (steps A1–A2). |
-| C9 | In-app Update: a Settings section that runs git pull and restarts the dashboard (R6) | not discharged | Plan addendum A, part B (steps A3–A7). |
+| C8 | First `make serve` auto-installs the scheduler job (R6) | not discharged | Plan addendum A.1, part A: A2 (auto-install), A5 (`/api/scheduler`), A6 ("Scheduled scan" buttons, H4). The live proof (A7) is PARKED (H6). |
+| C9 | In-app Update: a Settings section that runs git pull and restarts the dashboard (R6) | not discharged | Plan addendum A.1, part B: A3a, A3b, A5, A6, with the Host gate A8a/A8b (H2). The live proof (A7) is PARKED. |
 
 ## (superseded) Technical plan (v1)
 
@@ -226,6 +226,19 @@ Assertions:
 | R6 | launchd on this Mac | (verbatim) "2 and make serve on the first time, should always generate the launchd job when running for the first time also, have a separate update section right into the app from the config, which runs git pull and runs the dashboard is important such that someone doesnt have to refresh the dashboard everytime from the cli by stopping the current session and starting it again" — i.e. install and prove the job on this Mac; first `make serve` auto-installs it; plus a new in-app Update feature. |
 | R7 | Real scan | One list-only run on the real machine, with gh, allowed. |
 | R8 | OpenRouter | Resume always shows a Copy-prompt button as fallback. |
+
+## User decisions, round 3 (2026-11-15, head-out)
+
+| # | Question | User's answer |
+|---|---|---|
+| H1 | Addendum A.1 | "Approve both" (auto-install + in-app update). |
+| H2 | Host check | Fix ALL local-only routes, including the existing terminal routes (supersedes AD6; it is now in scope). |
+| H3 | Open terminals on Update | Confirm, then close them. |
+| H4 | Auto-install | (verbatim) "1 but everything happens with a button click instead of make command, the only command the user runs is first time with a make serve and then rest is managed by the app itself" — i.e. install when missing and respect an opt-out, AND install / uninstall / reinstall are buttons in Settings (the opt-out is recorded by the Uninstall button; `make pending-install`/`-uninstall` may remain as thin aliases but are not the user's path). This REVERSES review D's F9 cut of the route and button: restore a local-only status + action route and a Settings "Scheduled scan" block (status, Install/Reinstall, Uninstall). |
+| H5 | Landing | (verbatim) "test it throughly and review + plan if it affects any non-functional activities of the app, such as the slowneess, sync-ness, speed, slows the app and other aspects do a thorough review on those aspects as well" — not an authorisation to land; landing on main is PARKED for the user. |
+| H6 | launchd proof on this Mac | Wait for the user (PARKED). |
+| H7 | Flaky gate | Agents may fix the timing-sensitive tests that keep failing. |
+| H8 | Tests | (verbatim) "update evals/tests and add new ones as well". |
 
 ## (superseded) Technical plan (v2)
 
@@ -1217,7 +1230,17 @@ Any exception is caught, logged as one line, and returns `failed`. **The server 
 
 A second `make serve` on the next free port (F13) also calls this. That is harmless and idempotent: it hits `skipped:present`. A spare-port server started from a linked worktree hits `skipped:worktree`.
 
-**There is no Settings scheduler line, no Reinstall button and no `/api/update/scheduler` route** [D-F9]. `make pending-install` / `--scheduler-status` remain the manual tools. The resulting behaviour goes to the user as one decision, AD1.
+**Settings "Scheduled scan" block and its routes** [H4; reverses D-F9's cut]. The user's only command is the first `make serve`; everything after that is buttons. `make pending-install` / `make pending-uninstall` stay as thin aliases, but they are not the user's path.
+- **`GET /api/scheduler`** → `{**sched_status(), "opted_out": os.path.exists(_optout_path()), "supported": sys.platform in ("darwin", "win32")}`. It is local-only through the shared Host gate (below) plus `_local_caller`, and is not in `_RO_GET_ALLOW`.
+- **`POST /api/scheduler`** with body `{"action": "install"|"uninstall"}`, an **enum** (anything else → 400). No user string reaches a command.
+  - `install` → `sched_install()`, which also removes the opt-out. This button doubles as **Reinstall**, since `sched_install` already replaces and repoints an existing job.
+  - `uninstall` → `sched_uninstall()`, which writes the opt-out.
+  - It returns the fresh `GET /api/scheduler` body. The gates are the same as the update POSTs (`_update_gate`).
+- **The block** (`ext_cr_dialogs.js`, Board tab, under the two Pending-work rows of v3.1 step 14), headed "Scheduled scan":
+  - a status line: "Installed (launchd) · last exit 0 · runs from `<root>`" / "Not installed" / "Turned off (you uninstalled it)" / "Points at a missing checkout";
+  - an **Install** button when the job is not installed, or a **Reinstall** button when it is installed;
+  - an **Uninstall** button when it is installed.
+  - It is hidden when `!supported` or when `ctx.readOnly()`. The 403 is the real gate.
 
 **Risky spot.** A plist pinned to a path that later vanishes. It is mitigated by guards 3–5 and `sched_install`'s own refusal, and it **self-heals**: the next serve from a live checkout repoints the job. The fallback: the server thread keeps scanning regardless (v3.1 C-B1), so a dead OS job costs only redundancy.
 
@@ -1328,7 +1351,7 @@ The **recovery line** is: "If the dashboard does not come back: `git -C <root> c
 - `GET /api/update` → `update_status()`. Not added to `_RO_GET_ALLOW` (:248), so tunnel read-only viewers get 403.
 - `POST /api/update/fetch` → `update_fetch()`.
 - `POST /api/update/apply`, with a body of `{"confirm_terminals": bool}` only; any other key is ignored. It calls `update_apply(confirm_terminals=body.get("confirm_terminals") is True)`.
-- There is **no** `/api/update/scheduler` route [D-F9].
+- The scheduler routes are `GET`/`POST /api/scheduler` (Part A, H4), not part of `/api/update/*`.
 - **(F11)** `/api/list` gains `headers["X-Server-Started"] = str(_STARTED_AT)` next to `X-Server-Now` (:398). The page reloads when the value changes, so every open tab picks up a restart, not just the tab that pressed Update [D-F11].
 
 **Security** [D-F6]. Both POSTs go through **(new)** `_update_gate(handler)` in server.py, which returns `(ok, err)`:
@@ -1342,7 +1365,34 @@ ok = ok and host in ("localhost", "127.0.0.1", "::1") and tg is not None and tg.
 - It **fails closed** when `term_gate` is absent, as in the bundle.
 - `do_POST` already denies read-only callers before body parsing (:558).
 - There is no shell (`subprocess` argv lists only), and the request supplies no argument: remote, branch and sha all come from git config and the once-resolved `target`.
-- The same DNS-rebinding gap on the existing `/api/term/*` routes predates this work. It is recorded under Not grounded / gaps and put to the user as AD6. It is **not** fixed in this plan.
+- The same DNS-rebinding gap on every existing route is **fixed in this plan** per H2, by the shared Host gate below.
+
+**Shared Host gate for all routes without a credential** [H2]. This answers which file owns the helper, which routes get it, and the test that proves it.
+- **The helper.** `util.is_loopback_host(host) -> bool` **(new)**, in `aitracker/util.py`, which is always present and in the bundle. It holds the `_LOOPBACK_NAMES` set and the `ipaddress` check that are today private to `term_gate._is_loopback` (term_gate.py:21–35). `term_gate._is_loopback` becomes a one-line delegate to it, so there is one copy.
+- **The gate**, at the top of `Handler.do_GET` and `Handler.do_POST` in server.py, right after `_authok()`:
+  ```python
+  host = urlparse("//" + self.headers.get("Host", "")).hostname
+  if (host and not self._cred() and util.is_loopback_host(config.BIND_HOST)
+          and not util.is_loopback_host(host)):
+      return self._json({"error": "refused: Host is not this machine (DNS rebinding guard)"}, 403)
+  ```
+  Each condition has a reason:
+  - **No credential** (`_cred()` empty, server.py:305). With `TRACKER_AUTH` or a tunnel credential, a rebinding page has no cookie and already gets 401. So authenticated LAN/Tailscale/tunnel use (Host = a real name) is untouched.
+  - **Loopback bind.** A `HOST=0.0.0.0` no-auth LAN dashboard is the user's explicit choice, and terminals already refuse it (`term_gate.allowed`, :37–45).
+  - **A missing Host** is allowed. HTTP/1.0 curl may omit it, and browsers, which are what a rebinding attack uses, always send it.
+- **Routes covered.** Because the gate is in the two dispatchers, it covers **every** route, including the `EXTRA_GET`/`EXTRA_POST` routes (server.py:547/:829) that the term modules register. The local-only and terminal call sites it protects (grep of `_local_caller(`/`guard(`):
+  - `term_launch.open_terminal` (:161/:163, `POST /api/term/open`);
+  - term_vt: `open_pty` :3070, `term_cwds` :3704, `keys` :3734, `close_pty` :3801, `term_list` :3880, `resize_pty` :3900, `attached` :4104, `screen_stream` :4143, `term_scrollback` :4334, `inject` :4634, `renderer_info` :4730, `raw_stream` :4766;
+  - term_run: `status` :448, `run` :459, `stream` :533, `kill` :599;
+  - server.py: `GET /api/pending*` :411–413, `POST /api/pending/run` :595, the `/api/config` safe gate, and the new `/api/update*` and `/api/scheduler` routes.
+- **The proof.** One table-driven test, `tests/test_host_gate.py`:
+  - It enumerates every key of `server.EXTRA_GET` / `server.EXTRA_POST` after the term modules load, plus the explicit `p.path ==` routes of do_GET/do_POST.
+  - Each is requested through a live loopback test server with `Host: evil.example:<port>`, no auth, and a loopback bind. Every one must answer 403 with the rebinding error.
+  - The same requests with `Host: localhost:<port>` do not get that error.
+  - With `TRACKER_AUTH` set, `Host: evil.example` falls to the existing 401 path.
+  - Red-proof: remove the gate and at least `/api/term/pty` and `/api/session` stop returning 403.
+
+`_update_gate` keeps its explicit loopback-Host check as a belt (and still fails closed without term_gate). The global gate is the fix.
 
 **Page side** (`aitracker/web/ext_cr_dialogs.js`, Server tab, :1393), a **(new)** "Update" block:
 - **Status line**, from `GET /api/update` on open: "`<branch>` @ `<short head>` — `<head_subject>`. N behind `<upstream>` as of `<fetched_at age>`." Plus `dirty` files, or the `reason`.
@@ -1351,7 +1401,7 @@ ok = ok and host in ("localhost", "127.0.0.1", "::1") and tg is not None and tg.
   - when `started_at` changes, it calls `location.reload()` (the page is `no-store` and built from disk);
   - when `restart_error` is non-null, it shows it at once;
   - after 60s it shows the `recover` line.
-- There is no scheduler line and no Reinstall button [D-F9].
+- The scheduler controls live in the Board tab's "Scheduled scan" block (Part A, H4), not here.
 - **Read-only:** the block is hidden when `ctx.readOnly()` (ext_cr_boot.js :439). The server's 403 is the real gate.
 
 **Network (rule 6).** `git fetch` is outbound network, so it needs a **third** written exception, D6, in `.claude/rules/conventions.md`. This is review D's narrower wording, verbatim:
@@ -1425,6 +1475,7 @@ Each step says which remaining v3.1 steps (11–15) it must come after. "Free" m
       - in `run()`, the `autoinstall_once` daemon thread after `start_worker()`;
       - `_update_gate`;
       - `GET /api/update`, `POST /api/update/fetch` and `POST /api/update/apply`;
+      - `GET`/`POST /api/scheduler` (enum action) [H4];
       - the `X-Server-Started` header at :398;
     - `aitracker/cli.py`: `open_browser` from `TRACKER_NO_BROWSER`;
     - `scripts/bundle.py`: ORDER `… "schedule.py", "pending.py", "update.py", "server.py" …`.
@@ -1438,12 +1489,15 @@ Each step says which remaining v3.1 steps (11–15) it must come after. "Free" m
     - GET absent from `_RO_GET_ALLOW`;
     - apply returns 202 before a patched `restart_in_place` runs;
     - extra body keys are ignored;
+    - `POST /api/scheduler` with `action` not in {install, uninstall} → 400;
+    - `install` calls `sched_install` and `uninstall` calls `sched_uninstall` (both patched);
+    - non-loopback → 403;
     - `/api/list` carries `X-Server-Started`;
     - `run()` with `_under_test` patched False and `TRACKER_PENDING_INTERVAL=off` never calls `sched_install` [F8].
 
     Plus TestBundle: `--version` works, there is exactly one `^def status\(`, and `update_status` is present.
-- **A6 — Settings Update block.**
-  - Files: `aitracker/web/ext_cr_dialogs.js` (Server tab, :1393).
+- **A6 — Settings Update block + "Scheduled scan" block [H4].**
+  - Files: `aitracker/web/ext_cr_dialogs.js` (Server tab :1393 for Update; Board tab :1314 for Scheduled scan, under v3.1 step 14's rows).
   - After: **v3.1 step 14** (same file). ∥ with A5 (file-disjoint; built against this spec).
   - Test: `tests/test_update_settings_ui.py` (new, node) covers:
     - `reason` rendered verbatim;
@@ -1453,7 +1507,27 @@ Each step says which remaining v3.1 steps (11–15) it must come after. "Free" m
     - a non-null `restart_error` is shown at once;
     - the 60s timeout shows `recover`;
     - hidden when read-only;
-    - no scheduler line.
+    - Scheduled scan: each of the four status texts renders;
+    - Install shows when the job is not installed, and Reinstall + Uninstall show when it is installed;
+    - each button posts its enum action and re-renders from the response;
+    - the block is hidden when `!supported` or read-only.
+
+**Wave A-3b (H2 Host gate)**
+- **A8a ∥ — Loopback helper.**
+  - Files: `aitracker/util.py` (`is_loopback_host`, `_LOOPBACK_NAMES` moved here), `aitracker/term_gate.py` (`_is_loopback` delegates in one line).
+  - After: none. **Free** of 11–15.
+  - Test: `tests/test_term_gate.py` (existing; its `_is_loopback` cases must stay green unchanged) plus `tests/test_util_loopback.py` (new): `localhost`, `127.0.0.1`, `::1` and `127.5.5.5` give True; `evil.example`, `0.0.0.0`, `""` and `192.168.1.2` give False.
+- **A8b — Global Host gate.**
+  - Files: `aitracker/server.py` (top of `do_GET`/`do_POST`, after `_authok`).
+  - After: A8a, v3.1 steps 11 and 15, and A5 (all edit server.py; sequential).
+  - Test: `tests/test_host_gate.py` (new; the table-driven every-route test described in Part B), including its red-proof.
+- **A9 ∥ — Niced scan children** (AD8, if accepted).
+  - Files: `aitracker/pending.py` (`_git`/`_gh` argv gets the prefix `["nice", "-n", "10"]` when `os.name == "posix"` and `shutil.which("nice")`).
+  - After: v3.1 step 10 (done). **Free** of 11–15.
+  - Test: `tests/test_pending_nice.py` (new). The recorded argv starts with `nice -n 10` on posix and has no prefix with `os.name` patched to `nt`.
+
+**Wave P (measurements; after A8b, on the branch, before any landing)**
+- **P1–P7** (see Non-functional plan). P1–P3 and P5–P6 are ∥ (read-only, spare ports). P4 runs alone. P7 runs after A3b and A5.
 
 **Wave A-4 (after landing per R4, from the primary checkout; no code)**
 - **A7 — Live proof on this Mac.** It merges with v3.1 step 17. Every item is a pass condition:
@@ -1475,7 +1549,9 @@ New files:
 - `test_scheduler_autoinstall.py`;
 - `update_fixture.py`, `test_update.py`, `test_update_restart.py`;
 - `test_pending_copy_and_reload.py`;
-- `test_update_routes.py`, `test_update_settings_ui.py`.
+- `test_update_routes.py`, `test_update_settings_ui.py`;
+- `test_util_loopback.py`, `test_host_gate.py`, `test_pending_nice.py`;
+- plus the T8–T16 files in the Test plan.
 
 Addition: `TestBundle` (A5).
 
@@ -1492,29 +1568,101 @@ Every test that starts `run()` or the bundle sets `TRACKER_PENDING_INTERVAL=off`
 2. **Terminals on restart.** `_cloexec_all` guarantees they close instead of being orphaned. The user confirms the N terminals (counted by `_term_live`, which includes `term_run` jobs). Conversations stay resumable.
 3. **Auto-install pins a vanishing path.** Mitigated by the worktree/temp/bundle/test guards, and it self-heals on the next serve from a live checkout. The server thread remains a working scanner regardless.
 4. **A mid-apply scan cut off by exec.** Prevented by holding `_pending_lock` from apply step 0 to exec.
+5. **The global Host gate breaks a legitimate caller.** Missing-Host and credentialed requests are exempt, and the gate applies only to loopback binds. Fallback: set `TRACKER_AUTH`. T6 sweeps the existing Host-sending tests.
 
 ### Decisions for the user
-- **AD1 — Auto-install behaviour** (replaces old AD1 and AD2) [D-F9].
-  - **Recommended:** every serve from a primary checkout installs the job whenever it is missing (including a hand-deleted plist) or points at a checkout that no longer exists (repointing it to the one being served).
-  - The **only** thing that stops it is an explicit `make pending-uninstall`, which persists until `make pending-install`.
-  - There is no Reinstall button or Settings line.
-  - The alternative is "install once, never regenerate".
-- **AD3 — No automatic rollback after a failed restart.** Recommended: the strengthened pre-flight plus manual recovery text. A rollback would need `checkout`/`reset`, which D6 forbids. The alternative is a supervisor or two-phase restart, at about 3× the code.
-- **AD4 — Update UI only in the Control Room Settings (Server tab).** The classic view has no settings surface. The alternative is a small "Update" link in the classic sidebar header that opens the same dialog.
-- **AD5 — Open terminals at update time.** Recommended: confirm-to-close. The alternative is to refuse outright while any terminal is open.
-- **AD6 — DNS-rebinding gap on the existing local-only routes** [D-F6]. `/api/term/*` and the other `_local_caller`-only POSTs pass a rebinding page: they check peer + proxy headers only (server.py:219–229), `_origin_ok` passes when Origin is absent (term_gate.py:47–55), and there is no Host allowlist. This predates this work.
-  - The plan fixes it **only** for the update routes (`_update_gate`).
-  - Choose: (a) apply the same loopback-Host check to every local-only route now, in this PR (one shared gate, roughly one line per route plus tests); or (b) leave the existing routes and file a follow-up ticket.
-  - **Recommended: (a)**, since the fix is the same small gate, but this widens scope and is your call.
-- **D6 — the rule-6 network exception.** Review D's narrower wording above. Accept as written.
+Decided by the user (round 3):
+- **AD1 — Auto-install: decided (H4).** It installs when the job is missing or its root is gone, and respects an opt-out recorded by the Settings **Uninstall** button. Install, Reinstall and Uninstall are Settings buttons, and the make targets are thin aliases.
+- **AD3 — No automatic rollback: accepted (H1).** Pre-flight plus recovery text.
+- **AD4 — Update UI in the Control Room Settings only: accepted (H1).**
+- **AD5 — Open terminals: decided (H3).** Confirm, then close them.
+- **AD6 — DNS rebinding: decided (H2).** All routes get the shared Host gate, now in scope (A8a/A8b).
+- **D6 — accepted (H1).**
+- **Landing on main** (H5) and **the launchd proof** (H6) are **PARKED** for the user. A7 and v3.1 step 17 wait.
+
+Still open for the user:
+- **AD7 — Host-gate breadth.** H2 asked for all local-only routes. The plan puts the gate in the two dispatchers, so it covers **every** route (transcript GETs included, which a rebinding page could otherwise read) whenever there is no credential and the bind is loopback.
+  - **Recommended: as planned.** The alternative is to call it only at the listed local-only and terminal call sites, which leaves `/api/session` etc. readable by a rebinding page.
+- **AD8 — Scan priority.** **Recommended:** prefix the scan's git/gh children with `nice -n 10` on POSIX (argv prefix, not `preexec_fn`, which is unsafe with threads), and keep the scan strictly sequential, one child at a time. The alternative is no nicing.
 
 ### Not grounded / gaps
 - **Cross-terminal master inheritance** (known gap, separate ticket) [D-F1]. Terminal B's child inherits terminal A's master across its own `execvp`, so closing A alone never hangs it up. `term_vt` masks this with `killpg`. `_cloexec_all` at update time closes everything, so the update path is unaffected.
-- **DNS rebinding on the existing terminal and local-only routes:** see AD6. Not fixed unless the user picks (a).
+- **Host gate vs unusual local setups.** A no-auth, loopback-bound server reached through a custom local hostname (an `/etc/hosts` alias, or a port-forward that rewrites Host) will now get 403. Users with that setup need `TRACKER_AUTH` or a loopback name. Not measured here.
 - **uv reinstall command.** The exact command for a `package` install is not verified, so the copy says "reinstall it with uv" generically.
 - **SSH under the server's env.** `start_new_session` removes `/dev/tty`, so a passphrase prompt fails fast rather than hanging. Whether the `github-personal` alias fetches non-interactively, with the key in the agent, is unverified until A7.
 - **launchd behaviour** (TCC, gh keychain) is unproven until v3.1 step 17 / A7.
 - **Old Python with new web files after a failed exec.** The server keeps running (by design), but `build_page` now serves the new `web/*`. `restart_error` tells the user to restart by hand.
+
+### Non-functional plan (H5)
+Grounded facts:
+- The board/rail poll is 5s (`ext_cr_boot.js`, the `/api/list` interval).
+- `GET /api/list` runs `all_sessions()` (`server.py:408`).
+- `start_worker()` is a thread start (`pending.py:878–886`).
+- `pending._git` and `pending._gh` are synchronous `subprocess.run` (`pending.py:45`, `:61`), so the scan runs **one child at a time**.
+- `GET /api/pending` does `_local_caller` + `load_report()` (`server.py:411–417`).
+- The inlined page script is about 1.17 MB today (`cat aitracker/web/*.js | wc -c` = 1,171,661).
+- The real machine has 479 worktrees and 353 tmp dirs, and a full scan takes about 4 min (measured).
+
+| Aspect | Risk this feature adds | Budget | Measured / tested by |
+|---|---|---|---|
+| Server start-up | worker thread start; auto-install's `launchctl print`/`bootstrap` | first `GET /` within +50 ms of base; launchctl runs only on its own daemon thread | P1 |
+| 5s board poll / `GET /api/list` | none intended; the risk is any pending/scheduler/update call creeping into the list path | p50 and p95 unchanged within ±5% of base; **zero** pending/update/scheduler calls on the list path | P2 (timing) + T16 (patch `pending.scan`/`run_once`/`load_report`/`update_status`/`sched_status` to raise; `/api/list` still 200) |
+| `GET /api/pending` | must read the JSON report only, never scan | p50 < 20 ms with a 479-item report; never calls `scan`/`run_once` | P3 + T16 |
+| Real scan (about 4 min) | CPU/IO and git processes while the dashboard is in use; gh network | ≤ 1 git/gh child at a time (sequential by construction); children niced +10 (AD8); gh ≤ `GH_MAX_CALLS`=20 and ≤ `GH_BUDGET_S`=120s; `/api/list` p95 during a scan ≤ 1.5× idle p95; scheduled only every `PENDING_INTERVAL` (90d) plus Scan now | P4 |
+| Report in the page | `pendingCache` holds the whole report, refetched every 60s (5s while running) | `pending.json` ≤ 1 MB on the real machine; `JSON.parse` ≤ 20 ms | P5 |
+| Page-load weight | new code in app.js / ext_cr_board.js / ext_cr_dialogs.js / ext_launch.js inside the one inlined script | ≤ +20 KB total over base `build_page()` length; no new vendored asset | P6 |
+| Update restart path | time with no dashboard; reconnect | 202 → new `started_at` visible ≤ 5 s after the pre-flight ends (pre-flight ≤ 90s cap, typically a few seconds) | P7 |
+| Sync-ness | apply holds the scan lock; a scan blocks apply with 409 | no request thread ever waits on a scan or a fetch: Scan now, fetch and apply each run on a thread or return a 409 | T10, T13 |
+
+Measurement steps. All run on a spare port with `TRACKER_PENDING_INTERVAL=off` unless noted. Each records base (personal/main) against branch, and writes its numbers to the Log.
+- **P1 — start-up.** Script `scripts/perf_startup.py` **(new, dev-only)**: spawn `python -m aitracker` with `PORT=<spare>`, poll `GET /` until 200, 5 runs, print median ms. Run it on base and on branch.
+- **P2 — list latency.** Script `scripts/perf_list.py` **(new)**: 50 × `GET /api/list` against the running spare server; print p50/p95. Base vs branch.
+- **P3 — pending GET.** Generate a synthetic 479-item `pending.json` into a temp `PENDING_FILE`, then 50 × `GET /api/pending`; p50/p95.
+- **P4 — real scan load** (R7 allows one list-only run with gh, from the primary checkout).
+  - In one shell: `python -m aitracker --pending --dry-run --json > /tmp/scan.json`, wrapped in `/usr/bin/time -l`.
+  - In parallel: `scripts/perf_list.py`, plus a 1 Hz `ps -o pid,comm` sample counting `git`/`gh` children.
+  - Record: duration, user+sys CPU, max resident memory, the maximum concurrent git/gh count (must be ≤ 1), the gh call count (≤ 20), and `/api/list` p95 during the scan vs idle.
+- **P5 — report size.** `wc -c` of the P4 report, plus a node one-liner timing `JSON.parse` of it.
+- **P6 — page weight.** `python -c "from aitracker.page import build_page; print(len(build_page()))"`, base vs branch.
+- **P7 — restart.** On the A3a/A3b fixture clone served on a spare port, run apply with a trivial commit. Time from the 202 to the first `GET /api/update` with a new `started_at`.
+
+Cheaper agents (haiku gate-runner) run P1–P3 and P5–P6. P4 and P7 need sonnet, because they need judgment on the output. A budget miss is reported with its number; nothing is "fixed" without a re-plan.
+
+### Test plan (H8)
+The repo's evals live inside the unittest suite: `tests/test_tracker.py:2` ("Regression tests + evals") and `tests/test_integration.py:2` ("End-to-end evals across the seams…"). `Makefile:34` runs "unit + evals + server + selfcheck smoke". There is no separate evals directory.
+
+**Existing tests to update.** Found by grep for each anchor this feature changes. Each must be re-run and adjusted only where it pins the old behaviour.
+- **T1.** `config.EDITABLE`: `test_selfcheck.py`, `test_cr_routes.py`, `test_cr_tunnel.py`, `test_gateway.py`, `test_job_headline.py`, `test_pending_config.py`. Check none pins the exact key set or length; add the two keys where one does.
+- **T2.** `X-Server-Now` / headers: `test_integration.py`, `test_liveness_clock.py`. Add `X-Server-Started`. TestBundle in `test_integration.py` gets ORDER (`schedule`, `pending`, `update`), one `def status`, and `--pending --dry-run`.
+- **T3.** `pickDirectory`: `test_term_launch.py`, `test_term_vt_client.py`. These cover the new `prompt` param and the returned promise; existing call sites ignore the return.
+- **T4.** `tileId` / `t` key: `test_cr_board_resume_button.py`, `test_cr_readonly_ui.py`. Covers the pending tile id and the `t` key resolved by `focusedTileId`.
+- **T5.** `#slist` neighbours: `test_integration.py`, `test_uistate.py`. `#pendside` is inserted above `#slist`.
+- **T6.** Host header and loopback: `test_term_gate.py`, `test_term_gate_default.py`, `test_cr_routes.py`, `test_page_bundle.py`, `test_term_launch.py`, `test_tunnel.py`. Any test that sends a non-loopback `Host` without a credential now gets the rebinding 403. Fix the test's Host, or set auth, where that is not the point of the test.
+- **T7** (H7). The known load-sensitive `term_vt` backstop failure (memory: "make check flaky term_vt backstop"), and any other timing test that keeps failing in full runs. Replace fixed sleeps with bounded polling waits, keeping the assertion. Each fix is proven by 20 consecutive green runs of that module in isolation **and** 3 full gates.
+
+**New end-to-end tests:**
+- **T8 — route matrix** (`tests/test_pending_routes_matrix.py`). Routes: `/api/pending`, `/api/pending/item`, `POST /api/pending/run`, `/api/update`, `POST /api/update/fetch|apply`, `GET/POST /api/scheduler`. Callers:
+  - local with no auth;
+  - local with a `TRACKER_AUTH` cookie;
+  - local without the cookie, when auth is set;
+  - a tunnel caller (cf headers) with tunnel creds;
+  - a read-only tunnel visitor;
+  - a non-loopback `Host`.
+
+  Assert the exact status code in each cell.
+- **T9 — one `card`, two renderers** (node). Load app.js and ext_cr_board.js with the same `pendingCache`. The classic `#pendside` and the CR tile show identical title and summary, and `show:false` hides both.
+- **T10 — Scan now.** `POST /api/pending/run` returns 202 in < 200 ms with a slow patched `run_once`. A second click while running → 202 `running`, and only one scan ran. In `safe` config nothing is deleted.
+- **T11 — Resume + Copy prompt.** The item modal always has both buttons. Resume posts `/api/term/pty` with `cwd=top`, `mode:"new"`, and the server `prompt`. Without `ExtLaunch`, the fallback message appears.
+- **T12 — scheduler buttons end to end.** `GET`/`POST /api/scheduler` with `sched_*` patched: the UI round-trips Install → Reinstall → Uninstall, and the opt-out file appears and disappears.
+- **T13 — Update refusals over HTTP**, on the fixture clone:
+  - dirty, diverged, detached, no upstream, up to date;
+  - scan lock held;
+  - concurrent apply;
+  - terminals open → `needs_confirm`, then success with confirm (restart patched);
+  - pre-flight failure → HEAD unchanged.
+- **T14 — Host gate, every route.** `tests/test_host_gate.py` (A8b).
+- **T15 — new eval** in `test_integration.py`. A realistic fixture machine: 3 repos; worktrees in every verdict; a jobs dir with done/blocked jobs; a scratch tree; a fake gh. A full `scan()` asserts the verdict distribution, `card.summary` text, `would_delete` membership, and that `json.dumps(report)` round-trips.
+- **T16 — non-functional guards.** `/api/list` still 200 with pending/update/scheduler functions patched to raise. `GET /api/pending` still 200 with `scan`/`run_once` patched to raise.
 
 ## Reconciliation of reviews A + B (main thread, 2026-11-15)
 
@@ -1571,6 +1719,29 @@ Review: `reports/pending-work-worker-review-C.md` (2B/7S/10N). Its "Clean-plan d
 
 **Missed by review C:** a 90d default means a new install shows no card until the first run — `due()` already returns True when no report exists, so the first run happens ~60s after first server start; state this in README. Windows path remains planned-but-untested (cannot be proven on this machine) — recorded as a known gap, not discharged.
 
+## Reconciliation of review D (addendum A; main thread, 2026-11-15)
+
+Review: `reports/pending-work-worker-review-D.md` (F1–F15, "Clean-plan deltas" 1–15, and a narrower D6 wording).
+
+| Finding | Verdict | Note / trim |
+|---|---|---|
+| F1 pty masters survive exec | confirmed (term_vt.py:1657 pty.fork; no cloexec anywhere) | delta 1 as written. |
+| F2 scan/clean can start mid-apply | confirmed | delta 2 as written. |
+| F3 @{u} resolved twice | plausible | accept, delta 3. |
+| F4 exec failure leaves tunnel off | plausible | accept delta 4; `restart_error` is one status field, no new route. |
+| F5 ssh can read a passphrase from the serve terminal / orphan ssh | plausible | accept delta 5. |
+| F6 DNS rebinding passes both gates | confirmed (server.py:219-229 checks peer + proxy headers only; term_gate.py:47-55 passes when Origin is absent; no Host allowlist) | accept delta 6 for the update routes ONLY. The same hole on the existing terminal routes predates this work: record it under Known gaps and as decision AD6 for the user (fix all local-only routes now vs leave); do not widen this plan's scope unless the user says so. |
+| F7 pre-flight skips config overrides and page build | plausible | accept delta 7. |
+| F8 `"unittest" in sys.modules` always true | confirmed by logic | accept delta 8. |
+| F9 marker misses deleted plist / moved checkout | confirmed — and the reviewer's version fits the user's words ("should always generate the launchd job") better | accept delta 9: store only an explicit opt-out; install when the job is missing or its root is gone; cut the marker, the route and the Reinstall button. This replaces AD1 and AD2; put the resulting behaviour to the user as one decision. |
+| F10, F11, F12, F14, F15 | accepted as written. | |
+| F13 CLAUDE.md:22 says serve frees the port | confirmed (Makefile:9-10) | accept: correct the CLAUDE.md line in step A4; leave the Makefile. |
+| D6 | use the reviewer's narrower wording verbatim. | |
+
+Missed by both: none found beyond AD6.
+
+*Later superseded by round 3:* H2 puts AD6's fix in scope for all routes (A8a/A8b). H4 restores a scheduler status/action route and a Settings "Scheduled scan" block, reversing F9's cut of the route and button. F9's "store only an opt-out; install when missing or root gone" logic stands.
+
 ## Log
 - 2026-11-15: worktree cut; 4 parallel haiku Explore legs launched to map board, config/jobs, worktree/resume/cleanup wiring, on-disk inventory.
 - 2026-11-15: opus plan leg wrote "## Technical plan (v1)" (pending.py core + CLI + server thread, PENDING_INTERVAL/PENDING_CLEAN config, board card, open_pty prompt; D1-D3 recommendations). Awaiting user agreement before code.
@@ -1596,3 +1767,11 @@ Review: `reports/pending-work-worker-review-C.md` (2B/7S/10N). Its "Clean-plan d
   - D6 network exception;
   - steps A1–A7;
   - decisions AD1–AD5.
+- 2026-11-15: opus plan leg amended the addendum to "## Plan addendum A.1":
+  - review D deltas 1–15, with the reconciliation table recorded;
+  - "User decisions, round 3" (H1–H8) recorded;
+  - H2: global loopback-Host gate in `do_GET`/`do_POST` + `util.is_loopback_host`, steps A8a/A8b, every-route test;
+  - H4: `GET`/`POST /api/scheduler` + Settings "Scheduled scan" block;
+  - Non-functional plan P1–P7 and Test plan T1–T16 added;
+  - final steps A2, A3a, A3b, A1, A4, A5, A6, A8a, A8b, A9, P, A7;
+  - landing and launchd proof PARKED (H5/H6).

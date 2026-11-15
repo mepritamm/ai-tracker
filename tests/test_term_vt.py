@@ -671,7 +671,7 @@ class TestOutOfScopeConsumed(unittest.TestCase):
 
 class _FakeHeaders:
     def __init__(self, headers=None):
-        self._h = dict(headers or {})
+        self._h = {"Host": "localhost:8790", **(headers or {})}   # real requests always carry a Host
 
     def get(self, key, default=""):
         return self._h.get(key, default)

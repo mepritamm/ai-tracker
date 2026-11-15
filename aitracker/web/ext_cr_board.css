@@ -1515,6 +1515,9 @@
    state (both themes) — no new tokens needed. */
 .tracker-next .cr-tile--failing { background: var(--surface-failed); border-color: var(--line-failed); }
 .tracker-next .cr-tile--landed { background: var(--surface-done); border-color: var(--line-done); }
+/* Pending-work card: one violet tile (tokens in both themes, ext_cr.css); span2 comes from .cr-tile--span2. */
+.tracker-next .cr-tile--pending { background: var(--surface-pending); border-color: var(--line-pending); cursor: pointer; }
+.tracker-next .cr-tile--pending .cr-tile-title { color: var(--state-pending); font-weight: 600; }
 /* PINNED is orthogonal to the state modifiers above — a pinned tile keeps its state's surface
  * and gains a left accent, so "pinned" and "working" stay separately readable rather than one
  * overwriting the other. Same 3px left-accent idiom as .cr-tile--awaiting and .cr-rail-row--waiting.

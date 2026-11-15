@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -38,11 +39,17 @@ class _GitErr(Exception):
     pass
 
 
+def _nice():
+    """argv prefix that lowers a scan child's priority (AD8); [] where `nice` is unavailable.
+    Applied to the child only, never to this server process."""
+    return ["nice", "-n", "10"] if os.name == "posix" and shutil.which("nice") else []
+
+
 def _git(cwd, *args):
     """(rc, stdout) of `git -C cwd args`. rc is None on timeout / spawn failure (fail closed)."""
     env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
     try:
-        p = subprocess.run(["git", "--no-optional-locks", "-C", cwd, *args], capture_output=True,
+        p = subprocess.run([*_nice(), "git", "--no-optional-locks", "-C", cwd, *args], capture_output=True,
                            timeout=GIT_TIMEOUT, env=env)
     except (subprocess.TimeoutExpired, OSError, ValueError):
         return None, ""
@@ -58,7 +65,7 @@ def _gh(cwd, *args):
     env = {k: v for k, v in os.environ.items() if k not in ("GH_REPO", "GH_HOST")}
     env.update(GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", GH_SPINNER_DISABLED="1", NO_COLOR="1")
     try:
-        p = subprocess.run([exe, *args], capture_output=True, cwd=cwd, timeout=GH_TIMEOUT, env=env)
+        p = subprocess.run([*_nice(), exe, *args], capture_output=True, cwd=cwd, timeout=GH_TIMEOUT, env=env)
     except (subprocess.TimeoutExpired, OSError, ValueError):
         return None, ""
     return p.returncode, p.stdout.decode("utf-8", "replace")
@@ -876,14 +883,108 @@ def _worker_loop(sleep=time.sleep, clock=time.time):
 
 
 def start_worker():
-    """Idempotent. No-op only when PENDING_INTERVAL is off; the OS job does not stop it (tick dedups)."""
-    if config.interval_seconds(config.PENDING_INTERVAL) is None:
-        return
+    """Idempotent. Always starts the thread: _worker_loop re-reads config.PENDING_INTERVAL each tick
+    (off -> idle hour-long sleeps), so turning it on later needs no restart. The OS job does not stop
+    it (tick dedups)."""
     if _WORKER and _WORKER[0].is_alive():
         return
     t = threading.Thread(target=_worker_loop, daemon=True, name="pending-worker")
     _WORKER[:] = [t]
     t.start()
+
+
+# ---------------------------------------------------------------- report / item detail / resume (routes)
+
+def load_report():
+    """pending.json normalised for the API: always items/tmp/card, `running` true while a scan runs in
+    this process or another one holds the lock, `next_due` (epoch or None when off). gh_cache is
+    internal and dropped. Never scans."""
+    r = _load_json(config.PENDING_FILE, {})
+    r = dict(r) if isinstance(r, dict) else {}
+    r.pop("gh_cache", None)
+    for k in ("items", "tmp", "deleted", "would_delete", "refused", "errors", "repos"):
+        if not isinstance(r.get(k), list):
+            r[k] = []
+    running = _RUNNING.is_set()
+    if not running:
+        with _pending_lock() as got:
+            running = not got
+    r["running"] = running
+    card = r.get("card") if isinstance(r.get("card"), dict) else {"show": False, "title": "Pending work",
+                                                                   "summary": "", "count": 0}
+    if running:
+        card = dict(card, show=True, summary="scanning\u2026")
+    r["card"] = card
+    secs = config.interval_seconds(config.PENDING_INTERVAL)
+    r["next_due"] = None if secs is None else (r.get("scheduled_at") or time.time()) + secs
+    return r
+
+
+def _fence(text):
+    """Markdown code fence longer than any backtick run inside `text`, so git output can't break out."""
+    n = max([3] + [len(m) + 1 for m in re.findall(r"`+", text)])
+    return "%s\n%s\n%s" % ("`" * n, text.rstrip("\n"), "`" * n)
+
+
+def _cap(text, n):
+    lines = text.splitlines()
+    if len(lines) > n:
+        lines = lines[:n] + ["... (%d more lines)" % (len(lines) - n)]
+    return "\n".join(lines)
+
+
+def resume_prompt(item):
+    """Server-owned prompt text (D2): worktree-cleanup first, then cleanup. git runs via `git -C`."""
+    path = item.get("path") or ""
+    if item.get("kind") == "scratch":
+        return "Use the cleanup skill for session %s scratch at %s." % (item.get("session") or item.get("job") or "(unknown)", path)
+    gh = item.get("gh") or {}
+    ghs = gh.get("state") or "unknown"
+    if gh.get("pr"):
+        ghs += " " + (gh["pr"].get("url") if isinstance(gh["pr"], dict) else str(gh["pr"]))
+    sids = ", ".join(item.get("sids") or []) or "(any session that used it)"
+    return ("Use the worktree-cleanup skill on %s (repo %s, branch %s; %d uncommitted, %d unpushed as of last fetch; "
+            "gh: %s; operate with `git -C %s`, do not cd into it). Commit/push or discard only as I decide; ask "
+            "before anything destructive. Then use the cleanup skill for stray processes and scratch files of "
+            "session(s) %s." % (path, item.get("top") or item.get("repo"), item.get("branch") or "(detached)",
+                                (item.get("dirty") or 0) + (item.get("untracked") or 0), item.get("unpushed") or 0,
+                                ghs, path, sids))
+
+
+def item_detail(item_id):
+    """Live detail for one reported item, or None for an unknown id. {title, when, md, resume:{cwd,prompt}}.
+    git output is computed now (not from the report) and fenced; no scan, no gh call."""
+    r = _load_json(config.PENDING_FILE, {})
+    r = r if isinstance(r, dict) else {}
+    it = next((i for i in (r.get("items") or []) + (r.get("tmp") or [])
+               if isinstance(i, dict) and i.get("id") == item_id), None)
+    if it is None:
+        return None
+    path = it.get("path") or ""
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r.get("generated_at") or time.time()))
+    md = ["**Path** `%s`" % path]
+    if it.get("kind") == "scratch":
+        md.append("**Scratch** %s, %d bytes, idle %d s (%s)" % (it.get("verdict"), it.get("bytes") or 0,
+                                                                it.get("age_s") or 0, it.get("reason")))
+        return {"title": os.path.basename(path.rstrip("/")) or path, "when": when, "md": "\n\n".join(md),
+                "resume": {"cwd": os.path.expanduser("~"), "prompt": resume_prompt(it)}}
+    top = it.get("top") or it.get("repo") or path
+    md.append("**Branch** `%s` · **verdict** %s · %s" % (it.get("branch") or "(detached)", it.get("verdict"),
+                                                         it.get("label") or it.get("reason") or ""))
+    gh = it.get("gh") or {}
+    md.append("**gh** %s%s" % (gh.get("state") or "unknown",
+                               " " + str((gh.get("pr") or {}).get("url") if isinstance(gh.get("pr"), dict) else gh.get("pr") or "")))
+    if os.path.isdir(path):
+        for head, args, cap in (("git status --short", ("status", "--short"), 200),
+                                ("git diff --stat", ("diff", "--stat"), 200),
+                                ("git diff", ("diff",), 400),
+                                ("git log --oneline HEAD --not --remotes", ("log", "--oneline", "HEAD", "--not", "--remotes"), 50)):
+            rc, out = _git(path, *args)
+            md.append("**%s**\n%s" % (head, _fence(_cap(out, cap) if rc == 0 else "(git failed)")))
+    else:
+        md.append("The worktree directory is missing from disk (prunable).")
+    return {"title": it.get("branch") or os.path.basename(path), "when": when, "md": "\n\n".join(md),
+            "resume": {"cwd": top, "prompt": resume_prompt(it)}}
 
 
 def cli_main(argv):

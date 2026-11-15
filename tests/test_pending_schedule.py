@@ -126,5 +126,73 @@ class ScheduleTest(unittest.TestCase):
         self.assertIn("0 10 * * *", str(pr.call_args_list))
 
 
+class AutoInstallTest(ScheduleTest):
+    _real = staticmethod(schedule._under_test)
+
+    def setUp(self):
+        super().setUp()
+        self.plat("darwin")
+        for target, val in (("_under_test", lambda: False), ("_is_temp", lambda p: False)):
+            q = mock.patch.object(schedule, target, val)
+            q.start()
+            self.addCleanup(q.stop)
+
+    def test_missing_installs(self):
+        rec = Rec({"print": 113})
+        r = schedule.autoinstall_once(rec)
+        self.assertEqual(r["action"], "installed")
+        self.assertTrue(os.path.exists(schedule.plist_path()))
+
+    def test_present_only_status_call(self):
+        schedule.sched_install(Rec())
+        rec = Rec()
+        self.assertEqual(schedule.autoinstall_once(rec)["action"], "present")
+        self.assertEqual([c[1] for c in rec.calls], ["print"])
+
+    def test_root_gone_repoints(self):
+        schedule.sched_install(Rec())
+        with mock.patch.object(schedule, "_read_plist", lambda: {"WorkingDirectory": "/gone/x"}):
+            r = schedule.autoinstall_once(Rec())
+        self.assertEqual(r, {"action": "installed", "reason": "repointed"})
+
+    def test_optout_roundtrip(self):
+        schedule.sched_uninstall(Rec())
+        self.assertTrue(os.path.exists(schedule._optout_path()))
+        rec = Rec({"print": 113})
+        self.assertEqual(schedule.autoinstall_once(rec)["reason"], "opted out")
+        self.assertEqual(rec.calls, [])
+        schedule.sched_install(Rec())
+        self.assertFalse(os.path.exists(schedule._optout_path()))
+
+    def test_guards_skip_without_calls(self):
+        rec = Rec({"print": 113})
+        with mock.patch.object(schedule, "_under_test", lambda: True):
+            self.assertEqual(schedule.autoinstall_once(rec)["action"], "skipped")
+        with mock.patch.object(schedule, "_is_temp", lambda p: True):
+            self.assertEqual(schedule.autoinstall_once(rec)["reason"], "temp directory")
+        with mock.patch.object(schedule, "_root", lambda: "/Users/x/ai-tracker/.claude/worktrees/w"):
+            self.assertEqual(schedule.autoinstall_once(rec)["reason"], "linked worktree checkout")
+        open(os.path.join(self.root.name, ".git"), "w").close()
+        self.assertEqual(schedule.autoinstall_once(rec)["reason"], "linked worktree checkout")
+        self.plat("linux")
+        self.assertEqual(schedule.autoinstall_once(rec)["action"], "skipped")
+        self.assertEqual(rec.calls, [])
+
+    def test_under_test_helper_real(self):
+        q = mock.patch.object(schedule, "_under_test", self._real)
+        q.start(); self.addCleanup(q.stop)
+        self.assertTrue(schedule._under_test())  # we are running under unittest
+        with mock.patch.object(schedule.sys, "argv", ["x", "--selfcheck"]):
+            self.assertTrue(schedule._under_test())
+
+    def test_failure_returns_reason(self):
+        r = schedule.autoinstall_once(Rec({"print": 113, "bootstrap": 5}))
+        self.assertEqual(r["action"], "failed")
+        self.assertFalse(os.path.exists(schedule._optout_path()))
+        def boom(*a, **k):
+            raise OSError("nope")
+        self.assertEqual(schedule.autoinstall_once(boom)["action"], "failed")
+
+
 if __name__ == "__main__":
     unittest.main()

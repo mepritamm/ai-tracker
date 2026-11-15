@@ -636,7 +636,18 @@ main[data-sess=error] #drawerBtn{visibility:visible}
 main[data-sess=error]::before{content:attr(data-err);display:block;padding:24px;color:var(--bad,#c33)}
 main[data-sess=refreshing] #hmeta::after{content:" · " attr(data-snap)}
 
+/* pending-work card (classic view) + list/item modal rows; --violet exists in both themes */
+.pendside{margin:6px 8px;padding:8px 10px;border:1px solid var(--violet);border-radius:8px;cursor:pointer}
+.pendside[hidden]{display:none}
+.pendside .pt,.pendrow .pt{font-weight:600;font-size:12px;color:var(--text)}
+.pendside .ps,.pendrow .ps{font-size:11px;color:var(--muted);word-break:break-all}
+.pendbar{display:flex;gap:8px;align-items:center;margin:0 0 10px}
+.pendbar .pendbtn{display:inline-block}
+.pendrow{padding:6px 8px;margin:0 0 6px;border:1px solid var(--line3);border-radius:6px}
+.pendrow.click{cursor:pointer}
+.pendrow.click:hover{border-color:var(--violet)}
+.pendbar .pendbtn{cursor:pointer;color:var(--muted);font-size:11px;border:1px solid var(--line3);border-radius:6px;padding:3px 9px;white-space:nowrap}
+.pendbar .pendbtn:hover{color:var(--text);border-color:var(--violet)}
 /* Read-only view: cosmetic hide of classic-UI write controls (server still 403s). */
 html.tracker-readonly .ren,html.tracker-readonly .pin:not(.on),html.tracker-readonly .addflag,html.tracker-readonly .addnote{display:none!important}
 html.tracker-readonly .pin{pointer-events:none}
-

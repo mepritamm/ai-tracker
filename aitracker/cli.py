@@ -43,4 +43,4 @@ def main():
         sys.exit(cli_main(sys.argv[1:]))
     port = int(os.environ.get("PORT", 8790))
     host = os.environ.get("HOST", "127.0.0.1")   # 0.0.0.0 to reach it from a phone/tablet on LAN/Tailscale
-    run(host=host, port=port)   # run() picks the next free port if this one is busy, and opens the browser
+    run(host=host, port=port, open_browser=not os.environ.get("TRACKER_NO_BROWSER"))   # run() picks the next free port if this one is busy, and opens the browser

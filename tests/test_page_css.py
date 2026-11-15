@@ -340,6 +340,13 @@ class TestPageCSS(unittest.TestCase):
             "unreachably on phone."
         )
 
+    def test_pending_tile_rule_and_tokens_survive(self):
+        """The pending-work tile's rule and its three tokens reach the assembled CSS."""
+        css = _extract_style_content(_read_page())
+        self.assertIn(".tracker-next .cr-tile--pending", css)
+        for tok in ("--state-pending", "--surface-pending", "--line-pending"):
+            self.assertGreaterEqual(css.count(tok + ":"), 2, tok)
+
 
 if __name__ == "__main__":
     unittest.main()

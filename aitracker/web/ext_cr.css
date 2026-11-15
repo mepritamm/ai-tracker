@@ -175,6 +175,9 @@
      "pinned gets no hued colour, reuse --text-agent" ruling in
      ext_cr_board.css — that ruling predates this explicit colour request. */
   --state-pinned: var(--text-dusk);
+  --state-pending: #7A4FB3;
+  --surface-pending: #F1ECF7;
+  --line-pending: #CDBFE0;
 
   /* fills (2) */
   --fill-action: linear-gradient(180deg, #3B5747, #2E4438);
@@ -387,6 +390,9 @@
      (#A8C0C9, already measured/used for --cr-stat-dusk and the fork-lineage
      ink), never a separately-invented dark hex. */
   --state-pinned: var(--text-dusk);
+  --state-pending: #B79BE3;
+  --surface-pending: #2B2438;
+  --line-pending: #6B5A8C;
 
   /* fills (2 + solid) */
   --fill-action: linear-gradient(180deg, #8FB187, #6E8A75);

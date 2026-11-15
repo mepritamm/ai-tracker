@@ -1033,7 +1033,17 @@ def _run():
         assert _nw_srv._local_caller(_NwH("127.0.0.1", {"CF-Connecting-IP": "1.2.3.4"}))[0] is False, \
             "a Cf-Connecting-Ip request is never local"
         assert _nw_srv._local_caller(_NwH("192.168.1.9"))[0] is False, "a LAN peer is never local"
-        assert _nw_srv._local_caller(_NwH("127.0.0.1"))[0] is True, "loopback with no proxy header is local"
+        _nw_auth = config.AUTH
+        config.AUTH = ""   # the Host (DNS-rebinding) check only applies with auth off
+        try:
+            assert _nw_srv._local_caller(_NwH("127.0.0.1", {"Host": "localhost:8790"}))[0] is True, \
+                "loopback with no proxy header is local"
+            assert _nw_srv._local_caller(_NwH("127.0.0.1"))[0] is False, \
+                "auth off: a loopback peer with no Host header is refused (DNS-rebinding guard)"
+            assert _nw_srv._local_caller(_NwH("127.0.0.1", {"Host": "evil.example"}))[0] is False, \
+                "auth off: a loopback peer with a non-loopback Host is refused"
+        finally:
+            config.AUTH = _nw_auth
     finally:
         if _nw_env is not None:
             os.environ["TRACKER_TUNNEL_READONLY"] = _nw_env

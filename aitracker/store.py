@@ -1,4 +1,9 @@
-import fcntl, glob, json, os, time, uuid
+import glob, json, os, time, uuid
+try:
+    import fcntl
+except ImportError:   # Windows: the forks lock falls back to msvcrt.locking
+    fcntl = None
+    import msvcrt
 from . import config
 
 
@@ -328,6 +333,18 @@ def load_forks():
     return _load_forks()
 
 
+
+def _lock_fh(fh, acquire):
+    """Exclusive lock on fh's byte 0: fcntl.flock, or msvcrt.locking on Windows."""
+    if fcntl is not None:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX if acquire else fcntl.LOCK_UN)
+        return
+    fh.seek(0)
+    if acquire:
+        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)   # retries ~10s, then raises OSError
+    else:
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+
 def _update_forks(mutate):
     """Read-modify-write forks.json serialized behind an exclusive flock, so
     concurrent callers (record_fork for N different parents, resolve_fork_child
@@ -342,12 +359,11 @@ def _update_forks(mutate):
     save (the various already-recorded/already-resolved no-op cases), so an
     unnecessary rewrite doesn't happen while holding the lock.
 
-    flock is POSIX-only, which matches this project's footprint elsewhere
-    (the Makefile, term_vt's PTY handling) -- no cross-platform fallback."""
+    flock on POSIX, msvcrt.locking (byte 0, blocking) where fcntl is absent."""
     lock_path = config.FORKS_FILE + ".lock"
     lockfh = open(lock_path, "a")
     try:
-        fcntl.flock(lockfh.fileno(), fcntl.LOCK_EX)
+        _lock_fh(lockfh, True)
         try:
             # deliberately NOT _load_forks(): the whole point of holding the lock is to
             # read the true current on-disk state, and mutating a dict shared with
@@ -358,7 +374,7 @@ def _update_forks(mutate):
             if mutate(forks) is not False:
                 _save_json(config.FORKS_FILE, forks)
         finally:
-            fcntl.flock(lockfh.fileno(), fcntl.LOCK_UN)
+            _lock_fh(lockfh, False)
     finally:
         lockfh.close()
 

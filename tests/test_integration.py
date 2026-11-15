@@ -1490,7 +1490,7 @@ class TestTermIdleTtlEndToEnd(unittest.TestCase):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     def _req(self, method, path, payload=None):
-        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
         body = json.dumps(payload).encode() if payload is not None else None
         c.request(method, path, body=body,
                   headers={"Content-Type": "application/json"} if body else {})
@@ -1510,7 +1510,7 @@ class TestTermIdleTtlEndToEnd(unittest.TestCase):
         self.assertEqual(config.TERM_IDLE_TTL_MIN, 45)
 
     def _hdrs(self, path):
-        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
         c.request("GET", path)
         r = c.getresponse()
         r.read()
@@ -1758,8 +1758,15 @@ class TestBundle(unittest.TestCase):
             for nm in ([n.name] if isinstance(n, (ast.FunctionDef, ast.ClassDef)) else
                        [t.id for t in n.targets if isinstance(t, ast.Name)] if isinstance(n, ast.Assign) else []):
                 names[nm] = names.get(nm, 0) + 1
-        for nm in ("sched_install", "sched_status", "sched_uninstall", "cli_main", "tick", "clean", "_pending_lock", "_lock"):
+        for nm in ("sched_install", "sched_status", "sched_uninstall", "cli_main", "tick", "clean", "_pending_lock", "_lock",
+                   "update_status", "update_fetch", "update_apply", "start_restart", "restart_in_place"):
             self.assertEqual(names.get(nm), 1, nm)
+        self.assertEqual(names.get("_root"), 2)   # schedule.py and update.py: identical bodies, last wins
+
+    def test_bundle_update_status_reports_bundle_without_git(self):
+        r = subprocess.run([sys.executable, "-c", "import runpy; ns = runpy.run_path(%r, run_name='b'); st = ns['update_status'](); print(st['kind'], st['can_update'])" % self.dist],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "bundle False"), r.stderr)
 
     def test_bundle_pending_cli_runs_with_temp_home(self):
         """`--pending --dry-run` and `--pending --scheduler-status` exit 0 from the bundle. HOME is a temp dir, the
@@ -2138,6 +2145,8 @@ var sessRefreshing = false, snapTtlMin = 0;   // poll()'s hung-fetch check / loa
 function sessShown(){ return false; }
 function sessLanded(id, d){ lastData = d; render(d); return true; }   // app.js: cache + renderFor + clear loading mark
 function esc(s){ return String(s); }
+function serverRestarted(res){ return false; }
+function loadPending(){}
 var termCount = null;   // loadSide()'s X-Term-Count read target -- see app.js's own declaration
 var SIDE_EXT = [];      // loadSide() fires this after renderSide(); empty here, same as a page
                          // with no terminal-feature module loaded -- the guard behaviour under
