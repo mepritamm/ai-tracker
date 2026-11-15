@@ -77,26 +77,15 @@ def session_cwd(sid, resume=False):
     returns that instead of "". Verified empirically on claude 2.1.280: `claude --resume <sid>`
     looks the session up by id, not by cwd, so it resumes fine from ANY directory that merely
     exists -- the exact ancestor is cosmetic. Stops and returns "" if the walk's nearest
-    existing ancestor is "/" (not a real place to land a shell); the home dir is fine.
-
-    Also with resume=True, a cwd inside a git worktree (`<repo>/.claude/worktrees/<name>/...`)
-    resumes in the BASE repo `<repo>` (when it exists), so a resumed session never runs inside
-    a worktree -- the same by-id lookup makes that safe. New/cwd modes keep the recorded cwd."""
+    existing ancestor is "/" (not a real place to land a shell); the home dir is fine."""
     import os
     from .registry import parse_any
-    from .providers.claude import _WT_MARKER
     try:
         cwd = ((parse_any(sid) or {}).get("meta") or {}).get("cwd") or ""
     except Exception:
         return ""
     if not cwd:
         return ""
-    # ponytail: only the `.claude/worktrees/` layout (EnterWorktree's); `git rev-parse
-    # --git-common-dir` if worktrees elsewhere ever need it.
-    if resume and _WT_MARKER in cwd + os.sep:
-        base = (cwd + os.sep).split(_WT_MARKER, 1)[0]
-        if base and os.path.isdir(base):
-            return base
     if os.path.isdir(cwd):
         return cwd
     if not resume:
