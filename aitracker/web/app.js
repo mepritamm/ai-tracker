@@ -1174,12 +1174,16 @@ function renderSide(){
 }
 // one session row — shared by the flat list, agent-group children, and expandable parents.
 // ex (optional) = {gk,open,n,live}: this session originated N agents; render an expander + count.
+// Model marker (classic sidebar row + session header): the server's model_label as the same
+// .cr-model-chip the control room uses; raw id in the tooltip.
+const modelChipHtml=(label,id)=>`<span class=cr-model-chip title="${esc(id||"").replace(/"/g,"&quot;")}">${esc(label)}</span>`;
 function sessionRow(s,now,ex){
   const live=now-s.mtime<LIVE;
   const label=s.title||s.project||s.id.slice(0,8);
   const bits=[`<span class=proj>${s.title?esc(s.project):s.id.slice(0,8)}</span>`];
   if(s.source)bits.push(srcLabel(s.source));
   bits.push(ago(now-s.mtime));
+  if(s.model_label)bits.push(modelChipHtml(s.model_label,s.model));
   const chev=ex?`<span class="agtoggle${ex.open?' open':''}" onclick="toggleGroup('${encodeURIComponent(ex.gk)}');event.stopPropagation()" title="${ex.open?'Collapse':'Expand'} agent sessions">${ico('agent')}</span>`:"";
   const kidchip=ex?` · <span class=agentbadge title="agent sessions this one spawned">${ico('agent')} ${ex.live?ex.live+" live / ":""}${ex.n} agent${ex.n==1?"":"s"}</span>`:"";
   // in-transcript background agents (Task/Workflow) running now — they spawn no separate session, so this is their only sidebar cue
@@ -1918,6 +1922,7 @@ function render(d){
   if(src)meta.push(ico('keyboard')+" "+src);
   meta.push(`${(d.tokens.in/1000|0)}k in / ${(d.tokens.out/1000|0)}k out`);
   if(m.version)meta.push("v"+esc(m.version));
+  if(m.model_label)meta.push(modelChipHtml(m.model_label,m.model));
   $("hmeta").innerHTML=meta.map(x=>`<span>${x}</span>`).join("");
   paintTitleNote(m,cur);
 

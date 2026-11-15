@@ -1355,6 +1355,7 @@
             '<span class="crd-src"></span>' +
             '<span class="crd-div"></span>' +
             '<span class="crd-metaline mono"></span>' +
+            '<span class="cr-model-chip" hidden></span>' +
             '<span class="crd-pill crd-pill-state"></span>' +
             // GAP CLOSE (owner ask: "make the N AGENTS RUNNING tab clickable ...
             // track the agent live from the session header itself"): this used to
@@ -2398,11 +2399,15 @@
     // nothing (no "unknown"), handled by the existing .filter(Boolean).
     // model-update-nudge: prefer the server's own display label (meta.model_label) over the
     // client-side ladder-match heuristic — server owns the policy, this just reads the field.
-    var modelBit = meta.model_label || shortModel(meta.model) || null;
-    var metaBits = [proj || null, meta.gitBranch || null, elapsedStr, fmtTokens(session) || null, modelBit].filter(Boolean);
+    // Model marker: its own small chip (.cr-model-chip, shared with the board), hidden when unknown.
+    var modelBit = meta.model_label || shortModel(meta.model) || "";
+    var metaBits = [proj || null, meta.gitBranch || null, elapsedStr, fmtTokens(session) || null].filter(Boolean);
     var metaEl = qs(node, ".crd-metaline");
     metaEl.textContent = metaBits.join(" · ");
-    metaEl.title = meta.model || "";
+    var chipEl = qs(node, ".cr-model-chip");
+    chipEl.textContent = modelBit;
+    chipEl.title = meta.model || "";
+    chipEl.hidden = !modelBit;
 
     // TASK 1 FIX (owner-reported drift): the big header text used to be
     // session.overview.goal (overview.py:19 `goal = requests[-1]["text"]` --

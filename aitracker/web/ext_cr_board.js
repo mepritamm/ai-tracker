@@ -776,6 +776,13 @@ window.CR = window.CR || {};
 
     // -- small DOM helpers ------------------------------------------------
 
+    // Model marker chip: the server's display label (registry.py model_label -- server owns
+    // the label, so no JS re-derivation), raw id in the tooltip; null when unknown.
+    function modelChip(s) {
+      return s && s.model_label
+        ? h('span', { class: 'cr-model-chip', title: s.model || null }, [s.model_label]) : null;
+    }
+
     function h(tag, attrs, children) {
       var el = document.createElement(tag);
       attrs = attrs || {};
@@ -1926,8 +1933,9 @@ window.CR = window.CR || {};
       // a new element — a short form here, e.g. "opus 4.8", with the raw id
       // only in the row's full tooltip (titleAttr below), per the "rail rows
       // are tight" instruction.
-      var mdl = (s.gateway === 'openrouter' && s.model_label) ? s.model_label : modelShort(s.model);
-      var dirLine = [dir, mdl].filter(Boolean).join(' · ');
+      // Model marker: the server's model_label as a small chip (modelChip) at the
+      // end of the dir line, not text-joined into it.
+      var dirLine = dir;
       // `s.snippet` only exists on a decorated search-hit object (never on a
       // real list-dict session) — falls back to the prompt/title tooltip
       // exactly as before whenever it's absent, so this is purely additive.
@@ -2178,7 +2186,7 @@ window.CR = window.CR || {};
         // The directory/model line keeps its own row beneath the meta line --
         // it is control-room-only detail classic never had, and stacking it
         // here is what stops it competing with the title for width.
-        dirLine ? h('span', { class: 'cr-rail-dir' }, [dirLine]) : null,
+        (dirLine || s.model_label) ? h('span', { class: 'cr-rail-dir' }, [dirLine, modelChip(s)]) : null,
         rich ? railRichProgress(s) : null,
       ]);
     }
@@ -2781,12 +2789,10 @@ window.CR = window.CR || {};
       // every other state keeps the full "age · tool".
       var trailing = (state === 'awaiting') ? toolLabel(s.source)
         : (ago(now - (s.mtime || 0)) + ' · ' + toolLabel(s.source));
-      // Model is subordinate metadata, tacked onto the SAME trailing strip
-      // rather than a new visual element -- absent whenever the session's
-      // last-known model is unknown (never "unknown", never a placeholder).
-      var mdl = (s.gateway === 'openrouter' && s.model_label) ? s.model_label : modelShort(s.model);
-      if (mdl) trailing += ' · ' + mdl;
-      head.appendChild(h('span', { class: 'cr-tile-meta', title: s.model || null }, [trailing]));
+      head.appendChild(h('span', { class: 'cr-tile-meta' }, [trailing]));
+      // Model marker: a small chip after the meta strip; absent when the model is unknown.
+      var chip = modelChip(s);
+      if (chip) head.appendChild(chip);   // appendChild(null) throws -- no model, no chip
       return head;
     }
 

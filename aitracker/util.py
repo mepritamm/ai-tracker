@@ -526,6 +526,9 @@ def model_label(mid):
         if m.group(0)[1:-1].strip().lower() == "1m":
             tag = " (1M)"
         rm = _MODEL_BRACKET_RE.sub("", rm)
+    ctx = _COST_CTX_TAG_RE.search(rm)            # Auggie "-500k" context tag -> " (500k)"
+    if ctx and model_version(rm[:ctx.start()]) is not None:
+        tag, rm = " (%s)" % ctx.group(0)[1:], rm[:ctx.start()]
     if rm.lower() in _MODEL_FAMILIES:
         return rm[:1].upper() + rm[1:].lower() + tag
     mv = model_version(rm)

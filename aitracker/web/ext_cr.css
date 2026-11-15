@@ -488,6 +488,27 @@
 .tracker-next.is-dark .tn-emo-n { color: var(--text-thinking); }
 .tracker-next .tn-emo svg { width: calc(1em * var(--ico-scale)); height: calc(1em * var(--ico-scale)); display: inline-block; vertical-align: -0.15em; flex-shrink: 0; }
 
+/* Model marker (board tile, rail row, session-detail header, and the classic sidebar row +
+   session header): one small chip with the server's model_label -- which model runs the session.
+   Unscoped so classic and control room share it; tokens fall back to the classic palette. */
+.cr-model-chip {
+  flex: 0 0 auto;
+  display: inline-block;
+  max-width: 16ch;
+  margin-left: 6px;
+  padding: 0 6px;
+  border: 1px solid var(--line-default, var(--line3));
+  border-radius: 999px;
+  background: var(--surface-raised, var(--chipbg));
+  color: var(--text-muted, var(--muted));
+  font: 500 10px/16px var(--font-mono, ui-monospace, Menlo, monospace);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+.cr-model-chip[hidden] { display: none; }
+
 /* Read-only view (server-decided: app.js toggles html.tracker-readonly from X-Read-Only).
    Cosmetic only -- the server 403s every write regardless. Scoped under the class, never host-based. */
 html.tracker-readonly .cr-newsession,
@@ -512,3 +533,4 @@ html.tracker-readonly .cr-topbar::after {
   content: "View only"; padding: 2px 8px; border-radius: 999px;
   border: 1px solid currentColor; font-size: 11px; opacity: .8; white-space: nowrap;
 }
+
