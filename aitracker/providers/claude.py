@@ -148,6 +148,9 @@ def _tail_scan(path, nbytes=96000):
     shell_launches = {}   # tool_use_id -> True, Bash run_in_background calls seen in this tail
     shell_ids = {}        # tool_use_id -> harness shell id, from that launch's matching tool_result
     shell_done = set()    # harness shell/task ids marked done via <task-notification> in this tail
+    cwd = branch = ""     # latest cwd / gitBranch in this tail ("HEAD" = detached = no branch)
+    cwd_hist = []         # every cwd seen, oldest first (deduped + reversed below)
+    wt, wt_seen = None, False   # latest `worktree-state` worktreeSession; null clears it
     try:
         sz = os.path.getsize(path)
         with open(path, "rb") as fh:
@@ -166,6 +169,15 @@ def _tail_scan(path, nbytes=96000):
             ai = o.get("aiTitle", ai)
             custom = o.get("customTitle", custom)
             entry = o.get("entrypoint", entry)
+            if isinstance(o.get("cwd"), str) and o["cwd"]:
+                cwd = o["cwd"]
+                if not cwd_hist or cwd_hist[-1] != cwd:
+                    cwd_hist.append(cwd)
+            if isinstance(o.get("gitBranch"), str) and o["gitBranch"]:
+                branch = "" if o["gitBranch"] == "HEAD" else o["gitBranch"]
+            if o.get("type") == "worktree-state":
+                ws = o.get("worktreeSession")
+                wt, wt_seen = (ws if isinstance(ws, dict) else None), True
             m = o.get("message")
             if not isinstance(m, dict):
                 continue
@@ -231,9 +243,14 @@ def _tail_scan(path, nbytes=96000):
     ended = (not waiting) and last == "assistant_text"
     # See the docstring's `shells_running` section for the undercount-on-purpose rationale.
     shells_running = sum(1 for sid in shell_ids.values() if sid not in shell_done)
+    cwds = []
+    for d in reversed(cwd_hist):                 # newest first, distinct, capped
+        if d not in cwds:
+            cwds.append(d)
     return {"ai": ai, "custom": custom, "entry": entry, "waiting": waiting, "ended": ended,
             "last_text": last_text, "model": model, "fail_cmd": fail_cmd,
-            "shells_running": shells_running, "last": last}
+            "shells_running": shells_running, "last": last,
+            "cwd": cwd, "cwds": cwds[:16], "wt": wt, "wt_seen": wt_seen, "gitBranch": branch}
 
 
 def _tail_fields(path, nbytes=96000):

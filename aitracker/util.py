@@ -109,6 +109,33 @@ def _git_branch(cwd):
         return ""
 
 
+def git_worktree_root(path):
+    """(root, wt_top) when `path` is inside a LINKED git worktree, else ("", ""). Pure file
+    reads, never raises. A main checkout, plain dir, submodule or bare repo gives ("", "")."""
+    try:
+        d = os.path.realpath(path)
+        while d and not os.path.lexists(os.path.join(d, ".git")):
+            up = os.path.dirname(d)
+            if up == d:
+                return "", ""
+            d = up
+        dotgit = os.path.join(d, ".git")
+        if not os.path.isfile(dotgit):
+            return "", ""
+        with open(dotgit, encoding="utf-8") as fh:
+            line = fh.read().strip()
+        if not line.startswith("gitdir:"):
+            return "", ""
+        g = os.path.normpath(os.path.join(d, line[7:].strip()))
+        with open(os.path.join(g, "commondir"), encoding="utf-8") as fh:
+            c = os.path.normpath(os.path.join(g, fh.read().strip()))
+        if os.path.basename(c) != ".git" or not os.path.isdir(os.path.dirname(c)):
+            return "", ""
+        return os.path.realpath(os.path.dirname(c)), os.path.realpath(d)
+    except (OSError, ValueError):
+        return "", ""
+
+
 def _iso_epoch(s):
     try:
         import datetime as _dt

@@ -741,7 +741,8 @@ class TestCloseKillsForegroundChildForReal(unittest.TestCase):
             shell_pid = pt.pid
             self.addCleanup(pt.kill)
 
-            self.assertTrue(_wait_until(lambda: os.path.exists(pidfile), 5),
+            # Wait for the pid's CONTENT, not just the file: the child creates it before writing.
+            self.assertTrue(_wait_until(lambda: os.path.exists(pidfile) and os.path.getsize(pidfile) > 0, 5),
                              "the foreground child never started")
             with open(pidfile) as f:
                 child_pid = int(f.read())
@@ -1152,7 +1153,7 @@ class TestFreshFolderShellQueuesInsteadOfOverflow(unittest.TestCase):
         typed = []
         pending_seen = []
 
-        def _quiet(pt):
+        def _quiet(pt, quiet_since=None):
             pending_seen.append(pt.fg_pending)
             time.sleep(quiesce)
             return True

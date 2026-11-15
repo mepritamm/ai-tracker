@@ -2042,7 +2042,7 @@ def _inject_argv(pt, argv, deferred=False):
     AFTER Enter -- the job itself. A failed exit leaves the claim for the caller to release."""
     typed = False
     try:
-        if not _wait_for_quiescence(pt):
+        if not _wait_for_quiescence(pt, quiet_since=pt.last_output):
             return False, "folder shell never went quiet"
         deadline = time.time() + (0 if deferred else INJECT_MAX_WAIT)
         while _fg_pgid(pt) != pt.pid:
@@ -4905,7 +4905,7 @@ def _body_rows_version(pt):
         return tuple(row_v[:body])
 
 
-def _wait_for_quiescence(pt):
+def _wait_for_quiescence(pt, quiet_since=None):
     """Block the calling (HTTP handler) thread until `pt` has been silent for
     `INJECT_QUIET_WINDOW` seconds, AT LEAST `INJECT_MIN_WAIT` seconds have elapsed since this
     call started (see that constant's own comment), and no more than `INJECT_MAX_WAIT` seconds
@@ -4926,11 +4926,15 @@ def _wait_for_quiescence(pt):
     a caller -- production code choosing to retune them, or a test monkeypatching
     `term_vt.INJECT_QUIET_WINDOW` etc. -- sees the effect immediately, exactly like `_reader`'s
     own late-bound read of `config.TERM_IDLE_TTL_MIN`.
+
+    `quiet_since` (optional, Screen branch only) seeds the idle clock with the time the shell
+    last produced output (`pt.last_output`) instead of call time, so an already-idle shell does
+    not wait a fresh `INJECT_QUIET_WINDOW`; `INJECT_MIN_WAIT` still floors the wait.
     """
     start = time.time()
     deadline = start + INJECT_MAX_WAIT
     has_screen = pt.screen is not None
-    last_change = start
+    last_change = start if quiet_since is None else min(start, quiet_since)
     last_version = _body_rows_version(pt) if has_screen else None
     while True:
         now = time.time()

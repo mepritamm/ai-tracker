@@ -72,9 +72,68 @@ def guard(handler):
         return False
     return True
 
+def _existing_ancestor(cwd):
+    """The nearest EXISTING ancestor directory of a missing `cwd` ("" if the walk reaches "/")."""
+    import os
+    ancestor = os.path.dirname(cwd)
+    while ancestor and ancestor != "/" and not os.path.isdir(ancestor):
+        ancestor = os.path.dirname(ancestor)
+    return ancestor if ancestor and ancestor != "/" and os.path.isdir(ancestor) else ""
+
+
+def _recorded(sid, meta=None):
+    """(tail_scan_dict_or_None, cwd, branch) for a Claude sid. The cheap tail read is tried
+    first; only when it has no cwd (no transcript, or one line > 96 KB) do we fall back to the
+    full parse -- `meta` (when the caller IS parse_any) is used instead so it never re-enters."""
+    from .providers import claude
+    t = None
+    path = claude.find_session(sid)
+    if path:
+        t = claude._tail_scan(path)
+    if t and t.get("cwd"):
+        return t, t["cwd"], t.get("gitBranch") or ""
+    if meta is None:
+        from .registry import parse_any
+        try:
+            meta = (parse_any(sid) or {}).get("meta") or {}
+        except Exception:
+            meta = {}
+    branch = meta.get("gitBranch") or ""
+    return t, meta.get("cwd") or "", "" if branch == "HEAD" else branch
+
+
+def recorded_run_dir(sid, meta=None):
+    """(raw, branch): where a Claude session last ran, preferring worktree evidence -- the
+    latest `worktree-state` path, else the newest recorded cwd inside a linked worktree, else
+    the latest cwd. A later bare-root cwd never beats earlier worktree evidence. Non-Claude
+    sids give ("", "")."""
+    from .registry import provider_for
+    from .util import git_worktree_root
+    p = provider_for(sid)
+    if p is None or p.prefix != "":
+        return "", ""
+    t, cwd, branch = _recorded(sid, meta)
+    if not cwd:
+        return "", ""
+    t = t or {}
+    wt = t.get("wt")
+    if t.get("wt_seen") and isinstance(wt, dict) and wt.get("worktreePath"):
+        return wt["worktreePath"], branch
+    if t.get("wt_seen"):                         # ExitWorktree: deliberately left
+        return cwd, branch
+    for d in t.get("cwds") or []:
+        top = git_worktree_root(d)[1]
+        if top:                                  # the worktree TOP, not a subdir of it
+            return top, branch
+    return cwd, branch
+
+
 def session_cwd(sid, resume=False):
     """The working directory for a session id, or "" if unknown/gone. Late import: registry
     pulls in every provider, and this module is imported from server at startup.
+
+    S1: the cwd comes from the transcript TAIL (ms) when it has one; the full `parse_any`
+    (seconds on a big transcript) is only the fallback.
 
     With resume=True, a recorded cwd that no longer exists (the session's worktree/folder was
     since removed) walks up via os.path.dirname to the nearest EXISTING ancestor directory and
@@ -83,9 +142,8 @@ def session_cwd(sid, resume=False):
     exists -- the exact ancestor is cosmetic. Stops and returns "" if the walk's nearest
     existing ancestor is "/" (not a real place to land a shell); the home dir is fine."""
     import os
-    from .registry import parse_any
     try:
-        cwd = ((parse_any(sid) or {}).get("meta") or {}).get("cwd") or ""
+        cwd = _recorded(sid)[1]
     except Exception:
         return ""
     if not cwd:
@@ -94,10 +152,7 @@ def session_cwd(sid, resume=False):
         return cwd
     if not resume:
         return ""
-    ancestor = os.path.dirname(cwd)
-    while ancestor and ancestor != "/" and not os.path.isdir(ancestor):
-        ancestor = os.path.dirname(ancestor)
-    return ancestor if ancestor and ancestor != "/" and os.path.isdir(ancestor) else ""
+    return _existing_ancestor(cwd)
 
 
 REFUSAL_MARKER = "is currently running as a background agent (bg)"
