@@ -1477,6 +1477,11 @@ class TestTermIdleTtlEndToEnd(unittest.TestCase):
         config.CONFIG_FILE = os.path.join(self._tmpdir, "config.json")   # POST must never touch the real one
         config.AUTH = ""
         config.apply_overrides({})
+        # Hermetic: /api/list must not scan the real ~/.claude (slow cold -> 5s client timeout).
+        for k in ("PROJECTS", "AUGMENT_DIR"):
+            _p = mock.patch.object(config, k, self._tmpdir)
+            _p.start()
+            self.addCleanup(_p.stop)
         self.srv = _server.Server(("127.0.0.1", 0), _server.Handler)
         self.port = self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()

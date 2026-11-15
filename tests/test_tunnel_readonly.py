@@ -221,6 +221,11 @@ class TestFailClosed(_RO):
     def test_non_dict_config_is_readonly_but_list_served(self):
         with open(config.CONFIG_FILE, "w") as f:
             f.write("[]")
+        # Hermetic: don't scan the real ~/.claude (slow cold -> 5s client timeout under load).
+        for k in ("PROJECTS", "AUGMENT_DIR"):
+            p = mock.patch.object(config, k, self.state)
+            p.start()
+            self.addCleanup(p.stop)
         st, _d, h = self.get("/api/list")
         self.assertEqual(st, 200)
         self.assertEqual(h.get("X-Read-Only"), "1")

@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 import aitracker.config as config
 import aitracker.tunnel as tunnel
@@ -399,6 +400,12 @@ class TestAuthByPath(_ServerCase):
     tunnel.status()["on"])."""
 
     def test_localhost_open_when_auth_off(self):
+        # Hermetic: /api/list otherwise scans the real ~/.claude (1000+ sessions, >5s cold under
+        # load -> _get's 5s timeout). This test is about auth, not the session scan.
+        for k in ("PROJECTS", "AUGMENT_DIR"):
+            p = mock.patch.object(config, k, self._tmpdir)
+            p.start()
+            self.addCleanup(p.stop)
         st, _b, _h = _get(self.port, "/api/list")
         self.assertEqual(st, 200)
 

@@ -6434,7 +6434,10 @@ class TestIdleSessionLive(unittest.TestCase):
         self.assertTrue(_wait_for(lambda: pt._act_v is not None, 2))
         before = pt.last_active
         self._go(0.001)
-        time.sleep(1.5)
+        # the reader's select wakes once a second; poll for the hold itself rather than a fixed
+        # sleep (a loaded box can starve the reader past 1.5s), then let one more tick pass
+        self.assertTrue(_wait_for(lambda: pt.last_hold == "live", 10), "reap never deferred on live")
+        time.sleep(0.5)
         self.assertFalse(pt.done)
         self.assertEqual(pt.last_active, before, "a hold must not reset the idle clock")
         self.assertEqual(pt.last_hold, "live")
