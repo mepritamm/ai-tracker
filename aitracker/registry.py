@@ -191,6 +191,16 @@ def resume_cmd(sid, model):
     return "claude --resume " + sid
 
 
+def term_home(sid, meta=None):
+    """(raw run dir, branch) the owning provider recorded for a session, or ("", ""). The one
+    seam placement goes through; `meta` (when the caller IS parse_any) is never re-parsed."""
+    p = provider_for(sid)
+    try:
+        return p.term_home(sid, meta) if p else ("", "")
+    except Exception:
+        return "", ""
+
+
 def parse_any(sid):
     """Route a namespaced session id to the provider that owns it."""
     p = provider_for(sid)

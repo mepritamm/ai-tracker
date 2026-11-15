@@ -155,6 +155,58 @@ def session_cwd(sid, resume=False):
     return _existing_ancestor(cwd)
 
 
+_REMOVED = ("Worktree `%s` was removed. Open terminal or Resume will offer to recreate it and "
+            "continue this same session there. Uncommitted changes from the old worktree "
+            "cannot be recovered.")
+
+
+def terminal_dir(raw):
+    """Classify a recorded run dir with file reads only (no git): ("worktree", root, top) for an
+    existing linked worktree, ("deleted", root, "") for a removed one, else ("plain", "", "")."""
+    import os
+    from .util import git_worktree_root, deleted_worktree_root
+    if not raw:
+        return "plain", "", ""
+    if os.path.exists(raw):
+        root, top = git_worktree_root(raw)
+        return ("worktree", root, top) if root else ("plain", "", "")
+    root = deleted_worktree_root(raw)
+    return ("deleted", root, "") if root else ("plain", "", "")
+
+
+def _raw_for(sid, cwd, meta):
+    from .registry import term_home
+    return term_home(sid, meta)[0] or cwd
+
+
+def place(sid, cwd, mode, meta=None):
+    """Where a terminal for `sid` lives -> {"shell", "run", "note", "error"} (+ "recreate" for a
+    removed worktree). Order (row 12): resolve worktree -> existence check -> placement.
+    `cwd` is what the route's session_cwd returned (maybe ""). A worktree session's shell is the
+    main checkout root and `run` its worktree top (None for mode "cwd"); a removed worktree
+    answers {"recreate": {...}} with an error so the route can 409 (E1; nothing is launched).
+    Anything else is today's behaviour: shell = run = cwd."""
+    import os
+    raw = _raw_for(sid, cwd, meta)
+    kind, root, top = terminal_dir(raw)
+    if kind == "worktree":
+        return {"shell": root, "run": None if mode == "cwd" else top, "note": "", "error": ""}
+    if kind == "deleted":
+        if not os.path.isdir(root):
+            return {"shell": "", "run": None, "note": "",
+                    "error": "repository `%s` no longer exists -- resume by hand" % root}
+        msg = _REMOVED % raw
+        return {"shell": "", "run": None, "note": msg, "error": msg,
+                "recreate": {"path": raw, "root": root}}
+    return {"shell": cwd, "run": cwd, "note": "", "error": ""}
+
+
+def home_note(sid, cwd, meta=None):
+    """The server-owned removed-worktree message ("" otherwise). File reads only."""
+    raw = _raw_for(sid, cwd, meta)
+    return _REMOVED % raw if terminal_dir(raw)[0] == "deleted" else ""
+
+
 REFUSAL_MARKER = "is currently running as a background agent (bg)"
 """Substring of the CLI's OLD verbatim refusal (docs/claude-resume-command-matrix.md), kept
 for backward compat -- existing tests reference this name directly, and an older `claude`

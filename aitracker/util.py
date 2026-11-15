@@ -136,6 +136,85 @@ def git_worktree_root(path):
         return "", ""
 
 
+def _lenient_real(p):
+    """realpath of the longest EXISTING prefix of `p` plus the missing remainder, so a deleted
+    path under a symlinked tmp root still compares equal to its realpath'd siblings."""
+    p = os.path.normpath(p)
+    rest = []
+    while p and not os.path.lexists(p):
+        up = os.path.dirname(p)
+        if up == p:
+            break
+        rest.append(os.path.basename(p))
+        p = up
+    return os.path.join(os.path.realpath(p), *reversed(rest))
+
+
+def _admin_entries(root):
+    """[(admin_dir G, worktree dir X)] for every `<root>/.git/worktrees/*/gitdir` whose content
+    is `<X>/.git` (relative content resolved against G). Matched by CONTENT, never by basename:
+    git appends digits on a name collision (`api`, `api1`). Pure reads, never raises."""
+    out = []
+    try:
+        wdir = os.path.join(root, ".git", "worktrees")
+        for name in sorted(os.listdir(wdir)):
+            g = os.path.join(wdir, name)
+            try:
+                with open(os.path.join(g, "gitdir"), encoding="utf-8") as fh:
+                    t = os.path.normpath(os.path.join(g, fh.read().strip()))
+            except OSError:
+                continue
+            if os.path.basename(t) == ".git":
+                out.append((g, _lenient_real(os.path.dirname(t))))
+    except OSError:
+        pass
+    return out
+
+
+def _admin_dir_for(root, path):
+    """The admin dir `<root>/.git/worktrees/<n>` registered for worktree `path`, found by the
+    `gitdir` file's content (review D2), or ""."""
+    want = _lenient_real(path)
+    for g, x in _admin_entries(root):
+        if x == want:
+            return g
+    return ""
+
+
+def deleted_worktree_root(raw):
+    """The main-checkout root when `raw` is a MISSING path that was a linked worktree, else "".
+    T = first ancestor of the nearest existing ancestor (inclusive) that has a `.git` entry; it
+    must be a directory (a `.git` file is a linked worktree/submodule: not a deleted-worktree
+    home). Root when (a) a surviving admin entry names `raw` or an ancestor of it, or (b) `raw`
+    lies under `T/.claude/worktrees/`. Pure file reads, never raises."""
+    try:
+        if not raw or os.path.lexists(raw):
+            return ""
+        t = os.path.dirname(os.path.normpath(raw))
+        while t and not os.path.isdir(t):
+            up = os.path.dirname(t)
+            if up == t:
+                return ""
+            t = up
+        t = os.path.realpath(t)
+        while not os.path.lexists(os.path.join(t, ".git")):
+            up = os.path.dirname(t)
+            if up == t:
+                return ""
+            t = up
+        if not os.path.isdir(os.path.join(t, ".git")):
+            return ""
+        want = _lenient_real(raw)
+        for _g, x in _admin_entries(t):
+            if want == x or want.startswith(x.rstrip(os.sep) + os.sep):
+                return t
+        if want.startswith(os.path.join(t, ".claude", "worktrees") + os.sep):
+            return t
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
 def _iso_epoch(s):
     try:
         import datetime as _dt

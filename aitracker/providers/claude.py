@@ -2346,6 +2346,10 @@ class ClaudeProvider(Provider):
     def search(self, q):
         return search_sessions(q)
 
+    def term_home(self, sid, meta=None):
+        from .. import term_gate          # late: term_gate imports registry lazily
+        return term_gate.recorded_run_dir(sid, meta)
+
     def exists(self, sid):
         # cheap: just the file lookup, not a full parse
         return find_session(sid) is not None

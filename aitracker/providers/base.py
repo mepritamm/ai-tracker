@@ -19,6 +19,9 @@ class Provider:
     def search(self, q):     # -> [search result dicts] (optional)
         return []
 
+    def term_home(self, sid, meta=None):  # -> (raw run dir, branch) the terminal should resume in; ("", "") = none recorded
+        return "", ""
+
     def exists(self, sid):   # does this session actually exist?
         # registry.drill() calls this BEFORE any drill-down method, so a bogus id
         # 404s instead of reaching the empty defaults below. The default here is

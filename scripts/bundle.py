@@ -66,6 +66,15 @@ def main():
     parts = [HEADER % version]
     for rel in ORDER:
         body = strip_module(open(os.path.join(PKG, rel)).read())
+        if rel == "providers/claude.py":
+            # term_home reaches the terminal tier (term_gate), which is not bundled (see the
+            # server.py note below): the standalone build has no terminal, so no terminal home.
+            new = body.replace(
+                "        from .. import term_gate          # late: term_gate imports registry lazily\n"
+                "        return term_gate.recorded_run_dir(sid, meta)",
+                '        return ("", "")                    # bundle: no terminal tier')
+            assert new != body, "claude.py term_home text changed upstream; update bundle.py"
+            body = new
         if rel == "server.py":
             body = body.replace("build_page()", "PAGE")           # inline page
             # The terminal-tier loader below relies on `__import__("%s.%s" % (__package__, _m))`
