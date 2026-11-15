@@ -1748,6 +1748,41 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("Usage:", r.stdout)
 
+    def test_bundle_has_one_status_def_and_no_name_collisions(self):
+        # schedule.py/pending.py are flattened into the same namespace as tunnel.py (`status`, `_lock`):
+        # a second top-level def/assignment of one name silently shadows the first.
+        src = open(self.dist).read()
+        self.assertEqual(len(re.findall(r"^def status\(", src, re.M)), 1)
+        names = {}
+        for n in ast.parse(src).body:
+            for nm in ([n.name] if isinstance(n, (ast.FunctionDef, ast.ClassDef)) else
+                       [t.id for t in n.targets if isinstance(t, ast.Name)] if isinstance(n, ast.Assign) else []):
+                names[nm] = names.get(nm, 0) + 1
+        for nm in ("sched_install", "sched_status", "sched_uninstall", "cli_main", "tick", "clean", "_pending_lock", "_lock"):
+            self.assertEqual(names.get(nm), 1, nm)
+
+    def test_bundle_pending_cli_runs_with_temp_home(self):
+        """`--pending --dry-run` and `--pending --scheduler-status` exit 0 from the bundle. HOME is a temp dir, the
+        interval is off, and the bundle is copied to a tempdir so pending.json never lands in dist/. SCRATCH_ROOT
+        (not HOME-derived) is blanked through the bundle's own globals so the real /tmp/claude-<uid> is never walked."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        home = os.path.join(tmp, "home")
+        os.makedirs(home)
+        script = os.path.join(tmp, "tracker.py")
+        shutil.copy(self.dist, script)
+        driver = ("import runpy,sys; ns = runpy.run_path(%r, run_name='bundle_pending'); "
+                  "ns['cli_main'].__globals__['SCRATCH_ROOT'] = None; sys.argv = [%r] + sys.argv[1:]; ns['main']()" % (script, script))
+        env = dict(os.environ, HOME=home, USERPROFILE=home, TRACKER_PENDING_INTERVAL="off")
+        env.pop("TRACKER_AUTH", None)
+        for args, needle in ((("--pending", "--dry-run"), "pending-work [dry-run]"),
+                             (("--pending", "--scheduler-status"), '"installed"'),
+                             (("--pending", "--if-due"), "off")):
+            r = subprocess.run([sys.executable, "-c", driver, *args], capture_output=True, text=True, timeout=60, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn(needle, r.stdout)
+        self.assertEqual(os.listdir(os.path.join(home)), [".ai-tracker-pending.lock"])   # nothing else written under HOME
+
     def test_bundle_selfcheck_runs_without_crashing(self):
         # Neutered to a one-line print by bundle.py (see the class docstring) -- not the full
         # suite, so it's cheap enough to run here rather than only via `make bundle` by hand.

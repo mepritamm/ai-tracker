@@ -316,18 +316,23 @@
   // same POST /api/term/pty route ext_vt.js's openVT() already uses for the "…here" pair, just
   // keyed by `cwd` instead of `session` (Tier 2's addition; may 404/400 in a worktree where it
   // hasn't landed yet -- handled below, not left to fail silently or hang).
-  function pickDirectory(raw, mode) {
+  function pickDirectory(raw, mode, prompt) {
     var path = (raw == null ? "" : String(raw)).trim();
     // A leading "~" is left exactly as typed -- this file never invents a home directory of its
     // own (conventions rule 5: never invent data the server should supply). The server expands
     // it the same way every other path in this codebase is expanded (os.path.expanduser, see
     // config.py's PROJECTS/AUGMENT_DIR/TASKS_DIR); trimming is the only normalisation done here.
-    if (!path) { showPickerError("choose or type a directory first"); return; }
+    if (!path) {
+      showPickerError("choose or type a directory first");
+      return Promise.resolve({ ok: false, error: "choose or type a directory first" });
+    }
     showPickerBusy();
-    fetch("/api/term/pty", {
+    var body = { cwd: path, cols: 100, rows: 30, mode: mode };
+    if (prompt) body.prompt = prompt;   // optional first prompt for a `new` session (ExtLaunch.openAt)
+    return fetch("/api/term/pty", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: path, cols: 100, rows: 30, mode: mode }),
+      body: JSON.stringify(body),
     })
       .then(function (r) {
         return r.json().catch(function () { return {}; })
@@ -336,12 +341,12 @@
       .then(function (res) {
         if (res.j && res.j.tty && window.ExtVT && window.ExtVT.bindTty) window.ExtVT.bindTty(res.j.tty, "");   // session-less shell
         if (!res.ok || !res.j || !res.j.tty) {
-          showPickerError(
-            (res.j && res.j.error) ||
+          var emsg = (res.j && res.j.error) ||
             (res.status === 404 ? "opening a terminal at a chosen directory isn't available on this server yet" :
               res.status === 403 ? "in-browser terminal is disabled — set TRACKER_TERMINAL=1 and TRACKER_AUTH" :
-                "failed to open a terminal there"));
-          return;
+                "failed to open a terminal there");
+          showPickerError(emsg);
+          return { ok: false, error: emsg };
         }
         closePicker();
         toast(mode === "new" ? "Starting a new Claude session" : "Terminal opened", path);
@@ -361,11 +366,18 @@
           (res.j.notice ? "&notice=" + encodeURIComponent(res.j.notice) : "");
         var w = window.open(url, "_blank");
         if (!w) alert("Popup blocked — allow popups for this page to open a new tab.");
+        return { ok: true };
       })
       .catch(function (e) {
-        showPickerError("failed to reach the server: " + e);
+        var cmsg = "failed to reach the server: " + e;
+        showPickerError(cmsg);
+        return { ok: false, error: cmsg };
       });
   }
+
+  // The single Resume path (pending-work modal, both views): open a session-less terminal at a
+  // cwd, optionally with a first prompt. Resolves {ok, error}; never rejects.
+  window.ExtLaunch = { openAt: function (p, m, pr) { return pickDirectory(p, m, pr); } };
 
   buildSideControls();
 

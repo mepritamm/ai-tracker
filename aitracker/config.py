@@ -1,4 +1,5 @@
 import os
+import re
 
 
 PROJECTS = os.path.expanduser("~/.claude/projects")
@@ -11,6 +12,14 @@ FLAGS_FILE = os.path.join(_HERE, "flags.json")
 
 
 TITLES_FILE = os.path.join(_HERE, "titles.json")
+
+
+# Pending-work worker (aitracker/pending.py): report, audit log, per-user lock, scratch root.
+PENDING_FILE = os.path.join(_HERE, "pending.json")
+PENDING_LOG = os.path.join(_HERE, "pending.log")
+# HOME-derived (not gettempdir(), which differs under launchd) so every caller agrees.
+PENDING_LOCK = os.path.join(os.path.expanduser("~"), ".ai-tracker-pending.lock")
+SCRATCH_ROOT = "/tmp/claude-%d" % os.getuid() if hasattr(os, "getuid") else None
 
 
 # {session_id: title} -- the title (already truncated to 120 chars, exactly what was
@@ -206,7 +215,8 @@ CONFIG_FILE = os.path.join(_HERE, "config.json")
 # TRACKER_AUTH is deliberately not a member.
 EDITABLE = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL",
             "TERM_APP", "TERM_ALLOW", "PORT", "HOST", "ICON_STYLE", "ICON_SCALE",
-            "TERM_IDLE_TTL_MIN", "SNAPSHOT_TTL_MIN", "GATEWAY", "OPENROUTER_LAUNCHER", "OPENROUTER_SLOTS_FILE", "HEADER_LINE")
+            "TERM_IDLE_TTL_MIN", "SNAPSHOT_TTL_MIN", "GATEWAY", "OPENROUTER_LAUNCHER", "OPENROUTER_SLOTS_FILE", "HEADER_LINE",
+            "PENDING_INTERVAL", "PENDING_CLEAN")
 
 # Keys that only bind at process startup -- the dialog labels these "takes effect on
 # restart" and never claims a live apply for them.
@@ -239,6 +249,36 @@ def _v_enum(choices):
     return fn
 
 
+_INTERVAL_RE = re.compile(r"^\s*(\d{1,3})\s*(d|w|mo|m)\s*$", re.I)   # m == mo == MONTH (30d), never minutes
+_UNIT_S = {"d": 86400, "w": 7 * 86400, "m": 30 * 86400, "mo": 30 * 86400}
+_INTERVAL_MAX = 366 * 86400
+
+
+def interval_seconds(s):
+    """"90d"->7776000, "2w"->1209600, "3m"/"3M"/"3mo"->7776000 (month = 30d); "off"/"0" and
+    anything invalid -> None. Range is not checked here (see _v_interval)."""
+    if not isinstance(s, str):
+        return None
+    m = _INTERVAL_RE.match(s)
+    if not m:
+        return None
+    return int(m.group(1)) * _UNIT_S[m.group(2).lower()]
+
+
+def _v_interval(v):
+    """str only (bool/int rejected). "off"/"0" -> (True, "off"); 1d <= secs <= 366d -> (True,
+    normalised "<n><unit>" lower-case); else (False, None)."""
+    if not isinstance(v, str):
+        return False, None
+    if v.strip().lower() in ("off", "0"):
+        return True, "off"
+    secs = interval_seconds(v)
+    if secs is None or not (86400 <= secs <= _INTERVAL_MAX):
+        return False, None
+    m = _INTERVAL_RE.match(v)
+    return True, "%d%s" % (int(m.group(1)), m.group(2).lower())
+
+
 def _v_str(max_len):
     def fn(v):
         return (True, v) if isinstance(v, str) and len(v) <= max_len else (False, None)
@@ -269,6 +309,8 @@ VALIDATORS = {
     # "a bit smaller" to "twice as big" without letting a typo shrink icons to nothing or
     # blow up the layout.
     "ICON_SCALE":    _v_int(75, 200),
+    "PENDING_INTERVAL": _v_interval,        # "90d" / "2w" / "3m" (m = month) / "off"; read per tick
+    "PENDING_CLEAN": _v_enum(("off", "dry-run", "safe")),
 }
 
 # The real env var name backing each key, where one exists (LIVE_WINDOW never had one).
@@ -282,6 +324,8 @@ _ENV_NAME = {
     "TERM_ALLOW": "TRACKER_TERM_ALLOW",
     "PORT": "PORT",
     "HOST": "HOST",
+    "PENDING_INTERVAL": "TRACKER_PENDING_INTERVAL",
+    "PENDING_CLEAN": "TRACKER_PENDING_CLEAN",
 }
 
 # TERM_APP/TERM_ALLOW's *real* env var, captured ONCE at this module's own first import --
@@ -442,6 +486,23 @@ def resolve_header_line(overrides):
     return v if v in ("summary", "narration") else "summary"
 
 
+def resolve_pending_interval(overrides):
+    """config.json > env TRACKER_PENDING_INTERVAL (through _v_interval) > "90d"."""
+    for raw in (overrides.get("PENDING_INTERVAL"), os.environ.get("TRACKER_PENDING_INTERVAL")):
+        ok, val = _v_interval(raw)
+        if ok:
+            return val
+    return "90d"
+
+
+def resolve_pending_clean(overrides):
+    """config.json > env TRACKER_PENDING_CLEAN > "dry-run" (invalid values fall through)."""
+    for raw in (overrides.get("PENDING_CLEAN"), os.environ.get("TRACKER_PENDING_CLEAN")):
+        if raw in ("off", "dry-run", "safe"):
+            return raw
+    return "dry-run"
+
+
 def resolve_gateway(overrides):
     """Which launcher a NEW Claude session uses: "anthropic" (`claude`) or "openrouter" (the
     configured OpenRouter launcher). Resumes follow the session's own recorded gateway
@@ -525,6 +586,8 @@ _RESOLVERS = {
     "HEADER_LINE": resolve_header_line,
     "OPENROUTER_LAUNCHER": resolve_openrouter_launcher,
     "OPENROUTER_SLOTS_FILE": resolve_openrouter_slots_file,
+    "PENDING_INTERVAL": resolve_pending_interval,
+    "PENDING_CLEAN": resolve_pending_clean,
 }
 
 # The seven keys that ALSO exist as a plain, freely-reassignable module attribute (see the
@@ -532,7 +595,7 @@ _RESOLVERS = {
 # attribute was reverted in favour of this).
 _PLAIN_ATTR_KEYS = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL",
                     "TERM_IDLE_TTL_MIN", "SNAPSHOT_TTL_MIN", "GATEWAY", "OPENROUTER_LAUNCHER",
-                    "OPENROUTER_SLOTS_FILE", "HEADER_LINE")
+                    "OPENROUTER_SLOTS_FILE", "HEADER_LINE", "PENDING_INTERVAL", "PENDING_CLEAN")
 
 # Seeded here from env/default ONLY (an explicit `{}`, never a file read) -- this module has
 # no filesystem access of its own (see the big comment above), so at its own import time
@@ -549,6 +612,8 @@ GATEWAY = resolve_gateway({})
 HEADER_LINE = resolve_header_line({})
 OPENROUTER_LAUNCHER = resolve_openrouter_launcher({})
 OPENROUTER_SLOTS_FILE = resolve_openrouter_slots_file({})
+PENDING_INTERVAL = resolve_pending_interval({})
+PENDING_CLEAN = resolve_pending_clean({})
 
 
 def apply_overrides(overrides):

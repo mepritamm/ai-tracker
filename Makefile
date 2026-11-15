@@ -1,10 +1,10 @@
 PORT ?= 8790
 TUNNEL_PORT ?= 8790
 JOBS ?= 4
-.PHONY: help serve stop tunnel check test hooks bundle
+.PHONY: help serve stop tunnel check test hooks bundle pending pending-install pending-uninstall
 
 help:
-	@echo "make serve | stop | tunnel | check | test | hooks | bundle   (PORT=$(PORT))"
+	@echo "make serve | stop | tunnel | check | test | hooks | bundle | pending | pending-install | pending-uninstall   (PORT=$(PORT))"
 
 serve:
 	@PORT=$(PORT) python3 -m aitracker
@@ -45,3 +45,13 @@ hooks:
 
 bundle:
 	@python3 scripts/bundle.py
+
+# pending-work scan: list leftovers now (mode from PENDING_CLEAN; default dry-run)
+pending:
+	@python3 -m aitracker --pending
+
+# install / remove the per-user OS job (launchd on macOS, Task Scheduler on Windows)
+pending-install:
+	@python3 -m aitracker --pending --install-scheduler
+pending-uninstall:
+	@python3 -m aitracker --pending --uninstall-scheduler

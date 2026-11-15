@@ -132,6 +132,19 @@ _NEWEST_MODELS_TTL = 60   # ponytail: recompute ceiling for newest_models() belo
 _newest_models_cache = {"at": 0.0, "val": {}}
 
 
+def all_cwds():
+    """Every working directory any available provider has seen: p.cwds() if defined, else the cwd of each listed row."""
+    out = set()
+    for p in PROVIDERS:
+        try:
+            if p.available():
+                fn = getattr(p, "cwds", None)
+                out |= set(fn()) if fn else {r["cwd"] for r in p.list() if r.get("cwd")}
+        except Exception:
+            pass  # one broken provider must not sink discovery
+    return out
+
+
 def newest_models():
     """{family: model_id} -- the single newest-VERSION real model id seen across every
     provider's session-list `model` field (opus/sonnet/haiku/fable). Feeds parse_any()'s

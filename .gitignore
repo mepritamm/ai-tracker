@@ -11,6 +11,8 @@ config.json
 port
 token
 drain.log
+pending.json
+pending.log
 .claude/launch.json
 .claude/skills/tracker-push/
 .claude/skills/tracker-add-contributor/

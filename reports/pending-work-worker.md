@@ -20,6 +20,8 @@ Follow-up: "If I want to implement this, how should I plan this"
 | C5 | Resume button opens a Claude session that uses the `cleanup` skill | not discharged | v3 plans it: worktree-cleanup then cleanup, through one shared Resume path (`ExtLaunch.openAt`). It depends on the step-0 proof (M3). |
 | C6 | Worker safely deletes stale pending items / tmp files for sessions not needed | not discharged | v3 deletes **only once the user picks Safe delete** (default List only). Squash-merged worktrees are removed with the branch kept. Needs the D4 and D5 rule-6 exceptions. |
 | C7 | Deterministic part = scripts in the app, runs without a Claude session; Claude only on demand | not discharged | v3.1 plans it: `pending.py` + CLI + server thread **and** an installed launchd/Task Scheduler job, both deduped by `tick()`; Claude runs only on Resume. The launchd run is proven only post-landing (step 17). The Windows CLI path is planned but untested, not discharged. |
+| C8 | First `make serve` auto-installs the scheduler job (R6) | not discharged | Plan addendum A, part A (steps A1–A2). |
+| C9 | In-app Update: a Settings section that runs git pull and restarts the dashboard (R6) | not discharged | Plan addendum A, part B (steps A3–A7). |
 
 ## (superseded) Technical plan (v1)
 
@@ -211,6 +213,19 @@ Assertions:
 | U6 | Views | **Both views** (Control Room board AND classic) | **yes** (v2: Control Room only) |
 | U7 | Squash-merges | **Call gh during the scan** | **yes** (v2: no network). Needs a second written exception in conventions.md (rule 6 "no outbound network") |
 | U8 | Default interval | "90 days / 3 months" | **yes** (v2: 7d). Note: v2 has grace = max(interval, 7d); with 90d that makes deletion grace 90d — planner to decouple or justify |
+
+## User decisions, round 2 (2026-11-15)
+
+| # | Question | User's answer |
+|---|---|---|
+| R1 | Sign-off on v3.1 | "Approved, continue". |
+| R2 | Code written before sign-off | Keep it; all of it goes through the opus implementation review. |
+| R3 | Gap skill | `/tracker-gap` for all remaining changes; written code covered by the implementation review. |
+| R4 | Landing | Push the branch AND land on main via `/tracker-push` once the gate is green. |
+| R5 | Windows | Ship untested, labelled in README. |
+| R6 | launchd on this Mac | (verbatim) "2 and make serve on the first time, should always generate the launchd job when running for the first time also, have a separate update section right into the app from the config, which runs git pull and runs the dashboard is important such that someone doesnt have to refresh the dashboard everytime from the cli by stopping the current session and starting it again" — i.e. install and prove the job on this Mac; first `make serve` auto-installs it; plus a new in-app Update feature. |
+| R7 | Real scan | One list-only run on the real machine, with gh, allowed. |
+| R8 | OpenRouter | Resume always shows a Copy-prompt button as fallback. |
 
 ## (superseded) Technical plan (v2)
 
@@ -1132,6 +1147,375 @@ Node UI tests are listed in steps 12–14.
 - **The OpenRouter launcher** must forward `"$@"` for the Resume prompt to arrive; otherwise use Copy prompt.
 - **The cleanup skill's live-session scratch rules** remain unreconciled (flagged in v2).
 
+## Plan addendum A.1 (to v3.1)
+
+Author: opus plan leg, 2026-11-15. This covers R6's two new requirements: C8 (auto-install the scheduler on first serve) and C9 (in-app Update). It also checks R8. **A.1 amends A in place** with review D's accepted deltas, as reconciled in "## Reconciliation of review D". [D-Fn] marks the origin of each change.
+
+Every symbol below was grepped in this worktree. That includes the implementers' in-progress `aitracker/schedule.py`: `_root` :15, `_is_linked_worktree` :64, `sched_install` :80, `sched_uninstall` :118, `sched_status` :130. It also includes `aitracker/pending.py`, where `_RUNNING` is at :31. **(new)** marks anything that does not exist yet. Plan v3.1 stays in force; this only adds to it.
+
+### What already exists (searched first)
+- **No self-update, restart, re-exec or version-check code exists.**
+  - grep for `os.execv` / `git pull` / `/api/update` / `restart` finds only `os.execvp` for PTY children (`term_run.py:384`, `term_vt.py:1672`) and "takes effect on restart" UI copy (`ext_cr_dialogs.js:912–921`).
+  - `__version__ = "1.1.0"` is at `aitracker/__init__.py:1` and is printed by `cli.py:34`.
+- **Building blocks to reuse:**
+  - `server._on_sigterm` (:894): its logic is `tunnel.stop(keep_on=True)` then `SystemExit`, so `TUNNEL_ON` survives.
+  - `tunnel.autostart(actual, host)` in `run()` (:921) brings a kept tunnel back.
+  - `publish_endpoint(actual)` (:861) rewrites `config.PORT_FILE` (:67) and the token on every start.
+  - `bind()` (:848) falls through to the next port if this one is busy.
+  - `run(host, port, open_browser=True)` (:911), and `cli.main()` calls `run(host=host, port=port)`.
+  - `_local_caller(handler)` (:219) returns `(ok, err)`.
+  - The cross-origin check is `term_gate._origin_ok` (:47). server.py reaches term_gate only through `sys.modules.get("aitracker.term_gate")` (:123), because term_* are optional and absent from the bundle.
+  - `_term_count()` (:94) gives the live in-browser terminal count.
+  - `Handler.do_POST` already refuses read-only callers before parsing the body (:558).
+  - The page is `no-store`, and `build_page()` re-reads `web/*` from disk on **every** `/` request (`page.py:11–24`, `server.py:371`). So the page is not baked at startup: a reload after a fast-forward serves new web files even from old Python [D-F4].
+  - `pending._pending_lock()` (pending.py:98) is a per-user, non-blocking context manager. It is held across a scan or clean.
+  - `term_vt._live_count()` (:1821) and `term_run._live_count()` (:422) count live terminals. `_term_count()` counts only `term_vt` and feeds the badge.
+- **`make serve` does NOT free the port** (`Makefile:9–10`, `serve: @PORT=$(PORT) python3 -m aitracker`; commit 4165837 removed `serve: stop`). `CLAUDE.md:22`'s "frees the port first" is stale and is corrected in A4 [D-F13]. A restart relies on the old socket being closed at exec. Review D's probe confirmed this: the socket is non-inheritable and rebinds fine.
+- **Settings surface.**
+  - The only Settings UI is the Control Room dialog, `ext_cr_dialogs.js`, with sections `['Interface','Board','Terminal','Notifications','Server','Tunnel','Data files']` (:1143) and the Server tab at :1393.
+  - The classic view has **no settings surface**. app.js:128 only reads `/api/config` for icon style. So C9's UI lives in the Control Room Server tab only; see decision AD4.
+- **R8 is already in v3.1.** Section 6 prepends **Resume** *and* **Copy prompt** to every item. A1 makes it explicit that Copy prompt is unconditional.
+- **`pty.fork()` masters are INHERITABLE** (`term_vt.py:1656`, `term_run.py:361`). Review D measured `inheritable: True` on Python 3.12.3, macOS, and no cloexec exists anywhere. A bare `execv` would therefore keep every terminal's master open in the new image, orphaning the Claude children [D-F1].
+
+### Part A — auto-install the scheduler job on first serve (C8)
+
+**Hook.** In `server.run()`, right after `start_worker()` (v3.1 §2), add `threading.Thread(target=autoinstall_once, daemon=True).start()`. It runs on a thread so a slow `launchctl` never delays `serve_forever()`. Hooking `run()` rather than the Makefile covers `make serve`, `python -m aitracker` and the uv `ai-tracker` command alike. The Makefile is unchanged.
+
+**New functions in `aitracker/schedule.py`:**
+```python
+def _optout_path() -> str          # late-bound: os.path.join(os.path.expanduser("~"), ".ai-tracker-scheduler-optout")
+def _under_test() -> bool          # return "unittest" in sys.modules -- patchable belt     [D-F8]
+def autoinstall_once(run=subprocess.run) -> str
+    # returns "skipped:<why>" | "installed" | "failed" -- for tests and the one log line
+```
+**State = only an explicit opt-out** [D-F9]. The opt-out is a per-user, HOME-derived file whose mere presence means "opted out". There is no "done once" marker, no adopt step and no retry bookkeeping.
+- `sched_uninstall()` gains one line: create the opt-out file.
+- `sched_install()` gains one line: remove it.
+
+Both are called by `--uninstall-scheduler` / `--install-scheduler` (`make pending-uninstall` / `make pending-install`).
+
+`autoinstall_once` checks these in order and returns at the first one that applies:
+1. `sys.platform not in ("darwin", "win32")` → `skipped:platform`.
+2. A test or a disabled run → `skipped:test`. That is any of:
+   - `_under_test()`;
+   - `os.environ.get("TRACKER_SCHEDULER_AUTOINSTALL") == "0"`;
+   - `config.interval_seconds(config.PENDING_INTERVAL) is None`.
+
+   Every test that calls `run()` also sets `TRACKER_PENDING_INTERVAL=off` (v3.1 §8). `--selfcheck` never calls `run()` (cli.py :39). Tests of the later guards patch `_under_test` to False [D-F8].
+3. Not a package checkout: `not os.path.isfile(os.path.join(config._HERE, "__init__.py"))`, which is the flattened bundle → `skipped:bundle`.
+4. `_is_linked_worktree()` (schedule.py:64) → `skipped:worktree`. This is the plist-pins-a-deletable-path case review C flagged. `sched_install` also refuses it (:86), but checking first keeps the log quiet.
+5. `realpath(_root())` is under the realpath of any of `tempfile.gettempdir()`, `/tmp` or `/var/folders` → `skipped:temp` [D-F10]. On macOS `/tmp` is `/private/tmp`.
+6. The opt-out file exists → `skipped:optout`.
+7. `st = sched_status(run)`. If `st["installed"] and st["root_exists"]` → `skipped:present`.
+8. Otherwise `rc = sched_install(run)`. This covers both cases:
+   - **not installed**, including a hand-deleted plist: the job is regenerated;
+   - **installed but its root is gone** (moved checkout): `sched_install` already prints "replacing job that pointed at <old>" (:97–98) and **repoints the job to the checkout actually being served**.
+
+   rc 0 → `installed`. Otherwise `_log` one line and return `failed`. There is no state to write, so the next serve simply tries again.
+
+Any exception is caught, logged as one line, and returns `failed`. **The server always starts**: the call runs on a daemon thread and is fully wrapped.
+
+A second `make serve` on the next free port (F13) also calls this. That is harmless and idempotent: it hits `skipped:present`. A spare-port server started from a linked worktree hits `skipped:worktree`.
+
+**There is no Settings scheduler line, no Reinstall button and no `/api/update/scheduler` route** [D-F9]. `make pending-install` / `--scheduler-status` remain the manual tools. The resulting behaviour goes to the user as one decision, AD1.
+
+**Risky spot.** A plist pinned to a path that later vanishes. It is mitigated by guards 3–5 and `sched_install`'s own refusal, and it **self-heals**: the next serve from a live checkout repoints the job. The fallback: the server thread keeps scanning regardless (v3.1 C-B1), so a dead OS job costs only redundancy.
+
+### Part B — in-app Update (C9)
+
+**What Update means.** A fast-forward of the running checkout to its branch's upstream, followed by an in-place restart of the dashboard process. There are no channels, no timer and no version pinning.
+
+**New module `aitracker/update.py`.** It uses named top-level imports for the bundle: `from . import config, __version__`, `from .store import _load_json, _save_json`. It also has `from .pending import _pending_lock` and `from . import tunnel`; `tunnel.` is already rewritten by the bundler. Stdlib: `os, sys, subprocess, signal, json, tarfile, tempfile, threading, time, io`. All function names are unique in the flattened bundle (`status` already exists in tunnel.py).
+```python
+FETCH_TIMEOUT = 60        # s, git fetch
+PREFLIGHT_TIMEOUT = 90    # s, import + startup smoke test of the fetched tree
+_APPLY = threading.Lock() # single-flight apply                                                   [D-F2]
+_RESTART_ERROR = None     # str set when exec fails; surfaced in update_status()                  [D-F4]
+_STARTED_AT = time.time() # module import = process start
+def update_kind() -> str            # "git" | "bundle" | "package"
+def update_status() -> dict         # no network
+def update_fetch() -> dict          # git fetch of the upstream's remote only; then update_status()
+def update_apply(confirm_terminals=False) -> (int, dict)   # HTTP code + body; never raises
+def restart_in_place(port, held) -> None   # flush, recovery line, _cloexec_all, os.execv; on OSError restore
+def _term_live() -> int             # term_vt._live_count() + term_run._live_count(), each via sys.modules.get(...),
+                                    # 0 when absent; _term_count() (badge) is unchanged                [D-F1]
+def _cloexec_all() -> None          # every fd >= 3 (os.listdir("/dev/fd"), fallback range(3, SC_OPEN_MAX))
+                                    # -> os.set_inheritable(fd, False), OSError ignored              [D-F1]
+def _g(*args, timeout=10) -> (rc, out)
+    # Popen(["git", "-C", root, *args], start_new_session=True (no controlling tty -> ssh can't read /dev/tty),
+    #       stdin=DEVNULL, stdout=PIPE, stderr=PIPE, env + GIT_TERMINAL_PROMPT=0, GIT_OPTIONAL_LOCKS=0)
+    # communicate(timeout); on TimeoutExpired: os.killpg(p.pid, SIGKILL) (pattern of tunnel.py:211/264) -> (None, "timeout")  [D-F5]
+```
+
+**`update_kind`.**
+- `bundle` when `config._HERE` has no `__init__.py`.
+- `git` when `_g("rev-parse", "--show-toplevel")` equals `realpath(dirname(config._HERE))`.
+- Otherwise `package` (uv install).
+
+**`update_status()` schema.** It is the body of `GET /api/update`:
+```json
+{"kind": "git", "version": "1.1.0", "root": "...", "branch": "main", "detached": false,
+ "upstream": "personal/main", "head": "<sha>", "head_subject": "...", "behind": 3, "ahead": 0,
+ "dirty": ["M aitracker/x.py"], "fetched_at": 1763200000, "started_at": 1763190000,
+ "can_update": true, "reason": null, "terminals": 0, "pending_running": false, "restart_error": null}
+```
+How each field is computed:
+- `behind` and `ahead` come from `rev-list --left-right --count @{u}...HEAD` against the **last fetch**.
+- `fetched_at` is the mtime of `<git-dir>/FETCH_HEAD`.
+- `dirty` comes from `status --porcelain --untracked-files=no`, first 10 entries. Untracked and ignored files (`config.json`, `flags.json`) do not block a fast-forward.
+- `started_at` is `_STARTED_AT`.
+- `terminals` is `_term_live()`.
+- `pending_running` (`pending._RUNNING.is_set()`) is **display only**. The real guard is the lock in apply step 0 [D-F2].
+- `restart_error` is `_RESTART_ERROR` [D-F4].
+- `can_update` and `reason` are server-owned; the JS shows `reason` verbatim. The first failing check wins:
+  1. `kind != git`;
+  2. `detached`;
+  3. no upstream ("set one with `git branch -u`");
+  4. `dirty` ("commit or discard local edits first");
+  5. `ahead > 0 and behind > 0` ("local commits — not fast-forwardable");
+  6. `behind == 0` ("up to date").
+
+**For `bundle` and `package`,** `can_update` is false. The reason says:
+- bundle: "Standalone build — regenerate with `make bundle` from a clone";
+- package: "Installed package (version X) — reinstall it with uv to update".
+
+The section shows only the version line and that reason, with no buttons.
+
+**`update_fetch()`** runs `_g("fetch", "--quiet", "--no-tags", <remote>, <branch-of-upstream>, timeout=FETCH_TIMEOUT)`. `<remote>` comes from `git config branch.<b>.remote`, which is `personal` for this repo's `main`, and the branch from `@{u}`. Both are **read from git config, never from the request**. It returns a fresh `update_status()`.
+
+**`update_apply(confirm_terminals)`** runs these steps in order. Any failure releases what step 0 took, returns `(409, {error})` and changes nothing:
+0. **Single-flight and scan exclusion** [D-F2]:
+   - `_APPLY.acquire(blocking=False)`. If busy → `409 "update already in progress"`.
+   - Then `cm = _pending_lock(); got = cm.__enter__()`. If `got` is false → `409 "scan in progress"`.
+   - On success both stay **held until exec**. The flock fd is opened by `open()`, so it is non-inheritable and released at exec, and `_cloexec_all` covers it too. A scan or clean can therefore never start between the check and the exec, and two applies can't both get 202.
+1. `update_fetch()`. Then `can_update` must be true.
+2. **Resolve the target once** [D-F3]: `target = _g("rev-parse", "@{u}")`. Every later step uses `target`, never `@{u}`. `old = _g("rev-parse", "HEAD")`.
+3. **Terminal check** [D-F1]. `pty.fork` masters are inheritable (measured), so `_cloexec_all()` runs before `execv`. The kernel then closes every master at exec, and the terminals' children get SIGHUP. Their conversations remain resumable from disk, and the SIGHUP'd children are reaped zombies under the new image (harmless) [D-F15]. If `_term_live()` > 0 and not `confirm_terminals`, return `(409, {"error": "N open terminals will close", "needs_confirm": true})`.
+4. **Pre-flight, which is the rollback guard** [D-F7]. It tests `target` before touching the checkout:
+   - run `git archive --format=tar <target>`;
+   - extract it into a `tempfile.mkdtemp()` with stdlib `tarfile`, rejecting members with absolute paths or `..`;
+   - run, with `env TRACKER_PENDING_INTERVAL=off TRACKER_SCHEDULER_AUTOINSTALL=0` and `timeout=PREFLIGHT_TIMEOUT`:
+     `[sys.executable, "-I", "-c", "import sys, json; sys.path.insert(0, sys.argv[1]); import aitracker.server, aitracker.cli; from aitracker import config, page; config.apply_overrides(json.load(open(sys.argv[2])) if sys.argv[2] else {}); page.build_page(); print(aitracker.__version__)", tmp, <config.CONFIG_FILE if it exists else "">]`
+     This covers the import, the user's **real** `config.json` through the new validators, and building the page from the new `web/*`, which is what `run()` and `/` do before serving;
+   - rc ≠ 0 → `409` with the last 20 stderr lines, and the checkout is untouched;
+   - always `rmtree` the temp dir.
+5. `_g("merge", "--ff-only", target)`. This is the only write. There is **never** `stash`, `reset`, `checkout`, `--force` or `pull --rebase`. A refusal → `409` with git's message.
+6. Return `(202, {"restarting": true, "from": old, "to": target, "recover": "<recovery line>"})`. The route then starts `restart_in_place(port, held)` on a thread after `0.5s`, so the response is flushed first. There is no `update.json` and no `TRACKER_RESTARTED` [D-F12].
+
+The **recovery line** is: "If the dashboard does not come back: `git -C <root> checkout --detach <old>` then `make serve` (you were on `<branch>` at `<old>`)."
+
+**`restart_in_place(port, held)`** [D-F4]:
+1. `tunnel.stop(keep_on=True)`, the same call `_on_sigterm` makes. `TUNNEL_ON` survives, and the new process's `run()` → `tunnel.autostart` brings it back. A quick tunnel gets a **new** trycloudflare URL, which remote viewers must re-open. This is acceptable: tunnel callers can't trigger an update.
+2. Set `os.environ["PORT"] = str(port)` and `os.environ["TRACKER_NO_BROWSER"] = "1"`.
+3. `argv = getattr(sys, "orig_argv", None)` (3.10+; `pyproject.toml` says ≥3.8), falling back to `[sys.executable, "-m", "aitracker", *sys.argv[1:]]`.
+4. `sys.stdout.flush(); sys.stderr.flush(); print(recovery_line, flush=True)`. The recovery line lands in the `make serve` terminal, which survives a broken page [D-F7].
+5. `_cloexec_all()`, then `os.execv(sys.executable, argv)`. Exec replaces the image and keeps the PID and cwd. The listening socket is non-inheritable, so it closes at exec. `HTTPServer.allow_reuse_address` is on, so the new `bind()` takes the same port (probe-confirmed).
+6. **`except OSError as e`** (a moved `sys.executable`, ENOEXEC):
+   - `tunnel.autostart(port, config.BIND_HOST)`;
+   - `_RESTART_ERROR = str(e)`;
+   - release `held` (`cm.__exit__`, `_APPLY.release()`).
+
+   The server keeps serving. Note: from that point it is **old Python with new `web/*`**, because `build_page` re-reads from disk. The page shows `restart_error` at once and asks for a manual `make stop && make serve`.
+
+**`cli.main()` change.** `run(host=host, port=port, open_browser=os.environ.get("TRACKER_NO_BROWSER") != "1")`, so a restart doesn't open a new browser tab.
+
+**If the new process fails to start anyway** (pre-flight passed, but bind or runtime fails), the dashboard is down.
+- The open page's reconnect loop times out after 60s and shows the `recover` line from the 202 body it already holds.
+- The same line was printed to the `make serve` terminal, and README repeats the command.
+- No automatic rollback is built. A rollback would need `checkout`/`reset`, which D6 forbids. The import + config + page-build pre-flight covers the common failures. This is AD3.
+
+**Routes** (server.py, explicit branches like `/api/pending`):
+- `GET /api/update` → `update_status()`. Not added to `_RO_GET_ALLOW` (:248), so tunnel read-only viewers get 403.
+- `POST /api/update/fetch` → `update_fetch()`.
+- `POST /api/update/apply`, with a body of `{"confirm_terminals": bool}` only; any other key is ignored. It calls `update_apply(confirm_terminals=body.get("confirm_terminals") is True)`.
+- There is **no** `/api/update/scheduler` route [D-F9].
+- **(F11)** `/api/list` gains `headers["X-Server-Started"] = str(_STARTED_AT)` next to `X-Server-Now` (:398). The page reloads when the value changes, so every open tab picks up a restart, not just the tab that pressed Update [D-F11].
+
+**Security** [D-F6]. Both POSTs go through **(new)** `_update_gate(handler)` in server.py, which returns `(ok, err)`:
+```python
+ok, err = _local_caller(h)                                    # peer loopback + no proxy headers (:219-229)
+host = urlparse("//" + h.headers.get("Host", "")).hostname
+tg = sys.modules.get("aitracker.term_gate")
+ok = ok and host in ("localhost", "127.0.0.1", "::1") and tg is not None and tg._origin_ok(h)
+```
+- The **loopback Host check** blocks DNS rebinding: an `evil.example` page that rebinds to 127.0.0.1 still sends `Host: evil.example`.
+- It **fails closed** when `term_gate` is absent, as in the bundle.
+- `do_POST` already denies read-only callers before body parsing (:558).
+- There is no shell (`subprocess` argv lists only), and the request supplies no argument: remote, branch and sha all come from git config and the once-resolved `target`.
+- The same DNS-rebinding gap on the existing `/api/term/*` routes predates this work. It is recorded under Not grounded / gaps and put to the user as AD6. It is **not** fixed in this plan.
+
+**Page side** (`aitracker/web/ext_cr_dialogs.js`, Server tab, :1393), a **(new)** "Update" block:
+- **Status line**, from `GET /api/update` on open: "`<branch>` @ `<short head>` — `<head_subject>`. N behind `<upstream>` as of `<fetched_at age>`." Plus `dirty` files, or the `reason`.
+- **Check for updates** button → `POST /api/update/fetch` → re-render.
+- **Update and restart** button, enabled only when `can_update`. It posts apply, and on 409 `needs_confirm` it shows a confirm ("N open terminals will close") and re-posts with `confirm_terminals: true`. On 202 it shows "Restarting…" and polls `GET /api/update` every 1s:
+  - when `started_at` changes, it calls `location.reload()` (the page is `no-store` and built from disk);
+  - when `restart_error` is non-null, it shows it at once;
+  - after 60s it shows the `recover` line.
+- There is no scheduler line and no Reinstall button [D-F9].
+- **Read-only:** the block is hidden when `ctx.readOnly()` (ext_cr_boot.js :439). The server's 403 is the real gate.
+
+**Network (rule 6).** `git fetch` is outbound network, so it needs a **third** written exception, D6, in `.claude/rules/conventions.md`. This is review D's narrower wording, verbatim:
+> *"Exception (in-app Update, user-requested R6): `aitracker/update.py` may run `git fetch --quiet --no-tags <remote> <branch>` for the running checkout's own upstream, only when a local caller (loopback peer, loopback Host name, same Origin, not tunnelled, not read-only) presses Check for updates or Update and restart. Remote and branch come from git config, never from the request. The fetch runs with no controlling terminal and a timeout that kills its process group. There is no scheduled or automatic fetch. The only write is `git merge --ff-only <sha>`, where `<sha>` is the commit fetched and import/startup pre-flighted in that same request. It never stashes, resets, checks out, forces or rebases. No other outbound network call is allowed."*
+
+### Sequencing — steps A1.. (each: files + test; ∥ = file-disjoint, can run in parallel)
+Each step says which remaining v3.1 steps (11–15) it must come after. "Free" means it touches none of the v3.1 step 11–15 files (`server.py`, `app.js`, `index.html`, `app.css`, `ext_cr_*`, `store.py`).
+
+**Wave A-1 (all ∥ with each other, and with v3.1 steps 11–15 unless noted)**
+- **A2 ∥ — Auto-install** [D-F8, F9, F10].
+  - Files: `aitracker/schedule.py` (`_optout_path`, `_under_test`, `autoinstall_once`; one line each in `sched_uninstall` (create the opt-out) and `sched_install` (remove it)).
+  - After: v3.1 step 3 (done). **Free** of 11–15.
+  - Test: `tests/test_scheduler_autoinstall.py` (new), with HOME patched to a temp dir, `run` injected, and `_under_test` patched False except in the test-guard case. It covers:
+    - each skip in order: platform; test/env/off; bundle; linked worktree; temp root, including `/tmp/fake`; opt-out present; installed with root present (only the status call made);
+    - not installed → install;
+    - installed with `root_exists` False → install (repoint);
+    - install rc 1 → `failed` with no state written;
+    - an exception → `failed`;
+    - `sched_uninstall` creates the opt-out and `sched_install` removes it;
+    - the real `~/Library/LaunchAgents` listing is unchanged.
+- **A3a ∥ — Update core: status, fetch, apply** [D-F2, F3, F5, F7, F14].
+  - Files: `aitracker/update.py` (new: `update_kind`, `_g`, `update_status`, `update_fetch`, `update_apply`, `_term_live`), plus `tests/update_fixture.py` (new). The fixture is a temp bare remote with a **stub** `aitracker/` package (`__init__.py` with `__version__`, `server.py`, `cli.py`, `config.py` with `apply_overrides`, `page.py` with `build_page`, `web/`), a clone, and a second clone that pushes.
+  - After: none (new files; it only *calls* `pending._pending_lock`). **Free** of 11–15.
+  - Test: `tests/test_update.py` (new) covers:
+    - `update_status` behind=1 after fetch;
+    - `can_update` and `reason` for each refusal: detached, no upstream, dirty, diverged, up to date;
+    - apply fast-forwards to exactly `target`, even when a patched pre-flight hook pushes and fetches Y mid-flight, so HEAD == X [F3];
+    - a target with a raising `server.py`, with an `apply_overrides` that raises on the real `config.json` key, or with `web/app.css` deleted → each gives 409 and HEAD unchanged [F7];
+    - the test holding `_pending_lock` → 409 "scan in progress";
+    - while apply holds it, `pending.run_once()` returns `{"running": True}`;
+    - a second concurrent apply → 409 [F2];
+    - `term_run._live_count`=1 → `needs_confirm` [F1];
+    - a fake `GIT_SSH_COMMAND` that opens `/dev/tty` gets ENXIO and is dead after the timeout [F5];
+    - no `stash`/`reset`/`checkout`/`--force` in any recorded argv;
+    - bundle/package reasons.
+
+    Red-proofs:
+    - skip the pre-flight → the merge happens;
+    - drop the lock → the merge happens under a held scan lock;
+    - drop `start_new_session` → the fake ssh survives.
+
+**Wave A-2 (sequential after A3a, same file)**
+- **A3b — Restart path** [D-F1, F4, F12].
+  - Files: `aitracker/update.py` (`_cloexec_all`, `restart_in_place`, the exec-failure path).
+  - After: A3a. **Free** of 11–15.
+  - Test: `tests/test_update_restart.py` (new) covers:
+    - `pty.fork` child `sleep 30` → `_cloexec_all()` → `os.get_inheritable(fd) is False`;
+    - a subprocess script (pty.fork, `_cloexec_all`, `execv` printing `/dev/fd`) → the master fd is absent;
+    - `os.execv` patched to raise OSError → `tunnel.autostart` called, `update_status()["restart_error"]` set, locks released;
+    - `sys` without `orig_argv` → fallback argv;
+    - the recovery line is printed and flushed before exec;
+    - env has `PORT` and `TRACKER_NO_BROWSER`, and no `TRACKER_RESTARTED`.
+
+**Wave A-3 (each after the named v3.1 step; file-disjoint from each other)**
+- **A1 — Copy prompt unconditional (R8) + all-tab reload (F11, client half).**
+  - Files: `aitracker/web/app.js`:
+    - `openPendingItem` always prepends Copy prompt;
+    - `loadSide()` at :1323 reads `X-Server-Started` and calls `location.reload()` when it differs from the first value seen.
+  - After: **v3.1 step 12** (same file), or folded into it if step 12 is still open.
+  - Test: `tests/test_pending_copy_and_reload.py` (new, node) covers:
+    - Copy prompt is present with and without `ExtLaunch`;
+    - two polls with different `X-Server-Started` → `location.reload` is called once.
+- **A4 — Docs and rules.**
+  - Files: `.claude/rules/conventions.md` (D6 verbatim), `README.md` (Update section with the recovery command; "commit or discard local edits first"; auto-install and opt-out; "Windows: untested" per R5), `CLAUDE.md:22` (changed to: "starts on PORT or the next free port; `make stop` first to replace a running one") [F13].
+  - No `.gitignore` change [F12].
+  - After: v3.1 step 6 (shares README/conventions). **Free** of 11–15.
+  - Test: review only.
+- **A5 — Server and CLI wiring.**
+  - Files:
+    - `aitracker/server.py`:
+      - in `run()`, the `autoinstall_once` daemon thread after `start_worker()`;
+      - `_update_gate`;
+      - `GET /api/update`, `POST /api/update/fetch` and `POST /api/update/apply`;
+      - the `X-Server-Started` header at :398;
+    - `aitracker/cli.py`: `open_browser` from `TRACKER_NO_BROWSER`;
+    - `scripts/bundle.py`: ORDER `… "schedule.py", "pending.py", "update.py", "server.py" …`.
+  - After: **v3.1 steps 11 and 15**, because both edit server.py. Sequential with them, and after A3b.
+  - Test: `tests/test_update_routes.py` (new) covers:
+    - non-loopback → 403 on both POSTs;
+    - `Host: evil.example:P` with a matching Origin → 403 [F6];
+    - `term_gate` absent from `sys.modules` → 403 [F6];
+    - `Host: localhost:P` with no Origin → passes;
+    - read-only → 403;
+    - GET absent from `_RO_GET_ALLOW`;
+    - apply returns 202 before a patched `restart_in_place` runs;
+    - extra body keys are ignored;
+    - `/api/list` carries `X-Server-Started`;
+    - `run()` with `_under_test` patched False and `TRACKER_PENDING_INTERVAL=off` never calls `sched_install` [F8].
+
+    Plus TestBundle: `--version` works, there is exactly one `^def status\(`, and `update_status` is present.
+- **A6 — Settings Update block.**
+  - Files: `aitracker/web/ext_cr_dialogs.js` (Server tab, :1393).
+  - After: **v3.1 step 14** (same file). ∥ with A5 (file-disjoint; built against this spec).
+  - Test: `tests/test_update_settings_ui.py` (new, node) covers:
+    - `reason` rendered verbatim;
+    - the button is disabled when `!can_update`;
+    - 409 `needs_confirm` → confirm → re-post with `confirm_terminals: true`;
+    - a `started_at` change → `location.reload`;
+    - a non-null `restart_error` is shown at once;
+    - the 60s timeout shows `recover`;
+    - hidden when read-only;
+    - no scheduler line.
+
+**Wave A-4 (after landing per R4, from the primary checkout; no code)**
+- **A7 — Live proof on this Mac.** It merges with v3.1 step 17. Every item is a pass condition:
+  1. First `make serve` → the plist appears.
+  2. Delete the plist by hand, then `make serve` → it is regenerated.
+  3. `make pending-uninstall`, then `make serve` → not reinstalled.
+  4. `make pending-install`.
+  5. With one in-browser terminal open, push a trivial commit from another clone, then Settings → Check → Update and restart:
+     - the confirm appears;
+     - after the restart the terminal's `claude` pid is **gone** (`ps`);
+     - the same port answers, and a second open tab also reloads;
+     - the tunnel (if on) comes back.
+  6. Repeat with a dirty tracked file → the refusal text appears.
+
+  Record the results in the Log and in v3.1 section 10.
+
+### Tests summary
+New files:
+- `test_scheduler_autoinstall.py`;
+- `update_fixture.py`, `test_update.py`, `test_update_restart.py`;
+- `test_pending_copy_and_reload.py`;
+- `test_update_routes.py`, `test_update_settings_ui.py`.
+
+Addition: `TestBundle` (A5).
+
+Every test that starts `run()` or the bundle sets `TRACKER_PENDING_INTERVAL=off` and `TRACKER_SCHEDULER_AUTOINSTALL=0`. No test touches the real `~/Library/LaunchAgents`, the real opt-out file, or a network remote; every remote is a temp bare repo.
+
+### Risky spots and fallbacks
+1. **Self-restart leaves no dashboard.** Mitigated by:
+   - the import + real-config + page-build pre-flight of the exact `target` before the only write;
+   - single-flight apply plus the held scan lock;
+   - the recovery line printed to the serve terminal and held by the page;
+   - the exec-failure path that restarts the tunnel and reports `restart_error`.
+
+   Fallback: `make stop && make serve`, or the recovery command.
+2. **Terminals on restart.** `_cloexec_all` guarantees they close instead of being orphaned. The user confirms the N terminals (counted by `_term_live`, which includes `term_run` jobs). Conversations stay resumable.
+3. **Auto-install pins a vanishing path.** Mitigated by the worktree/temp/bundle/test guards, and it self-heals on the next serve from a live checkout. The server thread remains a working scanner regardless.
+4. **A mid-apply scan cut off by exec.** Prevented by holding `_pending_lock` from apply step 0 to exec.
+
+### Decisions for the user
+- **AD1 — Auto-install behaviour** (replaces old AD1 and AD2) [D-F9].
+  - **Recommended:** every serve from a primary checkout installs the job whenever it is missing (including a hand-deleted plist) or points at a checkout that no longer exists (repointing it to the one being served).
+  - The **only** thing that stops it is an explicit `make pending-uninstall`, which persists until `make pending-install`.
+  - There is no Reinstall button or Settings line.
+  - The alternative is "install once, never regenerate".
+- **AD3 — No automatic rollback after a failed restart.** Recommended: the strengthened pre-flight plus manual recovery text. A rollback would need `checkout`/`reset`, which D6 forbids. The alternative is a supervisor or two-phase restart, at about 3× the code.
+- **AD4 — Update UI only in the Control Room Settings (Server tab).** The classic view has no settings surface. The alternative is a small "Update" link in the classic sidebar header that opens the same dialog.
+- **AD5 — Open terminals at update time.** Recommended: confirm-to-close. The alternative is to refuse outright while any terminal is open.
+- **AD6 — DNS-rebinding gap on the existing local-only routes** [D-F6]. `/api/term/*` and the other `_local_caller`-only POSTs pass a rebinding page: they check peer + proxy headers only (server.py:219–229), `_origin_ok` passes when Origin is absent (term_gate.py:47–55), and there is no Host allowlist. This predates this work.
+  - The plan fixes it **only** for the update routes (`_update_gate`).
+  - Choose: (a) apply the same loopback-Host check to every local-only route now, in this PR (one shared gate, roughly one line per route plus tests); or (b) leave the existing routes and file a follow-up ticket.
+  - **Recommended: (a)**, since the fix is the same small gate, but this widens scope and is your call.
+- **D6 — the rule-6 network exception.** Review D's narrower wording above. Accept as written.
+
+### Not grounded / gaps
+- **Cross-terminal master inheritance** (known gap, separate ticket) [D-F1]. Terminal B's child inherits terminal A's master across its own `execvp`, so closing A alone never hangs it up. `term_vt` masks this with `killpg`. `_cloexec_all` at update time closes everything, so the update path is unaffected.
+- **DNS rebinding on the existing terminal and local-only routes:** see AD6. Not fixed unless the user picks (a).
+- **uv reinstall command.** The exact command for a `package` install is not verified, so the copy says "reinstall it with uv" generically.
+- **SSH under the server's env.** `start_new_session` removes `/dev/tty`, so a passphrase prompt fails fast rather than hanging. Whether the `github-personal` alias fetches non-interactively, with the key in the agent, is unverified until A7.
+- **launchd behaviour** (TCC, gh keychain) is unproven until v3.1 step 17 / A7.
+- **Old Python with new web files after a failed exec.** The server keeps running (by design), but `build_page` now serves the new `web/*`. `restart_error` tells the user to restart by hand.
+
 ## Reconciliation of reviews A + B (main thread, 2026-11-15)
 
 Reviews: `reports/pending-work-worker-review-A.md` (deletion/scanner: 4B/8S/5N), `reports/pending-work-worker-review-B.md` (wiring: 2B/12S/13N). Spot-checked in code: `scripts/bundle.py:41,46` (only `from . import tunnel` special-cased), `providers/claude.py:849` (`list_sessions(limit=200)`), `ext_cr_board.js:3090` (`t` key indexes `boardTiles()` by DOM idx).
@@ -1206,3 +1590,9 @@ Review: `reports/pending-work-worker-review-C.md` (2B/7S/10N). Its "Clean-plan d
   - nits C-N1..N10.
 
   Step 7 is split into 7a/7b; the clause table's C2/C7 rows are updated.
+- 2026-11-15: opus plan leg recorded "User decisions, round 2" (R1–R8), added clauses C8/C9, and wrote "## Plan addendum A (to v3.1)":
+  - part A: `schedule.autoinstall_once` from `run()`, remembered by `~/.ai-tracker-scheduler.json`;
+  - part B: `update.py`, `/api/update*` routes, ff-only pull, import pre-flight, `os.execv` restart;
+  - D6 network exception;
+  - steps A1–A7;
+  - decisions AD1–AD5.

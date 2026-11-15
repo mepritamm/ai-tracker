@@ -2948,6 +2948,15 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
 
 # --------------------------------------------------------------------------- routes
 
+def _with_prompt(argv, p):
+    """Append the optional `mode=new` body `prompt` as claude's positional [prompt] argument (an
+    interactive session that starts on it). Ignored when not a string, blank, over 4000 chars, or
+    starting with `-` (it would parse as a flag); `shlex.join` in `_inject_argv` quotes it."""
+    if isinstance(p, str) and p.strip() and len(p) <= 4000 and not p.lstrip().startswith("-"):
+        return argv + [p]
+    return argv
+
+
 def open_pty(handler, parsed, body):
     """POST /api/term/pty {session, cols, rows, mode} -> {tty, renderer, forked, notice, starting}.
     Also accepts a SESSION-LESS form: {cwd, cols, rows, mode} -- see "Two ways in" below.
@@ -3114,6 +3123,7 @@ def open_pty(handler, parsed, body):
             argv = [gateway.launcher(gw if gw in (gateway.ANTHROPIC, gateway.OPENROUTER) else config.GATEWAY)]
         except gateway.GatewayError as e:
             return handler._json({"error": str(e), "openrouter_configured": False}, 400)
+            argv = _with_prompt(argv, body.get("prompt"))
     else:
         argv = None                          # "cwd" IS the folder shell; nothing to type into it
     shell_argv = [os.environ.get("SHELL", "/bin/bash"), "-l"]

@@ -258,6 +258,31 @@ Add its source label to the `SRC` map in the page (e.g. `"mytool": "◆ MyTool"`
 
 ---
 
+## Pending-work worker — leftovers from Claude sessions
+
+A scheduled scan finds work that sessions left behind and writes a report to `pending.json` (git-ignored). The board shows it as a **Pending work** card; the classic view has no card.
+
+- **What is scanned.** Repos, found from the first working directory of each Claude transcript plus the repos from the previous report. For each repo: its git worktrees. Also scratch trees under `~/.claude/jobs/<id>/tmp/` and `/tmp/claude-<uid>/` for sessions that are no longer live. Transcripts are read, never changed.
+- **How the job runs.** The server runs a scan every `PENDING_INTERVAL` (default `90d`; accepts `Nd`, `Nw`, `Nm` for 30-day months, or `off`). One interval governs the whole run. Between runs the card shows the age of the last report. **Scan now** on the card, or `make pending`, refreshes it. A change to the interval applies within an hour.
+- **First run.** A new install runs about 60 seconds after the first server start, because there is no report yet.
+- **Modes (`PENDING_CLEAN`).** `off` changes nothing. `dry-run` (default) lists what would be deleted. `safe` deletes only what the rules below allow.
+- **What `safe` may delete.**
+  - A linked worktree whose branch is merged, clean, and not ahead of its upstream. It is removed with `git worktree remove` (never `--force`), then `git branch -d` (never `-D`).
+  - A squash-merged worktree, when `gh` reports its PR as merged. The worktree is removed and the branch ref is kept, because `branch -d` refuses squash-merged branches. Delete that branch yourself if you want it gone.
+  - A scratch tree with no `.git` anywhere in it, untouched for 7 days, whose session is not live.
+  - Any file git ignores (for example `.env`) blocks removal of its worktree.
+  - Transcripts (`*.jsonl`), `state.json`, `~/.claude/tasks`, `file-history` and shell-snapshots are never touched.
+  - Any git refusal or error keeps the item, and it is logged to `pending.log`.
+- **The `gh` call.** To detect squash merges, the scan runs `gh pr list --head <branch> --state merged` read-only from each repo, with bounded calls and time. A `gh` failure keeps the item. Nothing else is sent over the network.
+- **CLI.** `make pending` runs a scan now, in the mode from `PENDING_CLEAN`. It works with the server down. `make pending-install` adds a daily OS job that only asks whether a scan is due, so `PENDING_INTERVAL` stays the single setting. `make pending-uninstall` removes it. If the OS job runs, it reads only the installed checkout's `config.json`, not `TRACKER_PENDING_*` environment variables.
+- **Known gaps.**
+  - Only the first working directory of each transcript is used for discovery. A session that starts outside a repo and then `cd`s into one is found only through its jobs, its scratch, or another session.
+  - A moved worktree can lose its index at prune. Recover with Resume, then `git worktree repair`.
+  - Windows (Task Scheduler) is planned but not tested.
+- **Spare-port test servers** should run with `TRACKER_PENDING_INTERVAL=off`, so they never scan.
+
+---
+
 ## Skills
 
 The repo ships Claude Code skills under [`.claude/skills/`](.claude/skills/). Invoke them in Claude Code with `/<name>`:

@@ -2212,6 +2212,11 @@ class ClaudeProvider(Provider):
     def list(self):
         return list_sessions()
 
+    def cwds(self):
+        # first cwd of EVERY transcript (no 200-row limit); _session_meta is mtime-cached
+        fs = glob.glob(os.path.join(config.PROJECTS, "*", "*.jsonl"))
+        return {_session_meta(f).get("cwd") or "" for f in fs} - {""}
+
     def parse(self, sid):
         path = find_session(sid)
         return parse_session(path) if path else None

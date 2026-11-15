@@ -4,10 +4,12 @@ import sys
 
 from . import __version__
 from .server import run
+from .pending import cli_main
 
 HELP = """ai-tracker — live dashboard for AI coding sessions (Claude Code, Auggie, …).
 
 Usage: ai-tracker [--serve | --selfcheck | --version | --help]
+       ai-tracker --pending [--dry-run] [--json] [--if-due] [--install-scheduler] [--uninstall-scheduler] [--scheduler-status]
 Env:   PORT          (default 8790)
        HOST          bind address (default 127.0.0.1; use 0.0.0.0 for LAN/Tailscale access)
        TRACKER_AUTH  "user:pass" to require HTTP Basic Auth on every route (default off)
@@ -37,6 +39,8 @@ def main():
     if "--selfcheck" in sys.argv:
         _selfcheck()
         return
+    if "--pending" in sys.argv:
+        sys.exit(cli_main(sys.argv[1:]))
     port = int(os.environ.get("PORT", 8790))
     host = os.environ.get("HOST", "127.0.0.1")   # 0.0.0.0 to reach it from a phone/tablet on LAN/Tailscale
     run(host=host, port=port)   # run() picks the next free port if this one is busy, and opens the browser
