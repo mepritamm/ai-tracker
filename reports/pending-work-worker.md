@@ -11,15 +11,15 @@ Follow-up: "If I want to implement this, how should I plan this"
 
 ## Clauses
 
-| # | Clause | Verdict (code: none yet) | What v2 would discharge |
+| # | Clause | Verdict (code: none yet) | What v3.1 would discharge |
 |---|---|---|---|
-| C1 | Worker/job lists pending work in worktrees across all sessions | not discharged | v2 plans it: discovery from all transcripts, jobs, tmp and sticky repos; primary/locked work is shown. Gap: first-cwd-only coverage is unmeasured (section 10). |
-| C2 | Worker interval in days/months, controlled by config | not discharged | v2 plans it: `PENDING_INTERVAL` (`7d`/`2w`/`1m`); the CLI honours config.json. |
-| C3 | Pending items shown on main board as a separate, differently-coloured card | not discharged | v2 plans it for the Control Room board (violet, server-owned `card`). Classic view gets no card. |
-| C4 | Clicking shows the uncommitted / unpushed content | not discharged | v2 plans it: live status, diff and unpushed log in the modal. |
-| C5 | Resume button opens a Claude session that uses the `cleanup` skill | not discharged | v2 plans it: the prompt invokes worktree-cleanup then cleanup. It depends on the step-0 proof (M3). |
-| C6 | Worker safely deletes stale pending items / tmp files for sessions not needed | not discharged | v2 delivers deletion **only once the user picks Safe delete**; the default is dry-run. It needs the D4 rule-6 exception. |
-| C7 | Deterministic part = scripts in the app, runs without a Claude session; Claude only on demand | not discharged | v2 plans it: `pending.py` + CLI + daemon thread; Claude runs only on Resume. |
+| C1 | Worker/job lists pending work in worktrees across all sessions | not discharged | v3 plans it: discovery from all transcripts, jobs, tmp and sticky repos; primary/locked work is shown; squash-merged branches are recognised via gh. Gap: first-cwd-only coverage is unmeasured. |
+| C2 | Worker interval in days/months, controlled by config | not discharged | v3.1 plans it: `PENDING_INTERVAL` (default `90d`; `2w`/`3m`, …) governs the **whole run** (scan, gh, list, clean) for the thread, the OS job and the CLI. There is no daily refresh; Scan now and `make pending` refresh between runs. Deletion grace is decoupled (fixed 7d). |
+| C3 | Pending items shown on main board as a separate, differently-coloured card | not discharged | v3 plans it for **both** views: a Control Room violet tile and a classic-sidebar violet card, from one server `card`. Server only (POSIX). |
+| C4 | Clicking shows the uncommitted / unpushed content | not discharged | v3 plans it: live status, diff, unpushed log and gh PR state, in one shared modal. |
+| C5 | Resume button opens a Claude session that uses the `cleanup` skill | not discharged | v3 plans it: worktree-cleanup then cleanup, through one shared Resume path (`ExtLaunch.openAt`). It depends on the step-0 proof (M3). |
+| C6 | Worker safely deletes stale pending items / tmp files for sessions not needed | not discharged | v3 deletes **only once the user picks Safe delete** (default List only). Squash-merged worktrees are removed with the branch kept. Needs the D4 and D5 rule-6 exceptions. |
+| C7 | Deterministic part = scripts in the app, runs without a Claude session; Claude only on demand | not discharged | v3.1 plans it: `pending.py` + CLI + server thread **and** an installed launchd/Task Scheduler job, both deduped by `tick()`; Claude runs only on Resume. The launchd run is proven only post-landing (step 17). The Windows CLI path is planned but untested, not discharged. |
 
 ## (superseded) Technical plan (v1)
 
@@ -199,7 +199,20 @@ Assertions:
 - The OpenRouter launcher must forward `"$@"` for the Resume prompt to arrive. If it does not, the Copy-prompt button is the fallback.
 - One card for all items. A card per worktree is a one-line change in `renderBoard` if you want it instead.
 
-## Technical plan (v2)
+## User decisions (2026-11-15, via AskUserQuestion — these override v2 where they differ)
+
+| # | Question | User's answer (verbatim where free-text) | Differs from v2? |
+|---|---|---|---|
+| U1 | Scheduling | "2 and launchd job for mac, something similar for windows as well" — i.e. server thread + CLI, PLUS a shipped launchd job on macOS and an equivalent on Windows | **yes** (v2: README snippet only) |
+| U2 | Resume skill | worktree-cleanup, then cleanup | no |
+| U3 | Auto-delete default | List only by default; Safe delete is opt-in | no |
+| U4 | Rule-6 exception for Claude tmp folders | Yes, narrow exception | no |
+| U5 | Card layout | One card for everything | no |
+| U6 | Views | **Both views** (Control Room board AND classic) | **yes** (v2: Control Room only) |
+| U7 | Squash-merges | **Call gh during the scan** | **yes** (v2: no network). Needs a second written exception in conventions.md (rule 6 "no outbound network") |
+| U8 | Default interval | "90 days / 3 months" | **yes** (v2: 7d). Note: v2 has grace = max(interval, 7d); with 90d that makes deletion grace 90d — planner to decouple or justify |
+
+## (superseded) Technical plan (v2)
 
 Author: opus plan leg, 2026-11-15. v2 = v1 + every confirmed/plausible row of the Reconciliation table below (applied **as trimmed**) + M1–M3. It is self-contained: an implementer reads only this section. Symbols were checked by grep/sed at b3d6230. **(new)** marks things that do not exist yet. Finding ids in brackets, e.g. [A-B3], point to the reviews.
 
@@ -537,6 +550,588 @@ More assertions:
 - **OpenRouter launcher** must forward `"$@"` for the Resume prompt to arrive. The fallback is Copy prompt.
 - **Cleanup-skill scratch rules.** The cleanup skill's "keep the scratchpad dir; lsof before deleting logs" rules (B's pointer to A) apply to *live* sessions. The worker touches only non-live trees older than grace. Not reconciled in the table; flagged for the main thread.
 
+## Technical plan (v3.1)
+
+Author: opus plan leg, 2026-11-15. **v3 = v2 + the "User decisions" overrides U1, U6, U7 and U8.** U2–U5 are unchanged from v2. **v3.1 amends v3 in place with review C's clean-plan deltas 1–10, as the "Reconciliation of review C" table trims them.** In particular, the v3 "daily list refresh" is **deleted**: one interval governs the whole run [C-S6]. [C-xx] marks the review C origin of a change.
+
+v3 is self-contained: an implementer reads only this section. Symbols were checked with grep/sed at b3d6230. **(new)** marks things that do not exist yet. Brackets give the origin of each point: [A-xx]/[B-xx] are review findings, [M1–M3] are items both reviews missed, and [U1–U8] are user decisions.
+
+### 1. Shape in one paragraph
+One stdlib module, `aitracker/pending.py`, is the deterministic core. It runs these stages in order:
+1. **Discover** repos.
+2. **Inspect** worktrees and tmp trees: read-only git and disk access.
+3. **Ask `gh`** whether a bounded set of candidate branches was squash-merged [U7].
+4. **Classify** each item. This is pure, and the display `verdict` is kept separate from `deletable`.
+5. **Clean**: mode-gated and fail-closed.
+6. **Write the report** to `pending.json`.
+
+A second small module, `aitracker/schedule.py`, installs and uninstalls an OS scheduler job: a launchd agent on macOS, a Task Scheduler task on Windows [U1].
+
+Everything runs through one function, `pending.tick()`. Its callers:
+- (a) the server's daemon thread, which always runs when the interval is not `off` [C-B1];
+- (b) the installed OS job, which fires once a day but only does anything when `--if-due` says a run is due;
+- (c) a manual `make pending`.
+
+Both (a) and (b) may be active together. `tick()` dedups them through the per-user lock and the on-disk `scheduled_at`, so the second caller finds nothing due.
+
+`PENDING_INTERVAL` (default 90d) is the single source of truth for **the whole run**: scan, gh, list refresh, and the clean in the configured mode [C-S6]. Between runs, the only refreshes are "Scan now" and `make pending`. There is no separate daily list refresh.
+
+"Scan now" is a dry-run that returns at once [B-S8, M1]. The server owns a `card` field. Both views render it from **one** shared fetch: the Control Room board tile and a classic-sidebar card [U6]. Both views also share **one** list/detail modal and **one** Resume path.
+
+Resume opens a fresh Claude session at the repo's primary checkout, with a prompt written by the server. Claude only runs when the user presses Resume (C7).
+
+### 2. Files to add / change (exact)
+
+| File | Change |
+|---|---|
+| `aitracker/pending.py` **(new)** | The core (section 3). Imports are **named and top-level**, so the bundler can flatten them [B-B1]: `from . import config`, `from .store import _load_json, _save_json`, `from .registry import all_cwds`, `from .providers.claude import _pid_alive` [A-N4]. `from .schedule import sched_install, sched_uninstall, sched_status` [C-B2]. Stdlib: `subprocess, os, re, shutil, hashlib, threading, time, json, glob`. No top-level `fcntl`; the lock is in section 3 (portability). Never write `store.X` / `registry.X` / `schedule.X` attribute access, and never import `server`. |
+| `aitracker/schedule.py` **(new)** | OS scheduler glue [U1] (section 3b). It imports only `from . import config` plus stdlib `os, sys, subprocess, plistlib`. Its public names are unique in the flattened bundle: `sched_install`, `sched_uninstall`, `sched_status`. `tunnel.py:309` already defines `status` [C-B2]. |
+| `aitracker/registry.py` | **(new)** `all_cwds() -> set[str]`. For each available provider it uses `p.cwds()` if the provider defines one, else `{r["cwd"] for r in p.list() if r.get("cwd")}`. `list_sessions` is unchanged. |
+| `aitracker/providers/claude.py` | **(new)** `ClaudeProvider.cwds()` returns `{_session_meta(f)["cwd"] for f in glob(config.PROJECTS/*/*.jsonl)} - {""}`. That is the first cwd of **every** transcript, with no 200 limit. `_session_meta` (:247) is already mtime-cached. |
+| `aitracker/config.py` | Add `import re` [A-N1/B-N2]. Path constants next to `FLAGS_FILE` (:10):<br>• `PENDING_FILE` = `_HERE/pending.json`<br>• `PENDING_LOG` = `_HERE/pending.log`<br>• `PENDING_LOCK = os.path.join(os.path.expanduser("~"), ".ai-tracker-pending.lock")`: per-user, HOME-derived, so launchd, shells and Windows agree. `gettempdir()` differs under launchd, which has no TMPDIR. No `tempfile`/`getpass` import [A-S7, C-S1]<br>• `SCRATCH_ROOT = "/tmp/claude-%d" % os.getuid() if hasattr(os, "getuid") else None`. Windows has no known scratch root, so the scratch scan is skipped there.<br>Two EDITABLE keys, `PENDING_INTERVAL` (default **`"90d"`** [U8]) and `PENDING_CLEAN` (default `"dry-run"` [U3]). Each goes into `EDITABLE` (:207), `VALIDATORS` (:251), `_ENV_NAME`, `_RESOLVERS` (:511), `_PLAIN_ATTR_KEYS` and the module-level seeds. Neither goes into `RESTART_REQUIRED`. Also add the pure helpers `_v_interval` and `interval_seconds` (section 4). |
+| `aitracker/server.py` | Top-level `from .pending import start_worker, load_report, item_detail, run_async`.<br>do_GET gets `/api/pending` and `/api/pending/item`; do_POST gets `/api/pending/run`.<br>In the `/api/config` branch, after the validator (≈:601): `if key == "PENDING_CLEAN" and coerced == "safe": ok, err = _local_caller(self); if not ok: return self._json({"error": "safe delete can only be enabled from this machine"}, 403)` [B-S12, B-N1].<br>`run()` (:911), after `publish_endpoint(actual)`: `start_worker()`.<br>Neither GET path goes into `_RO_GET_ALLOW` (:248).<br>**Windows step only** (section 7, step 15): the term-module loader (:944) iterates `() if os.name == "nt" else ("term_launch", "term_run", "term_vt")`. |
+| `aitracker/store.py` | **Windows step only.** Replace the top-level `import fcntl` (:1) with `try: import fcntl` / `except ImportError: fcntl = None`. The forks lock (:350/:361) then uses `msvcrt.locking` when `fcntl is None`. POSIX behaviour is unchanged. |
+| `aitracker/term_vt.py` | In `open_pty` (:2951), `mode == "new"` branch (~:3112), after `argv = [gateway.launcher(...)]`: `p = body.get("prompt"); if isinstance(p, str) and p.strip() and len(p) <= 4000 and not p.lstrip().startswith("-"): argv.append(p)` [B-N3]. Add one docstring line. Do this only if step 0 proves `claude "<prompt>"` stays interactive [M3]. |
+| `aitracker/cli.py` | Top-level `from .pending import cli_main`. In `main()`, after `--help` and before serve: `if "--pending" in sys.argv: sys.exit(cli_main(sys.argv[1:]))`. Add HELP lines for `--pending [--dry-run] [--json] [--if-due] [--install-scheduler] [--uninstall-scheduler] [--scheduler-status]`. |
+| `aitracker/web/app.js` | **Shared, used by both views** [U6]. **(new)** pieces:<br>• `let pendingCache = null`.<br>• `loadPending()`: called at the end of `loadSide()` (:1318), which polls in **both** UI modes. Throttled to 60s, or 5s while `pendingCache.running`, or immediately when `pendingDirty`. Skipped when `trackerReadOnly`. Non-OK responses are ignored.<br>• `renderPendingSide()`: the **classic card**. It fills **(new)** `#pendside` when `pendingCache.card.show`, otherwise hides it.<br>• `openPendingList(p)`, `openPendingItem(id)` and `pendingResume(r)`: **one** implementation of each, called by both views (section 6). |
+| `aitracker/web/index.html` | **(new)** `<div class=pendside id=pendside hidden></div>` directly above `<div class=slist id=slist>` (:98). |
+| `aitracker/web/app.css` | `.pendside{margin:6px 8px;padding:8px 10px;border:1px solid var(--violet);border-radius:8px;cursor:pointer}` plus a title/line style. `--violet` already exists in both themes (app.css:1/:2), so no new token is needed. |
+| `aitracker/web/ext_launch.js` | `pickDirectory(raw, mode)` (:319) becomes `pickDirectory(raw, mode, prompt)`, which adds `prompt` to the POST body and **returns** a promise of `{ok, error}`. Existing callers ignore the return value. Export `window.ExtLaunch = { openAt: function (p, m, pr) { return pickDirectory(p, m, pr); } }`. This is the **single** Resume path for both views. ext_launch.js is inlined in both modes (page.py sorted `ext_*` glob), its picker helpers are null-safe (:205/:299/:306), and the tab-open code (:357) does not depend on the view. The v2 plan for `CR.term.openAt` is **dropped**, so no second copy exists (conventions rule 4). |
+| `aitracker/web/ext_cr_boot.js` | In the `SIDE_EXT.push` hook (:997–1004), pass `pending: (typeof pendingCache !== 'undefined') ? pendingCache : null` into `board.update(...)`. The hook does **no** fetch of its own. That keeps one data source and keeps the board a pure renderer [B-S6]. |
+| `aitracker/web/ext_cr_board.js` | **(new)** `pendingTile(p)`, modelled on `agentGroupTile` (:2950), with class `'cr-tile cr-tile--pending cr-tile--span2'` [B-S5]. It renders only when `p && p.card && p.card.show && !activeFilter` [B-N6].<br>`renderBoard` (:2606) prepends it and skips the empty copy while it shows.<br>`tileId` (:2599) returns `'pending'` for it.<br>`activateTile` (:2661): `if (t.kind === 'pending') { if (typeof openPendingList === 'function') openPendingList(lastState.pending); return; }`.<br>The `t` key (:3091): `var t = tiles.filter(function (x) { return tileId(x) === focusedTileId; })[0];` [B-S4]. |
+| `aitracker/web/ext_cr_board.css` | `.tracker-next .cr-tile--pending { border-color: var(--line-pending); background: var(--surface-pending); }`, next to :1484–1489. |
+| `aitracker/web/ext_cr.css` | `--state-pending`, `--surface-pending` and `--line-pending` in both blocks, next to `--surface-awaiting` (:71/:325), `--state-awaiting` (:135/:374) and `--line-awaiting` (:112/:364). Light: `#8A6FD1` / `#F1ECFB` / `#C3B3EC`. Dark: `#A48BE6` / `#2A2340` / `#6E58B8`. |
+| `aitracker/web/ext_cr_dialogs.js` | Board tab (:1314), after `SNAPSHOT_TTL_MIN`, add two rows:<br>• `serverRow('Pending-work scan', 'PENDING_INTERVAL', 'Scan every <interval>: e.g. 90d, 2w, 3m (m = month). Each scan refreshes the list, checks gh, and cleans per the mode below. Use Scan now on the card to refresh between scans. "off" stops all scheduled scans. A change applies within an hour.' [C-S6], textFieldCtl(...trim))`<br>• `serverRow('Pending-work cleanup', 'PENDING_CLEAN', …, segmented([['off','Off'],['dry-run','List only'],['safe','Safe delete']]))`<br>Add `_ENVCHIP` entries for both. |
+| `.claude/rules/conventions.md` | Rule 6 gains the two written exceptions: D4 (Claude tmp deletion) and D5 (`gh`). |
+| `.gitignore` | `pending.json`, `pending.log`. The scheduler log lives in `~/Library/Logs`, outside the repo [C-S5]. |
+| `scripts/bundle.py` | `ORDER` (:11) becomes `… "registry.py", "tunnel.py", "schedule.py", "pending.py", "server.py", "cli.py"`. HEADER (:19–23) gains `plistlib` [C-B2]. No regex changes. |
+| `Makefile` | `pending:` → `@python3 -m aitracker --pending`; `pending-install:` → `--pending --install-scheduler`; `pending-uninstall:` → `--pending --uninstall-scheduler`. Add all three to `.PHONY` and `help`. |
+| `README.md` | Cover:
+- what is scanned, and the ways the job runs;
+- one interval governs the whole run, and Scan now / `make pending` refresh between runs;
+- the first run happens about 60s after the first server start, because `due()` is True with no report, so a new install shows the card without waiting 90 days;
+- the exact delete rules, and the gh use;
+- scheduler install, uninstall and repoint;
+- the OS job sees only PATH/PYTHONPATH and the **installed checkout's** `config.json`, so `TRACKER_PENDING_*` env vars and other checkouts' settings do not reach it [C-N6];
+- "run spare-port test servers with `TRACKER_PENDING_INTERVAL=off`";
+- the Windows status (section 3b). |
+| tests | One new file per step (section 7), so steps that run in parallel never share a test file. Add one assertion to `tests/test_selfcheck.py`. |
+
+### 3. `aitracker/pending.py` — signatures and logic
+
+```python
+GIT_TIMEOUT = 10                 # s per git call; timeout -> verdict "unknown", not deletable
+SCAN_ENTRY_CAP = 50_000          # dirents per tmp tree; exceeded -> keep
+PENDING_GRACE = 7 * 86400        # deletion idle-grace; DECOUPLED from PENDING_INTERVAL [U8, A-S6]
+SLACK = 3600                     # due() tolerance, so a daily OS trigger is not skipped by seconds  [C-S3]
+GH_TIMEOUT = 15                  # s per gh call                                            [U7]
+GH_MAX_CALLS = 20                # gh calls per scan, hard cap
+GH_BUDGET_S = 120                # wall-clock budget for all gh calls in one scan
+GH_NONE_TTL = 86400              # re-ask gh about a "no merged PR" answer after 24h
+_RUNNING = threading.Event()
+
+def tick(now=None) -> str        # THE scheduler decision, shared by thread, OS job and CLI:
+    # if interval_seconds(config.PENDING_INTERVAL) is None -> "off"                       [C-S2]
+    # report = _load_json(PENDING_FILE) read FRESH from disk on every call (never a memory copy)  [C-B1]
+    # if due(report, now, interval_s): run_once(config.PENDING_CLEAN, scheduled=True) -> "run"
+    # else -> "idle"            (no separate list-refresh branch: one interval, whole run  [C-S6])
+def run_once(mode=None, now=None, scheduled=False) -> dict
+    # takes the per-user lock (busy -> {"running": True}), then:
+    # discover -> inspect -> gh -> classify -> clean(mode) -> report.
+    # scheduled_at = now only when scheduled and mode == config.PENDING_CLEAN; else carried forward [B-S8]
+def run_async(mode="dry-run") -> bool          # [M1] daemon thread; False if already running
+def due(report, now, interval_s) -> bool       # pure; interval None -> False; no scheduled_at -> True;
+                                               # else now - scheduled_at >= interval_s - SLACK            [C-S3]
+def start_worker() -> None
+    # idempotent; no-op only if PENDING_INTERVAL is "off". It does NOT check for an installed OS job:
+    # both may run, and tick() dedups through the lock and due()                               [C-B1]
+def _worker_loop(sleep=time.sleep, clock=time.time)
+    # sleep(60) at boot; then forever: try: tick() except Exception: _log(...)          [B-S7]
+    #   sleep(max(60, min(3600, seconds until the next run is due)))
+def load_report() -> dict    # _load_json(PENDING_FILE, {}) normalised; adds "running"; card summary "scanning…" while running
+def item_detail(item_id) -> dict | None   # live: {title, when, md, resume: {cwd, prompt}}
+def resume_prompt(item) -> str            # per kind (D2)
+def cli_main(argv) -> int
+    # FIRST: config.apply_overrides(_load_json(config.CONFIG_FILE, {}))                 [B-S1]
+    # --install-scheduler / --uninstall-scheduler / --scheduler-status -> sched_install()/sched_uninstall()/sched_status()  [C-B2]
+    # --if-due -> print(tick()); return 0          ("off" | "run" | "idle")
+    # --dry-run -> run_once("dry-run"); bare --pending -> run_once(config.PENDING_CLEAN, scheduled=True)
+    # --json prints the report
+
+def discover_repos(now) -> dict[str, dict]     # abs realpath common dir -> {"top", "cwds"}
+def list_worktrees(repo) -> list[dict]         # git -C <top> worktree list --porcelain
+def inspect_worktree(wt, repo, ctx) -> dict
+def gh_merged(items, report_cache, now) -> None   # fills item["gh"] in place, bounded   [U7]
+def scan_tmp(ctx, now) -> (list[dict], list[str]) # tmp entries, git_roots
+def classify(wt, ctx, now) -> dict                # {"verdict", "deletable", "reason"}
+def clean(report, mode, ctx, now) -> list[dict]
+def _under(path, root, depth=None) -> bool        # normcase(realpath) vs normcase(realpath) via commonpath; exact rel depth
+def _alive(pid) -> bool                           # os.name == "nt" -> True (fail-closed); else _pid_alive(pid)
+def _lock()                                       # context manager on config.PENDING_LOCK:
+                                                  #   fcntl.flock(LOCK_EX|LOCK_NB), or msvcrt.locking(LK_NBLCK, 1) on nt
+def _git(cwd, *args) -> (rc, out)   # ["git", "--no-optional-locks", "-C", cwd, *args], timeout=GIT_TIMEOUT,
+                                    # env + GIT_OPTIONAL_LOCKS=0, GIT_TERMINAL_PROMPT=0
+def _gh(cwd, *args) -> (rc, out)    # [shutil.which("gh"), *args], cwd=cwd, timeout=GH_TIMEOUT, env + GH_PROMPT_DISABLED=1,
+                                    # GH_NO_UPDATE_NOTIFIER=1, GH_SPINNER_DISABLED=1, NO_COLOR=1; GH_REPO and GH_HOST
+                                    # REMOVED from the child env [C-S7]; which() None -> (None, "")
+```
+
+**Discovery** [A-B1/B-S11 trimmed, A-B2, A-S5]. The seed set is the union of four sources:
+- `registry.all_cwds()`;
+- the `cwd`, `originCwd` and `worktreePath` fields of every `config.JOBS_DIR/*/state.json`;
+- the `git_roots` found by `scan_tmp`;
+- the sticky `repos[]` from the previous `pending.json`. An entry is dropped only when its common dir is gone.
+
+Each seed is resolved like this:
+1. If the seed no longer exists, walk up to the nearest existing ancestor.
+2. Run `rev-parse --path-format=absolute --git-common-dir`, then `realpath`. Skip non-repos.
+3. Dedupe on the result.
+4. `top` is the first porcelain `worktree` entry.
+
+**ctx** (built once per run):
+- `jobs`: a list of `(realpath(worktreePath or cwd), state)`.
+- `live`: the realpath cwds from `config.LIVE_SESSIONS_DIR/*.json` where `_alive(pid)`. This feeds the guards only, never seeding.
+- `tx`: `{realpath cwd: newest transcript mtime}`.
+
+**inspect_worktree.** All read-only:
+- `status --porcelain=v1 -z --untracked-files=normal` gives `dirty`, `untracked`, and up to 50 `files`.
+- `status --porcelain=v1 -z --ignored=matching --untracked-files=no` gives `ignored` and up to 20 `ignored_files`. There is no allowlist [A-B4 trimmed].
+- `unpushed = rev-list --count HEAD --not --remotes` [A-S1].
+- `@{u}` gives `upstream`, `ahead` and `behind`, for display only.
+- `base` is the first existing of `refs/remotes/*/{develop,main,master}`.
+- `ancestor` comes from `merge-base --is-ancestor HEAD <base>`.
+- `head` is `rev-parse HEAD`.
+- `last_activity` is the max of: the mtimes of `<common>/worktrees/<name>/{HEAD,index,logs/HEAD}`, the dir mtime, and `ctx.tx` under the path [A-B3].
+- For `prunable` entries: `contained` (`for-each-ref --contains <sha> --count=1` is non-empty) and `unpushed` (from `<sha>`) [A-S3].
+
+**gh squash-merge check** [U7].
+
+The exact command is `gh pr list --head <branch> --state merged --json number,url,headRefOid,baseRefName,mergedAt --limit 5` [C-N2]. It runs with `cwd=<top>`, and gh infers the repository from that checkout's remotes. `GH_REPO` and `GH_HOST` are stripped from the child env, so a server-wide override can't redirect every worktree [C-S7]. Optionally, a later change could pin `-R <owner>/<repo>` from the branch's remote URL. That is **not** built in v3.1.
+
+A PR merged into a non-base branch (a stacked PR) still counts as merged. This is safe: the worktree must be clean and the branch ref is kept. The label names the base: "squash-merged into develop (PR #12)" [C-N2].
+
+A **merged** answer means any returned PR has `headRefOid == item.head`. The PR merged exactly the local tip, so no commit was made after the merge.
+
+Candidates are bounded. Only worktree items that would be reclaimable *except* for the merge test are asked. All of these must hold:
+- not detached, not primary, not locked, not own-tracker;
+- `dirty == untracked == ignored == 0`;
+- not `ancestor`;
+- idle ≥ `PENDING_GRACE`;
+- no unfinished job;
+- no live session.
+
+Calls are sequential, oldest `last_activity` first, and stop at `GH_MAX_CALLS` or `GH_BUDGET_S`. Results are cached in `report["gh_cache"]` under the **string** key `"\x00".join((repo, branch, head))`, so it is valid JSON. Entries whose repo is no longer in `repos[]` are dropped [C-N3]. The rules:
+- `merged` is cached for good, because a merged PR for an exact sha is immutable;
+- `none` is re-asked after `GH_NONE_TTL`, so repeated Scan now clicks within 24h don't re-call gh;
+- errors are **not** cached.
+
+Item field: `gh: {"state": "merged"|"none"|"error"|"unavailable"|"skipped", "pr": url|null, "checked_at": ts}`. The states mean:
+- `unavailable`: `gh` is not on PATH. Every candidate gets this and **no calls are made**.
+- `error`: a non-zero exit (e.g. 4 = not authenticated), a timeout, unparseable JSON, or an ambiguous-repo refusal from `GH_PROMPT_DISABLED`. The **first `error` of any kind** trips a per-run circuit breaker [C-N1]. That covers fast offline and rate-limit exit-1 failures as well as auth and timeouts. It stops all further gh calls this run, so a failing scan makes exactly one call.
+- `skipped`: not a candidate, or over the cap.
+
+Every state except `merged` leaves the item non-deletable. gh failure is **fail-closed**.
+
+**Report item.** This is the shared shape both views render. v2 fields plus `head` and `gh`:
+```json
+{"id": "<sha1(realpath)[:12]>", "kind": "worktree|repo", "path": "...", "repo": "<common>", "top": "<primary>",
+ "branch": "feat-x", "detached": false, "head": "<sha>", "base": "origin/develop", "upstream": null,
+ "dirty": 0, "untracked": 0, "ignored": 0, "files": [], "ignored_files": [],
+ "unpushed": 4, "ahead": 0, "behind": 0, "ancestor": false, "locked": false, "primary": false,
+ "missing": false, "contained": true, "last_activity": 1763190000,
+ "gh": {"state": "merged", "pr": "https://github.com/o/r/pull/12", "checked_at": 1763200000},
+ "verdict": "clean", "deletable": true, "reason": "squash-merged (PR #12)",
+ "label": "squash-merged (PR #12) · worktree reclaimable; branch kept", "error": null}
+```
+- Tmp entries carry `{kind: "scratch", path, session, job, bytes, age_s, verdict: "stale"|"keep", deletable, reason}`.
+- Top level: `{generated_at, scheduled_at, interval, mode, duration_s, repos[], gh_cache{}, items[], tmp[], deleted[], would_delete[], refused[], errors[], running, card: {show, title, summary, count}}`.
+- `card.count` counts items with `verdict in {pending, missing}` plus `stale` tmp entries. `show` is `count > 0`. The summary is server-built. The JS never derives a verdict or a threshold.
+
+**classify** [A-S2/B-S3].
+
+The display verdict is the first of these that applies:
+1. `unknown` on a git error or timeout.
+2. `missing`. The label then says "N orphan commits" or "branch has N unpushed".
+3. `pending` if `dirty or untracked or (unpushed > 0 and gh.state != "merged")`.
+4. Otherwise `clean`, with reason "pushed; not merged into <base>" or "squash-merged (PR #n)".
+
+Ignored files show in the label only.
+
+`deletable` is False when any of these hold:
+- the item is primary, bare or locked;
+- it is the tracker's own checkout: `os.path.realpath(config._HERE).startswith(os.path.realpath(path) + os.sep)`;
+- `ignored > 0`;
+- the verdict is not `clean`.
+
+**reclaimable** means `deletable` and **every** one of:
+- (`ancestor and unpushed == 0`) **or** (`gh.state == "merged"`, with `headRefOid == head` already enforced);
+- `now - last_activity >= PENDING_GRACE`;
+- no `ctx.jobs` entry at or under the path with a state outside `{done, failed, stopped}`;
+- no `ctx.live` cwd at or under the path.
+
+**A MERGED PR on its own never makes anything deletable.** It replaces only the ancestor/unpushed term. Every other guard still applies, and the TOCTOU re-inspect re-checks all of them, including `head` being unchanged.
+
+### 3b. `aitracker/schedule.py` — the OS job [U1]
+
+```python
+LABEL = "com.aitracker.pending"                 # launchd label
+TASK = r"ai-tracker\pending"                    # Task Scheduler name
+def _root() -> str                              # dirname(config._HERE): the checkout holding the package
+def _argv() -> list[str]                        # [sys.executable, "-m", "aitracker", "--pending", "--if-due"]
+def plist_path() -> str                         # LATE-BOUND: os.path.join(os.path.expanduser("~"), "Library",
+                                                #   "LaunchAgents", LABEL + ".plist"), read at call time  [C-S4]
+def sched_log_path() -> str                     # ~/Library/Logs/ai-tracker-pending.log, late-bound      [C-S5]
+def launchd_plist() -> bytes                    # pure; plistlib.dumps({...}) below
+def schtasks_create_argv() -> list[str]         # pure; below
+def sched_install(run=subprocess.run) -> int    # dispatch on sys.platform; `run` injectable for tests   [C-B2 names]
+def sched_uninstall(run=subprocess.run) -> int
+def sched_status(run=subprocess.run) -> dict    # {"kind": "launchd"|"schtasks"|None, "installed": bool,
+                                                #  "last_exit": int|None, "root": str|None, "root_exists": bool}  [C-B1, C-N5]
+```
+There is **no `installed()`** gate. The server thread never checks for the OS job [C-B1]. `os.getuid()` (for `gui/<uid>`) is called only inside the darwin branch, never at module level [C-N7].
+
+**Guards common to both platforms.** `sched_install()` refuses, exit 2 with a message, in two cases:
+- When `_root()` is a **linked worktree**: its `.git` is a file. A worktree may be removed later, and the job would then point at nothing. "Install from the primary checkout."
+- On any platform other than darwin or win32. The refusal prints the equivalent crontab line (`0 10 * * * cd <root> && <py> -m aitracker --pending --if-due`) for the user to add themselves.
+
+**macOS (launchd).**
+- The plist is written to `plist_path()` with mode 0644:
+  ```
+  Label = LABEL
+  ProgramArguments = _argv()
+  WorkingDirectory = _root()
+  EnvironmentVariables = {PATH: os.environ["PATH"] (captured at install, so git and gh resolve), PYTHONPATH: _root()}
+  StartCalendarInterval = {Hour: 10, Minute: 0}   # daily; launchd runs a missed slot at the next wake
+  RunAtLoad = False
+  ProcessType = "Background"
+  LowPriorityIO = True
+  StandardOutPath = StandardErrorPath = sched_log_path()   # ~/Library/Logs, like this Mac's working agents; outside ~/Documents (TCC)  [C-S5]
+  ```
+- **Install:**
+  - If a plist already exists with a different `WorkingDirectory`, print "replacing job that pointed at <old root>" [C-N5]. There is one job per user.
+  - Run `launchctl bootout gui/<uid>/com.aitracker.pending` (errors ignored), then `launchctl bootstrap gui/<uid> <plist>`.
+  - **If bootstrap fails, `os.remove(plist)` and return 1**, so no plist is left that never runs [C-B1].
+- **Uninstall** runs `bootout` and then `os.remove(plist)`. Both are idempotent.
+- **Status** reads `launchctl print gui/<uid>/com.aitracker.pending`:
+  - rc 0 means installed;
+  - `last_exit` is parsed from the `last exit code = N` line;
+  - `root` and `root_exists` come from the plist's `WorkingDirectory`.
+
+**Windows (Task Scheduler).**
+- **Create:** `["schtasks", "/Create", "/TN", TASK, "/SC", "DAILY", "/ST", "10:00", "/F", "/TR", 'cmd /c cd /d "<root>" && "<pythonw.exe>" -m aitracker --pending --if-due >> "%LOCALAPPDATA%\ai-tracker-pending.log" 2>&1']`.
+  - Use `pythonw.exe` from `sys.executable`'s dir when it exists, so no console flashes; else `python.exe` [C-N7].
+  - The log redirect is dropped if it would breach the cap.
+  - `schtasks /Create` has no working-directory option, hence the `cd /d`.
+  - `/TR` is capped at 261 chars. Install refuses with a message if the string is still longer.
+  - The task runs only while the user is logged on.
+- **Uninstall:** `schtasks /Delete /TN TASK /F`.
+- **Status:** `schtasks /Query /TN TASK`, where rc 0 means installed.
+- A missed trigger is caught up because `--if-due` reads `scheduled_at` on the next trigger.
+
+**Two triggers, one decision** [C-B1].
+- The server thread and the OS job may both be active; neither switches the other off.
+- Both call `tick()`, which takes the HOME-derived per-user lock and reads `scheduled_at` fresh from disk. A second caller therefore finds nothing due.
+- If the OS job is broken (moved Python, deleted checkout, TCC denial), the server thread keeps scanning, and `--scheduler-status` shows `last_exit` and `root_exists`.
+- The daily OS trigger only *asks*. `PENDING_INTERVAL` (± `SLACK`) alone decides whether a run happens.
+
+**Windows portability: the honest verdict.** **The app does not run on Windows today.** These blockers were found by grep:
+
+| Where | Problem on Windows | Minimum stdlib fix | In v3? |
+|---|---|---|---|
+| `store.py:1` `import fcntl` (top-level) | ImportError, and `server`, `cli` and `pending` all import store | Guarded import + `msvcrt.locking` for the forks lock (:350/:361) | yes (step 15) |
+| `server.py:944` loader imports `term_vt` / `term_run`, which import `pty` at the top level (`term_vt.py:177`, `term_run.py:36`) | `ModuleNotFoundError: pty` has `e.name == "pty"`, so the loader **re-raises**, and `cli.py:6` imports server | Skip the term modules when `os.name == "nt"` | yes (step 15) |
+| `providers/claude.py:562` `_pid_alive` → `os.kill(pid, 0)` | On Windows `os.kill` with any signal other than CTRL_C/BREAK calls **TerminateProcess**. Probing liveness would **kill** the process | `pending._alive()` returns True on nt: fail-closed, so nothing is live-guarded into deletion. The real fix would be ctypes `OpenProcess` + `GetExitCodeProcess`, which is out of scope | yes (in pending.py) |
+| `os.getuid` (config `SCRATCH_ROOT`; launchd `gui/<uid>`) | AttributeError | `PENDING_LOCK` is HOME-derived; `SCRATCH_ROOT = None` on nt; `getuid` only inside schedule's darwin branch | yes |
+| `fcntl.flock` (pending lock) | missing | `_lock()` uses `msvcrt.locking` on nt | yes |
+| `/tmp/claude-<uid>` scratch layout | Claude Code's Windows scratch location is **unknown and not checked** | Scratch scan skipped on nt | yes (gap) |
+| Path compare | case-insensitive FS | `os.path.normcase` in `_under` | yes |
+| `term_launch.py:212` `osascript`; `ps`/`lsof` in `term_vt.py:3380/3397/3930/4069` and `claude.py:615`; `os.killpg`/`signal.SIGKILL` (term_run, term_vt, tunnel) | macOS/POSIX only | none; out of scope | no |
+
+What this limits: on Windows, **only the CLI and Task Scheduler path is in scope**. That covers scan, gh, clean and `pending.json`. The server and both cards are not; they run only on POSIX. Even with step 15, the server's other features stay POSIX-only, and **nothing is verified on Windows**: this machine is macOS and there is no Windows CI. The Windows code is covered only by pure unit tests of `schtasks_create_argv()`, `_alive`/`_lock` with `os.name` patched, and the `store` import fallback. Whether `~/.claude/projects`, `jobs` and `sessions` have the same layout on Windows is **not grounded**.
+
+### 4. Interval config — parser and validator (C2)
+```python
+_INTERVAL_RE = re.compile(r"^\s*(\d{1,3})\s*(d|w|mo|m)\s*$", re.I)   # m == mo == MONTH (30d), never minutes
+_UNIT_S = {"d": 86400, "w": 7 * 86400, "m": 30 * 86400, "mo": 30 * 86400}
+_INTERVAL_MAX = 366 * 86400
+def interval_seconds(s)    # "90d"->7776000, "3m"/"3M"->7776000 (unit via _UNIT_S[m.group(2).lower()]  [C-N9]),
+                           # "2w"->1209600, "off"/"0"->None, invalid->None
+def _v_interval(v)         # str only; "off"/"0" -> (True, "off"); 1d <= secs <= _INTERVAL_MAX -> (True, normalised); else (False, None)
+VALIDATORS["PENDING_INTERVAL"] = _v_interval
+VALIDATORS["PENDING_CLEAN"]    = _v_enum(("off", "dry-run", "safe"))
+def resolve_pending_interval(o)   # config.json > os.environ["TRACKER_PENDING_INTERVAL"] via _v_interval > "90d"   [U8]
+def resolve_pending_clean(o)      # config.json > os.environ["TRACKER_PENDING_CLEAN"] > "dry-run"                [U3]
+```
+Accepted: `7d`, `2w`, `1m`, `1mo`, `3m`, `90d`, `12m`, `365d`, `52w`, `off`, `0`. Rejected: `7`, `1y`, `-1d`, `1.5d`, `13m`, `400d`, `True`, `""`. `POST /api/config` already returns 400 through `VALIDATORS` (server.py:597–601).
+
+**Interval vs grace, decoupled** [U8]. v2 used grace = max(interval, 7d). With the new 90d default, that would make an item wait 90 days idle *and then* up to another 90 days for the next clean: up to about 180 days. That conflates two different things:
+- **`PENDING_INTERVAL`** is *how often the whole worker runs*: scan, gh, list, and the clean in the configured mode. The user asked for it to be configurable in days or months.
+- **`PENDING_GRACE`** is a fixed 7 days. It answers "how long must an item be untouched before it can be deleted". That is a safety property of the item, and a cadence knob must not shrink or stretch it. This also closes A-S6: a `1d` interval no longer shrinks the grace.
+
+**One interval, no daily list refresh** [C-S6]. Between scheduled runs, the card shows the last run's report together with its age ("scanned N days ago"). To refresh sooner, use **Scan now** (a dry-run) or `make pending`. A new install is not stuck for 90 days: `due()` is True when no `scheduled_at` exists, so the first run happens about 60s after the first server start, or at the first OS trigger. If you meant "delete things untouched for 90 days", that is the D3 overrule below.
+
+### 5. Deletion — the risky spot, and its fallback (C6)
+Nothing is deleted unless **every** condition below holds. Each one fails closed: any error, timeout or gh failure means keep.
+
+1. **Mode.**
+   - Only a `tick()`/`run_once` in `safe` deletes. That means `config.PENDING_CLEAN == "safe"`, and the run is either scheduled or a bare `make pending`.
+   - "Scan now" is always `run_async("dry-run")`.
+   - `dry-run` fills `would_delete[]` and touches nothing.
+   - `safe` can be **enabled** only by a local caller [B-S12].
+2. **Worktrees.** Only `reclaimable` items (section 3), re-inspected **immediately before** removal: every term, plus `head` unchanged.
+   - Remove with `git -C <top> worktree remove <path>`, **never `--force`**.
+   - Then `git -C <top> branch -d <branch>`, **never `-D`**. Skip this for a detached HEAD, and when the branch name equals the base's short name [A-N2, A-N3].
+   - For a **squash-merged** item, `branch -d` refuses because the branch is not merged locally. That refusal is expected: the branch **ref is kept**, so the commits survive, and it is listed as "branch kept (squash-merged; delete with `-D` yourself)". Removing the worktree loses no commits.
+   - Any git refusal is the KEEP signal. It is logged to `refused[]` and never retried.
+3. **Missing worktrees** [A-S3 trimmed]. `git -C <top> worktree prune` runs only if every `prunable` entry in that repo is `contained`. Otherwise the whole repo's prune is skipped, and the orphan entry is listed as "N orphan commits".
+4. **Scratch / tmp.** Only `SCRATCH_ROOT/<slug>/<sid>` (exact depth 2; POSIX only) and `JOBS_DIR/<id>/tmp` (exact `[id, "tmp"]`), checked through `_under` (realpath + normcase + commonpath). All of these must hold:
+   - not a symlink;
+   - the job state is in `{done, failed, stopped}`, or there is no job and no transcript newer than `PENDING_GRACE`;
+   - the newest mtime is `< now - PENDING_GRACE`;
+   - no `ctx.live` entry under it;
+   - the walk stayed under `SCAN_ENTRY_CAP`;
+   - **no `.git` file or directory anywhere in the tree** (`followlinks=False`).
+
+   Removal is `shutil.rmtree`. Any error goes to `refused[]`. A tree's `.git` roots go to discovery instead: a linked worktree flows through rule 2, and a standalone repo becomes `kind: "repo"`, never deletable. This is two-phase across runs.
+5. **Never touched:** `*.jsonl` transcripts, `state.json`, `~/.claude/tasks`, `file-history`, shell-snapshots (D4).
+6. **Single cleaner.** One cleaner per user, through the per-user `PENDING_LOCK`, across the thread, the OS job, the CLI and every checkout.
+7. **Audit.** One line per delete or refusal goes to `PENDING_LOG`. `deleted[]` covers the last run.
+
+**Fallback.** The default is `dry-run` [U3]: the first release only lists deletions until the user picks "Safe delete" locally. A misclassification costs one Resume, never data. A squash-merge removal keeps the branch ref.
+
+### 6. Cards (both views), click-through and Resume (C3, C4, C5)
+- **Feed: one source** [U6]. `app.js` `loadPending()` runs at the end of `loadSide()`, which polls in both UI modes, and fills the global `pendingCache`.
+  - The classic view renders it via `renderPendingSide()`.
+  - The Control Room receives it as `state.pending` through the boot hook.
+  - Read-only viewers do not fetch.
+- **Cards: two renderers of one server `card`.** Neither renderer has any logic of its own.
+  - **Classic:** `#pendside` above `#slist`, with a violet border. It shows `card.title` and `card.summary`, and a click calls `openPendingList(pendingCache)`.
+  - **Control Room:** `pendingTile`, a `span2` tile coloured with `--state-pending`. It comes first, and only when no filter is active. A click goes to the same `openPendingList`.
+  - Both read only `card.show`, `card.title` and `card.summary`. The summary reads "scanning…" while a scan runs [M1], and otherwise carries the server-computed age of the last run ("scanned 12 days ago"), because scheduled runs are `PENDING_INTERVAL` apart [C-S6].
+- **List** (`openPendingList`, app.js, shared).
+  - First set `curModal = null` and clear `#msgnav` [B-S9].
+  - Then `openText('Pending work', when, '')` (app.js:2271), and fill `#msgbody` with one `h()` row per item: `label`, `path`, `branch`.
+  - A **Scan now** button calls `POST /api/pending/run` and then sets `pendingDirty`.
+- **Item** (`openPendingItem`, shared). It calls `GET /api/pending/item?id=`, which returns `{title, when, md, resume}`. The `md` is computed live, with fenced git output:
+  - `git status --short`;
+  - `git diff --stat`;
+  - a `git diff` capped at 400 lines;
+  - `git log --oneline HEAD --not --remotes`, capped at 50;
+  - the gh line (PR link or error state).
+
+  Do the same `curModal` reset, then `openText(title, when, md)`, then prepend **Resume** and **Copy prompt** buttons.
+- **Resume** (`pendingResume`, shared). It calls `window.ExtLaunch.openAt(resume.cwd, 'new', resume.prompt)`, resolved at click time and guarded. On `{ok: false}`, the error is shown in the modal. The standalone `dist/tracker.py` page inlines only app.js, so `window.ExtLaunch` is absent there. When it is missing, the modal shows "Resume unavailable in this build — use Copy prompt" and never fails silently [C-N10].
+  - `resume.cwd` is `top` for worktree, repo and missing items, and `$HOME` for scratch [B-S10].
+  - The prompt tells Claude to use `git -C <path>`.
+- **Routes.**
+  - `GET /api/pending` returns `load_report()`.
+  - `GET /api/pending/item?id=` returns 404 for an unknown id.
+  - `POST /api/pending/run` does `ok, err = _local_caller(self)`, returns 403 when not ok, otherwise `run_async("dry-run")` and `202 {"running": true}` [M1].
+
+### 7. Sequencing — small, independently assignable steps
+Each step lists its files and its test. **∥** marks steps that can run in parallel with the other ∥ steps of the same wave, because they touch disjoint files, test files included. Every step ends green on its own new test file plus the existing suite.
+
+**Wave 0 (do first, alone)**
+0. **Prove M3.** Run `claude "say hi and wait"` once in a PTY, in a scratch dir. Pass: the TUI stays interactive. Record it in the Log. **No files.** If it fails, step 4 is dropped, step 5's `openAt` uses "`mode:new` + `POST /api/term/inject`" instead, and `term_vt.py` is untouched.
+
+**Wave 1 (all ∥)**
+1. ∥ **Config keys + parser.**
+   - Files: `aitracker/config.py`.
+   - Tests: `tests/test_pending_config.py` (new), covering the section 4 table, the defaults `90d` and `dry-run`, and env/config precedence. Plus the one assertion in `tests/test_selfcheck.py`: both keys are in `EDITABLE`, neither is in `RESTART_REQUIRED`, and `interval_seconds("3m") == 7776000`.
+2. ∥ **Discovery seam.**
+   - Files: `aitracker/registry.py` (`all_cwds`), `aitracker/providers/claude.py` (`ClaudeProvider.cwds`).
+   - Test: `tests/test_pending_cwds.py` (new). A temp `PROJECTS` with 250 transcripts must return every first cwd, and a provider without `cwds()` falls back to its `list()`.
+3. ∥ **OS scheduler module.**
+   - Files: `aitracker/schedule.py` (`sched_install`/`sched_uninstall`/`sched_status`, `plist_path`, `sched_log_path`).
+   - Test: `tests/test_pending_schedule.py` (new), all pure or with an injected `run`, **no real launchctl/schtasks**, and `HOME` patched to a temp dir. It covers:
+     - plist keys and argv, and the log path under `~/Library/Logs`;
+     - schtasks argv (`pythonw`, log redirect) and the 261-char refusal;
+     - refusal from a linked worktree;
+     - install/uninstall call sequences;
+     - a bootstrap rc 5 leaves **no** plist [C-B1];
+     - a second install with a different root prints the old root [C-N5];
+     - `sched_status` parses `last exit code`;
+     - the non-darwin/win32 crontab message;
+     - **the real `~/Library/LaunchAgents` listing is identical before and after the test** [C-S4].
+4. ∥ **PTY prompt** (only if step 0 passed).
+   - Files: `aitracker/term_vt.py`.
+   - Test: `tests/test_pending_pty_prompt.py` (new). With a prompt, the argv ends with it; a `-x` prompt or no prompt leaves the argv unchanged.
+5. ∥ **One Resume path.**
+   - Files: `aitracker/web/ext_launch.js` (`pickDirectory` gains `prompt` and a returned promise; `window.ExtLaunch.openAt`).
+   - Test: `tests/test_pending_ext_launch.py` (new, node). `openAt` POSTs `prompt`, resolves `{ok, error}`, and the existing picker test stays green.
+6. ∥ **Docs and rules.**
+   - Files: `.claude/rules/conventions.md` (the D4 and D5 text), `.gitignore`, `README.md`, `Makefile`.
+   - Test: none beyond review. `make help` lists the new targets.
+
+**Wave 2 (sequential: one file, `pending.py`)**
+
+7a. **Fixture helper, discover and inspect (read-only)** [C-N8].
+   - Files: `tests/pending_fixture.py` (new), `aitracker/pending.py` (`discover_repos`, `list_worktrees`, `inspect_worktree`, `_git`, `_under`, `_alive`, `_lock`).
+   - Test: `tests/test_pending_scan.py` (new), fixtures B, C, E, I and J. Also measure first-cwd against all-cwd repo coverage on the real disk once, and log the number.
+7b. **Classify, report and card.**
+   - Files: `aitracker/pending.py` (`classify`, `scan_tmp`, report, `card` with the age summary).
+   - Test: `tests/test_pending_classify.py` (new), the remaining fixtures A, D, F, F2, G, H, K, L, M, plus card show/hide.
+8. **gh check.**
+   - Files: `aitracker/pending.py` (`_gh` with `GH_REPO`/`GH_HOST` stripped, `gh_merged`, string-keyed `gh_cache`, breaker on any error, `baseRefName` label).
+   - Test: `tests/test_pending_gh.py` (new), fixtures N1–N8, using a **fake `gh` script** on a patched PATH. Never the real gh. Also run once on the real disk and log the count of each `gh.state` [C-S7].
+9. **Clean.**
+   - Files: `aitracker/pending.py` (`clean`, TOCTOU re-inspect, prune rule, rmtree rule, log).
+   - Test: `tests/test_pending_clean.py` (new): red-proofs per guard, plus the squash-merge "worktree removed, branch kept".
+10. **tick, worker, CLI and bundle.**
+    - Files: `aitracker/pending.py` (`tick`, `due` with `SLACK`, `run_once`, `run_async`, `start_worker`, `_worker_loop`, `cli_main`), `aitracker/cli.py`, `scripts/bundle.py` (ORDER **and** HEADER `plistlib`) [C-B2].
+    - Tests: `tests/test_pending_tick.py` (new), plus `tests/test_integration.py::TestBundle` extended with:
+      - `--pending --dry-run` and `--pending --scheduler-status` both rc 0, with a temp HOME and interval off;
+      - `dist/tracker.py` has exactly one `^def status\(`;
+      - bundled `--version` works [C-B2].
+
+**Wave 3 (∥ after wave 2)**
+11. ∥ **Server.**
+    - Files: `aitracker/server.py` (routes, `/api/config` safe gate, `start_worker()` in `run()`).
+    - Test: `tests/test_pending_routes.py` (new).
+12. ∥ **Shared SPA plus the classic card.**
+    - Files: `aitracker/web/app.js` (`pendingCache`, `loadPending`, `renderPendingSide`, `openPendingList`/`Item`, `pendingResume`), `aitracker/web/index.html` (`#pendside`), `aitracker/web/app.css`.
+    - Test: `tests/test_pending_ui_classic.py` (new, node/page stub). It covers:
+      - card hidden when `show` is false;
+      - shown and clickable when true;
+      - `syncModal` does not overwrite the list;
+      - read-only does no fetch;
+      - Resume calls `ExtLaunch.openAt` with the server prompt;
+      - without `ExtLaunch`, Resume shows "Resume unavailable in this build — use Copy prompt" [C-N10];
+      - `.pendside` survives `build_page()`.
+13. ∥ **Control Room card.**
+    - Files: `aitracker/web/ext_cr_boot.js` (pass `pendingCache`), `aitracker/web/ext_cr_board.js` (tile, `tileId`, `activateTile`, `t` fix), `aitracker/web/ext_cr_board.css`, `aitracker/web/ext_cr.css`.
+    - Tests: `tests/test_pending_ui_board.py` (new, node), plus `tests/test_page_css.py` (selector `.tracker-next .cr-tile--pending`).
+    - Contract with step 12: the global names `pendingCache` and `openPendingList`, guarded with `typeof`.
+14. ∥ **Settings rows.**
+    - Files: `aitracker/web/ext_cr_dialogs.js`.
+    - Test: `tests/test_pending_settings.py` (new, node). Both rows render and post `PENDING_INTERVAL`/`PENDING_CLEAN`.
+
+**Wave 4 (sequential; after 11, since both touch server.py)**
+
+15. **Windows import blockers.**
+    - Files: `aitracker/store.py` (guarded `fcntl` + `msvcrt` lock), `aitracker/server.py` (nt loader skip).
+    - Test: `tests/test_pending_windows_shims.py` (new). With `fcntl` hidden from `sys.modules` and `os.name` patched, `store` imports and the loader skips the term modules. This is a unit test, not a Windows run.
+
+**Wave 5**
+
+16. **Finish.**
+    - Gate on `tests/test_page_bundle.py::test_bundle_executes` and `tests/test_page_css.py`, then the full gate.
+    - `make serve` on a spare port with `TRACKER_PENDING_INTERVAL=off`, and check both views by hand.
+    - `/branch-sync`, re-run the gate, and push to `personal`.
+    - **No launchd install from the worktree**: `sched_install` refuses linked worktrees by design.
+
+**Wave 6 (after landing on `main`, from the primary checkout)** [C-S5]
+
+17. **Live launchd proof.** No files except the Log and section 10. The checklist is the test, and every item is a pass condition:
+    1. `make pending-install`;
+    2. `launchctl kickstart -p gui/$UID/com.aitracker.pending`;
+    3. `launchctl print …` shows `last exit code = 0`;
+    4. `pending.json` `generated_at` advanced;
+    5. `~/Library/Logs/ai-tracker-pending.log` has no `Operation not permitted` (TCC);
+    6. the logged `gh.state` counts are not all `error` (gh keychain under launchd);
+    7. `make pending-uninstall`;
+    8. `launchctl print` then returns rc ≠ 0 and the plist is gone.
+
+    Record the TCC and gh results in section 10.
+
+### 8. Tests (fixtures; each guard has one red-proof)
+`tests/test_pending_scan.py`, `_classify.py`, `_gh.py` and `_clean.py` share a helper `tests/pending_fixture.py` (new, written in step 7a). It builds:
+- a `tempfile.mkdtemp()` holding a bare `remote.git` and a `repo`, created with `git -c user.name=t -c user.email=t@t init -b main`, committed and pushed;
+- `config.PENDING_FILE`, `PENDING_LOG`, `PENDING_LOCK`, `JOBS_DIR`, `SCRATCH_ROOT`, `LIVE_SESSIONS_DIR`, `PROJECTS` and `CONFIG_FILE`, all patched to temp paths;
+- aging via `os.utime`.
+
+The whole file is skipped if `shutil.which("git")` is None. Any test that calls `run()` or runs the bundle sets `TRACKER_PENDING_INTERVAL=off` [B-N12].
+
+| Fx | Setup | Expected | Red-proof |
+|---|---|---|---|
+| A | merged into origin/main, clean, aged 8d | removed in `safe`; branch gone | positive control |
+| B | uncommitted edit | `pending`, kept | — |
+| C | local commit, never pushed, gh `none` | `pending`, unpushed 1, kept | `unpushed` term |
+| D | branch worktree rm'd, HEAD contained | `missing`; pruned | — |
+| E | pushed to origin/e, upstream set, not merged, gh `none` | `clean` "pushed; not merged", kept | `ancestor` term |
+| F | fresh worktree at base, mtime now | kept "active < grace" | idle term |
+| F2 | F aged 8d + `blocked` job on its path | kept | job term |
+| G | A + ignored `.env` | not deletable; `.env` byte-identical | `ignored` term |
+| H | detached, commit X, rm'd | `missing` "1 orphan commits"; prune skipped; `cat-file -t X == commit` | contained check |
+| I | dirty primary checkout | `pending`, not deletable, untouched | primary guard |
+| J | branch tracking **local** main, main 2 ahead of origin | unpushed 2, `pending` | `--not --remotes` |
+| K | done job tmp holding a standalone repo with 1 unpushed | `kind:"repo"`, tree survives | `.git` walk |
+| L | `SCRATCH_ROOT` a symlink; done-job tree aged 8d; sibling `<root>0/x` | tree removed; sibling kept | `_under` realpath |
+| M | own-tracker worktree (patched `config._HERE`), clean, aged | kept | own-tracker guard |
+
+gh fixtures (`tests/test_pending_gh.py`). A fake `gh` is an executable Python script on a temp PATH. It logs its argv and replies from a JSON table.
+
+| Fx | Setup | Expected | Red-proof |
+|---|---|---|---|
+| N1 | C-shaped (branch commits only local, remote branch deleted), aged 8d, gh `MERGED` with `headRefOid == HEAD` | `clean` "squash-merged"; `safe` removes the worktree; **branch ref still exists**; commits reachable | — (positive) |
+| N2 | N1, but a commit is added after the merge (`headRefOid != HEAD`) | `pending`, kept | head-equality check |
+| N3 | N1 + dirty file, gh `MERGED` | `pending`, kept | MERGED-alone-never-deletes |
+| N4 | `gh` not on PATH | `gh.state == "unavailable"`, kept, 0 calls | fail-closed |
+| N5 | fake gh exits 4 (auth) for the first candidate; variant: exits 1 (offline) | all candidates `error`/`skipped`, exactly 1 call (breaker on **any** error) in both variants, kept | breaker [C-N1] |
+| N6 | fake gh sleeps > `GH_TIMEOUT` (patched to 1s) | `error`, kept, 1 call | timeout |
+| N7 | 25 candidates | ≤ `GH_MAX_CALLS` calls; extras `skipped`; a second run makes 0 calls for cached `merged`; `json.dumps(report)` round-trips (string cache key) | cap + cache [C-N3] |
+| N8 | `GH_REPO=x/y` and `GH_HOST=h` in `os.environ` | the fake gh's logged env has neither | env strip [C-S7] |
+
+More tests:
+- `test_pending_tick.py`:
+  - `tick()` returns `run` when due and `idle` otherwise, with no list-refresh branch [C-S6]:
+    - a report with `generated_at` 2 days old and `scheduled_at` 10 days old under `90d` gives `idle`, and a patched `run_once` is not called;
+  - interval `off` with an old report gives `"off"`, and `run_once` is never called [C-S2];
+  - `scheduled_at = now - 86370` with `1d` gives `run`, thanks to `SLACK` [C-S3];
+  - a dry-run leaves `scheduled_at` unchanged;
+  - `run_once` then `tick(now + 5)` gives `idle`, and tick reads the disk fresh: no double run between the thread and the OS job [C-B1];
+  - `start_worker()` **starts** the thread even when `sched_status` is patched to installed [C-B1];
+  - the worker survives an exception, and every sleep is ≥ 60;
+  - `cli_main` honours config.json `safe`;
+  - the per-user lock returns `{"running": True}` across two `PENDING_FILE`s;
+  - `config.PENDING_LOCK` is equal with `TMPDIR` set and unset, re-resolved under a patched env [C-S1];
+  - grace stays 7d with interval `1d` and with `90d` [U8];
+  - `interval_seconds("3M") == 7776000` [C-N9].
+- `test_pending_routes.py`:
+  - `GET /api/pending` serves the report, and the path is absent from `_RO_GET_ALLOW`;
+  - `POST /api/pending/run` returns 403 for non-loopback, and 202 before a slow patched `run_once` finishes;
+  - in `safe` mode the run route deletes nothing;
+  - `/api/config` `PENDING_CLEAN=safe` from non-loopback returns 403 with config.json unchanged;
+  - `item_detail(...)["resume"]["cwd"] == top`.
+
+Node UI tests are listed in steps 12–14.
+
+### 9. Decisions (user answers folded in; remaining overrules flagged)
+- **D1 Scheduler** [U1, decided]. The server thread **and** an installed OS job: launchd on macOS, Task Scheduler on Windows. They are installed by `--install-scheduler` and removed by `--uninstall-scheduler`. The OS job fires daily but only *asks* `tick()` (`--if-due`), so `PENDING_INTERVAL` stays the single source of truth for the whole run. **Both triggers run.** `tick()` dedups them through the HOME-derived lock and the on-disk `scheduled_at`, so a broken OS job never silences the server thread [C-B1].
+- **D2 Resume prompt** [U2, decided]. Two forms:
+  - **Worktree / repo / missing:** *"Use the worktree-cleanup skill on `<path>` (repo `<top>`, branch `<branch>`; N uncommitted, M unpushed as of last fetch; gh: `<state/PR>`; operate with `git -C <path>`, do not cd into it). Commit/push or discard only as I decide; ask before anything destructive. Then use the cleanup skill for stray processes and scratch files of session(s) `<sids>`."*
+  - **Scratch:** *"Use the cleanup skill for session `<sid>` scratch at `<path>`."*
+- **D3 Auto-delete** [U3, decided: List only by default, Safe is opt-in]. Section 5 is the full scope. **One overrule to confirm:** the grace is a fixed 7 days, decoupled from the 90-day interval. If "90 days" was meant as "delete things untouched for 90 days", set `PENDING_GRACE` = interval instead. That is a one-line change; the cost is that items can then wait up to about 180 days.
+- **D4 Rule-6 exception: Claude tmp folders** [U4, decided yes]. Append to conventions rule 6:
+  > *"Exception (pending-work worker, user-requested): `aitracker/pending.py` may delete, only in `PENDING_CLEAN=safe` and only under the guards in its module docstring, (a) `~/.claude/jobs/<id>/tmp/` and `/tmp/claude-<uid>/<slug>/<sid>/` trees containing no `.git`, and (b) git worktrees via non-force `git worktree remove` / `git branch -d` / `git worktree prune`. It never deletes or edits `*.jsonl` transcripts, `state.json`, `~/.claude/tasks`, `file-history` or shell-snapshots."*
+- **D5 Rule-6 exception: outbound network for `gh`** [U7, decided: call gh]. Append to conventions rule 6:
+  > *"Exception (pending-work worker, user-requested): `aitracker/pending.py` — and only it, never synchronously inside a request handler (the server's worker and Scan-now threads may) — may run the GitHub CLI read-only as `gh pr list --head <branch> --state merged --json number,url,headRefOid,baseRefName,mergedAt --limit 5`, from the repo's own checkout, with `GH_REPO`/`GH_HOST` removed from its environment, to detect squash-merged branches. Cadence: once per scheduled run (every `PENDING_INTERVAL`, default 90 days) plus each manual Scan now or `make pending`. Bounds: at most `GH_MAX_CALLS` (20) calls and `GH_BUDGET_S` (120 s) per scan, `GH_TIMEOUT` (15 s) each, with a circuit breaker on the first error of any kind. It contacts only the GitHub API host gh resolves for that repo, with gh's own credentials (stored login or `GH_TOKEN`). Any gh failure (missing, unauthenticated, offline, timeout, unparseable) leaves the item pending and never deletable, and a MERGED PR never makes a worktree deletable unless every other deletion guard also passes. No other outbound network call is allowed."*
+- **Card layout** [U5, decided]: one card. **Views** [U6, decided]: both.
+
+### 10. Known gaps (stated, not solved)
+- **Windows** (section 3b): the app does not run there today. Only the CLI and Task Scheduler path is in scope; it is **planned but untested**, cannot be proven on this machine, and is **not discharged**. Details:
+  - On nt, the live-session guard fails closed (assumes alive), and scratch cleanup is skipped.
+  - The task runs only while the user is logged on.
+  - Claude Code's on-disk layout on Windows is **not grounded**.
+- **gh scope.**
+  - gh decides the target repo from the checkout's remotes (`GH_REPO`/`GH_HOST` are stripped). The only remote here is an SSH alias (`github-personal`), and whether gh maps it to github.com is unverified; steps 8 and 17 log real `gh.state` counts.
+  - Repos with several GitHub remotes can be refused under `GH_PROMPT_DISABLED`, which shows as `error` and is kept.
+  - Non-GitHub remotes always show `error` or `unavailable`, so they are kept.
+  - `-R` pinning is not built.
+- **launchd under TCC and gh keychain:** **not yet proven.** Step 17 records the result here.
+- **Between runs**, the card is as old as the last run (up to `PENDING_INTERVAL`). Scan now and `make pending` are the refresh [C-S6]. A new install runs about 60s after the first server start, because there is no `scheduled_at`.
+- **OS job config reach** [C-N6]. The OS job sees only PATH and PYTHONPATH, so `TRACKER_PENDING_*` env vars don't reach it. It reads the **installed checkout's** `config.json`, so Settings saved from a server in another checkout don't apply to it. A second `--install-scheduler` repoints the single per-user job.
+- **Squash-merged branches**: they stay as local branches after their worktree is removed. `branch -d` refuses by design, and `-D` is never used.
+- **Discovery** uses the first cwd per transcript. Step 7a logs the real coverage. If the gap matters, widen `ClaudeProvider.cwds()` to every cwd line.
+- **Stale reports in other checkouts**: the report is per checkout. The OS job writes the installed checkout's `pending.json`, so a server started from a different checkout shows that checkout's report, which can be stale.
+- **Transcripts pruned after about 30 days** are covered by sticky `repos[]`.
+- **Moved worktrees** can lose their index at prune. Use Resume → `git worktree repair`.
+- **Non-Claude providers** have no live signal, so the idle guard is their only one.
+- **A git timeout** leaves an item `unknown`: listed, never deleted.
+- **Interval edits** apply within an hour.
+- **The OpenRouter launcher** must forward `"$@"` for the Resume prompt to arrive; otherwise use Copy prompt.
+- **The cleanup skill's live-session scratch rules** remain unreconciled (flagged in v2).
+
 ## Reconciliation of reviews A + B (main thread, 2026-11-15)
 
 Reviews: `reports/pending-work-worker-review-A.md` (deletion/scanner: 4B/8S/5N), `reports/pending-work-worker-review-B.md` (wiring: 2B/12S/13N). Spot-checked in code: `scripts/bundle.py:41,46` (only `from . import tunnel` special-cased), `providers/claude.py:849` (`list_sessions(limit=200)`), `ext_cr_board.js:3090` (`t` key indexes `boardTiles()` by DOM idx).
@@ -573,7 +1168,41 @@ Reviews: `reports/pending-work-worker-review-A.md` (deletion/scanner: 4B/8S/5N),
 - **M2** The cleaner deletes Claude-owned files (`~/.claude/jobs/<id>/tmp`, `/tmp/claude-<uid>/…`) — a deliberate, user-requested exception to conventions rule 6 ("read-only w.r.t. session logs"). Must be written into `.claude/rules/conventions.md` and never extend to `*.jsonl`, `state.json`, tasks, or file-history.
 - **M3** Not examined by either: whether `claude <prompt>` in the `new` PTY path starts an interactive session (vs `-p` print mode) — prove with a one-off manual run in step 1 before wiring the button.
 
+## Reconciliation of review C (v3 delta; main thread, 2026-11-15)
+
+Review: `reports/pending-work-worker-review-C.md` (2B/7S/10N). Its "Clean-plan deltas" 1-10 are the fix list.
+
+| Finding | Verdict | Note / trim |
+|---|---|---|
+| C-B1 server thread off when plist exists | **confirmed** | Delta 1 as written: both run, `tick()` dedups via the lock + `due()`. |
+| C-B2 `schedule.status` collides in the bundle | **confirmed** (bundle flattens; `tunnel.status` exists) | Delta 2 as written. |
+| C-S1 lock dir differs launchd vs shell | confirmed | Delta 3: `~/.ai-tracker-pending.lock`. |
+| C-S2 `off` means two things | confirmed | Delta 4. |
+| C-S3 daily trigger vs strict ≥ threshold | confirmed | Delta 5, `SLACK` in `due()` only (see C-S6). |
+| C-S4 tests write the real LaunchAgents plist | confirmed | Delta 6. |
+| C-S5 launchd proof can't run as written | confirmed | Delta 7. |
+| C-S6 interval does nothing under dry-run; scans run daily incl. gh | **confirmed — fix replaced (overengineered plan, not review)** | The "daily list refresh" was the planner's invention and contradicts the contract ("time for the worker ... in days/months ... controlled by the config") and the user's explicit 90d choice over a 1d option. **Delete the daily list refresh entirely.** One interval governs the whole run (scan + gh + list + clean-per-mode). Freshness between runs = the "Scan now" button and `make pending`. The OS job still fires daily but only executes `--if-due`. Drop delta 8's disclosure copy; Settings copy says "Scan every <interval>". |
+| C-S7 gh repo resolution not pinned | confirmed | Delta 9; `-R` derivation stays optional (not built). |
+| C-N1..N10 | accepted | as written. |
+
+**Missed by review C:** a 90d default means a new install shows no card until the first run — `due()` already returns True when no report exists, so the first run happens ~60s after first server start; state this in README. Windows path remains planned-but-untested (cannot be proven on this machine) — recorded as a known gap, not discharged.
+
 ## Log
 - 2026-11-15: worktree cut; 4 parallel haiku Explore legs launched to map board, config/jobs, worktree/resume/cleanup wiring, on-disk inventory.
 - 2026-11-15: opus plan leg wrote "## Technical plan (v1)" (pending.py core + CLI + server thread, PENDING_INTERVAL/PENDING_CLEAN config, board card, open_pty prompt; D1-D3 recommendations). Awaiting user agreement before code.
 - 2026-11-15: opus plan leg wrote "## Technical plan (v2)" from the A+B reconciliation (all confirmed/plausible rows as trimmed, M1-M3, D4 rule-6 exception). v1 marked superseded; the clause table gained a v2 column. Awaiting user agreement before code.
+- 2026-11-15: opus plan leg wrote "## Technical plan (v3)" folding U1 (launchd + schtasks via schedule.py), U6 (classic card, shared fetch/modal/Resume), U7 (bounded fail-closed gh + D5), U8 (90d default, grace decoupled to fixed 7d). Windows portability table added. v2 marked superseded; clause table column now v3. Section 7 is 17 steps in 6 waves, with ∥ marks.
+- 2026-11-15: opus plan leg amended v3 in place to "## Technical plan (v3.1)" with review-C deltas 1–10 per its reconciliation:
+  - the daily list refresh is deleted (one interval, whole run);
+  - both triggers run, deduped by `tick()`;
+  - `sched_*` names and bundle HEADER `plistlib`;
+  - HOME lock;
+  - `off` → "off";
+  - `SLACK` in `due()`;
+  - late-bound plist path;
+  - `~/Library/Logs` log;
+  - post-landing launchd proof (step 17);
+  - gh env strip;
+  - nits C-N1..N10.
+
+  Step 7 is split into 7a/7b; the clause table's C2/C7 rows are updated.
