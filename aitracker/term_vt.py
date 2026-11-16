@@ -3251,7 +3251,10 @@ def open_pty(handler, parsed, body):
                if mode == "resume" else term_gate.session_cwd(sid))
         # Placement BEFORE the 404, in all three modes (row 6): a worktree session's shell is the
         # repo root and the session runs in the worktree top; a removed worktree answers 409.
-        pl = term_gate.place(sid, cwd, mode)
+        tok = body.get("recreate") if isinstance(body.get("recreate"), str) else None
+        if tok and term_gate.recreate_forbidden(handler):     # E1: never from a read-only / tunnel request
+            return handler._json({"error": "recreating a worktree is not allowed from a read-only or tunnel request"}, 403)
+        pl = term_gate.place(sid, cwd, mode, token=tok) if tok else term_gate.place(sid, cwd, mode)
         if pl.get("error"):
             body409 = {"error": pl["error"]}
             if pl.get("recreate"):

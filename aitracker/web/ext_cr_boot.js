@@ -784,10 +784,12 @@ window.CR = window.CR || {};
   // otherwise a plain cwd shell.
   // POST /api/term/open, shared by openExternal and answerSession. Resolves
   // { ok, status, j } (j = {} when the body isn't JSON); rejects on network failure.
-  function postTermOpen(id, mode) {
+  function postTermOpen(id, mode, extra) {
+    var body = { session: id, mode: mode };
+    if (extra) for (var k in extra) body[k] = extra[k];
     return fetch('/api/term/open', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session: id, mode: mode }),
+      body: JSON.stringify(body),
     }).then(function (r) {
       return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
     });
@@ -798,6 +800,15 @@ window.CR = window.CR || {};
     if (!id || typeof fetch !== 'function') return;
     var resumable = !/^(auggie|augment-vscode|augment-cursor):/.test(id);
     postTermOpen(id, resumable ? 'resume' : 'cwd').then(function (res) {
+      if (res.status === 409 && res.j && res.j.recreate && window.ExtVT && window.ExtVT.confirmRecreate) {   // E1 (lazy: ext_vt.js loads last)
+        window.ExtVT.confirmRecreate(res.j, function (x) {
+          postTermOpen(id, resumable ? 'resume' : 'cwd', x).then(function (r2) {
+            emit('notify', { text: (r2.ok && !(r2.j && r2.j.error)) ? 'Opened in an external window — this machine only.'
+              : ((r2.j && r2.j.error) || 'Couldn’t open an external terminal.') });
+          });
+        }, function () { return true; });
+        return;
+      }
       if (!res.ok || (res.j && res.j.error)) {
         emit('notify', { text: (res.j && res.j.error) || 'Couldn’t open an external terminal.' });
         return;
@@ -831,7 +842,14 @@ window.CR = window.CR || {};
     if (typeof fetch !== 'function') return;
     return postTermOpen(id, 'resume').then(function (res) {
       var j = res.j || {};
-      if (res.ok && !j.error) {
+      if (res.status === 409 && j.recreate && window.ExtVT && window.ExtVT.confirmRecreate) {   // E1 (lazy: ext_vt.js loads last)
+        window.ExtVT.confirmRecreate(j, function (x) {
+          postTermOpen(id, 'resume', x).then(function (r2) {
+            emit('notify', { text: (r2.ok && !(r2.j && r2.j.error)) ? 'Resuming in an external window — this machine only.'
+              : ((r2.j && r2.j.error) || 'Couldn’t resume that session.') });
+          });
+        }, function () { return true; });
+      } else if (res.ok && !j.error) {
         emit('notify', { text: 'Resuming in an external window — this machine only.' });
       } else if (res.status === 403 && j['remote'] && !j['readonly']) {
         emit('session:resume', { id: id });

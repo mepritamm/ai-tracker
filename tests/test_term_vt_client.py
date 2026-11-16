@@ -2589,8 +2589,13 @@ class TestTerminalManagerPanel(unittest.TestCase):
         live PTY stream -- for as long as they're up, which is why _popupBlockedNotice() replaced
         the inline alert() this test file used to pin. Guard the invariant directly, and confirm
         the helper it was replaced by still actually carries the user-visible message."""
+        # The ONE sanctioned exception: confirmRecreate's confirm() (terminal-at-root E1). It runs on a
+        # 409 -- nothing is spawned yet, so no live PTY stream or poll is held up -- and falls back
+        # to a toast when the browser suppresses it.
+        self.assertEqual(self.js.count("ok = window.confirm(text);"), 1)
+        js = self.js.replace("ok = window.confirm(text);", "")
         for native in ("alert(", "confirm(", "prompt("):
-            self.assertNotIn(native, self.js,
+            self.assertNotIn(native, js,
                               "native blocking dialog %r found in ext_vt.js -- it freezes the "
                               "2s poll and any live PTY stream; route it through "
                               "_popupBlockedNotice() (or CR.dialogs/toast) instead" % native)

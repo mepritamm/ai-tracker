@@ -2968,7 +2968,47 @@
       });
   }
 
-  function _openVTFresh(sid, mode, mount, gen) {
+  // E1: a 409 {error, recreate:{summary,token}} means the session's worktree was removed and the
+  // server will recreate it on confirmation. ONE helper for every entry point (in-app terminal, the
+  // mounted pane, ext_launch's native button, the Control Room terminal and board). Shows the server
+  // text in a confirm; when the confirm dialog is suppressed (iOS standalone PWA, sandboxed iframe: it returns
+  // false at once) the same text goes into a toast whose "Recreate" button proceeds. `retry({recreate:
+  // token})` re-POSTs; it only runs while stillCurrent() (the caller was not superseded meanwhile).
+  function confirmRecreate(body, retry, stillCurrent) {
+    var rc = body && body.recreate;
+    if (!rc || !rc.token) return false;
+    var go = function () { if (!stillCurrent || stillCurrent()) retry({ recreate: rc.token }); };
+    var text = (body.error || "") + "\n\n" + (rc.summary || "");
+    var t0 = Date.now(), ok = false;
+    try { ok = window.confirm(text); } catch (e) { ok = false; }
+    if (ok) { go(); return true; }
+    if (Date.now() - t0 < 50) {
+      var host = document.getElementById("toasts");
+      if (host) {
+        var el = document.createElement("div");
+        el.className = "toast show vtrecreate";
+        var msg = document.createElement("div");
+        msg.className = "tt";
+        msg.textContent = text;
+        var btn = document.createElement("button");
+        btn.className = "mini vtrecreatebtn";
+        btn.textContent = "Recreate";
+        btn.onclick = function () { el.remove(); go(); };
+        el.appendChild(msg);
+        el.appendChild(btn);
+        host.appendChild(el);
+        setTimeout(function () { el.remove(); }, 30000);
+      }
+    }
+    return true;
+  }
+
+  function _withExtra(o, extra) {
+    if (extra) for (var k in extra) o[k] = extra[k];
+    return o;
+  }
+
+  function _openVTFresh(sid, mode, mount, gen, extra) {
     if (!overlay) buildOverlay(mount);
     if (activeTerm) { activeTerm.destroy(); activeTerm = null; }
     if (activeBar) { activeBar.destroy(); activeBar = null; }
@@ -2996,7 +3036,7 @@
       modalBodyEl.innerHTML = "";
       fetch("/api/term/pty", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session: sid, cols: m.cols, rows: m.rows, mode: mode })
+        body: JSON.stringify(_withExtra({ session: sid, cols: m.cols, rows: m.rows, mode: mode }, extra))
       }).then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; }); })
         .then(function (res) {
           if (res.j && res.j.tty) bindTty(res.j.tty, res.j.session || sid);   // the session the server says runs there (a parked original resolves to its job)
@@ -3034,6 +3074,10 @@
                 ? "in-browser terminal is disabled — set TRACKER_TERMINAL=1 and TRACKER_AUTH"
                 : "failed to start terminal")
             ) + "</div>";
+            if (res.status === 409 && res.j && res.j.recreate) {
+              confirmRecreate(res.j, function (x) { _openVTFresh(sid, mode, mount, ++openGen, x); },
+                function () { return gen === openGen; });
+            }
             return;
           }
           activeTty = res.j.tty;
@@ -3898,6 +3942,7 @@
           // Nothing running yet -- spawn one sized to the CONTAINER's actual rendered box, same
           // reasoning as _openVTFresh's own probePane: ask the server for the right size instead
           // of guessing a default and resizing after.
+          function spawn(extra) {
           var probe = document.createElement("div");
           probe.className = "vtpane";
           wrap.appendChild(probe);
@@ -3907,12 +3952,17 @@
             wrap.innerHTML = "";
             fetch("/api/term/pty", {
               method: "POST", headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ session: sid, cols: m.cols, rows: m.rows, mode: mode })
+              body: JSON.stringify(Object.assign({ session: sid, cols: m.cols, rows: m.rows, mode: mode }, extra || {}))
             }).then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; }); })
               .then(function (res) {
                 if (res.j && res.j.tty) bindTty(res.j.tty, res.j.session || sid);   // the session the server says runs there
                 if (!res.ok || !res.j || !res.j.tty) {
                   if (destroyed) return;
+                  if (res.status === 409 && res.j && res.j.recreate) {
+                    fail(res.j.error);
+                    confirmRecreate(res.j, spawn, function () { return !destroyed; });
+                    return;
+                  }
                   fail((res.j && res.j.error) ||
                     (res.status === 403
                       ? "in-browser terminal is disabled — set TRACKER_TERMINAL=1 and TRACKER_AUTH"
@@ -3927,6 +3977,8 @@
               })
               .catch(function (e) { fail("failed to reach the server: " + String(e)); });
           });
+          }
+          spawn();
         });
     } else {
       fail("mountInto: target must be {session, mode} or {tty}");
@@ -3941,6 +3993,7 @@
   // extending the object inline would break a passing assertion over a cosmetic difference. Same
   // object, same two original entries, one more property.
   window.ExtVT.mountInto = mountInto;
+  window.ExtVT.confirmRecreate = confirmRecreate;
   window.ExtVT.bindTty = bindTty;
   window.ExtVT.bindRows = bindRows;
   window.ExtVT.ttyBody = ttyBody;

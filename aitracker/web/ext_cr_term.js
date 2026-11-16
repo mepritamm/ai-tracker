@@ -562,9 +562,17 @@
     }
     return extProbing;
   }
-  function _openExternal(mode) {
+  function _openExternal(mode, extra) {
     if (!st.sessionId) return;
-    post("/api/term/open", { session: st.sessionId, mode: mode }).then(j).then(function (res) {
+    var sidAtClick = st.sessionId;
+    var body = { session: st.sessionId, mode: mode };
+    if (extra) for (var k in extra) body[k] = extra[k];
+    post("/api/term/open", body).then(j).then(function (res) {
+      if (res.status === 409 && res.j && res.j.recreate && window.ExtVT && window.ExtVT.confirmRecreate) {   // E1 (lazy: ext_vt.js loads last)
+        window.ExtVT.confirmRecreate(res.j, function (x) { _openExternal(mode, x); },
+          function () { return st.sessionId === sidAtClick; });
+        return;
+      }
       if (!res.ok || (res.j && res.j.error)) {
         if (res.status === 403) { extAllowed = false; _syncControlVisibility(); }
         showToast((res.j && res.j.error) || "Failed to open terminal.");

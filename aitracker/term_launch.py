@@ -201,7 +201,11 @@ def open_terminal(handler, parsed, body) -> None:
     cwd = (term_gate.session_cwd(sid, resume=True) or term_gate.session_cwd(req_sid, resume=True)
            if mode == "resume" else term_gate.session_cwd(sid))
     # Placement BEFORE the 404, all modes (row 6): a worktree session's tab opens at the repo root.
-    pl = term_gate.place(sid, cwd, mode)
+    tok = body.get("recreate") if isinstance(body.get("recreate"), str) else None
+    if tok and term_gate.recreate_forbidden(handler):     # E1: never from a read-only / tunnel request
+        handler._json({"error": "recreating a worktree is not allowed from a read-only or tunnel request"}, 403)
+        return
+    pl = term_gate.place(sid, cwd, mode, token=tok) if tok else term_gate.place(sid, cwd, mode)
     if pl.get("error"):
         body409 = {"error": pl["error"]}
         if pl.get("recreate"):

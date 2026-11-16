@@ -55,11 +55,19 @@
     el.innerHTML = "";
   }
 
-  async function openTerm(mode) {
+  async function openTerm(mode, extra) {
     if (!cur) return;
+    const sidAtClick = cur;
     try {
-      const r = await post({ session: cur, mode: mode });
+      const r = await post(Object.assign({ session: cur, mode: mode }, extra || {}));
       const j = await r.json().catch(() => ({}));
+      if (r.status === 409 && j.recreate) {   // E1: removed worktree -- one-click recreate (resolved lazily: ext_vt.js loads last)
+        const ev = window.ExtVT;
+        if (ev && ev.confirmRecreate) {
+          ev.confirmRecreate(j, (x) => openTerm(mode, x), () => cur === sidAtClick);
+          return;
+        }
+      }
       if (!r.ok || j.error) {
         if (r.status === 403) {         // feature off, or the server refused us as remote
           allowed = false;

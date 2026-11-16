@@ -31,6 +31,7 @@ python -m aitracker --version | --help | --selfcheck
 - **Shared shapes** both providers emit: the session-list dict and the session-detail dict (`meta/todos/files/commands/narration/agents_bg/shells/overview/counts/…`). The SPA renders any source uniformly.
 - **Overridable paths are late-bound via `config.NAME`** (so tests and callers see one source of truth). `store.py`/`providers/*` reference `config.FLAGS_FILE` etc., not a copied import.
 - **App-owned state:** `flags.json`/`titles.json` via `store._load_json`/`_save_json` — read **live**. Both gitignored.
+- **One sanctioned git write:** `term_gate.recreate_worktree()` recreates a removed worktree on a one-click confirm — see the rule-6 exception in `.claude/rules/conventions.md`; nothing else writes to a repo.
 - **Liveness:** one constant — `LIVE_WINDOW` (config, default 300s, live-editable; every server consumer reads `config.LIVE_WINDOW` at call time). The SPA's `LIVE` is served by the server — `page.build_page()` substitutes it into `web/app.js` on every page load — never a second literal.
 
 ## The rule that bites everyone

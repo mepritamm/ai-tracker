@@ -146,10 +146,11 @@ class TestPlace(_Base):
         os.makedirs(anc)
         gone = os.path.join(anc, "gone")
         for mode in ("resume", "new", "cwd"):
-            with self._raw(gone):
+            fake = {"path": gone, "root": self.root, "token": "t"}     # planning itself: test_term_recreate
+            with self._raw(gone), mock.patch.object(term_gate, "_plan", return_value=(fake, "")):
                 pl = term_gate.place("s", anc, mode)       # cwd = what session_cwd(resume=True) returned
             self.assertEqual(pl["shell"], "")              # never row 4 (shell = the ancestor)
-            self.assertEqual(pl["recreate"], {"path": gone, "root": self.root})
+            self.assertEqual(pl["recreate"], fake)
             self.assertIn("was removed", pl["error"])
             self.assertEqual(pl["note"], pl["error"])
 

@@ -160,7 +160,8 @@ class TestOpenPtyAtRoot(_Base):
         gone = os.path.join(self.root, ".claude", "worktrees", "gone")
         self.runs["S"] = gone
         self.folder_pty()
-        with mock.patch.object(term_vt, "spawn") as sp:
+        fake = ({"path": gone, "root": self.root, "token": "t"}, "")     # planning: test_term_recreate
+        with mock.patch.object(term_vt, "spawn") as sp, mock.patch.object(term_gate, "_plan", return_value=fake):
             for mode in ("cwd", "new", "resume"):
                 obj, code = self.run_open("S", mode, [])
                 self.assertEqual(code, 409, (mode, obj))
@@ -324,8 +325,10 @@ class TestOpenTerminalAtRoot(_Base):
             self.assertEqual(h.calls[-1][1], 200)
             self.assertIn("cd %s && sh -c" % shlex.quote(self.root), self.unescape(run.call_args[0][0][2]))
             self.runs["S"] = os.path.join(self.root, ".claude", "worktrees", "gone")
+            fake = ({"path": self.runs["S"], "root": self.root, "token": "t"}, "")
             for mode in ("cwd", "resume"):
-                term_launch.open_terminal(h, None, {"session": "S", "mode": mode})
+                with mock.patch.object(term_gate, "_plan", return_value=fake):
+                    term_launch.open_terminal(h, None, {"session": "S", "mode": mode})
                 self.assertEqual(h.calls[-1][1], 409, mode)
                 self.assertIn("recreate", h.calls[-1][0])
             self.assertEqual(run.call_count, 1)
