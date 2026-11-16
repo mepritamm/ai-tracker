@@ -7,7 +7,7 @@ Branch `worktree-tracker-agents-parity` (base personal/main f07f1e4). Opened 202
 
 | Clause | Status |
 |---|---|
-| Agent map / Agents section agree with the session's actual agents | not discharged |
+| Agent map / Agents section agree with the session's actual agents | **discharged** (2026-11-16). Live: 6/6 Claude Code fan agents match tracker running/waiting/done on every live job (impl reviews v3 A + v3 sonnet log). Evidence count reads "N agents · M shells" and reconciles with the map. Residuals: in-flight foreground Bash appears in fan before any transcript row; Claude Code's footer total ("51") is not derivable from disk; B3-4 classic UI. Lands on main via /tracker-push (user). |
 
 ## Diagnosis (sonnet, read-only; session 82ce95d1-1717-4154-9d1a-53798586893b, dw-vida-stack)
 Observed: Claude Code footer "51 agents · 3 shells" with 3 agents running; tracker Agent map "133 agents · 0 running"; Evidence "Agents & shells 142".
