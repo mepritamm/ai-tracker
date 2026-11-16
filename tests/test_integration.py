@@ -266,7 +266,7 @@ class TestSearchAllRanking(unittest.TestCase):
         self.assertEqual(set(by_source), {"claude", "auggie", "augment-vscode"},
                           "fixture must be found via all three providers")
         expected = {"id", "project", "title", "agent", "matches", "snippet",
-                    "inQuery", "titleMatch", "mtime"}
+                    "inQuery", "titleMatch", "mtime", "hidden"}
         for name, r in by_source.items():
             self.assertEqual(set(r.keys()), expected, "shape mismatch for %s" % name)
 

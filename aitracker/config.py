@@ -32,6 +32,7 @@ TITLE_SYNC_FILE = os.path.join(_HERE, "title_sync.json")
 
 
 PINS_FILE = os.path.join(_HERE, "pins.json")
+HIDDEN_FILE = os.path.join(_HERE, "hidden.json")   # {session_id: hidden_at_epoch}; app-owned, read live
 
 
 NOTES_FILE = os.path.join(_HERE, "notes.json")

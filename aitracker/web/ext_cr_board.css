@@ -1060,7 +1060,8 @@
 }
 .tracker-next .cr-rail-pin,
 .tracker-next .cr-rail-map,
-.tracker-next .cr-rail-rename {
+.tracker-next .cr-rail-rename,
+.tracker-next .cr-rail-remove {
   flex: 0 0 auto;
   border: 0;
   background: transparent;
@@ -1082,13 +1083,16 @@
 .tracker-next .cr-rail-row:hover .cr-rail-map,
 .tracker-next .cr-rail-row:focus-within .cr-rail-map,
 .tracker-next .cr-rail-row:hover .cr-rail-rename,
-.tracker-next .cr-rail-row:focus-within .cr-rail-rename { opacity: .6; }
+.tracker-next .cr-rail-row:focus-within .cr-rail-rename,
+.tracker-next .cr-rail-row:hover .cr-rail-remove,
+.tracker-next .cr-rail-row:focus-within .cr-rail-remove { opacity: .6; }
 .tracker-next .cr-rail-pin:hover,
 .tracker-next .cr-rail-map:hover,
-.tracker-next .cr-rail-rename:hover { opacity: 1 !important; background: var(--fill-row-hover); }
+.tracker-next .cr-rail-rename:hover,
+.tracker-next .cr-rail-remove:hover { opacity: 1 !important; background: var(--fill-row-hover); }
 .tracker-next .cr-rail-pin--on { opacity: 1; color: var(--text-agent); }
 @media (hover: none) {
-  .tracker-next .cr-rail-pin, .tracker-next .cr-rail-map, .tracker-next .cr-rail-rename { opacity: .6; }
+  .tracker-next .cr-rail-pin, .tracker-next .cr-rail-map, .tracker-next .cr-rail-rename, .tracker-next .cr-rail-remove { opacity: .6; }
 }
 
 .tracker-next .cr-rail-agentrow {
@@ -1806,6 +1810,8 @@
 .tracker-next .cr-tile-map svg { width: calc(12px * var(--ico-scale)); height: calc(12px * var(--ico-scale)); }
 .tracker-next .cr-tile-map:hover { color: var(--text-primary); }
 .tracker-next .cr-tile-map:focus-visible { outline: 2px solid var(--line-focus); outline-offset: 2px; }
+/* Remove button: must stay AFTER .cr-tile-map:hover (same specificity) so the red hover wins. */
+.tracker-next .cr-rail-remove:hover, .tracker-next .cr-tile-remove:hover { color: var(--text-failed); }
 .tracker-next .cr-tile-resume svg { width: calc(12px * var(--ico-scale)); height: calc(12px * var(--ico-scale)); }
 .tracker-next .cr-tile-resume:focus-visible { outline: 2px solid var(--line-focus); outline-offset: 2px; }
 /* 32px touch target on phones. */

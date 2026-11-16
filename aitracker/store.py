@@ -58,6 +58,26 @@ def load_pins():
     return p if isinstance(p, list) else []
 
 
+def load_hidden():
+    """{session_id: hidden_at_epoch} -- sessions the user removed from the dashboard. Read live.
+    Sticky: membership alone hides; the timestamp is metadata. Never touches a transcript (rule 6)."""
+    d = _load_json(config.HIDDEN_FILE, {})
+    return d if isinstance(d, dict) else {}
+
+
+def set_hidden(sid, hidden):
+    """Add (stamped now) or drop one id under _update_json's flock, so concurrent POSTs
+    never lose a write."""
+    def mutate(d):
+        if hidden:
+            d[sid] = time.time()
+        elif sid in d:
+            d.pop(sid)
+        else:
+            return False      # already visible: skip the rewrite
+    _update_json(config.HIDDEN_FILE, mutate)
+
+
 _TSTATUS = {"completed": "completed", "complete": "completed", "done": "completed",
             "in_progress": "in_progress", "started": "in_progress", "pending": "pending"}
 

@@ -770,6 +770,7 @@ window.CR = window.CR || {};
     var sessionsSearchResults = null;  // null (nothing resolved yet for this query) | Array of
                                         // /api/search hits, server-ranked, used AS-IS (never re-sorted)
     var sessionsSearchLoading = false;
+    var removedStack = [];   // ids this page removed, newest LAST (pop() = newest); page-lifetime only
     var sessionsSearchSeq = 0;         // request-sequence guard: a slow response for an older
                                         // query can never overwrite a newer one's results
     var sessionsSearchDebounce = null;
@@ -966,6 +967,7 @@ window.CR = window.CR || {};
       buildTopBar();
       buildTriageShell();
       applyRailMode();
+      bindUndoKey();   // BEFORE bindKeyboard: tests that capture only the last keydown listener must see bindKeyboard's
       bindKeyboard();
       bindResize();
     }
@@ -1706,6 +1708,7 @@ window.CR = window.CR || {};
           bg: known ? known.bg : '',
           cwd: known ? known.cwd : '',
           source: known ? known.source : '',
+          hidden: !!hit.hidden && !known,
         };
       });
     }
@@ -2114,13 +2117,14 @@ window.CR = window.CR || {};
             if (ctx && typeof ctx.dialog === 'function') ctx.dialog('rename', { sessionId: s.id, currentTitle: s.title || '' });
           }
         }, [glyph('edit', '')]),
+        (rich && !isReadOnly()) ? removeBtn(s, 'cr-rail-remove') : null,
       ]);
       return h('div', {
         class: 'cr-rail-row' + (s.id === selectedId() ? ' cr-rail-row--selected' : '') +
           (rich ? ' cr-rail-row--rich' : '') + rowMods,
         tabindex: '0', role: 'button', title: titleAttr, 'aria-label': label, 'data-id': s.id,
         onclick: function () { openSession(s.id); },
-        onkeydown: function (e) { if (e.key === 'Enter') openSession(s.id); }
+        onkeydown: function (e) { if (e.key === 'Enter' && e.target === e.currentTarget) openSession(s.id); }
       }, [
         // GAP CLOSE ("the current/existing dashboard view is much cleaner,
         // increase the height and try to get the similar information"): this row
@@ -2215,6 +2219,74 @@ window.CR = window.CR || {};
         renderRail(lastState);
         renderBoard(lastState);
         renderTriage(lastState);
+      });
+    }
+
+    // -- remove / restore (sticky; POST /api/hide, server owns hidden.json) ------
+    function postHidden(id, hidden) {
+      if (typeof fetch !== 'function') return Promise.resolve(false);
+      return fetch('/api/hide', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session: id, hidden: hidden }),
+      }).then(function (r) { return r.ok; }, function () { return false; }).then(function (ok) {
+        if (!ok) {
+          ctx && ctx.emit && ctx.emit('notify', { title: 'Couldn\u2019t update the session.', icon: 'alert', iconClass: 'tn-emo-a' });
+          return false;
+        }
+        // Flip the SOURCE search array; decorateSearchHits rebuilds copies every render.
+        (sessionsSearchResults || []).forEach(function (r) { if (r.id === id) r.hidden = hidden; });
+        if (hidden) { if (removedStack.indexOf(id) < 0) removedStack.push(id); }
+        else removedStack = removedStack.filter(function (x) { return x !== id; });
+        update(lastState);   // update() filters by removedStack and re-renders rail/triage/board/sessions
+        if (typeof loadSide === 'function') loadSide();   // refresh app.js `sessions` too (best effort)
+        return true;
+      });
+    }
+    function removeSession(s) {
+      postHidden(s.id, true).then(function (ok) {
+        if (!ok) return;
+        ctx && ctx.emit && ctx.emit('notify', {
+          title: 'Session removed \u00b7 \u2318Z / Ctrl+Z to undo',
+          actionLabel: 'Undo',
+          onAction: function () { postHidden(s.id, false); },
+        });
+      });
+    }
+    function undoLastRemove() {          // returns true iff it acted
+      var id = removedStack.pop();
+      if (!id) return false;
+      postHidden(id, false).then(function (ok) { if (!ok) removedStack.push(id); });
+      return true;
+    }
+    function isReadOnly() { return !!(ctx && typeof ctx.readOnly === 'function' && ctx.readOnly()); }
+    function removeBtn(s, cls) {
+      var restore = !!s.hidden;
+      var label = restore ? 'Restore to dashboard' : 'Remove from dashboard (log is kept)';
+      return h('button', {
+        class: cls, type: 'button', 'data-act': restore ? 'restore' : 'remove',
+        title: label, 'aria-label': label,
+        onclick: function (e) { e.stopPropagation(); if (restore) postHidden(s.id, false); else removeSession(s); }
+      }, [glyph(restore ? 'return' : 'x', '')]);
+    }
+    // Never steal Cmd/Ctrl+Z from a text field or a terminal: in a PTY, Ctrl+Z is SIGTSTP.
+    var UNDO_BLOCK_SEL = '#cr-term-root, #vtmodal, #vtmgrmodal, .vtpane, .xterm';
+    function isUndoBlockedTarget(t) {
+      if (!t) return false;
+      var tag = t.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable) return true;
+      return !!(typeof t.closest === 'function' && t.closest(UNDO_BLOCK_SEL));
+    }
+    function bindUndoKey() {
+      document.addEventListener('keydown', function (e) {
+        if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey || e.repeat) return;
+        if (e.key !== 'z' && e.key !== 'Z') return;
+        if (!root || !root.isConnected) return;
+        var nr = document.getElementById('nextRoot');
+        if (nr && nr.hidden) return;                 // Control Room not the visible mode
+        if (document.querySelector('.cr-dialog-layer[aria-hidden="false"]')) return;   // a CR dialog is open
+        if (isUndoBlockedTarget(e.target)) return;
+        if (!undoLastRemove()) return;               // empty stack: browser default passes through
+        e.preventDefault();
       });
     }
 
@@ -2918,6 +2990,7 @@ window.CR = window.CR || {};
           onclick: function (e) { e.stopPropagation(); openMap(ctx, s); }
         }, [glyph('agent', '')]));
       }
+      if (!readOnly) head.appendChild(removeBtn(s, 'cr-tile-map cr-tile-remove'));
       var body = [
         head,
         h('div', { class: 'cr-tile-title' }, [tileTitleText(s, state)]),
@@ -3227,6 +3300,8 @@ window.CR = window.CR || {};
 
     function update(state) {
       lastState = state || { sessions: [], now: Math.floor(Date.now() / 1000) };
+      // Client overlay: a poll already in flight may still carry a session this page just removed.
+      if (removedStack.length) lastState = Object.assign({}, lastState, { sessions: (lastState.sessions || []).filter(function (x) { return removedStack.indexOf(x.id) < 0; }) });
       var sessions = lastState.sessions || [];
       renderRail(lastState);
       renderTriage(lastState);

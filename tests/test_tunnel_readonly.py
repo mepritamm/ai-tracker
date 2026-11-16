@@ -22,7 +22,7 @@ PROXIED = {"Cf-Connecting-Ip": "1.2.3.4"}
 CRED = "u:p"
 RO_ERR = "read-only: this tracker is shared view-only"
 
-_STATE = ("TITLES_FILE", "PINS_FILE", "FLAGS_FILE", "NOTES_FILE", "TITLE_SYNC_FILE", "MODEL_KEEP_FILE")
+_STATE = ("TITLES_FILE", "PINS_FILE", "FLAGS_FILE", "NOTES_FILE", "TITLE_SYNC_FILE", "MODEL_KEEP_FILE", "HIDDEN_FILE")
 
 # Every mutating route (server.py POST chain + EXTRA_POST). Bodies are inert: if the choke point
 # were missing these must still not do anything dangerous (term routes get `{}` -> 400).
@@ -32,6 +32,7 @@ POST_ROUTES = [
     ("/api/tunnel", {"key": "TUNNEL_READONLY", "value": False}),
     ("/api/tunnel/ctl", {"action": "stop"}),
     ("/api/pin", {"session": "s1", "pinned": True}),
+    ("/api/hide", {"session": "s1", "hidden": True}),
     ("/api/model-keep", {"session": "s1", "model": "m"}),
     ("/api/flags", {"session": "s1", "text": "t"}),
     ("/api/flags/resolve", {"session": "s1", "id": "1"}),

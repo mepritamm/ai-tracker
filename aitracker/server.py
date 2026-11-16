@@ -13,7 +13,7 @@ from .schedule import sched_install, sched_uninstall, sched_status, autoinstall_
 from .schedule import svc_install, svc_uninstall, svc_status, svc_baked, svc_spawn_deferred, SVC_WAIT, SVC_GRACE
 from .update import update_status, update_fetch, update_apply, start_restart, _APPLY
 from .agent_cli import agent_status, agent_plan_upgrade, agent_start, agent_job_running, agent_plan_resume_all, agent_start_resume_all
-from .store import load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, save_model_keep, load_title_sync, save_title_sync, _load_json, _save_json
+from .store import set_hidden, load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, save_model_keep, load_title_sync, save_title_sync, _load_json, _save_json
 # TITLES_FILE/PINS_FILE (below) are referenced live as config.TITLES_FILE/config.PINS_FILE at
 # their write sites, never imported by name -- a copied name freezes the value at import
 # time, so a caller that repoints config.TITLES_FILE (e.g. a test's temp-dir override) would
@@ -480,7 +480,7 @@ class Handler(BaseHTTPRequestHandler):
                 tc = _term_count()
                 if tc is not None:
                     headers["X-Term-Count"] = str(tc)
-            self._json(all_sessions(), headers=headers)
+            self._json(all_sessions(include_hidden=False), headers=headers)
         elif p.path == "/api/flags":
             self._json(load_flags())
         elif p.path in ("/api/pending", "/api/pending/item"):
@@ -890,6 +890,14 @@ class Handler(BaseHTTPRequestHandler):
             elif not body.get("pinned") and sid in pins:
                 pins.remove(sid)
             _save_json(config.PINS_FILE, pins)
+            self._json({"ok": True})
+            return
+        if p.path == "/api/hide":
+            # Remove from dashboard: app-owned hidden.json only, never a session log (rule 6).
+            sid = body.get("session")
+            if not isinstance(sid, str) or not sid or len(sid) > 512:
+                return self._json({"error": "session required"}, 400)
+            set_hidden(sid, bool(body.get("hidden")))
             self._json({"ok": True})
             return
         if p.path == "/api/model-keep":

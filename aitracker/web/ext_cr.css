@@ -534,6 +534,8 @@ html.tracker-readonly .tracker-next .crd-notecard,
 html.tracker-readonly .tracker-next .cr-tile-action,
 html.tracker-readonly .tracker-next .cr-rail-pin,
 html.tracker-readonly .tracker-next .cr-rail-rename,
+html.tracker-readonly .tracker-next .cr-rail-remove,
+html.tracker-readonly .tracker-next .cr-tile-remove,
 html.tracker-readonly .tracker-next .crd-phone-input { display: none !important; }
 html.tracker-readonly .cr-topbar::after {
   content: "View only"; padding: 2px 8px; border-radius: 999px;

@@ -8,7 +8,7 @@ from .providers.augment_ext import AugmentVscodeProvider, AugmentCursorProvider
 # NOTE: one line, no parenthesised continuation — scripts/bundle.py strips imports
 # line-by-line (`^(import |from )`), so a wrapped import leaves its tail behind and
 # `make bundle` emits a file that won't parse.
-from .store import load_pins, load_notes, load_flags, load_forks, resolve_fork_child, fork_parent_of, load_model_keep, load_titles, load_title_sync
+from .store import load_hidden, load_pins, load_notes, load_flags, load_forks, resolve_fork_child, fork_parent_of, load_model_keep, load_titles, load_title_sync
 from .gateway import gateway_of, model_meta, or_launcher
 from .util import annotate_liveness, model_version, model_label, cost_summary, now_phrase
 from .overview import empty_heartbeat, headline, list_headline
@@ -18,8 +18,9 @@ PROVIDERS = [ClaudeProvider(), AuggieProvider(),
              AugmentVscodeProvider(), AugmentCursorProvider()]
 
 
-def all_sessions():
-    """Every available provider's sessions, pinned first then newest-first."""
+def all_sessions(include_hidden=True):
+    """Every available provider's sessions, pinned first then newest-first.
+    include_hidden=False drops ids the user removed (only /api/list asks for that)."""
     out = []
     for p in PROVIDERS:
         try:
@@ -32,6 +33,10 @@ def all_sessions():
                 out += rows
         except Exception:
             pass  # one broken provider must not sink the whole list
+    if not include_hidden:
+        hidden = load_hidden()
+        if hidden:
+            out = [s for s in out if s.get("id") not in hidden]
     pins = set(load_pins())                       # user-pinned ids, read live
     notes = load_notes()                          # per-session note stacks, read live
     open_flags = {}                               # session id -> unresolved 🚩 count, read live
@@ -408,6 +413,9 @@ def search_all(q):
         except Exception:
             pass
     out.sort(key=lambda r: (not r.get("titleMatch"), not r.get("inQuery"), -r.get("mtime", 0)))
+    hidden = load_hidden()
+    for r in out:
+        r["hidden"] = r.get("id") in hidden
     return out
 
 

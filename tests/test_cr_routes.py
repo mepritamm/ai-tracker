@@ -35,7 +35,7 @@ from aitracker.providers import claude as _claude
 
 _PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "VSCODE_WS_ROOT", "CURSOR_WS_ROOT",
           "FLAGS_FILE", "TITLES_FILE", "PINS_FILE", "NOTES_FILE", "TASKS_DIR", "PORT_FILE",
-          "TOKEN_FILE", "CONFIG_FILE", "FORKS_FILE")
+          "TOKEN_FILE", "CONFIG_FILE", "FORKS_FILE", "HIDDEN_FILE")
 
 _CFG_ATTRS = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL", "TERM_IDLE_TTL_MIN", "SNAPSHOT_TTL_MIN",
               "GATEWAY", "OPENROUTER_LAUNCHER", "OPENROUTER_SLOTS_FILE", "HEADER_LINE")
@@ -89,6 +89,7 @@ def _empty_env():
     config.FLAGS_FILE = tempfile.mktemp(suffix=".json")
     config.TITLES_FILE = tempfile.mktemp(suffix=".json")
     config.PINS_FILE = tempfile.mktemp(suffix=".json")
+    config.HIDDEN_FILE = tempfile.mktemp(suffix=".json")
     config.NOTES_FILE = tempfile.mktemp(suffix=".json")
     config.TASKS_DIR = tempfile.mkdtemp()
     config.PORT_FILE = tempfile.mktemp()
@@ -395,7 +396,7 @@ class TestApiSearchWholeStack(_ServerCase):
         self.assertTrue(j, "expected at least one hit")
         hit = next(h for h in j if h["id"] == "term-hit")
         expected_keys = {"id", "project", "title", "agent", "matches", "snippet",
-                          "inQuery", "titleMatch", "mtime"}
+                          "inQuery", "titleMatch", "mtime", "hidden"}
         self.assertEqual(set(hit.keys()), expected_keys)
         self.assertIsInstance(hit["matches"], int)
         self.assertIsInstance(hit["inQuery"], bool)
@@ -777,3 +778,75 @@ class TestGatewayEndToEnd(_ServerCase):
         self.assertNotIn("location.hostname", sl)
         self.assertNotIn("localOnly", sl)
         self.assertNotIn("isLocalhost", sl)
+
+
+# =============================================================================
+# Remove session (hidden.json, sticky)
+# =============================================================================
+
+from aitracker import registry as _registry
+
+
+class TestRemoveSession(_ServerCase):
+    def _listed(self):
+        st, j = self._get_json("/api/list")
+        self.assertEqual(st, 200)
+        return {r["id"] for r in j}
+
+    def test_hide_route_round_trips(self):
+        _write_claude("h1")
+        # F4: the harness must have repointed the file away from the worktree.
+        self.assertTrue(os.path.realpath(config.HIDDEN_FILE).startswith(
+            os.path.realpath(tempfile.gettempdir())))
+        self.assertIn("h1", self._listed())
+        st, j = self._post("/api/hide", {"session": "h1", "hidden": True})
+        self.assertEqual((st, j), (200, {"ok": True}))
+        self.assertNotIn("h1", self._listed())
+        with open(config.HIDDEN_FILE) as fh:
+            d = json.load(fh)
+        self.assertIsInstance(d["h1"], float)
+        st, j = self._post("/api/hide", {"session": "h1", "hidden": False})
+        self.assertEqual(st, 200)
+        self.assertIn("h1", self._listed())
+        with open(config.HIDDEN_FILE) as fh:
+            self.assertNotIn("h1", json.load(fh))
+        self.assertEqual(self._post("/api/hide", {})[0], 400)
+        self.assertEqual(self._post("/api/hide", {"session": 5})[0], 400)
+        self.assertEqual(self._post("/api/hide", {"session": "x" * 600, "hidden": True})[0], 400)
+
+    def test_hidden_filter_spans_providers_and_keeps_internal_callers(self):
+        _write_claude("h2")
+        _write_auggie("a2", "t")
+        with open(config.HIDDEN_FILE, "w") as fh:
+            json.dump({"h2": 1.0, "auggie:a2": 1.0}, fh)
+        shown = {s["id"] for s in _registry.all_sessions(include_hidden=False)}
+        self.assertNotIn("h2", shown)
+        self.assertNotIn("auggie:a2", shown)
+        every = {s["id"] for s in _registry.all_sessions()}
+        self.assertIn("h2", every)
+        self.assertIn("auggie:a2", every)
+
+    def test_removed_session_stays_hidden_through_new_activity(self):
+        now = time.time()
+        path = _write_claude("h3", mtime=now - 100)
+        self._post("/api/hide", {"session": "h3", "hidden": True})
+        self.assertNotIn("h3", self._listed())
+        iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 5))
+        with open(path, "a") as fh:
+            fh.write(json.dumps({"type": "user", "timestamp": iso,
+                                  "message": {"role": "user", "content": "more"}}) + "\n")
+        os.utime(path, (now + 5, now + 5))
+        _claude._META_CACHE.clear()
+        self.assertNotIn("h3", self._listed())
+        self._post("/api/hide", {"session": "h3", "hidden": False})
+        self.assertIn("h3", self._listed())
+
+    def test_search_marks_hidden_hits(self):
+        _write_claude("s1", prompt="please frobnicate the gizmo")
+        _write_claude("s2", prompt="also frobnicate the gizmo")
+        self._post("/api/hide", {"session": "s1", "hidden": True})
+        st, j = self._get_json("/api/search?q=frobnicate")
+        self.assertEqual(st, 200)
+        by = {h["id"]: h for h in j}
+        self.assertIs(by["s1"]["hidden"], True)
+        self.assertIs(by["s2"]["hidden"], False)
