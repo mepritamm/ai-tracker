@@ -3048,7 +3048,7 @@ def _resume_backstop(pt, sid, already_forked, cols, rows):
 # --------------------------------------------------------------------------- routes
 
 def _with_prompt(argv, p):
-    """Append the optional `mode=new` body `prompt` as claude's positional [prompt] argument (an
+    """Append the optional `mode=new`/`mode=resume` body `prompt` as claude's positional [prompt] argument (an
     interactive session that starts on it). Ignored when not a string, blank, over 4000 chars, or
     starting with `-` (it would parse as a flag), or holding a control character (typed into a shell:
     ^U/^C/an early bracketed-paste end); `shlex.join` in `_inject_argv` quotes the rest."""
@@ -3217,6 +3217,7 @@ def open_pty(handler, parsed, body):
             argv = term_gate.resume_argv(sid)
         except gateway.GatewayError as e:     # nothing is spawned or claimed
             return handler._json({"error": str(e), "openrouter_configured": False}, 400)
+        argv = _with_prompt(argv, body.get("prompt"))     # agent upgrade resumes a busy session with its prompt
         forked = "--fork-session" in argv
     elif mode == "new":
         gw = body.get("gateway")   # optional per-open override of config.GATEWAY; other values ignored
@@ -3252,7 +3253,7 @@ def open_pty(handler, parsed, body):
                     return handler._json({"tty": hit.id, "session": bound, "renderer": config.TERM_RENDERER,
                                           "forked": hit.forked, "notice": None,
                                           "starting": False, "reused": True,
-                                          "folder": hit.folder})
+                                          "attached": True, "folder": hit.folder})
             fp = _folder_pty(cwd)
             reused = fp is not None
             pending = None if fp is not None else _FOLDER_SPAWNING.get(cwd)
@@ -3353,7 +3354,8 @@ def open_pty(handler, parsed, body):
             if fp.fg is not None:
                 fp.fg.setdefault("grants", set()).add(sid)
         return handler._json({"tty": fp.id, "session": sid, "renderer": config.TERM_RENDERER, "forked": fp.forked,
-                              "notice": None, "starting": False, "reused": True, "folder": True})
+                              "notice": None, "starting": False, "reused": True, "folder": True,
+                              "attached": True})
     if busy_what is None and not settled:
         starting = mode == "resume"
         if starting:
@@ -3555,6 +3557,139 @@ def _swap_candidate(fp, sid, cwd):
             time.sleep(0.25)
     except Exception:
         return None
+
+
+
+
+def _agent_kids(pid):
+    """[(pid, lstart)] of `pid`'s tool-work children (`_claude_work_children`, non-strict), each with its
+    start time captured NOW so `_agent_sweep` can never signal a recycled pid. Forks: not under _LOCK."""
+    c = _provider()
+    ps = c._ps_lstart if c is not None else (lambda _p: "")
+    return [(k, ps(k)) for k in _claude_work_children(pid)]
+
+
+def _agent_sweep(kids, shell_pid):
+    """SIGTERM (then, after 2s, SIGKILL) the process group of each `(pid, lstart)` that is still the SAME
+    process (start time unchanged) and whose group is not 0, ours, or the shell's. -> count signalled.
+    Also stops `run_in_background` shells the session started. Never raises."""
+    c = _provider()
+    ps = c._ps_lstart if c is not None else (lambda _p: "")
+    sent = []
+    for k, lstart in kids or ():
+        try:
+            if not lstart or ps(k) != lstart:
+                continue
+            g = os.getpgid(k)
+            if g in (0, os.getpgrp(), shell_pid) or g in (x[1] for x in sent):
+                continue
+            os.killpg(g, signal.SIGTERM)
+            sent.append((k, g, lstart))
+        except OSError:
+            continue
+    if sent:
+        time.sleep(2.0)
+        for k, g, lstart in sent:
+            try:
+                if ps(k) == lstart:
+                    os.killpg(g, signal.SIGKILL)
+            except OSError:
+                pass
+    return len(sent)
+
+
+def stop_for_upgrade(tty, sid, pid, thin=False):
+    """Stop the Claude in tracker pane `tty` (identified by its foreground pgid `pid`) for an agent
+    upgrade: SIGTERM first, wait PARKED_DETACH_WAIT, SIGKILL fallback, then sweep its tool children.
+    A folder pane keeps its shell and tty. -> {stopped, graceful, confirmed, work_children,
+    orphans_killed, error, closed}. Never raises. `sid` is informational (the identity check is the pid)."""
+    out = {"stopped": False, "graceful": False, "confirmed": False, "work_children": 0,
+           "orphans_killed": 0, "error": "", "closed": False}
+    try:
+        with _LOCK:
+            _reap()
+            pt = PTYS.get(tty)
+            if pt is None or pt.done or pt.closing:
+                out["error"], out["closed"] = "its terminal closed", True
+                return out
+            _refresh_fg(pt)
+            pg = _fg_pgid(pt) if pt.folder else pt.pid
+            already = bool(pt.folder and pg == pt.pid)
+            if not already and pg != pid:
+                out["error"] = "a different program is now running in that terminal"
+                return out
+            if pg <= 0 or pg == os.getpgrp():
+                out["error"] = "a different program is now running in that terminal"
+                return out
+        kids = [] if already else _agent_kids(pg)
+        out["work_children"] = len(kids)
+        if not already:
+            try:
+                os.killpg(pg, signal.SIGTERM)
+            except OSError:
+                pass
+        if pt.folder:
+            graceful = _folder_wait_prompt(pt, PARKED_DETACH_WAIT)
+        else:
+            end = time.time() + PARKED_DETACH_WAIT
+            while not pt.done and time.time() < end:
+                time.sleep(BACKSTOP_POLL)
+            graceful = pt.done
+        out["graceful"] = graceful
+        if not graceful:
+            if pg > 0 and not (pt.folder and pg == pt.pid) and pg != os.getpgrp():
+                try:
+                    os.killpg(pg, signal.SIGKILL)
+                except OSError:
+                    pass
+            end = time.time() + CLOSE_CONFIRM_WAIT
+            while time.time() < end:
+                if pt.folder:
+                    if _fg_pgid(pt) == pt.pid:
+                        break
+                elif pt.done:
+                    break
+                time.sleep(BACKSTOP_POLL)
+        try:
+            os.kill(pid, 0)
+            gone = False
+        except ProcessLookupError:
+            gone = True
+        except OSError:
+            gone = False
+        if pt.folder:
+            with _LOCK:
+                _refresh_fg(pt)
+                claim_cleared = pt.fg is None
+            out["confirmed"] = gone and claim_cleared
+        else:
+            out["confirmed"] = gone and pt.done
+        if thin and out["confirmed"] and pt.screen is not None:
+            with pt.lock:
+                pt.screen.feed(_TERM_MODE_RESET)
+                _tee_raw(pt, _TERM_MODE_RESET)
+        out["orphans_killed"] = _agent_sweep(kids, pt.pid)
+        out["stopped"] = True
+    except Exception as e:
+        out["error"] = "stop failed: %s" % e
+    return out
+
+
+class _Internal:
+    headers = {"Host": "127.0.0.1"}   # term_gate.guard's loopback-Host check; no Origin = same-origin
+
+    def __init__(self):
+        self.reply = (500, {"error": "no reply"})
+
+    def _json(self, obj, code=200, headers=None):
+        self.reply = (code, obj)
+
+
+def call_route(fn, body):
+    """Call an `open_pty`/`close_pty`-shaped route in-process -> (code, obj)."""
+    h = _Internal()
+    fn(h, None, body)
+    return h.reply
 
 
 def _swap_in(fp, cand, sid, argv, forked, cols, rows):
@@ -4105,6 +4240,92 @@ def _claude_work_children(claude_pid, strict=False):
                 and not _is_claude_daemon(parts[3] if len(parts) > 3 else "")):
             kids.append(pid)
     return kids
+
+
+def upgrade_candidates():
+    """The tracker panes whose foreground is a Claude, as agent-upgrade rows (plan 5.3). Forks `ps`:
+    never call under _LOCK. Never raises (-> [])."""
+    try:
+        with _LOCK:
+            _reap()
+            panes = [p for p in PTYS.values() if not p.done and not p.closing]
+            for p in panes:
+                if p.folder:
+                    _refresh_fg(p)
+        c = _provider()
+        run = {}
+        if c is not None:
+            try:
+                run = {r["pid"]: r for r in c.running_sessions()}
+            except Exception:
+                run = {}
+        orl = gateway.or_launcher()[0]
+        rows = []
+        for p in panes:
+            if not _foreground_is_claude(p.fd):
+                continue
+            pg = _fg_pgid(p) if p.folder else p.pid
+            label = (_pty_session_ids(p) or ("",))[0]
+            e = run.get(pg)
+            sid = e["id"] if e and e.get("host") == "tui" else label
+            relabelled = label if (label and sid != label) else ""
+            bg = _background_target(sid) if sid else ""
+            daemon = bool(bg)
+            thin = bool(_thin_client_short(pg))
+            target = bg or sid
+            entry = e
+            if daemon:
+                entry = next((r for r in run.values() if r.get("id") == bg and r.get("kind") == "bg"), None)
+            version = entry.get("version", "") if entry else ""
+            short = (entry.get("job") or "") if daemon and entry else ""
+            cwd_to = term_gate.session_cwd(target, resume=True) if target else ""
+            needs_slot = not any(q.folder and q.cwd == cwd_to and (q is p or (q.fg is None and _fg_pgid(q) == q.pid))
+                                 for q in panes)
+            stoppable, reason, argv = True, "", None
+            if not sid:
+                stoppable, reason = False, ("the tracker cannot tell which session this terminal runs "
+                                            "(for example Claude's agent view)")
+            elif not term_gate.allowed():
+                stoppable, reason = False, ("terminals are disabled here (TRACKER_TERMINAL=0, or a network "
+                                            "bind without TRACKER_AUTH)")
+            else:
+                try:
+                    argv = term_gate.resume_argv(target)
+                except gateway.GatewayError as err:
+                    stoppable, reason = False, str(err)
+                if stoppable and not cwd_to:
+                    stoppable, reason = False, "its folder no longer exists"
+                elif stoppable and daemon and not re.fullmatch(r"[0-9a-f]{4,64}", short or ""):
+                    stoppable, reason = False, "could not find its background job"
+                elif stoppable and thin and not daemon:
+                    stoppable, reason = False, "could not find its background job"
+            if daemon:
+                command = ["claude stop " + short, "claude --resume " + bg]
+            else:
+                command = [shlex.join(argv)] if argv else []
+            rows.append({"tty": p.id, "session": sid, "relabelled": relabelled, "target": target, "pid": pg,
+                         "version": version, "status": (entry or {}).get("status_raw"), "cwd": p.cwd,
+                         "title": _term_title(p, orl),
+                         "cols": p.screen.cols if p.screen else DEFAULT_COLS,
+                         "rows": p.screen.rows if p.screen else DEFAULT_ROWS,
+                         "folder": p.folder, "thin": thin, "daemon": daemon, "job_short": short,
+                         "needs_slot": needs_slot, "stoppable": stoppable, "reason": reason,
+                         "command": command})
+        groups = {}
+        for r in rows:
+            if r["target"]:
+                groups.setdefault(r["target"], []).append(r)
+        for r in rows:
+            g = groups.get(r["target"], [])
+            if len(g) > 1:
+                r["dup_group"] = sorted(x["tty"] for x in g)
+                first = next((x for x in g if x["stoppable"]), None)
+                r["primary"] = r is first
+            else:
+                r["dup_group"], r["primary"] = [], True
+        return rows
+    except Exception:
+        return []
 
 
 def _claude_busy(pt):

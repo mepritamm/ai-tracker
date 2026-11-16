@@ -182,6 +182,15 @@ def provider_for(sid):
     return None
 
 
+def resume_cmd(sid, model):
+    """`claude --resume <sid>` for a Claude session, through the OpenRouter launcher when its model ran there;
+    None when that launcher is not configured."""
+    if gateway_of(model) == "openrouter":
+        lau, _err = or_launcher()
+        return (shlex.quote(lau) + " --resume " + sid) if lau else None
+    return "claude --resume " + sid
+
+
 def parse_any(sid):
     """Route a namespaced session id to the provider that owns it."""
     p = provider_for(sid)
@@ -280,11 +289,7 @@ def parse_any(sid):
         meta["model_update"] = None
         meta.update(model_meta(meta.get("model")))   # gateway/model_ladder/model_hints/model_slot
         if p is not None and p.prefix == "":   # Claude sessions only (the unprefixed provider)
-            if meta.get("gateway") == "openrouter":
-                lau, _err = or_launcher()      # None when unconfigured: no command to offer
-                meta["resume_cmd"] = (shlex.quote(lau) + " --resume " + sid) if lau else None
-            else:
-                meta["resume_cmd"] = "claude --resume " + sid
+            meta["resume_cmd"] = resume_cmd(sid, meta.get("model"))
         cur = model_version(meta.get("model"))
         if cur and meta.get("gateway") != "openrouter":   # nudge is Anthropic-family logic
             family, cur_ver = cur

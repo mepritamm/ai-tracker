@@ -1304,6 +1304,137 @@
     return wrap;
   }
 
+  // Agents (Config): every sentence is server-written (agent_cli.py); the JS owns only button labels.
+  var _agentJobTimer = null, _agentToasted = null, _agentWatchId = null;
+  function agentWatchJob(id) {
+    if (_agentJobTimer) {
+      if (_agentWatchId === id) return;
+      clearInterval(_agentJobTimer); _agentJobTimer = null;
+    }
+    _agentWatchId = id;
+    _agentJobTimer = setInterval(function () {
+      crCall('/api/agents').then(function (r) {
+        if (_agentWatchId !== id) return;
+        if (!r.ok) return;
+        var j = r.body.job;
+        if (!j || j.id !== id) { clearInterval(_agentJobTimer); _agentJobTimer = null; return; }
+        if (j.state === 'running') return;
+        clearInterval(_agentJobTimer); _agentJobTimer = null;
+        if (_agentToasted !== j.id) { _agentToasted = j.id; toast({ title: j.summary, duration: 30000 }); }
+      });
+    }, 2000);
+  }
+
+  function agentsBlock() {
+    if (crReadOnly()) return null;
+    var wrap = h('div', { class: 'cr-agents-block' });
+    var st = null, msg = '', plan = null, pending = false, poll = null;
+    function cmdLines(cmds) {
+      return (cmds || []).map(function (c) { return h('div', {}, [h('code', {}, [c])]); });
+    }
+    function confirmBox() {
+      var kids = [h('div', { class: 'cr-update-confirm-text' }, [plan.message || ''])];
+      (plan.stop || []).forEach(function (c) {
+        kids.push(h('div', { class: 'cr-cfg-row-sub' }, [
+          [c.title, c.cwd, c.version, c.version_text, c.state_text, c.relabelled_text, c.dup_text].filter(Boolean).join(' · ')]));
+      });
+      (plan.cannot_stop || []).forEach(function (c) {
+        kids.push(h('div', { class: 'cr-cfg-row-sub' }, [[c.title, c.reason].filter(Boolean).join(' · ')]));
+        cmdLines(c.command).forEach(function (l) { kids.push(l); });
+      });
+      (plan.outside || []).forEach(function (o) {
+        kids.push(h('div', { class: 'cr-cfg-row-sub' }, [
+          [o.title, o.version, o.out_of_date_text, o.how].filter(Boolean).join(' · ')]));
+        cmdLines(o.command).forEach(function (l) { kids.push(l); });
+      });
+      if (plan.note) kids.push(h('div', { class: 'cr-cfg-row-sub' }, [plan.note]));
+      var agent = plan.agent;
+      kids.push(crBtn('Upgrade and restart these', function () {
+        var confirm = (plan.stop || []).map(function (c) { return { tty: c.tty, session: c.session }; });
+        plan = null; run(agent, 'upgrade', confirm);
+      }, 'cr-btn-danger'));
+      kids.push(crBtn('Cancel', function () { plan = null; paint(); }));
+      return h('div', { class: 'cr-update-confirm cr-agents-confirm', role: 'alertdialog' }, kids);
+    }
+    function jobView(job) {
+      var kids = [];
+      if (job.state === 'running') {
+        kids.push(h('div', { class: 'cr-cfg-row-sub' }, [job.step || '']));
+      } else {
+        kids.push(h('div', { class: 'cr-cfg-row-name' }, [job.summary || '']));
+        if (job.output) kids.push(h('pre', {}, [job.output]));
+        (job.items || []).forEach(function (i) {
+          kids.push(h('div', { class: 'cr-cfg-row-sub' }, [[i.title, i.detail].filter(Boolean).join(' — ')]));
+        });
+        (job.outside || []).forEach(function (o) {
+          kids.push(h('div', { class: 'cr-cfg-row-sub' }, [[o.title, o.version, o.out_of_date_text, o.how].filter(Boolean).join(' · ')]));
+          cmdLines(o.command).forEach(function (l) { kids.push(l); });
+        });
+      }
+      return h('div', { class: 'cr-agents-job' }, kids);
+    }
+    function paint() {
+      var job = st && st.job, running = !!(job && job.state === 'running') || pending;
+      wrap.innerHTML = '';
+      if (!st) wrap.appendChild(h('div', { class: 'cr-cfg-row-sub' }, [msg || 'Loading…']));
+      (st ? st.agents || [] : []).forEach(function (a) {
+        var ctl = h('div', { class: 'cr-cfg-row-control' });
+        if (a.can_doctor) {
+          var d = crBtn('Doctor', function () { run(a.id, 'doctor'); });
+          if (running) d.setAttribute('disabled', 'disabled');
+          ctl.appendChild(d);
+        }
+        if (a.can_upgrade) {
+          var u = crBtn('Upgrade', function () { run(a.id, 'upgrade'); });
+          if (running || !a.installed) u.setAttribute('disabled', 'disabled');
+          ctl.appendChild(u);
+        }
+        var sub = [h('div', {}, [a.error ? a.error : a.installed ? a.installed : a.checking ? 'checking…' : ''])];
+        if (a.note) sub.push(h('div', {}, [a.note]));
+        wrap.appendChild(h('div', { class: 'cr-cfg-row cr-agent-row' }, [
+          h('div', { class: 'cr-cfg-row-label' }, [
+            h('div', { class: 'cr-cfg-row-name' }, [a.label || a.id]),
+            h('div', { class: 'cr-cfg-row-sub' }, sub),
+          ]),
+          ctl,
+        ]));
+      });
+      if (msg && st) wrap.appendChild(h('div', { class: 'cr-cfg-row-sub' }, [msg]));
+      if (plan) wrap.appendChild(confirmBox());
+      if (job) wrap.appendChild(jobView(job));
+    }
+    function load(first) {
+      crCall('/api/agents').then(function (r) {
+        if (r.ok) {
+          st = r.body;
+          if (first && st.job && st.job.state === 'running') agentWatchJob(st.job.id);
+        } else msg = (r.body && r.body.error) || 'request failed';
+        paint();
+        var again = (st && st.job && st.job.state === 'running') || (st && (st.agents || []).some(function (a) { return a.checking; }));
+        if (again && !poll) {
+          poll = setTimeout(function () { poll = null; if (wrap.isConnected !== false) load(false); }, 2000);
+        }
+      });
+    }
+    function run(agent, action, confirm) {
+      pending = true; msg = ''; paint();
+      var body = { agent: agent, action: action };
+      if (confirm !== undefined) body.confirm = confirm;
+      crCall('/api/agents/run', 'POST', body).then(function (r) {
+        pending = false;
+        if (r.status === 202 && r.body.job) {
+          st = st || {}; st.job = r.body.job; agentWatchJob(r.body.job.id);
+          paint(); load(false); return;
+        }
+        if (r.status === 409 && r.body.needs_confirm) { plan = r.body; paint(); return; }
+        msg = (r.body && r.body.error) || 'request failed';
+        paint();
+      });
+    }
+    paint(); load(true);
+    return wrap;
+  }
+
   function renderConfig(payload) {
     var srv = (payload && payload.server) || {};
     // Header subtitle: 5c gives Config the real server address (its mock shows
@@ -1315,7 +1446,7 @@
     var chrome = buildChrome('config', 'Config', 'gear', subtitle, true);
     chrome.panel.classList.add('cr-dialog-config');
 
-    var sections = ['Interface', 'Board', 'Terminal', 'Notifications', 'Server', 'Tunnel', 'Data files'];
+    var sections = ['Interface', 'Board', 'Terminal', 'Agents', 'Notifications', 'Server', 'Tunnel', 'Data files'];
     var nav = h('div', { class: 'cr-cfg-nav' });
     var body = h('div', { class: 'cr-cfg-body' });
     // `payload.section` lets a caller open Config straight onto a given tab -- the boot-
@@ -1568,6 +1699,8 @@
           function (value, onCommit) {
             return textareaCtl(value || '', function (text) { onCommit(text); }, 'default set (leave empty)');
           }));
+      } else if (active === 'Agents') {
+        var agEl = agentsBlock(); if (agEl) body.appendChild(agEl);
       } else if (active === 'Notifications') {
         // Fix (drift 4): this tab used to carry its own second copy of the two toggles
         // now combined into the Interface tab's single "Desktop notifications + sound"

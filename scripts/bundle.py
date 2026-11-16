@@ -12,7 +12,7 @@ ORDER = [
     "config.py", "util.py", "gateway.py", "store.py", "overview.py",
     "providers/base.py", "providers/claude.py", "providers/auggie.py",
     "providers/augment_ext.py",
-    "registry.py", "tunnel.py", "schedule.py", "pending.py", "update.py", "server.py", "cli.py",
+    "registry.py", "tunnel.py", "schedule.py", "pending.py", "update.py", "agent_cli.py", "server.py", "cli.py",
 ]
 
 HEADER = '''#!/usr/bin/env python3

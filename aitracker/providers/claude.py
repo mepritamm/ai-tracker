@@ -233,7 +233,7 @@ def _tail_scan(path, nbytes=96000):
     shells_running = sum(1 for sid in shell_ids.values() if sid not in shell_done)
     return {"ai": ai, "custom": custom, "entry": entry, "waiting": waiting, "ended": ended,
             "last_text": last_text, "model": model, "fail_cmd": fail_cmd,
-            "shells_running": shells_running}
+            "shells_running": shells_running, "last": last}
 
 
 def _tail_fields(path, nbytes=96000):
@@ -703,6 +703,105 @@ def background_id(sid):
         return j if j and daemon_repl_pid(j) > 0 else ""
     except Exception:
         return ""
+
+
+_JOB_RE = re.compile(r"[0-9a-f]{4,64}")
+
+
+def session_state(sid, status=None):
+    """THE busy signal: "busy" | "waiting" | "idle" | "". A non-empty pid-file `status` decides:
+    idle -> idle, waiting -> waiting, anything else (busy, shell, unseen) -> busy. Otherwise the
+    transcript tail decides; no transcript -> "". Never raises."""
+    try:
+        if isinstance(status, str) and status:
+            return "idle" if status == "idle" else "waiting" if status == "waiting" else "busy"
+        path = find_session(sid)
+        if path is None:
+            return ""
+        t = _tail_scan(path)
+        if t.get("waiting"):
+            return "waiting"
+        if t.get("last") in ("assistant_tool", "tool_result", "user_prompt"):
+            return "busy"
+        return "idle"
+    except Exception:
+        return ""
+
+
+def running_sessions():
+    """Live Claude processes from LIVE_SESSIONS_DIR/*.json: [{id,pid,version,kind,entrypoint,job,host,
+    state,status_raw,cwd,title,model}]. Reads only pid/procStart/sessionId/kind/entrypoint/jobId/
+    parkedJobId/version/status/cwd. An entry needs an int pid that is alive AND a procStart equal to the
+    process's real start time (fail closed, like parked_job_id). Never raises."""
+    out = []
+    try:
+        names = sorted(glob.glob(os.path.join(config.LIVE_SESSIONS_DIR, "*.json")))
+    except Exception:
+        return out
+    for fn in names:
+        try:
+            with open(fn) as fh:
+                raw = json.load(fh)
+            if not isinstance(raw, dict):
+                continue
+            d = {k: raw.get(k) for k in ("pid", "procStart", "sessionId", "kind", "entrypoint", "jobId",
+                                         "parkedJobId", "version", "status", "cwd")}
+            pid = d["pid"]
+            if type(pid) is not int or pid <= 0 or not _pid_alive(pid):
+                continue
+            started = d["procStart"]
+            if not isinstance(started, str) or " ".join(started.split()) != _ps_lstart(pid):
+                continue
+            sid = d["sessionId"]
+            if not isinstance(sid, str) or not sid:
+                continue
+            kind = d["kind"] if isinstance(d["kind"], str) else ""
+            entry = d["entrypoint"] if isinstance(d["entrypoint"], str) else ""
+            job = d["jobId"] or d["parkedJobId"] or ""
+            job = job if isinstance(job, str) and _JOB_RE.fullmatch(job) else ""
+            host = "daemon" if kind == "bg" or d["parkedJobId"] else "desktop" if entry == "claude-desktop" else "tui"
+            status = d["status"] if isinstance(d["status"], str) else None
+            path = find_session(sid)
+            model = ""
+            if path:
+                try:
+                    model = _session_meta(path).get("model") or ""
+                except Exception:
+                    model = ""
+            out.append({"id": sid, "pid": pid, "version": d["version"] if isinstance(d["version"], str) else "",
+                        "kind": kind, "entrypoint": entry, "job": job, "host": host,
+                        "state": session_state(sid, status), "status_raw": status,
+                        "cwd": d["cwd"] if isinstance(d["cwd"], str) else "",
+                        "title": session_label(sid), "model": model})
+        except Exception:
+            continue
+    return out
+
+
+def transcript_size(sid):
+    """Byte size of a session's transcript, 0 when there is none. Never raises."""
+    try:
+        path = find_session(sid)
+        return os.path.getsize(path) if path else 0
+    except Exception:
+        return 0
+
+
+def user_line_has(sid, text, since=0):
+    """True when a user line after byte offset `since` (last 96 KB at most) contains `text` (raw
+    substring check, like _CONTINUED_MARK). Never raises."""
+    try:
+        path = find_session(sid)
+        if not path or not isinstance(text, str) or not text:
+            return False
+        needle = json.dumps(text)[1:-1].encode()
+        with open(path, "rb") as fh:
+            size = fh.seek(0, 2)
+            fh.seek(max(int(since or 0), size - 98304, 0))
+            tail = fh.read()
+        return any(b'"type":"user"' in ln and needle in ln for ln in tail.split(b"\n"))
+    except Exception:
+        return False
 
 
 def session_label(sid):
@@ -2205,6 +2304,12 @@ def parse_session(path):
 
 class ClaudeProvider(Provider):
     prefix = ""
+    agent_cli = {"id": "claude", "label": "Claude Code", "bin": "claude",
+                 "version": ["--version"], "doctor": ["doctor"], "update": ["update"],
+                 "update_timeout": 600, "restarts_sessions": True}
+
+    def running(self):
+        return running_sessions()
 
     def available(self):
         return os.path.isdir(config.PROJECTS)

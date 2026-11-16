@@ -10,7 +10,8 @@ from .gateway import openrouter_configured
 from .registry import all_sessions, parse_any, search_all, search_session, drill, _attached_pty
 from .pending import start_worker, load_report, item_detail, run_async
 from .schedule import sched_install, sched_uninstall, sched_status, autoinstall_once, _optout_path
-from .update import update_status, update_fetch, update_apply, start_restart
+from .update import update_status, update_fetch, update_apply, start_restart, _APPLY
+from .agent_cli import agent_status, agent_plan_upgrade, agent_start, agent_job_running
 from .store import load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, save_model_keep, load_title_sync, save_title_sync, _load_json, _save_json
 # TITLES_FILE/PINS_FILE (below) are referenced live as config.TITLES_FILE/config.PINS_FILE at
 # their write sites, never imported by name -- a copied name freezes the value at import
@@ -473,6 +474,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(load_report())
             d = item_detail(parse_qs(p.query).get("id", [""])[0])
             self._json(d if d is not None else {"error": "unknown item"}, 200 if d is not None else 404)
+        elif p.path == "/api/agents":
+            # agent CLI versions / session paths: this machine only (never in _RO_GET_ALLOW)
+            ok, err = _local_caller(self)
+            if not ok:
+                return self._json({"error": err}, 403)
+            return self._json(agent_status())
         elif p.path in ("/api/update", "/api/scheduler"):
             # checkout path / git state / scheduler job: this machine only (never in _RO_GET_ALLOW)
             ok, err = _local_caller(self)
@@ -684,6 +691,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": err}, 403)
             run_async("dry-run")        # list-only, off the request thread; False = a scan is already running
             return self._json({"running": True}, 202)
+        if p.path == "/api/agents/run":
+            ok, err = _local_caller(self)
+            if not ok:
+                return self._json({"error": err}, 403)
+            if not isinstance(body, dict):                # do_POST accepts any JSON value
+                return self._json({"error": "bad body: expected a JSON object"}, 400)
+            agent, action, confirm = body.get("agent"), body.get("action"), body.get("confirm")
+            if (action == "upgrade" and confirm is None and isinstance(agent, str)
+                    and not agent_job_running() and not _APPLY.locked()):   # busy -> agent_start's 409, never a stale preview
+                plan = agent_plan_upgrade(agent)          # None for an unknown agent -> falls to agent_start's 400
+                if plan is not None:
+                    return self._json(plan, 409)
+            code, out = agent_start(agent, action, confirm)
+            return self._json(out, code)
         if p.path == "/api/config":
             # Writes a runtime setting into config.json (see config.py's big module comment
             # for the precedence/liveness contract). ALLOWLIST-ONLY: `key` must be a member of

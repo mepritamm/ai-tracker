@@ -27,7 +27,7 @@ python -m aitracker --version | --help | --selfcheck
 ```
 
 ## Architecture (the seams)
-- **Providers.** Each tool is a `Provider` (`available/list/parse/search`) in `aitracker/providers/`. Registry (`registry.py`): `PROVIDERS`, `all_sessions()`, `parse_any(sid)`, `search_all(q)`. Routes call the seam, never a source. Ids namespaced by prefix (`""`=Claude, `auggie:`). **Add a tool = one module in `providers/` + one line in `PROVIDERS` + a `SRC` label in `web/app.js`.**
+- **Providers.** Each tool is a `Provider` (`available/list/parse/search`) in `aitracker/providers/`. Registry (`registry.py`): `PROVIDERS`, `all_sessions()`, `parse_any(sid)`, `search_all(q)`. Routes call the seam, never a source. Ids namespaced by prefix (`""`=Claude, `auggie:`). **Add a tool = one module in `providers/` + one line in `PROVIDERS` + a `SRC` label in `web/app.js`** (+ an optional `agent_cli` descriptor / `running()` for Config → Agents).
 - **Shared shapes** both providers emit: the session-list dict and the session-detail dict (`meta/todos/files/commands/narration/agents_bg/shells/overview/counts/…`). The SPA renders any source uniformly.
 - **Overridable paths are late-bound via `config.NAME`** (so tests and callers see one source of truth). `store.py`/`providers/*` reference `config.FLAGS_FILE` etc., not a copied import.
 - **App-owned state:** `flags.json`/`titles.json` via `store._load_json`/`_save_json` — read **live**. Both gitignored.

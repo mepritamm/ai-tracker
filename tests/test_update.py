@@ -31,6 +31,23 @@ class UpdateTests(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
+    # -- agent-job lock (S2)
+    def test_apply_refused_while_agent_job_holds_lock(self):
+        self.assertTrue(update._AGENT_JOB_LOCK.acquire(blocking=False))
+        try:
+            code, body = update.update_apply()
+        finally:
+            update._AGENT_JOB_LOCK.release()
+        self.assertEqual(code, 409)
+        self.assertIn("agent upgrade", body["error"])
+        self.assertFalse(update._APPLY.locked())
+
+    def test_run_passes_cwd(self):
+        d = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(os.rmdir, d)
+        rc, out, _ = update._run([sys.executable, "-c", "import os;print(os.getcwd())"], 20, cwd=d)
+        self.assertEqual(os.path.realpath(out.decode().strip()), d)
+
     # -- status / fetch
     def test_behind_after_fetch(self):
         self.assertEqual(update.update_status()["behind"], 0)

@@ -25,6 +25,7 @@ from .pending import _pending_lock, _RUNNING
 FETCH_TIMEOUT = 60            # s, git fetch
 PREFLIGHT_TIMEOUT = 90        # s, import + startup smoke test of the fetched tree
 _APPLY = threading.Lock()     # single-flight apply
+_AGENT_JOB_LOCK = threading.Lock()   # held by agent_cli for a whole Doctor/Upgrade job; update_apply refuses while held
 _FETCH = threading.Lock()     # single-flight git fetch
 _RESTART_ERROR = None         # str set when exec fails; surfaced in update_status()
 _STARTED_AT = time.time()     # module import = process start
@@ -59,13 +60,13 @@ def _kill_proc_group(p):
             pass
 
 
-def _run(argv, timeout, env=None):
+def _run(argv, timeout, env=None, cwd=None):
     """argv -> (rc, stdout_bytes, stderr_bytes). stdin closed, no controlling tty (own session, so
     ssh cannot read a passphrase from /dev/tty), and on timeout the whole group is killed: (None, b"", b"timeout")."""
     kw = {} if os.name == "nt" else {"start_new_session": True}
     try:
         p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, env=env or _git_env(), **kw)
+                             stderr=subprocess.PIPE, env=env or _git_env(), cwd=cwd, **kw)
     except OSError as e:
         return None, b"", str(e).encode()
     try:
@@ -265,6 +266,9 @@ def update_apply(confirm_terminals=False):
     global _HELD
     if not _APPLY.acquire(blocking=False):
         return 409, {"error": "update already in progress"}
+    if _AGENT_JOB_LOCK.locked():
+        _APPLY.release()
+        return 409, {"error": "an agent upgrade is running — try again when it finishes"}
     cm = _pending_lock()
     try:
         got = cm.__enter__()

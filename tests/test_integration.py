@@ -1756,11 +1756,21 @@ class TestBundle(unittest.TestCase):
         names = {}
         for n in ast.parse(src).body:
             for nm in ([n.name] if isinstance(n, (ast.FunctionDef, ast.ClassDef)) else
-                       [t.id for t in n.targets if isinstance(t, ast.Name)] if isinstance(n, ast.Assign) else []):
+                       [t.id for tg in n.targets for t in ast.walk(tg) if isinstance(t, ast.Name)]
+                       if isinstance(n, ast.Assign) else []):      # tuple targets count too (AGENT_STEP_OLD, ...)
                 names[nm] = names.get(nm, 0) + 1
         for nm in ("sched_install", "sched_status", "sched_uninstall", "cli_main", "tick", "clean", "_pending_lock", "_lock",
-                   "_sched_run", "_run", "update_status", "update_fetch", "update_apply", "start_restart", "restart_in_place"):
+                   "_sched_run", "_run", "update_status", "update_fetch", "update_apply", "start_restart", "restart_in_place",
+                   "_AGENT_JOB_LOCK", "running_sessions", "session_state", "user_line_has", "transcript_size", "resume_cmd"):
             self.assertEqual(names.get(nm), 1, nm)
+        # every top-level name of agent_cli.py is flattened into the same namespace: none may collide (M4, N2)
+        mod = ast.parse(open(os.path.join(self.root, "aitracker", "agent_cli.py")).read())
+        for n in mod.body:
+            for nm in ([n.name] if isinstance(n, (ast.FunctionDef, ast.ClassDef)) else
+                       [t.id for tg in n.targets for t in ast.walk(tg) if isinstance(t, ast.Name)]
+                       if isinstance(n, ast.Assign) else
+                       [t.id for t in ast.walk(n.target) if isinstance(t, ast.Name)] if isinstance(n, ast.AnnAssign) else []):
+                self.assertEqual(names.get(nm), 1, nm)
         self.assertEqual(names.get("_root"), 2)   # schedule.py and update.py: identical bodies, last wins
 
     def test_bundle_update_status_reports_bundle_without_git(self):

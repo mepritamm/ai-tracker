@@ -1478,4 +1478,17 @@ def _run():
         import shutil as _sh
         _sh.rmtree(_or_tmp, ignore_errors=True)
 
+    from aitracker import agent_cli as _ac
+    from aitracker.registry import PROVIDERS as _AP
+    _ad = {p.agent_cli["id"]: p.agent_cli for p in _AP if p.agent_cli}
+    assert (_ad["claude"]["update"] == ["update"] and _ad["auggie"]["update"] == ["upgrade", "--skip-confirmation"]
+            and _ac.agent_parse_version("2.1.211 (Claude Code)") == "2.1.211"
+            and _ac.agent_parse_version("0.36.0 (commit x)") == "0.36.0"
+            and "will be stopped" in _ac._agent_message(["A"], True)
+            and _ac.AGENT_RESUME_PROMPT in _ac._agent_message(["A"], True)
+            and "not restarted by the tracker" in _ac._agent_message([], False)
+            and _ac._agent_was_busy("waiting", 0) and not _ac._agent_was_busy("idle", 0)
+            and __import__("aitracker.providers.claude", fromlist=["x"]).session_state("x", "shell") == "busy"), \
+        "agent upgrade: descriptors / version parser / warning text / busy rule"
+
     print("selfcheck ok")

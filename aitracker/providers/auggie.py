@@ -937,6 +937,9 @@ def file_diffs(session_id, target):
 
 class AuggieProvider(Provider):
     prefix = "auggie:"
+    agent_cli = {"id": "auggie", "label": "Auggie", "bin": "auggie",
+                 "version": ["--version"], "doctor": None, "update": ["upgrade", "--skip-confirmation"],
+                 "update_timeout": 300, "restarts_sessions": False}
 
     def available(self):
         return os.path.isdir(config.AUGGIE_SESSIONS)

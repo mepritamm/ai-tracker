@@ -2,6 +2,10 @@
 
 class Provider:
     prefix = ""              # id namespace ("" = default/Claude with bare ids)
+    agent_cli = None         # optional {id,label,bin,version,doctor,update,update_timeout,restarts_sessions}
+
+    def running(self):       # live agent processes: [{id,pid,version,kind,entrypoint,job,host,state,status_raw,cwd,title,model}]
+        return []
 
     def available(self):     # is this tool's data present on the machine?
         return True
