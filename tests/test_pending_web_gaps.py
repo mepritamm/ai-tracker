@@ -1,6 +1,6 @@
 """UI-side gaps from the plan's H8 test plan (T9-T13), hand-built fixtures where the server shape is not the point:
 read-only visitors get nothing (no list, no item, no fetch), hostile strings are escaped in the card, list rows,
-item modal and Control Room tile, the dialog's scheduler Reinstall round-trip and its scan-now refusal text.
+item modal and Control Room tile, the dialog's scheduler Reschedule round-trip and its scan-now refusal text.
 """
 import json
 import os
@@ -135,20 +135,20 @@ class TestDialogSchedulerGaps(unittest.TestCase):
 
     def test_reinstall_posts_install_and_stays_installed(self):
         inst = _sched(installed=True, last_exit=0, root="/x", root_exists=True)
-        r = self._run(dict(tab="Board", sched=inst, clicks=["Reinstall"],
+        r = self._run(dict(tab="Board", sched=inst, clicks=["Reschedule"],
                            afterPost={"install": {"installed": True, "last_exit": 0, "root": "/y", "root_exists": True}}))
         self.assertEqual(r["posts"], [["/api/scheduler", {"action": "install"}]])
-        self.assertEqual(r["after_Reinstall"]["buttons"], ["Reinstall", "Uninstall", "Scan now"])
-        self.assertIn("runs from /y", r["after_Reinstall"]["text"])
+        self.assertEqual(r["after_Reschedule"]["buttons"], ["Reschedule", "Unschedule", "Scan now"])
+        self.assertIn("runs from /y", r["after_Reschedule"]["text"])
 
     def test_install_reinstall_uninstall_round_trip(self):
-        r = self._run(dict(tab="Board", sched=_sched(), clicks=["Install", "Reinstall", "Uninstall"], afterPost={
+        r = self._run(dict(tab="Board", sched=_sched(), clicks=["Schedule", "Reschedule", "Unschedule"], afterPost={
             "install": {"installed": True, "last_exit": 0, "root": "/x", "root_exists": True},
             "uninstall": {"installed": False, "opted_out": True}}))
         self.assertEqual([p[1]["action"] for p in r["posts"]], ["install", "install", "uninstall"])
-        self.assertEqual(r["after_Install"]["buttons"], ["Reinstall", "Uninstall", "Scan now"])
-        self.assertEqual(r["after_Uninstall"]["buttons"], ["Install", "Scan now"])
-        self.assertIn("Turned off", r["after_Uninstall"]["text"])
+        self.assertEqual(r["after_Schedule"]["buttons"], ["Reschedule", "Unschedule", "Scan now"])
+        self.assertEqual(r["after_Unschedule"]["buttons"], ["Schedule", "Scan now"])
+        self.assertIn("Turned off", r["after_Unschedule"]["text"])
 
     def _scan(self, reply, with_lp=True):
         body = _DLG_BODY.replace(

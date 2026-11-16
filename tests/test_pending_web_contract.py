@@ -261,10 +261,10 @@ try {
     def test_dialog_scheduler_block_renders_the_servers_body(self):
         s = self.data["sched"]
         r = self._dialog("Board", sched=s)
-        self.assertIn("Installed (launchd)", r["before"]["text"])
+        self.assertIn("Scheduled (launchd)", r["before"]["text"])
         self.assertIn("last exit 0", r["before"]["text"])
         self.assertIn("runs from " + s["root"], r["before"]["text"])
-        self.assertEqual(r["before"]["buttons"], ["Reinstall", "Uninstall", "Scan now"])
+        self.assertEqual(r["before"]["buttons"], ["Reschedule", "Unschedule", "Scan now"])
 
     def test_dialog_update_block_renders_the_servers_body(self):
         u = self.data["update"]

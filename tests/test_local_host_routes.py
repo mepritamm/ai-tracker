@@ -13,7 +13,8 @@ from tests.test_cr_routes import _ServerCase
 
 ROUTES = (("GET", "/api/pending"), ("GET", "/api/pending/item?id=x"), ("POST", "/api/pending/run"),
           ("GET", "/api/scheduler"), ("POST", "/api/scheduler"), ("GET", "/api/update"),
-          ("POST", "/api/update/fetch"), ("POST", "/api/update/apply"))
+          ("POST", "/api/update/fetch"), ("POST", "/api/update/apply"),
+          ("GET", "/api/service"), ("POST", "/api/service"))
 
 
 class HostTests(_ServerCase):
@@ -27,11 +28,12 @@ class HostTests(_ServerCase):
             p.start()
             self.addCleanup(p.stop)
         for n, rv in (("run_async", False), ("update_fetch", {}), ("update_apply", (200, {})),
-                      ("sched_install", 0), ("sched_uninstall", 0), ("start_restart", None)):
+                      ("sched_install", 0), ("sched_uninstall", 0), ("start_restart", None),
+                      ("svc_install", 0), ("svc_uninstall", 0), ("svc_spawn_deferred", None)):
             p = mock.patch.object(_server, n, return_value=rv)
             p.start()
             self.addCleanup(p.stop)
-        for n in ("update_status", "_sched_body"):
+        for n in ("update_status", "_sched_body", "_svc_body"):
             p = mock.patch.object(_server, n, return_value={})
             p.start()
             self.addCleanup(p.stop)

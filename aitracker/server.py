@@ -1,4 +1,4 @@
-import json, os, re, sys, errno, threading, webbrowser, base64, hmac, hashlib, time, traceback, signal
+import json, os, re, sys, errno, socket, threading, webbrowser, base64, hmac, hashlib, time, traceback, signal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from . import config                       # referenced live (config.AUTH) so tests/env see one source
@@ -10,6 +10,7 @@ from .gateway import openrouter_configured, claude_auth_status
 from .registry import all_sessions, parse_any, search_all, search_session, drill, _attached_pty
 from .pending import start_worker, load_report, item_detail, run_async
 from .schedule import sched_install, sched_uninstall, sched_status, autoinstall_once, _optout_path
+from .schedule import svc_install, svc_uninstall, svc_status, svc_baked, svc_spawn_deferred, SVC_WAIT, SVC_GRACE
 from .update import update_status, update_fetch, update_apply, start_restart, _APPLY
 from .agent_cli import agent_status, agent_plan_upgrade, agent_start, agent_job_running, agent_plan_resume_all, agent_start_resume_all
 from .store import load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, save_model_keep, load_title_sync, save_title_sync, _load_json, _save_json
@@ -272,6 +273,21 @@ def _sched_body(rc=None):
     return st
 
 
+def _svc_body(this_port, rc=None):
+    """svc_status() plus what only the server knows; the client renders these strings and flags verbatim."""
+    st = svc_status()
+    st["self"] = bool(config.SERVICE)
+    st["this_port"] = this_port
+    st["install_port"] = st["port"] if st["installed"] and st["port"] else config.BIND_PORT
+    st["started_at"] = _STARTED
+    st["waiting"] = bool(st["loaded"] and st["pid"] and not config.SERVICE and st["port"] == this_port)
+    if rc == 2:
+        st["error"] = st["reason"] or "the background service cannot be installed here"
+    elif rc == 1:
+        st["error"] = "launchctl bootstrap failed; see ~/Library/Logs/ai-tracker-server.log"
+    return st
+
+
 def _autoinstall_thread():
     try:
         r = autoinstall_once()
@@ -482,11 +498,13 @@ class Handler(BaseHTTPRequestHandler):
             if not ok:
                 return self._json({"error": err}, 403)
             return self._json(agent_status())
-        elif p.path in ("/api/update", "/api/scheduler"):
-            # checkout path / git state / scheduler job: this machine only (never in _RO_GET_ALLOW)
+        elif p.path in ("/api/update", "/api/scheduler", "/api/service"):
+            # checkout path / git state / scheduler + service jobs: this machine only (never in _RO_GET_ALLOW)
             ok, err = _local_caller(self)
             if not ok:
                 return self._json({"error": err}, 403)
+            if p.path == "/api/service":
+                return self._json(_svc_body(self.server.server_address[1]))
             return self._json(_update_body(update_status()) if p.path == "/api/update" else _sched_body())
         elif p.path == "/api/claude/auth":
             # the machine's Claude Code login state: this machine only (never in _RO_GET_ALLOW)
@@ -675,13 +693,29 @@ class Handler(BaseHTTPRequestHandler):
                     _save_json(config.TITLE_SYNC_FILE, sync)
             self._json({"ok": True, "synced": synced})
             return
-        if p.path in ("/api/update/fetch", "/api/update/apply", "/api/scheduler"):
+        if p.path in ("/api/update/fetch", "/api/update/apply", "/api/scheduler", "/api/service"):
             # acts on the checkout / OS scheduler: this machine only; takes no value that reaches git or a shell
             ok, err = _local_caller(self)
             if not ok:
                 return self._json({"error": err}, 403)
             if p.path == "/api/update/fetch":
                 return self._json(_update_body(update_fetch()))
+            if p.path == "/api/service":
+                act = body.get("action")
+                if act not in ("install", "reinstall", "uninstall"):
+                    return self._json({"error": "action must be install, reinstall or uninstall"}, 400)
+                if act == "uninstall":
+                    rc = svc_uninstall()
+                else:   # reinstall keeps the installed PORT/HOST; install uses what this server was asked for
+                    port, host = (svc_baked() if act == "reinstall" else None) or (config.BIND_PORT, config.BIND_HOST)
+                    rc = svc_install(port, host)
+                if rc != 3:
+                    return self._json(_svc_body(self.server.server_address[1], rc))
+                try:
+                    self._json({"deferred": act, "self": True}, 202)
+                finally:           # the 202 is flushed before launchd SIGTERMs this process
+                    svc_spawn_deferred(act != "uninstall")
+                return
             if p.path == "/api/scheduler":
                 act = body.get("action")
                 if act not in ("install", "uninstall"):
@@ -995,9 +1029,44 @@ class Server(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-def bind(host="127.0.0.1", port=8790, tries=20):
+def _port_busy(host, port):
+    try:
+        socket.create_connection((host, port), timeout=1).close()
+        return True
+    except ConnectionRefusedError:
+        return False
+    except OSError:      # reset (full backlog: a stopped/wedged holder), timeout, ...: still held
+        return True
+
+
+def bind(host="127.0.0.1", port=8790, tries=20, strict=False, wait=5.0, grace=3.0):
     """Bind to `port`, or the next free port after it (up to `tries`).
-    Returns the listening Server — read its real port off server_address."""
+    Returns the listening Server — read its real port off server_address.
+    strict (the launchd `--service`): never move to another port. Wait while it is busy; once it frees
+    after a wait, exit 75 so launchd respawns a fresh process on the CURRENT checkout code; otherwise
+    stay quiet for `grace` first so a shell server that is starting right now wins the port."""
+    if strict:
+        waited = False
+        while True:
+            if _port_busy(host, port):
+                if not waited:
+                    print("ai-tracker: port %d is busy; service mode waits for it" % port, flush=True)
+                waited = True
+                time.sleep(wait)
+                continue
+            if waited:
+                print("ai-tracker: port %d is free; restarting to take it over" % port, flush=True)
+                raise SystemExit(75)
+            time.sleep(grace)
+            if _port_busy(host, port):
+                waited = True
+                continue
+            try:
+                return Server((host, port), Handler)
+            except OSError as e:
+                if e.errno != errno.EADDRINUSE:
+                    raise
+                time.sleep(wait)     # bound-but-not-listening holder: retry, never exit 75 on it
     for p in range(port, port + tries):
         try:
             return Server((host, p), Handler)
@@ -1058,8 +1127,12 @@ def _on_sigterm(signum, frame):
     raise SystemExit(0)
 
 
-def run(host="127.0.0.1", port=8790, open_browser=True):
+def run(host="127.0.0.1", port=8790, open_browser=True, service=False):
     config.BIND_HOST = host    # term_gate reads this to know whether we're loopback-only
+    config.BIND_PORT = port
+    config.SERVICE = service
+    if service:     # dashboard terminals inherit this, so a CLI install run inside one knows it must defer
+        os.environ["AITRACKER_SERVICE_PID"] = str(os.getpid())
     # Fold in any config.json overrides left over from a previous run (LIVE_WINDOW/
     # TERM_RENDERER/MAX_TERMS/TERMINAL are plain module globals seeded from env/default at
     # config.py's own import time -- see its module comment -- so a pre-existing config.json
@@ -1067,7 +1140,7 @@ def run(host="127.0.0.1", port=8790, open_browser=True):
     # than waiting for someone to open the Config dialog first).
     config.apply_overrides(_load_json(config.CONFIG_FILE, {}))
     signal.signal(signal.SIGTERM, _on_sigterm)
-    srv = bind(host, port)
+    srv = bind(host, port, strict=service, wait=SVC_WAIT, grace=SVC_GRACE)
     actual = srv.server_address[1]
     publish_endpoint(actual)
     start_worker()
@@ -1076,7 +1149,10 @@ def run(host="127.0.0.1", port=8790, open_browser=True):
         tv.start_remember()                        # via the module attribute, so tests/__init__.py's stub applies
     if os.environ.get("TRACKER_SCHEDULER_AUTOINSTALL") != "0":
         threading.Thread(target=_autoinstall_thread, name="sched-autoinstall", daemon=True).start()
-    tunnel.autostart(actual, host)   # config.json TUNNEL_ON=true from a previous run -> bring it back up
+    if service:
+        print("tunnel autostart skipped in service mode", flush=True)
+    else:
+        tunnel.autostart(actual, host)   # config.json TUNNEL_ON=true from a previous run -> bring it back up
     if tunnel.status()["on"]:
         print("Tunnel restored from last run (TUNNEL_ON in config.json) — flip it off in "
               "Config → Tunnel if you didn't mean that")

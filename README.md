@@ -69,6 +69,20 @@ To keep it running in the background: `nohup python3 -m aitracker >/tmp/tracker.
 
 ---
 
+## Background service (macOS)
+
+Settings, Server tab, **Background service** (or `make service-install`; also `service-reinstall`, `service-uninstall`, `service-status`) installs a LaunchAgent (`com.aitracker.server`) that runs the dashboard at login with no shell.
+
+- It uses the **same port** as `make serve`. If a shell server holds the port, the service waits, and takes over within about 8 s (5 s poll plus a 3 s grace) after that server stops (up to about 30 s if the service itself started less than 30 s earlier: launchd throttles respawns). An in-place update restart in service mode leaves the page unreachable about 3 s longer. A shell server that is starting always wins the port.
+- `make stop` stops the service only briefly: launchd brings it back (KeepAlive). **Uninstall** stops it for good.
+- Loopback only, with no `TRACKER_AUTH` (a plaintext secret never goes into the plist), so install is refused for a non-loopback `HOST`, from a linked worktree, from the single-file bundle and from a temp directory. The plist carries your non-secret `TRACKER_*` variables and `LANG`; launchd's own per-user environment also applies, and dashboard terminals get that plus your login-shell rc files, not your interactive exports.
+- No tunnel autostart in service mode; a tunnel switched on at runtime gets its own credential.
+- The first "open in Terminal" from the service may ask to let python3 control Terminal (macOS Automation prompt).
+- `TRACKER_*` and `LANG`/`SHELL` are copied when you install. To change one, export it in a Terminal and run `make service-reinstall` (Reinstall in the service's own page re-uses the service's settings). `make service-reinstall` keeps the installed port unless you pass `PORT=`.
+- If the checkout is under Documents, Desktop or Downloads, macOS asks once to let python3 access that folder. If you missed the prompt, grant it in System Settings > Privacy & Security > Files and Folders (or Full Disk Access) for the python path shown by `make service-status`, then Reinstall.
+- Log: `~/Library/Logs/ai-tracker-server.log`.
+- A `0.0.0.0` shell server next to the service is unsupported (the wildcard listener can sit beside the loopback one).
+
 ## View it on your phone or tablet
 
 Locally it's just `make serve` (localhost, no tunnel, no login). To reach it from a phone, pick a connectivity option — a free **Cloudflare tunnel** (`make tunnel`; works through most corporate firewalls where ngrok/Tailscale are blocked), a private **Tailscale** mesh, an **ngrok** tunnel, or your **LAN** — then install it as a home-screen app (fullscreen, responsive phone/tablet layout) and require a password with `TRACKER_AUTH`. It's all opt-in — the tracker stays localhost-only until you choose one.
@@ -302,7 +316,7 @@ A scheduled scan finds work that sessions left behind and writes a report to `pe
   - Safe delete never removes: uncommitted, unpushed or gitignored work; files hidden with assume-unchanged or skip-worktree; a worktree with a rebase, merge, cherry-pick, revert or bisect in progress; a live session's scratch folder; anything under a symlinked scratch root.
 - **The `gh` call.** To detect squash merges, the scan runs `gh pr list --head <branch> --state merged` read-only from each repo, with bounded calls and time. A `gh` failure keeps the item. Nothing else is sent over the network.
 - **Scheduler (the only command is the first `make serve`).** The daily OS job (launchd on macOS, Task Scheduler on Windows) only asks whether a scan is due, so `PENDING_INTERVAL` stays the single setting. On server start the server installs it when it is missing, or when the checkout it points at is gone. It does nothing when the job is already installed with its checkout present, when running from a `.claude/worktrees/` checkout, a temp dir, the flattened bundle or a test run, when `TRACKER_SCHEDULER_AUTOINSTALL=0` is set, or after you opted out. A failed install is logged and never stops the server.
-  - **Opt-out.** The **Scheduled scan** block on the Control Room Board tab shows the status and has Install (or Reinstall) and Uninstall buttons. Uninstall removes the job and records an opt-out, so the server does not install it again. Install clears the opt-out. `make pending-install` and `make pending-uninstall` are thin aliases for the same actions.
+  - **Opt-out.** The **Scheduled scan** block on the Control Room Board tab shows the status and has Schedule (or Reschedule) and Unschedule buttons. Unschedule removes the job and records an opt-out, so the server does not install it again. Schedule clears the opt-out. `make pending-install` and `make pending-uninstall` are thin aliases for the same actions.
   - The buttons are local-only and hidden for read-only viewers. If the OS job runs, it reads only the installed checkout's `config.json`, not `TRACKER_PENDING_*` environment variables.
 - **CLI.** `make pending` runs a scan now, in the mode from `PENDING_CLEAN`. It works with the server down.
 - **In-app Update (Control Room Server tab).** Shows the branch, the head commit, and how far it is behind its upstream. The remote and branch come from git config, never from the request.

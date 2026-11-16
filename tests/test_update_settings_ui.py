@@ -27,6 +27,8 @@ let reloads = 0;
 let updateGets = 0;
 let sched = SCEN.sched || {supported: true, installed: false, opted_out: false, kind: 'launchd', root: null, root_exists: false, last_exit: null};
 let upd = SCEN.update || {};
+let svc = SCEN.svc || {supported: true, installed: false, can_install: true, install_port: 8790, this_port: 8790, started_at: 'a'};
+let svcGets = 0, svcPosted = false;
 let clock = 1000000;
 Date.now = () => { clock += (SCEN.clockStep || 0); return clock; };
 global.setTimeout = (f, ms) => realST(f, 0);
@@ -42,6 +44,17 @@ global.fetch = (url, opt) => {
     posts.push([url, body]);
     sched = Object.assign({}, sched, SCEN.afterPost[body.action]);
     return json(sched);
+  }
+  if (url === '/api/service' && method === 'GET') {
+    const seq = SCEN.svcSeq;
+    const v = seq && svcPosted ? seq[Math.min(svcGets++, seq.length - 1)] : svc;   // the sequence starts after the POST
+    return v === null ? Promise.reject(new Error('down')) : json(v);   // null = a failed fetch in the restart gap
+  }
+  if (url === '/api/service') {
+    posts.push([url, body]); svcPosted = true;
+    const r = (SCEN.svcPost || {})[body.action] || {status: 200, body: svc};
+    if (r.body && r.status < 300) svc = r.body;
+    return json(r.body, r.status < 400, r.status);
   }
   if (url === '/api/pending/run') { posts.push([url, body]); return json({started: true}); }
   if (url === '/api/update' && method === 'GET') {
@@ -64,7 +77,7 @@ const SRC = require('fs').readFileSync(process.argv[2], 'utf8');
   const root = new El('div');
   window.CR.dialogs.mount(root, {icon: () => '', readOnly: () => !!SCEN.ro});
   await tick();
-  window.CR.dialogs.open('config', {section: SCEN.tab});
+  window.CR.dialogs.open('config', {section: SCEN.tab === 'Service' ? 'Server' : SCEN.tab});
   await tick();
   const q = (c) => root.querySelector('.' + c);
   const btns = (c) => { const b = q(c); return b ? b.querySelectorAll('button') : []; };
@@ -85,6 +98,10 @@ const SRC = require('fs').readFileSync(process.argv[2], 'utf8');
   if (SCEN.tab === 'Board') {
     out.before = info('cr-sched-block');
     for (const step of (SCEN.clicks || [])) { await click('cr-sched-block', step); out['after_' + step] = info('cr-sched-block'); }
+  } else if (SCEN.tab === 'Service') {
+    out.hasSvc = !!q('cr-svc-block');
+    out.before = info('cr-svc-block');
+    for (const step of (SCEN.clicks || [])) { await click('cr-svc-block', step); out['after_' + step] = info('cr-svc-block'); }
   } else {
     out.before = info('cr-update-block');
     for (const step of (SCEN.clicks || [])) {
@@ -127,6 +144,59 @@ def _sched(**kw):
     return d
 
 
+def _svc(**kw):
+    d = {"supported": True, "installed": False, "can_install": True, "install_port": 8790, "this_port": 8790,
+         "port": None, "loaded": False, "pid": None, "self": False, "waiting": False, "started_at": "a",
+         "python_exists": None, "root_exists": None, "last_exit": None, "reason": ""}
+    d.update(kw)
+    return d
+
+
+@unittest.skipUnless(_HAS_NODE, "node not on PATH")
+class BackgroundServiceBlock(unittest.TestCase):
+    def go(self, svc, clicks=(), **kw):
+        return _run(dict(tab="Service", svc=svc, clicks=list(clicks), **kw))
+
+    def test_states(self):
+        r = self.go(_svc())
+        self.assertTrue(r["hasSvc"])
+        self.assertEqual(r["before"]["buttons"], ["Install"])
+        self.assertIn("at login on port 8790", r["before"]["text"])
+        r = self.go(_svc(installed=True, port=8790, loaded=True, pid=42))
+        self.assertEqual(r["before"]["buttons"], ["Reinstall", "Uninstall"])
+        self.assertIn("Running (pid 42) on :8790", r["before"]["text"])
+        r = self.go(_svc(installed=True, port=8790, loaded=True, pid=42, waiting=True))
+        self.assertIn("waiting for :8790", r["before"]["text"])
+        r = self.go(_svc(supported=False, can_install=False))
+        self.assertEqual(r["before"]["buttons"], [])
+        self.assertIn("macOS-only", r["before"]["text"])
+        r = self.go(_svc(can_install=False, reason="a linked git worktree"))
+        self.assertEqual(r["before"]["buttons"], [])
+        self.assertIn("linked git worktree", r["before"]["text"])
+        r = self.go(_svc(installed=True, python_exists=False, python="/p/py", port=8790))
+        self.assertIn("Python at /p/py is gone", r["before"]["text"])
+        r = self.go(_svc(loaded=True, pid=5))
+        self.assertEqual(r["before"]["buttons"], ["Uninstall"])
+        self.assertIn("plist is gone", r["before"]["text"])
+        r = self.go(_svc(installed=True, can_install=False, port=8790))
+        self.assertEqual(r["before"]["buttons"], ["Uninstall"])
+
+    def test_actions_post_and_deferred_uninstall(self):
+        r = self.go(_svc(installed=True, port=8790, loaded=True, pid=1), ["Uninstall"],
+                    svcPost={"uninstall": {"status": 202, "body": {"deferred": "uninstall", "self": True}}})
+        self.assertEqual(r["posts"], [["/api/service", {"action": "uninstall"}]])
+        self.assertIn("This dashboard was the service", r["after_Uninstall"]["text"])
+        r = self.go(_svc(), ["Install"], svcPost={"install": {"status": 200, "body": _svc(installed=True, port=8790, loaded=True, pid=9)}})
+        self.assertEqual(r["after_Install"]["buttons"], ["Reinstall", "Uninstall"])
+
+    def test_deferred_reinstall_polls_through_gap_then_reloads(self):
+        r = self.go(_svc(installed=True, port=8790, loaded=True, pid=1, self=True), ["Reinstall"],
+                    svcPost={"reinstall": {"status": 202, "body": {"deferred": "reinstall", "self": True}}},
+                    svcSeq=[None, None, _svc(started_at="a"), _svc(started_at="b")])
+        self.assertEqual(r["reloads"], 1)
+        self.assertIn("Restarting the service", r["after_Reinstall"]["text"])
+
+
 @unittest.skipUnless(_HAS_NODE, "node not on PATH")
 class ScheduledScanBlock(unittest.TestCase):
     def go(self, sched, clicks=(), after=None, **kw):
@@ -134,27 +204,27 @@ class ScheduledScanBlock(unittest.TestCase):
 
     def test_four_status_texts_and_buttons(self):
         r = self.go(_sched(installed=True, last_exit=0, root="/here", root_exists=True))
-        self.assertIn("Installed (launchd) · last exit 0 · runs from /here", r["before"]["text"])
-        self.assertEqual(r["before"]["buttons"], ["Reinstall", "Uninstall", "Scan now"])
+        self.assertIn("Scheduled (launchd) · last exit 0 · runs from /here", r["before"]["text"])
+        self.assertEqual(r["before"]["buttons"], ["Reschedule", "Unschedule", "Scan now"])
         r = self.go(_sched())
-        self.assertIn("Not installed", r["before"]["text"])
-        self.assertEqual(r["before"]["buttons"], ["Install", "Scan now"])
+        self.assertIn("Not scheduled", r["before"]["text"])
+        self.assertEqual(r["before"]["buttons"], ["Schedule", "Scan now"])
         r = self.go(_sched(opted_out=True))
-        self.assertIn("Turned off (you uninstalled it)", r["before"]["text"])
-        self.assertEqual(r["before"]["buttons"], ["Install", "Scan now"])
+        self.assertIn("Turned off (you unscheduled it)", r["before"]["text"])
+        self.assertEqual(r["before"]["buttons"], ["Schedule", "Scan now"])
         r = self.go(_sched(installed=True, root="/gone", root_exists=False))
         self.assertIn("Points at a missing checkout", r["before"]["text"])
-        self.assertEqual(r["before"]["buttons"], ["Reinstall", "Uninstall", "Scan now"])
+        self.assertEqual(r["before"]["buttons"], ["Reschedule", "Unschedule", "Scan now"])
 
     def test_buttons_post_enum_action_and_rerender_from_response(self):
-        r = self.go(_sched(), ["Install"], {"install": {"installed": True, "last_exit": 0, "root": "/x", "root_exists": True}})
+        r = self.go(_sched(), ["Schedule"], {"install": {"installed": True, "last_exit": 0, "root": "/x", "root_exists": True}})
         self.assertEqual(r["posts"], [["/api/scheduler", {"action": "install"}]])
-        self.assertEqual(r["after_Install"]["buttons"], ["Reinstall", "Uninstall", "Scan now"])
-        r = self.go(_sched(installed=True, root="/x", root_exists=True), ["Uninstall"],
+        self.assertEqual(r["after_Schedule"]["buttons"], ["Reschedule", "Unschedule", "Scan now"])
+        r = self.go(_sched(installed=True, root="/x", root_exists=True), ["Unschedule"],
                     {"uninstall": {"installed": False, "opted_out": True}})
         self.assertEqual(r["posts"], [["/api/scheduler", {"action": "uninstall"}]])
-        self.assertIn("Turned off", r["after_Uninstall"]["text"])
-        self.assertEqual(r["after_Uninstall"]["buttons"], ["Install", "Scan now"])
+        self.assertIn("Turned off", r["after_Unschedule"]["text"])
+        self.assertEqual(r["after_Unschedule"]["buttons"], ["Schedule", "Scan now"])
 
     def test_scan_now_posts_pending_run(self):
         r = self.go(_sched(), ["Scan now"])

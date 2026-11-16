@@ -1162,12 +1162,12 @@
   function schedulerText(st) {
     if (st.root && !st.root_exists) return 'Points at a missing checkout (' + st.root + ')';
     if (st.installed) {
-      return 'Installed (' + (st.kind || 'scheduler') + ')' +
+      return 'Scheduled (' + (st.kind || 'scheduler') + ')' +
         (st.last_exit != null ? ' · last exit ' + st.last_exit : '') +
         (st.root ? ' · runs from ' + st.root : '');
     }
-    if (st.opted_out) return 'Turned off (you uninstalled it)';
-    return 'Not installed';
+    if (st.opted_out) return 'Turned off (you unscheduled it)';
+    return 'Not scheduled';
   }
 
   function schedulerBlock() {
@@ -1179,10 +1179,10 @@
       var ctl = h('div', { class: 'cr-cfg-row-control' });
       if (st && !busy && !unsup) {
         if (st.installed) {
-          ctl.appendChild(crBtn('Reinstall', function () { act('install'); }));
-          ctl.appendChild(crBtn('Uninstall', function () { act('uninstall'); }, 'cr-btn-danger'));
+          ctl.appendChild(crBtn('Reschedule', function () { act('install'); }));
+          ctl.appendChild(crBtn('Unschedule', function () { act('uninstall'); }, 'cr-btn-danger'));
         } else {
-          ctl.appendChild(crBtn('Install', function () { act('install'); }));
+          ctl.appendChild(crBtn('Schedule', function () { act('install'); }));
         }
       }
       if (st && !busy) ctl.appendChild(crBtn('Scan now', scanNow));
@@ -1577,6 +1577,88 @@
     return wrap;
   }
 
+  // Background service (macOS LaunchAgent): Install / Reinstall / Uninstall. All wording that depends on
+  // server state (port, error, waiting, self) is decided by /api/service; this only renders it.
+  function serviceBlock() {
+    if (crReadOnly()) return null;
+    var wrap = h('div', { class: 'cr-cfg-row cr-svc-block' });
+    var st = null, msg = '', busy = false, waiting = false;
+    function lines() {
+      if (!st) return [msg || 'Loading…'];
+      if (st.supported === false) return ['The background service is macOS-only.'];
+      var out = [], p = ':' + (st.port || st.install_port);
+      if (!st.installed && st.loaded) {
+        out.push('Running (pid ' + st.pid + ') but its plist is gone');
+      } else if (!st.installed) {
+        out.push(!st.can_install ? (st.reason || 'Not available here.') :
+          'Not installed. Install runs this dashboard from launchd at login on port ' + st.install_port +
+          ', with no shell; it takes over when you stop make serve.');
+      } else {
+        if (st.self) out.push('Running as the service (pid ' + st.pid + ') on ' + p);
+        else if (st.waiting) out.push('Installed, waiting for ' + p + ' (this shell server holds it; stop it and the service takes over)');
+        else if (st.loaded && st.pid) out.push('Running (pid ' + st.pid + ') on ' + p);
+        else out.push('Installed, not running' + (st.last_exit != null ? ' · last exit ' + st.last_exit : ''));
+        if (st.python_exists === false) out.push('Python at ' + st.python + ' is gone. Reinstall.');
+        if (st.root_exists === false) out.push('Points at a missing checkout (' + st.root + ')');
+        if (!st.can_install && st.reason) out.push(st.reason);
+      }
+      if (st.error) out.push(st.error);
+      return out;
+    }
+    function paint() {
+      var ctl = h('div', { class: 'cr-cfg-row-control' });
+      if (st && !busy && !waiting && st.supported !== false) {
+        if (st.installed || st.loaded) {
+          if (st.installed && st.can_install) ctl.appendChild(crBtn('Reinstall', function () { act('reinstall'); }));
+          ctl.appendChild(crBtn('Uninstall', function () { act('uninstall'); }, 'cr-btn-danger'));
+        } else if (st.can_install) {
+          ctl.appendChild(crBtn('Install', function () { act('install'); }));
+        }
+      }
+      var ls = lines();
+      if (msg && st) ls.push(msg);
+      wrap.innerHTML = '';
+      wrap.appendChild(h('div', { class: 'cr-cfg-row-label' }, [
+        h('div', { class: 'cr-cfg-row-name' }, ['Background service']),
+        h('div', { class: 'cr-cfg-row-sub cr-svc-status' }, ls.map(function (l) { return h('div', {}, [l]); })),
+      ]));
+      wrap.appendChild(ctl);
+    }
+    function act(action) {
+      busy = true; msg = ''; paint();
+      crCall('/api/service', 'POST', { action: action }).then(function (r) {
+        busy = false;
+        if (r.status === 202 && r.body && r.body.deferred) {
+          if (r.body.deferred === 'uninstall') {
+            msg = 'Uninstalled. This dashboard was the service and is stopping. Start one with make serve.';
+            waiting = true; paint();
+          } else {
+            msg = 'Restarting the service…'; waiting = true; paint(); waitForService(Date.now(), st && st.started_at);
+          }
+          return;
+        }
+        if (r.ok) st = r.body; else msg = (r.body && r.body.error) || 'request failed';   // a 200 body carries its own error line
+        paint();
+      });
+    }
+    function waitForService(t0, started) {
+      setTimeout(function () {
+        if (wrap.isConnected === false) return;
+        crCall('/api/service').then(function (r) {   // failed fetches during the restart gap are expected
+          if (r.ok && r.body.started_at !== started) { window.location.reload(); return; }
+          if (Date.now() - t0 >= 60000) { waiting = false; msg = 'The service did not come back. Run make service-install in a terminal.'; paint(); return; }
+          waitForService(t0, started);
+        });
+      }, 1000);
+    }
+    paint();
+    crCall('/api/service').then(function (r) {
+      if (r.ok) st = r.body; else msg = (r.body && r.body.error) || 'request failed';
+      paint();
+    });
+    return wrap;
+  }
+
   function renderConfig(payload) {
     var srv = (payload && payload.server) || {};
     // Header subtitle: 5c gives Config the real server address (its mock shows
@@ -1869,6 +1951,8 @@
         if (loginEl) body.appendChild(loginEl);
         var updEl = updateBlock();
         if (updEl) body.appendChild(updEl);
+        var svcEl = serviceBlock();
+        if (svcEl) body.appendChild(svcEl);
       } else if (active === 'Tunnel') {
         // The one-line, always-visible disclosure the security review this feature was
         // built under calls for: never hidden behind the reveal action, never a lecture.

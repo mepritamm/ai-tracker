@@ -28,9 +28,12 @@ ROUTES = (
     ("POST", "/api/update/apply", {}),
     ("GET", "/api/scheduler", None),
     ("POST", "/api/scheduler", {"action": "install"}),
+    ("GET", "/api/service", None),
+    ("POST", "/api/service", {"action": "install"}),
 )
 LOCAL_OK = {"/api/pending": 200, "/api/pending/item?id=nope": 404, "/api/pending/run": 202, "/api/update": 200,
-            "/api/update/fetch": 200, "/api/update/apply": 409, "/api/scheduler": 200}
+            "/api/update/fetch": 200, "/api/update/apply": 409, "/api/scheduler": 200,
+            "/api/service": 200}
 
 
 def basic(cred):
@@ -38,7 +41,7 @@ def basic(cred):
 
 
 def _expected_local(method, path):
-    if method == "POST" and path == "/api/scheduler":
+    if method == "POST" and path in ("/api/scheduler", "/api/service"):
         return 200
     return LOCAL_OK[path]
 
@@ -66,11 +69,13 @@ class MatrixTests(_ServerCase):
         self.stubs = {}
         for name, rv in (("run_async", True), ("update_fetch", {"ok": True}),
                          ("update_apply", (409, {"needs_confirm": True, "terminals": 1})),
-                         ("sched_install", 0), ("sched_uninstall", 0), ("start_restart", None)):
+                         ("sched_install", 0), ("sched_uninstall", 0), ("start_restart", None),
+                         ("svc_install", 0), ("svc_uninstall", 0), ("svc_spawn_deferred", None)):
             m = mock.patch.object(_server, name, return_value=rv)
             self.stubs[name] = m.start()
             self.addCleanup(m.stop)
-        for name, rv in (("update_status", {"ok": True}), ("sched_status", {"installed": False})):
+        for name, rv in (("update_status", {"ok": True}), ("sched_status", {"installed": False}),
+                       ("_svc_body", {"ok": 1})):
             m = mock.patch.object(_server, name, return_value=rv)
             m.start()
             self.addCleanup(m.stop)
@@ -99,7 +104,8 @@ class MatrixTests(_ServerCase):
             return r.status, {}
 
     def assert_no_side_effect(self):
-        for name in ("run_async", "update_fetch", "update_apply", "sched_install", "sched_uninstall", "start_restart"):
+        for name in ("run_async", "update_fetch", "update_apply", "sched_install", "sched_uninstall", "start_restart",
+                     "svc_install", "svc_uninstall", "svc_spawn_deferred"):
             self.stubs[name].assert_not_called()
 
     def sweep(self, expect, headers=None, port=None):
@@ -126,6 +132,7 @@ class MatrixTests(_ServerCase):
         self.stubs["update_fetch"].reset_mock()
         self.stubs["update_apply"].reset_mock()
         self.stubs["sched_install"].reset_mock()
+        self.stubs["svc_install"].reset_mock()
         self.sweep(401)                                       # no credential: login wall, nothing ran
         self.assert_no_side_effect()
         self.sweep(401, basic("u:wrong"))

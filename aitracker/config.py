@@ -141,6 +141,10 @@ TERM_TAB_HOSTS = os.environ.get("TRACKER_TERM_TAB_HOSTS", "1") != "0"
 # tunnel terminates locally, so a request that arrived through `make tunnel` still shows up with
 # a loopback peer address even though the tunnel makes the server reachable from anywhere.
 BIND_HOST = "127.0.0.1"
+# The port run() was ASKED for (not the one bind() got) and whether this process is the launchd
+# service (`--service`). The /api/service route bakes BIND_PORT and defers self-bootout on SERVICE.
+BIND_PORT = 8790
+SERVICE = False
 
 
 # =============================================================================

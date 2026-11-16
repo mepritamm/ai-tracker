@@ -1,10 +1,10 @@
 PORT ?= 8790
 TUNNEL_PORT ?= 8790
 JOBS ?= 4
-.PHONY: help serve stop tunnel check test hooks bundle pending pending-install pending-uninstall
+.PHONY: help serve stop tunnel check test hooks bundle pending pending-install pending-uninstall service-install service-reinstall service-uninstall service-status
 
 help:
-	@echo "make serve | stop | tunnel | check | test | hooks | bundle | pending | pending-install | pending-uninstall   (PORT=$(PORT))"
+	@echo "make serve | stop | tunnel | check | test | hooks | bundle | pending | pending-install | pending-uninstall | service-install | service-reinstall | service-uninstall | service-status   (PORT=$(PORT))"
 
 serve:
 	@PORT=$(PORT) python3 -m aitracker
@@ -55,3 +55,13 @@ pending-install:
 	@python3 -m aitracker --pending --install-scheduler
 pending-uninstall:
 	@python3 -m aitracker --pending --uninstall-scheduler
+
+# the dashboard as a macOS LaunchAgent (runs at login on PORT, takes over when a shell server stops)
+service-install:
+	@PORT=$(PORT) python3 -m aitracker --install-service
+service-reinstall:
+	@$(if $(filter command line environment,$(origin PORT)),PORT=$(PORT) ,)python3 -m aitracker --reinstall-service
+service-uninstall:
+	@python3 -m aitracker --uninstall-service
+service-status:
+	@python3 -m aitracker --service-status
