@@ -132,6 +132,7 @@
         '<div class="cr-term-eyebrow">Terminal</div>' +
         '<div class="cr-term-cwd" data-el="cwd"></div>' +
         '<div class="cr-term-resumecmd" data-el="resumecmd" hidden></div>' +
+        '<div class="cr-term-homenote" data-el="homenote" hidden></div>' +
       '</div>' +
       '<div class="cr-term-head-actions">' +
         '<button type="button" class="cr-term-headpill" data-action="config">' +
@@ -252,6 +253,7 @@
       overlay: overlay, shell: shell,
       cwd: head.querySelector('[data-el="cwd"]'),
       resumecmd: head.querySelector('[data-el="resumecmd"]'),
+      homenote: head.querySelector('[data-el="homenote"]'),
       primaryGroup: bar.querySelector('[data-group="primary"]'),
       openHere: bar.querySelector('[data-action="open-here"]'),
       resumeHere: bar.querySelector('[data-action="resume-here"]'),
@@ -1110,6 +1112,12 @@
         var m = d.meta || {};
         st.cwd = m.cwd || m.project || null;
         el.cwd.textContent = st.cwd || "";
+        // server-owned note, rendered verbatim (textContent); empty -> hidden
+        var hn = typeof m.term_home_note === "string" ? m.term_home_note : "";
+        if (el.homenote) {               // optional: never let the note break the rest of the header
+          el.homenote.textContent = hn;
+          el.homenote.hidden = !hn;
+        }
         var resumable = isClaudeId(sid);
         el.resumeHere.hidden = !resumable;
         el.extResume.hidden = !resumable || !localOnly();

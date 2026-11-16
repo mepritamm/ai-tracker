@@ -445,7 +445,11 @@
       }
     }
 
-    el.innerHTML = vtHtml + nativeHtml;
+    // Server-owned note (registry.parse_any -> meta.term_home_note); rendered verbatim, never derived
+    // here. Empty (Auggie, or nothing to say) renders nothing.
+    const homeNote = d && d.meta && typeof d.meta.term_home_note === "string" ? d.meta.term_home_note : "";
+    el.innerHTML = vtHtml + nativeHtml +
+      (homeNote ? '<div class="extlaunchnote" data-el="homenote">' + esc(homeNote) + "</div>" : "");
     const vb = document.getElementById("extvtopenbtn");
     if (vb) vb.onclick = () => window.ExtVT ? window.ExtVT.open(cur, "cwd") : alert("in-browser terminal unavailable");
     const vr = document.getElementById("extvtresumebtn");

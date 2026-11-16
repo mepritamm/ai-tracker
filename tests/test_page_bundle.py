@@ -304,6 +304,73 @@ class TestPageBundle(unittest.TestCase):
         )
 
 
+_HOME_NOTE_HARNESS = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const els = {ext_launch: {style: {}, innerHTML: ''}};
+const EXT = [];
+const run = new Function('document', 'location', 'fetch', 'EXT', 'SIDE_EXT', 'ico', 'esc', 'toast', 'cur', 'window',
+  src.replace(/\bcur\b/g, 'cur') + '; return EXT;');
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+const doc = {getElementById: id => els[id] || null};
+const fns = run(doc, {hostname: 'example.com'}, () => Promise.resolve({}), EXT, [], n => '', esc, () => {}, 'abc', {});
+const out = {};
+for (const [k, d] of Object.entries(JSON.parse(process.argv[3]))) {
+  els.ext_launch.innerHTML = '';
+  fns[0](d);
+  out[k] = els.ext_launch.innerHTML;
+}
+console.log('OUT:' + JSON.stringify(out));
+"""
+
+
+class TestTermHomeNoteRendered(unittest.TestCase):
+    """L4: the server-owned meta.term_home_note is rendered (escaped, verbatim) in both UIs;
+    an empty/absent note renders nothing (Auggie)."""
+
+    def test_served_page_carries_markup_and_css(self):
+        html = _read_page()
+        self.assertIn('data-el="homenote"', html)
+        self.assertIn("cr-term-homenote", html)
+        self.assertIn(".extlaunchnote", html)
+        self.assertIn("m.term_home_note", html)
+        self.assertIn("d.meta.term_home_note", html)
+
+    def test_css_has_no_stray_comment_close(self):
+        for name in ("ext_cr_term.css", "ext_launch.css"):
+            with open(os.path.join(_WEB, name), encoding="utf-8") as fh:
+                css = fh.read()
+            self.assertEqual(css.count("/*"), css.count("*/"), name)
+
+    def test_note_hidden_in_cr_header_when_empty(self):
+        with open(os.path.join(_WEB, "ext_cr_term.js"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("el.homenote.hidden = !hn;", src)
+        self.assertIn('typeof m.term_home_note === "string"', src)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_ext_launch_renders_note_escaped_and_omits_when_empty(self):
+        cases = {
+            "note": {"meta": {"term_home_note": "Worktree <b>x</b> was removed"}},
+            "empty": {"meta": {"term_home_note": ""}},
+            "absent": {"meta": {}},
+        }
+        with tempfile.TemporaryDirectory() as d:
+            h = os.path.join(d, "h.js")
+            with open(h, "w", encoding="utf-8") as fh:
+                fh.write(_HOME_NOTE_HARNESS)
+            proc = subprocess.run(
+                ["node", h, os.path.join(_WEB, "ext_launch.js"), json.dumps(cases)],
+                capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout.split("OUT:", 1)[1])
+        self.assertIn('class="extlaunchnote"', out["note"])
+        self.assertIn("Worktree &lt;b&gt;x&lt;/b&gt; was removed", out["note"])
+        for k in ("empty", "absent"):
+            self.assertNotIn("extlaunchnote", out[k])
+            self.assertNotIn("undefined", out[k])
+
+
 class TestTermTabHostsMark(unittest.TestCase):
     """F9: page.build_page() must always replace page.TERM_TAB_MARK with a real boolean literal
     -- see aitracker/config.py's TERM_TAB_HOSTS and page.py's chained .replace() next to

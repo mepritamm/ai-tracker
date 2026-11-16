@@ -80,6 +80,14 @@
   max-width: 62vw;
 }
 .cr .cr-term-resumecmd[hidden] { display: none; }
+.cr .cr-term-homenote {
+  font: 11px/1.35 var(--font-sans);
+  color: var(--text-muted);
+  white-space: normal;
+  overflow-wrap: anywhere;
+  max-width: 62vw;
+}
+.cr .cr-term-homenote[hidden] { display: none; }
 
 .cr .cr-term-head-actions { display: flex; align-items: center; gap: 6px; flex: none; }
 .cr .cr-term-headpill {
@@ -420,7 +428,7 @@
 @media (max-width: 760px) {
   .cr .cr-term-overlay { padding: 0; }
   .cr .cr-term-shell { width: 100%; height: 100%; border-radius: 0; }
-  .cr .cr-term-cwd, .cr .cr-term-resumecmd { max-width: 44vw; }
+  .cr .cr-term-cwd, .cr .cr-term-resumecmd, .cr .cr-term-homenote { max-width: 44vw; }
 }
 
 /* BLOCKER 2 — phone touch targets (terminal surface). Phone tier only;

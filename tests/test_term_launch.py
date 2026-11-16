@@ -618,7 +618,10 @@ class TestRenamedLaunchButtonsAndNewControls(unittest.TestCase):
         start = self.src.index("function render(d) {")
         end = self.src.index("EXT.push(render)")
         body = self.src[start:end]
-        self.assertIn("el.innerHTML = vtHtml + nativeHtml;", body)
+        # The buttons are exactly vtHtml + nativeHtml; the only thing appended after them is the
+        # server-owned term_home_note (a <div>, not a button group -- terminal-at-root L4).
+        self.assertIn("el.innerHTML = vtHtml + nativeHtml +\n      (homeNote ? '<div class=\"extlaunchnote\"", body)
+        self.assertEqual(body.count("<button"), 4)
         self.assertNotIn("newHtml", body)
         self.assertNotIn("+ New terminal", body)
         self.assertNotIn("+ New Claude session", body)
