@@ -222,7 +222,7 @@ class TestPlan(_Repo):
 class TestConfirm(_Repo):
     def test_recreate_then_resume_same_sid(self):
         self.normal_remove()
-        h = type("H", (), {"headers": {}, "calls": [], "_json": lambda s, o, c=200: s.calls.append((o, c))})()
+        h = type("H", (), {"headers": {"Host": "127.0.0.1:8790"}, "calls": [], "_json": lambda s, o, c=200: s.calls.append((o, c))})()
         with mock.patch.object(term_launch, "_local_caller", return_value=(True, "")), \
                 mock.patch.object(term_launch, "subprocess") as sp, \
                 mock.patch.object(term_launch, "_background_target", return_value=""), \
@@ -282,7 +282,8 @@ class TestConfirm(_Repo):
         config.TERMINAL, config.AUTH = True, ""
         self.addCleanup(setattr, config, "TERMINAL", t0)
         self.addCleanup(setattr, config, "AUTH", a0)
-        for extra in ({"headers": {"CF-Ray": "x"}}, {"headers": {}, "_readonly": lambda s: True}):
+        for extra in ({"headers": {"CF-Ray": "x", "Host": "127.0.0.1:8790"}},
+                      {"headers": {"Host": "127.0.0.1:8790"}, "_readonly": lambda s: True}):
             seen = []
             h = type("H", (), dict(extra, _json=lambda s, o, c=200: seen.append((o, c))))()
             term_vt.open_pty(h, None, {"session": SID, "mode": "resume", "recreate": tok})

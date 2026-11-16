@@ -122,6 +122,13 @@ class _TunnelCase(unittest.TestCase):
         config.AUTH = ""
         self._tmpdir = tempfile.mkdtemp()
         self.addCleanup(self._teardown)
+        # Hermetic for every tunnel test: /api/list otherwise scans the real ~/.claude (1000+
+        # sessions, several seconds cold under parallel-gate load -> _get's 5 s timeout).
+        # These tests are about auth/tunnel behaviour, never the session scan.
+        for k in ("PROJECTS", "AUGMENT_DIR"):
+            p = mock.patch.object(config, k, self._tmpdir)
+            p.start()
+            self.addCleanup(p.stop)
 
     def _teardown(self):
         tunnel.stop()

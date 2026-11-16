@@ -3346,7 +3346,7 @@ def open_pty(handler, parsed, body):
                 if free < 1:
                     return handler._json({"error": "too many running terminals (max %d)"
                                           % config.MAX_TERMS, "terminals": _live_list(orl)}, 429)
-                warm = fp is None and _FOLDER_SPAWNING.get(cwd) is None and free >= 2
+                warm = fp is None and _FOLDER_SPAWNING.get(cwd) is None and free >= 3
                 _slots_add(2 if warm else 1)
                 if warm:
                     reserved = _FOLDER_SPAWNING[cwd] = threading.Event()

@@ -154,6 +154,28 @@ class TestColdOpen(_S3):
         self.assertIn(b"sh -c 'cd \"$0\" && exec \"$@\"'", b"".join(typed))
         self.assertEqual(len(self.spawns), 2)
 
+    def test_warm_never_takes_the_last_slot_a_real_opener_needs(self):    # F1
+        config.MAX_TERMS = 2
+        o1, c1 = self.go("S", "resume")
+        o2, c2 = self.go("T", "resume")
+        self.assertEqual((c1, c2), (200, 200), (o1, o2))
+        self.assertEqual([a for _, a in self.spawns],
+                         [["claude", "--resume", "S"], ["claude", "--resume", "T"]])    # no warm shell
+        self.assertEqual(term_vt._SLOTS_RESERVED, self._slots0)
+
+    def test_settled_shell_with_foreground_job_goes_dedicated_nothing_typed(self):    # F7
+        fp = self.folder_pty()
+        fp.startup_done = True
+        typed = []
+        with mock.patch.object(term_vt, "_fg_pgid", return_value=SHELL + 1), \
+                mock.patch.object(term_vt, "_inject_argv", side_effect=AssertionError("claimed the shell")):
+            obj, code = self.go("S", "resume", typed)    # a job holds the tty: never claimed, never waited on
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(typed, [])
+        self.assertEqual(self.spawns, [(self.top, ["claude", "--resume", "S"])])
+        self.assertNotEqual(obj["tty"], fp.id)
+        self.assertIsNone(fp.fg)
+
     def test_cwd_mode_cold_still_opens_shell(self):                      # guard: unchanged behaviour
         obj, code = self.go("", "cwd", cwd=self.root)
         self.assertEqual(code, 200, obj)

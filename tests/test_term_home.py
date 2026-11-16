@@ -64,6 +64,29 @@ class TestTailScanCwd(_Base):
         self.assertEqual(claude._tail_scan(p)["gitBranch"], "")
 
 
+class TestTailMemoCopyAndKey(_Base):
+    def test_result_is_an_independent_copy(self):                       # F3
+        p = self.transcript("m1", [{"cwd": "/a"}, {"cwd": "/b"}])
+        t = claude._tail_scan(p)
+        t["cwds"].append("/zzz")
+        if isinstance(t.get("wt"), dict):
+            t["wt"]["poison"] = 1
+        t2 = claude._tail_scan(p)
+        self.assertNotIn("/zzz", t2["cwds"])
+        self.assertNotIn("poison", t2.get("wt") or {})
+
+    def test_one_memo_entry_per_file(self):                             # F4
+        p = self.transcript("m2", [{"cwd": "/a"}])
+        claude._TAIL_MEMO.clear()
+        for i in range(300):
+            with open(p, "a") as fh:
+                fh.write(json.dumps({"cwd": "/c%d" % i}) + "\n")
+            os.utime(p, ns=(10**9 + i, 10**9 + i))     # distinct mtime each append
+            claude._tail_scan(p)
+        self.assertEqual(len(claude._TAIL_MEMO), 1)
+        self.assertEqual(claude._tail_scan(p)["cwd"], "/c299")
+
+
 class TestSessionCwdFastPath(_Base):
     def test_tail_cwd_without_parse_any(self):
         self.transcript("s3", [{"cwd": self.tmp}])

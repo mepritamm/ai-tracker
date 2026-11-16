@@ -86,28 +86,32 @@ _META_CACHE = {}
 _PR_SCAN_BUDGET_SECS = 0.05
 
 
-_TAIL_MEMO = {}              # (realpath, mtime_ns, size, nbytes) -> _tail_scan_raw result; bounded
+_TAIL_MEMO = {}              # realpath -> (mtime_ns, size, nbytes, _tail_scan_raw result); one entry per file
 _TAIL_MEMO_LOCK = threading.Lock()
 _TAIL_MEMO_MAX = 256
 
 
 def _tail_scan(path, nbytes=96000):
     """Memoized `_tail_scan_raw`: an UNCHANGED transcript (same realpath, mtime_ns, size) is never
-    reopened -- placement/`parse_any` call this on every poll. A stat is the only I/O on a hit."""
+    reopened -- placement/`parse_any` call this on every poll. A stat is the only I/O on a hit.
+    One entry per realpath (replaced when the file changes); callers get an independent copy."""
     try:
         st = os.stat(path)
-        key = (os.path.realpath(path), st.st_mtime_ns, st.st_size, nbytes)
+        rp = os.path.realpath(path)
+        sig = (st.st_mtime_ns, st.st_size, nbytes)
     except OSError:
         return _tail_scan_raw(path, nbytes)
     with _TAIL_MEMO_LOCK:
-        hit = _TAIL_MEMO.get(key)
-    if hit is None:
+        ent = _TAIL_MEMO.get(rp)
+    if ent is not None and ent[:3] == sig:
+        hit = ent[3]
+    else:
         hit = _tail_scan_raw(path, nbytes)
         with _TAIL_MEMO_LOCK:
-            if len(_TAIL_MEMO) >= _TAIL_MEMO_MAX:
+            if rp not in _TAIL_MEMO and len(_TAIL_MEMO) >= _TAIL_MEMO_MAX:
                 _TAIL_MEMO.pop(next(iter(_TAIL_MEMO)))
-            _TAIL_MEMO[key] = hit
-    return dict(hit)
+            _TAIL_MEMO[rp] = sig + (hit,)
+    return {k: (list(v) if isinstance(v, list) else dict(v) if isinstance(v, dict) else v) for k, v in hit.items()}
 
 
 def _tail_scan_raw(path, nbytes=96000):
