@@ -168,6 +168,7 @@ Config → **Agents** lists each agent CLI the tracker manages that is installed
 - **Search** by keyword — all three search boxes (classic dashboard, session rail, Sessions view) share one query and one full-transcript result set, so a phrase found deep in a conversation shows everywhere. Sessions whose *name* matches rank first.
 - **Rename** any session to a title that means something to you (saved to `titles.json`).
 - **Pin** any session to keep it at the top of the list, above recency (saved to `pins.json`); the pinned marker is now the same blue in both classic and Control Room views.
+- **Remove** a session from the Control Room's Sessions view or Board with its **×** button. It only hides the session from the dashboard (saved to `hidden.json`); the transcript is never touched. A toast offers **Undo**, and **⌘Z / Ctrl+Z** undoes removals newest first (ignored while typing, in a terminal pane or with a dialog open). Removal is sticky, so new activity doesn't bring the session back; to restore one later, search for it in the Sessions view and click **Restore**. Remote read-only visitors don't see the button.
 - Sessions with todos show a **todo badge** — a compact `done/total` count, the same `todo_done`/`todo_total` the Control Room's rail rows and board tiles already drew, so progress reads the same in both UIs. Claude and Auggie alike; sessions with no todos show nothing rather than `0/0`.
 - Sessions with notes show a **notes** badge (see the Plan-on-the-go panel below).
 - Sessions with open flags show a **flags** badge and a red edge, and the sidebar's own **Flags** button (next to the notification bell) opens **every session's flags in one list** — each row names the session it belongs to and clicks through to it. Without it, a flag raised on a session you aren't currently looking at is invisible. Resolve / reopen / delete work from that list too, on any screen size.
@@ -251,7 +252,7 @@ All providers emit the **same result shape**, so the browser renders them identi
 | Push a note into the session | ✅ live → next turn-end; idle → next prompt/resume (`Stop` + `UserPromptSubmit` + `SessionStart` hooks) | ➖ queues fine, but Auggie has no hooks to deliver it — use copy | ➖ same — no hook, use copy |
 | Degraded-transcript notice ("Couldn't read this session — a line failed to parse, everything before it is shown") | ✅ reports the failing line **number** (1-based JSONL line) | 🟡 reports the same notice, but with **no line number** — Auggie's task-storage is a family of separate files, not one file with lines. A session file that's corrupt *outright* (fails to parse at all) now degrades the same honest way when you open it directly — "couldn't read this session," not missing; it still won't turn up in the sidebar **list** itself, which silently skips a file it can't parse | ➖ n/a |
 
-**Data files** — `flags.json` (your flags), `titles.json` (your renames), `pins.json` (pinned sessions), `notes.json` (your notes), `model_keep.json` (model versions you chose to keep), `title_sync.json` (renames that reached the Claude session), and `config.json` (Control Room's editable settings, tunnel on/off state, tunnel URL, and tunnel credentials) are read **live** (no restart). Everything else is baked into the page at startup, so **editing `aitracker/` or `web/` needs a server restart** to show.
+**Data files** — `flags.json` (your flags), `titles.json` (your renames), `pins.json` (pinned sessions), `hidden.json` (sessions you removed), `notes.json` (your notes), `model_keep.json` (model versions you chose to keep), `title_sync.json` (renames that reached the Claude session), and `config.json` (Control Room's editable settings, tunnel on/off state, tunnel URL, and tunnel credentials) are read **live** (no restart). Everything else is baked into the page at startup, so **editing `aitracker/` or `web/` needs a server restart** to show.
 
 ---
 
@@ -411,7 +412,7 @@ CLAUDE.md / AGENTS.md          context for AI agents working in this repo
 .claude/skills/tracker-gap/    skill: add a capability at the shared seam
                                (tracker-push, the maintainer's publish skill, is gitignored —
                                local-only, not part of this tree — see Skills above)
-flags.json / titles.json / pins.json / notes.json / forks.json / model_keep.json   your local data (git-ignored)
+flags.json / titles.json / pins.json / hidden.json / notes.json / forks.json / model_keep.json   your local data (git-ignored)
 config.json                    Control Room's editable settings + staged tunnel credentials
                                (mode 0600), read live — see Config/Tunnel above, git-ignored
 port / token / drain.log       where the server is, a local credential for the drain hook,
