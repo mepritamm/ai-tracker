@@ -242,6 +242,7 @@ def _run():
     det = agent_detail(spath, "cafebabe00")
     assert det["task"] == longtask, "detail task must be full & keep paragraph breaks"
 
+    _live_dir0, config.LIVE_SESSIONS_DIR = config.LIVE_SESSIONS_DIR, os.path.join(sdir, "no-live-dir")  # unknown host = no gate
     # background shells: launch + result naming id/output file; live .output -> running
     outp = os.path.join(sdir, "srv.output")
     with open(outp, "w") as f:
@@ -265,6 +266,17 @@ def _run():
         f.write(json.dumps({"type": "user", "message": {"role": "user",
                 "content": "<task-notification>\n<task-id>abcd1234</task-id>\n</task-notification>"}}) + "\n")
     assert parse_shells(spath)[0]["running"] is False, "task-notification -> done"
+    # a shell launched INSIDE a sub-agent is listed with its owner (default host_start = today's rule)
+    sbg = os.path.join(adir, "agent-feed0000000.jsonl")
+    with open(sbg, "w") as f:
+        f.write(json.dumps({"type": "assistant", "timestamp": "2026-06-22T10:02:00Z", "message": {"content": [
+            {"type": "tool_use", "id": "bgS", "name": "Bash",
+             "input": {"command": "sleep 99", "description": "Sidecar shell", "run_in_background": True}}]}}) + "\n")
+        f.write(json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "bgS",
+             "content": "Command running in background with ID: sc99. Output is being written to: %s/sc99.output" % sdir}]}}) + "\n")
+    sh2 = {s_["id"]: s_ for s_ in parse_shells(spath)}
+    assert sh2["sc99"]["agent"] == "feed0000000" and sh2["sc99"]["running"] is True and sh2["abcd1234"]["agent"] == "", sh2
 
     # output fallback: command redirects to its own LOG, harness .output stays empty
     logf = os.path.join(sdir, "heal.log")
@@ -282,6 +294,7 @@ def _run():
              "content": "Command running in background with ID: ef567890. Output is being written to: %s." % empty_out}]}}) + "\n")
     so2 = shell_output(spath, "ef567890")
     assert "PASS 12/12" in so2["out"], so2  # fell back to the LOG file
+    config.LIVE_SESSIONS_DIR = _live_dir0
 
     # search: matches real content, prefers user prompts, and ignores boilerplate
     w = _window("the quick brown fox jumps over", "brown", pad=5)
@@ -482,6 +495,7 @@ def _run():
     assert pa["cost"]["total_usd"] == 1.5 and pa["cost"]["basis"] == "Billed by Augment, USD", pa["cost"]   # billed $, not a recompute
     assert pa and pa["counts"]["done"] == 1 and pa["counts"]["todos"] == 2, pa   # todos via rootTaskUuid
     assert [r["text"] for r in pa["requests"]] == ["list the dir"], pa["requests"]
+    assert pa["shells"] == [] and pa["agents_bg"] == [], "auggie: no on-disk background shells/agents (degrades empty)"
     _narr = next((n for n in pa["narrative"] if "list it" in n["text"].lower()), None)
     assert _narr, pa["narrative"]
     assert len(_narr["text"]) > 2000, "narration must keep the full message, not cap at 900"

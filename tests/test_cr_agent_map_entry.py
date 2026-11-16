@@ -92,6 +92,33 @@ console.log('@@JSON@@' + JSON.stringify(OUT[0]));
 """ % (json.dumps(session), json.dumps(ui or {}))
         return _node(js)
 
+    def _count(self, session):
+        s = _src("ext_cr_detail.js")
+        js = r"""
+var CNT = null;
+function esc(x){return String(x==null?'':x);}
+function parseT(t){return t||0;}
+function shortModel(m){return m;}
+function mdHtmlSafe(t){return esc(t);}
+function setPanelCount(w,t){ CNT = t; }
+function setPanelBody(w,h){}
+function emptyHtml(t){return 'EMPTY';}
+function sharedStateHtml(n){return 'DEGRADED-MARKER';}
+function providerNote(sess){ return sess.note || null; }
+""" + _fn(s, "groupAgentReruns") + "\n" + _fn(s, "renderAgentsPanel") + "\n" + r"""
+renderAgentsPanel({}, {}, {}, %s);
+console.log('@@JSON@@' + JSON.stringify(CNT));
+""" % json.dumps(session)
+        return _node(js)
+
+    def test_panel_count_names_agents_and_shells(self):
+        ag = [{"aid": "a%d" % i, "task": "t", "running": True, "ts": 1} for i in range(2)]
+        sh = [{"id": "s%d" % i, "running": i == 0} for i in range(3)]
+        self.assertEqual(self._count({"agents_bg": ag, "shells": sh, "agent_sessions": [{"id": "x", "runs": 1}]}),
+                         "2 agents \u00b7 3 shells \u00b7 1 session")
+        self.assertEqual(self._count({"agents_bg": ag[:1], "shells": []}), "1 agent \u00b7 0 shells")
+        self.assertEqual(self._count({"agents_bg": [], "shells": []}), "\u2014")
+
     def test_panel_degraded_has_no_map_link(self):
         html = self._panel({"agents_bg": [], "shells": [], "agent_sessions": [],
                             "note": {"name": "Auggie", "degraded": "no bg model"}})

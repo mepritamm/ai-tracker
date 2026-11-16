@@ -280,5 +280,173 @@ class TestListAndDetail(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+def _iso(off):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + off))
+
+
+def _bash(tuid, off, bg=True, cmd="sleep 99"):
+    inp = {"command": cmd, "description": "d"}
+    if bg:
+        inp["run_in_background"] = True
+    return _msg(_iso(off), "run", tool_use={"type": "tool_use", "id": tuid, "name": "Bash", "input": inp})
+
+
+def _result(tuid, off, text, tur=None, err=False):
+    o = {"type": "user", "timestamp": _iso(off),
+         "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tuid,
+                                                   "content": text, "is_error": err}]}}
+    if tur is not None:
+        o["toolUseResult"] = tur
+    return o
+
+
+def _bgres(tid):
+    return "Command running in background with ID: %s. Output is being written to: /tmp/t/%s.output" % (tid, tid)
+
+
+class TestBackgroundHold(Base):
+    """Sidecar background shells hold their agent running while the host process lives."""
+    def setUp(self):
+        super().setUp()
+        self.live = tempfile.mkdtemp()
+        p = mock.patch.object(config, "LIVE_SESSIONS_DIR", self.live)
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(shutil.rmtree, self.live, True)
+        self.host()
+
+    def host(self, off=-3600, sid="sess"):
+        for n in os.listdir(self.live):
+            os.remove(os.path.join(self.live, n))
+        if off is None:
+            return
+        ps = time.strftime("%a %b %d %H:%M:%S %Y", time.gmtime(time.time() + off))
+        with open(os.path.join(self.live, "%d.json" % os.getpid()), "w") as fh:
+            json.dump({"pid": os.getpid(), "sessionId": sid, "kind": "bg", "procStart": ps}, fh)
+
+    def side(self, aid="a1", extra=(), stop=True):
+        rows = [_msg(_iso(-1900), "start")] + list(extra) + ([_stop(_iso(-1000))] if stop else [])
+        return self.agent(aid, rows, age=1000)
+
+    def sess(self):
+        claude._AGENT_CACHE.clear()
+        return parse_session(self.main)
+
+    def ag(self, d, aid="a1"):
+        return next(a for a in d["agents_bg"] if a["aid"] == aid)
+
+    def s1(self, tid="bsh1"):
+        return [_bash("u1", -1800), _result("u1", -1790, _bgres(tid), {"backgroundTaskId": tid})]
+
+    def main_add(self, rows):
+        with open(self.main, "a") as fh:
+            for o in rows:
+                fh.write(json.dumps(o) + "\n")
+
+    def test_open_sidecar_shell_holds_agent_after_stop_row(self):
+        self.side(extra=self.s1())
+        a = self.ag(self.sess())
+        self.assertEqual((a["state"], a["running"], a["ended"]), ("running", True, None))
+
+    def test_sidecar_shell_listed_with_owner(self):
+        self.side(extra=self.s1())
+        sh = self.sess()["shells"]
+        self.assertEqual([(s["id"], s["agent"], s["running"]) for s in sh], [("bsh1", "a1", True)])
+
+    def test_moved_to_background_shell_listed(self):
+        # (a) main, structured id + timeout wording
+        self.main_add([_bash("m1", -1800, bg=False),
+                       _result("m1", -1790, "Command did not complete within its 120s timeout and was moved to the background (ID: bmv1).",
+                               {"backgroundTaskId": "bmv1"})])
+        # (b) sidecar with no toolUseResult: harness text only, output path after the sentence
+        txt = ("...test output...\nCommand was moved to the background (ID: bmv2) so that a message that arrived "
+               "while it was running can reach you; it was not interrupted. Output is being written to: /tmp/t/bmv2.output")
+        self.side(extra=[_bash("u2", -1800, bg=False), _result("u2", -1790, txt)])
+        d = self.sess()
+        sh = {s["id"]: s for s in d["shells"]}
+        self.assertTrue(sh["bmv1"]["running"] and sh["bmv2"]["running"], sh)
+        self.assertTrue(sh["bmv2"]["out"].endswith("/bmv2.output"))
+        self.assertEqual(self.ag(d)["state"], "running")
+
+    def test_quoted_harness_text_is_not_a_shell(self):
+        line = "Command did not complete within its 120s timeout and was moved to the background (ID: bq1)."
+        # (a) dict toolUseResult without backgroundTaskId: the sentence starts a line (a cat of a log)
+        # (b) no toolUseResult: the sentence is quoted mid-line (a grep over a transcript)
+        for tur, q in (({"stdout": line, "interrupted": False}, line), (None, 'grep out: "content": "' + line + ' x"')):
+            self.side(extra=[_bash("u3", -1800, bg=False), _result("u3", -1790, q, tur)])
+            d = self.sess()
+            self.assertEqual(d["shells"], [], tur)
+            self.assertEqual(self.ag(d)["state"], "done", tur)
+
+    def test_refused_background_launch_is_not_a_shell(self):
+        self.side(extra=[_bash("u4", -1800), _result("u4", -1790, "auto mode cannot determine the safety of Bash", err=True)])
+        d = self.sess()
+        self.assertEqual(d["shells"], [])
+        self.assertEqual(self.ag(d)["state"], "done")
+
+    def test_completion_in_main_closes_sidecar_shell(self):
+        self.side(extra=self.s1())
+        self.main_add([{"type": "queue-operation", "content": "<task-notification><task-id>bsh1</task-id></task-notification>"}])
+        d = self.sess()
+        self.assertFalse(d["shells"][0]["running"])
+        self.assertEqual(self.ag(d)["state"], "done")
+
+    def test_failed_taskstop_keeps_hold_successful_closes(self):
+        self.side(extra=self.s1())
+        self.main_add([_msg(_iso(-900), "stop", tool_use={"type": "tool_use", "id": "ts1", "name": "TaskStop", "input": {"task_id": "bsh1"}}),
+                       _result("ts1", -890, "No task found", err=True)])
+        self.assertEqual(self.ag(self.sess())["state"], "running")
+        self.main_add([_msg(_iso(-800), "stop", tool_use={"type": "tool_use", "id": "ts2", "name": "TaskStop", "input": {"task_id": "bsh1"}}),
+                       _result("ts2", -790, "Successfully stopped task")])
+        d = self.sess()
+        self.assertEqual(self.ag(d)["state"], "done")
+        self.assertFalse(d["shells"][0]["running"])
+
+    def test_agent_taskstopped_from_main_releases_its_shells(self):
+        self.side(extra=self.s1())
+        self.main_add([_msg(_iso(-900), "stop", tool_use={"type": "tool_use", "id": "ts3", "name": "TaskStop", "input": {"task_id": "a1"}}),
+                       _result("ts3", -890, "Successfully stopped task")])
+        d = self.sess()
+        self.assertEqual(self.ag(d)["state"], "done")
+        self.assertFalse(d["shells"][0]["running"])
+
+    def test_monitor_does_not_hold_agent(self):
+        self.side(extra=[_msg(_iso(-1800), "m", tool_use={"type": "tool_use", "id": "mn1", "name": "Monitor", "input": {"command": "tail -f x"}}),
+                         _result("mn1", -1790, "Monitor started", {"taskId": "bm1", "timeoutMs": 1800000})])
+        d = self.sess()
+        self.assertEqual(d["shells"], [])
+        self.assertEqual(self.ag(d)["state"], "done")
+
+    def test_host_gate_orphans(self):
+        self.side(extra=self.s1())
+        boot = time.time() - time.clock_gettime(getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC))
+        for label, off in (("no live file", None), ("procStart after launch", -600),
+                           ("procStart before boot", boot - 7200 - time.time())):
+            self.host(off)
+            d = self.sess()
+            self.assertEqual(self.ag(d)["state"], "done", label)
+            self.assertFalse(d["shells"][0]["running"], label)
+
+    def test_unknown_host_keeps_todays_rules(self):
+        self.side(extra=self.s1())
+        with mock.patch.object(config, "LIVE_SESSIONS_DIR", os.path.join(self.live, "missing")):
+            d = self.sess()
+        self.assertEqual(self.ag(d)["state"], "done")
+        self.assertTrue(d["shells"][0]["running"])
+
+    def test_gate_keys_on_file_name(self):
+        self.side(extra=self.s1())
+        self.main_add([{"type": "user", "sessionId": "other", "message": {"role": "user", "content": "later"}}])
+        self.assertEqual(self.ag(self.sess())["state"], "running")
+
+    def test_union_never_mutates_cached_agent_sets(self):
+        sp = self.side(extra=self.s1())
+        self.sess()
+        before = set(claude._AGENT_CACHE[sp][1]["bg"]["done"])
+        self.main_add([{"type": "queue-operation", "content": "<task-notification><task-id>zzz</task-id></task-notification>"}])
+        parse_session(self.main)
+        self.assertEqual(claude._AGENT_CACHE[sp][1]["bg"]["done"], before)
+
+
 if __name__ == "__main__":
     unittest.main()

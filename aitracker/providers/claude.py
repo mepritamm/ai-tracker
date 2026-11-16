@@ -1,4 +1,4 @@
-import glob, json, os, re, subprocess, threading, time
+import calendar, glob, json, os, re, subprocess, threading, time
 from ..config import EDIT_TOOLS, NARRATION_CAP
 from .. import config
 from ..util import file_pass, _dur, _names, _short_title, _first_line, _window, _iso_epoch, _ts_epoch, _git_branch, cmd_kind, TEST_RE, COMMIT_MSG_RE, collect_prs, note_pr_states, prs_sorted, pr_worked, pr_summary, push_when, PR_CREATE_RE, unified as _unified, safe_path_component, context_window, todo_summary, todo_times_approximate, now_phrase, real_model, model_label, cost_add, cost_summary, _cost_merge, _acc_usd
@@ -1403,12 +1403,16 @@ def _agent_file_pass(af, mt):
     segs, seg_start, last_msg_ep = [], None, 0.0
     first_ts = stop_ts = None
     n_stop, stop_after, ctx_tok = 0, False, None
+    bg = _bg_acc()
     try:
         with open(af, encoding="utf-8") as fh:
             for line in fh:
                 try:
                     o = json.loads(line)
                 except ValueError:
+                    o = None
+                _bg_line(bg, line, o)       # this file's background shells / completions / stops
+                if o is None:
                     continue
                 if o.get("timestamp"):
                     last_ts = o["timestamp"]
@@ -1501,7 +1505,9 @@ def _agent_file_pass(af, mt):
     wf = next((p for p in af.split(os.sep) if p.startswith("wf_")), "")
     hbl["labels"][aid] = (" ".join(task.split())[:60] or "agent " + aid[:7], model)
     sd = sc.get("spawnDepth")
+    bg.pop("_pend", None)
     return {
+        "bg": bg,
         "mt": mt, "aid": aid, "hb": hbl, "cost": _cost_acc(cost_last), "files": files, "prs": prs, "pst": pst, "spawned": spawned,
         "segs": segs, "open_start": seg_start, "last_msg_ep": last_msg_ep,
         "n_stop": n_stop, "stop_after": stop_after, "stop_ts": stop_ts, "last_ts": last_ts,
@@ -1560,7 +1566,7 @@ def _agent_entry(af):
     return st.st_mtime, e
 
 
-def parse_agents(path, hb=None, cost=None):
+def parse_agents(path, hb=None, cost=None, live=frozenset()):
     """Parse background-agent transcripts: what each one is, doing, and whether it's live.
     Also harvests PRs the agents generated (a `gh pr create`/MCP in a subagent) + their state,
     so a PR opened by a background agent is attributed to the session — not lost with the subagent.
@@ -1626,8 +1632,11 @@ def parse_agents(path, hb=None, cost=None):
     for e in entries:
         aid = e["aid"]
         row = dict(e["row"])
-        running = (now - e["mt"]) < config.LIVE_WINDOW
-        if e["stop_after"]:
+        held = aid in live      # owns an open background shell while its host process lives
+        running = (now - e["mt"]) < config.LIVE_WINDOW or held
+        if held:
+            done, ended = False, None
+        elif e["stop_after"]:
             done, ended = True, e["stop_ts"]
         elif not e["n_stop"] and e["finished"]:
             done, ended = True, e["last_ts"]
@@ -1745,59 +1754,155 @@ SHELL_RE = re.compile(r"running in background with ID:\s*(\S+?)\.\s*"
 
 TASKDONE_RE = re.compile(r"<task-id>([^<]+)</task-id>")
 
+# Harness sentences for a Bash call that became a background task without `run_in_background`
+# (line-anchored so output that merely QUOTES one mid-line is never a shell), and the output path.
+BG_LINE_RE = re.compile(r"^Command (?:running in background with ID: |did not complete within its \d+s timeout and was moved to the background \(ID: |was moved to the background \(ID: |was manually backgrounded by user with ID: )([A-Za-z0-9]+)", re.M)
+_OUT_RE = re.compile(r"Output is being written to:\s*(\S+\.output)")
+_BLOB_TYPES = ("api-request-blob", "api-request-shape")
+
+
+def _bg_acc():
+    return {"shells": {}, "done": set(), "stopped": set(), "_pend": {}}
+
+
+def _bg_line(acc, line, o):
+    """Feed one transcript row (raw `line`, parsed `o`) into a per-file background-shell accumulator.
+    A shell exists only once its tool_result resolves an id: the structured toolUseResult.backgroundTaskId
+    when the row has a dict one, else (explicit run_in_background, or no dict at all) the harness text."""
+    if "<task-notification>" in line:
+        acc["done"].update(TASKDONE_RE.findall(line))
+    if not isinstance(o, dict) or o.get("type") in _BLOB_TYPES:
+        return
+    m = o.get("message")
+    content = m.get("content") if isinstance(m, dict) else None
+    if not isinstance(content, list):
+        return
+    pend = acc["_pend"]
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "tool_use":
+            inp = b.get("input") or {}
+            if b.get("name") == "Bash":
+                pend[b.get("id")] = ("bg" if inp.get("run_in_background") else "fg",
+                                     {"cmd": inp.get("command", "")[:4000], "desc": inp.get("description", "") or "",
+                                      "ts": o.get("timestamp")})
+            elif b.get("name") == "TaskStop":
+                pend[b.get("id")] = ("stop", inp.get("task_id"))
+        elif b.get("type") == "tool_result" and b.get("tool_use_id") in pend:
+            tuid = b["tool_use_id"]
+            kind, info = pend.pop(tuid)
+            if kind == "stop":
+                if not b.get("is_error") and isinstance(info, str) and info:
+                    acc["stopped"].add(info)
+                continue
+            txt = _result_text(b.get("content"))
+            tur = o.get("toolUseResult")
+            tid = tur.get("backgroundTaskId") if isinstance(tur, dict) else None
+            if not (isinstance(tid, str) and tid):
+                tid = None
+                if kind == "bg" or not isinstance(tur, dict):
+                    mt = (SHELL_RE.search(txt) if kind == "bg" else None) or BG_LINE_RE.search(txt)
+                    tid = mt.group(1) if mt else None
+            if tid:
+                outs = _OUT_RE.findall(txt)
+                out = next((p for p in outs if p.endswith("/" + tid + ".output")), outs[-1] if outs else "")
+                acc["shells"].setdefault(tuid, dict(info, id=tid, out=out))
+
 
 def _shells_pass(path):
     """Scan half of parse_shells: a pure function of the transcript's bytes (cached by file_pass)."""
-    launches, results, done = {}, {}, set()
+    acc = _bg_acc()
     with open(path, encoding="utf-8") as fh:
         for line in fh:
-            if "<task-notification>" in line:
-                done.update(TASKDONE_RE.findall(line))
             try:
                 o = json.loads(line)
             except ValueError:
-                continue
-            ts = o.get("timestamp")
-            m = o.get("message")
-            content = m.get("content") if isinstance(m, dict) else None
-            if not isinstance(content, list):
-                continue
-            for b in content:
-                if not isinstance(b, dict):
-                    continue
-                if b.get("type") == "tool_use" and b.get("name") == "Bash" and (b.get("input") or {}).get("run_in_background"):
-                    inp = b["input"]
-                    launches[b.get("id")] = {"cmd": inp.get("command", "")[:4000],
-                                             "desc": inp.get("description", ""), "ts": ts}
-                elif b.get("type") == "tool_result" and b.get("tool_use_id") in launches:
-                    mt = SHELL_RE.search(_result_text(b.get("content")))
-                    if mt:
-                        results[b["tool_use_id"]] = (mt.group(1), mt.group(2))
-    return launches, results, done
+                o = None
+            _bg_line(acc, line, o)
+    acc.pop("_pend")
+    return acc
 
 
-def parse_shells(path):
-    """Background shells: a Bash run_in_background launch + its result naming the
-    shell id and live .output file. A shell is running until a <task-notification>
+def _host_start(sid):
+    """Epoch start of the live process hosting session `sid` (min over its live <pid>.json files);
+    None = no live host (everything closed); 0.0 = unknown (dir unreadable / procStart unparseable:
+    no bound). A procStart from before this boot is a stale file with a reused pid. Never raises."""
+    try:
+        names = os.listdir(config.LIVE_SESSIONS_DIR)
+    except OSError:
+        return 0.0
+    try:
+        boot = time.time() - time.clock_gettime(getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC))
+    except Exception:
+        boot = 0.0
+    best = None
+    for n in names:
+        if not n.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(config.LIVE_SESSIONS_DIR, n)) as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(d, dict) or d.get("sessionId") != sid or not _pid_alive(d.get("pid")):
+            continue
+        try:
+            ps = calendar.timegm(time.strptime(" ".join(d["procStart"].split()), "%a %b %d %H:%M:%S %Y"))
+        except Exception:
+            return 0.0
+        if ps < boot - 60:
+            continue
+        best = ps if best is None else min(best, ps)
+    return best
+
+
+def _bg_tasks(path, host_start=0.0):
+    """Every background shell of the session (main + sidecars), each {id,agent,cmd,desc,ts,out,running}.
+    Open = no notification and no successful TaskStop (of it or its owner agent) anywhere in the
+    session, and launched after the live host started (None host = closed, 0.0 = unbounded)."""
+    accs = [("", file_pass("claude.shells", path, _shells_pass))]
+    for af in sorted(_agent_files(path)):
+        e = _agent_entry(af)[1]
+        if e is not None:
+            accs.append((e["aid"], e["bg"]))
+    done = set().union(*(a["done"] for _, a in accs))
+    stopped = set().union(*(a["stopped"] for _, a in accs))
+    out = []
+    for aid, a in accs:
+        for info in a["shells"].values():
+            running = (info["id"] not in done and info["id"] not in stopped and aid not in stopped
+                       and host_start is not None
+                       and (host_start == 0.0 or _ts_epoch(info["ts"]) >= host_start - 1))
+            out.append(dict(info, agent=aid, running=running))
+    return out
+
+
+def _last_line(p, n=4096):
+    """Last non-blank line (<=200 chars) of the final `n` bytes of file `p`; "" if unreadable."""
+    if not p:
+        return ""
+    try:
+        with open(p, "rb") as fh:
+            fh.seek(max(0, os.fstat(fh.fileno()).st_size - n))
+            lines = [l for l in fh.read().decode("utf-8", "ignore").splitlines() if l.strip()]
+    except OSError:
+        return ""
+    return lines[-1][:200] if lines else ""
+
+
+def parse_shells(path, host_start=0.0, tasks=None):
+    """Background shells of the session (main + sidecars): a Bash call whose result resolved a
+    background shell id and its live .output file. A shell is running until a <task-notification>
     for its id appears (the harness' completion signal) — the .output file's mtime
     is NOT reliable, since commands often redirect their output to their own log."""
-    try:
-        launches, results, done = file_pass("claude.shells", path, _shells_pass)
-    except OSError:
-        return []
-    out = []
-    for lid, info in launches.items():
-        shell_id, outpath = results.get(lid, ("", ""))
-        last = ""
-        if outpath and os.path.exists(outpath):
-            try:
-                with open(outpath, encoding="utf-8", errors="ignore") as fh:
-                    lines = [l for l in fh.read().splitlines() if l.strip()]
-                last = lines[-1][:200] if lines else ""
-            except OSError:
-                pass
-        out.append({"id": shell_id or (lid or "")[:10], "cmd": info["cmd"], "desc": info["desc"],
-                    "ts": info["ts"], "running": (shell_id or "") not in done, "last": last, "out": outpath})
+    if tasks is None:
+        try:
+            tasks = _bg_tasks(path, host_start)
+        except OSError:
+            return []
+    out = [{"id": t["id"], "cmd": t["cmd"], "desc": t["desc"], "ts": t["ts"], "running": t["running"],
+            "last": _last_line(t["out"]), "out": t["out"], "agent": t["agent"]} for t in tasks]
     out.sort(key=lambda s: (not s["running"], s["ts"] or ""))
     return out
 
@@ -1832,7 +1937,7 @@ def _read_tail(p, n=40000):
 def shell_output(path, shell_id):
     """Fetched on click: the launching command + the tail of its output — the
     harness .output file, or the command's own redirect target if that's empty."""
-    sh = next((s for s in parse_shells(path) if s["id"] == shell_id), None)
+    sh = next((s for s in parse_shells(path, _host_start(os.path.basename(path)[:-6])) if s["id"] == shell_id), None)
     if not sh:
         return {"cmd": "", "out": "", "running": False}
     out = _read_tail(sh["out"]) if sh["out"] and os.path.exists(sh["out"]) else ""
@@ -2226,7 +2331,13 @@ def parse_session(path):
     done_todos = [t for t in todos if t.get("status") == "completed"]
     hb_ag = {"turns": hb_turns, "calls": hb_calls, "iv": hb_iv, "labels": {}}   # parse_agents appends who=aid rows
     agent_cost = {"tok": {}, "per": []}
-    agents_bg, newest_agent, agent_files, agent_prs, agent_pr_states = parse_agents(path, hb_ag, agent_cost)
+    hs = _host_start(os.path.basename(path)[:-6])
+    try:
+        bg_tasks = _bg_tasks(path, hs)
+    except OSError:
+        bg_tasks = []
+    live_aids = {t["agent"] for t in bg_tasks if t["running"] and t["agent"]} if hs else set()
+    agents_bg, newest_agent, agent_files, agent_prs, agent_pr_states = parse_agents(path, hb_ag, agent_cost, live_aids)
     for aid_, d_ in hb_desc.items():   # prefer the short Agent description over the prompt-prefix label
         if aid_ in hb_ag["labels"] and " ".join(d_.split()):
             hb_ag["labels"][aid_] = (" ".join(d_.split())[:60], hb_ag["labels"][aid_][1])
@@ -2257,7 +2368,7 @@ def parse_session(path):
         if ae["created"]:
             e["created"] = True
         e["agent"] = True     # a background agent created/updated it — mark it even if the main session also touched it
-    shells = parse_shells(path)
+    shells = parse_shells(path, hs, bg_tasks)
     meta["title"] = (load_titles().get(sid) or meta.get("customTitle") or meta.get("aiTitle")
                      or (_short_title(requests[0]["text"]) if requests else ""))
     # Anti-drift: the detail view's "is this session working" glow must agree with the

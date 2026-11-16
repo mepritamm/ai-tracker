@@ -180,6 +180,7 @@ class ClaudeShellsRunningTailScanTests(unittest.TestCase):
         _write_jsonl(self.main, rows)
         e = self._entry()
         self.assertEqual(e["shells_running"], 0)
+        self.assertEqual(parse_shells(self.main), [])
 
 
 class NowLineSurfacesShellsLikeAgentsTests(unittest.TestCase):

@@ -2988,7 +2988,12 @@
     var finishedGroups = grouped.filter(function (g) { return !g.running; });
     var runningShells = Array.isArray(shells) ? shells.filter(function (s) { return s && s.running; }) : [];
     var finishedShells = Array.isArray(shells) ? shells.filter(function (s) { return s && !s.running; }) : [];
-    setPanelCount(wrap, (agentsBg.length + (Array.isArray(shells) ? shells.length : 0) + (Array.isArray(session.agent_sessions) ? session.agent_sessions.length : 0)) || "—");
+    var nAg = agentsBg.length, nSh = Array.isArray(shells) ? shells.length : 0;
+    var nSe = Array.isArray(session.agent_sessions) ? session.agent_sessions.length : 0;
+    // numbers and fixed words only: setPanelCount writes innerHTML
+    var cntParts = [nAg + " agent" + (nAg === 1 ? "" : "s"), nSh + " shell" + (nSh === 1 ? "" : "s")];
+    if (nSe) cntParts.push(nSe + " session" + (nSe === 1 ? "" : "s"));
+    setPanelCount(wrap, (nAg || nSh || nSe) ? cntParts.join(" · ") : "—");
 
     function agentRow(g) {
       var a = g.latest;

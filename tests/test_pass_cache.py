@@ -393,6 +393,23 @@ class TestParseSessionCache(_Env):
         self.assertEqual(s2[0]["last"], "tail now")
         self.assertIn(("claude.shells", self.main), util._PASS_CACHE)
 
+    def test_shell_last_reads_bounded_tail(self):
+        import builtins
+        outp = os.path.join(self.dir, "big.output")
+        with open(outp, "w") as fh:
+            fh.write("noise line\n" * 20000 + "END\n")
+        reads, real = [], builtins.open
+
+        def spy(*a, **k):
+            fh = real(*a, **k)
+            if a and a[0] == outp:
+                rd = fh.read
+                fh.read = lambda *x: (lambda b: (reads.append(len(b)), b)[1])(rd(*x))
+            return fh
+        with mock.patch.object(builtins, "open", spy):
+            self.assertEqual(claude._last_line(outp), "END")
+        self.assertTrue(reads and max(reads) <= 4096, reads)
+
     def test_missing_transcript_shells_empty(self):
         self.assertEqual(parse_shells(os.path.join(self.dir, "nope.jsonl")), [])
 
