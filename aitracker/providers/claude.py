@@ -1825,7 +1825,7 @@ def _bg_line(acc, line, o):
                 pend[b.get("id")] = ("agent", None)
         elif b.get("type") == "tool_result" and b.get("tool_use_id") in pend:
             tuid = b["tool_use_id"]
-            kind, info = pend.pop(tuid)
+            kind, info = pend[tuid] if pend[tuid][0] == "agent" else pend.pop(tuid)
             if kind == "stop":
                 if not b.get("is_error") and isinstance(info, str) and info:
                     acc["stopped"].add(info)

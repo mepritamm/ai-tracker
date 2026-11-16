@@ -3016,7 +3016,7 @@
       var titleHtml = a.task ? mdHtmlSafe(a.task) : esc(a.aid || "background agent");
       return '<div class="crd-agent-row-item"><span class="crd-state-dot ' + (g.running ? "is-working" : g.waiting ? "is-waiting" : "is-done") +
         '"></span><span class="crd-agent-title">' + titleHtml + "</span>" +
-        tag + (g.waiting ? '<span class="crd-agent-wf mono">waiting on shell ' + esc((a.waiting_on || []).join(", ")) + "</span>" : "") + modelTag + '<button type="button" class="crd-open-link" data-act="agent-map" data-focus="' + esc(a.aid) + '">map</button>' +
+        tag + (g.waiting && (a.waiting_on || []).length ? '<span class="crd-agent-wf mono">waiting on shell' + (a.waiting_on.length > 1 ? "s " : " ") + esc(a.waiting_on.join(", ")) + "</span>" : "") + modelTag + '<button type="button" class="crd-open-link" data-act="agent-map" data-focus="' + esc(a.aid) + '">map</button>' +
         '<button class="crd-open-link" data-act="agent-open" data-id="' + esc(a.aid) + '">open ›</button></div>'; // "opening the latest"
     }
     function shellRow(s) {

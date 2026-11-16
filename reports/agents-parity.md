@@ -975,3 +975,171 @@ Implemented Plan v3 + v3.1 amendments (R1 running rule, R3 empty-pane) on top of
 **Known gaps recorded (R2, R4).** R2: sidecar `toolUseResult` is absent before 2026-11, so a pre-Nov nested async spawn has no `ret`; covered by the last-message-vs-notification comparison. R4 (a)-(d) doc-only items from the re-review are accepted as known gaps, no code.
 
 **Gate:** `unset TRACKER_AUTH; make check` green, `selfcheck ok`.
+
+## Implementation review v3 B — UI & tests (opus)
+
+Scope: ext_cr_dialogs.js/.css, ext_cr_detail.js/.css, and the five test files at aa2d8d2. The other reviewer covers claude.py logic. Method: grep and sed ranges only. Red proofs used a scoped single-match revert through `~/.claude/jobs/16c95193/tmp/revB/rp.py` (back up, replace, run one test, restore). `git status --short` was clean afterwards.
+
+**Verified, no defect:**
+- **Red proofs re-run independently (7). All went RED and are green again.**
+  - Panel `runningGroups` filter reverted to `g.running`: `test_panel_waiting_agent_listed_not_finished` failed. The row vanished entirely.
+  - `emptyText` reverted to `state === 'done'`: `test_pane_empty_text_by_state` failed with "(no output yet)".
+  - The map's `dimmed` waiting exclusion dropped: `test_waiting_agent_is_live_in_model_and_subtitle` failed with `dimmed: True`.
+  - The `nodeEl` waiting-on meta dropped: `test_j_waiting_agent_node` failed.
+  - Notification made permanent (`aid not in nts_u`): `test_woken_agent_is_running_until_renotified` failed with waiting≠running. `test_resumed_host_agent_woken_after_restart_is_running` failed with done≠running.
+  - `ret_u` term dropped: `test_sync_spawn_result_ends_agent_async_does_not` failed with running≠done.
+- **`OUT.empty_waiting` is not a test-only value.** The harness calls the real `agentPaneModel` (test_cr_agent_map_ui.py:129), and the string comes from ext_cr_dialogs.js:2982.
+- **innerHTML safety holds.**
+  - Panel: shell ids pass through `esc()` (ext_cr_detail.js:3019).
+  - Map: `meta.join(' · ')` is a string child of `h()`, which becomes `createTextNode` (ext_cr_dialogs.js:39-56).
+  - `setPanelCount` still receives numbers and fixed words only.
+- **Consumers that bucket by state.** All of them match the plan's consumer table (Plan v3 §3):
+  - The glow, the "N agents running" pill and overview read `running`. So does `paneNeedsFetch`, whose `state !== 'running'` makes waiting re-fetch like done. Waiting is not "working" for any of them.
+  - Auggie emits `agents_bg: []` (auggie.py:502,774), so the new shared-shape fields cost it nothing.
+- **CSS is balanced.**
+  - ext_cr_detail.css: 103 `/*` and 103 `*/`; 441 `{` and 441 `}`.
+  - ext_cr_dialogs.css: 35 `/*` and 35 `*/`; 249 `{` and 249 `}`.
+  - With comments stripped, no stray `*/` remains. `node --check` passes on both JS files.
+- **Tests are hermetic.**
+  - `TestBackgroundHold` patches `LIVE_SESSIONS_DIR` to a tmpdir (test_agent_map.py:312), and `test_shells_running` does the same.
+  - Every time is relative to `time.time()` (`_iso`, `host`).
+  - 103 tests across the five modules: OK.
+
+**Findings (all four parts each):**
+
+**B3-1 LOW: the "hide finished" default for waiting is untested.**
+- **Defect:** the change at ext_cr_dialogs.js:2919 (`counts.running + counts.waiting > 0`) is not pinned by any test.
+- **Repro:** revert it to `counts.running > 0` and run all of test_cr_agent_map_ui + test_cr_agent_map_entry. Both stay green (RC 0).
+  - The only waiting fixture (`mw`) also has a running row, so `hide` is true either way.
+  - Live effect of a regression: a session whose only live agents are waiting would show every finished agent, undimmed. Waiting rows would then not stand out.
+- **Direction:** test only. No code change.
+- **Way:** in `_PURE_JS` next to `mw`, add:
+  ```
+  var mwo = agentMapModel(sess([row('w', { state: 'waiting', waiting_on: ['b1'] }), row('d')]), {});
+  OUT.wo = [mwo.flags.hideFinished, mwo.hiddenCount];
+  ```
+  In `test_waiting_agent_is_live_in_model_and_subtitle`, assert `O["wo"] == [True, 1]`.
+- **Test:** RED with the revert above, which gives `[False, 0]`.
+
+**B3-2 LOW: the R3 fix is bypassed for a freshly waiting agent.**
+- **Defect:** ext_cr_dialogs.js:2982 keeps `&& !(detail && detail.running)`. `agent_detail.running` is still mtime-based (claude.py:1977, known gap (a)). The common waiting case is an agent that just finished its turn, and its sidecar mtime is within `LIVE_WINDOW`.
+- **Repro:** `agentPaneModel(row('a', {state:'waiting'}), {tail:'', running:true}).emptyText` returns "(no output yet)", but "No text output" is expected. So for the first 300 s, exactly when R3 matters, the pane still says "(no output yet)".
+  - The new test passes `{tail:''}` with no `running`, so it never reaches this path.
+- **Direction:** the server's `state` is authoritative for waiting (rule 5).
+  - Must NOT change: the `empty_done_but_running` behaviour (state 'done' with `detail.running` gives "(no output yet)"). It covers the no-host, mtime-based path.
+- **Way:** change it to `emptyText: (node.state === 'waiting' || (node.state !== 'running' && !(detail && detail.running))) ? 'No text output' : '(no output yet)'`.
+  - Alternative, server-side and owned by the claude.py reviewer: make `agent_detail.running` reuse the `parse_agents` state.
+- **Test:** add `OUT.empty_waiting_live = agentPaneModel(row('a', { state: 'waiting' }), { tail: '', running: true }).emptyText;` and assert "No text output" in `test_pane_empty_text_by_state`. It is RED on aa2d8d2.
+
+**B3-3 LOW (cosmetic): two renderers word the same field differently.**
+- **Defect:** for more than one shell they disagree (conventions rule 4).
+  - ext_cr_detail.js:3019 always says "waiting on shell a, b".
+  - The map, ext_cr_dialogs.js:3071, says "waiting on shells a, b" and omits the tag when `waiting_on` is empty. The panel would then print a bare "waiting on shell ".
+- **Repro:** `_panel({agents_bg:[{aid:'w1',task:'t',running:false,state:'waiting',waiting_on:['b1','b2'],ts:1}],shells:[]})` gives "waiting on shell b1, b2", but "waiting on shells b1, b2" is expected.
+- **Direction:** the panel matches the map's wording and guard. Must NOT change: `esc()` and the tag position.
+- **Way:** in `agentRow`, `var wo = a.waiting_on || [];` then `(g.waiting && wo.length ? '<span class="crd-agent-wf mono">waiting on shell' + (wo.length > 1 ? 's ' : ' ') + esc(wo.join(", ")) + "</span>" : "")`.
+- **Test:** in test_cr_agent_map_entry.py, add `test_panel_waiting_on_two_shells_plural`, asserting "waiting on shells b1, b2". It is RED on aa2d8d2.
+
+**B3-4 NOTE (no change; known gap, plan-accepted in the Plan v3 §3 table):** some surfaces still treat waiting as finished. Document this in the push note.
+- The classic UI's app.js:1963-2000 bg panel files a waiting agent under "Show N finished" with a "done" label. Its header reads "all finished".
+- The timeline marker (ext_cr_detail.js:712) labels it "finished".
+- The completion toast fires on running→waiting.
+- The user decision scoped "visible, not behind Show N finished" to the Evidence panel, and the plan marked these "none". No missed-by-both item here.
+
+**Verdict:** the UI and tests match Plan v3 + v3.1. The implementer's red-proof claims hold for every one I re-ran. Three LOW fixes remain, B3-1 to B3-3: one test-only and two one-line code changes, each with a red test. None blocks.
+
+## Implementation review v3 A — provider (opus)
+
+Scope: `aitracker/providers/claude.py` at aa2d8d2 only (`_bg_acc`, `_bg_line`, `_bg_tasks`, `parse_agents`, `parse_session`, `shell_output`). I started from the assumption that the implementer's report was false. Probes are in `~/.claude/jobs/16c95193/tmp/rvA3/` and were run with `python3 -I` and `TRACKER_AUTH` unset. No code edits, no stash, no process control.
+
+### Verdict
+The rule is implemented as v3.1 states it. The pre-v2 branch is byte-identical to base, caches are never mutated, and live parity is 6/6 right now. **One LOW defect (A3-1)** can leave an agent "running" for the host's whole life. It is rare: 1 case in 1500 sessions.
+
+### Findings
+
+**A3-1 LOW: an interrupted sync spawn that later completes stays "running" while the host lives.** The defect is at claude.py:1783, `kind, info = pend.pop(tuid)`, together with 1791.
+- **Mechanism.** `_bg_line` pops the spawn's `pend` entry at its first tool_result. Any later result for the same spawn id is therefore ignored, and `ret` keeps the epoch of the first result only.
+- **Live repro: c2cb9d22, agent a6552f622 (`rvA3/insp.py c2cb9d22 a6552f622`).**
+  - Main transcript:
+    - Agent tool_use at 04:46:25.
+    - Result with str `toolUseResult` "[Request interrupted by user for tool use]" at 04:47:38.
+    - A second result with dict `toolUseResult` and `status: "completed"` at 04:56:06.
+  - The sidecar keeps working until 04:56:02.956 and has no notification, because it is a sync agent.
+  - So `ret` = 04:47:38 and `lm` > `ret`. Under a live host it is "running" forever (actual); expected "done" after 04:56:06.
+  - The host is dead today, so production shows it done.
+  - Prevalence (`rvA3/multiret.py 1500`, `retgap.py 1500`): it is the only spawn with more than one non-blob result, and the only one of 265 agents with a `ret` epoch whose last message is newer than both `ret` and its notifications.
+- **Fix direction.**
+  - What changes: every non-`async_launched` result of a spawn id updates `ret` by max.
+  - What must NOT change:
+    - Bash and TaskStop `pend` entries are still popped at their first result, so shells and stops are unchanged.
+    - async results still never set `ret`.
+    - `ret` stays a per-file pure dict.
+- **The way.** At claude.py:1783:
+  ```python
+  kind, info = pend[tuid] if pend[tuid][0] == "agent" else pend.pop(tuid)
+  ```
+  - This keeps "agent" entries alive in `pend`, which `_agent_file_pass` and `_shells_pass` already drop before caching.
+  - The 1791 max-merge then does the rest. No `parse_agents` change is needed.
+  - Verified in memory with `rvA3/fix_f1.py`: the whole of `tests/test_agent_map.py` plus the repro gives 63 OK.
+- **Test.** Add `test_interrupted_sync_spawn_that_later_completes_is_done` to `TestBackgroundHold`. The exact body is in `rvA3/repro_f1.py`:
+  - sidecar a1 (meta `toolUseId` tu1) has messages at -1900 and -1500, then a stop at -1499;
+  - main has `_spawn("tu1")` at -2000, a str/is_error interrupt result at -1800, and a `{"status":"completed"}` result at -1490;
+  - expect "done".
+  - It is RED on aa2d8d2 (`'running' != 'done'`) and green with the fix.
+
+### Attacks that held (no change)
+- **What bumps `last_msg_ep`.**
+  - Census of 300 sessions (`rvA3/census.py`): sidecar rows with a dict `message` and a timestamp are only `user` and `assistant` (128061 and 80670).
+  - `api-request-blob` rows carry a `message` but **no timestamp**, so they never bump it.
+  - SubagentStop and other hook rows are attachments with no `message`, which the code `continue`s past.
+  - `api-request` and `progress` rows have no `message`.
+  - The incoming notification lands in the *parent's* file. In a parent sidecar it is an isMeta user row, which correctly marks the parent as woken (`rvA3/sidenotif.py`: 357 of 362 are answered).
+  - The 4 unanswered rows are all one event: 37184523 at 11-05T05:17, `<status>killed</status>`, the shells killed at host exit. Its host is now dead, so they show done.
+  - Queue rows never have a `message`.
+- **Which rows set `nts`.**
+  - Notification-bearing rows are: queue enqueue/remove, attachment, user, api-request-blob (no timestamp), and api-request-shape (timestamped, but carrying only the system-prompt mention and no `<task-id>`; `rvA3/shape.py`: 0 ids).
+  - `remove` is the only other queue operation, and it is excluded.
+  - Agent-id statuses are completed, killed, failed and stopped, plus 10 status-less "automatically restarted from its saved transcript" rows (`rvA3/agstatus.py`, `restart.py`). A restart notification precedes the restarted agent's first row by 2.5–10.7 s, so that agent reads "done" for those seconds and then "running". This is transient. No change.
+  - The "messages arrived too late … being resumed" notification is followed by the wake row in 54 ms, so it reads correctly as running.
+- **hs None / 0.0 is byte-identical to 9e686c8** (`rvA3/prev2.py`, run with `AITRACKER_NO_PASS_CACHE=1` because both modules share the `claude.shells` key). Every row matched field for field except the new `waiting_on == []`, and the tail tuple matched too: 169 sessions, 5484 rows, 0 diffs, checked for both hs None and hs 0.0.
+- **Caches.**
+  - `stopped_u`, `nts_u` and `ret_u` are fresh containers. `waiting_on` is `list(...)`, and `mb` is a fresh pickle copy.
+  - Pickle snapshots of all 148 cached 82ce95d1 entries (`bg`, `row`, `last_msg_ep`) are unchanged after 13 hs-branch parses (`rvA3/perf.py`).
+  - `nts`/`ret` come only from file bytes plus `_ts_epoch`, so the keys stay pure.
+  - Restarts go through `os.execv`, so no old-shape accumulator survives an Update.
+- **Exceptions and invariants** (`rvA3/exc.py`): `parse_session` plus `shell_output` on the 150 newest transcripts raised 0 exceptions. Every row has a list `waiting_on`, `state == "waiting"` ⇔ non-empty `waiting_on`, and `running` ⇔ `state == "running"`.
+- **Perf.** Warm `parse_any` on 82ce95d1 is 36/38/43 ms (min/median/max over 12 runs), against the A-F2 baseline of 61–150 ms.
+- **Live parity, re-run now** (`parity3.py`): **6/6 fan agents match.**
+  - 16c95193: 2 running.
+  - 82ce95d1: a173ac831 running; a9ad361b4 waiting on [bn4u12cbj]; afd1ab11c waiting on [bsh4mgoq0].
+  - 5849622c: done.
+  - The shell DIFFs are only fan-only in-flight foreground ids, the known gap.
+- **Live sweep of all 10 live hosts** (`rvA3/livesweep.py`). Only 4 are non-job (985e4755, 2bda7c0d, 542952d8, 2e71f77c), so 20 were not available. Those 4 have 163 agents, all done, with no implausible running.
+  - The only "waiting" rows are a9ad361b4 on bn4u12cbj (72 h, `.output` untouched for 72 h) and afd1ab11c on bsh4mgoq0 (32 h). Fan also lists both shells open, so this is the accepted Plan-v1 decision 1 (no age cap), not a defect.
+  - As a substitute for the missing 20, I ran a simulated live host (hs = first row) over the 300 newest sessions (`rvA3/stuck.py`): 32 running, 16 of them idle for more than 30 min. Of those 16:
+    - 1 is A3-1;
+    - 11 are May-2026 sidecars with no `toolUseId` (the `hs` gate closes them on any resume);
+    - 4 are the 37184523 host-exit kills above.
+- **`shell_output` gate.** `_host_start(basename[:-6])` never raises. A None host still returns cmd/out with `running False`.
+
+### Residuals (document, no change)
+- `ret` uses epoch 0.0 for a timestamp-less result, where the re-review's text had `inf`. No such non-blob result was found, so this is immaterial.
+- A woken agent whose own notification is re-delivered late reads "done" until its next message. Not observed.
+
+## Reconciliation of implementation review v3 (main thread, 2026-11-16)
+| # | Finding | Verdict | Action |
+|---|---|---|---|
+| A3-1 | Interrupted-then-completed sync spawn stays running (claude.py:1783) | **confirmed, low**: 1/1500 sessions | Keep `agent` pend entries and update `ret` by max; test `test_interrupted_sync_spawn_that_later_completes_is_done` (body in tmp/rvA3/repro_f1.py) |
+| B3-1 | Hide-finished default for waiting is untested (ext_cr_dialogs.js:2919) | **confirmed** | Add a red test |
+| B3-2 | A just-waiting pane says "(no output yet)" for about 5 min (ext_cr_dialogs.js:2982) | **confirmed** | `state === 'waiting'` decides; red test with `{tail:'', running:true}` |
+| B3-3 | Panel "waiting on shell" wording and empty guard differ from the map (ext_cr_detail.js:3019) | **confirmed** | Match the map's wording and guard; red test |
+| B3-4 | Classic UI, timeline marker and toast treat waiting as finished | known gap, accepted in the plan | Document in the commit message |
+| — | Missed by both | none found | — |
+
+## Fix pass log (sonnet)
+Applied A3-1 (claude.py `_bg_line` keeps `agent` pend entries), B3-1 (test only), B3-2 (ext_cr_dialogs.js emptyText: waiting decides), B3-3 (ext_cr_detail.js panel wording plural + empty guard). `node --check` ok on both JS files. Red proofs by scoped one-line revert, then restored:
+- test_interrupted_sync_spawn_that_later_completes_is_done: RED with `pend.pop(tuid)` restored.
+- test_waiting_agent_is_live_in_model_and_subtitle (new `wo == [True, 1]`): RED with `counts.running > 0`.
+- test_pane_empty_text_by_state (new `empty_waiting_live`): RED with the old emptyText condition.
+- test_panel_waiting_on_two_shells_plural: RED with the old singular wording.
+Known gap B3-4 unchanged (classic UI, timeline marker, toast treat waiting as finished).

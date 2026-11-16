@@ -126,6 +126,11 @@ console.log('@@JSON@@' + JSON.stringify(CNT));
         self.assertIn("waiting on shell bsh1", html)
         self.assertNotIn("Show 1 finished", html)
 
+    def test_panel_waiting_on_two_shells_plural(self):
+        html = self._panel({"agents_bg": [{"aid": "w1", "task": "t", "running": False, "state": "waiting",
+                                           "waiting_on": ["b1", "b2"], "ts": 1}], "shells": []})
+        self.assertIn("waiting on shells b1, b2", html)
+
     def test_panel_degraded_has_no_map_link(self):
         html = self._panel({"agents_bg": [], "shells": [], "agent_sessions": [],
                             "note": {"name": "Auggie", "degraded": "no bg model"}})

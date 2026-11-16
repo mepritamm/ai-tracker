@@ -3164,7 +3164,7 @@
       facts: facts,
       prompt: (detail && detail.task) || node.task || '',
       lastOutput: tail,
-      emptyText: (node.state !== 'running' && !(detail && detail.running)) ? 'No text output' : '(no output yet)',
+      emptyText: (node.state === 'waiting' || (node.state !== 'running' && !(detail && detail.running))) ? 'No text output' : '(no output yet)',
       error: detail && detail.error ? String(detail.error) : '',
       loading: !detail,
       actions: [{ id: 'transcript', label: 'Full transcript' }],

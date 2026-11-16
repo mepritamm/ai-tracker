@@ -368,6 +368,15 @@ class TestBackgroundHold(Base):
         self.host(None)
         self.assertEqual(self.ag(self.sess())["state"], "done")
 
+    def test_interrupted_sync_spawn_that_later_completes_is_done(self):
+        self.agent("a1", [_msg(_iso(-1900), "start"), _msg(_iso(-1500), "still working after the interrupt"),
+                          _stop(_iso(-1499))], meta={"toolUseId": "tu1"}, age=1000)
+        self.main_add([_msg(_iso(-2000), "spawn", tool_use=_spawn("tu1")),
+                       _result("tu1", -1800, "[Request interrupted by user for tool use]",
+                               "[Request interrupted by user for tool use]", err=True),
+                       _result("tu1", -1490, "done", {"status": "completed", "agentId": "a1"})])
+        self.assertEqual(self.ag(self.sess())["state"], "done")
+
     def test_sync_spawn_result_ends_agent_async_does_not(self):
         self.agent("a1", [_msg(_iso(-1900), "start"), _stop(_iso(-1000))], meta={"toolUseId": "tu1"}, age=1000)
         self.main_add([_msg(_iso(-2000), "spawn", tool_use=_spawn("tu1")),

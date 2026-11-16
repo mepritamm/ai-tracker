@@ -114,6 +114,9 @@ OUT.w_nosub = agentMapSubtitle(m).indexOf('waiting') < 0;
 OUT.w_node = mw.nodes.filter(function (n) { return n.aid === 'w'; })[0];
 OUT.w_node = { visible: OUT.w_node.visible, dimmed: OUT.w_node.dimmed };
 OUT.w_hidden = mw.hiddenCount;
+var mwo = agentMapModel(sess([row('w', { state: 'waiting', waiting_on: ['b1'] }), row('d')]), {});
+OUT.wo = [mwo.flags.hideFinished, mwo.hiddenCount];
+OUT.empty_waiting_live = agentPaneModel(row('a', { state: 'waiting' }), { tail: '', running: true }).emptyText;
 OUT.subtitle_ok = agentMapSubtitle(m).indexOf('5 agents') === 0 && agentMapSubtitle(m).indexOf('3 haiku') > 0;
 
 // (b) pane tail trimmed at a paragraph break
@@ -265,10 +268,12 @@ class TestAgentMapPure(unittest.TestCase):
         self.assertTrue(O["w_nosub"])
         self.assertEqual(O["w_node"], {"visible": True, "dimmed": False})
         self.assertEqual(O["w_hidden"], 1)   # only the finished agent is hidden
+        self.assertEqual(O["wo"], [True, 1])   # waiting + done rows only: finished still hidden by default
 
     def test_pane_empty_text_by_state(self):
         O = self.O
         self.assertEqual(O["empty_waiting"], "No text output")
+        self.assertEqual(O["empty_waiting_live"], "No text output")
         self.assertEqual(O["empty_done"], "No text output")
         self.assertEqual(O["empty_running"], "(no output yet)")
         self.assertEqual(O["empty_done_but_running"], "(no output yet)")
