@@ -897,3 +897,16 @@ Reviews: `reports/launchd-server-install.impl-review-A.md` (server/cli) and `…
 | B-L7 scheduler status still says "Installed" next to Schedule | confirmed LOW | **fix** (assumption, consistent with D1): "Scheduled" / "Not scheduled" |
 | B-I2 helper survives bootout | unproven | live proof step |
 | missed by both | — | none found |
+
+## Live proof (2026-11-16, bf34517, clone under ~/Documents, port 8799) — ALL PASS
+
+| Step | Result | Evidence |
+|---|---|---|
+| Install (CLI) | PASS | pid ppid=1, HTTP 200 first poll; plist KeepAlive/RunAtLoad true, Throttle 30, `--service`; env keys HOST LANG PATH PORT PYTHONPATH PYTHONUNBUFFERED SHELL TRACKER_TERM_APP (no AUTH/tokens) |
+| KeepAlive | PASS | SIGTERM → new pid serving 200 in ~4 s |
+| Takeover | PASS | shell server owned :8799 (no drift); service logged "port 8799 is busy; service mode waits"; after shell server killed, service owned :8799 in ~24 s (30 s throttle) |
+| Reinstall from inside | PASS | POST → 202 `{"deferred":"reinstall","self":true}`; new pid ppid=1 serving in ~7 s |
+| Uninstall from inside | PASS | POST → 202; label gone in 2 s, plist deleted, port free, no respawn after 40 s |
+| CLI reinstall/uninstall | PASS | reinstall without PORT kept baked 8799; uninstall cleared label/plist/port. Note: an exported `PORT` in the shell is treated as explicit (cli.py) — by design |
+| TCC (~/Documents) | PASS | no prompt, no "Operation not permitted" |
+| Teardown | PASS | label + plist absent, :8799 free, clone + log removed; :8790 still pid 86000 (verified by main thread) |
