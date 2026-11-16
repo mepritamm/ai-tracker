@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -202,13 +203,31 @@ class TestAgentCache(unittest.TestCase):
         self.assertEqual(next(r for r in rows if r["aid"] == "aaa111")["desc"], "BBBB")
 
     def test_cold_equals_warm_including_hb(self):
-        with mock.patch.dict(os.environ, {"AITRACKER_NO_AGENT_CACHE": "1"}):
+        # Pin the clock the parser reads: a still-running agent's dur_s is `now - start`, so a
+        # second boundary between the three reads would differ for reasons unrelated to the cache.
+        frozen = mock.Mock(wraps=time)
+        frozen.time.return_value = time.time()
+        with mock.patch.object(claude, "time", frozen), \
+                mock.patch.dict(os.environ, {"AITRACKER_NO_AGENT_CACHE": "1"}):
             nocache = self._everything()
             self.assertEqual(len(claude._AGENT_CACHE), 0)          # kill-switch really bypasses it
-        cold = self._everything()
-        warm = self._everything()
+        with mock.patch.object(claude, "time", frozen):
+            cold = self._everything()
+            warm = self._everything()
         self.assertEqual(cold, warm)
         self.assertEqual(nocache, warm)
+
+    def test_time_derived_fields_not_cached(self):
+        frozen = mock.Mock(wraps=time)
+        t = time.time()
+        frozen.time.return_value = t
+        with mock.patch.object(claude, "time", frozen):
+            self._everything()                                     # warm the cache at T
+            frozen.time.return_value = t + 7
+            warm7 = self._everything()
+            with mock.patch.dict(os.environ, {"AITRACKER_NO_AGENT_CACHE": "1"}):
+                nocache7 = self._everything()
+        self.assertEqual(warm7, nocache7)
 
     def test_no_aliasing_across_parse_session_calls(self):
         d1 = parse_session(self.main)

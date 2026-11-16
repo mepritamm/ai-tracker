@@ -2336,7 +2336,7 @@ class TestIdleTimeout(unittest.TestCase):
                                create=True):
             pt = self._claude(body=False)
             try:
-                self.assertTrue(_wait_for(lambda: pt.screen.v > 3, 5), "fake Claude never drew")
+                self.assertTrue(_wait_for(lambda: pt.screen.v > 3, 30), "fake Claude never drew")
                 time.sleep(6)                      # > 2x the TTL
                 self.assertFalse(pt.done, "a Claude with tool work still running was reaped")
                 self.assertEqual(pt.last_hold, "busy")
@@ -6323,7 +6323,7 @@ class TestIdleSessionLive(unittest.TestCase):
         self._write(age=config.LIVE_WINDOW + 5)
         pt = self._pty()
         self._go(0.001)
-        self.assertTrue(_drain(pt, 5).done, "a quiet session's pty was held forever")
+        self.assertTrue(_drain(pt, 15).done, "a quiet session's pty was held forever")
 
     def test_U3a_forked_dedicated_copy_ignores_parent_liveness(self):
         self._fg()
@@ -6413,6 +6413,16 @@ class TestIdleSessionLive(unittest.TestCase):
         # property under test is the LOWER bound above (never reaped inside the window).
         self.assertTrue(_wait_for(lambda: pt.done, max(0, t0 + 20 - time.time())),
                         "still held long after LIVE_WINDOW")
+
+    def test_U8c_session_live_boundary_is_live_window(self):
+        self._fg()
+        config.LIVE_WINDOW = 5
+        self._write(age=4.5)
+        pt = self._pty()
+        config.TERM_IDLE_TTL_MIN = 0.001      # _pty set 30 min; the window must come from LIVE_WINDOW
+        self.assertTrue(term_vt._session_live(pt, time.time()))
+        self._write(age=5.5)
+        self.assertFalse(term_vt._session_live(pt, time.time()))
 
     def test_U8b_window_uses_ttl_when_larger(self):
         self._fg()

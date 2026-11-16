@@ -46,7 +46,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         FakePopen.instances, FakePopen.out = [], "{}"
         FakePopen.gate, FakePopen.timeouts, FakePopen.raise_os = None, 0, False
-        gateway._AUTH_CACHE.update(at=0.0, val=None)
+        gateway._AUTH_CACHE.update(at=0.0, val=None, ttl=gateway.AUTH_TTL)
         self.now = [1000.0]
         self.killpg = mock.Mock()
         for p in (mock.patch.object(gateway.shutil, "which", return_value="/usr/bin/claude"),
@@ -134,7 +134,31 @@ class TimeoutTests(Base):
         self.killpg.assert_called_once_with(p.pid, signal.SIGKILL)
         self.assertEqual(p.calls, [gateway.AUTH_STATUS_TIMEOUT, 5])
         self.assertTrue(r["error"])
+        self.assertIn("timed out", r["error"])
         self.assertFalse(r["logged_in"])
+
+    def test_slow_real_cli_under_load_still_reads(self):
+        # guards the timeout floor: under load the CLI was measured at 20-26 s (16 concurrent runs), exit 0, full JSON.
+        real = json.dumps(dict(loggedIn=True, authMethod="claude.ai", subscriptionType="enterprise",
+                               apiProvider="firstParty", email="x@y.test"))
+
+        def slow(self, timeout=None):
+            self.calls.append(timeout)
+            if timeout < 25:
+                raise subprocess.TimeoutExpired("claude", timeout)
+            return real, ""
+        with mock.patch.object(FakePopen, "communicate", slow):
+            r = gateway.claude_auth_status(fresh=True)
+        self.assertTrue(r["logged_in"], r)
+        self.assertEqual(r["label"], "Logged in · Claude Enterprise subscription")
+
+    def test_timeout_failure_is_not_cached_for_the_full_ttl(self):
+        FakePopen.timeouts = 1
+        self.run_status({"loggedIn": True, "authMethod": "claude.ai"})
+        FakePopen.timeouts = 0
+        self.now[0] += gateway.AUTH_FRESH_FLOOR + 1          # next poll, well inside AUTH_TTL
+        r = self.run_status({"loggedIn": True, "authMethod": "claude.ai"})
+        self.assertTrue(r["logged_in"], r)
 
     def test_busy_lock_returns_within_bound(self):
         FakePopen.gate = threading.Event()
@@ -157,6 +181,31 @@ class TimeoutTests(Base):
 class CacheTests(Base):
     def calls(self):
         return len(FakePopen.instances)
+
+    def test_failed_read_keeps_floor_and_single_flight(self):
+        FakePopen.out = "not json"
+        gateway.claude_auth_status(fresh=True)
+        self.now[0] += 1
+        gateway.claude_auth_status(fresh=True)
+        self.assertEqual(self.calls(), 1)
+        self.now[0] += gateway.AUTH_FRESH_FLOOR + 1
+        FakePopen.out = json.dumps({"loggedIn": True, "authMethod": "claude.ai"})
+        self.assertTrue(gateway.claude_auth_status()["logged_in"])
+
+    def test_concurrent_fresh_callers_after_failure_one_run(self):
+        FakePopen.out = "not json"
+        gateway.claude_auth_status(fresh=True)
+        out = []
+        ts = [threading.Thread(target=lambda: out.append(gateway.claude_auth_status(fresh=True))) for _ in range(6)]
+        [t.start() for t in ts]
+        [t.join(10) for t in ts]
+        self.assertEqual(self.calls(), 1)
+
+    def test_transient_failure_keeps_last_good_login(self):
+        self.run_status({"loggedIn": True, "authMethod": "claude.ai"})
+        self.now[0] += gateway.AUTH_TTL + 1
+        FakePopen.timeouts = 1
+        self.assertTrue(gateway.claude_auth_status()["logged_in"])
 
     def test_ttl_and_fresh_floor(self):
         self.run_status({"loggedIn": False})

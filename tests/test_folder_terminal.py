@@ -744,6 +744,15 @@ class TestCloseKillsForegroundChildForReal(unittest.TestCase):
             # Wait for the pid's CONTENT, not just the file: the child creates it before writing.
             self.assertTrue(_wait_until(lambda: os.path.exists(pidfile) and os.path.getsize(pidfile) > 0, 5),
                              "the foreground child never started")
+            # the child creates the file (open "w") BEFORE writing the pid: wait for the content
+            def _pid_written():
+                try:
+                    with open(pidfile) as f:
+                        int(f.read())
+                    return True
+                except (OSError, ValueError):
+                    return False
+            self.assertTrue(_wait_until(_pid_written, 10), "the foreground child never wrote its pid")
             with open(pidfile) as f:
                 child_pid = int(f.read())
 

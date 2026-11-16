@@ -89,8 +89,9 @@ def model_meta(model_id):
             "openrouter_configured": openrouter_configured()}
 
 
-AUTH_TTL, AUTH_FRESH_FLOOR, AUTH_STATUS_TIMEOUT, AUTH_LOCK_EXTRA = 60, 5, 15, 10     # seconds
-_AUTH_CACHE = {"at": 0.0, "val": None}
+# inferred (unproven): a slow CLI (keychain contention measured at 20-26 s under 16 concurrent runs) overran the old 15 s
+AUTH_TTL, AUTH_FRESH_FLOOR, AUTH_STATUS_TIMEOUT, AUTH_LOCK_EXTRA = 60, 5, 40, 10     # seconds
+_AUTH_CACHE = {"at": 0.0, "val": None, "ttl": AUTH_TTL}
 _AUTH_LOCK = threading.Lock()
 _AUTH_LABELS = {"claude.ai": "Claude subscription", "oauth_token": "CLAUDE_CODE_OAUTH_TOKEN",
                 "api_key": "API key", "api_key_helper": "apiKeyHelper script",
@@ -104,7 +105,7 @@ def _auth_result(available=True, logged_in=False, method="", sub="", label="", e
 
 def _auth_run(exe):
     """Run `claude auth status --json` -> parsed dict or None. Own session (no tty); on timeout the whole
-    process group is killed. A failed spawn (OSError) or any bad output -> None, never an exception."""
+    process group is killed. -> dict | None (bad output) | "timeout" | False (spawn failed); never an exception."""
     kw = {} if os.name == "nt" else {"start_new_session": True}
     try:
         p = subprocess.Popen([exe, "auth", "status", "--json"], stdin=subprocess.DEVNULL,
@@ -126,7 +127,7 @@ def _auth_run(exe):
             p.communicate(timeout=5)
         except Exception:
             pass
-        return None
+        return "timeout"
     except Exception:
         return None
     try:
@@ -146,17 +147,20 @@ def claude_auth_status(fresh=False):
         return _auth_result(error="claude auth status is busy — try again")
     try:
         age = time.monotonic() - _AUTH_CACHE["at"]
-        if _AUTH_CACHE["val"] is not None and (age < AUTH_FRESH_FLOOR or (not fresh and age < AUTH_TTL)):
+        if _AUTH_CACHE["val"] is not None and (age < AUTH_FRESH_FLOOR or (not fresh and age < _AUTH_CACHE["ttl"])):
             return _AUTH_CACHE["val"]
-        exe = shutil.which("claude")
+        exe, failed = shutil.which("claude"), False
         if not exe:
             res = _auth_result(available=False, error="claude not found on the server's PATH")
         elif exe == or_launcher()[0]:
             res = _auth_result(available=False, error="claude on PATH is the OpenRouter launcher")
         else:
             d = _auth_run(exe)
+            failed = not isinstance(d, dict)
             if d is False:
                 res = _auth_result(available=False, error="claude couldn't be started")
+            elif d == "timeout":
+                res = _auth_result(error="claude auth status timed out after %d s" % AUTH_STATUS_TIMEOUT)
             elif d is None:
                 res = _auth_result(error="couldn't read claude auth status")
             else:
@@ -171,7 +175,11 @@ def claude_auth_status(fresh=False):
                     res = _auth_result(logged_in=True, method=m if m in _AUTH_LABELS else "", sub=st, label=label)
                 else:
                     res = _auth_result(method=m if m in _AUTH_LABELS else "", label="Not logged in")
-        _AUTH_CACHE.update(at=time.monotonic(), val=res)
+        prev = _AUTH_CACHE["val"]
+        if failed and prev is not None and prev.get("logged_in"):
+            res = prev           # a slow/unreadable read must not flip a known-good login to an error
+        # a transient failure (timeout / unreadable) is only held AUTH_FRESH_FLOOR s, not the full AUTH_TTL
+        _AUTH_CACHE.update(at=time.monotonic(), val=res, ttl=AUTH_FRESH_FLOOR if failed else AUTH_TTL)
         return res
     finally:
         _AUTH_LOCK.release()
