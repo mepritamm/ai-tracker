@@ -56,6 +56,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_TESTS_DIR)
@@ -124,6 +125,10 @@ class ClaudeShellsRunningTailScanTests(unittest.TestCase):
         self.sid = "s_shell"
         self.main = os.path.join(self.sdir, self.sid + ".jsonl")
         _write_jsonl(self.main, _shell_launch_rows())
+        # no live-host dir => host unknown, so parse_shells below is the ungated pre-host-gate verdict
+        p = mock.patch.object(config, "LIVE_SESSIONS_DIR", os.path.join(self.pdir, "no-live"))
+        p.start()
+        self.addCleanup(p.stop)
 
     def tearDown(self):
         config.PROJECTS = self._pdir_snap
@@ -148,7 +153,8 @@ class ClaudeShellsRunningTailScanTests(unittest.TestCase):
     def test_agrees_with_parse_shells_on_the_same_transcript(self):
         """The list-path's cheap tail count and the detail-path's full parse_shells()
         must reach the SAME verdict for the SAME transcript -- a launched shell with
-        no completion is 'running' in both."""
+        no completion is 'running' in both. (Compared against the ungated parse_shells, host unknown;
+        the live detail path is host-gated and may differ, which is documented.)"""
         shells = parse_shells(self.main)
         self.assertEqual(len(shells), 1)
         self.assertTrue(shells[0]["running"])

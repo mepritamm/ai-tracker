@@ -640,6 +640,7 @@
 .cr .cr-amap-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--state-idle, #A89C8B); }
 .cr .cr-amap-dot.is-running { background: var(--state-working, #1c9163); }
 .cr .cr-amap-dot.is-done { background: var(--state-done, #3B5747); }
+.cr .cr-amap-dot.is-waiting { background: transparent; box-shadow: inset 0 0 0 1.5px var(--state-working, #1c9163); }
 .cr .cr-amap-desc { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cr .cr-amap-chip { flex: none; padding: 1px 8px; border-radius: var(--radius-pill, 999px); border: 1px solid var(--line-default, #CFC7B7); font-size: 11px; color: var(--text-muted, #877866); }
 .cr .cr-amap-meta { flex: none; font-size: 11px; color: var(--text-muted, #877866); }

@@ -3080,7 +3080,7 @@
       model_label: meta.model_label || meta.model || '',
       ctx: (session.context && session.context.current) || 0,
     };
-    var counts = { total: rows.length, running: 0, byFamily: {} };
+    var counts = { total: rows.length, running: 0, waiting: 0, byFamily: {} };
     var byKey = {}, all = [];
     rows.forEach(function (a, i) {
       var n = { children: [], level: 0, dimmed: false };
@@ -3089,7 +3089,7 @@
       all.push(n);
       if (a.aid && !byKey[a.aid]) byKey[a.aid] = n;
       if (a.id && !byKey[a.id]) byKey[a.id] = n;
-      if (a.state === 'running') counts.running++;
+      if (a.state === 'running') counts.running++; else if (a.state === 'waiting') counts.waiting++;
       var fam = String(a.model_label || '').trim().split(/\s+/)[0].toLowerCase();
       if (fam) counts.byFamily[fam] = (counts.byFamily[fam] || 0) + 1;
     });
@@ -3101,19 +3101,19 @@
       var seen = {}, c = n;
       while (c) { if (seen[c.key]) { n.up = null; break; } seen[c.key] = 1; c = c.up; }
     });
-    var hide = opts.hideFinished == null ? counts.running > 0 : !!opts.hideFinished;
+    var hide = opts.hideFinished == null ? counts.running + counts.waiting > 0 : !!opts.hideFinished;
     var show = {}, forced = {};
     function showUp(n) { for (var c = n; c && !show[c.key]; c = c.up) show[c.key] = true; }
     [opts.focus, opts.selected].forEach(function (f) {
       var n = f ? byKey[f] : null;
       if (n) { for (var c = n; c; c = c.up) forced[c.key] = true; showUp(n); }
     });
-    all.forEach(function (n) { if (n.state === 'running') showUp(n); });
+    all.forEach(function (n) { if (n.state === 'running' || n.state === 'waiting') showUp(n); });
     var hidden = 0;
     all.forEach(function (n) {
       n.visible = !hide || !!show[n.key];
       if (!n.visible) hidden++;
-      else n.dimmed = hide && n.state !== 'running' && !forced[n.key];
+      else n.dimmed = hide && n.state !== 'running' && n.state !== 'waiting' && !forced[n.key];
     });
     var roots = [];
     all.forEach(function (n) {
@@ -3138,6 +3138,7 @@
 
   function agentMapSubtitle(m) {
     var c = m.counts, parts = [c.total + ' agent' + (c.total === 1 ? '' : 's'), c.running + ' running'];
+    if (c.waiting) parts.push(c.waiting + ' waiting');
     Object.keys(c.byFamily).sort(function (a, b) { return c.byFamily[b] - c.byFamily[a] || (a < b ? -1 : 1); })
       .forEach(function (f) { parts.push(c.byFamily[f] + ' ' + f); });
     parts.push('click an agent for details');
@@ -3163,7 +3164,7 @@
       facts: facts,
       prompt: (detail && detail.task) || node.task || '',
       lastOutput: tail,
-      emptyText: (node.state === 'done' && !(detail && detail.running)) ? 'No text output' : '(no output yet)',
+      emptyText: (node.state !== 'running' && !(detail && detail.running)) ? 'No text output' : '(no output yet)',
       error: detail && detail.error ? String(detail.error) : '',
       loading: !detail,
       actions: [{ id: 'transcript', label: 'Full transcript' }],
@@ -3246,16 +3247,17 @@
     }
 
     function nodeEl(n) {
-      var run = n.state === 'running';
+      var run = n.state === 'running', wait = n.state === 'waiting';
       var key = n.aid || n.key;
       var meta = [];
       if (n.dur_s != null) meta.push(amapFmtDur(n.dur_s));
       if (n.ctx_tok != null) meta.push(amapFmtK(n.ctx_tok) + ' tokens');
+      if (wait && n.waiting_on && n.waiting_on.length) meta.push('waiting on shell' + (n.waiting_on.length > 1 ? 's ' : ' ') + n.waiting_on.join(', '));
       var btn = h('button', {
         class: 'cr-amap-btn' + (sel === key ? ' is-sel' : ''), type: 'button', 'data-aid': key,
         onclick: function () { selectNode(key); },
       }, [
-        h('span', { class: 'cr-amap-dot ' + (run ? 'is-running' : 'is-done'), 'aria-hidden': 'true' }),
+        h('span', { class: 'cr-amap-dot ' + (run ? 'is-running' : wait ? 'is-waiting' : 'is-done'), 'aria-hidden': 'true' }),
         h('span', { class: 'cr-amap-desc' }, [n.desc || n.task || key]),
         chip(n.model_label),
         h('span', { class: 'cr-amap-meta cr-mono' }, [meta.join(' · ')]),

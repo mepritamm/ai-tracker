@@ -343,10 +343,79 @@ class TestBackgroundHold(Base):
             for o in rows:
                 fh.write(json.dumps(o) + "\n")
 
-    def test_open_sidecar_shell_holds_agent_after_stop_row(self):
+    def notify(self, off, *ids, op=None):
+        """A <task-notification> row (timestamped `off` s from now) for each id, in the main transcript."""
+        o = {"type": "queue-operation", "timestamp": _iso(off),
+             "content": "".join("<task-notification><task-id>%s</task-id></task-notification>" % i for i in ids)}
+        if op:
+            o["operation"] = op
+        self.main_add([o])
+
+    def test_notified_owner_of_open_shell_is_waiting(self):
         self.side(extra=self.s1())
         a = self.ag(self.sess())
-        self.assertEqual((a["state"], a["running"], a["ended"]), ("running", True, None))
+        self.assertEqual(a["state"], "running")        # not notified yet: still working
+        self.notify(-1000, "a1")
+        d = self.sess()
+        a = self.ag(d)
+        self.assertEqual((a["state"], a["running"], a["ended"], a["waiting_on"]), ("waiting", False, None, ["bsh1"]))
+        self.assertIs(d["shells"][0]["running"], True)
+
+    def test_unanswered_foreground_bash_agent_is_running(self):
+        self.side(extra=[_bash("u5", -1800, bg=False)])
+        a = self.ag(self.sess())
+        self.assertEqual((a["state"], a["running"]), ("running", True))
+        self.host(None)
+        self.assertEqual(self.ag(self.sess())["state"], "done")
+
+    def test_sync_spawn_result_ends_agent_async_does_not(self):
+        self.agent("a1", [_msg(_iso(-1900), "start"), _stop(_iso(-1000))], meta={"toolUseId": "tu1"}, age=1000)
+        self.main_add([_msg(_iso(-2000), "spawn", tool_use=_spawn("tu1")),
+                       _result("tu1", -1000, "done", {"status": "completed", "agentId": "a1"})])
+        self.assertEqual(self.ag(self.sess())["state"], "done")
+        self.main_add([_msg(_iso(-3000), "spawn", tool_use=_spawn("tu2")),
+                       _result("tu2", -2900, "launched", {"status": "async_launched", "agentId": "a2"})])
+        self.agent("a2", [_msg(_iso(-2950), "start")], meta={"toolUseId": "tu2"}, age=1000)
+        self.assertEqual(self.ag(self.sess(), "a2")["state"], "running")
+
+    def test_notification_in_another_sidecar_counts(self):
+        self.side("a1")
+        self.side("a0", extra=[{"type": "queue-operation", "timestamp": _iso(-1000),
+                                "content": "<task-notification><task-id>a1</task-id></task-notification>"}])
+        self.assertEqual(self.ag(self.sess())["state"], "done")
+
+    def test_woken_agent_is_running_until_renotified(self):
+        sp = self.side(extra=self.s1())
+        self.notify(-1000, "a1")
+        self.assertEqual(self.ag(self.sess())["state"], "waiting")
+        with open(sp, "a") as fh:                       # woken by SendMessage: new work after the notification
+            fh.write(json.dumps(_msg(_iso(-500), "woken")) + "\n")
+        self.assertEqual(self.ag(self.sess())["state"], "running")
+        self.notify(-50, "a1", op="remove")             # a dequeue row is not a notification
+        self.assertEqual(self.ag(self.sess())["state"], "running")
+        self.notify(-100, "a1")
+        self.assertEqual(self.ag(self.sess())["state"], "waiting")
+
+    def test_resumed_host_agent_woken_after_restart_is_running(self):
+        sp = self.side()
+        self.notify(-1000, "a1")
+        self.host(-600)                                 # host restarted after the agent's first run
+        self.assertEqual(self.ag(self.sess())["state"], "done")
+        with open(sp, "a") as fh:
+            fh.write(json.dumps(_msg(_iso(-300), "woken")) + "\n")
+        self.assertEqual(self.ag(self.sess())["state"], "running")
+
+    def test_shell_output_follows_host_gate(self):
+        self.side(extra=self.s1())
+        for off, want in ((None, False), (-3600, True), (-600, False)):
+            self.host(off)
+            self.assertIs(claude.shell_output(self.main, "bsh1")["running"], want, off)
+
+    def test_error_exit_quoting_harness_sentence_is_not_a_shell(self):
+        txt = "Exit code 1\nCommand running in background with ID: zzz9. Output is being written to: /tmp/t/zzz9.output"
+        self.side(extra=[_bash("u6", -1800, bg=False), _result("u6", -1790, txt, txt, err=True)])
+        self.notify(-1000, "a1")
+        self.assertEqual(self.sess()["shells"], [])
 
     def test_sidecar_shell_listed_with_owner(self):
         self.side(extra=self.s1())
@@ -366,7 +435,9 @@ class TestBackgroundHold(Base):
         sh = {s["id"]: s for s in d["shells"]}
         self.assertTrue(sh["bmv1"]["running"] and sh["bmv2"]["running"], sh)
         self.assertTrue(sh["bmv2"]["out"].endswith("/bmv2.output"))
-        self.assertEqual(self.ag(d)["state"], "running")
+        self.notify(-1000, "a1")
+        a = self.ag(self.sess())
+        self.assertEqual((a["state"], a["waiting_on"]), ("waiting", ["bmv2"]))
 
     def test_quoted_harness_text_is_not_a_shell(self):
         line = "Command did not complete within its 120s timeout and was moved to the background (ID: bq1)."
@@ -374,28 +445,33 @@ class TestBackgroundHold(Base):
         # (b) no toolUseResult: the sentence is quoted mid-line (a grep over a transcript)
         for tur, q in (({"stdout": line, "interrupted": False}, line), (None, 'grep out: "content": "' + line + ' x"')):
             self.side(extra=[_bash("u3", -1800, bg=False), _result("u3", -1790, q, tur)])
+            self.notify(-1000, "a1")
             d = self.sess()
             self.assertEqual(d["shells"], [], tur)
             self.assertEqual(self.ag(d)["state"], "done", tur)
 
     def test_refused_background_launch_is_not_a_shell(self):
         self.side(extra=[_bash("u4", -1800), _result("u4", -1790, "auto mode cannot determine the safety of Bash", err=True)])
+        self.notify(-1000, "a1")
         d = self.sess()
         self.assertEqual(d["shells"], [])
         self.assertEqual(self.ag(d)["state"], "done")
 
     def test_completion_in_main_closes_sidecar_shell(self):
         self.side(extra=self.s1())
-        self.main_add([{"type": "queue-operation", "content": "<task-notification><task-id>bsh1</task-id></task-notification>"}])
+        self.notify(-1000, "a1")
+        self.assertEqual(self.ag(self.sess())["state"], "waiting")
+        self.notify(-900, "bsh1")
         d = self.sess()
         self.assertFalse(d["shells"][0]["running"])
         self.assertEqual(self.ag(d)["state"], "done")
 
-    def test_failed_taskstop_keeps_hold_successful_closes(self):
+    def test_failed_taskstop_keeps_shell_open_successful_closes(self):
         self.side(extra=self.s1())
+        self.notify(-1000, "a1")
         self.main_add([_msg(_iso(-900), "stop", tool_use={"type": "tool_use", "id": "ts1", "name": "TaskStop", "input": {"task_id": "bsh1"}}),
                        _result("ts1", -890, "No task found", err=True)])
-        self.assertEqual(self.ag(self.sess())["state"], "running")
+        self.assertEqual(self.ag(self.sess())["state"], "waiting")
         self.main_add([_msg(_iso(-800), "stop", tool_use={"type": "tool_use", "id": "ts2", "name": "TaskStop", "input": {"task_id": "bsh1"}}),
                        _result("ts2", -790, "Successfully stopped task")])
         d = self.sess()
@@ -410,9 +486,10 @@ class TestBackgroundHold(Base):
         self.assertEqual(self.ag(d)["state"], "done")
         self.assertFalse(d["shells"][0]["running"])
 
-    def test_monitor_does_not_hold_agent(self):
+    def test_monitor_is_not_a_shell(self):
         self.side(extra=[_msg(_iso(-1800), "m", tool_use={"type": "tool_use", "id": "mn1", "name": "Monitor", "input": {"command": "tail -f x"}}),
                          _result("mn1", -1790, "Monitor started", {"taskId": "bm1", "timeoutMs": 1800000})])
+        self.notify(-1000, "a1")
         d = self.sess()
         self.assertEqual(d["shells"], [])
         self.assertEqual(self.ag(d)["state"], "done")
@@ -440,12 +517,17 @@ class TestBackgroundHold(Base):
         self.assertEqual(self.ag(self.sess())["state"], "running")
 
     def test_union_never_mutates_cached_agent_sets(self):
-        sp = self.side(extra=self.s1())
+        sp = self.side(extra=self.s1() + [_msg(_iso(-1850), "sp", tool_use=_spawn("tu8")),
+                                          _result("tu8", -1840, "x", {"status": "completed"}),
+                                          {"type": "queue-operation", "timestamp": _iso(-1830),
+                                           "content": "<task-notification><task-id>qq</task-id></task-notification>"}])
         self.sess()
-        before = set(claude._AGENT_CACHE[sp][1]["bg"]["done"])
-        self.main_add([{"type": "queue-operation", "content": "<task-notification><task-id>zzz</task-id></task-notification>"}])
+        bg = claude._AGENT_CACHE[sp][1]["bg"]
+        snap = {k: (set(bg[k]) if isinstance(bg[k], set) else dict(bg[k])) for k in ("done", "stopped", "nts", "ret")}
+        self.main_add([_msg(_iso(-1900), "spawn", tool_use=_spawn("tu9")), _result("tu9", -900, "x", {"status": "completed"})])
+        self.notify(-1000, "zzz")
         parse_session(self.main)
-        self.assertEqual(claude._AGENT_CACHE[sp][1]["bg"]["done"], before)
+        self.assertEqual({k: bg[k] for k in snap}, snap)
 
 
 if __name__ == "__main__":

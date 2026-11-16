@@ -119,6 +119,13 @@ console.log('@@JSON@@' + JSON.stringify(CNT));
         self.assertEqual(self._count({"agents_bg": ag[:1], "shells": []}), "1 agent \u00b7 0 shells")
         self.assertEqual(self._count({"agents_bg": [], "shells": []}), "\u2014")
 
+    def test_panel_waiting_agent_listed_not_finished(self):
+        html = self._panel({"agents_bg": [{"aid": "w1", "task": "t", "running": False, "state": "waiting",
+                                           "waiting_on": ["bsh1"], "ts": 1}], "shells": []})
+        self.assertIn("is-waiting", html)
+        self.assertIn("waiting on shell bsh1", html)
+        self.assertNotIn("Show 1 finished", html)
+
     def test_panel_degraded_has_no_map_link(self):
         html = self._panel({"agents_bg": [], "shells": [], "agent_sessions": [],
                             "note": {"name": "Auggie", "degraded": "no bg model"}})

@@ -230,6 +230,7 @@ def _run():
     # agent-map fields ride every row: no sidecar -> root (parent "", depth 1); stale + no stop marker -> done
     _r0 = parse_agents(spath)[0][0]
     assert _r0["parent"] == "" and _r0["depth"] == 1 and _r0["state"] == "done", _r0
+    assert _r0["waiting_on"] == [], _r0
 
     # agent_detail returns the FULL prompt (multi-paragraph, un-truncated) — the card blurb
     # collapses to 160 chars, but the click-through detail must not lose the message.

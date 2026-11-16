@@ -107,6 +107,13 @@ var ms = agentMapModel(hs, { hideFinished: false });
 OUT.show_all = ids(ms.nodes).length === 3 && ms.hiddenCount === 0;
 var none = agentMapModel(sess([row('q'), row('w')]), { hideFinished: true });
 OUT.empty_visible = none.flags.emptyVisible; OUT.empty_hidden = none.hiddenCount;
+var mw = agentMapModel(sess([row('r', { state: 'running' }), row('w', { state: 'waiting', waiting_on: ['b1'] }), row('d')]), {});
+OUT.w_counts = [mw.counts.running, mw.counts.waiting];
+OUT.w_subtitle = agentMapSubtitle(mw);
+OUT.w_nosub = agentMapSubtitle(m).indexOf('waiting') < 0;
+OUT.w_node = mw.nodes.filter(function (n) { return n.aid === 'w'; })[0];
+OUT.w_node = { visible: OUT.w_node.visible, dimmed: OUT.w_node.dimmed };
+OUT.w_hidden = mw.hiddenCount;
 OUT.subtitle_ok = agentMapSubtitle(m).indexOf('5 agents') === 0 && agentMapSubtitle(m).indexOf('3 haiku') > 0;
 
 // (b) pane tail trimmed at a paragraph break
@@ -119,6 +126,7 @@ OUT.short_tail = agentPaneModel(row('a'), { tail: 'abc' }).lastOutput;
 OUT.prompt = pm.prompt;
 OUT.loading = agentPaneModel(row('a'), null).loading;
 OUT.empty_done = agentPaneModel(row('a', { state: 'done' }), { tail: '' }).emptyText;
+OUT.empty_waiting = agentPaneModel(row('a', { state: 'waiting' }), { tail: '' }).emptyText;
 OUT.empty_running = agentPaneModel(row('a', { state: 'running' }), { tail: '' }).emptyText;
 OUT.empty_done_but_running = agentPaneModel(row('a', { state: 'done' }), { tail: '', running: true }).emptyText;
 
@@ -250,8 +258,17 @@ class TestAgentMapPure(unittest.TestCase):
         self.assertEqual(O["prompt"], "do it")
         self.assertTrue(O["loading"])
 
+    def test_waiting_agent_is_live_in_model_and_subtitle(self):
+        O = self.O
+        self.assertEqual(O["w_counts"], [1, 1])
+        self.assertIn("1 running \u00b7 1 waiting", O["w_subtitle"])
+        self.assertTrue(O["w_nosub"])
+        self.assertEqual(O["w_node"], {"visible": True, "dimmed": False})
+        self.assertEqual(O["w_hidden"], 1)   # only the finished agent is hidden
+
     def test_pane_empty_text_by_state(self):
         O = self.O
+        self.assertEqual(O["empty_waiting"], "No text output")
         self.assertEqual(O["empty_done"], "No text output")
         self.assertEqual(O["empty_running"], "(no output yet)")
         self.assertEqual(O["empty_done_but_running"], "(no output yet)")
@@ -438,6 +455,10 @@ NOW += 3000; tick(d, [row('a', { ts: 't1' }), row('b', { ts: 't1' })]);
 OUT.h_3s = EMITS.length;
 NOW += 8000; tick(d, [row('a', { ts: 't1' }), row('b', { ts: 't1' })]);
 OUT.h_11s = EMITS.length;
+// (j) a waiting agent: hollow dot class + the shells it waits on
+d = renderAgentMap({ sessionId: 'S', session: sess([row('r', { state: 'running' }), row('w', { state: 'waiting', waiting_on: ['bsh1'] })]) });
+OUT.j_dot = nodeBtn(d, 'w').querySelector('.cr-amap-dot').className;
+OUT.j_text = nodeBtn(d, 'w').textContent;
 console.log("%s" + JSON.stringify(OUT));
 """ % ("%s", MARK)
 
@@ -489,6 +510,10 @@ class TestAgentMapDialogBehaviour(unittest.TestCase):
     def test_i_done_agent_without_text_says_no_text_output(self):
         self.assertIn("No text output", self.o["i_text"])
         self.assertNotIn("(no output yet)", self.o["i_text"])
+
+    def test_j_waiting_agent_node(self):
+        self.assertIn("is-waiting", self.o["j_dot"])
+        self.assertIn("waiting on shell bsh1", self.o["j_text"])
 
     def test_e_other_session_closes(self):
         self.assertEqual(self.o["e_closes"], 1)

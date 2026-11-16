@@ -33,7 +33,7 @@
 //   tests[]         same shape as commands, kind==='test' — claude.py:933,983
 //   requests[]      {t,text} — user prompts, chronological oldest-first — claude.py:853,984
 //   agents[]        {t,type,desc} — Task tool dispatches — claude.py:922-923,985
-//   agents_bg[]     {id,aid,wf,task,last,ts,running,tools} — claude.py:537-546,986
+//   agents_bg[]     {id,aid,wf,task,last,ts,running,state,waiting_on,tools} — claude.py:537-546,986
 //   shells[]        parse_shells() shape, opaque here — claude.py:971,988
 //   decisions[]     {t,open,answer,questions:[{q,header,options[]}]} — claude.py:924-929,990
 //   waiting         bool — claude.py:993
@@ -2974,8 +2974,9 @@
     return order.map(function (g) {
       var items = g.items.slice().sort(function (x, y) { return (parseT(y.ts) || 0) - (parseT(x.ts) || 0); });
       var runningItem = items.filter(function (x) { return x.running; })[0];
-      var latest = runningItem || items[0];
-      return { latest: latest, count: items.length, running: !!runningItem };
+      var waitingItem = items.filter(function (x) { return x.state === "waiting"; })[0];
+      var latest = runningItem || waitingItem || items[0];
+      return { latest: latest, count: items.length, running: !!runningItem, waiting: !runningItem && !!waitingItem };
     });
   }
 
@@ -2984,8 +2985,8 @@
     var agentsBg = session.agents_bg || [];
     var shells = session.shells || [];
     var grouped = groupAgentReruns(agentsBg);
-    var runningGroups = grouped.filter(function (g) { return g.running; });
-    var finishedGroups = grouped.filter(function (g) { return !g.running; });
+    var runningGroups = grouped.filter(function (g) { return g.running || g.waiting; });
+    var finishedGroups = grouped.filter(function (g) { return !g.running && !g.waiting; });
     var runningShells = Array.isArray(shells) ? shells.filter(function (s) { return s && s.running; }) : [];
     var finishedShells = Array.isArray(shells) ? shells.filter(function (s) { return s && !s.running; }) : [];
     var nAg = agentsBg.length, nSh = Array.isArray(shells) ? shells.length : 0;
@@ -3013,9 +3014,9 @@
       // not mdHtml(): a task label is machine/agent-authored (can read "delete the
       // stray *.pyc"), so single-asterisk italics must not fire on it.
       var titleHtml = a.task ? mdHtmlSafe(a.task) : esc(a.aid || "background agent");
-      return '<div class="crd-agent-row-item"><span class="crd-state-dot ' + (g.running ? "is-working" : "is-done") +
+      return '<div class="crd-agent-row-item"><span class="crd-state-dot ' + (g.running ? "is-working" : g.waiting ? "is-waiting" : "is-done") +
         '"></span><span class="crd-agent-title">' + titleHtml + "</span>" +
-        tag + modelTag + '<button type="button" class="crd-open-link" data-act="agent-map" data-focus="' + esc(a.aid) + '">map</button>' +
+        tag + (g.waiting ? '<span class="crd-agent-wf mono">waiting on shell ' + esc((a.waiting_on || []).join(", ")) + "</span>" : "") + modelTag + '<button type="button" class="crd-open-link" data-act="agent-map" data-focus="' + esc(a.aid) + '">map</button>' +
         '<button class="crd-open-link" data-act="agent-open" data-id="' + esc(a.aid) + '">open ›</button></div>'; // "opening the latest"
     }
     function shellRow(s) {

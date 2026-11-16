@@ -489,3 +489,489 @@ Red/green proofs (revert the guarded line with a scoped replace, run the one tes
 - `test_cr_agent_map_entry...test_panel_count_names_agents_and_shells`: label -> old summed number
 - selfcheck sidecar-shell assertion (`tests.test_tracker`): sidecar accumulation -> `pass`
 - Auggie `shells == [] and agents_bg == []` selfcheck assertion: a regression pin, no Auggie code changed, so no red-by-revert exists.
+
+## Live parity DIFF debug (sonnet)
+
+Method: ran `_bg_line` / `_bg_tasks` of the worktree code (9e686c8) over the real jsonl bytes (scripts in `~/.claude/jobs/16c95193/tmp/{dbg,dbg2,ids}.py`). Fan `shell` rows are volatile (state.json evicts finished ones), so ids were re-found in transcripts, not in the current fan.
+
+| # | Session / id | Verdict | Root cause |
+|---|---|---|---|
+| 1 | 16c95193 `bc3tkgaj3` phantom, owner `ac3a04e8` | (c) not reproducible on current code; was the OLD (pre-9e686c8) unanchored `SHELL_RE` | In `agent-ac3a04e8*.jsonl` only rows 112 (Bash#106, toolUseResult dict without `backgroundTaskId`) and 119 (Bash#116, `toolUseResult` is a str because "Exit code 1") have a `tool_result` whose text contains "running in background with ID: bc3tkgaj3. Output is being written to". Old code (`git show 9e686c8^`, claude.py:1728 `SHELL_RE.search(_result_text(...))` on any Bash result) accepted both. Current `_bg_line` (claude.py:1750-1761): kind=="fg", dict tur has no id -> skipped; row 119 str tur falls to `BG_LINE_RE` (^-anchored, `re.M`) whose text starts "Exit code 1\n--- 1191..." -> no match. `_bg_tasks` on the real transcript now returns only bd5ae7rq9/bvpycwx49/bgf8ul8im (all closed). The haiku run most likely hit the running dashboard (old code, not restarted) rather than the worktree: restart `make serve` and re-run. |
+| 2 | 16c95193 fan `bud6r2kxo` (later `bcwu9t6z2`, `bvgcoz8y8`) | (c) in-flight FOREGROUND Bash, legit timing | The id appears in NO transcript row as a launch; it appears only inside the output of the parity.py / grep Bash calls themselves (agent-aabf5893 row 70 = result of Bash#61 that ran parity.py; agent-ab6e8e46 rows 73/105). Those are the very commands reading state.json while still running; the harness gives every running Bash a shell id in `fan` before any result exists, and the transcript only learns the id if/when it is backgrounded. Same documented known gap as Reconciliation (in-flight fg Bash). Not detectable from bytes. |
+| 3 | 57f66536 `bx8hmd2it` | (c) timing; tracker correct | Launched in `agent-a5356f76*.jsonl` row 41 (13:58:06Z) as a plain fg Bash, auto-backgrounded at row 44 with dict `toolUseResult.backgroundTaskId:"bx8hmd2it", backgroundedToDeliverMessage:true` (accepted by `_bg_line`; confirmed in `_bg_tasks`), `<task-notification>` for it at 14:00:17.9Z (main file row 674, sidecar row 75), so tracker = closed. `fan.doneAt` lags the notification (state.json refreshed per turn), so a run within that window shows fan open vs tracker closed. Tracker is the more accurate side. |
+| 3b | 57f66536 `bxfx3fgbp` | (c) in-flight fg Bash | Appears in no transcript at all (not even a result). Same as #2. The id now present in fan, `b55d4yiux` (label `bash .../probe2.sh ... | sed`), is again a running fg Bash (startedAt 1794837650187, no transcript id). |
+| 4 | 82ce95d1 `be1j71eaj` | (c) in-flight fg Bash, confirmed | Id appears in no row of the main jsonl or any subagent file; fan label is `J=.../tmp/ab; for i in ...` (a foreground poll loop), and it has since left the fan. Matches Reconciliation's documented known gap. |
+
+No (a)/(b) defect found, so no fix is required for the four DIFFs.
+
+### Residual hardening (optional, plan gap, low severity)
+- Defect: claude.py:1759-1760 - for a fg Bash whose `toolUseResult` is NOT a dict (every `Exit code N` error result and other str/None results) the text fallback runs `BG_LINE_RE.search(txt)` with `re.M`, i.e. ANY line of the output may start with "Command running in background with ID: X". Repro: a fg Bash that prints (e.g. via python decoding a transcript, or `cat` of a note) a line beginning with that sentence and exits non-zero -> `toolUseResult` is a str -> phantom shell (input: tool_result text "Exit code 1\nCommand running in background with ID: zzz9. Output is being written to: /tmp/zzz9.output"; actual: shell zzz9 open; expected: none).
+- Direction: for the non-dict-tur branch only, accept the sentence at position 0 of the result text (`BG_LINE_RE.match`), never mid-text; the explicit `run_in_background` branch and dict `backgroundTaskId` path must NOT change.
+- Way: claude.py:1760 `BG_LINE_RE.search(txt)` -> `BG_LINE_RE.match(txt)` (the `^`/`re.M` can stay; `.match` anchors at 0). Real harness sentences start the text, so no live shell is lost (rows 44/48 of agent-a5356f76 begin "Command was moved to the background ...").
+- Test: in the `_bg_line` unit tests add rows (fg Bash tool_use + user row with str `toolUseResult` and tool_result text "Exit code 1\nCommand running in background with ID: zzz9. ...") asserting `acc["shells"] == {}`; red before the `.match` change, green after; plus a positive row with text starting at 0 and no dict tur still yields the shell.
+
+## Implementation review B — tests & UI (opus)
+
+Scope: TestBackgroundHold, test_shell_last_reads_bounded_tail, test_panel_count_names_agents_and_shells, test_selfcheck/test_shells_running edits, ext_cr_detail.js label, scripts/bundle.py. Every revert below was applied to the worktree file, the test run, then the file restored and `cmp`-checked against a backup.
+
+### Verified (independently)
+- **Red on revert (8 reverts, all RED, all restored):** quoted text, `^` dropped from `BG_LINE_RE`; quoted text, `if kind == "bg" or not isinstance(tur, dict):` -> `if True:`; refused launch, `if tid:` -> `if True:`; boot guard, `if ps < boot - 60:` -> `if False:` (the "procStart before boot" case of test_host_gate_orphans); cached sets, union -> in-place `.update` on a cached set; tail read, `fh.seek(...)` -> `fh.seek(0)`; JS label -> old summed number; unknown host, `live_aids = ... if hs else set()` with the `if hs` dropped -> test_unknown_host_keeps_todays_rules RED.
+- **Whole-feature revert:** with the parent commit's claude.py swapped in, 10 of the 13 TestBackgroundHold tests fail. The 3 that pass (quoted, refused, monitor) pass only because the parent never scanned sidecars. They guard only the new path. The main-transcript refused case is guarded by the test_shells_running addition, which is red on the parent.
+- **Hermetic:** `config.LIVE_SESSIONS_DIR` is patched to a tempdir. procStart and every timestamp are relative to `time.time()`. The host pid is `os.getpid()`. The tests do not depend on the real ~/.claude.
+- **Live path:** the tests go through `parse_session` -> `_host_start`/`_bg_tasks` -> `parse_agents(live=)` (claude.py:2289-2295, 1590) and `parse_shells(path, hs, bg_tasks)` (claude.py:2326), not a side helper.
+- **Selfcheck deviation:** this is not a weakening. A missing dir gives `_host_start` = 0.0, which is the pre-change ungated rule. Every prior assert is kept and one is added. It is, however, why F1 below goes unnoticed.
+- **JS:** `setPanelCount` innerHTML receives only array lengths and fixed words. The empty case "—" is asserted. "N agents" = `agents_bg.length`, the same number as `agentMapModel` `counts.total` (ext_cr_dialogs.js:2898), so the map and the Evidence label agree. Nothing else reads the count text. `node --check` passes, and the change sits inside a function body, so it cannot throw at load time.
+- **bundle.py:** `calendar` is claude.py's only new stdlib import (claude.py:1), and it was added to HEADER.
+
+### F1 (medium): the `shell_output` host gate is untested
+- **Defect:** the host gate in `shell_output` at aitracker/providers/claude.py:1895 (`parse_shells(path, _host_start(os.path.basename(path)[:-6]))`) has no test. Replace it with `parse_shells(path)`, then run tests.test_selfcheck, test_agent_map, test_pass_cache, test_shells_running, test_cr_routes and test_integration: all stay **green**. The /api/shell click-through (server.py -> shell_output) could therefore drift from the panel row (parse_session, gated), showing a dead-host shell as "running" in the modal while the row says done, and no test would notice.
+- **Fix direction:** add a test only, with no production change. Do NOT remove the selfcheck missing-dir patch, which keeps the selfcheck on today's ungated rule.
+- **Way:** in `TestBackgroundHold`, add `test_shell_output_follows_host_gate`: `self.side(extra=self.s1())`, then `self.host(None)` -> `claude.shell_output(self.main, "bsh1")["running"] is False`; `self.host(-3600)` -> `True`; `self.host(-600)` (procStart after launch) -> `False`.
+- **Proof:** red with the revert above, green restored.
+
+### F2 (low; known gap, documented at reconciliation item 2/§438)
+- **Defect:** test_shells_running's `test_agrees_with_parse_shells*` docstring says the list and detail paths reach the "SAME verdict". It compares `_tail_scan` with **ungated** `parse_shells(self.main)` (host_start=0.0), not the live detail path. Repro: take that fixture and set `LIVE_SESSIONS_DIR` to an existing empty dir. `list_sessions()` then gives `shells_running` 1, while `parse_session(main)["shells"]` gives running `[False]` (run here).
+- **Fix direction:** no code change; the board chip stays ungated by decision. Correct the docstring to say "ungated parse_shells (host unknown)". Patch `config.LIVE_SESSIONS_DIR` to a missing dir in that class's setUp so the test states its precondition. Name the divergence in the PR body.
+- **Proof:** none required, since only a docstring changes. If the board is ever gated, a parse_session-based agreement test becomes the red/green pin.
+
+### No other findings
+The rest of the implementer's red-on-revert claims that I spot-checked held.
+
+## Implementation review A — provider (opus), recorded by the main thread
+(The reviewer agent had no Edit tool. This is the main thread's summary of its report.)
+- **Verdict:** the code follows Plan v2 line for line, but the v2 **hold rule is wrong**.
+- **A-F1 HIGH:** on 82ce95d1, fan `doneAt` is set for a9ad361b and afd1ab11. Each has 4 `<task-notification><task-id>{aid}` rows in main, and their shells bn4u12cbj and bsh4mgoq0 are still open.
+  - The only fan-open agent is a86a4bdd: a 600 s foreground Bash with an unanswered `tool_use` and no notification.
+  - v2 (claude.py:2294 `live_aids` = shell owners; :1590 `held = aid in live`) shows a9ad/afd1 as running and a86a as done. That is wrong in both directions.
+  - Proposed rule: when `hs > 0`, an agent is running if all of these hold:
+    - it launched at or after `hs - 1`;
+    - its aid is not in the session-wide `done` union;
+    - its aid is not in `stopped`;
+    - its spawning `tool_use` has no result with `toolUseResult.status != "async_launched"` (this covers sync agents).
+  - The reviewer measured that this matches fan-open agents exactly on 6/6 live sessions.
+  - Unchanged: shell listing and running state, the `hs` None/0.0 branches, and `_tail_scan`.
+  - Tests:
+    - (a) the owner of an open shell has a notification, so it is not running, and its shell is running;
+    - (b) an unanswered foreground Bash with an old mtime and a live host is running, and becomes done when the host is None.
+- **A-F2 LOW cost:** warm `parse_any` on 82ce95d1 goes from 33–69 ms to 61–150 ms. `parse_shells` takes 16 ms (165 tail reads). No change; document it.
+
+## Implementation reconciliation (main thread, 2026-11-16)
+| # | Finding | Verdict | Action |
+|---|---|---|---|
+| A-F1 | Hold rule inverts agent liveness vs Claude Code | **confirmed** (matches the original screenshot: Claude Code lists notified agents with live shells as hollow ○ "waiting on its own background work") | Re-plan → Plan v3 (design change, user decision below) |
+| A-F2 | Poll cost about 2× warm | confirmed, **accepted** | Document only |
+| B-F1 | `shell_output` host gate untested (claude.py:1895) | **confirmed** | Add `test_shell_output_follows_host_gate` |
+| B-F2 | `test_agrees_with_parse_shells*` docstrings overstate list/detail agreement | **confirmed** | Fix docstrings, patch `LIVE_SESSIONS_DIR` in setUp, document the list/detail divergence |
+| DBG | `BG_LINE_RE.search` with `re.M` on non-dict results can match mid-output (claude.py:1760) | **confirmed, low** | Change to `.match`, with a negative test and a positive test |
+| live DIFFs | fan-only shells | **known gap** | In-flight foreground Bash appears in fan before any transcript row exists |
+
+## User decision (2026-11-16, second round)
+- Agent state is three-way, mirroring Claude Code's footer:
+  - **running**: not yet notified, not stopped, launched since host start;
+  - **waiting**: notified, but owns an open shell (shown with its shell id(s));
+  - **done**.
+- The Agent map header shows e.g. "1 running · 2 waiting". The server owns the state; the SPA renders it.
+
+## Plan v3 — delta (opus)
+
+Delta on 9e686c8 (Plan v2 as implemented). No code edited while planning. Probe scripts are in `~/.claude/jobs/16c95193/tmp/`: `v3shape.py`, `v3none.py`, `v3sync.py`, `v3live.py`, `v3bgline.py`.
+
+### 0. Real shapes confirmed (conventions rule 7)
+- **Spawn result.** 82ce95d1 has 140 Agent tool_uses, and every one maps 1:1 to a sidecar `meta.json` `toolUseId`. Each one's non-blob `tool_result` row has `toolUseResult.status == "async_launched"` (118 with `run_in_background: true`, 22 without). That row also carries the keys `agentId`, `isAsync`, `outputFile`, …
+  - 16 further results carry `toolUseResult = None`. All 16 are `type: "api-request-blob"` rows, which re-echo the same "Async agent launched" text. `_bg_line` already returns early on `_BLOB_TYPES`, so they never count.
+  - 18 tool_use ids are re-emitted after compaction. This is harmless because a re-seen launch only re-adds a `pend` entry.
+- **Sync agents.** Across the 600 newest transcripts there are 726 `async_launched` results. There are 12 `completed` results (session 2e71f77c), with the keys `agentId`, `content`, `totalDurationMs`, `toolStats`, … There are 8 errors where `toolUseResult` is a **str** (`"Error: …"`) and `is_error` is true. So "the spawning tool_use has a non-blob result whose status != `async_launched`" means the agent returned (sync) or failed. In both cases it is not running.
+- **Notification id = aid.** A real row reads `<task-notification>\n<task-id>a89fa5ca3328a98ae</task-id>\n<tool-use-id>toolu_…</tool-use-id>\n<output-file>…/tasks/a89fa5ca3328a98ae.output</output-file>\n<status>completed</status>…`. The `<task-id>` is the full sidecar aid, the same 17-character id that `state.json` `fan` uses. In 82ce95d1, 138 of the 140 aids have a notification. The 2 without one, a446c33e44a406319 and af5a77723b4bddc02, are exactly the two `fan` agents with no `doneAt`.
+
+### 1. The rule (server, `parse_agents`)
+Let `hs = _host_start(file-name sid)`, which `parse_session` already computes.
+- **`hs` is None or 0.0:** use today's pre-v2 rules exactly. `running = (now - mt) < LIVE_WINDOW`, the stop_after/finished chain applies, `waiting` is never set, and `waiting_on = []`.
+- **`hs > 0`:** compute three states.
+  - **running** when all of these hold:
+    - `aid ∉ done_u`, the session-wide `<task-id>` union from main plus every sidecar;
+    - `aid ∉ stopped_u`, the union of successful TaskStop targets;
+    - `e["tuid"] ∉ ret_u`, the union of spawn tool_use ids whose non-blob result has `toolUseResult.status != "async_launched"`;
+    - `_ts_epoch(row["started"]) >= hs - 1`.
+  - **waiting:** not running, and `aid` owns at least one shell with `running=True` in `bg_tasks`.
+  - **done:** otherwise.
+
+  In the `hs > 0` branch, SubagentStop rows and the mtime are both **ignored** for liveness. The stop_after/finished chain still supplies `ended` for done agents.
+
+Live match: `v3live.py`, run at 2026-11-16T20:00:18. It used the worktree's `_host_start`/`_bg_tasks`/`_agent_entry` plus the rule above, against `~/.claude/jobs/<sid8>/state.json` `fan` for every session with a live pid. Expected states:
+- a fan agent with no `doneAt` should be **running**;
+- a fan agent with `doneAt` that owns an open shell should be **waiting**;
+- any other fan agent should be **done**.
+
+| Session | hs | Fan agents | v3 = fan | Waiting (open shells) | v3 live but not in fan | Open shells (fan / tracker) |
+|---|---|---|---|---|---|---|
+| 82ce95d1 | live | 4 (open: a446c33e4, af5a77723) | **4/4** | a9ad361b4 [bn4u12cbj], afd1ab11c [bsh4mgoq0] | none | 5 / 3 |
+| 16c95193 | live | 1 (open: af4c805a4) | **1/1** | — | none | 0 / 0 |
+| 5849622c | live | 1 (done) | **1/1** | — | none | 0 / 0 |
+| bd1381a0, 57f66536, 0f4ee7b4 | live | 0 | 0/0 | — | none | 0 / 0 |
+| 985e4755, 2bda7c0d, 542952d8, 2e71f77c, ae962345 | — | no job `state.json` (desktop/other sessions) | n/a | | | |
+
+Totals: 6/6 fan agents match, and the rule adds no extra live agents. Under v2, 82ce95d1 shows a9ad/afd1 as running (wrong) and the two un-notified agents as done (wrong). In 82ce95d1, a446c33e4 owns the open shell br5ilh5yj and is correctly **running**, because running wins over waiting. The 2 fan-only shells, b0f546jpo and bfyatvqoc, appear in no transcript. They are the in-flight foreground Bash known gap and are not this plan's concern.
+
+### 2. Server shape (shared detail dict, `agents_bg[]` row)
+- `state` is one of `"running" | "waiting" | "done"`; today it is only running|done.
+- `running` stays a bool and is **True only for state running**. A waiting row has `running=False`.
+- New field `waiting_on`: a list of shell ids, in `bg_tasks` launch order. It is non-empty only when state is `"waiting"` and `[]` otherwise. It is always present on Claude rows. Auggie emits `agents_bg: []`, so it needs no change.
+- `ended` is None for waiting. `dur_s` for a waiting agent freezes at its last message (`end_ep = last_msg_ep if done or waiting else now`). This is identical to today for pre-v2 rows.
+- The sort is unchanged (`(not running, ts)`).
+
+Consumers of `running`/`state`, and whether waiting counts as live:
+
+| Consumer | Reads | Waiting counts as live? | Change |
+|---|---|---|---|
+| overview.py:57 "⚙ N background agent(s) working" | `running` | **no**: its own turn is done; its shell is listed under shells | none |
+| ext_cr_detail.js:962 `detailIsWorking` (glow) | `running` | no; stays close to the board's mtime-based `bg` | none |
+| ext_cr_detail.js:2466 pill "N agents running" | `running` | no ("running" means running) | none |
+| ext_cr_detail.js:712 timeline "finished" marker | `!running` | marker = its turn finished. Correct, since Claude Code also notifies at that point | none |
+| app.js:1660 `checkCompletions` | `running` | no. The running→waiting transition fires the "finished" toast, which is the same moment Claude Code notifies | none |
+| app.js:1952 chips, app.js:1963 legacy bg panel | `running` | no | none |
+| ext_cr_dialogs.js:2907 `agentMapModel` counts | `state` | separate count | **add `counts.waiting`** |
+| ext_cr_dialogs.js:2919/2926/2931 hide/showUp/dimmed | `state === 'running'` | **yes**: visible and not dimmed under "Hide finished" | treat `running` or `waiting` as live |
+| ext_cr_dialogs.js:2955 `agentMapSubtitle` | counts | — | `"N agents · R running · W waiting · …"` (the waiting part only when W>0) |
+| ext_cr_dialogs.js:3064-3078 `nodeEl` | `state` | hollow dot plus "waiting on shell <ids>" in the meta span | dot class `is-waiting` |
+| ext_cr_dialogs.js:2967 pane facts / 2981 emptyText / 3005 paneNeedsFetch | `state` | "State: waiting" renders as-is; a waiting agent re-fetches like a done one | none |
+| ext_cr_detail.js:2967-2988 `groupAgentReruns` / `renderAgentsPanel` | `running` | **yes**: in the top list, not behind "Show N finished" | `g.waiting`, hollow dot, tag |
+| claude.py:1906 `agent_detail.running` (mtime) | — | — | none (known gap (a), still documented) |
+| tests/test_working_glow_detail.py, test_cr_logic.py | `running` bool | — | none (semantics of `running` unchanged for pre-v2) |
+
+### 3. Exact edits (shortest diff, no new abstractions)
+
+**aitracker/providers/claude.py**
+1. `_bg_acc` (1719-1720): add `"ret": set()`.
+2. `_bg_line` (1723-1765):
+   - In the tool_use arm, add `elif b.get("name") in ("Agent", "Task"): pend[b.get("id")] = ("agent", None)`.
+   - In the tool_result arm, right after `kind, info = pend.pop(tuid)`, add:
+     ```python
+     tur = o.get("toolUseResult")
+     if kind == "agent":
+         if (tur.get("status") if isinstance(tur, dict) else None) != "async_launched":
+             acc["ret"].add(tuid)
+         continue
+     ```
+     Then delete the later duplicate `tur = o.get("toolUseResult")`.
+   - **DBG fix (direction changed, see §6):** line 1759 `if kind == "bg" or not isinstance(tur, dict):` becomes `if kind == "bg" or tur is None:`. `BG_LINE_RE.search` stays as it is.
+   - Update the docstring to say "+ spawn ids that returned".
+3. `parse_agents` (1524):
+   - New signature: `parse_agents(path, hb=None, cost=None, hs=None, open_by=None)`. The `live` param is removed. Its only caller is `parse_session`; the tests call it positionally with ≤2 args.
+   - Before the `out` loop:
+     ```python
+     open_by = open_by or {}
+     if hs:
+         try:
+             mb = file_pass("claude.shells", path, _shells_pass)   # fresh pickled copy, 0.04 ms warm on 82ce95d1
+         except OSError:
+             mb = _bg_acc()
+         accs = [mb] + [e["bg"] for e in entries]
+         done_u = set().union(*(a["done"] for a in accs))          # FRESH sets, never .update a cached one
+         stopped_u = set().union(*(a["stopped"] for a in accs))
+         ret_u = set().union(*(a["ret"] for a in accs))
+     ```
+   - In the loop, replace the `held`/`running` lines (1590-1593) with:
+     ```python
+     if hs:
+         running = (aid not in done_u and aid not in stopped_u and e["tuid"] not in ret_u
+                    and _ts_epoch(e["row"]["started"]) >= hs - 1)
+         waiting = not running and aid in open_by
+     else:
+         running, waiting = (now - e["mt"]) < config.LIVE_WINDOW, False
+     if hs and (running or waiting):
+         done, ended = False, None
+     elif e["stop_after"]: ...   # unchanged chain
+     ```
+   - Then:
+     - `end_ep = e["last_msg_ep"] if done or waiting else now`
+     - `"state": "waiting" if waiting else ("done" if done else "running")`
+     - `"waiting_on": list(open_by.get(aid, ())) if waiting else []`
+   - Update the docstring: replace the `live=` text with the three-way rule.
+4. `parse_session` (2289-2295): replace the `live_aids` line with:
+   ```python
+   open_by = {}
+   for t in bg_tasks:
+       if t["running"] and t["agent"]:
+           open_by.setdefault(t["agent"], []).append(t["id"])
+   agents_bg, ... = parse_agents(path, hb_ag, agent_cost, hs, open_by)
+   ```
+   This is safe with hs None/0.0 because `parse_agents` ignores `open_by` unless `hs`.
+5. Remove every v2 "hold" comment (1590 "owns an open background shell …").
+
+**aitracker/web/ext_cr_dialogs.js**
+- 2898: `counts = { total, running: 0, waiting: 0, byFamily }`.
+- 2907: `if (a.state === 'running') counts.running++; else if (a.state === 'waiting') counts.waiting++;`.
+- 2919: `hide` default becomes `counts.running + counts.waiting > 0`.
+- 2926: `showUp` for `n.state === 'running' || n.state === 'waiting'`.
+- 2931: `dimmed = hide && n.state !== 'running' && n.state !== 'waiting' && !forced[n.key]`.
+- 2955: after the running part, `if (c.waiting) parts.push(c.waiting + ' waiting');`.
+- 3064-3073 `nodeEl`:
+  - `var wait = n.state === 'waiting';`
+  - when `wait && n.waiting_on && n.waiting_on.length`, push `'waiting on shell' + (n.waiting_on.length > 1 ? 's ' : ' ') + n.waiting_on.join(', ')` into `meta`. This is a text node via `h()`, so no HTML.
+  - dot class `run ? 'is-running' : wait ? 'is-waiting' : 'is-done'`.
+
+**aitracker/web/ext_cr_dialogs.css** (after 642): `.cr .cr-amap-dot.is-waiting { background: transparent; box-shadow: inset 0 0 0 1.5px var(--state-working, #1c9163); }`.
+
+**aitracker/web/ext_cr_detail.js**
+- `groupAgentReruns` (2967-2981): add `var waitingItem = items.filter(function (x) { return x.state === "waiting"; })[0];`. Set `latest = runningItem || waitingItem || items[0]` and return `{ latest, count, running: !!runningItem, waiting: !runningItem && !!waitingItem }`.
+- `renderAgentsPanel`:
+  - 2987: `runningGroups = grouped.filter(g => g.running || g.waiting)`.
+  - 2988: `finishedGroups = grouped.filter(g => !g.running && !g.waiting)`.
+- `agentRow`:
+  - 3016: dot `g.running ? "is-working" : g.waiting ? "is-waiting" : "is-done"`.
+  - When `g.waiting`, append `'<span class="crd-agent-wf mono">waiting on shell ' + esc((a.waiting_on || []).join(", ")) + "</span>"` after `tag`.
+- Doc comment line 36: `{id,aid,wf,task,last,ts,running,state,waiting_on,tools}`.
+
+**aitracker/web/ext_cr_detail.css** (after 1308): `.cr .crd-state-dot.is-waiting { background: transparent; box-shadow: inset 0 0 0 1.5px var(--state-thinking); }`.
+
+**Not touched:** `dist/tracker.py`, app.js, overview.py, `_tail_scan`, `_mtime_and_bg`, `_bg_tasks`, `parse_shells`, `shell_output`, `agent_detail`, Auggie.
+
+### 4. Tests (all in existing files; name → fixture → red-before-fix)
+New helper in `TestBackgroundHold`: `def notify(self, *ids): self.main_add([{"type": "queue-operation", "content": "".join("<task-notification><task-id>%s</task-id></task-notification>" % i for i in ids)}])`. The fixture agent from `side()` is unchanged (started -1900 s, stop row, mtime -1000 s; host procStart -3600 s).
+
+| Test (tests/test_agent_map.py unless noted) | Fixture | Expected | Red before |
+|---|---|---|---|
+| **REWRITE** `test_open_sidecar_shell_holds_agent_after_stop_row` → `test_notified_owner_of_open_shell_is_waiting` (A-F1 a) | `side(extra=s1())`; `notify("a1")` | a1 `(state, running, ended, waiting_on) == ("waiting", False, None, ["bsh1"])`; `shells[0]["running"] is True` | on 9e686c8: state "running" (v2 hold). After the fix, revert `waiting = ...` → `False`: "done" |
+| **NEW** `test_unanswered_foreground_bash_agent_is_running` (A-F1 b) | `side(extra=[_bash("u5", -1800, bg=False)])`: no result, stop row, old mtime, no notify | host -3600 → "running", `running` True; `self.host(None)` → "done" | on 9e686c8: "done" (no open shell, stale mtime). Revert the v3 `running` to the mtime rule: red |
+| **NEW** `test_sync_spawn_result_ends_agent_async_does_not` | main gets Agent tool_use `tu1` (`_spawn("tu1")` in `_msg`) and `_result("tu1", -1000, "done", {"status": "completed", "agentId": "a1"})`; sidecar meta `{"toolUseId": "tu1"}` via `self.agent(..., meta=)` | "done"; then with `{"status": "async_launched"}` instead: "running" | drop `e["tuid"] not in ret_u` → first half red. Replace `!= "async_launched"` with `True` → second half red |
+| **NEW** `test_notification_in_another_sidecar_counts` | `side("a1")` and `side("a0", extra=[{"type": "queue-operation", "content": "<task-notification><task-id>a1</task-id></task-notification>"}])` | a1 "done" | build `done_u` from main only → red |
+| **CHANGE** `test_moved_to_background_shell_listed` | add `notify("a1")` | a1 `("waiting", ["bmv2"])`; (b) stays the positive guard for tur-None, sentence-after-output | the v2 assertion "running" is vacuous under v3; the `.match` variant of DBG turns (b) red |
+| **CHANGE** `test_quoted_harness_text_is_not_a_shell` | add `notify("a1")` per loop | "done" (a phantom shell would make it "waiting") | unchanged reverts; without notify it would fail spuriously as "running" |
+| **CHANGE** `test_refused_background_launch_is_not_a_shell`, `test_monitor_does_not_hold_agent` (rename `…_is_not_a_shell`) | add `notify("a1")` | "done" | as v2 (Monitor-as-shell → "waiting") |
+| **CHANGE** `test_completion_in_main_closes_sidecar_shell` | `notify("a1")` → assert "waiting"; then `notify("bsh1")` → "done", shell not running | — | drop `info["id"] not in done` → stays "waiting" |
+| **CHANGE** `test_failed_taskstop_keeps_hold_successful_closes` → `test_failed_taskstop_keeps_shell_open_successful_closes` | `notify("a1")` first | failed stop → "waiting"; successful stop → "done", shell closed | as v2, with "waiting" in place of "running" |
+| unchanged `test_agent_taskstopped_from_main_releases_its_shells` | — | "done" | now also pins `aid not in stopped_u` (without it a1 is "running") |
+| unchanged `test_host_gate_orphans` | — | "done" ×3 | "procStart after launch" now pins `started >= hs - 1` |
+| unchanged `test_unknown_host_keeps_todays_rules`, `test_gate_keys_on_file_name` | — | "done"/"running" | `if hs` → `if hs is not None` turns unknown-host red ("running") |
+| **EXTEND** `test_union_never_mutates_cached_agent_sets` | snapshot `done`, `stopped` and `ret` of the cached entry | all equal after re-parse | `done_u = accs[1]["done"]; done_u.update(...)` → red |
+| **NEW** `test_shell_output_follows_host_gate` (B-F1) | `side(extra=s1())` | `shell_output(self.main, "bsh1")["running"]`: host None → False; -3600 → True; -600 → False | `shell_output` → `parse_shells(path)` → red |
+| **NEW** `test_error_exit_quoting_harness_sentence_is_not_a_shell` (DBG) | `side(extra=[_bash("u6", -1800, bg=False), _result("u6", -1790, txt, txt, err=True)])` with `txt = "Exit code 1\nCommand running in background with ID: zzz9. Output is being written to: /tmp/t/zzz9.output"` (str tur) | `shells == []` | on 9e686c8: phantom zzz9 (str tur takes the text fallback) |
+| tests/test_shells_running.py `ClaudeShellsRunningTailScanTests` (B-F2) | `setUp`: `p = mock.patch.object(config, "LIVE_SESSIONS_DIR", os.path.join(self.pdir, "no-live")); p.start(); self.addCleanup(p.stop)`. Docstrings of `test_agrees_with_parse_shells*` say "ungated parse_shells (host unknown); the live detail path is host-gated and may differ (documented)" | unchanged | none (docstring and precondition only) |
+| tests/test_cr_agent_map_ui.py `_PURE_JS` + class | `agentMapModel(sess([row('r', {state: 'running'}), row('w', {state: 'waiting', waiting_on: ['b1']}), row('d')]), {})` | `counts.running == 1`, `counts.waiting == 1`; subtitle contains `"1 running · 1 waiting"`; `w` visible and not dimmed; a model with no waiting row has no "waiting" in its subtitle | before: `counts.waiting` undefined, no subtitle part, `w` dimmed |
+| tests/test_cr_agent_map_ui.py renderAgentMap DOM harness (~349) | add `row('w', {state: 'waiting', waiting_on: ['bsh1']})` | node dot has `is-waiting`; text contains "waiting on shell bsh1" | before: `is-done`, no text |
+| tests/test_cr_agent_map_entry.py `test_panel_waiting_agent_listed_not_finished` | `_panel({"agents_bg": [{"aid": "w1", "task": "t", "running": False, "state": "waiting", "waiting_on": ["bsh1"], "ts": 1}], "shells": []})` | html has `is-waiting` and "waiting on shell bsh1", and **no** "Show 1 finished" | before: the row is hidden behind "Show 1 finished" |
+| tests/test_selfcheck.py ~232 (rule 9) | existing `_r0` | add `assert _r0["waiting_on"] == []` | the field is missing on 9e686c8 |
+
+Prove each test red by reverting with a scoped Edit, never with git stash. Gate: `unset TRACKER_AUTH; make check` (one module per process if it is OOM-killed). Also run `node --check` on both JS files. CSS change only adds rules; per the gate-misses-load-time memory, keep it free of comment edits.
+
+### 5. Sequencing, caches, risks
+1. **Sequencing:**
+   1. `_bg_acc`/`_bg_line` (`ret` plus the DBG fix) with the DBG test.
+   2. `parse_agents`/`parse_session` with the TestBackgroundHold rewrites and new tests.
+   3. B-F1/B-F2 tests.
+   4. JS/CSS with JS tests.
+   5. Gate, then the `v3live.py` re-run against the running worktree build (restart `make serve` on a test port; never kill 8787).
+
+   Server first, because the SPA needs `state == "waiting"` to exist.
+2. **Caches:**
+   - `ret` lives in the per-file accumulator, so it is a pure function of that file's bytes. The `_AGENT_CACHE` key and `file_pass` key are unchanged.
+   - Both caches are in-memory only, so a restart drops entries that lack `ret`. No persisted shape changes.
+   - Unions are always `set().union(...)`, which creates fresh sets. No `.update`/`.add` ever touches `e["bg"][*]`.
+   - `open_by` is built fresh per call from `bg_tasks` dicts that `_bg_tasks` already builds fresh.
+3. **Risky spot: losing the notification.**
+   - Possible causes:
+     - Claude Code changes the `<task-notification>` format;
+     - the notification is lost to a crash;
+     - the Agent result is only in a blob row.
+   - Effect: under a live host, an un-notified agent stays "running" indefinitely.
+   - Bound: `hs` (a new host process makes it done), plus TaskStop and the sync `ret`.
+   - **Fallback, if live checks ever show a stuck agent:** add `or (e["stop_after"] and (now - e["mt"]) > 6 * 3600)` to `done` in the `hs` branch. It is not added now, because 6/6 sessions match and the user chose no age cap for shells.
+   - The second risk is `started` being empty, which gives `_ts_epoch` 0.0 and therefore "done". That is the safe direction.
+4. **Must NOT change:**
+   - shell running rule (`_bg_tasks`);
+   - `parse_shells`/`shell_output` gating;
+   - `_tail_scan`/`shells_running`;
+   - `_mtime_and_bg`/board `bg`;
+   - `hs` None/0.0 agent behaviour;
+   - the `running` bool semantics for pre-v2 rows;
+   - the `parse_agents` 5-tuple return;
+   - `agent_detail`;
+   - Auggie's empty shapes;
+   - the selfcheck missing-dir patch;
+   - `dist/tracker.py`;
+   - the `BG_LINE_RE` `^`/`re.M` anchor and `.search`.
+5. **Cost:** A-F2 is still accepted. v3 adds one warm `file_pass` load of the main accumulator (0.04 ms on 82ce95d1) and three small set unions.
+
+### 6. Decisions / corrections the user may want to overrule
+- **DBG direction is reversed (an evidence-based correction to the reconciliation).** `BG_LINE_RE.search` → `.match` would **lose real shells**. Across the 1500 newest transcripts there are 9 genuine harness "did not complete within its 120s timeout and was moved to the background" results with `toolUseResult` absent. In each, the sentence starts a line **after** interim output, and the text ends with the harness tail. The change would also break the existing positive test `test_moved_to_background_shell_listed` (b).
+  - The only phantom observed is a **str** `toolUseResult` (an `is_error` "Exit code 1" result). All real background results have `toolUseResult` either None or a dict, and `is_error` false.
+  - Fix: `not isinstance(tur, dict)` becomes `tur is None`.
+  - Residual known gap: a sidecar foreground Bash with no `toolUseResult` that exits 0 and prints a line starting with the harness sentence would still create a phantom.
+- **Waiting is not "working".** The session glow, the overview "now" line, the "N agents running" pill, app.js chips and the completion toast all treat waiting as not running. The toast fires on running→waiting, the same moment Claude Code notifies. The alternative is to count waiting as live in the glow.
+- **Header wording:** "· W waiting" appears only when W>0 (for example "3 agents · 1 running · haiku…"). The alternative is to always show "0 waiting".
+- **`dur_s` for a waiting agent freezes** at its last message rather than ticking.
+
+## Re-review of Plan v3 (opus)
+
+Brief: assume Plan v3 is wrong. Read-only; probes are in `~/.claude/jobs/16c95193/tmp/rr_*.py` (run with `python3 -I`, `TRACKER_AUTH` unset). No code edits, no git diff, no stash, no process control.
+
+### Verdict
+The v3 **running rule is wrong in one material way.** It treats an agent's notification as permanent, and it gates liveness on the agent's *first* row. Claude Code agents are **re-openable**: they wake after a SendMessage from the coordinator, or after their own background shell finishes. So any woken agent shows "done" while it works.
+
+Everything else holds up:
+- the three-way shape;
+- the SPA consumers;
+- the DBG reversal;
+- decisions 2–4.
+
+Fix that one rule (R1 below) and v3 ships.
+
+### Findings
+
+**R1 HIGH — a woken or resumed agent is shown "done" while it runs** (Plan v3 §1 / §3.3 `running = aid not in done_u … and started >= hs - 1`)
+- **Live repro, caught by `rr_v31live.py` / `v3live.py` at 20:13:56 local, session 8b05c822.**
+  - Agent adea15293a8528229 was spawned 2026-11-15T11:39Z.
+  - It was notified many times. The last notification before the wake was at 2026-11-16T12:23:48Z.
+  - The host restarted at 13:48:07Z (a resumed session: same sid, new pid).
+  - The coordinator sent a SendMessage at 14:42:12Z. The sidecar wake row ("The coordinator sent a message while you were working") is at 14:42:22Z, and that equals fan `startedAt`.
+  - **Fan said running; v3 said done**, failing both clauses: the aid was in `done_u`, and `started` 11-15 < hs.
+  - v2 and pre-v2 (mtime) said running.
+  - The agent re-notified at 14:47:08Z. Its last message was at 14:47:03Z.
+- **Prevalence (`rr_wake.py`, 400 newest sessions).** 277 of 2726 agents (10%) woke after their first notification:
+  - 301 wakes were coordinator SendMessages;
+  - 201 were `[SYSTEM NOTIFICATION]` wakes, where the agent's own shell finished. This is exactly the **waiting → woken** path: v3 shows such an agent "done" because its shell closed and its aid is already in `done_u`;
+  - 72 were other (hook re-prompts).
+  - Since 2026-10, spawn results carry `canContinueAgent`.
+- **Ordering is reliable (`rr_lastmsg2.py`, 2491 notified agents).** The notification always follows the agent's last message row:
+  - the minimum gap is +7 ms and the median is +13 s;
+  - no gap falls in (-5 s, 0);
+  - only 5 gaps are negative, all of them real wakes on dead hosts (`hs` None, so harmless).
+- **Fix direction.** Replace "ever notified" with "the agent's last message is newer than its last notification or sync return". Replace the `started` gate with `last_msg_ep`.
+- **Must NOT change:**
+  - the shell rule (`_bg_tasks` keeps the plain `done` set, counting every row, timestamped or not);
+  - the `hs` None/0.0 branch;
+  - `stopped_u`;
+  - waiting = not running ∧ owns an open shell.
+- **The way:**
+  - `_bg_acc`: add `"nts": {}` (task-id → latest notification epoch) and make `"ret": {}` a dict (spawn tuid → result epoch), not a set.
+  - `_bg_line`, at the top:
+    ```python
+    if "<task-notification>" in line:
+        ids = TASKDONE_RE.findall(line)
+        acc["done"].update(ids)
+        ts = o.get("timestamp") if isinstance(o, dict) and o.get("operation") != "remove" else None
+        ep = _ts_epoch(ts) if ts else 0.0
+        if ep:
+            for i in ids:
+                if ep > acc["nts"].get(i, 0.0):
+                    acc["nts"][i] = ep
+    ```
+    Why these exclusions:
+    - Blob re-echoes have no timestamp. If they counted, an old notification would close a woken agent.
+    - A queue `remove` row is written when the queue drains, which can be after the agent wakes.
+  - In the agent arm:
+    ```python
+    acc["ret"].setdefault(tuid, _ts_epoch(o.get("timestamp") or "") or float("inf"))
+    ```
+    This replaces `.add`.
+  - `parse_agents`, hs branch: build FRESH `nts_u`/`ret_u` dicts by max-merging every `accs` entry, never `.update` a cached one. Then:
+    ```python
+    fin = max(nts_u.get(aid, 0.0), ret_u.get(e["tuid"], 0.0) if e["tuid"] else 0.0)
+    running = aid not in stopped_u and e["last_msg_ep"] > fin and e["last_msg_ep"] >= hs - 1
+    ```
+    `waiting`, `done`, `end_ep`, `state` and `waiting_on` stay as v3 wrote them.
+  - Validation: re-running with this rule (`rr_v31live.py` / `rr_v31all.py`, 20:36 local) gave 6/6 fan agents matched, 0 extra live agents on the 7 job sessions, and 1 plausible running agent (idle 0 min) on the 4 non-job live sessions. By the timeline above, it also gives the right answer for the adea15293 window (running from 14:42:22 to 14:47:08).
+- **Tests (tests/test_agent_map.py `TestBackgroundHold`):**
+  - Change the plan's `notify(*ids)` helper to `notify(off, *ids)`, writing `{"type": "queue-operation", "operation": "enqueue", "timestamp": _iso(off), "content": …}`. Without a timestamp, under R1 it closes nothing.
+  - **NEW `test_woken_agent_is_running_until_renotified`:**
+    - Sidecar a1 rows: `_msg(_iso(-1900),"start")`, `_stop(_iso(-1600))`, then a user `_msg(_iso(-900), "The coordinator sent a message while you were working: go", role="user")`.
+    - Call `notify(-1500, "a1")`.
+    - Expect "running" (red on v3: "done").
+    - Then `notify(-800, "a1")` → "done".
+    - Variant b, in a fresh fixture: the wake is at -300, and main holds only `notify(-1500, "a1")` plus `{"type":"queue-operation","operation":"remove","timestamp":_iso(-100),"content":<the same notification>}`. Expect "running". It is red if `remove` rows count.
+  - **NEW `test_resumed_host_agent_woken_after_restart_is_running`:**
+    - `self.host(-600)`. Sidecar started at -1900, notified at -1500, woken at -300.
+    - Expect "running" (red on v3: the `started` gate).
+    - Then `host(-200)` → "done" (the `last_msg_ep >= hs - 1` gate).
+  - **CHANGE** every v3 test that calls `notify` to pass an offset later than the agent's last row. `test_sync_spawn_result_ends_agent_async_does_not` keeps its halves: the completed result at -1000 is later than the last sidecar message at -1900, so "done"; async gives "running".
+  - **EXTEND** `test_union_never_mutates_cached_agent_sets` so it also snapshots the `nts` and `ret` dicts.
+
+**R2 LOW (subsumed by R1) — nested async spawns read as "returned" on older sidecars**
+- **Repro (`rr_nest4.py`, 600 sessions):** a nested async spawn's result row in the parent sidecar had `toolUseResult` absent, with text "Async agent launched…". This occurs 49 times between 2026-07 and 2026-10, including 8 in the live session 985e4755. In 2026-11 it is a dict in all 9 cases.
+- Under v3's set rule, `None != "async_launched"` puts the tuid into `ret`, and the agent is "done" from launch.
+- **Direction:** no separate change. Under R1, `fin` is the spawn-result epoch, about 1 s after launch, and the agent's later messages exceed it, so it reads "running" until it notifies.
+- **Test:** none beyond R1. Document in §0 that sidecars before 2026-11 omit `toolUseResult`.
+
+**R3 LOW — a woken agent's empty pane says "(no output yet)"** (`ext_cr_dialogs.js:2981` `emptyText: node.state === 'done' && …`)
+- For a waiting row, the agent's own turn is finished, yet it reads "(no output yet)".
+- **Fix:** change it to `node.state !== 'running' && !(detail && detail.running)`.
+- **Test:** in `tests/test_cr_agent_map_ui.py` next to `OUT.empty_done` (line 121), add `OUT.empty_waiting = agentPaneModel(row('a', { state: 'waiting' }), { tail: '' }).emptyText` and assert `'No text output'`. It is red before the fix.
+
+**R4 LOW, no change — known gaps to document in the PR:**
+- **(a)** A notification-shaped string *quoted* in a tool input or text (Plan v3 §0 itself quotes one with a real aid) is read by the raw-line check. Base already behaves this way for shells. Under R1 it closes an agent only if the quote is newer than the agent's last message.
+- **(b)** `stopped_u` is not time-ordered, so an agent that is TaskStopped and later SendMessage-woken stays "done".
+- **(c)** The "waiting" half of the 6/6 `v3live.py` match is self-referential. The expected state is computed from the tracker's own `open_by`, because fan shell rows carry no owner (`{id, kind, label, startedAt}`). Only running and done were checked against Claude Code.
+- **(d)** In the classic UI (app.js:1952/1963 chips and the legacy panel), a waiting agent counts as finished, and the panel can say "all finished". Decision 2 accepts this.
+
+### Attacks that held (v3 is right)
+- **Sync and foreground agents mid-call:** there is no result yet, so the tuid is not in `ret`, so the agent is running. 130 top-level sync agents have a `completed` result and no notification, and `ret` covers them. All statuses on Agent results (`rr_status.py`, every transcript) are only `async_launched` or `completed`, plus str errors. There are no other variants. The tool name is always `Agent`.
+- **Nested sync agents (84, spawnDepth 2):** the parent-sidecar result has no `toolUseResult`, so `ret` applies and they are done. Correct.
+- **Agents with no `toolUseId` (11):** all date from May 2026 with dead hosts, so they are irrelevant.
+- **Stuck "running" plausibility** (`rr_live.py hist 120`, hs = session start, now = transcript mtime): 2 of 1628 agents were idle for more than 60 min. Both had no notification, and their main transcript had **no rows after the agent ended**, so the host was dead and `hs` None makes them done in production. There are no stuck agents on the 11 live hosts.
+- **DBG reversal:** confirmed by `rr_dbg.py` over the 1500 newest sessions plus sidecars, covering foreground Bash results whose text contains a harness sentence:
+  - 655 have dict `toolUseResult` with `backgroundTaskId` (504 at line start, 151 mid-text, all unaffected);
+  - **140 have `toolUseResult` None** (131 at line start and **9 mid-text after interim output**). `.match` would lose those 9;
+  - **0 have str or list** `toolUseResult`.
+
+  So `tur is None` keeps every real shell, and it changes behaviour only for the str-error phantom. The planner's 9-shell claim is exact.
+- **Consumers:**
+  - No SPA path switches exhaustively on agent `state`. The only `state` readers are `agentMapModel`/`nodeEl`/the pane (2907/2926/2931/3055/3064/2981; R3 covers 2981) and the boot cache key.
+  - `ext_cr_board.js:422` `RANK[a.state]` is the *session* state.
+  - overview.py:57, app.js `checkCompletions`/chips and ext_cr_detail.js 712/962/2466 read `running` only.
+  - Auggie emits `agents_bg: []` (auggie.py:502/774, augment_ext.py:276).
+- **Decisions 2–4:**
+  - The toast fires on running→waiting. Under R1 it fires again on woken→done, mirroring Claude Code's second notification.
+  - The freeze of `dur_s`/`end_ep` is fine.
+  - The header text appears only when W>0.
+
+  No regressions.
+- **Overbuilding:** none found. The edits are bounded by the user's decision (`waiting_on`, two dot classes, counts). The 6 h fallback was correctly left out.
+
+### Plan v3.1 amendments
+1. **R1:** in `_bg_acc`/`_bg_line`, add the `nts` dict (timestamped, non-`remove` rows only) and turn `ret` into a dict of epochs. In `parse_agents`, the hs branch becomes `running = aid ∉ stopped_u ∧ last_msg_ep > max(nts_u[aid], ret_u[tuid]) ∧ last_msg_ep ≥ hs − 1`. Build fresh merged dicts. The `done` set and the shell rule stay unchanged.
+2. **Tests for R1:**
+   - give `notify` a timestamp offset;
+   - add `test_woken_agent_is_running_until_renotified` (with the `remove`-row case);
+   - add `test_resumed_host_agent_woken_after_restart_is_running`;
+   - extend the cache-mutation test to `nts`/`ret`.
+3. **R3:** change `emptyText` to `state !== 'running'` and add `OUT.empty_waiting`.
+4. **Docs and PR:** record R2 (sidecar `toolUseResult` absent before 2026-11) and R4 (a)–(d) as known gaps. The §1 live-match table must say that "waiting" was not checked against Claude Code.
+5. **Re-run after implementing:** run `rr_v31all.py` against the worktree build and include its output in the implementation log.
+
+## Reconciliation of Plan v3 re-review (main thread, 2026-11-16)
+| # | Finding | Verdict | Action |
+|---|---|---|---|
+| R1 | Woken or resumed agents show as done (notification treated as permanent) | **confirmed**: live repro adea15293 on 8b05c822; 277/2726 agents across 400 sessions | Apply the v3.1 rule: `running = aid ∉ stopped ∧ last_msg_ep > max(last notify, sync-return) ∧ last_msg_ep ≥ hs−1`. Notify times come only from timestamped rows that are not queue `remove` rows. |
+| R2 | Pre-2026-11 nested async spawn with no `toolUseResult` | confirmed, low | Covered by R1; no separate change |
+| R3 | Waiting agent's empty pane says "(no output yet)" (ext_cr_dialogs.js:2981) | **confirmed** | `state !== 'running'` plus `OUT.empty_waiting` |
+| R4 | Doc-only items | accepted | Document in the report; no code |
+| v3 decisions 1–4 | DBG `tur is None` (`.search` kept); waiting is not "working"; header shows waiting only when >0; dur_s freezes | **accepted**: the re-review verified DBG on 140 shells | — |
+
+The plan of record is now **Plan v3 + the "Plan v3.1 amendments"**. The user-visible design is unchanged from the user's second-round decision.
+
+## Implementation log v3 (sonnet)
+
+Implemented Plan v3 + v3.1 amendments (R1 running rule, R3 empty-pane) on top of 9e686c8. Not a server restart concern here: aitracker/** and web/** changed, so a `make serve` restart is needed to see it.
+
+**Code.** `claude.py`: `_bg_acc` gains `nts` (task-id -> latest notification epoch; only timestamped, non-queue-`remove` rows) and `ret` (spawn tool_use id -> epoch of a non-`async_launched` result); `_bg_line` tracks Agent/Task spawns, DBG `tur is None` (`.search` kept); `parse_agents(path, hb, cost, hs, open_by)` builds fresh merged `stopped_u/nts_u/ret_u` (main + every sidecar) and applies `running = aid not in stopped_u and last_msg_ep > max(nts, ret) and last_msg_ep >= hs-1`, `waiting = not running and aid in open_by`, `state` running|waiting|done, `waiting_on`; hs None/0.0 keeps the pre-v2 rules. `parse_session` builds `open_by`. JS/CSS: `ext_cr_dialogs.js` (counts.waiting, hide/dim, subtitle, `nodeEl` dot + "waiting on shell", `emptyText` `!== 'running'`), `ext_cr_detail.js` (`groupAgentReruns` waiting, panel top list, hollow dot + tag), two `.is-waiting` CSS rules. `node --check` OK on both JS files.
+
+**Red proofs** (scoped edit of the guarded line, test alone, restore, green again; script `~/.claude/jobs/16c95193/tmp/redproof_v3.py`):
+- `waiting = False` -> RED: test_notified_owner_of_open_shell_is_waiting, test_failed_taskstop_keeps_shell_open_successful_closes, test_completion_in_main_closes_sidecar_shell, test_moved_to_background_shell_listed
+- hs branch -> mtime rule -> RED: test_unanswered_foreground_bash_agent_is_running
+- drop `ret_u` term -> RED; ret on every spawn result (async too) -> RED: test_sync_spawn_result_ends_agent_async_does_not (fixture tuned so a2's last message precedes its async result, else timing masks the guard)
+- main-only accumulators -> RED: test_notification_in_another_sidecar_counts
+- notification permanent (v3 rule) -> RED: test_woken_agent_is_running_until_renotified, test_resumed_host_agent_woken_after_restart_is_running
+- queue `remove` rows counted -> RED: test_woken_agent_is_running_until_renotified
+- shell_output ungated -> RED: test_shell_output_follows_host_gate
+- DBG `not isinstance(tur, dict)` -> RED: test_error_exit_quoting_harness_sentence_is_not_a_shell
+- union aliases cached dicts -> RED: test_union_never_mutates_cached_agent_sets (now covers done/stopped/nts/ret)
+- phantom shell on no-id result -> RED: test_quoted_harness_text_is_not_a_shell, test_refused_background_launch_is_not_a_shell; Monitor counted as shell -> RED: test_monitor_is_not_a_shell
+- `waiting_on` key dropped -> RED: selfcheck `_r0["waiting_on"] == []`
+- JS: counts.waiting / showUp / subtitle -> RED test_waiting_agent_is_live_in_model_and_subtitle; emptyText -> RED test_pane_empty_text_by_state; dot class + meta text -> RED test_j_waiting_agent_node; panel grouping -> RED test_panel_waiting_agent_listed_not_finished.
+- Not red-provable: test_shells_running B-F2 change (setUp LIVE_SESSIONS_DIR + docstrings) is a precondition/docs change, as the plan says.
+
+**Live parity** (`unset TRACKER_AUTH; python3 -I ~/.claude/jobs/16c95193/tmp/parity.py`, extended copy `parity3.py` prints per-fan-agent state; also `rr_v31all.py`): 6/6 fan agents match. 16c95193 a1be24b39 no doneAt -> running; 82ce95d1 ab4c7f336 no doneAt -> running; 57f66536 aadeb8f45 no doneAt -> running; 82ce95d1 a9ad361b4 and afd1ab11c have doneAt and own open shells bn4u12cbj / bsh4mgoq0 -> waiting (waiting_on matches); 5849622c a9a970c51 doneAt, no shell -> done. Shell DIFFs: 16c95193 (fan bo54i8p4x) and 57f66536 (fan buht9e14s) are fan-only open shells absent from every transcript = in-flight foreground Bash, the documented known gap; 82ce95d1 fan has 3 open shells vs tracker 2 (same gap). `rr_v31all.py`: v3 match on every session, no extra live agents, no "bad" rows. Per R4, "waiting" itself was not checked against Claude Code (no fan field for it); only the fan-derived done/running/owns-open-shell expectation was.
+
+**Known gaps recorded (R2, R4).** R2: sidecar `toolUseResult` is absent before 2026-11, so a pre-Nov nested async spawn has no `ret`; covered by the last-message-vs-notification comparison. R4 (a)-(d) doc-only items from the re-review are accepted as known gaps, no code.
+
+**Gate:** `unset TRACKER_AUTH; make check` green, `selfcheck ok`.
