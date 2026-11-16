@@ -1556,20 +1556,54 @@ class Pty:
         one kill path every caller shares (close_pty, the idle reap, test teardown) rather than
         only in close_pty. `close_pty()` is what then PROVES both are gone. Our own process group
         is never signalled -- see `_kill_group`.
+
+        Never SIGKILL a foreground job outright: SIGKILL skips EXIT traps, so a shell killed
+        mid-rc leaked its rc jobs' locks -- see KILL_GRACE for the regression. The shell is
+        STOPPED while its foreground job is hung up: a live shell would start its next rc job
+        and re-send SIGHUP to it, and bash aborts an EXIT trap on a second fatal signal
+        (measured, both). Then the shell is SIGKILLed; its exit hangs up whatever still holds
+        the foreground once, and each group gets KILL_GRACE before its SIGKILL. Any pty, not
+        only a folder one: `$SHELL -l` spawned directly (the test suite) runs the same rc files.
         """
         if self.pid > 0 and not self.done:
-            if self.folder:
-                # `fg > 0` is load-bearing, not hygiene: once the shell (the session leader) is
-                # dead the tty has NO foreground group and tcgetpgrp reports 0 -- and killpg(0)
-                # is "my own process group", i.e. this server. Measured, not hypothetical: a
-                # second kill() on a not-yet-reaped folder pty took the test runner down with it.
+            own = os.getpgrp()
+            # `fg > 0` is load-bearing, not hygiene: once the shell (the session leader) is dead
+            # the tty has NO foreground group and tcgetpgrp reports 0 -- and killpg(0) is "my own
+            # process group", i.e. this server. Measured, not hypothetical: a second kill() on a
+            # not-yet-reaped folder pty took the test runner down with it. Read BEFORE the shell
+            # dies, for the same reason.
+            try:
+                fg = os.tcgetpgrp(self.fd)
+            except OSError:
+                fg = 0
+            if fg > 0 and fg != self.pid and fg != own:
+                # Freeze the shell (it starts no next rc job, forwards no SIGHUP), then hang up the
+                # job's LEADER alone -- pyenv execs pyenv-rehash, so the leader IS the trap owner,
+                # and bash 3.2 skips the trap ~1/40 when it and its child are signalled together
+                # (0/40 leader-only, measured). Its children go with the group's SIGKILL below.
+                for pid, sig in ((self.pid, signal.SIGSTOP), (fg, signal.SIGHUP)):
+                    try:
+                        os.kill(pid, sig)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
+                _wait_exit(fg, KILL_GRACE)
+            else:
+                fg = 0
+            try:
+                os.kill(self.pid, signal.SIGKILL)    # also ends a stopped shell
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            # Its exit hangs up the tty's foreground group once -- the shell's own group when no job
+            # held it (an rc job sharing that group runs its trap then). Each group gets the grace,
+            # then the SIGKILL. pid as the pgid, never getpgid(pid) -- see `_kill_group`.
+            for pg in (g for g in (fg, self.pid) if g > 0 and g != own):
+                end = time.time() + KILL_GRACE
+                while pg == self.pid and time.time() < end and _group_alive(pg):
+                    time.sleep(0.02)
                 try:
-                    fg = os.tcgetpgrp(self.fd)
-                    if fg > 0 and fg != self.pid and fg != os.getpgrp():
-                        os.killpg(fg, signal.SIGKILL)
+                    os.killpg(pg, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
-            _kill_group(self.pid)
 
     def finish(self):
         """Close the master fd and reap the child -- always called from the reader thread, so
@@ -1615,6 +1649,55 @@ def _late_reap(pid):
         os.waitpid(pid, 0)
     except (ChildProcessError, OSError):
         pass
+
+
+KILL_GRACE = 1.0
+"""How long `Pty.kill()` lets each hung-up process group exit (running its EXIT traps) before
+the SIGKILL.
+The regression this guards: SIGKILLing a login shell mid-rc killed `pyenv rehash` before its
+`trap release_lock EXIT`, leaking ~/.pyenv/shims/.pyenv-shim; every later login shell then
+waited 60s per rehash (x2 in a typical .zshrc) -- past FOLDER_STARTUP_WAIT -- so every Resume
+ended "shell never reached its prompt". Only a group that ignores SIGHUP (a TUI) pays the wait.
+Measured on a real pty: a SIGHUP'd trap owner exits p95 0.19s, max 0.43s -- 0.3s leaked 1 in 40."""
+
+
+def _group_alive(pg):
+    """killpg(pg, 0) -- only ESRCH means gone. macOS answers EPERM once ANY member is a zombie,
+    which happens while the rest still run their EXIT trap (measured: treating EPERM as gone
+    SIGKILLed the trap mid-run), so EPERM counts as alive; the grace bounds the wait."""
+    try:
+        os.killpg(pg, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+def _wait_exit(pid, timeout):
+    """Block until `pid` -- not necessarily our child -- has EXITED, or `timeout` passes. Unlike
+    kill(pid, 0) a zombie counts as exited: `Pty.kill()` waits on a job whose parent shell it has
+    stopped, so nobody reaps it. kqueue NOTE_EXIT where available (macOS/BSD), /proc otherwise."""
+    if hasattr(select, "kqueue"):
+        kq = select.kqueue()
+        try:
+            kq.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                                      flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                      fflags=select.KQ_NOTE_EXIT)], 1, timeout)
+        except OSError:
+            pass                         # ESRCH: already gone
+        finally:
+            kq.close()
+        return
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                if f.read().rsplit(")", 1)[1].split()[0] in ("Z", "X"):
+                    return
+        except (OSError, IndexError):
+            return
+        time.sleep(0.02)
 
 
 def _kill_group(pid):

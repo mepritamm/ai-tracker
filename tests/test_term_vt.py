@@ -11,6 +11,7 @@ import io
 import json
 import os
 import queue
+import shlex
 import signal
 import sys
 import tempfile
@@ -974,8 +975,8 @@ class TestProcessGroupKill(unittest.TestCase):
                     "time.sleep(60)\n" % pidfile)
             pt = term_vt.spawn(td, ["python3", script], 80, 24)
             try:
-                self.assertTrue(_wait_for(lambda: os.path.exists(pidfile), 10),
-                                 "grandchild never started")
+                self.assertTrue(_wait_for(lambda: os.path.exists(pidfile) and os.path.getsize(pidfile), 10),
+                                 "grandchild never started")   # non-empty: open() creates it before write()
                 with open(pidfile) as f:
                     gpid = int(f.read())
                 try:
@@ -1000,6 +1001,97 @@ class TestProcessGroupKill(unittest.TestCase):
                 _drain(pt, 5)
 
 
+class TestKillRunsExitTraps(unittest.TestCase):
+    """Regression: Pty.kill() SIGKILLed a login shell mid-rc, so `pyenv rehash` never ran its
+    `trap release_lock EXIT` and ~/.pyenv/shims/.pyenv-shim leaked. Every later login shell then
+    waited 2x60s on that lock, past FOLDER_STARTUP_WAIT, and every Resume ended "shell never
+    reached its prompt -- claude was not started". A killed pane must let EXIT traps run."""
+
+    # The pyenv-rehash shape: take a lock, register an EXIT trap that releases it, do work.
+    JOB = "trap 'rm -f {lock}' EXIT; : > {lock}; sleep 30"
+
+    def _assert_lock_released(self, argv, folder, typed=False, fg_job=False):
+        with tempfile.TemporaryDirectory() as td:
+            lock = os.path.join(td, "LOCK")
+            job = "bash -c %s" % shlex.quote(self.JOB.format(lock=lock))
+            pt = term_vt.spawn(td, argv(td, job), 80, 24)
+            pt.folder = folder
+            try:
+                if typed:
+                    time.sleep(0.3)
+                    os.write(pt.fd, (job + "\n").encode())
+                self.assertTrue(_wait_for(lambda: os.path.exists(lock), 10), "job never took the lock")
+                if fg_job:   # the zsh-rc shape: the job owns the tty's foreground group
+                    self.assertTrue(_wait_for(lambda: os.tcgetpgrp(pt.fd) != pt.pid, 5),
+                                    "the job never became the foreground group")
+            finally:
+                t0 = time.time()
+                pt.kill()
+                took = time.time() - t0
+                _drain(pt, 5)
+            self.assertTrue(_wait_for(lambda: not os.path.exists(lock), 3),
+                            "kill() skipped the job's EXIT trap: its lock leaked")
+            self.assertLess(took, 2 * term_vt.KILL_GRACE + 1.0)
+
+    def test_folder_shell_killed_with_a_foreground_job_releases_its_lock(self):
+        """THE production shape: zsh runs `pyenv rehash` from .zshrc as a foreground job in its
+        own process group -- kill()'s fg-group branch, hung up before the shell."""
+        self._assert_lock_released(lambda td, job: ["/bin/bash", "--noprofile", "--norc", "-i"],
+                                   folder=True, typed=True, fg_job=True)
+
+    def test_plain_pty_killed_mid_job_releases_its_lock(self):
+        """The test suite's shape: `$SHELL -l` spawned straight, not as a folder pty. Before the
+        fix its job got only the kernel's group-wide hangup, which bash 3.2 loses ~1 in 40 --
+        a leak per many `make check` runs, not per run, so this is coverage, not the red test."""
+        self._assert_lock_released(lambda td, job: ["/bin/bash", "--noprofile", "--norc", "-i"],
+                                   folder=False, typed=True, fg_job=True)
+
+    @unittest.skipUnless(os.path.exists("/bin/zsh"), "needs zsh")
+    def test_zsh_killed_across_back_to_back_rc_jobs_leaks_no_lock(self):
+        """The production shape end to end: zsh (the default login shell) whose .zshrc runs
+        pyenv-rehash-shaped jobs back to back (`pyenv init --path` then `pyenv init -` each
+        rehash), killed at random points of its startup. A SIGHUP'd shell starts the NEXT rc job
+        and re-sends SIGHUP to it mid-trap -- so the shell itself must die by SIGKILL, after its
+        foreground jobs. Repeated, because the old orders leaked in only ~1 of 6 runs."""
+        import random
+        import subprocess
+        job = ("bash -c 'set -o noclobber; n=0; until : > \"$L\" 2>/dev/null; do n=$((n+1)); "
+               "[ $n -gt 30 ] && exit 1; sleep 0.1; done; set +o noclobber; "
+               "trap \"rm -f \\\"$L\\\"\" EXIT; /bin/sleep 0.35; /bin/sleep 0.05'\n")
+        rng, leaks = random.Random(7), []
+        for i in range(12):
+            with tempfile.TemporaryDirectory() as td:
+                lock = os.path.join(td, "LOCK")
+                with open(os.path.join(td, ".zshrc"), "w") as f:
+                    f.write(job * 3)
+                pt = term_vt.spawn(td, ["/usr/bin/env", "ZDOTDIR=" + td, "L=" + lock,
+                                        "/bin/zsh", "-d", "-l"], 80, 24)
+                pt.folder = bool(i % 2)
+                time.sleep(rng.uniform(0.1, 1.4))
+                pt.kill()
+                _drain(pt, 5)
+                time.sleep(0.5)
+                if os.path.exists(lock):
+                    leaks.append(i)
+                    # an orphaned job still holding it would be the bug too; kill it, don't leak it
+                    subprocess.run(["pkill", "-9", "-f", lock])
+        self.assertEqual(leaks, [], "kill() leaked an rc job's lock in runs %s" % leaks)
+
+    def test_sighup_ignoring_job_still_dies_within_the_grace(self):
+        """The SIGKILL fallback still lands: a TUI ignoring SIGHUP costs at most KILL_GRACE."""
+        with tempfile.TemporaryDirectory() as td:
+            pt = term_vt.spawn(td, ["/bin/bash", "--noprofile", "--norc", "-c",
+                                    "trap '' HUP; echo up; sleep 30"], 80, 24)
+            pid = pt.pid
+            self.assertTrue(_wait_for(lambda: term_vt._group_alive(pid), 5))
+            t0 = time.time()
+            pt.kill()
+            self.assertLess(time.time() - t0, 2 * term_vt.KILL_GRACE + 1.0)
+            _drain(pt, 5)
+            self.assertTrue(_wait_for(lambda: not term_vt._group_alive(pid), 5),
+                            "a SIGHUP-ignoring group survived kill()")
+
+
 class TestNeverKillsOwnProcessGroup(unittest.TestCase):
     """pty.fork() returns to the parent before the child's setsid, so getpgid(child) can be the
     PARENT's group; killpg of it SIGKILLs this process. Nothing here may ever signal our group."""
@@ -1012,6 +1104,8 @@ class TestNeverKillsOwnProcessGroup(unittest.TestCase):
              mock.patch.object(term_vt.os, "kill") as kill:
             pt.kill()
         self.assertNotIn(mock.call(own, signal.SIGKILL), killpg.call_args_list)
+        for c in killpg.call_args_list + kill.call_args_list:   # no signal at all, SIGHUP included
+            self.assertNotEqual(c[0][0], own)
         kill.assert_any_call(424242, signal.SIGKILL)
 
     def test_folder_pty_kill_never_signals_own_group_via_fg(self):
@@ -1021,10 +1115,10 @@ class TestNeverKillsOwnProcessGroup(unittest.TestCase):
         with mock.patch.object(term_vt.os, "getpgid", lambda p: own), \
              mock.patch.object(term_vt.os, "tcgetpgrp", lambda fd: own), \
              mock.patch.object(term_vt.os, "killpg") as killpg, \
-             mock.patch.object(term_vt.os, "kill"):
+             mock.patch.object(term_vt.os, "kill") as kill:
             pt.kill()
         self.assertNotIn(mock.call(own, signal.SIGKILL), killpg.call_args_list)
-        for c in killpg.call_args_list:
+        for c in killpg.call_args_list + kill.call_args_list:
             self.assertNotEqual(c[0][0], own)
 
 
