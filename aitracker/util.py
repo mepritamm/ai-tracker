@@ -717,7 +717,22 @@ def origin_matches_host(headers):
     request's Host (incl. `Origin: null`). An absent Origin is allowed -- browsers always send one
     on a cross-origin POST, so only non-browser clients omit it."""
     o = headers.get("Origin", "")
-    return not o or urlparse(o).netloc == headers.get("Host", "")
+    if not o:
+        return True
+    u = urlparse(o)
+    host = (headers.get("Host", "") or "").strip().lower()
+    if u.netloc.lower() == host:
+        return True
+    # A TLS tunnel forwards `Host: name` (or `name:443`) while the browser's Origin is
+    # `https://name`: compare with the scheme's default port made explicit on both sides.
+    dflt = {"https": "443", "http": "80"}.get(u.scheme)
+    if not dflt or not u.netloc:
+        return False
+
+    def norm(n):
+        h, sep, p = n.rpartition(":")
+        return n if (sep and p.isdigit() and not h.endswith(":")) else n + ":" + dflt
+    return norm(u.netloc.lower()) == norm(host)
 
 
 def is_loopback_host(host_header):

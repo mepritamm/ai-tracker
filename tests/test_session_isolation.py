@@ -709,8 +709,10 @@ class TestSessionIsolationStaticSweep(unittest.TestCase):
     def test_model_effort_senders_require_claude_and_note_senders_send_text(self):
         for f, needle, n in (("ext_cr_detail.js", "clear_first: true, require_claude: true", 1),
                              ("ext_cr_term.js", "clear_first: true, require_claude: true", 1),
-                             ("ext_vt.js", "clear_first: true, require_claude: true", 2)):
-            self.assertEqual(_web_src(f).count(needle), n, f + ": model/effort sender without require_claude")
+                             ("ext_vt.js", "clear_first: true, require_claude: true", 3)):  # model, effort, /login
+            self.assertEqual(_web_src(f).count(needle), n, f + ": model/effort/login sender without require_claude")
+        self.assertIn('{ text: "/login", submit: true, clear_first: true, require_claude: true }',
+                      _web_src("ext_vt.js"))
         self.assertIn("snapLabel: (typeof sessSnapLabel", _web_src("ext_cr_boot.js"))
         self.assertIn("text: payload.text", _web_src("ext_cr_boot.js"))
         self.assertIn("text: rmNote && rmNote.text", _web_src("ext_cr_detail.js"))

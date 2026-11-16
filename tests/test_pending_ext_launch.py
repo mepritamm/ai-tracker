@@ -38,6 +38,14 @@ vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
   out.err = await win.ExtLaunch.openAt('/tmp/p', 'new', 'x');
   reply = {fail: true};
   out.net = await win.ExtLaunch.openAt('/tmp/p', 'new', 'x');
+  reply = {status: 200, j: {tty: 't1'}};
+  calls.length = 0;
+  await win.ExtLaunch.openAt('~', 'new', '/login', {gateway: 'anthropic'});
+  out.gw = calls[0].body;
+  calls.length = 0;
+  await win.ExtLaunch.openAt('~', 'new', '/login', {gateway: 'bedrock'});
+  out.gwbad = calls[0].body;
+  reply = {fail: true};
   out.empty = await win.ExtLaunch.openAt('  ', 'new', 'x');
   console.log(JSON.stringify(out));
 })();
@@ -63,6 +71,11 @@ class OpenAt(unittest.TestCase):
         self.assertFalse(o["net"]["ok"])
         self.assertIn("down", o["net"]["error"])
         self.assertFalse(o["empty"]["ok"])
+        self.assertEqual(o["gw"]["gateway"], "anthropic")
+        self.assertEqual(o["gw"]["prompt"], "/login")
+        self.assertNotIn("gateway", o["body"])
+        self.assertNotIn("gateway", o["noprompt"])
+        self.assertNotIn("gateway", o["gwbad"])
 
 
 if __name__ == "__main__":

@@ -1435,6 +1435,56 @@
     return wrap;
   }
 
+  // Settings > Server "Claude Code login (/login)". Status comes from GET /api/claude/auth (fetched
+  // only when this block is built, i.e. when the Server tab renders; never polled). The button opens
+  // a terminal in ~ running `claude "/login"` through the normal launch path (ExtLaunch.openAt).
+  function claudeLoginBlock() {
+    if (crReadOnly()) return null;
+    var wrap = h('div', { class: 'cr-cfg-row cr-claude-login-block' });
+    var st = null, msg = '', denied = false, busy = false;
+    function paint() {
+      var status = denied ? 'Login status is shown on this machine only' : (msg || (st ? (st.error || st.label || '') : 'Loading…'));
+      wrap.innerHTML = '';
+      wrap.appendChild(h('div', { class: 'cr-cfg-row-label' }, [
+        h('div', { class: 'cr-cfg-row-name' }, ['Claude Code login (/login)']),
+        h('div', { class: 'cr-cfg-row-sub cr-claude-login-status' }, [status]),
+        h('div', { class: 'cr-cfg-row-sub cr-claude-login-warn' }, ['Signs in for every Claude Code session on this machine — choosing a different login method signs out the existing claude.ai login. Opens Claude Code’s own /login in a new terminal tab.']),
+      ]));
+      var ctl = h('div', { class: 'cr-cfg-row-control' });
+      var b = crBtn(st && st.logged_in ? 'Switch account' : 'Log in', login);
+      if (busy) b.setAttribute('disabled', 'disabled');
+      ctl.appendChild(b);
+      wrap.appendChild(ctl);
+    }
+    function load(fresh) {
+      crCall('/api/claude/auth' + (fresh ? '?fresh=1' : '')).then(function (r) {
+        denied = r.status === 403;
+        if (r.ok) { st = r.body; msg = ''; } else if (!denied) msg = (r.body && r.body.error) || 'request failed';
+        paint();
+      });
+    }
+    function login() {
+      var L = window.ExtLaunch;
+      if (!L || typeof L.openAt !== 'function') { msg = 'Log in failed: terminals are unavailable in this build'; paint(); return; }
+      busy = true; msg = ''; paint();
+      var pr;
+      try { pr = L.openAt('~', 'new', '/login', { gateway: 'anthropic' }); } catch (e) { pr = { ok: false, error: String(e) }; }
+      Promise.resolve(pr).then(function (x) {
+        busy = false;
+        msg = x && x.ok === false ? 'Log in failed: ' + (x.error || 'unknown error') : '';
+        paint();
+      }, function (e) { busy = false; msg = 'Log in failed: ' + e; paint(); });
+    }
+    // Coming back from the login tab refocuses this tab: re-read the status (the server floors the rate).
+    function onFocus() {
+      if (wrap.isConnected === false) { window.removeEventListener('focus', onFocus); return; }
+      load(true);
+    }
+    if (typeof window.addEventListener === 'function') window.addEventListener('focus', onFocus);
+    paint(); load(false);
+    return wrap;
+  }
+
   function renderConfig(payload) {
     var srv = (payload && payload.server) || {};
     // Header subtitle: 5c gives Config the real server address (its mock shows
@@ -1723,6 +1773,8 @@
           readonlyField(String((srv.cfg && srv.cfg.PORT && srv.cfg.PORT.value != null) ? srv.cfg.PORT.value : 8790)), true));
         body.appendChild(cfgRow('Host', 'HOST', 'Same as Port — read-only.',
           readonlyField(String((srv.cfg && srv.cfg.HOST && srv.cfg.HOST.value) || '127.0.0.1')), true));
+        var loginEl = claudeLoginBlock();
+        if (loginEl) body.appendChild(loginEl);
         var updEl = updateBlock();
         if (updEl) body.appendChild(updEl);
       } else if (active === 'Tunnel') {

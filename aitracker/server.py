@@ -6,7 +6,7 @@ from . import tunnel                       # runtime tunnel switch -- see tunnel
 from .config import NARR_PAGE
 from .util import is_loopback_host, origin_matches_host
 from .page import build_page
-from .gateway import openrouter_configured
+from .gateway import openrouter_configured, claude_auth_status
 from .registry import all_sessions, parse_any, search_all, search_session, drill, _attached_pty
 from .pending import start_worker, load_report, item_detail, run_async
 from .schedule import sched_install, sched_uninstall, sched_status, autoinstall_once, _optout_path
@@ -240,6 +240,8 @@ def _local_caller(handler):
         return False, "refused: Host is not loopback%s" % _NOT_LOCAL
     return True, ""
 
+
+_CLAUDE_AUTH_KEYS = ("available", "logged_in", "auth_method", "subscription", "label", "error")
 
 _STARTED = "%.6f" % time.time()   # per-process; an in-place restart re-imports this, so open tabs see it change
 
@@ -486,6 +488,14 @@ class Handler(BaseHTTPRequestHandler):
             if not ok:
                 return self._json({"error": err}, 403)
             return self._json(_update_body(update_status()) if p.path == "/api/update" else _sched_body())
+        elif p.path == "/api/claude/auth":
+            # the machine's Claude Code login state: this machine only (never in _RO_GET_ALLOW)
+            ok, err = _local_caller(self)
+            if not ok:
+                return self._json({"error": err}, 403)
+            st = claude_auth_status(fresh=parse_qs(p.query).get("fresh") == ["1"])
+            # belt: whitelist the non-identifying keys, so email/org/ids can never reach the wire
+            return self._json({k: st.get(k) for k in _CLAUDE_AUTH_KEYS if k in st})
         elif p.path == "/api/config":
             # The Config dialog's live read: every config.json-overridable setting's current
             # effective value (config.json > env > default -- see config.py's big module
@@ -632,6 +642,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = urlparse(self.path)
+        if not origin_matches_host(self.headers):      # CSRF, every POST incl. /login; absent Origin (CLI) passes
+            return self._json({"error": "refused: cross-origin request"}, 403)
         if p.path == "/login":          # the only route reachable while unauthenticated
             return self._do_login()
         if not self._authok():

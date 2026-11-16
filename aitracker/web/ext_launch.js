@@ -316,7 +316,7 @@
   // same POST /api/term/pty route ext_vt.js's openVT() already uses for the "…here" pair, just
   // keyed by `cwd` instead of `session` (Tier 2's addition; may 404/400 in a worktree where it
   // hasn't landed yet -- handled below, not left to fail silently or hang).
-  function pickDirectory(raw, mode, prompt) {
+  function pickDirectory(raw, mode, prompt, opts) {
     var path = (raw == null ? "" : String(raw)).trim();
     // A leading "~" is left exactly as typed -- this file never invents a home directory of its
     // own (conventions rule 5: never invent data the server should supply). The server expands
@@ -329,6 +329,7 @@
     showPickerBusy();
     var body = { cwd: path, cols: 100, rows: 30, mode: mode };
     if (prompt) body.prompt = prompt;   // optional first prompt for a `new` session (ExtLaunch.openAt)
+    if (opts && (opts.gateway === "anthropic" || opts.gateway === "openrouter")) body.gateway = opts.gateway;
     return fetch("/api/term/pty", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -377,7 +378,7 @@
 
   // The single Resume path (pending-work modal, both views): open a session-less terminal at a
   // cwd, optionally with a first prompt. Resolves {ok, error}; never rejects.
-  window.ExtLaunch = { openAt: function (p, m, pr) { return pickDirectory(p, m, pr); } };
+  window.ExtLaunch = { openAt: function (p, m, pr, o) { return pickDirectory(p, m, pr, o); } };
 
   buildSideControls();
 

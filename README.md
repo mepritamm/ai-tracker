@@ -105,6 +105,27 @@ HOST=0.0.0.0 TRACKER_AUTH=user:pass make serve # terminal enabled (requires TRAC
 - **Open in Terminal/iTerm instead** — the **External terminal** / **External resume** buttons launch your real macOS terminal app (`TRACKER_TERM_APP` picks Terminal or iTerm) `cd`'d to the session's directory. Local machine only; hidden when you're not on localhost. Resume is Claude-only; other tools get the `cd` alone. The Control Room board's **Waiting on you** tiles use the same native launcher (see below).
 - **Command runner** — runs line-oriented commands (`git status`, `make check`, `npm test`, …) in the session's directory and streams the output into the page with colour. There is **no shell**: the command is `shlex.split` into argv and `execvp`'d directly, so shell metacharacters are never operators. Commands must match an argv-prefix allowlist, overridable with `TRACKER_TERM_ALLOW`. Output is capped, concurrent jobs are capped, and a job is killed when you close its view.
 
+### Claude Code login
+
+Two buttons sign Claude Code in on this machine. The login is machine-wide: it applies to every Claude Code session, not only the one you are looking at.
+
+- **Settings → Server → "Claude Code login (/login)"** shows a status line from `claude auth status --json` and a **Log in** or **Switch account** button (it reads **Log in** when the status is unknown). The button opens a new terminal in `~` running `claude /login`. Only `loggedIn`, `authMethod` and `subscriptionType` reach the page; email, org and account ids never do. The status is cached for 60 s on the server, an on-demand refresh is floored at 5 s, it is never polled, and it is open to local callers only. It reflects the server's environment (no login shell, no rc files), so it can disagree with a terminal's `claude`.
+- **`/login` button** in the terminal bar, next to `/model`, in both views. It types `/login` into the running Claude Code session. It shows only for terminals launched with the Anthropic `claude` launcher, so it is hidden on OpenRouter sessions, on `claude attach` panes (including Anthropic ones), and on terminals with no session.
+
+Warning: signing in covers every Claude Code session on this machine, and choosing a different login method signs out the existing claude.ai login.
+
+Known gaps (documented, not fixed):
+
+- An open permission prompt receives the Enter that `/login` sends. Use the button when Claude is idle at its prompt.
+- A multi-line draft gets sent with `/login` appended.
+- `/login` and `/design-login` both appear in Claude Code's menu.
+- A Control Room resend may pre-pick a login method.
+- Terminals with no session have no `/login` button.
+- A plain `claude` whose command or environment the user's shell changed (an alias, or exported `ANTHROPIC_*` variables) is not detected, so the button can show for it. A hand-typed `claude` started right after an app-launched one keeps the button until that job exits.
+- When `claude` on PATH is the OpenRouter launcher, the Log in button still types `claude /login`, which the shell resolves to that launcher.
+
+Every POST to the dashboard checks the `Origin` header: a mismatched or `null` Origin gets 403. A request with no `Origin` (curl, other CLI tools) is allowed.
+
 ### What these features do and don't guarantee
 
 Worth reading, especially if you expose the server over a tunnel.

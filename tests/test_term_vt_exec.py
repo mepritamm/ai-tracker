@@ -4965,5 +4965,149 @@ console.log(JSON.stringify({ result: result }));
         self.assertEqual(result, "http://tracker.test")
 
 
+_LOGIN_TIP = ("Types /login into Claude Code. Use when Claude is idle at its prompt. Signs in for "
+              "every Claude Code session on this machine \u2014 choosing a different login method "
+              "signs out the existing claude.ai login.")
+
+
+def _cb_method(src, name):
+    """One `ContextBar.prototype.NAME = function ...` slice, up to the next ContextBar method."""
+    marker = "ContextBar.prototype.%s = " % name
+    start = src.index(marker)
+    nxt = src.find("ContextBar.prototype.", start + len(marker))
+    return src[start: nxt if nxt != -1 else len(src)]
+
+
+class TestContextBarLoginButton(unittest.TestCase):
+    """The in-terminal /login button renders the server's `login_ok` only (conventions rule 5).
+    ContextBar's handlers are closure-private, so the REAL methods are sliced out of ext_vt.js and
+    run under node against a stubbed fetch / toast / element."""
+
+    def _run(self, body):
+        src = _read_src()
+        parts = "\n".join(_cb_method(src, n) for n in
+                          ("_setAttached", "_syncBarVisibility", "_syncLoginBtn", "_login", "start"))
+        script = """
+function ContextBar() {}
+var toasts = [], posts = [], q = {};
+function toast(a, b) { toasts.push([a, b]); }
+function ttyQuery(t) { return "tty=" + t; }
+function setInterval() { return 1; } function clearInterval() {}
+ContextBar.prototype._closeModelDropdown = function () {};
+ContextBar.prototype._closeEffortDropdown = function () {};
+ContextBar.prototype._applySessionData = function () {};
+ContextBar.prototype._focusTerminal = function () {};
+var fetchImpl = null;
+function fetch(url, opts) {
+  if (opts && opts.method === "POST") { posts.push([url, JSON.parse(opts.body)]); }
+  return fetchImpl(url, opts);
+}
+function resp(ok, j, status) { return Promise.resolve({ ok: ok, status: status || (ok ? 200 : 500), json: function () { return Promise.resolve(j); } }); }
+""" + parts + """
+function mk() {
+  var c = new ContextBar();
+  c.ttyId = "t1"; c.sid = "s"; c._destroyed = false; c.attached = false; c._loginOk = false;
+  c.switchersEl = {style: {}}; c.el = {style: {}, parentNode: null};
+  c.loginBtn = {style: {display: "none"}};
+  return c;
+}
+function flush() { return new Promise(function (r) { setTimeout(r, 5); }); }
+""" + body
+        return _run_node(script)
+
+    def _poll(self, attached_resp):
+        # attached_resp: JS expression for the /api/term/attached fetch (a promise)
+        return self._run("""
+var c = mk();
+fetchImpl = function (url) { return url.indexOf("/api/term/attached") === 0 ? (%s) : resp(true, {}); };
+c.start();
+flush().then(function () { console.log(JSON.stringify({vis: c.loginBtn.style.display, lo: c._loginOk})); });
+""" % attached_resp)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_visible_only_when_attached_and_login_ok(self):
+        r = self._poll('resp(true, {claude_attached: true, login_ok: true})')
+        self.assertEqual(r["vis"], "")
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_login_ok_alone_decides_even_if_claude_attached_false(self):
+        r = self._poll('resp(true, {claude_attached: false, login_ok: true})')
+        self.assertEqual(r["vis"], "")
+        self.assertTrue(r["lo"])
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_hidden_when_login_ok_false_missing_or_response_bad(self):
+        for expr in ('resp(true, {claude_attached: true, login_ok: false})',
+                     'resp(true, {claude_attached: true})',
+                     'resp(false, {}, 404)',
+                     'Promise.reject(new Error("net"))'):
+            r = self._poll(expr)
+            self.assertEqual(r["vis"], "none", expr)
+            self.assertFalse(r["lo"], expr)
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_rejected_fetch_clears_an_earlier_true(self):
+        r = self._run("""
+var c = mk(), n = 0;
+fetchImpl = function (url) {
+  if (url.indexOf("/api/term/attached") !== 0) return resp(true, {});
+  return ++n === 1 ? resp(true, {claude_attached: true, login_ok: true}) : Promise.reject(new Error("x"));
+};
+c.start();
+var first;
+flush().then(function () { first = c.loginBtn.style.display; c.start(); return flush(); })
+  .then(function () { console.log(JSON.stringify({first: first, vis: c.loginBtn.style.display})); });
+""")
+        self.assertEqual((r["first"], r["vis"]), ("", "none"))
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_login_ok_flip_with_attached_unchanged_updates_button(self):
+        r = self._run("""
+var c = mk(), lo = false;
+fetchImpl = function (url) {
+  return url.indexOf("/api/term/attached") === 0 ? resp(true, {claude_attached: true, login_ok: lo}) : resp(true, {});
+};
+var seq = [];
+c.start();
+flush().then(function () { seq.push(c.loginBtn.style.display); lo = true; c.start(); return flush(); })
+  .then(function () { seq.push(c.loginBtn.style.display); console.log(JSON.stringify(seq)); });
+""")
+        self.assertEqual(r, ["none", ""])
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_click_sends_exactly_one_inject_with_exact_body(self):
+        r = self._run("""
+var c = mk();
+fetchImpl = function () { return resp(true, {ok: true}); };
+c._login();
+flush().then(function () { console.log(JSON.stringify({posts: posts, toasts: toasts})); });
+""")
+        self.assertEqual(len(r["posts"]), 1)
+        self.assertEqual(r["posts"][0][0], "/api/term/inject")
+        body = r["posts"][0][1]
+        self.assertEqual((body["text"], body["submit"], body["clear_first"], body["require_claude"]),
+                         ("/login", True, True, True))
+        self.assertEqual(body.get("tty"), "t1")
+        self.assertEqual(r["toasts"], [])
+
+    @unittest.skipUnless(_HAS_NODE, "node not available")
+    def test_failed_inject_toasts_with_the_reason(self):
+        r = self._run("""
+var c = mk();
+fetchImpl = function () { return resp(false, {ok: false, error: "no claude here"}, 409); };
+c._login();
+flush().then(function () { console.log(JSON.stringify(toasts)); });
+""")
+        self.assertEqual(r, [["Couldn't start login", "no claude here"]])
+
+    def test_title_is_the_tip_and_button_follows_effort(self):
+        src = _read_src()
+        self.assertIn("var LOGIN_TIP = %s;" % json.dumps(_LOGIN_TIP), src)
+        self.assertIn("lbtn.title = LOGIN_TIP;", src)
+        self.assertLess(src.index("switchers.appendChild(effortWrap);"),
+                        src.index("switchers.appendChild(lbtn);"))
+        self.assertIn('lbtn.className = "vtmodelbtn vtloginbtn";', src)
+
+
 if __name__ == "__main__":
     unittest.main()

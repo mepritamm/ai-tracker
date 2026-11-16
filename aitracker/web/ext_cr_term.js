@@ -86,6 +86,7 @@
     notice: null,
     engineHandle: null,  // whatever _attachEngine() returned, or null while degraded
     attached: false,     // is a Claude CLI foreground on this pty right now
+    loginOk: false,      // server's login_ok (Anthropic launcher, not attach pane)
     model: null,
     modelLabel: null,    // server's meta.model_label — display string, prefer over `model`
     modelUpdate: null,   // server's meta.model_update — {id,label,current_label} | null
@@ -219,6 +220,7 @@
       '<div class="cr-term-status-right">' +
         '<button type="button" class="cr-term-pill cr-term-pill-model" data-action="model" hidden data-el="modelpill">model</button>' +
         '<button type="button" class="cr-term-pill cr-term-pill-effort" data-action="effort" hidden data-el="effortpill">effort</button>' +
+        '<button type="button" class="cr-term-pill cr-term-pill-login" data-action="login" hidden data-el="loginpill" title="Types /login into Claude Code. Use when Claude is idle at its prompt. Signs in for every Claude Code session on this machine — choosing a different login method signs out the existing claude.ai login.">/login</button>' +
         '<button type="button" class="cr-term-iconbtn" data-action="copy">' + ico('copy') + ' Copy</button>' +
         '<button type="button" class="cr-term-iconbtn cr-term-kill" data-action="kill">' + ico('stop') + ' Kill</button>' +
       '</div>';
@@ -271,6 +273,7 @@
       ctxreadout: status.querySelector('[data-el="ctxreadout"]'),
       modelPill: status.querySelector('[data-el="modelpill"]'),
       effortPill: status.querySelector('[data-el="effortpill"]'),
+      loginPill: status.querySelector('[data-el="loginpill"]'),
       copyBtn: status.querySelector('[data-action="copy"]'),
       killBtn: status.querySelector('[data-action="kill"]'),
       footnote: foot.querySelector('[data-el="footnote"]'),
@@ -305,6 +308,7 @@
       case "theme": _cycleTheme(); return;
       case "model": _openModelDialog(); return;
       case "effort": _openEffortDialog(); return;
+      case "login": _injectSlash("/login", "Couldn't start login"); return;
       case "copy": _copyPane(); return;
       case "kill": _killCurrent(); return;
       case "lineage": _openLineageDialog(); return;
@@ -434,6 +438,7 @@
     st.forked = false;
     st.notice = null;
     st.attached = false;
+    st.loginOk = false;
     st.model = null;
     st.modelLabel = null;
     st.modelUpdate = null;
@@ -993,9 +998,9 @@
         var reason = (res.j && (res.j.error || res.j.reason)) ||
           (res.status === 404 ? "that route isn't available in this build yet" :
            res.status === 400 ? "the terminal rejected that request" :
-           "the terminal didn't confirm the switch");
+           "the terminal didn't confirm it");
         showToast(failLabel + " — " + reason);
-      }).catch(function () { showToast("Couldn't reach the server — the switch wasn't sent"); });
+      }).catch(function () { showToast("Couldn't reach the server — the command wasn't sent"); });
   }
 
   // ===== ⧉ Copy — uses the mounted engine's real handle.copyBuffer() (see the seam comment above
@@ -1149,6 +1154,7 @@
     // (doc 05: "A slash command must never land on a bash prompt.") — never derived from `mode`.
     el.modelPill.hidden = !st.attached;
     el.effortPill.hidden = !st.attached;
+    el.loginPill.hidden = !st.loginOk;   // server-owned `login_ok`; render only
     // Hide "Open terminal here" / "Resume terminal here" once a terminal is actually attached
     if (el.primaryGroup) el.primaryGroup.hidden = st.attached;
     if (st.attached) {
@@ -1215,8 +1221,9 @@
           .then(function (jj) {
             if (gen !== pollGen) return;
             st.attached = !!(jj && jj.claude_attached);
+            st.loginOk = !!(jj && jj.login_ok);
             _syncStatusBar();
-          }).catch(function () { if (gen === pollGen) { st.attached = false; _syncStatusBar(); } });
+          }).catch(function () { if (gen === pollGen) { st.attached = false; st.loginOk = false; _syncStatusBar(); } });
       }
       _refreshRunningList();
     }

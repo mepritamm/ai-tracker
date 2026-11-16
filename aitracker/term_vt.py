@@ -2233,6 +2233,32 @@ def resolve_spawned(throttle=5.0, new_only=False):
         exclude = tuple(claimed)
 
 
+def _cmd_argv(cmd):
+    try:
+        return shlex.split(cmd or "")
+    except ValueError:
+        return (cmd or "").split()
+
+
+def _cmd_gateway(cmd, or_launcher):
+    """gateway.OPENROUTER when `cmd` is/starts with the OpenRouter launcher path (it may hold spaces,
+    so a prefix test, not shlex) or its argv[0] equals it; gateway.ANTHROPIC for a `claude` argv[0]; else ""."""
+    cmd = cmd or ""
+    if or_launcher and (cmd == or_launcher or cmd.startswith(or_launcher + " ")):
+        return gateway.OPENROUTER
+    argv = _cmd_argv(cmd)
+    a0 = argv[0] if argv else ""
+    if a0 and or_launcher and a0 == or_launcher:
+        return gateway.OPENROUTER
+    return gateway.ANTHROPIC if os.path.basename(a0) == "claude" else ""
+
+
+def _login_ok(cmd, or_launcher):
+    """Server policy for the in-terminal /login button: only a pty the app launched with the Anthropic
+    `claude` launcher, never a `claude attach` pane."""
+    return _cmd_gateway(cmd, or_launcher) == gateway.ANTHROPIC and _cmd_argv(cmd)[1:2] != ["attach"]
+
+
 def _term_title(p, or_launcher=""):
     """Tab title "<folder> - <Anthropic models|OpenRouter models> - <Claude Code|Auggie>". Read off
     `p.cmd`'s argv[0] (the shell when idle, the launcher once a job runs): the configured OpenRouter
@@ -2246,21 +2272,12 @@ def _term_title(p, or_launcher=""):
     spawns/injects `auggie`) -- kept so a future Auggie launch labels correctly.
     ponytail: label is derived from the lossy cmd string; upgrade = store the gateway on Pty at the cmd= sites."""
     folder = os.path.basename((p.cwd or "").rstrip(os.sep)) or p.cwd or ""
-    cmd = p.cmd or ""
-    if or_launcher and (cmd == or_launcher or cmd.startswith(or_launcher + " ")):
-        return " - ".join([folder, "OpenRouter models", "Claude Code"] if folder
-                          else ["OpenRouter models", "Claude Code"])    # path may hold spaces: shlex would cut it
-    try:
-        argv = shlex.split(p.cmd or "")
-    except ValueError:
-        argv = (p.cmd or "").split()
-    a0 = argv[0] if argv else ""
-    base = os.path.basename(a0)
-    if a0 and or_launcher and a0 == or_launcher:
+    gw = _cmd_gateway(p.cmd, or_launcher)
+    if gw == gateway.OPENROUTER:
         tail = ["OpenRouter models", "Claude Code"]
-    elif base == "claude":
+    elif gw == gateway.ANTHROPIC:
         tail = ["Anthropic models", "Claude Code"]
-    elif base == "auggie":
+    elif os.path.basename((_cmd_argv(p.cmd) or [""])[0]) == "auggie":
         tail = ["Auggie"]
     else:
         tail = ["Terminal"]
@@ -4463,7 +4480,10 @@ def _foreground_is_claude(fd):
 
 
 def attached(handler, parsed):
-    """GET /api/term/attached?tty=<id> -> {"claude_attached": bool}.
+    """GET /api/term/attached?tty=<id> -> {"claude_attached": bool, "login_ok": bool}.
+
+    `login_ok` is the server-computed gate for the /login button: true only when the terminal was
+    launched with the Anthropic `claude` launcher, and it implies `claude_attached`.
 
     The server-owned answer to "is a Claude CLI listening on this pty" -- see
     `_foreground_is_claude()` above for why `mode` alone can't answer this and why a failure here
@@ -4478,17 +4498,20 @@ def attached(handler, parsed):
     sid = _req_session(parsed=parsed)
     if sid is None:
         return handler._json({"error": "session required"}, 400)
+    orl = gateway.or_launcher()[0]      # fs I/O: before the lock
     with _LOCK:
         _reap()
         pt = PTYS.get(tid)
         if pt is not None and pt.folder and not pt.done:
             _refresh_fg(pt)         # this poll runs per open terminal: keep `fg` honest from it too
         owned = pt is None or _pty_owned(pt, sid)
+        lo = pt is not None and _login_ok(pt.cmd, orl)
     if pt is None or pt.done:
         return handler._json({"error": "no such terminal"}, 404)
     if not owned:
         return _mismatch(handler, tid)
-    handler._json({"claude_attached": _foreground_is_claude(pt.fd)})
+    fa = _foreground_is_claude(pt.fd)
+    handler._json({"claude_attached": fa, "login_ok": bool(fa and lo)})
 
 
 def screen_stream(handler, parsed):

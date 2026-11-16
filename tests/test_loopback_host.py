@@ -47,6 +47,22 @@ class TestOriginMatchesHost(unittest.TestCase):
             self.assertFalse(term_gate._origin_ok(_Handler(h)), h)
 
 
+class TestOriginMatchesTunnelHost(unittest.TestCase):
+    def test_default_ports(self):
+        from aitracker.util import origin_matches_host
+        t = "abc.trycloudflare.com"
+        ok = [("https://" + t, t), ("https://" + t, t + ":443"), ("https://" + t, "ABC.trycloudflare.com"),
+              ("https://ABC.trycloudflare.com", t + ":443"), ("http://" + t, t), ("http://" + t, t + ":80"),
+              ("https://" + t + ":443", t), ("http://" + t + ":80", t)]
+        bad = [("https://" + t, "other.trycloudflare.com"), ("https://" + t, t + ":8443"),
+               ("null", t), ("http://" + t, t + ":443"), ("https://" + t, t + ":80")]
+        for o, h in ok:
+            self.assertTrue(origin_matches_host(_H({"Origin": o, "Host": h})), (o, h))
+        for o, h in bad:
+            self.assertFalse(origin_matches_host(_H({"Origin": o, "Host": h})), (o, h))
+            self.assertFalse(term_gate._origin_ok(_Handler({"Origin": o, "Host": h})), (o, h))
+
+
 class TestGuardHost(unittest.TestCase):
     def setUp(self):
         self._s = (config.TERMINAL, config.AUTH, config.BIND_HOST)

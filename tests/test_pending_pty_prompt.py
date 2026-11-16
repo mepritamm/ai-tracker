@@ -43,13 +43,15 @@ class OpenPtyRoutePrompt(unittest.TestCase):
         term_vt.PTYS.clear()
         term_vt.PTYS.update(self._ptys0)
 
-    def _open(self, body):
+    def _open(self, body, or_launcher=None):
         pt = term_vt.Pty(tid="fo1", pid=42424, fd=99, cwd=self._tmpdir)
         pt.folder, pt.session, pt.mode, pt.shell_cmd, pt.startup_done = True, "", "cwd", "sh", True
         term_vt.PTYS["fo1"] = pt
         h = tft._FakeHandler()
         with mock.patch.object(term_gate, "session_cwd", return_value=self._tmpdir), \
-             mock.patch.object(term_vt.gateway, "launcher", return_value="claude"), \
+             mock.patch.object(term_vt.gateway, "launcher", return_value="claude") \
+             if or_launcher is None else mock.patch.object(term_vt.gateway, "or_launcher",
+                                                            return_value=(or_launcher, "")), \
              mock.patch.object(term_vt, "_fg_pgid", side_effect=lambda p: p.pid), \
              mock.patch.object(term_vt, "_inject_argv", return_value=(True, "")) as inj, \
              mock.patch.object(term_vt, "_start_backstop", return_value=False), \
@@ -67,6 +69,32 @@ class OpenPtyRoutePrompt(unittest.TestCase):
         (obj, code), inj = self._open({"session": "", "mode": "new", "cwd": self._tmpdir})
         self.assertEqual(code, 200, obj)
         self.assertEqual(inj.call_args[0][1], ["claude"])
+
+    def test_login_prompt_pin_anthropic_launcher(self):
+        # Declared pin of current behaviour (not red-first): "/login" passes validation and is appended.
+        for gw in ("anthropic", None):
+            body = {"session": "", "mode": "new", "cwd": self._tmpdir, "prompt": "/login"}
+            if gw:
+                body["gateway"] = gw
+            (obj, code), inj = self._open(body)
+            self.assertEqual(code, 200, obj)
+            argv = inj.call_args[0][1]
+            self.assertEqual(argv, ["claude", "/login"])
+            self.assertEqual(shlex.join(argv), "claude /login")
+
+    def test_login_prompt_anthropic_override_beats_openrouter_default(self):
+        # No launcher mock: the real gateway.launcher decides. An OpenRouter default must not win.
+        body = {"session": "", "mode": "new", "cwd": self._tmpdir, "gateway": "anthropic", "prompt": "/login"}
+        with mock.patch.object(config, "GATEWAY", "openrouter"):
+            (obj, code), inj = self._open(body, or_launcher="/opt/or/claude-or")
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(inj.call_args[0][1], ["claude", "/login"])
+
+    def test_login_prompt_pin_openrouter_launcher(self):
+        body = {"session": "", "mode": "new", "cwd": self._tmpdir, "gateway": "openrouter", "prompt": "/login"}
+        (obj, code), inj = self._open(body, or_launcher="/opt/or/claude-or")
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(inj.call_args[0][1], ["/opt/or/claude-or", "/login"])
 
 
 class InjectArgvQuoting(unittest.TestCase):

@@ -1,7 +1,7 @@
 """Which gateway a Claude Code session runs through: plain `claude` (Anthropic) or the configured
 OpenRouter launcher (a wrapper that exports OpenRouter env vars and execs `claude`), and how the
 CLI's opus/sonnet/haiku slots map there. Both OpenRouter settings are empty until the user sets them."""
-import os, shlex, shutil
+import json, os, re, shlex, shutil, signal, subprocess, threading, time
 
 from . import config
 from .util import real_model
@@ -87,3 +87,91 @@ def model_meta(model_id):
     slot = hit[0] if len(hit) == 1 else None      # several slots share the model -> ambiguous, don't claim
     return {"gateway": gw, "model_ladder": LADDERS[OPENROUTER], "model_hints": hints, "model_slot": slot,
             "openrouter_configured": openrouter_configured()}
+
+
+AUTH_TTL, AUTH_FRESH_FLOOR, AUTH_STATUS_TIMEOUT, AUTH_LOCK_EXTRA = 60, 5, 15, 10     # seconds
+_AUTH_CACHE = {"at": 0.0, "val": None}
+_AUTH_LOCK = threading.Lock()
+_AUTH_LABELS = {"claude.ai": "Claude subscription", "oauth_token": "CLAUDE_CODE_OAUTH_TOKEN",
+                "api_key": "API key", "api_key_helper": "apiKeyHelper script",
+                "third_party": "cloud provider", "none": "not logged in"}
+
+
+def _auth_result(available=True, logged_in=False, method="", sub="", label="", error=""):
+    return {"available": available, "logged_in": logged_in, "auth_method": method, "subscription": sub,
+            "label": label, "error": error}
+
+
+def _auth_run(exe):
+    """Run `claude auth status --json` -> parsed dict or None. Own session (no tty); on timeout the whole
+    process group is killed. A failed spawn (OSError) or any bad output -> None, never an exception."""
+    kw = {} if os.name == "nt" else {"start_new_session": True}
+    try:
+        p = subprocess.Popen([exe, "auth", "status", "--json"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             cwd=os.path.expanduser("~"), **kw)
+    except OSError:
+        return False
+    try:
+        out, _err = p.communicate(timeout=AUTH_STATUS_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except (OSError, AttributeError):
+            try:
+                p.kill()
+            except OSError:
+                pass
+        try:
+            p.communicate(timeout=5)
+        except Exception:
+            pass
+        return None
+    except Exception:
+        return None
+    try:
+        d = json.loads(out)
+    except (TypeError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def claude_auth_status(fresh=False):
+    """-> {"available","logged_in","auth_method","subscription","label","error"}, built FRESH from three
+    keys of `claude auth status --json` (loggedIn/authMethod/subscriptionType) -- never spreads the CLI's
+    dict, so email/org/ids and any key it adds later can't leak. Cached AUTH_TTL s; `fresh` re-runs only
+    when the cache is >= AUTH_FRESH_FLOOR s old. One run at a time; a stuck run can't block a later
+    caller past the lock timeout. Logs nothing."""
+    if not _AUTH_LOCK.acquire(timeout=AUTH_STATUS_TIMEOUT + AUTH_LOCK_EXTRA):
+        return _auth_result(error="claude auth status is busy — try again")
+    try:
+        age = time.monotonic() - _AUTH_CACHE["at"]
+        if _AUTH_CACHE["val"] is not None and (age < AUTH_FRESH_FLOOR or (not fresh and age < AUTH_TTL)):
+            return _AUTH_CACHE["val"]
+        exe = shutil.which("claude")
+        if not exe:
+            res = _auth_result(available=False, error="claude not found on the server's PATH")
+        elif exe == or_launcher()[0]:
+            res = _auth_result(available=False, error="claude on PATH is the OpenRouter launcher")
+        else:
+            d = _auth_run(exe)
+            if d is False:
+                res = _auth_result(available=False, error="claude couldn't be started")
+            elif d is None:
+                res = _auth_result(error="couldn't read claude auth status")
+            else:
+                m, st = d.get("authMethod"), d.get("subscriptionType")
+                m = m if isinstance(m, str) and re.fullmatch(r"[A-Za-z0-9_.]{1,24}", m) else ""
+                st = st if isinstance(st, str) and re.fullmatch(r"[a-z0-9_]{1,24}", st) else ""
+                if d.get("loggedIn") is True:
+                    if m == "claude.ai":
+                        label = "Logged in · Claude " + (st.replace("_", " ").title() + " " if st else "") + "subscription"
+                    else:
+                        label = "Logged in · " + _AUTH_LABELS.get(m, "another credential")
+                    res = _auth_result(logged_in=True, method=m if m in _AUTH_LABELS else "", sub=st, label=label)
+                else:
+                    res = _auth_result(method=m if m in _AUTH_LABELS else "", label="Not logged in")
+        _AUTH_CACHE.update(at=time.monotonic(), val=res)
+        return res
+    finally:
+        _AUTH_LOCK.release()

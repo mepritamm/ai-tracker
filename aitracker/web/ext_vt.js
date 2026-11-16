@@ -2188,6 +2188,9 @@
     return { current: c.current, limit: limit, pct: pct };
   }
 
+  // Tooltip for the in-terminal /login button (and the Control Room pill): the shared warning.
+  var LOGIN_TIP = "Types /login into Claude Code. Use when Claude is idle at its prompt. Signs in for every Claude Code session on this machine \u2014 choosing a different login method signs out the existing claude.ai login.";
+
   // ===== ContextBar: one instance per open terminal (modal or standalone), destroyed with it. ==
   function ContextBar(container, sid, ttyId, mode, getInput) {
     this.sid = sid; this.ttyId = ttyId; this.getInput = getInput;
@@ -2203,6 +2206,7 @@
     // first poll answers (see start()/_setAttached() below) — conventions rule 5: the server owns
     // this policy, this file only renders it.
     this.attached = false;
+    this._loginOk = false;   // server-computed `login_ok` from /api/term/attached; rendered only
     this.modelDropdownOpen = false;
     this.effortDropdownOpen = false;
     this.currentModel = null;
@@ -2290,6 +2294,19 @@
     effortWrap.appendChild(edd);
     switchers.appendChild(effortWrap);
     this.effortBtn = ebtn; this.effortDd = edd;
+
+    // ---- /login button: shown only while the server says login_ok (see _syncLoginBtn). Same
+    // focus-safe mousedown as the pickers; a plain click types "/login" into the CLI. ----
+    var lbtn = document.createElement("button");
+    lbtn.type = "button";
+    lbtn.className = "vtmodelbtn vtloginbtn";
+    lbtn.textContent = "/login";
+    lbtn.title = LOGIN_TIP;
+    lbtn.style.display = "none";
+    lbtn.addEventListener("mousedown", function (ev) { ev.preventDefault(); });
+    lbtn.addEventListener("click", function (ev) { ev.stopPropagation(); self._login(); });
+    switchers.appendChild(lbtn);
+    this.loginBtn = lbtn;
 
     // Both switcher buttons carry a chevron icon built at construction time (_textThenIcon calls
     // above) and otherwise only get rebuilt when session data actually changes (_applySessionData
@@ -2463,6 +2480,25 @@
     });
   };
 
+  // "/login" via the inject route -- a copy of _pickEffort's contract (require_claude refuses a
+  // plain shell). The dashboard only types the command; it never answers any Claude prompt.
+  ContextBar.prototype._login = function () {
+    this._focusTerminal();
+    fetch("/api/term/inject", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(ttyBody(this.ttyId, { text: "/login", submit: true, clear_first: true, require_claude: true }))
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
+    }).then(function (res) {
+      if (res.ok && res.j && res.j.ok === true) return;
+      var reason = (res.j && (res.j.error || res.j.reason)) ||
+        (res.status === 400 ? "the terminal rejected that request" : "the terminal didn't confirm the login");
+      if (typeof toast === "function") toast("Couldn't start login", reason);
+    }).catch(function () {
+      if (typeof toast === "function") toast("Couldn't reach the server", "the login wasn't sent");
+    });
+  };
+
   ContextBar.prototype._applySessionData = function (d) {
     var meta = (d && d.meta) || {};
     // OpenRouter: the server owns the slot (model_slot); never re-derive one from a vendor/model id.
@@ -2552,6 +2588,12 @@
   // Whole-bar visibility: shown when there's EITHER a live switcher OR usage data to show,
   // hidden (not just left empty) when there's neither — the same "no empty chrome" rule
   // _renderReadout always followed, now covering the switcher's own dynamic state too.
+  // Rendered from the server's `login_ok` only. Separate from _setAttached, which early-returns
+  // when `attached` is unchanged, so a login_ok flip alone must still reach the button.
+  ContextBar.prototype._syncLoginBtn = function () {
+    if (this.loginBtn) this.loginBtn.style.display = this._loginOk ? "" : "none";
+  };
+
   ContextBar.prototype._syncBarVisibility = function () {
     if (this.el) this.el.style.display = (this.attached || this._hasUsage) ? "" : "none";
   };
@@ -2572,8 +2614,13 @@
       // now listening on this pty instead.
       fetch("/api/term/attached?" + ttyQuery(self.ttyId))
         .then(function (r) { return r.ok ? r.json() : { claude_attached: false }; })
-        .then(function (j) { if (!self._destroyed) self._setAttached(!!(j && j.claude_attached)); })
-        .catch(function () { if (!self._destroyed) self._setAttached(false); });
+        .then(function (j) {
+          if (self._destroyed) return;
+          self._setAttached(!!(j && j.claude_attached));
+          self._loginOk = !!(j && j.login_ok);
+          self._syncLoginBtn();
+        })
+        .catch(function () { if (!self._destroyed) { self._setAttached(false); self._loginOk = false; self._syncLoginBtn(); } });
     }
     tick();
     var timer = setInterval(tick, 2000);   // mirrors app.js's own 2s poll cadence

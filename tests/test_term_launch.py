@@ -718,8 +718,8 @@ class TestDirectoryPicker(unittest.TestCase):
         self.assertIn("aren't available on this server yet", self.src)
 
     def test_free_text_is_trimmed(self):
-        self.assertIn("function pickDirectory(raw, mode, prompt)", self.src)
-        fn_start = self.src.index("function pickDirectory(raw, mode, prompt)")
+        self.assertIn("function pickDirectory(raw, mode, prompt, opts)", self.src)
+        fn_start = self.src.index("function pickDirectory(raw, mode, prompt, opts)")
         fn_body = self.src[fn_start:fn_start + 400]
         self.assertIn(".trim()", fn_body)
 

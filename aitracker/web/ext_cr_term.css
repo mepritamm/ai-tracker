@@ -362,7 +362,8 @@
 /* model-update-nudge: the "↑ <label> available" state — a warmer tint on the otherwise-frozen
    white pill so the marker reads as an attention cue, not decoration. */
 .cr .cr-term-pill-model.has-update { background: var(--surface-awaiting, #FDF0E4); color: var(--text-awaiting, #9A4F19); }
-.cr .cr-term-pill-effort {
+.cr .cr-term-pill-effort,
+.cr .cr-term-pill-login {
   background: transparent;
   border: 1px solid #6F6455;
   color: #D8CFC2;

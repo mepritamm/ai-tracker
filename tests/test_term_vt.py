@@ -1732,7 +1732,7 @@ class TestRoutes(unittest.TestCase):
             term_vt._foreground_is_claude = lambda fd: True
             h = _FakeHandler()
             term_vt.attached(h, _Q("session=&tty=p1"))
-            self.assertEqual(h.calls[-1], ({"claude_attached": True}, 200))
+            self.assertEqual(h.calls[-1], ({"claude_attached": True, "login_ok": False}, 200))
         finally:
             term_vt._foreground_is_claude = old
 
@@ -1743,7 +1743,7 @@ class TestRoutes(unittest.TestCase):
             term_vt._foreground_is_claude = lambda fd: False
             h = _FakeHandler()
             term_vt.attached(h, _Q("session=&tty=p1"))
-            self.assertEqual(h.calls[-1], ({"claude_attached": False}, 200))
+            self.assertEqual(h.calls[-1], ({"claude_attached": False, "login_ok": False}, 200))
         finally:
             term_vt._foreground_is_claude = old
 
@@ -1755,7 +1755,7 @@ class TestRoutes(unittest.TestCase):
         term_vt.PTYS["p1"] = term_vt.Pty(tid="p1", pid=0, fd=-1)
         h = _FakeHandler()
         term_vt.attached(h, _Q("session=&tty=p1"))
-        self.assertEqual(h.calls[-1], ({"claude_attached": False}, 200))
+        self.assertEqual(h.calls[-1], ({"claude_attached": False, "login_ok": False}, 200))
 
     def test_attached_is_behind_the_same_gate_as_every_other_term_route(self):
         """A refused gate must short-circuit BEFORE the tty is looked up at all."""
