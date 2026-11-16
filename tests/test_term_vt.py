@@ -1387,7 +1387,7 @@ class TestRoutes(unittest.TestCase):
         self.assertEqual(len(obj["terminals"]), 1)
         row = obj["terminals"][0]
         self.assertEqual(set(row.keys()),
-                         {"tty", "cmd", "cwd", "started", "session", "mode", "suffix", "forked",
+                         {"tty", "cmd", "cwd", "shell_cwd", "started", "session", "mode", "suffix", "forked",
                           "folder", "overflow", "fg", "title", "idle_s", "viewers", "last_hold"})
         self.assertEqual(row["last_hold"], "")
         self.assertEqual(row["viewers"], 0)
@@ -6411,7 +6411,10 @@ class TestIdleSessionLive(unittest.TestCase):
         self._go(0.001)
         time.sleep(max(0, t0 + 3 - time.time()))
         self.assertFalse(pt.done, "reaped inside LIVE_WINDOW")
-        self.assertTrue(_wait_for(lambda: pt.done, max(0, t0 + 9 - time.time())),
+        # Generous upper bound: the reaper ticks once a second and the full gate runs ~100
+        # modules in parallel, so 4 s of slack past the 5 s window flaked under load. The
+        # property under test is the LOWER bound above (never reaped inside the window).
+        self.assertTrue(_wait_for(lambda: pt.done, max(0, t0 + 20 - time.time())),
                         "still held long after LIVE_WINDOW")
 
     def test_U8b_window_uses_ttl_when_larger(self):

@@ -354,7 +354,7 @@ class TestFgClaimPendingUntilTyped(unittest.TestCase):
         polled = threading.Event()      # the poller has run its job -> prompt timeline
         real_inject_argv = term_vt._inject_argv
 
-        def _inject_argv_after_the_poll(pt, argv):
+        def _inject_argv_after_the_poll(pt, argv, **_kw):
             in_window.set()
             polled.wait(3)
             return real_inject_argv(pt, argv)
@@ -1090,7 +1090,7 @@ class TestAttachedPtyForeground(unittest.TestCase):
         pt.folder = True
         seen = {}
 
-        def _inj(p, argv):
+        def _inj(p, argv, **_kw):
             seen["fg"] = dict(p.fg)
             return True, ""
         with mock.patch.object(term_vt, "_folder_wait_prompt", return_value=True), \

@@ -2948,13 +2948,6 @@
     // global doesn't exist); if the session can't be found yet, the clause below is simply
     // skipped -- the server dedupes on its own end regardless, this is only the client's shortcut
     // to a peek instead of a round-trip spawn-then-reuse.
-    var targetCwd = null;
-    if (mode === "cwd") {
-      var slist = (typeof sessions !== "undefined" && sessions) || [];
-      for (var si = 0; si < slist.length; si++) {
-        if (slist[si] && slist[si].id === sid) { targetCwd = slist[si].cwd || null; break; }
-      }
-    }
     fetch("/api/term/list")
       .then(function (r) { return r.ok ? r.json().catch(function () { return {}; }) : {}; })
       // The catch sits HERE, on the FETCH alone, not on the end of the chain: a route that is off
@@ -2969,7 +2962,6 @@
         for (var i = 0; i < terms.length; i++) {
           var t = terms[i];
           if (t.session === sid && t.mode === mode) { peekTerm(t); return; }
-          if (mode === "cwd" && targetCwd && t.folder && t.cwd === targetCwd) { peekTerm(t); return; }
           if (mode === "resume" && t.fg && t.fg.session === sid) { peekTerm(t); return; }
         }
         _openVTFresh(sid, mode, mount, gen);
@@ -3878,13 +3870,6 @@
       // Same folder-dedupe extension as openVT's own copy (see that function's comment for the
       // full reasoning) -- kept as its own inline lookup for the identical reason the whole scan
       // below is self-contained rather than shared.
-      var targetCwd = null;
-      if (mode === "cwd") {
-        var slist = (typeof sessions !== "undefined" && sessions) || [];
-        for (var si = 0; si < slist.length; si++) {
-          if (slist[si] && slist[si].id === sid) { targetCwd = slist[si].cwd || null; break; }
-        }
-      }
       // Self-contained find-existing check -- see this function's own header comment for why it's
       // not shared with openVT's identical decision. Same fetch/catch/scan shape as that one.
       fetch("/api/term/list")
@@ -3895,7 +3880,6 @@
           for (var i = 0; i < terms.length; i++) {
             var t = terms[i];
             if (t.session === sid && t.mode === mode) return t;
-            if (mode === "cwd" && targetCwd && t.folder && t.cwd === targetCwd) return t;
             if (mode === "resume" && t.fg && t.fg.session === sid) {
               bindTty(t.tty, sid);   // the user picked THIS session: what runs here is theirs now, whoever opened the pane
               return t;

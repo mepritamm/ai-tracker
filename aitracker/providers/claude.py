@@ -86,7 +86,31 @@ _META_CACHE = {}
 _PR_SCAN_BUDGET_SECS = 0.05
 
 
+_TAIL_MEMO = {}              # (realpath, mtime_ns, size, nbytes) -> _tail_scan_raw result; bounded
+_TAIL_MEMO_LOCK = threading.Lock()
+_TAIL_MEMO_MAX = 256
+
+
 def _tail_scan(path, nbytes=96000):
+    """Memoized `_tail_scan_raw`: an UNCHANGED transcript (same realpath, mtime_ns, size) is never
+    reopened -- placement/`parse_any` call this on every poll. A stat is the only I/O on a hit."""
+    try:
+        st = os.stat(path)
+        key = (os.path.realpath(path), st.st_mtime_ns, st.st_size, nbytes)
+    except OSError:
+        return _tail_scan_raw(path, nbytes)
+    with _TAIL_MEMO_LOCK:
+        hit = _TAIL_MEMO.get(key)
+    if hit is None:
+        hit = _tail_scan_raw(path, nbytes)
+        with _TAIL_MEMO_LOCK:
+            if len(_TAIL_MEMO) >= _TAIL_MEMO_MAX:
+                _TAIL_MEMO.pop(next(iter(_TAIL_MEMO)))
+            _TAIL_MEMO[key] = hit
+    return dict(hit)
+
+
+def _tail_scan_raw(path, nbytes=96000):
     """aiTitle/customTitle/entrypoint live on metadata lines written as the
     session evolves — read the tail to get the current values cheaply. The same
     pass yields the session's end-state for the sidebar: `waiting` (an

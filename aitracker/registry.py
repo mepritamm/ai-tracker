@@ -296,6 +296,13 @@ def parse_any(sid):
     meta = d.get("meta")
     if isinstance(meta, dict):
         meta["model_label"] = model_label(meta.get("model"))
+        raw, _br = term_home(sid, meta)          # `meta=` so the tail-less fallback never re-enters parse_any
+        try:
+            from . import term_gate
+            meta["term_home"] = term_gate.terminal_dir(raw or meta.get("cwd") or "")[1] or ""
+            meta["term_home_note"] = term_gate.home_note(sid, meta.get("cwd") or "", meta)
+        except Exception:
+            meta["term_home"], meta["term_home_note"] = "", ""
         meta["model_update"] = None
         meta.update(model_meta(meta.get("model")))   # gateway/model_ladder/model_hints/model_slot
         if p is not None and p.prefix == "":   # Claude sessions only (the unprefixed provider)

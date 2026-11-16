@@ -75,6 +75,15 @@ def main():
                 '        return ("", "")                    # bundle: no terminal tier')
             assert new != body, "claude.py term_home text changed upstream; update bundle.py"
             body = new
+        if rel == "registry.py":
+            # Same reason: parse_any's terminal-home note needs term_gate (not bundled).
+            new = re.sub(
+                r'        try:\n            from \. import term_gate\n.*?'
+                r'        except Exception:\n            meta\["term_home"\], meta\["term_home_note"\] = "", ""\n',
+                '        meta["term_home"], meta["term_home_note"] = "", ""   # bundle: no terminal tier\n',
+                body, count=1, flags=re.S)
+            assert new != body, "registry.py term_home text changed upstream; update bundle.py"
+            body = new
         if rel == "server.py":
             body = body.replace("build_page()", "PAGE")           # inline page
             # The terminal-tier loader below relies on `__import__("%s.%s" % (__package__, _m))`

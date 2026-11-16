@@ -88,6 +88,28 @@ class TestSessionCwdFastPath(_Base):
         self.assertEqual((raw, br), (self.tmp, ""))
 
 
+class TestTailMemo(_Base):
+    def test_unchanged_not_reopened_changed_reread(self):
+        root, top = self.fake_worktree("w")
+        rows = [{"type": "user", "cwd": top, "message": {"role": "user", "content": "a"}}]
+        path = self.transcript("sidm", rows)
+        term_gate.recorded_run_dir("sidm")
+        real_open = open
+        opened = []
+
+        def spy(f, *a, **k):
+            if str(f) == path:
+                opened.append(f)
+            return real_open(f, *a, **k)
+        with mock.patch("builtins.open", spy):
+            self.assertEqual(term_gate.recorded_run_dir("sidm")[0], top)
+            self.assertEqual(opened, [], "unchanged transcript was reopened")
+            with real_open(path, "a") as fh:
+                fh.write(json.dumps({"type": "user", "cwd": root, "message": {"role": "user", "content": "bb"}}) + "\n")
+            term_gate.recorded_run_dir("sidm")
+            self.assertTrue(opened, "appended transcript must be re-read")
+
+
 class TestRunDirPreference(_Base):
     def test_wt_preferred_over_later_root_cwd(self):
         root, top = self.fake_worktree("w")

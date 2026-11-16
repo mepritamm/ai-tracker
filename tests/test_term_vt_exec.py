@@ -4223,12 +4223,13 @@ main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1)
     # `claude --resume` in its foreground -- see openVT's own comment on why.
 
     @unittest.skipUnless(_HAS_NODE, "node not available")
-    def test_folder_shell_at_the_same_cwd_is_peeked_for_a_cwd_open(self):
+    def test_cwd_open_posts_instead_of_peeking_a_same_cwd_folder_shell(self):
         """Scenario: no terminal matches {session, mode} directly, but a LIVE folder shell is
         already open at this session's own working directory (resolved via the `sessions` global,
-        the same way buildTermRow resolves a session's title). Reverting the
-        `t.folder && t.cwd === targetCwd` clause in openVT makes this go red: `ptyCalls` flips from
-        `[]` to a fresh spawn and `windowOpenCalls` drops to `[]`."""
+        the same way buildTermRow resolves a session's title). The client NO LONGER peeks on a cwd
+        match (plan v4.2 row 4): the folder shell is the repo ROOT shared by many worktree sessions,
+        and the server answers `reused: true`. Restoring the `t.folder && t.cwd === targetCwd`
+        clause makes this go red: `windowOpenCalls` becomes 1 and `ptyCalls` stays empty."""
         script = self._script("""
 var sessions = [{ id: "sess1", cwd: "/Users/x/proj" }];
 async function main() {
@@ -4237,16 +4238,17 @@ async function main() {
   ] }];
   openVT("sess1", "cwd");
   await __flush();
+  flushRAF();
+  await __flush();
   console.log(JSON.stringify({ windowOpenCalls: __windowOpenCalls, ptyCalls: __ptyCalls }));
 }
 main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
 """)
         result = _run_node(script)
-        self.assertEqual(len(result["windowOpenCalls"]), 1,
-                          "a live folder shell at this session's own cwd must be peeked")
-        self.assertIn("tty-folder", result["windowOpenCalls"][0])
-        self.assertEqual(result["ptyCalls"], [],
-                          "no new pty may be spawned when the folder shell is reused")
+        self.assertEqual(result["windowOpenCalls"], [],
+                          "a same-cwd folder shell must not be peeked client-side")
+        self.assertEqual(len(result["ptyCalls"]), 1,
+                          "the open POSTs and lets the server answer reused")
 
     @unittest.skipUnless(_HAS_NODE, "node not available")
     def test_folder_shell_at_a_different_cwd_is_not_reused(self):
@@ -4550,7 +4552,7 @@ class TestMountIntoFolderDedupe(unittest.TestCase):
         return "'use strict';\n" + _MOUNTINTO_MOCKS + _MOUNTINTO_SRC + body
 
     @unittest.skipUnless(_HAS_NODE, "node not available")
-    def test_folder_row_at_the_same_cwd_is_attached_for_a_cwd_mount(self):
+    def test_folder_row_at_the_same_cwd_is_not_attached_client_side_for_a_cwd_mount(self):
         """Reverting the `mode === "cwd" && targetCwd && t.folder && t.cwd === targetCwd` clause in
         mountInto's copy of the scan (this test's ONLY difference from the sibling below) makes this
         go red: `finish` never runs against the existing tty, and a POST /api/term/pty happens
@@ -4564,6 +4566,8 @@ async function main() {
   var container = __makeEl("div");
   var handle = mountInto(container, { session: "sess1", mode: "cwd" }, { renderer: "grid" });
   await __flush();
+  flushRAF();
+  await __flush();
   console.log(JSON.stringify({
     handleTty: handle.tty,
     terminalCtorCalls: __terminalCtorCalls,
@@ -4573,11 +4577,10 @@ async function main() {
 main().catch(function (e) { console.error(e.stack || String(e)); process.exit(1); });
 """)
         result = _run_node(script)
-        self.assertEqual(result["handleTty"], "tty-folder",
-                          "a live folder shell at this session's own cwd must be attached")
-        self.assertEqual(result["terminalCtorCalls"], [{"renderer": "grid", "tty": "tty-folder"}])
-        self.assertEqual(result["ptyCalls"], [],
-                          "no new pty may be spawned when the folder shell is reused")
+        self.assertNotEqual(result["handleTty"], "tty-folder",
+                             "a same-cwd folder shell must not be attached client-side")
+        self.assertEqual(len(result["ptyCalls"]), 1,
+                          "the mount POSTs and lets the server answer reused")
 
     @unittest.skipUnless(_HAS_NODE, "node not available")
     def test_folder_row_running_this_sessions_resume_is_attached(self):

@@ -1491,6 +1491,10 @@ class Pty:
                                     # up). While False, an open claims the shell and DEFERS (waits
                                     # it out) instead of the sync type / busy->overflow. Default True
                                     # so every reused/fixture shell keeps the old path. Under _LOCK.
+        self.run_dirs = {}         # folder ptys only: {sid: worktree top the session RUNS in} (`""`
+                                    # keys a `new` claim). Written under `_LOCK`, NEVER cleared by
+                                    # `_refresh_fg` -- the fork/attach retypes happen after `fg` is gone.
+                                    # Server-side only: never on the wire (see `_fg_public`).
         self.shell_cmd = ""        # folder ptys only: the login shell's own argv string, so `cmd`
                                     # (which follows the running job while one is typed in) can be
                                     # put back when the prompt returns.
@@ -2013,7 +2017,21 @@ def _folder_wait_prompt(pt, wait=None):
     return False
 
 
-def _inject_argv(pt, argv, deferred=False):
+def _run_dir(p, sid=None):
+    """Where a folder shell's session RUNS (the worktree top) while the shell itself sits at the
+    repo root. With an explicit `sid`: its recorded run dir, else the shell's cwd. With none: the
+    CURRENT claim's (`p.fg["session"]`) -- only while a claim exists, else `p.cwd`, so a stale
+    `run_dirs[""]` from an earlier `new` never labels an idle root shell (review C3). Plain dict
+    reads: callable with or without `_LOCK`."""
+    if sid is None:
+        fg = p.fg
+        if fg is None:
+            return p.cwd
+        sid = fg.get("session") or ""
+    return p.run_dirs.get(sid) or p.cwd
+
+
+def _inject_argv(pt, argv, deferred=False, sid=None):
     """Type `argv` at a folder shell's prompt and press Enter -- the folder counterpart of
     `_fork_child`: where a dedicated pty execs argv directly, the folder shell runs it as a
     foreground job. Built from `inject()`'s own primitives (`_wait_for_quiescence`,
@@ -2049,7 +2067,19 @@ def _inject_argv(pt, argv, deferred=False):
             if pt.done or time.time() >= deadline:
                 return False, "folder shell never returned to its prompt"
             time.sleep(INJECT_POLL_INTERVAL)
-        if not _inject_write(pt, _bracket_if_needed(shlex.join(argv))):
+        with _LOCK:
+            rd = _run_dir(pt, sid)
+        line = shlex.join(argv)
+        if rd and os.path.realpath(rd) != os.path.realpath(pt.cwd):
+            # The shell sits at the repo root; the session runs in its worktree. Shell-agnostic
+            # (zsh/bash/fish) and argv[0] is exactly what gateway.launcher returned -- never
+            # shutil.which (the server's PATH can pick a different `claude`, review C1).
+            line = "sh -c 'cd \"$0\" && exec \"$@\"' " + shlex.join([rd] + list(argv))
+        if "\n" in line or "\r" in line:
+            return False, "unsafe path"
+        # Never bracketed: macOS /bin/bash 3.2 does not understand bracketed paste and a long
+        # worktree line would arrive mangled (row 2). `inject()` keeps its own bracketing.
+        if not _inject_write(pt, line.encode()):
             return False, "write failed"
         time.sleep(INJECT_KEY_GAP)
         if not _inject_write(pt, b"\r"):
@@ -2173,6 +2203,8 @@ def resolve_spawned(throttle=5.0, new_only=False):
             if p.forked:
                 forked_cwds.add(p.cwd)   # see the docstring: this directory may hold a fork
                                           # transcript whose id nobody can attribute
+                forked_cwds.add(_run_dir(p))
+                forked_cwds.update(d for d in p.run_dirs.values() if d)   # worktree tops it ran in
             fg = p.fg if p.folder else None
             if fg is not None and fg.get("session"):
                 claimed.add(fg["session"])
@@ -2181,12 +2213,12 @@ def resolve_spawned(throttle=5.0, new_only=False):
             fg_new = fg is not None and fg.get("mode") == "new" and not fg.get("session")
             latch = (p.mode == "new") if new_only else (p.mode in ("cwd", "new"))
             if (((latch and not p.spawned) or fg_new)
-                    and p.cwd not in forked_cwds and now - p.spawn_probe >= throttle):
+                    and _run_dir(p) not in forked_cwds and now - p.spawn_probe >= throttle):
                 cands.append((p, fg["started"] if fg_new else p.started))
         # A forked pty later in the iteration cannot un-select a candidate already appended above
         # (PTYS is a dict, so the order is arbitrary), so the filter is applied once more here,
         # against the COMPLETE set -- still inside the same critical section, still no I/O.
-        cands = [(p, after) for p, after in cands if p.cwd not in forked_cwds]
+        cands = [(p, after) for p, after in cands if _run_dir(p) not in forked_cwds]
         for p, _ in cands:
             p.spawn_probe = now     # reserve, under the lock, before any I/O below
     # ---- _LOCK IS RELEASED FROM HERE DOWN: filesystem work only, until the claim block below
@@ -2204,8 +2236,9 @@ def resolve_spawned(throttle=5.0, new_only=False):
         return
     exclude = tuple(claimed)
     for p, after in cands:
+        rdir = _run_dir(p)      # the worktree for a folder shell's claim, else its cwd
         try:
-            sid = _claude.newest_session_in_cwd(p.cwd, after, exclude=exclude)
+            sid = _claude.newest_session_in_cwd(rdir, after, exclude=exclude)
         except Exception:
             sid = ""
         if not sid:
@@ -2219,7 +2252,8 @@ def resolve_spawned(throttle=5.0, new_only=False):
         # that does the store -- which is what makes the claim atomic rather than check-then-act.
         with _LOCK:
             taken = any(
-                (q.session == sid or q.spawned == sid) or (q.forked and q.cwd == p.cwd)
+                (q.session == sid or q.spawned == sid)
+                or (q.forked and _run_dir(p) in (q.cwd, _run_dir(q), *q.run_dirs.values()))
                 for q in PTYS.values() if not q.done)
             if not taken:
                 if not p.spawned:
@@ -2271,7 +2305,8 @@ def _term_title(p, or_launcher=""):
     deferred claim is injected; (d) the Auggie branch is unreachable from terminals today (nothing
     spawns/injects `auggie`) -- kept so a future Auggie launch labels correctly.
     ponytail: label is derived from the lossy cmd string; upgrade = store the gateway on Pty at the cmd= sites."""
-    folder = os.path.basename((p.cwd or "").rstrip(os.sep)) or p.cwd or ""
+    rd = _run_dir(p)   # where claude runs (the worktree), not the shared shell's folder
+    folder = os.path.basename((rd or "").rstrip(os.sep)) or rd or ""
     gw = _cmd_gateway(p.cmd, or_launcher)
     if gw == gateway.OPENROUTER:
         tail = ["OpenRouter models", "Claude Code"]
@@ -2316,7 +2351,7 @@ def _live_list(orl=None):
     `last_hold` expose the idle clock (seconds idle, attached viewers, what the reap last deferred on)."""
     orl = gateway.or_launcher()[0] if orl is None else orl   # fallback for callers not under _LOCK
     now = time.time()
-    return [{"tty": p.id, "cmd": p.cmd, "cwd": p.cwd, "started": p.started,
+    return [{"tty": p.id, "cmd": p.cmd, "cwd": _run_dir(p), "shell_cwd": p.cwd, "started": p.started,
              "session": p.spawned or p.session, "mode": p.mode,
              "suffix": _MODE_SUFFIX.get(p.mode, ""), "forked": p.forked,
              "title": _term_title(p, orl),
@@ -2541,7 +2576,7 @@ def _folder_retype(pt, sid, argv, forked=False):
             pt.add_notice("[ai-tracker] note: the retry for session %s was abandoned -- this "
                           "folder terminal is now running %s" % (sid, what))
         return False
-    ok, why = _inject_argv(pt, argv)
+    ok, why = _inject_argv(pt, argv, sid=sid)
     if not ok:
         print("[ai-tracker] terminal %s: could not type the retry into the folder shell (%s)"
               % (pt.id, why))
@@ -2612,7 +2647,7 @@ def _retry_with_fork(pt, sid, cols, rows):
         with _LOCK:
             pt.forked = True
         try:
-            store.record_fork(sid, pt.cwd, time.time(), fork_snapshot)
+            store.record_fork(sid, _run_dir(pt, sid), time.time(), fork_snapshot)
         except Exception as exc:
             print("[ai-tracker] terminal %s: record_fork failed for session %s: %r" % (pt.id, sid, exc))
         _feed_note(pt, "[ai-tracker] note: the resume was refused as a running background agent; "
@@ -2669,7 +2704,7 @@ def _retry_with_fork(pt, sid, cols, rows):
     # handed along here; record_fork never re-derives it. A failure to record must never turn a
     # successful fork retry -- the user-visible recovery -- into a crash, so it's swallowed.
     try:
-        store.record_fork(sid, pt.cwd, time.time(), fork_snapshot)
+        store.record_fork(sid, _run_dir(pt, sid), time.time(), fork_snapshot)
     except Exception as exc:
         print("[ai-tracker] terminal %s: record_fork failed for session %s: %r" % (pt.id, sid, exc))
     _feed_note(pt, "[ai-tracker] note: the resume was refused as a running background agent; "
@@ -3214,8 +3249,17 @@ def open_pty(handler, parsed, body):
         # with a one-arg lambda; unconditionally passing resume=False would break those too).
         cwd = (term_gate.session_cwd(sid, resume=True) or term_gate.session_cwd(req_sid, resume=True)
                if mode == "resume" else term_gate.session_cwd(sid))
-        if not cwd:
+        # Placement BEFORE the 404, in all three modes (row 6): a worktree session's shell is the
+        # repo root and the session runs in the worktree top; a removed worktree answers 409.
+        pl = term_gate.place(sid, cwd, mode)
+        if pl.get("error"):
+            body409 = {"error": pl["error"]}
+            if pl.get("recreate"):
+                body409["recreate"] = pl["recreate"]
+            return handler._json(body409, 409)
+        if not pl.get("shell"):
             return handler._json({"error": "session not found or its cwd no longer exists"}, 404)
+        cwd, run_dir = pl["shell"], pl.get("run")
     else:
         # Session-less form: the caller supplies a directory directly (the sidebar picker).
         if mode == "resume":
@@ -3226,6 +3270,7 @@ def open_pty(handler, parsed, body):
         cwd = os.path.expanduser(raw_cwd.strip())
         if not os.path.isdir(cwd):
             return handler._json({"error": "cwd does not exist or is not a directory"}, 400)
+        run_dir = cwd
     cols = _clamp_int(body.get("cols"), MIN_COLS, MAX_COLS, DEFAULT_COLS)
     rows = _clamp_int(body.get("rows"), MIN_ROWS, MAX_ROWS, DEFAULT_ROWS)
     forked = False
@@ -3357,6 +3402,8 @@ def open_pty(handler, parsed, body):
             # mistake the shell's own startup job for this claim's.
             fp.fg = {"session": sid if mode == "resume" else "", "mode": mode,
                      "started": time.time(), "grants": {sid}}   # the claimant: see _pty_owned
+            if run_dir:      # the worktree top; kept per session, NEVER cleared with `fg`
+                fp.run_dirs[sid if mode == "resume" else ""] = run_dir
             fp.fg_seen_child = False
             fp.fg_pending = True
         elif mode == "resume" and fg is not None and fg.get("session") == sid:
@@ -3403,7 +3450,7 @@ def open_pty(handler, parsed, body):
             # refusal flash, exactly as a dedicated resume pane would.
             with fp.lock:
                 fp.starting = True
-        ok, why = _inject_argv(fp, argv)
+        ok, why = _inject_argv(fp, argv, sid=sid if mode == "resume" else "")
         if ok:
             if starting:
                 starting = _start_backstop(fp, sid, forked, cols, rows)
@@ -3423,7 +3470,7 @@ def open_pty(handler, parsed, body):
     # ---- an unwatched pane showing ANOTHER background session's daemon client is taken over
     if mode == "resume" and busy_what and bg:
         cand = _swap_candidate(fp, sid, cwd)
-        reply = cand and _swap_in(fp, cand, sid, argv, forked, cols, rows)
+        reply = cand and _swap_in(fp, cand, sid, argv, forked, cols, rows, run_dir=run_dir)
         if reply:
             return handler._json(reply)
     # ---- overflow: the pre-folder behaviour, verbatim, plus the `overflow` flag
@@ -3433,7 +3480,7 @@ def open_pty(handler, parsed, body):
             return handler._json({"error": "too many running terminals (max %d)" % config.MAX_TERMS,
                                   "terminals": _live_list(orl)}, 429)
     try:
-        pt = spawn(cwd, argv, cols, rows)
+        pt = spawn(run_dir or cwd, argv, cols, rows)    # a dedicated pty runs IN the worktree
     except OSError as e:
         return handler._json({"error": "spawn failed: %s" % e}, 500)
     pt.session = sid
@@ -3709,7 +3756,7 @@ def call_route(fn, body):
     return h.reply
 
 
-def _swap_in(fp, cand, sid, argv, forked, cols, rows):
+def _swap_in(fp, cand, sid, argv, forked, cols, rows, run_dir=None):
     """Take `fp` over for `sid`: claim, SIGTERM the displaced client, type `argv` at the prompt it
     leaves. -> the open_pty response dict, or None (nothing typed; the caller opens a dedicated pty)."""
     old, pg, kind = cand["fg"], cand["pg"], cand["kind"]
@@ -3719,6 +3766,8 @@ def _swap_in(fp, cand, sid, argv, forked, cols, rows):
         # The claim names the target at once, so a concurrent open of it peeks instead of racing us,
         # and `fg_pending` stops the list poll's _refresh_fg from latching the dying client.
         fp.fg = {"session": sid, "mode": "resume", "started": time.time(), "grants": {sid}}
+        if run_dir:
+            fp.run_dirs[sid] = run_dir
         fp.fg_seen_child = False
         fp.fg_pending = True
         fp.touch()                  # the idle reap must not take the shell mid-swap
@@ -3747,7 +3796,7 @@ def _swap_in(fp, cand, sid, argv, forked, cols, rows):
         with fp.lock:
             fp.screen.feed(_TERM_MODE_RESET)
             _tee_raw(fp, _TERM_MODE_RESET)
-    ok, _why = _inject_argv(fp, argv)
+    ok, _why = _inject_argv(fp, argv, sid=sid)
     if not ok:
         release(False)
         return None
@@ -3922,7 +3971,7 @@ def _deferred_folder_start(fp, argv, sid, mode, forked, cols, rows):
     try:
         while _folder_settled(fp, deadline, slow):
             slow = None                       # one progress note per start, not one per settle
-            ok, why = _inject_argv(fp, argv, deferred=True)
+            ok, why = _inject_argv(fp, argv, deferred=True, sid=sid if mode == "resume" else "")
             if ok or why == "write failed":   # never retype after a (partial) write
                 break
             # not ready after all: claim still pending (deferred=True), settle again -- never a second pty.

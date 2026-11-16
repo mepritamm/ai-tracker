@@ -74,7 +74,7 @@ def _is_claude(sid):
     return True
 
 
-def build_script(cwd: str, sid: str, mode: str, app: str, resume_argv=None) -> str:
+def build_script(cwd: str, sid: str, mode: str, app: str, resume_argv=None, run_dir=None) -> str:
     """Return the AppleScript source that opens a tab and runs the command.
 
     Pure function -- no side effects -- so the test can assert the exact string. `cwd` comes
@@ -109,13 +109,17 @@ def build_script(cwd: str, sid: str, mode: str, app: str, resume_argv=None) -> s
     Terminal/iTerm tab is opaque to this server once launched, so that case is left to the CLI's
     own already-observed behaviour (silently starts a fresh conversation; see
     docs/claude-resume-command-matrix.md) with no warning surfaced here.
+
+    `run_dir` (a worktree session): the tab opens at `cwd` (the repo root) and the resume chain runs
+    in a `sh -c 'cd "$0" && ...' <run_dir>` subshell, so Claude runs in the worktree and the tab is
+    left at the root. Every path is shlex-quoted first, then AppleScript-escaped.
     """
-    inner = "cd %s" % shlex.quote(cwd)
+    inner = "" if run_dir else "cd %s" % shlex.quote(cwd)
     if mode == "resume":
         argv = resume_argv or ["claude", "--resume", sid]
         primary = " ".join(shlex.quote(a) for a in argv)
         if "--fork-session" in argv:
-            inner += " && " + primary
+            inner += (" && " if inner else "") + primary
         else:
             # Build fallback chain: (<resume> || [<attach>] || <resume> --fork-session)
             # attach returns the REAL session (resumes in place); fork-session only ever makes a copy.
@@ -136,7 +140,10 @@ def build_script(cwd: str, sid: str, mode: str, app: str, resume_argv=None) -> s
 
             # Join all fallbacks with || and wrap in parens
             chain = " || ".join(fallback_parts)
-            inner += " && (%s)" % chain
+            inner += (" && " if inner else "") + "(%s)" % chain
+        if run_dir:
+            inner = "cd %s && sh -c %s %s" % (shlex.quote(cwd),
+                                              shlex.quote('cd "$0" && ' + inner), shlex.quote(run_dir))
     escaped = inner.replace("\\", "\\\\").replace('"', '\\"')
     if app == "iTerm":
         return (
@@ -193,9 +200,20 @@ def open_terminal(handler, parsed, body) -> None:
         sid = _background_target(sid) or sid
     cwd = (term_gate.session_cwd(sid, resume=True) or term_gate.session_cwd(req_sid, resume=True)
            if mode == "resume" else term_gate.session_cwd(sid))
-    if not cwd:
+    # Placement BEFORE the 404, all modes (row 6): a worktree session's tab opens at the repo root.
+    pl = term_gate.place(sid, cwd, mode)
+    if pl.get("error"):
+        body409 = {"error": pl["error"]}
+        if pl.get("recreate"):
+            body409["recreate"] = pl["recreate"]
+        handler._json(body409, 409)
+        return
+    if not pl.get("shell"):
         handler._json({"error": "session not found or its cwd no longer exists"}, 404)
         return
+    cwd, run_dir = pl["shell"], pl.get("run")
+    if run_dir == cwd:
+        run_dir = None
     app = os.environ.get("TRACKER_TERM_APP", "Terminal")
     if app not in TERM_APPS:
         app = "Terminal"
@@ -207,7 +225,7 @@ def open_terminal(handler, parsed, body) -> None:
     except gateway.GatewayError as e:     # nothing is launched
         handler._json({"error": str(e), "openrouter_configured": False}, 400)
         return
-    script = build_script(cwd, sid, mode, app, resume_argv)
+    script = build_script(cwd, sid, mode, app, resume_argv, run_dir=run_dir)
     try:
         subprocess.run(["osascript", "-e", script], check=True, timeout=10,
                         capture_output=True)
