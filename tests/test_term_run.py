@@ -663,9 +663,10 @@ class TestProcessGroupKill(unittest.TestCase):
             os.environ["TRACKER_TERM_ALLOW"] = "python3"
             job = term_run.spawn(td, term_run.parse_cmd("python3 " + script))
             end = time.time() + 10
-            while not os.path.exists(pidfile) and time.time() < end:
+            # non-empty, not just present: open() creates the file before write() fills it
+            while not (os.path.exists(pidfile) and os.path.getsize(pidfile)) and time.time() < end:
                 time.sleep(0.05)
-            self.assertTrue(os.path.exists(pidfile), "grandchild never started")
+            self.assertTrue(os.path.exists(pidfile) and os.path.getsize(pidfile), "grandchild never started")
             with open(pidfile) as f:
                 gpid = int(f.read())
             try:
