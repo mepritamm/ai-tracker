@@ -3294,6 +3294,7 @@ def open_pty(handler, parsed, body):
     cols = _clamp_int(body.get("cols"), MIN_COLS, MAX_COLS, DEFAULT_COLS)
     rows = _clamp_int(body.get("rows"), MIN_ROWS, MAX_ROWS, DEFAULT_ROWS)
     forked = False
+    login_sid = ""      # set only for a Log in / Switch account open (mode=new, Anthropic, prompt "/login")
     if mode == "resume":
         try:   # [launcher, "--resume", sid] -- no proactive fork; see term_gate.resume_argv's docstring
             argv = term_gate.resume_argv(sid)
@@ -3303,11 +3304,18 @@ def open_pty(handler, parsed, body):
         forked = "--fork-session" in argv
     elif mode == "new":
         gw = body.get("gateway")   # optional per-open override of config.GATEWAY; other values ignored
+        gw_eff = gw if gw in (gateway.ANTHROPIC, gateway.OPENROUTER) else config.GATEWAY
         try:
-            argv = [gateway.launcher(gw if gw in (gateway.ANTHROPIC, gateway.OPENROUTER) else config.GATEWAY)]
+            argv = [gateway.launcher(gw_eff)]
         except gateway.GatewayError as e:
             return handler._json({"error": str(e), "openrouter_configured": False}, 400)
-        argv = _with_prompt(argv, body.get("prompt"))
+        lp = body.get("prompt")
+        if gw_eff == gateway.ANTHROPIC and isinstance(lp, str) and lp.strip() == LOGIN_PROMPT:
+            # A login open: a dedicated pty on a session id the server chose, so its transcript is known.
+            login_sid = str(uuid.uuid4())
+            argv = [argv[0], "--session-id", login_sid, LOGIN_PROMPT]
+        else:
+            argv = _with_prompt(argv, lp)
     else:
         argv = None                          # "cwd" IS the folder shell; nothing to type into it
     shell_argv = [os.environ.get("SHELL", "/bin/bash"), "-l"]
@@ -3339,7 +3347,7 @@ def open_pty(handler, parsed, body):
                                           "attached": True, "folder": hit.folder})
             fp = _folder_pty(cwd)
             reused = fp is not None
-            if mode != "cwd" and (fp is None or not fp.startup_done):
+            if mode != "cwd" and (login_sid or fp is None or not fp.startup_done):
                 # S3: a cold or still-warming root shell never makes an opener wait. Reserve the
                 # slot(s) HERE, under the lock that counts them, then fork outside it.
                 free = config.MAX_TERMS - _live_count() - _SLOTS_RESERVED
@@ -3377,7 +3385,8 @@ def open_pty(handler, parsed, body):
         # Dedicated claude at its worktree NOW; the root shell warms beside it only when two slots
         # reserved (`reserved` is set then). Nobody waits on the shell.
         try:
-            reply = _spawn_dedicated(run_dir or cwd, argv, mode, sid, forked, cols, rows, held=True)
+            reply = _spawn_dedicated(run_dir or cwd, argv, mode, sid, forked, cols, rows, held=True,
+                                     login_sid=login_sid)
         finally:
             if reserved is not None:
                 _warm_root(cwd, shell_argv, cols, rows, reserved)
@@ -3504,7 +3513,7 @@ def open_pty(handler, parsed, body):
     handler._json(*_spawn_dedicated(run_dir or cwd, argv, mode, sid, forked, cols, rows))
 
 
-def _spawn_dedicated(spawn_cwd, argv, mode, sid, forked, cols, rows, held=False):
+def _spawn_dedicated(spawn_cwd, argv, mode, sid, forked, cols, rows, held=False, login_sid=""):
     """Spawn a dedicated overflow pty running `argv` in `spawn_cwd` and register it. Returns the
     `(body, status)` for `_json`. `held`: the caller reserved one slot in `_SLOTS_RESERVED`; it is
     given back once the pty is in PTYS or the spawn failed (never under `_LOCK` while forking)."""
@@ -3517,6 +3526,8 @@ def _spawn_dedicated(spawn_cwd, argv, mode, sid, forked, cols, rows, held=False)
         pt.mode = mode
         pt.forked = forked
         pt.overflow = True
+        if login_sid:
+            pt.spawned = login_sid      # the session this terminal CREATED, known up front
         starting = mode == "resume"
         if starting:
             # Set BEFORE the backstop thread starts (and thus before any viewer can possibly learn
@@ -3531,6 +3542,12 @@ def _spawn_dedicated(spawn_cwd, argv, mode, sid, forked, cols, rows, held=False)
     finally:
         if held:
             _slots_release()
+    if login_sid:
+        try:
+            threading.Thread(target=_login_watch, args=(pt, login_sid), name="login-watch-%s" % pt.id,
+                             daemon=True).start()
+        except RuntimeError:
+            pass        # no watcher: login still works and nothing is removed
     if mode == "resume":
         starting = _start_backstop(pt, sid, forked, cols, rows)
     # `renderer` is server-owned policy handed to the client, never asked of it (conventions rule
@@ -3589,6 +3606,55 @@ VIEWER_GRACE = 0.5          # grid streams poll _peer_gone every 0.05s, raw ones
 _TERM_MODE_RESET = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?25h"
 """What a killed `claude attach` client leaves on: alt screen, mouse (1000/1002/1003 + SGR), focus
 reporting, a hidden cursor. Fed to the Screen and the raw viewers before the next line is typed."""
+
+
+LOGIN_PROMPT = "/login"
+LOGIN_POLL = 2.0
+LOGIN_SETTLE = 3.0
+LOGIN_WATCH_MAX = 1800.0
+LOGIN_DONE_NOTE = "Login complete \u2014 closing this terminal and removing its /login session."
+
+
+def _login_watch(pt, sid):
+    """Own thread per login open (`open_pty`'s `/login` case). Once the transcript `sid` records
+    `Login successful`, stop this terminal's claude and, after it exited, delete that one
+    /login-only transcript. A transcript that only recorded an interrupted /login is deleted too,
+    but only once the terminal is done (the user closed it); a real prompt or a timeout keeps it."""
+    try:
+        prov = _provider()
+        if prov is None:
+            return                                   # flattened bundle: never deletes
+        deadline = time.time() + LOGIN_WATCH_MAX
+        while not (pt.done or pt.closing):
+            if time.time() >= deadline:
+                return
+            st = prov.login_transcript_state(sid)
+            if st == "other":
+                return
+            if st == "ok":
+                _feed_note(pt, LOGIN_DONE_NOTE)
+                time.sleep(LOGIN_SETTLE)             # F4: a prompt typed meanwhile turns it "other"
+                if pt.done or pt.closing:
+                    break
+                if prov.login_transcript_state(sid) != "ok":
+                    return
+                r = stop_for_upgrade(pt.id, sid, pt.pid) or {}
+                if not (r.get("confirmed") or r.get("closed")):
+                    return                           # never delete under a live process
+                break
+            time.sleep(LOGIN_POLL)
+        end = time.time() + CLOSE_CONFIRM_WAIT
+        while not pt.done and time.time() < end:
+            time.sleep(CLOSE_CONFIRM_POLL)
+        if pt.done and prov.remove_login_transcript(sid):    # re-reads; refuses unless ok/interrupted
+            with _LOCK:                                      # F5: plain stores, no I/O
+                for q in PTYS.values():
+                    if q is not pt and q.spawned == sid:
+                        q.spawned = ""
+                    if q is not pt and q.folder and q.fg and q.fg.get("session") == sid:
+                        q.fg["session"] = ""
+    except Exception:
+        pass
 
 
 def _provider():

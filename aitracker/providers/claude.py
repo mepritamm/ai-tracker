@@ -78,6 +78,14 @@ def find_session(sid):
     return hits[0] if hits else None
 
 
+def _mtime0(f):
+    """getmtime that survives a file deleted between a glob and its use (0.0 = oldest)."""
+    try:
+        return os.path.getmtime(f)
+    except OSError:
+        return 0.0
+
+
 _META_CACHE = {}
 
 # Wall-clock budget for _fill_pr() calls in one list_sessions() poll — see the call site.
@@ -992,7 +1000,7 @@ def job_index(live):
 
 def list_sessions(limit=200):
     fs = glob.glob(os.path.join(config.PROJECTS, "*", "*.jsonl"))
-    fs.sort(key=os.path.getmtime, reverse=True)
+    fs.sort(key=_mtime0, reverse=True)
     titles = load_titles()
     blocked = _blocked_jobs()
     jobs = job_index(_live_daemon_shorts())
@@ -1204,7 +1212,7 @@ def search_sessions(q, limit=500):
     terms = ql.split()                       # keyword search: every word must be present
     titles = load_titles()
     fs = glob.glob(os.path.join(config.PROJECTS, "*", "*.jsonl"))
-    fs.sort(key=os.path.getmtime, reverse=True)
+    fs.sort(key=_mtime0, reverse=True)
     out = []
     for f in fs[:limit]:
         try:
@@ -1242,7 +1250,7 @@ def search_sessions(q, limit=500):
             "snippet": snippet,
             "inQuery": in_query,
             "titleMatch": title_match,
-            "mtime": os.path.getmtime(f),
+            "mtime": _mtime0(f),
         })
     # rank: title matches first, then hits in the user's own prompt, then the rest
     # (stable sort preserves the newest-first order within each group)
@@ -1272,6 +1280,82 @@ def _slash_prompt(s):
     a = _CMD_ARGS_RE.search(s)
     args = a.group(1).strip() if a else ""
     return (name + (" " + args if args else "")).strip()
+
+
+LOGIN_MAX_BYTES = 262144
+_LOGIN_OK_TYPES = frozenset({"last-prompt", "mode", "permission-mode", "session-owner", "tools-used",
+                             "file-history-snapshot", "custom-title", "agent-name", "cost-state", "atis-latch"})
+
+
+def login_transcript_state(sid):
+    """What a transcript holds, for the /login cleanup: "ok" (only /login-command records and at
+    least one `Login successful`), "interrupted" (same, `/login` stdout seen but never a success),
+    "pending" (missing, truncated last line, or no /login stdout yet) or "other" (anything else:
+    a real prompt, an assistant/system record, a sidechain, a non-hook attachment). Never raises."""
+    try:
+        path = find_session(sid)
+        if not path:
+            return "pending"
+        if os.path.getsize(path) > LOGIN_MAX_BYTES:
+            return "other"
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = [l for l in fh.read().split("\n") if l.strip()]
+        ok = out = saw_cmd = False
+        for i, line in enumerate(lines):
+            try:
+                d = json.loads(line)
+            except ValueError:
+                return "pending" if i == len(lines) - 1 else "other"
+            if not isinstance(d, dict) or d.get("isSidechain"):
+                return "other"
+            t = d.get("type")
+            if t == "attachment" or (t is None and "attachment" in d):
+                a = d.get("attachment")
+                if isinstance(a, dict) and str(a.get("type", "")).startswith("hook_"):
+                    continue
+                return "other"
+            if t in _LOGIN_OK_TYPES:
+                continue
+            if t != "user":
+                return "other"
+            c = (d.get("message") or {}).get("content")
+            if isinstance(c, list):
+                if any(not isinstance(x, dict) or x.get("type") != "text" for x in c):
+                    return "other"
+                c = "".join(x.get("text", "") for x in c)
+            if not isinstance(c, str):
+                return "other"
+            if d.get("isMeta") and c.startswith("<local-command-caveat>"):
+                continue
+            if _slash_prompt(c) == "/login":
+                saw_cmd = True
+            elif c.startswith("<local-command-stdout>") and saw_cmd:
+                out = True
+                ok = ok or "Login successful" in c
+            else:
+                return "other"
+        return "ok" if ok else ("interrupted" if out else "pending")
+    except Exception:
+        return "other"
+
+
+def remove_login_transcript(sid):
+    """Delete exactly `<PROJECTS>/<dir>/<sid>.jsonl` when it is a /login-only transcript
+    (state ok or interrupted). Never raises; True only when the file was unlinked."""
+    try:
+        path = find_session(sid)
+        if not path or os.path.basename(path) != sid + ".jsonl":
+            return False
+        root = os.path.realpath(config.PROJECTS)
+        if not os.path.realpath(path).startswith(root + os.sep):
+            return False
+        if login_transcript_state(sid) not in ("ok", "interrupted"):
+            return False
+        os.unlink(path)
+        _META_CACHE.pop(path, None)
+        return True
+    except Exception:
+        return False
 
 
 def _active_mtime(path):

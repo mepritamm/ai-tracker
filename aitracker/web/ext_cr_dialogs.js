@@ -463,7 +463,7 @@
     // didn't opt in — see update()'s own comment for why this lives at the seam.
     var entry = { name: name, wrap: wrap, panel: built.panel, opener: opener, untrap: untrap, update: built.update, wantsPoll: !!built.wantsPoll,
       sid: (payload && payload.sessionId) || '',   // '' = session-less (flags, help, config...)
-      wantsSession: !!built.wantsSession, onEscape: built.onEscape };
+      wantsSession: !!built.wantsSession, onEscape: built.onEscape, onClose: built.onClose };
     _stack.push(entry);
     // Focus the first focusable control, else the panel itself.
     var f = built.panel.querySelector(FOCUSABLE);
@@ -478,6 +478,7 @@
     if (!entry) return;
     entry.untrap();
     entry.wrap.remove();
+    if (typeof entry.onClose === 'function') { try { entry.onClose(); } catch (e) {} }
     if (!_stack.length) _layer.setAttribute('aria-hidden', 'true');
     if (entry.opener && typeof entry.opener.focus === 'function') {
       try { entry.opener.focus({ preventScroll: true }); } catch (e) {}
@@ -1622,7 +1623,7 @@
       wrap.appendChild(h('div', { class: 'cr-cfg-row-label' }, [
         h('div', { class: 'cr-cfg-row-name' }, ['Claude Code login (/login)']),
         h('div', { class: 'cr-cfg-row-sub cr-claude-login-status' }, [status]),
-        h('div', { class: 'cr-cfg-row-sub cr-claude-login-warn' }, ['Signs in for every Claude Code session on this machine — choosing a different login method signs out the existing claude.ai login. Opens Claude Code’s own /login in a new terminal tab.']),
+        h('div', { class: 'cr-cfg-row-sub cr-claude-login-warn' }, ['Signs in for every Claude Code session on this machine — choosing a different login method signs out the existing claude.ai login. Opens Claude Code’s own /login in a terminal window over this page.']),
       ]));
       var ctl = h('div', { class: 'cr-cfg-row-control' });
       var b = crBtn(loginSt && loginSt.logged_in ? 'Switch account' : 'Log in', login);
@@ -1630,20 +1631,30 @@
       ctl.appendChild(b);
       wrap.appendChild(ctl);
     }
-    function load(fresh) {
+    function load(fresh, announce) {
       crCall('/api/claude/auth' + (fresh ? '?fresh=1' : '')).then(function (r) {
         denied = r.status === 403;
         if (r.ok) { loginSt = r.body; msg = ''; } else if (!denied) msg = (r.body && r.body.error) || 'request failed';
         paint();
+        if (announce && r.ok && r.body && r.body.logged_in) toast({ title: 'Logged in', meta: r.body.label || '' });
       });
     }
     function login() {
       var L = window.ExtLaunch;
       if (!L || typeof L.openAt !== 'function') { msg = 'Log in failed: terminals are unavailable in this build'; paint(); return; }
       busy = true; msg = ''; paint();
-      var pr;
-      try { pr = L.openAt('~', 'new', '/login', { gateway: 'anthropic' }); } catch (e) { pr = { ok: false, error: String(e) }; }
+      var pr, inline = !!(window.ExtVT && typeof window.ExtVT.mountInto === 'function');
+      try { pr = L.openAt('~', 'new', '/login', inline ? { gateway: 'anthropic', tab: false } : { gateway: 'anthropic' }); } catch (e) { pr = { ok: false, error: String(e) }; }
       Promise.resolve(pr).then(function (x) {
+        if (x && x.ok && inline && x.tty) {
+          try {
+            open('claude-login', { tty: x.tty, renderer: x.renderer, onDone: function (ended) { busy = false; load(true, ended); } });
+          } catch (e) {
+            crCall('/api/term/close', 'POST', window.ExtVT.ttyBody(x.tty, {}, ''));
+            busy = false; msg = 'Log in failed: ' + e; paint();
+          }
+          return;
+        }
         busy = false;
         msg = x && x.ok === false ? 'Log in failed: ' + (x.error || 'unknown error') : '';
         paint();
@@ -1657,6 +1668,57 @@
     if (typeof window.addEventListener === 'function') window.addEventListener('focus', onFocus);
     paint(); load(false);
     return wrap;
+  }
+
+  // Claude login modal: the /login pty (opened by claudeLoginBlock) mounted inline over Config.
+  // Polls the existing GET /api/term/attached: 404 = the pty is gone (the server stops claude and
+  // removes it when login completes) -> close. Esc closes the modal even while the terminal has focus (capture-phase listener below).
+  function renderClaudeLogin(payload) {
+    var tty = payload.tty;
+    var chrome = buildChrome('claude-login', 'Claude Code login', 'gear', '~', true);
+    chrome.panel.classList.add('cr-dialog-login');
+    // Capture phase: runs before the terminal's own keydown handler, which would send Esc to claude.
+    chrome.panel.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape' || e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
+      e.preventDefault(); e.stopPropagation();
+      var t = topEntry(); if (t && t.panel === chrome.panel) close();
+    }, true);
+    var statusEl = h('div', { class: 'cr-claude-login-status' }, ['Complete the login in the terminal below. Closing this window ends this terminal.']);
+    var connEl = h('div', { class: 'cr-claude-login-conn' });
+    var termEl = h('div', { class: 'cr-login-term' });
+    chrome.body.appendChild(statusEl); chrome.body.appendChild(connEl); chrome.body.appendChild(termEl);
+    var handle = null, polling = true, gone = false, timer = null, blips = 0;
+    function inTerm() { var a = document.activeElement; return !!(a && typeof termEl.contains === 'function' && termEl.contains(a)); }
+    function stopPoll() { polling = false; clearTimeout(timer); timer = null; }
+    function teardown() { stopPoll(); if (handle) { handle.destroy(); handle = null; } }
+    function focusTerm(n) { if (!handle || inTerm()) return; handle.focus(); if (n > 0) setTimeout(function () { focusTerm(n - 1); }, 100); }
+    handle = window.ExtVT.mountInto(termEl, { tty: tty }, { renderer: payload.renderer });
+    handle.onStatus(function (s) { connEl.textContent = (s === 'connected' || s === 'connecting…') ? '' : s; });
+    handle.onNotice(function (n) { if (n && n.text) statusEl.textContent = n.text; });
+    handle.onForked(function () { focusTerm(30); });
+    function poll() {
+      if (!polling) return;
+      crCall('/api/term/attached?' + window.ExtVT.ttyQuery(tty)).then(function (r) {
+        if (!polling) return;
+        if (r.status === 404) {
+          gone = true; teardown();
+          var t = topEntry();
+          if (t && t.panel === chrome.panel) close();
+          else statusEl.textContent = 'This login terminal has ended. Close this window.';
+          return;
+        }
+        if (r.ok) { blips = 0; timer = setTimeout(poll, 2000); return; }
+        if (r.status === 0 && ++blips < 5) { timer = setTimeout(poll, 2000); return; }   // transient blip, capped
+        stopPoll(); connEl.textContent = (r.body && r.body.error) || ('login status unavailable (' + r.status + ')');
+      });
+    }
+    timer = setTimeout(poll, 2000);
+    function onClose() {
+      var wasGone = gone; teardown();
+      if (!wasGone) crCall('/api/term/close', 'POST', window.ExtVT.ttyBody(tty, {}, ''));
+      if (payload.onDone) payload.onDone(wasGone);
+    }
+    return { backdrop: chrome.backdrop, panel: chrome.panel, onClose: onClose };
   }
 
   function renderConfig(payload) {
@@ -3434,6 +3496,7 @@
 
   var REGISTRY = {
     help: renderHelp,
+    'claude-login': renderClaudeLogin,
     config: renderConfig,
     flags: renderFlagsList,
     'manage-terminals': renderManageTerminals,

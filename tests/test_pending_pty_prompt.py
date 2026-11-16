@@ -1,7 +1,9 @@
 import shlex
 import subprocess
 import tempfile
+import threading
 import unittest
+import uuid
 from unittest import mock
 
 from aitracker import config, term_gate, term_vt
@@ -36,6 +38,8 @@ class OpenPtyRoutePrompt(unittest.TestCase):
         term_vt.PTYS.clear()
         self._tmpdir = tempfile.mkdtemp()
         tft._stub_kill(self)
+        self.spawned = []
+        self._watched = threading.Event()
         self.addCleanup(self._restore)
 
     def _restore(self):
@@ -55,9 +59,33 @@ class OpenPtyRoutePrompt(unittest.TestCase):
              mock.patch.object(term_vt, "_fg_pgid", side_effect=lambda p: p.pid), \
              mock.patch.object(term_vt, "_inject_argv", return_value=(True, "")) as inj, \
              mock.patch.object(term_vt, "_start_backstop", return_value=False), \
-             mock.patch.object(term_vt, "resolve_spawned"):
+             mock.patch.object(term_vt, "resolve_spawned"), \
+             mock.patch.object(term_vt, "spawn", side_effect=self._fake_spawn), \
+             mock.patch.object(term_vt, "_warm_root"), \
+             mock.patch.object(term_vt, "_login_watch",
+                               side_effect=lambda pt, sid: self._watched.set()) as self.watch:
             term_vt.open_pty(h, None, dict(body, cols=80, rows=24))
         return h.calls[-1], inj
+
+    def _fake_spawn(self, cwd, argv, cols, rows):
+        # No real claude is ever forked: a login open (dedicated pty) lands here.
+        self.spawned.append(list(argv))
+        return term_vt.Pty(tid="dd1", pid=42425, fd=98, cwd=self._tmpdir)
+
+    def _assert_dedicated_login(self, obj):
+        self.assertEqual(len(self.spawned), 1)
+        argv = self.spawned[0]
+        self.assertEqual(argv[1], "--session-id")
+        self.assertEqual(argv[3], "/login")
+        self.assertEqual(uuid.UUID(argv[2]).version, 4)
+        self.assertFalse(obj["folder"])
+        pt = term_vt.PTYS["dd1"]
+        self.assertTrue(pt.overflow)
+        self.assertEqual(pt.spawned, argv[2])
+        self.assertTrue(self._watched.wait(2))
+        self.watch.assert_called_once()
+        self.assertEqual(self.watch.call_args[0], (pt, argv[2]))
+        return argv
 
     def test_new_mode_prompt_reaches_the_injected_argv(self):
         (obj, code), inj = self._open({"session": "", "mode": "new", "cwd": self._tmpdir, "prompt": "do it"})
@@ -71,16 +99,18 @@ class OpenPtyRoutePrompt(unittest.TestCase):
         self.assertEqual(inj.call_args[0][1], ["claude"])
 
     def test_login_prompt_pin_anthropic_launcher(self):
-        # Declared pin of current behaviour (not red-first): "/login" passes validation and is appended.
+        # A login open is a dedicated pty on a server-chosen session id; nothing is typed into the folder shell.
         for gw in ("anthropic", None):
+            self.spawned.clear()
             body = {"session": "", "mode": "new", "cwd": self._tmpdir, "prompt": "/login"}
             if gw:
                 body["gateway"] = gw
             (obj, code), inj = self._open(body)
             self.assertEqual(code, 200, obj)
-            argv = inj.call_args[0][1]
-            self.assertEqual(argv, ["claude", "/login"])
-            self.assertEqual(shlex.join(argv), "claude /login")
+            inj.assert_not_called()
+            argv = self._assert_dedicated_login(obj)
+            self.assertEqual(argv[0], "claude")
+            self.assertEqual(obj["tty"], "dd1")
 
     def test_login_prompt_anthropic_override_beats_openrouter_default(self):
         # No launcher mock: the real gateway.launcher decides. An OpenRouter default must not win.
@@ -88,13 +118,16 @@ class OpenPtyRoutePrompt(unittest.TestCase):
         with mock.patch.object(config, "GATEWAY", "openrouter"):
             (obj, code), inj = self._open(body, or_launcher="/opt/or/claude-or")
         self.assertEqual(code, 200, obj)
-        self.assertEqual(inj.call_args[0][1], ["claude", "/login"])
+        inj.assert_not_called()
+        self._assert_dedicated_login(obj)
 
     def test_login_prompt_pin_openrouter_launcher(self):
         body = {"session": "", "mode": "new", "cwd": self._tmpdir, "gateway": "openrouter", "prompt": "/login"}
         (obj, code), inj = self._open(body, or_launcher="/opt/or/claude-or")
         self.assertEqual(code, 200, obj)
         self.assertEqual(inj.call_args[0][1], ["/opt/or/claude-or", "/login"])
+        self.assertEqual(self.spawned, [])
+        self.watch.assert_not_called()
 
 
 class InjectArgvQuoting(unittest.TestCase):

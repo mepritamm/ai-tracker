@@ -655,3 +655,6 @@
   .cr .cr-amap, .cr .cr-amap.has-pane { grid-template-columns: minmax(0, 1fr); }
   .cr .cr-amap-tree { max-height: none; }
 }
+
+.cr .cr-dialog-login .cr-login-term { position: relative; height: min(60vh, 520px); overflow: hidden; }
+.cr .cr-dialog-login .cr-login-term .vttermwrap { height: 100%; }

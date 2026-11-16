@@ -45,6 +45,11 @@ vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
   calls.length = 0;
   await win.ExtLaunch.openAt('~', 'new', '/login', {gateway: 'bedrock'});
   out.gwbad = calls[0].body;
+  reply = {status: 200, j: {tty: 'L1', renderer: 'xterm', notice: 'n'}};
+  const wo = []; win.open = (...a) => { wo.push(a); return {}; };
+  out.notab = await win.ExtLaunch.openAt('~', 'new', '/login', {gateway: 'anthropic', tab: false});
+  out.notabOpens = wo.length;
+  out.tabOpens = (await win.ExtLaunch.openAt('~', 'new', '/login', {gateway: 'anthropic'}), wo.length);
   reply = {fail: true};
   out.empty = await win.ExtLaunch.openAt('  ', 'new', 'x');
   console.log(JSON.stringify(out));
@@ -76,6 +81,10 @@ class OpenAt(unittest.TestCase):
         self.assertNotIn("gateway", o["body"])
         self.assertNotIn("gateway", o["noprompt"])
         self.assertNotIn("gateway", o["gwbad"])
+        # tab:false -> hand the pty back, open no tab; without it a tab opens as before
+        self.assertEqual(o["notab"], {"ok": True, "tty": "L1", "renderer": "xterm", "notice": "n"})
+        self.assertEqual(o["notabOpens"], 0)
+        self.assertEqual(o["tabOpens"], 1)
 
 
 if __name__ == "__main__":

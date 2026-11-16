@@ -358,6 +358,8 @@
           return { ok: false, error: emsg };
         }
         closePicker();
+        // opts.tab === false: the caller mounts the terminal itself (ExtVT.mountInto) -- open no tab.
+        if (opts && opts.tab === false) return { ok: true, tty: res.j.tty, renderer: res.j.renderer || "grid", notice: res.j.notice || "" };
         toast(mode === "new" ? "Starting a new Claude session" : "Terminal opened", path);
         // Reuses ext_vt.js's EXISTING standalone-tab path (?tty=...) -- the same URL scheme its
         // own openNewTab() builds -- instead of duplicating the grid/xterm renderer in this

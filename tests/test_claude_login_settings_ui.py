@@ -17,7 +17,7 @@ _BODY = r"""
 const SCEN = JSON.parse(process.argv[3]);
 const realST = setTimeout;
 const gets = [], opens = [], listeners = {};
-global.setTimeout = (f, ms) => realST(f, 0);
+global.setTimeout = (f, ms) => ms === 8000 ? 0 : realST(f, 0);   // toast auto-dismiss never fires
 global.window.location = {host: 'x', reload() {}};
 global.addEventListener = (t, f) => { (listeners[t] = listeners[t] || []).push(f); };
 const removed = [];
@@ -27,6 +27,26 @@ if (!El.prototype.remove) El.prototype.remove = function () { if (this.parentNod
 Object.defineProperty(El.prototype, 'isConnected', {configurable: true, get() {
   for (let n = this; n; n = n.parentNode) if (n === ROOT) return true; return false; }});
 global.ExtLaunch = {openAt: (...a) => { opens.push(a); return Promise.resolve(SCEN.openReply || {ok: true}); }};
+const mounts = [], closes = [], attached = [];
+const M = {destroyed: 0, focused: 0, cb: {}};
+let termEl = null, activeChild = null;
+if (SCEN.vt) {
+  global.ExtVT = {
+    mountInto: (el, t, o) => {
+      if (SCEN.mountThrows) throw new Error('boom');
+      termEl = el; mounts.push({t, o});
+      activeChild = new El('div');
+      if (SCEN.focusAt) el.appendChild(activeChild);
+      if (SCEN.forked) realST(() => (M.cb.f || (() => {}))(), 0);
+      return {onStatus: f => { M.cb.s = f; }, onNotice: f => { M.cb.n = f; }, onForked: f => { M.cb.f = f; },
+              focus: () => { M.focused++; if (SCEN.focusAt && M.focused >= SCEN.focusAt) document.activeElement = activeChild; },
+              destroy: () => { M.destroyed++; }};
+    },
+    ttyBody: (tty, x, s) => ({tty, session: s}),
+    ttyQuery: t => 'tty=' + t + '&session=',
+  };
+  if (SCEN.focusAt) { const oc = El.prototype.contains; El.prototype.contains = function (n) { if (this === termEl && n === activeChild) return true; return oc ? oc.call(this, n) : false; }; }
+}
 global.fetch = (url, opt) => {
   const json = (body, ok=true, status) => Promise.resolve({ok, status: status || (ok ? 200 : 400), json: () => Promise.resolve(body)});
   if (url === '/api/tunnel') return json({on: false});
@@ -37,6 +57,12 @@ global.fetch = (url, opt) => {
     const rep = SCEN.authSeq ? SCEN.authSeq[Math.min(gets.length - 1, SCEN.authSeq.length - 1)] : SCEN.auth;
     return json(rep.body, rep.status < 400, rep.status);
   }
+  if (url.indexOf('/api/term/attached?') === 0) {
+    const seq = SCEN.attachedSeq || [200]; const st = seq[Math.min(attached.length, seq.length - 1)]; attached.push(url);
+    if (st === 0) return Promise.reject(new Error('net'));
+    return json(st === 200 ? {claude_attached: true, login_ok: false} : {error: 'e' + st}, st < 400, st);
+  }
+  if (url === '/api/term/close') { closes.push(JSON.parse(opt.body)); return json({ok: true}); }
   return json({});
 };
 const tick = async (n=6) => { for (let i = 0; i < n; i++) await new Promise(r => realST(r, 5)); };
@@ -56,6 +82,27 @@ const SRC = require('fs').readFileSync(process.argv[2], 'utf8');
   if (SCEN.click && out.before) {
     q('cr-claude-login-block').querySelectorAll('button')[0].fire('click'); await tick(10);
     out.afterClick = info(); out.opens = opens;
+  }
+  if (SCEN.vt && SCEN.click) {
+    const cnt = (c) => root.querySelectorAll('.' + c).length;
+    const snap = () => ({login: cnt('cr-dialog-login'), config: cnt('cr-dialog-config')});
+    out.mounts = mounts; out.open = snap();
+    if (SCEN.statusConnected && M.cb.s) { M.cb.s('connected'); out.statusAfter = (q('cr-dialog-login').querySelector('.cr-claude-login-status') || {}).textContent; }
+    if (SCEN.manualClose) { await tick(3); window.CR.dialogs.close(); await tick(8); const n = attached.length; await tick(8); out.attachedAfterClose = attached.length - n; }
+    else if (SCEN.escape) {
+      await tick(3);
+      (q('cr-dialog-login').handlers.keydown || []).slice().forEach(f => f({key: 'Escape', preventDefault() {}, stopPropagation() {}}));
+      await tick(8);
+    }
+    else if (SCEN.ticks) { await tick(SCEN.ticks); const n = attached.length; await tick(10); out.attachedExtra = attached.length - n; }
+    else await tick(15);
+    out.end = snap(); out.destroyed = M.destroyed; out.closes = closes; out.focused = M.focused;
+    out.conn = (q('cr-claude-login-conn') || {}).textContent; out.gets = gets;
+    const btn = q('cr-claude-login-block'); out.btnDisabled = btn ? !!btn.querySelectorAll('button')[0].attrs.disabled : null;
+    out.attached = attached.length;
+    out.toasts = root.querySelectorAll('.cr-toast-title').map(x => x.textContent);
+    out.block = btn ? btn.textContent : null;
+    while (root.querySelectorAll('.cr-dialog-wrap').length) { const b = root.querySelectorAll('.cr-dialog-wrap').length; window.CR.dialogs.close(); if (root.querySelectorAll('.cr-dialog-wrap').length >= b) break; }
   }
   if (SCEN.focus) { (listeners.focus || []).slice().forEach(f => f()); await tick(10); out.afterFocus = info(); out.gets = gets; }
   if (SCEN.reopen) {
@@ -115,6 +162,79 @@ class ClaudeLoginBlock(unittest.TestCase):
     def test_click_opens_login_terminal_once(self):
         r = self.go(_auth(True), click=True)
         self.assertEqual(r["opens"], [["~", "new", "/login", {"gateway": "anthropic"}]])
+
+    def vt(self, **kw):
+        return self.go(_auth(False), click=True, vt=True, **kw)
+
+    def test_inline_open_mounts_over_config(self):
+        r = self.vt(openReply={"ok": True, "tty": "L1", "renderer": "grid"}, statusConnected=True, attachedSeq=[200])
+        self.assertEqual(r["opens"], [["~", "new", "/login", {"gateway": "anthropic", "tab": False}]])
+        self.assertEqual(r["open"], {"login": 1, "config": 1})
+        self.assertEqual(r["mounts"], [{"t": {"tty": "L1"}, "o": {"renderer": "grid"}}])
+        self.assertIn("Complete the login", r["statusAfter"])   # connection status never overwrites guidance
+
+    def test_pty_gone_auto_closes(self):
+        r = self.vt(openReply={"ok": True, "tty": "L1", "renderer": "grid"}, attachedSeq=[200, 404])
+        self.assertEqual(r["end"], {"login": 0, "config": 1})
+        self.assertEqual(r["closes"], [])
+        self.assertEqual(r["destroyed"], 1)
+        self.assertIn("/api/claude/auth?fresh=1", r["gets"])
+        self.assertFalse(r["btnDisabled"])
+
+    def test_manual_close_posts_close_once(self):
+        r = self.vt(openReply={"ok": True, "tty": "L1", "renderer": "grid"}, attachedSeq=[200], manualClose=True)
+        self.assertEqual(r["closes"], [{"tty": "L1", "session": ""}])
+        self.assertEqual(r["destroyed"], 1)
+        self.assertIn("/api/claude/auth?fresh=1", r["gets"])
+        self.assertEqual(r["attachedAfterClose"], 0)
+
+    def test_live_pty_keeps_terminal(self):
+        r = self.vt(openReply={"ok": True, "tty": "L1", "renderer": "grid"}, attachedSeq=[200], ticks=12)
+        self.assertEqual(r["destroyed"], 0)
+        self.assertEqual(r["open"]["login"], 1)
+        self.assertEqual(r["end"]["login"], 1)
+
+    def test_poll_error_stops_poll(self):
+        r = self.vt(openReply={"ok": True, "tty": "L1", "renderer": "grid"}, attachedSeq=[401], ticks=6)
+        self.assertEqual(r["attachedExtra"], 0)
+        self.assertIn("e401", r["conn"])
+        self.assertEqual(r["destroyed"], 0)
+
+    def test_escape_in_terminal_closes_modal(self):
+        r = self.vt(openReply={"ok": True, "tty": "L1", "renderer": "grid"}, attachedSeq=[200], escape=True)
+        self.assertEqual(r["end"], {"login": 0, "config": 1})
+        self.assertEqual(r["closes"], [{"tty": "L1", "session": ""}])
+        self.assertEqual(r["destroyed"], 1)
+
+    def test_pty_exit_without_login_no_toast(self):
+        r = self.go(_auth(False), click=True, vt=True, openReply={"ok": True, "tty": "L1", "renderer": "grid"},
+                    attachedSeq=[200, 404], authSeq=[_auth(False), _auth(False)])
+        self.assertNotIn("Logged in", r["toasts"])
+
+    def test_pty_exit_after_login_toasts_once(self):
+        r = self.go(_auth(False), click=True, vt=True, openReply={"ok": True, "tty": "L1", "renderer": "grid"},
+                    attachedSeq=[200, 404], authSeq=[_auth(False), _auth(True)])
+        self.assertEqual(r["toasts"].count("Logged in"), 1)
+
+    def test_blips_capped(self):
+        r = self.vt(openReply={"ok": True, "tty": "L1", "renderer": "grid"}, attachedSeq=[0], ticks=14)
+        self.assertEqual(r["attached"], 5)
+        self.assertIn("net", r["conn"])
+
+    def test_blip_recovers(self):
+        r = self.vt(openReply={"ok": True, "tty": "L1", "renderer": "grid"}, attachedSeq=[0, 0, 200, 404])
+        self.assertEqual(r["end"], {"login": 0, "config": 1})
+        self.assertEqual(r["closes"], [])
+
+    def test_open_throw_closes_pty_and_reenables(self):
+        r = self.vt(openReply={"ok": True, "tty": "L1", "renderer": "grid"}, mountThrows=True)
+        self.assertEqual(r["closes"], [{"tty": "L1", "session": ""}])
+        self.assertFalse(r["btnDisabled"])
+        self.assertIn("Log in failed", r["block"])
+
+    def test_focus_retry_until_focused(self):
+        r = self.vt(openReply={"ok": True, "tty": "L1", "renderer": "grid"}, attachedSeq=[200], forked=True, focusAt=3, ticks=12)
+        self.assertEqual(r["focused"], 3)   # retried until focus landed, then stopped
 
     def test_open_failure_shown(self):
         r = self.go(_auth(False), click=True, openReply={"ok": False, "error": "X"})
