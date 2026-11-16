@@ -1309,6 +1309,10 @@ dropped notice is invisible to a viewer whose `since_notice` is old enough to ha
 PTYS = {}                # id -> Pty
 _STREAMS = 0              # open SSE connections across all PTYs; guarded by _LOCK
 _LOCK = threading.Lock()
+_SLOTS_RESERVED = 0       # terminal slots promised to cold openers whose fork is still in flight
+                          # (open_pty's cold path). Guarded by _LOCK; checked together with
+                          # `_live_count()` in the SAME section that increments it, so K concurrent
+                          # openers can never overshoot config.MAX_TERMS.
 _FOLDER_SPAWNING = {}     # cwd -> threading.Event: a folder shell for that cwd is being spawned
                           # by some open_pty() right now and is not in PTYS yet. Guarded by _LOCK;
                           # set + removed by the spawner on every exit. See open_pty()'s
@@ -1923,6 +1927,19 @@ def _reader(pt):
 
 def _live_count():
     return sum(1 for p in PTYS.values() if not p.done)
+
+
+def _slots_add(n):
+    """Reserve `n` slots (open_pty's cold path). Call UNDER `_LOCK`, in the section that checked them."""
+    global _SLOTS_RESERVED
+    _SLOTS_RESERVED += n
+
+
+def _slots_release(n=1):
+    """Give back `n` reserved slots once the pty is in PTYS or its spawn failed. Takes `_LOCK` itself."""
+    global _SLOTS_RESERVED
+    with _LOCK:
+        _SLOTS_RESERVED = max(0, _SLOTS_RESERVED - n)
 
 
 # --------------------------------------------------------------------------- folder terminal
@@ -3304,6 +3321,7 @@ def open_pty(handler, parsed, body):
     # lookup, both spawned `folder=True`, and the manage list showed two folder rows for one cwd.
     reserved = None     # this request's own reservation, when it is the one spawning
     waited = False
+    cold = False        # S3: dedicated claude now (+ a warming root shell when `reserved`)
     if mode == "resume":
         resolve_spawned(throttle=0, new_only=True)     # latch a 'new' launch's session BEFORE asking who has it
     while True:
@@ -3321,9 +3339,22 @@ def open_pty(handler, parsed, body):
                                           "attached": True, "folder": hit.folder})
             fp = _folder_pty(cwd)
             reused = fp is not None
+            if mode != "cwd" and (fp is None or not fp.startup_done):
+                # S3: a cold or still-warming root shell never makes an opener wait. Reserve the
+                # slot(s) HERE, under the lock that counts them, then fork outside it.
+                free = config.MAX_TERMS - _live_count() - _SLOTS_RESERVED
+                if free < 1:
+                    return handler._json({"error": "too many running terminals (max %d)"
+                                          % config.MAX_TERMS, "terminals": _live_list(orl)}, 429)
+                warm = fp is None and _FOLDER_SPAWNING.get(cwd) is None and free >= 2
+                _slots_add(2 if warm else 1)
+                if warm:
+                    reserved = _FOLDER_SPAWNING[cwd] = threading.Event()
+                cold = True
+                break
             pending = None if fp is not None else _FOLDER_SPAWNING.get(cwd)
             if fp is None and (pending is None or waited):
-                if _live_count() >= config.MAX_TERMS:
+                if _live_count() + _SLOTS_RESERVED >= config.MAX_TERMS:
                     # Ride the list of slot-holders on the 429 itself rather than making the client
                     # ask a second route for it: this response IS the only moment that list is
                     # wanted, and it is the same "server-owned policy handed to the client on the
@@ -3342,6 +3373,15 @@ def open_pty(handler, parsed, body):
         # the pre-reservation duplicate -- a plain shell nobody reuses -- not a hang or a refusal.
         pending.wait(FOLDER_SPAWN_WAIT)
         waited = True
+    if cold:
+        # Dedicated claude at its worktree NOW; the root shell warms beside it only when two slots
+        # reserved (`reserved` is set then). Nobody waits on the shell.
+        try:
+            reply = _spawn_dedicated(run_dir or cwd, argv, mode, sid, forked, cols, rows, held=True)
+        finally:
+            if reserved is not None:
+                _warm_root(cwd, shell_argv, cols, rows, reserved)
+        return handler._json(*reply)
     if fp is None:
         try:
             try:
@@ -3364,7 +3404,8 @@ def open_pty(handler, parsed, body):
             reserved.set()
     if mode == "cwd" and not reused:
         try:
-            threading.Thread(target=_folder_settled, args=(fp, time.time() + FOLDER_STARTUP_WAIT),
+            threading.Thread(target=_folder_settled, args=(fp, time.time() + FOLDER_STARTUP_WAIT,
+                                                            False, _slow_start_note(fp)),
                              name="folder-settle-%s" % fp.id, daemon=True).start()
         except RuntimeError:
             with _LOCK:
@@ -3423,28 +3464,6 @@ def open_pty(handler, parsed, body):
         return handler._json({"tty": fp.id, "session": sid, "renderer": config.TERM_RENDERER, "forked": fp.forked,
                               "notice": None, "starting": False, "reused": True, "folder": True,
                               "attached": True})
-    if busy_what is None and not settled:
-        starting = mode == "resume"
-        if starting:
-            with fp.lock:
-                fp.starting = True
-        try:
-            fp.deferred = threading.Thread(
-                target=_deferred_folder_start, name="folder-start-%s" % fp.id, daemon=True,
-                args=(fp, argv, sid, mode, forked, cols, rows))
-            fp.deferred.start()
-        except RuntimeError:     # thread exhaustion: undo the claim and the placeholder
-            with _LOCK:
-                fp.fg, fp.fg_seen_child, fp.fg_pending = None, False, False
-                fp.startup_done = True
-            with fp.lock:
-                fp.starting = False
-            starting = False
-        with _LOCK:
-            fp.grants.add(sid)
-        return handler._json({"tty": fp.id, "session": sid, "renderer": config.TERM_RENDERER, "forked": forked,
-                              "notice": None, "starting": starting, "reused": reused,
-                              "folder": True})
     if busy_what is None:
         starting = mode == "resume"
         if starting:
@@ -3479,41 +3498,79 @@ def open_pty(handler, parsed, body):
     # ---- overflow: the pre-folder behaviour, verbatim, plus the `overflow` flag
     with _LOCK:
         _reap()
-        if _live_count() >= config.MAX_TERMS:
+        if _live_count() + _SLOTS_RESERVED >= config.MAX_TERMS:
             return handler._json({"error": "too many running terminals (max %d)" % config.MAX_TERMS,
                                   "terminals": _live_list(orl)}, 429)
+    handler._json(*_spawn_dedicated(run_dir or cwd, argv, mode, sid, forked, cols, rows))
+
+
+def _spawn_dedicated(spawn_cwd, argv, mode, sid, forked, cols, rows, held=False):
+    """Spawn a dedicated overflow pty running `argv` in `spawn_cwd` and register it. Returns the
+    `(body, status)` for `_json`. `held`: the caller reserved one slot in `_SLOTS_RESERVED`; it is
+    given back once the pty is in PTYS or the spawn failed (never under `_LOCK` while forking)."""
     try:
-        pt = spawn(run_dir or cwd, argv, cols, rows)    # a dedicated pty runs IN the worktree
-    except OSError as e:
-        return handler._json({"error": "spawn failed: %s" % e}, 500)
-    pt.session = sid
-    pt.mode = mode
-    pt.forked = forked
-    pt.overflow = True
-    starting = mode == "resume"
-    if starting:
-        # Set BEFORE the backstop thread starts (and thus before any viewer can possibly learn
-        # this tty id and attach a `screen_stream()`) -- see the readiness-state section above
-        # `_resume_backstop` and `_screen_stream_body()`'s use of this flag. Guarded by `pt.lock`
-        # like every other field it shares that lock with.
-        with pt.lock:
-            pt.starting = True
-    with _LOCK:
-        pt.grants.add(sid)
-        PTYS[pt.id] = pt
+        try:
+            pt = spawn(spawn_cwd, argv, cols, rows)    # a dedicated pty runs IN the worktree
+        except OSError as e:
+            return {"error": "spawn failed: %s" % e}, 500
+        pt.session = sid
+        pt.mode = mode
+        pt.forked = forked
+        pt.overflow = True
+        starting = mode == "resume"
+        if starting:
+            # Set BEFORE the backstop thread starts (and thus before any viewer can possibly learn
+            # this tty id and attach a `screen_stream()`) -- see the readiness-state section above
+            # `_resume_backstop` and `_screen_stream_body()`'s use of this flag. Guarded by `pt.lock`
+            # like every other field it shares that lock with.
+            with pt.lock:
+                pt.starting = True
+        with _LOCK:
+            pt.grants.add(sid)
+            PTYS[pt.id] = pt
+    finally:
+        if held:
+            _slots_release()
     if mode == "resume":
         starting = _start_backstop(pt, sid, forked, cols, rows)
     # `renderer` is server-owned policy handed to the client, never asked of it (conventions rule
-    # 5) -- see the TRACKER_TERM_RENDERER switch comment above raw_stream() below. Riding along on
-    # the response that already exists (rather than a forced extra round trip) is what lets the
-    # modal open its Terminal/XtermTerminal without waiting on anything else. `starting` rides the
-    # same way: True only for a fresh `mode="resume"` pty (a "cwd"/"new" pty answers False here
-    # and never touches the flag again), so a viewer attaching later already knows to expect
-    # `_screen_stream_body()`'s rows-suppressed frames until the `starting` key in those frames
-    # itself goes False.
-    handler._json({"tty": pt.id, "session": sid, "renderer": config.TERM_RENDERER, "forked": forked,
-                   "notice": None,
-                   "starting": starting, "reused": False, "folder": False})
+    # 5). `starting` rides the same way: True only for a fresh `mode="resume"` pty (a "cwd"/"new"
+    # pty answers False here and never touches the flag again), so a viewer attaching later already
+    # knows to expect `_screen_stream_body()`'s rows-suppressed frames until the `starting` key in
+    # those frames itself goes False.
+    return {"tty": pt.id, "session": sid, "renderer": config.TERM_RENDERER, "forked": forked,
+            "notice": None, "starting": starting, "reused": False, "folder": False}, 200
+
+
+def _warm_root(cwd, shell_argv, cols, rows, reserved):
+    """S3: spawn the root folder shell beside a cold opener's dedicated claude, so the NEXT open
+    finds it settled. No claim, nothing typed; only `_folder_settled` watches it (wedge_close: a
+    shell that never settles is closed). Releases its `_FOLDER_SPAWNING` reservation and its slot
+    on every exit. A failed spawn is silent: the opener already has its claude."""
+    try:
+        try:
+            fp = spawn(cwd, shell_argv, cols, rows)
+        except OSError:
+            return
+        fp.mode = "cwd"
+        fp.folder = True
+        fp.shell_cmd = fp.cmd
+        fp.startup_done = False
+        with _LOCK:
+            PTYS[fp.id] = fp
+        try:
+            threading.Thread(target=_folder_settled, args=(fp, time.time() + FOLDER_STARTUP_WAIT, True,
+                                                            _slow_start_note(fp)),
+                             name="folder-settle-%s" % fp.id, daemon=True).start()
+        except RuntimeError:
+            with _LOCK:
+                fp.startup_done = True
+    finally:
+        with _LOCK:
+            if _FOLDER_SPAWNING.get(cwd) is reserved:
+                del _FOLDER_SPAWNING[cwd]
+        reserved.set()
+        _slots_release()
 
 
 # ------------------------------------------------------ taking over an unwatched daemon-client pane
@@ -3922,14 +3979,34 @@ def _startup_diag(fp):
     return msg
 
 
-def _folder_settled(fp, deadline, on_slow=None):
+def _slow_start_note(fp):
+    """The one slow-start progress note (base bc0f44e), for a shell whose rc files are still
+    running FOLDER_STARTUP_NOTE after spawn. With L5 nothing is typed into a just-spawned shell
+    any more (a cold open gets a dedicated claude at once), so the note only says what the shell
+    waits on -- for whoever is viewing it."""
+    def slow():
+        try:
+            _feed_note(fp, "ai-tracker: waiting for your shell's startup files%s" % _startup_diag(fp))
+        except Exception:
+            pass
+    return slow
+
+
+def _folder_settled(fp, deadline, wedge_close=False, on_slow=None):
     """Block until the folder shell has held its OWN foreground continuously for
     INJECT_QUIET_WINDOW seconds -- its rc files have stopped handing the terminal to jobs. A
     single idle sample is not enough: a fresh shell reads idle at t~0 and again in the ~0.2s gaps
     between rc jobs (measured: 0.000 SHELL, 0.205 JOB, 0.419 SHELL, 0.604 JOB, 0.944 SHELL).
-    False on deadline or when the shell died/closed. `on_slow` runs once, FOLDER_STARTUP_NOTE in. Marks `fp.startup_done` on
-    EVERY return: after this the shell is treated like any reused one (busy means busy)."""
+    False on deadline or when the shell died/closed. `on_slow` runs once, FOLDER_STARTUP_NOTE in.
+    Marks `fp.startup_done` on EVERY return: after this the shell is treated like any reused one
+    (busy means busy).
+
+    `wedge_close` (the warm shell S3 spawns, which nobody claimed): a shell that never settled, is
+    still not at its prompt and has no viewers is marked `closing` in the SAME `_LOCK` section that
+    sets `startup_done`, so an opener can never claim it in between (`_folder_pty` skips closing
+    shells), then killed -- a wedged warm shell never pins a slot."""
     idle_since = None
+    ok = False
     slow_at = time.time() + FOLDER_STARTUP_NOTE if on_slow else 0
     try:
         while not (fp.done or fp.closing):
@@ -3944,54 +4021,19 @@ def _folder_settled(fp, deadline, on_slow=None):
             elif idle_since is None:
                 idle_since = now
             elif now - idle_since >= INJECT_QUIET_WINDOW:
+                ok = True
                 return True
             time.sleep(FOLDER_STARTUP_POLL)
         return False
     finally:
+        wedged = False
         with _LOCK:
             fp.startup_done = True
-
-
-def _deferred_folder_start(fp, argv, sid, mode, forked, cols, rows):
-    """Type `argv` into a just-spawned folder shell once its startup has finished. Runs on a
-    daemon thread (`fp.deferred`); never spawns a pty. The claim on `fp.fg` (pending) was made
-    by open_pty; on failure it is released and a note is fed to the terminal.
-
-    "Finished startup" is `_folder_settled` (the shell held its own foreground for
-    INJECT_QUIET_WINDOW), not one idle sample: a fresh shell reads idle at t~0 and between rc
-    jobs. If a job reappears after the settle, `_inject_argv(deferred=True)` fails at once with
-    the claim still pending, and this settles again -- all inside FOLDER_STARTUP_WAIT. A slow
-    start says what it waits on (FOLDER_STARTUP_NOTE)."""
-    ok = False
-    deadline = time.time() + FOLDER_STARTUP_WAIT
-
-    def slow():
-        try:
-            _feed_note(fp, "ai-tracker: waiting for your shell's startup files%s \u2014 %s starts at "
-                           "the prompt" % (_startup_diag(fp), os.path.basename(argv[0])))
-        except Exception:
-            pass
-    try:
-        while _folder_settled(fp, deadline, slow):
-            slow = None                       # one progress note per start, not one per settle
-            ok, why = _inject_argv(fp, argv, deferred=True, sid=sid if mode == "resume" else "")
-            if ok or why == "write failed":   # never retype after a (partial) write
-                break
-            # not ready after all: claim still pending (deferred=True), settle again -- never a second pty.
-        if ok and mode == "resume":
-            _start_backstop(fp, sid, forked, cols, rows)
-    finally:
-        if not ok:
-            with _LOCK:
-                fp.fg, fp.fg_seen_child, fp.fg_pending = None, False, False
-            with fp.lock:
-                fp.starting = False
-            if not (fp.done or fp.closing):
-                try:
-                    _feed_note(fp, "ai-tracker: shell never reached its prompt%s \u2014 %s was not "
-                                   "started" % (_startup_diag(fp), os.path.basename(argv[0])))
-                except Exception:
-                    pass
+            if (wedge_close and not ok and not (fp.done or fp.closing) and fp.viewers <= 0
+                    and fp.fg is None and _fg_pgid(fp) != fp.pid):
+                fp.closing = wedged = True
+        if wedged:
+            fp.kill()
 
 
 def _start_backstop(pt, sid, forked, cols, rows):

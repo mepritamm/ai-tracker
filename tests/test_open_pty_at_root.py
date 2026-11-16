@@ -18,7 +18,7 @@ SHELL = 4242
 
 class _H:
     def __init__(self):
-        self.headers = {}
+        self.headers = {"Host": "127.0.0.1:8790"}   # base 2bca388: loopback Host check
         self.calls = []
 
     def _json(self, obj, code=200):

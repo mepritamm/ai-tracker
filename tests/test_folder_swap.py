@@ -400,11 +400,20 @@ exec cat
         self.assertEqual(code, 200, obj)
         return obj
 
+    def _settled_shell(self):
+        """S3: a cold resume gets its own dedicated claude, so the swap contract (same-tty swap into the
+        shared folder shell) needs the shell opened and SETTLED first, as it is after any earlier open."""
+        h = _FakeHandler()
+        term_vt.open_pty(h, None, {"cwd": self.cwd, "mode": "cwd", "cols": 80, "rows": 24})
+        fp = term_vt.PTYS[h.calls[-1][0]["tty"]]
+        self.assertTrue(_wait_until(lambda: fp.startup_done, 30), "folder shell settled")
+
     def _client_short(self, fp):
         pg = term_vt._fg_pgid(fp)
         return pg, (term_vt._thin_client_short(pg) if pg != fp.pid else "")
 
     def test_thin_client_swaps_in_same_tty(self):
+        self._settled_shell()
         first = self._open(A)
         fp = term_vt.PTYS[first["tty"]]
         self.assertTrue(_wait_until(lambda: self._client_short(fp)[1] == A[:8], 30),
@@ -425,6 +434,7 @@ exec cat
         self.assertEqual(fp.fg["session"], B)
 
     def test_watched_pane_is_left_alone(self):
+        self._settled_shell()
         first = self._open(A)
         fp = term_vt.PTYS[first["tty"]]
         self.assertTrue(_wait_until(lambda: self._client_short(fp)[1] == A[:8], 30))
