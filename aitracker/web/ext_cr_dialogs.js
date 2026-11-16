@@ -1436,14 +1436,14 @@
   }
 
   // Settings > Server "Claude Code login (/login)". Status comes from GET /api/claude/auth (fetched
-  // only when this block is built, i.e. when the Server tab renders; never polled). The button opens
+  // only when this block is built, that is, when the Server tab renders; never polled). The button opens
   // a terminal in ~ running `claude "/login"` through the normal launch path (ExtLaunch.openAt).
   function claudeLoginBlock() {
     if (crReadOnly()) return null;
     var wrap = h('div', { class: 'cr-cfg-row cr-claude-login-block' });
-    var st = null, msg = '', denied = false, busy = false;
+    var loginSt = null, msg = '', denied = false, busy = false;
     function paint() {
-      var status = denied ? 'Login status is shown on this machine only' : (msg || (st ? (st.error || st.label || '') : 'Loading…'));
+      var status = denied ? 'Login status is shown on this machine only' : (msg || (loginSt ? (loginSt.error || loginSt.label || '') : 'Loading…'));
       wrap.innerHTML = '';
       wrap.appendChild(h('div', { class: 'cr-cfg-row-label' }, [
         h('div', { class: 'cr-cfg-row-name' }, ['Claude Code login (/login)']),
@@ -1451,7 +1451,7 @@
         h('div', { class: 'cr-cfg-row-sub cr-claude-login-warn' }, ['Signs in for every Claude Code session on this machine — choosing a different login method signs out the existing claude.ai login. Opens Claude Code’s own /login in a new terminal tab.']),
       ]));
       var ctl = h('div', { class: 'cr-cfg-row-control' });
-      var b = crBtn(st && st.logged_in ? 'Switch account' : 'Log in', login);
+      var b = crBtn(loginSt && loginSt.logged_in ? 'Switch account' : 'Log in', login);
       if (busy) b.setAttribute('disabled', 'disabled');
       ctl.appendChild(b);
       wrap.appendChild(ctl);
@@ -1459,7 +1459,7 @@
     function load(fresh) {
       crCall('/api/claude/auth' + (fresh ? '?fresh=1' : '')).then(function (r) {
         denied = r.status === 403;
-        if (r.ok) { st = r.body; msg = ''; } else if (!denied) msg = (r.body && r.body.error) || 'request failed';
+        if (r.ok) { loginSt = r.body; msg = ''; } else if (!denied) msg = (r.body && r.body.error) || 'request failed';
         paint();
       });
     }
