@@ -40,7 +40,9 @@ class CloexecTests(unittest.TestCase):
     def test_pty_master_becomes_non_inheritable(self):
         pid, fd = _pty_sleeper()
         self.addCleanup(self._reap, pid, fd)
-        self.assertTrue(os.get_inheritable(fd))           # pty.fork leaves it inheritable (the bug)
+        # pty.fork left it inheritable (the bug) before Python 3.15; recreate that state on every
+        # runtime so this stays a red proof of _cloexec_all, not of the interpreter.
+        os.set_inheritable(fd, True)
         update._cloexec_all()
         self.assertFalse(os.get_inheritable(fd))
 
@@ -49,6 +51,7 @@ class CloexecTests(unittest.TestCase):
         script = ("import os, pty, sys, signal\n" + inspect.getsource(update._cloexec_all) + "\n"
                   "pid, fd = pty.fork()\n"
                   "if pid == 0:\n    os.execvp('sleep', ['sleep', '30'])\n"
+                  "os.set_inheritable(fd, True)\n"        # the pre-3.15 pty.fork state (see above)
                   "if os.environ.get('DO_CLOEXEC') == '1':\n    _cloexec_all()\n"
                   "probe = 'import os,sys\\ntry:\\n os.fstat(int(sys.argv[1])); print(\"open\")\\n"
                   "except OSError:\\n print(\"closed\")'\n"

@@ -1561,7 +1561,10 @@ class Pty:
         mid-rc leaked its rc jobs' locks -- see KILL_GRACE for the regression. The shell is
         STOPPED while its foreground job is hung up: a live shell would start its next rc job
         and re-send SIGHUP to it, and bash aborts an EXIT trap on a second fatal signal
-        (measured, both). Then the shell is SIGKILLed; its exit hangs up whatever still holds
+        (measured, both). During startup the frozen shell's rc job first gets KILL_GRACE to
+        finish UNSIGNALLED -- bash 3.2 under load still drops a trap on SIGHUP now and then
+        (measured 5/180; 0/300 with this wait). Then the shell is SIGKILLed -- on every path,
+        even if the wait raises, so it can never be left stopped; its exit hangs up whatever still holds
         the foreground once, and each group gets KILL_GRACE before its SIGKILL. Any pty, not
         only a folder one: `$SHELL -l` spawned directly (the test suite) runs the same rc files.
         """
@@ -1581,18 +1584,26 @@ class Pty:
                 # job's LEADER alone -- pyenv execs pyenv-rehash, so the leader IS the trap owner,
                 # and bash 3.2 skips the trap ~1/40 when it and its child are signalled together
                 # (0/40 leader-only, measured). Its children go with the group's SIGKILL below.
-                for pid, sig in ((self.pid, signal.SIGSTOP), (fg, signal.SIGHUP)):
+                # ponytail: a trap owned by a NON-leader pipeline member gets no grace of its own.
+                try:
+                    os.kill(self.pid, signal.SIGSTOP)
+                    if not self.startup_done:
+                        _wait_exit(fg, KILL_GRACE)       # a short rc job just finishes on its own
+                    os.kill(fg, signal.SIGHUP)
+                    _wait_exit(fg, KILL_GRACE)
+                except Exception:
+                    pass
+                finally:
                     try:
-                        os.kill(pid, sig)
+                        os.kill(self.pid, signal.SIGKILL)    # also ends a stopped shell
                     except (ProcessLookupError, PermissionError, OSError):
                         pass
-                _wait_exit(fg, KILL_GRACE)
             else:
                 fg = 0
-            try:
-                os.kill(self.pid, signal.SIGKILL)    # also ends a stopped shell
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
+                try:
+                    os.kill(self.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
             # Its exit hangs up the tty's foreground group once -- the shell's own group when no job
             # held it (an rc job sharing that group runs its trap then). Each group gets the grace,
             # then the SIGKILL. pid as the pgid, never getpgid(pid) -- see `_kill_group`.
@@ -1658,7 +1669,9 @@ The regression this guards: SIGKILLing a login shell mid-rc killed `pyenv rehash
 `trap release_lock EXIT`, leaking ~/.pyenv/shims/.pyenv-shim; every later login shell then
 waited 60s per rehash (x2 in a typical .zshrc) -- past FOLDER_STARTUP_WAIT -- so every Resume
 ended "shell never reached its prompt". Only a group that ignores SIGHUP (a TUI) pays the wait.
-Measured on a real pty: a SIGHUP'd trap owner exits p95 0.19s, max 0.43s -- 0.3s leaked 1 in 40."""
+Measured on a real pty: a SIGHUP'd trap owner exits p95 0.19s, max 0.43s -- 0.3s leaked 1 in 40.
+The idle reap pays it in full: kill() runs on the reader thread, so the SIGKILLed shell stays an
+unreaped zombie (EPERM, counted alive) for the whole wait -- bounded, on the pty's own thread."""
 
 
 def _group_alive(pg):
@@ -1679,7 +1692,10 @@ def _wait_exit(pid, timeout):
     kill(pid, 0) a zombie counts as exited: `Pty.kill()` waits on a job whose parent shell it has
     stopped, so nobody reaps it. kqueue NOTE_EXIT where available (macOS/BSD), /proc otherwise."""
     if hasattr(select, "kqueue"):
-        kq = select.kqueue()
+        try:
+            kq = select.kqueue()          # EMFILE must degrade to no grace, never raise into kill()
+        except OSError:
+            return
         try:
             kq.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
                                       flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
@@ -3661,26 +3677,64 @@ def _mismatch(handler, tid):
     return handler._json({"error": SESSION_MISMATCH, "mismatch": True, "tty": tid}, 409)
 
 
-FOLDER_STARTUP_WAIT = 120.0
+FOLDER_STARTUP_WAIT = 300.0
 """How long a folder shell THIS request just spawned may take to reach its prompt (slow rc files:
 pyenv rehash, nvm, ...) before the deferred start gives up. Far longer than INJECT_MAX_WAIT on
-purpose: the alternative to waiting is a second pty for the same session."""
+purpose: the alternative to waiting is a second pty for the same session. Was 120s -- exactly the
+2x60s a stale pyenv lock costs a typical .zshrc, so Resume gave up the moment the shell would have
+come up. An idle shell settles within INJECT_QUIET_WINDOW, so this only ever bounds a shell still
+running its rc files (or one that settles but never takes the line)."""
+FOLDER_STARTUP_NOTE = 10.0
+"""After this long without a prompt, the deferred start tells the viewer what it is waiting on,
+so the pane is never blank and silent for minutes."""
 FOLDER_STARTUP_POLL = 0.1
+PYENV_LOCK_STALE = 60.0
+"""A pyenv rehash holds ~/.pyenv/shims/.pyenv-shim for well under a second; pyenv itself gives up
+waiting on it after 60s. Older than that, it is a leaked lock (its owner was SIGKILLed)."""
 
 
-def _folder_settled(fp, deadline):
+def _startup_diag(fp):
+    """Read-only diagnosis for the slow-startup notes: the foreground job the shell is waiting on,
+    and a stale pyenv rehash lock if there is one. Never touches the file -- the hint says how.
+    Forks `ps`: never call under _LOCK."""
+    msg, pg = "", _fg_pgid(fp)
+    if pg != fp.pid:
+        try:
+            what = subprocess.run(["ps", "-o", "args=", "-p", str(int(pg))], capture_output=True,
+                                  text=True, timeout=2).stdout.strip()
+        except Exception:
+            what = ""
+        if what:
+            msg = " (running: %s)" % what[:120]
+    lock = os.path.join(os.environ.get("PYENV_ROOT") or os.path.expanduser("~/.pyenv"),
+                        "shims", ".pyenv-shim")
+    try:
+        age = time.time() - os.stat(lock).st_mtime
+    except OSError:
+        age = 0
+    if age > PYENV_LOCK_STALE:
+        msg += (" -- %s is %dm old: a stale pyenv lock makes every shell wait 60s per rehash; "
+                "if no `pyenv rehash` is running, remove it: rm %s" % (lock, age // 60, shlex.quote(lock)))
+    return msg
+
+
+def _folder_settled(fp, deadline, on_slow=None):
     """Block until the folder shell has held its OWN foreground continuously for
     INJECT_QUIET_WINDOW seconds -- its rc files have stopped handing the terminal to jobs. A
     single idle sample is not enough: a fresh shell reads idle at t~0 and again in the ~0.2s gaps
     between rc jobs (measured: 0.000 SHELL, 0.205 JOB, 0.419 SHELL, 0.604 JOB, 0.944 SHELL).
-    False on deadline or when the shell died/closed. Marks `fp.startup_done` on EVERY return:
-    after this the shell is treated like any reused one (busy means busy)."""
+    False on deadline or when the shell died/closed. `on_slow` runs once, FOLDER_STARTUP_NOTE in. Marks `fp.startup_done` on
+    EVERY return: after this the shell is treated like any reused one (busy means busy)."""
     idle_since = None
+    slow_at = time.time() + FOLDER_STARTUP_NOTE if on_slow else 0
     try:
         while not (fp.done or fp.closing):
             now = time.time()
             if now >= deadline:          # FIRST, so a settled-but-never-typable shell cannot loop forever
                 return False
+            if slow_at and now >= slow_at:
+                slow_at = 0
+                on_slow()
             if _fg_pgid(fp) != fp.pid:
                 idle_since = None
             elif idle_since is None:
@@ -3702,11 +3756,20 @@ def _deferred_folder_start(fp, argv, sid, mode, forked, cols, rows):
     "Finished startup" is `_folder_settled` (the shell held its own foreground for
     INJECT_QUIET_WINDOW), not one idle sample: a fresh shell reads idle at t~0 and between rc
     jobs. If a job reappears after the settle, `_inject_argv(deferred=True)` fails at once with
-    the claim still pending, and this settles again -- all inside FOLDER_STARTUP_WAIT."""
+    the claim still pending, and this settles again -- all inside FOLDER_STARTUP_WAIT. A slow
+    start says what it waits on (FOLDER_STARTUP_NOTE)."""
     ok = False
     deadline = time.time() + FOLDER_STARTUP_WAIT
+
+    def slow():
+        try:
+            _feed_note(fp, "ai-tracker: waiting for your shell's startup files%s \u2014 %s starts at "
+                           "the prompt" % (_startup_diag(fp), os.path.basename(argv[0])))
+        except Exception:
+            pass
     try:
-        while _folder_settled(fp, deadline):
+        while _folder_settled(fp, deadline, slow):
+            slow = None                       # one progress note per start, not one per settle
             ok, why = _inject_argv(fp, argv, deferred=True)
             if ok or why == "write failed":   # never retype after a (partial) write
                 break
@@ -3721,7 +3784,8 @@ def _deferred_folder_start(fp, argv, sid, mode, forked, cols, rows):
                 fp.starting = False
             if not (fp.done or fp.closing):
                 try:
-                    _feed_note(fp, "ai-tracker: shell never reached its prompt \u2014 claude was not started")
+                    _feed_note(fp, "ai-tracker: shell never reached its prompt%s \u2014 %s was not "
+                                   "started" % (_startup_diag(fp), os.path.basename(argv[0])))
                 except Exception:
                     pass
 

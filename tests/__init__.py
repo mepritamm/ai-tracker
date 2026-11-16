@@ -14,3 +14,18 @@ _term_vt._real_background_target = _term_vt._background_target
 _term_vt._background_target = lambda sid: ""
 _term_launch._real_background_target = _term_launch._background_target
 _term_launch._background_target = lambda sid: ""
+
+# Hermetic login shells. Many tests spawn the real `$SHELL -l`; with the user's own dotfiles every
+# `make check` ran their ~/.zshrc -- `pyenv rehash` writing into ~/.pyenv -- and a test-teardown kill
+# mid-rehash once leaked pyenv's lock, making every terminal on the machine wait 2 minutes. An empty
+# ZDOTDIR gives zsh (the macOS default) no user rc files; the system ones still run.
+# ponytail: zsh only -- a bash login shell reads ~/.bash_profile via HOME, which tests can't swap
+# globally (config paths derive from it). Add a temp HOME for spawned shells if bash users appear.
+import atexit as _atexit
+import os as _os
+import shutil as _shutil
+import tempfile as _tempfile
+
+_ZDOTDIR = _tempfile.mkdtemp(prefix="aitracker-test-zdotdir-")
+_os.environ["ZDOTDIR"] = _ZDOTDIR
+_atexit.register(_shutil.rmtree, _ZDOTDIR, True)

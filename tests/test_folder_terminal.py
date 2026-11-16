@@ -25,6 +25,7 @@ directly rather than depending on the process environment at all.)
 import contextlib
 import os
 import pty
+import shutil
 import signal
 import tempfile
 import threading
@@ -683,6 +684,7 @@ class TestLiveListFolderFields(unittest.TestCase):
 
 _FOLDER_SHELL_SCRIPT = """
 import os
+import shutil
 import signal
 import sys
 import time
@@ -1142,7 +1144,8 @@ class TestFreshFolderShellQueuesInsteadOfOverflow(unittest.TestCase):
         term_vt.PTYS.update(self._ptys0)
         term_gate.session_cwd = self._session_cwd0
 
-    def _open(self, cwd, phases, startup_wait=None, quiesce=0.05):
+    def _open(self, cwd, phases, startup_wait=None, quiesce=0.05, note_after=60,
+              diag=" (running: fake-rc-job)"):
         term_gate.session_cwd = lambda sid, resume=False: cwd
         fixture = term_vt.Pty(tid="fresh1", pid=self.SHELL, fd=99, cwd=cwd)
         t0 = [time.time()]
@@ -1172,6 +1175,8 @@ class TestFreshFolderShellQueuesInsteadOfOverflow(unittest.TestCase):
         }
         if startup_wait is not None:
             patches["wait"] = mock.patch.object(term_vt, "FOLDER_STARTUP_WAIT", startup_wait)
+        patches["note_after"] = mock.patch.object(term_vt, "FOLDER_STARTUP_NOTE", note_after)
+        patches["diag"] = mock.patch.object(term_vt, "_startup_diag", return_value=diag)
         with contextlib.ExitStack() as st:
             m = {k: st.enter_context(p) for k, p in patches.items()}
             h = _FakeHandler()
@@ -1236,6 +1241,83 @@ class TestFreshFolderShellQueuesInsteadOfOverflow(unittest.TestCase):
         self.assertFalse(fixture.fg_pending)
         self.assertFalse(fixture.starting)
         self.assertEqual(len(term_vt.PTYS), 1)
+
+
+    # -- slow startup: keep waiting while the rc files still run, and say what it waits on --------
+
+    def test_startup_wait_outlasts_a_stale_pyenv_lock(self):
+        """A stale pyenv lock costs a typical .zshrc exactly 2x60s (two rehashes, pyenv's own 60s
+        lock timeout each) -- the old FOLDER_STARTUP_WAIT, so Resume gave up the instant the shell
+        would have come up. The wait must clear that with real margin."""
+        self.assertGreaterEqual(term_vt.FOLDER_STARTUP_WAIT, 2 * 60 * 2)
+
+    def test_startup_wait_expiry_gives_up_with_the_diagnosis(self):
+        S, J = self.SHELL, self.STARTUP_JOB
+        t = time.time()
+        fixture, obj, code, typed, _p, m = self._open(
+            "/tmp/fresh-pastwait", [(0.05, S), (30, J)], startup_wait=0.5)
+        self.assertLess(time.time() - t, 5, "the wait must bound the start")
+        self.assertEqual(typed, [])
+        text = m["note"].call_args[0][1]
+        self.assertIn("never reached its prompt (running: fake-rc-job)", text)
+        self.assertIsNone(fixture.fg)
+        self.assertFalse(fixture.starting)
+
+    def test_slow_start_feeds_one_progress_note_naming_the_job(self):
+        """The pane must never sit blank and silent for minutes (the first screenshot)."""
+        S, J = self.SHELL, self.STARTUP_JOB
+        fixture, obj, code, typed, _p, m = self._open(
+            "/tmp/fresh-note", [(0.05, S), (1.0, J)], note_after=0.3,
+            diag=" (running: pyenv rehash)")
+        self.assertIn(b"claude --resume S1", b"".join(d for _t, d in typed))
+        texts = [c[0][1] for c in m["note"].call_args_list]
+        self.assertEqual(len(texts), 1, texts)
+        self.assertIn("waiting for your shell's startup files (running: pyenv rehash)", texts[0])
+        self.assertIn("claude starts at the prompt", texts[0])
+
+    def test_fast_start_feeds_no_progress_note(self):
+        S, J = self.SHELL, self.STARTUP_JOB
+        fixture, obj, code, typed, _p, m = self._open("/tmp/fresh-fast", [(0.05, S)], note_after=5)
+        self.assertTrue(typed)
+        m["note"].assert_not_called()
+
+
+class TestStartupDiag(unittest.TestCase):
+    """_startup_diag: names the foreground job, flags a STALE pyenv lock, never touches it."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.td, True)
+        os.makedirs(os.path.join(self.td, "shims"))
+        self.lock = os.path.join(self.td, "shims", ".pyenv-shim")
+        p = mock.patch.dict(os.environ, {"PYENV_ROOT": self.td})
+        p.start()
+        self.addCleanup(p.stop)
+        self.pt = term_vt.Pty(tid="diag", pid=424242, fd=-1)
+
+    def _diag(self, fg):
+        with mock.patch.object(term_vt, "_fg_pgid", return_value=fg):
+            return term_vt._startup_diag(self.pt)
+
+    def test_idle_shell_and_no_lock_says_nothing(self):
+        self.assertEqual(self._diag(self.pt.pid), "")
+
+    def test_names_the_foreground_job(self):
+        self.assertIn("(running: ", self._diag(os.getpid()))
+        self.assertIn("python", self._diag(os.getpid()).lower())
+
+    def test_stale_lock_gets_the_remove_hint_and_is_left_alone(self):
+        open(self.lock, "w").close()
+        old = time.time() - 3600
+        os.utime(self.lock, (old, old))
+        msg = self._diag(self.pt.pid)
+        self.assertIn("stale pyenv lock", msg)
+        self.assertIn("rm " + self.lock, msg)
+        self.assertTrue(os.path.exists(self.lock), "diagnosis must never delete the lock")
+
+    def test_fresh_lock_is_a_rehash_in_progress_not_stale(self):
+        open(self.lock, "w").close()
+        self.assertEqual(self._diag(self.pt.pid), "")
 
 
 class TestInjectArgvGraceAndDeferredMode(unittest.TestCase):

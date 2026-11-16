@@ -1031,7 +1031,7 @@ class TestKillRunsExitTraps(unittest.TestCase):
                 _drain(pt, 5)
             self.assertTrue(_wait_for(lambda: not os.path.exists(lock), 3),
                             "kill() skipped the job's EXIT trap: its lock leaked")
-            self.assertLess(took, 2 * term_vt.KILL_GRACE + 1.0)
+            self.assertLess(took, 3 * term_vt.KILL_GRACE + 1.0)
 
     def test_folder_shell_killed_with_a_foreground_job_releases_its_lock(self):
         """THE production shape: zsh runs `pyenv rehash` from .zshrc as a foreground job in its
@@ -1047,35 +1047,50 @@ class TestKillRunsExitTraps(unittest.TestCase):
                                    folder=False, typed=True, fg_job=True)
 
     @unittest.skipUnless(os.path.exists("/bin/zsh"), "needs zsh")
-    def test_zsh_killed_across_back_to_back_rc_jobs_leaks_no_lock(self):
-        """The production shape end to end: zsh (the default login shell) whose .zshrc runs
-        pyenv-rehash-shaped jobs back to back (`pyenv init --path` then `pyenv init -` each
-        rehash), killed at random points of its startup. A SIGHUP'd shell starts the NEXT rc job
-        and re-sends SIGHUP to it mid-trap -- so the shell itself must die by SIGKILL, after its
-        foreground jobs. Repeated, because the old orders leaked in only ~1 of 6 runs."""
-        import random
-        import subprocess
-        job = ("bash -c 'set -o noclobber; n=0; until : > \"$L\" 2>/dev/null; do n=$((n+1)); "
-               "[ $n -gt 30 ] && exit 1; sleep 0.1; done; set +o noclobber; "
-               "trap \"rm -f \\\"$L\\\"\" EXIT; /bin/sleep 0.35; /bin/sleep 0.05'\n")
-        rng, leaks = random.Random(7), []
-        for i in range(12):
+    def test_zsh_killed_during_each_back_to_back_rc_job_leaks_no_lock(self):
+        """The production shape: zsh (the macOS default) whose .zshrc runs pyenv-rehash-shaped
+        jobs back to back (`pyenv init --path` then `pyenv init -` each rehash), killed while EACH
+        one holds the lock. Deterministic: every job marks `ready.N` once its trap is installed and
+        the kill lands exactly then. The shell must be frozen (job N+1 never starts) and the job
+        must release its lock -- base SIGKILLed the foreground group and leaked every time."""
+        job = ("bash -c 'set -o noclobber; until : > \"$L\" 2>/dev/null; do sleep 0.05; done; "
+               "set +o noclobber; trap \"rm -f \\\"$L\\\"\" EXIT; : > \"$L.ready.{n}\"; /bin/sleep 0.3'\n")
+        for k in (1, 2, 3):
             with tempfile.TemporaryDirectory() as td:
                 lock = os.path.join(td, "LOCK")
                 with open(os.path.join(td, ".zshrc"), "w") as f:
-                    f.write(job * 3)
+                    f.write("".join(job.format(n=n) for n in (1, 2, 3)))
                 pt = term_vt.spawn(td, ["/usr/bin/env", "ZDOTDIR=" + td, "L=" + lock,
                                         "/bin/zsh", "-d", "-l"], 80, 24)
-                pt.folder = bool(i % 2)
-                time.sleep(rng.uniform(0.1, 1.4))
-                pt.kill()
-                _drain(pt, 5)
+                pt.folder, pt.startup_done = True, False      # a freshly spawned folder shell
+                try:
+                    self.assertTrue(_wait_for(lambda: os.path.exists(lock + ".ready.%d" % k), 15),
+                                    "rc job %d never installed its trap" % k)
+                finally:
+                    pt.kill()
+                    _drain(pt, 5)
+                self.assertTrue(_wait_for(lambda: not os.path.exists(lock), 3),
+                                "kill() during rc job %d leaked its lock" % k)
                 time.sleep(0.5)
-                if os.path.exists(lock):
-                    leaks.append(i)
-                    # an orphaned job still holding it would be the bug too; kill it, don't leak it
-                    subprocess.run(["pkill", "-9", "-f", lock])
-        self.assertEqual(leaks, [], "kill() leaked an rc job's lock in runs %s" % leaks)
+                self.assertFalse(os.path.exists(lock + ".ready.%d" % (k + 1)),
+                                 "the shell started rc job %d after kill() -- it was not frozen" % (k + 1))
+
+    def test_kill_never_leaves_the_shell_stopped_when_the_wait_fails(self):
+        """kill() SIGSTOPs the shell before it waits; a wait that raises (kqueue() -> EMFILE) must
+        still end in the SIGKILL, never a forever-stopped shell nobody can reap."""
+        import errno
+        with tempfile.TemporaryDirectory() as td:
+            pt = term_vt.spawn(td, ["/bin/bash", "--noprofile", "--norc", "-i"], 80, 24)
+            pt.folder = True
+            time.sleep(0.3)
+            os.write(pt.fd, b"sleep 30\n")
+            self.assertTrue(_wait_for(lambda: os.tcgetpgrp(pt.fd) != pt.pid, 5))
+            with mock.patch.object(term_vt.select, "kqueue", side_effect=OSError(errno.EMFILE, "x"),
+                                   create=True):
+                pt.kill()                                  # must not raise
+            _drain(pt, 5)
+            self.assertTrue(pt.done, "the shell was left stopped")
+            self.assertTrue(_wait_for(lambda: not term_vt._group_alive(pt.pid), 5))
 
     def test_sighup_ignoring_job_still_dies_within_the_grace(self):
         """The SIGKILL fallback still lands: a TUI ignoring SIGHUP costs at most KILL_GRACE."""
@@ -1090,6 +1105,17 @@ class TestKillRunsExitTraps(unittest.TestCase):
             _drain(pt, 5)
             self.assertTrue(_wait_for(lambda: not term_vt._group_alive(pid), 5),
                             "a SIGHUP-ignoring group survived kill()")
+
+
+class TestHermeticTestShells(unittest.TestCase):
+    def test_login_shells_spawned_by_tests_never_read_the_users_dotfiles(self):
+        """tests/__init__.py: every `$SHELL -l` a test spawns gets an empty ZDOTDIR, never ~."""
+        z = os.environ.get("ZDOTDIR", "")
+        self.assertTrue(z and os.path.isdir(z), "ZDOTDIR must point at a temp dir")
+        # no rc files -- a test zsh may still leave a .zsh_history there (macOS /etc/zshrc)
+        self.assertFalse([f for f in (".zshenv", ".zprofile", ".zshrc", ".zlogin")
+                          if os.path.exists(os.path.join(z, f))])
+        self.assertNotEqual(os.path.realpath(z), os.path.realpath(os.path.expanduser("~")))
 
 
 class TestNeverKillsOwnProcessGroup(unittest.TestCase):
