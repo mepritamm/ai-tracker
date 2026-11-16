@@ -29,3 +29,11 @@ import tempfile as _tempfile
 _ZDOTDIR = _tempfile.mkdtemp(prefix="aitracker-test-zdotdir-")
 _os.environ["ZDOTDIR"] = _ZDOTDIR
 _atexit.register(_shutil.rmtree, _ZDOTDIR, True)
+
+# The suite never writes the real "Resume all prior terminals" record (aitracker/last_terms.json): the write
+# gate term_vt._REMEMBER_ON stays off because start_remember is stubbed; the path redirect is a second layer.
+from aitracker import config as _config
+_config.LAST_TERMS_FILE = _os.path.join(_tempfile.mkdtemp(prefix="ait-lastterms-"), "last_terms.json")
+_atexit.register(_shutil.rmtree, _os.path.dirname(_config.LAST_TERMS_FILE), True)
+_term_vt._real_start_remember = _term_vt.start_remember
+_term_vt.start_remember = lambda: False

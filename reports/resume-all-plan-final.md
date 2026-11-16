@@ -868,3 +868,32 @@ ownership, never `pkill -f aitracker`, and stop test servers by PID.
     `_REMEMBER_ON` gate stated as the real test guard (N2, N3, N5, N6, N8).
   - Fixed the fork-copy claim (N1).
   - Re-grounded the `agent_cli.py` line numbers after AU's review fixes.
+
+## Live proof (R7) - 2026-11-16, scratch run
+
+Setup: own tracker from this worktree on ports 8798 then 8799 (stopped by recorded PID), `config.LAST_TERMS_FILE` and
+`PORT_FILE` redirected to a scratch path by a launcher script (no env override exists), `TRACKER_MAX_TERMS` 4 then 3 then 4.
+4 scratch Claude sessions (`claude -p`), driven only via the HTTP API, `mode: "resume"` only. `aitracker/last_terms.json` never
+appeared.
+
+1. PASS. Opened 3 resume terminals; the recorder wrote the scratch history within ~75 s: 3 entries, fields
+   `cols cwd rows seen title`.
+2. PASS (R-D1). Closed one pane (`/api/term/close`, force); `/api/term/list` showed 2 panes, the history still held 3,
+   and after a restart the closed session was still offered (older `seen`, not refreshed).
+3. PASS. After restarting on the same port, `POST /api/terminals/resume-all {}` gave 409 `needs_confirm`, `free 4, max 4`, 3
+   `open[]` rows all `checked: true`, `cannot: []`, `pick: ""`, with `message` and `note` equal to `AGENT_RA_MESSAGE` and
+   `AGENT_RA_NOTE` (30 minutes). Later with 1 pane open and cap 3 it returned `already` = "Already open in a terminal here,
+   so not listed: Say ok." and `pick` = "Only 2 terminal slots free (1 of 3 in use), so the newest that fit are ticked; ..."
+   with 2 of 3 ticked.
+4. PASS. Confirm of 2 -> 202 `{job}`; two presses during the run (`{}` and a `{confirm}`) -> 409 "an agent job is already
+   running". Job done in ~3.8 s, items outcome `unprompted`, both panes then in the list with fg mode `resume` and 0
+   viewers; user-line count in each transcript stayed 1 (no prompt). Summary: "Started resuming 2 of 2 prior terminals in
+   the background: Say ok, Say ok. Nobody is watching these terminals, so one that sits idle closes after 30 minutes
+   (Config -> Terminal -> Idle terminal TTL). Peek or open one to keep it."
+5. PASS with one observation. Cap 3, one pane open (free 2), confirm of 3 -> 409 with `error` "The 3 you ticked need 3 terminal
+   slots, but only 2 are free now. Untick some or close a terminal, then press Resume again. The list below is current."
+   and a fresh list. Observation: the 409 body carries only the server's default ticks (ra-1, ra-2 ticked, ra-3 not), so
+   the user's own three ticks are not echoed back; the UI, which does `plan = r.body`, shows the server's default ticks.
+6. PASS. Stopped by PID, restarted on port 8799 with the same history path: list offered all 4 sessions, `free 4`, all
+   ticked (one merged history, not per-port).
+Not exercised: the "cannot" rows with a Terminal.app session, and the Config -> Agents host (API only, no browser).

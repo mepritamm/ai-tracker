@@ -346,7 +346,12 @@ def _lock_fh(fh, acquire):
         msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
 
 def _update_forks(mutate):
-    """Read-modify-write forks.json serialized behind an exclusive flock, so
+    """Read-modify-write forks.json under `_update_json`'s lock (see there for the why)."""
+    return _update_json(config.FORKS_FILE, mutate)
+
+
+def _update_json(path, mutate):
+    """Read-modify-write a JSON file (forks.json, last_terms.json, ...) serialized behind an exclusive flock, so
     concurrent callers (record_fork for N different parents, resolve_fork_child
     memoizing a match or a give-up) don't lose each other's write. `_save_json`'s
     unique-temp-name fix only stops writers from clobbering each other's temp
@@ -360,7 +365,7 @@ def _update_forks(mutate):
     unnecessary rewrite doesn't happen while holding the lock.
 
     flock on POSIX, msvcrt.locking (byte 0, blocking) where fcntl is absent."""
-    lock_path = config.FORKS_FILE + ".lock"
+    lock_path = path + ".lock"
     lockfh = open(lock_path, "a")
     try:
         _lock_fh(lockfh, True)
@@ -368,11 +373,11 @@ def _update_forks(mutate):
             # deliberately NOT _load_forks(): the whole point of holding the lock is to
             # read the true current on-disk state, and mutating a dict shared with
             # _load_forks' memo would leak this in-progress edit to every reader.
-            forks = _load_json(config.FORKS_FILE, {})
+            forks = _load_json(path, {})
             if not isinstance(forks, dict):
                 forks = {}
             if mutate(forks) is not False:
-                _save_json(config.FORKS_FILE, forks)
+                _save_json(path, forks)
         finally:
             _lock_fh(lockfh, False)
     finally:

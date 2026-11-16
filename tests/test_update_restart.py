@@ -105,6 +105,21 @@ class RestartTests(unittest.TestCase):
         with pending._pending_lock() as got:                            # pending lock released
             self.assertTrue(got)
 
+    def test_t7b_remember_terminals_final_runs_before_exec_and_cannot_block_it(self):
+        held = self._hold()
+        order = []
+
+        class Rec:
+            @staticmethod
+            def remember_terminals(final=False):
+                order.append(("remember", final))
+                raise RuntimeError("boom")        # a failing recorder must not stop the exec
+        with mock.patch.dict(sys.modules, {"aitracker.term_vt": Rec}), \
+                mock.patch.object(update, "_cloexec_all", lambda: order.append("cloexec")), \
+                mock.patch.object(update.os, "execv", side_effect=lambda *a: order.append("exec") or (_ for _ in ()).throw(OSError("x"))):
+            update.restart_in_place(8790, held)
+        self.assertEqual(order, [("remember", True), "cloexec", "exec"])
+
     def test_exec_args_env_and_recovery_line_before_exec(self):
         held = self._hold("RECOVER ME")
         out = FlushLog()

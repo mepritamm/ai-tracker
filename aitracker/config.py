@@ -60,6 +60,10 @@ MODEL_KEEP_FILE = os.path.join(_HERE, "model_keep.json")
 # ".lock") serializes concurrent read-modify-write access — see store._update_forks.
 FORKS_FILE = os.path.join(_HERE, "forks.json")
 
+# {"<session id>": entry} -- the merged "Resume all prior terminals" history of every tracker run from this
+# checkout. Written only by term_vt.remember_terminals through store._update_json; read live.
+LAST_TERMS_FILE = os.path.join(_HERE, "last_terms.json")
+
 
 # Where the server is actually listening, written at startup. `run()` falls back to the next
 # free port when 8790 is taken, so anything outside the browser (the notes drain hook) has to

@@ -66,5 +66,38 @@ Next: the plan is revised to a final plan by the opus plan agent with all of the
 | F6 | UI test T15 too vague | Confirmed | Harness spelled out. |
 | N1-N8 | Nits | Accepted | |
 
-Status: plan ready for the user's sign-off. Implementation waits for the agent-upgrade fix verification, since it
+## Implementation review (`resume-all-impl-review.md`), main-thread reconciliation
+
+User signed off the final plan ("Go, implement it"). Built R0-R6 on branch `resume-all` (cut from personal/main 9754d93,
+after the agent-upgrade feature landed). Review verdict: works as specified; 0 BLOCKER, 4 SHOULD-FIX, 9 NIT. The
+reviewer verified clean: two trackers writing at once, crash, clean stop, self-update restart, empty run, the 32 bound,
+removed transcript, no leaked thread or real-file write in tests, the server re-check (stale confirm, cap changed,
+double press, during an agent job or self-update), already-open / Auggie / desktop sessions, background open with no
+modal and no prompt, agent-upgrade behaviour unchanged by the refactors.
+
+| # | Finding | Verdict | Fix |
+|---|---|---|---|
+| S1 | Recorder calls `upgrade_candidates()`, which re-parses every live pane's whole transcript at least once a minute (measured 1.3–10 s per 12–61 MB transcript, holding the GIL) and again before a self-update restart | Confirmed | As designed: `upgrade_candidates(light=True)` for the recorder, skipping the transcript parse; it MUST keep the pid-file-beats-label session id (the stale-label fix the recorder reuses it for). Agent Upgrade's rows unchanged. |
+| S2 | The preview parses up to 32 transcripts inside the request (6 cold took 22 s) | Confirmed | As designed: a cheap metadata path used by `resume_all_plan` only; `open_pty` untouched. |
+| S3 | Deleting `start_remember` in `server.run` or `onRefresh` in `_openManageDialog` leaves every test green | Confirmed | Add both wiring checks. |
+| S4 | Summary says "Resumed" on a 200 alone; a later `--fork-session` copy or a resume that never starts is still "Resumed" | Confirmed; read-back fix overbuilt for "one button" | Reword to "Started resuming" (and report `forked` when the open reply already says so). No polling loop. |
+| N1-N9 | Nits | Accepted unless they widen scope | |
+
+Fix verification (opus): 9 FIXED, 1 PARTLY (N7, a harmless redundant `hasattr`), 0 regressed; two cosmetic nits left
+as recorded (F1 test never reaches the head fallback; F2 stale "forks ps" comment). S2 residual accepted: the preview's
+folder can differ from `open_pty`'s only in an edge case found in 0 of 255 real transcripts, and the result is then
+reported honestly as "Not opened".
+
+Gate after fixes: red on 12 bundle tests — R4's multi-line `from .agent_cli import (...)` in server.py left its
+continuation line in `dist/tracker.py` (the bundler strips only the first import line). Fixed by putting the import on
+one line; TestBundle 12 OK, test_pass_cache 27 OK.
+
+Live proof (R7, scratch tracker, scratch history path, 4 scratch sessions): all 6 checks PASS — recorded, closed pane
+kept (R-D1), list after restart pre-ticked up to free slots, background open with no prompt and "Started resuming N of
+M…", second press refused, stale confirm 409 with a fresh list, history shared across ports. The real
+`aitracker/last_terms.json` never appeared. Its one "defect" (409 carries only the server's default ticks) is a false
+alarm: the widget reapplies the user's ticks to every row they saw (`ext_cr_dialogs.js:1407`); the proof drove the API
+only.
+
+Status: implemented on branch `resume-all`; committed locally next; landing on main waits for the user. Implementation waits for the agent-upgrade fix verification, since it
 builds on `_agent_resume` / `_agent_launch`.

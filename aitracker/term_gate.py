@@ -128,7 +128,7 @@ def recorded_run_dir(sid, meta=None):
     return cwd, branch
 
 
-def session_cwd(sid, resume=False):
+def session_cwd(sid, resume=False, fast=False):
     """The working directory for a session id, or "" if unknown/gone. Late import: registry
     pulls in every provider, and this module is imported from server at startup.
 
@@ -140,10 +140,26 @@ def session_cwd(sid, resume=False):
     returns that instead of "". Verified empirically on claude 2.1.280: `claude --resume <sid>`
     looks the session up by id, not by cwd, so it resumes fine from ANY directory that merely
     exists -- the exact ancestor is cosmetic. Stops and returns "" if the walk's nearest
-    existing ancestor is "/" (not a real place to land a shell); the home dir is fine."""
+    existing ancestor is "/" (not a real place to land a shell); the home dir is fine.
+
+    fast=True (the Resume-all preview only) never parses the transcript: it reads the last `cwd` in the
+    file's 96 KB tail, else the first one in its head, for a Claude session id; any other id falls back to
+    the full parse. open_pty and agent-upgrade keep the default and stay authoritative."""
     import os
+    from .registry import provider_for
     try:
-        cwd = _recorded(sid)[1]
+        cwd = ""
+        if fast:
+            from .providers import claude as _cl
+            if (provider_for(sid) or object()).prefix == "":
+                path = _cl.find_session(sid)
+                cwd = (_cl._tail_scan(path).get("cwd") or _cl._session_meta(path).get("cwd")) if path else ""
+                if not path:
+                    return ""
+            else:
+                fast = False
+        if not fast:
+            cwd = _recorded(sid)[1]
     except Exception:
         return ""
     if not cwd:

@@ -7,6 +7,8 @@ notes.json
 model_keep.json
 forks.json
 forks.json.lock
+last_terms.json
+last_terms.json.lock
 config.json
 port
 token

@@ -774,6 +774,7 @@
           });
         },
         onCloseAll: _closeAllTerminals,
+        onRefresh: _repaintManage,
       });
     }).catch(function (e) {
       ctx.dialog("manage-terminals", { error: "failed to reach the server: " + e });

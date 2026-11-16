@@ -91,6 +91,29 @@ AGENT_VERSION_MISMATCH = ("resumed on v%s, expected v%s — another claude may b
                           "run Doctor")
 AGENT_NOT_CONFIRMED = "resumed, but not yet seen running on v%s — open its terminal"
 AGENT_DOCTOR_DONE, AGENT_DOCTOR_FAILED = "Doctor finished.", "Doctor exited with an error; see its output."
+# resume all prior terminals (every user-facing string is server-written):
+AGENT_RA_MESSAGE = ("These Claude sessions ran in a tracker terminal from this checkout (newest first, closed ones "
+                    "included) and are not open now. Resume opens the ticked ones in the background with claude "
+                    "--resume, each in its folder's terminal. No terminal window opens and no prompt is sent; they "
+                    "appear in Manage terminals.")
+AGENT_RA_NONE = ("Nothing to resume: no Claude session that is not open now has run in a tracker terminal from "
+                 "this checkout. The tracker keeps this record from this version on.")
+AGENT_RA_NONE_OPENABLE = " None of them can be reopened here; the reasons are below."
+AGENT_RA_PICK = ("Only %d terminal slot%s free (%d of %d in use), so the newest that fit are ticked; tick others "
+                 "instead, or close a terminal first. Each new folder, and each further session in a folder whose "
+                 "terminal is busy, takes a slot.")
+AGENT_RA_ALREADY = "Already open in a terminal here, so not listed: %s."
+AGENT_RA_NOTE = ("Nobody is watching these terminals, so one that sits idle closes after %d minutes "
+                 "(Config → Terminal → Idle terminal TTL). Peek or open one to keep it.")
+AGENT_RA_TOO_MANY = ("The %d you ticked need %d terminal slot%s, but only %d %s free now. Untick some or close a "
+                     "terminal, then press Resume again. The list below is current.")
+AGENT_RA_NONE_PICKED = "None of the sessions you ticked can be opened now. The list below is current."
+AGENT_RA_GONE = "no longer in the list (it is open now, or its transcript is gone)"
+AGENT_RA_REUSED = "already open in tracker terminal %s, so it was not opened again"
+AGENT_RA_STEP = "Opening %d of %d: %s"
+AGENT_RA_NO_TERMS = "This build has no in-browser terminals, so there is nothing to resume."
+AGENT_RA_DISABLED = "Terminals are disabled here (TRACKER_TERMINAL=0, or a network bind without TRACKER_AUTH)."
+AGENT_RA_FAIL_SCAN = "A pending-work scan is running; nothing was opened. Try again in a minute."
 
 _AGENT_JOB = None               # last job, memory only
 _AGENT_JLOCK = threading.Lock() # guards every write to _AGENT_JOB and its items
@@ -235,7 +258,7 @@ def _agent_refresh_versions():
 
 def agent_status():
     """GET /api/agents body. Never runs a subprocess itself (a refresh runs in its own thread)."""
-    now, stale, rows = time.time(), False, []
+    now, stale, rows, tv = time.time(), False, [], _agent_tv()
     for spec in agent_specs():
         c = _AGENT_VERSIONS.get(spec["id"]) or {}
         if spec["path"] and now - c.get("checked_at", 0) > AGENT_VERSION_TTL:
@@ -245,7 +268,9 @@ def agent_status():
                      "error": "" if spec["path"] else "%s not found on the tracker's PATH" % spec["bin"],
                      "can_doctor": bool(spec["doctor"] and spec["path"]), "can_upgrade": bool(spec["path"]),
                      "restarts_sessions": bool(spec["restarts_sessions"]),
-                     "note": AGENT_AUTO_UPDATE_NOTE if spec["id"] == "claude" else ""})
+                     "note": AGENT_AUTO_UPDATE_NOTE if spec["id"] == "claude" else "",
+                     "can_resume_all": bool(spec["id"] == "claude" and tv is not None
+                                            and hasattr(tv, "term_gate") and tv.term_gate.allowed())})
         if spec["path"] and c.get("error"):
             rows[-1]["error"] = c["error"]
     if stale and not _AGENT_VLOCK.locked():
@@ -346,7 +371,6 @@ def _agent_outside(spec, installed, owned_pids, owned_ids):
 # --------------------------------------------------------------------------- start
 def agent_start(agent_id, action, confirm):
     """-> (202 | 400 | 409 | 500, body). confirm: None or a list of {tty, session} the user saw in the warning."""
-    global _AGENT_JOB, _AGENT_SEQ
     spec = _agent_spec(agent_id) if isinstance(agent_id, str) else None
     if spec is None:
         return 400, {"error": "unknown agent"}
@@ -360,18 +384,24 @@ def agent_start(agent_id, action, confirm):
         return 400, {"error": "confirm must be a list of {tty, session}"}
     if not spec["path"]:
         return 409, {"error": "%s not found on the tracker's PATH" % spec["bin"]}
+    fn, args = (_agent_job_doctor, (spec,)) if action == "doctor" else (_agent_job_upgrade, (spec, confirm))
+    return _agent_launch(agent_id, action, fn, args)
+
+
+def _agent_launch(agent, action, fn, args):
+    """The job-slot tail shared by every agent job. -> (202 | 409 | 500, body)."""
+    global _AGENT_JOB, _AGENT_SEQ
     if not _AGENT_JOB_LOCK.acquire(blocking=False):
         return 409, {"error": "an agent job is already running", "job": _agent_snapshot()}
     if _APPLY.locked():
         _AGENT_JOB_LOCK.release()
         return 409, {"error": "the tracker is updating itself — try again after it restarts"}
     _AGENT_SEQ += 1
-    job = {"id": _AGENT_SEQ, "agent": agent_id, "action": action, "state": "running", "step": "",
+    job = {"id": _AGENT_SEQ, "agent": agent, "action": action, "state": "running", "step": "",
            "started": time.time(), "finished": None, "old": None, "new": None, "output": "", "items": [],
            "outside": [], "summary": ""}
     with _AGENT_JLOCK:
         _AGENT_JOB = job
-    fn, args = (_agent_job_doctor, (spec,)) if action == "doctor" else (_agent_job_upgrade, (spec, confirm))
     try:
         threading.Thread(target=_agent_thread, args=(job, fn, args), name="agent-" + action, daemon=True).start()
     except RuntimeError as e:
@@ -391,9 +421,109 @@ def _agent_thread(job, fn, args):
         _AGENT_JOB_LOCK.release()
 
 
-def _agent_fail(job, summary):
+def _agent_fail(job, summary, label="agent upgrade"):
     _agent_set(job, state="failed", summary=summary)
-    print("ai-tracker: agent upgrade: " + summary, flush=True)
+    print("ai-tracker: %s: %s" % (label, summary), flush=True)
+
+
+# --------------------------------------------------------------------------- resume all prior terminals
+def _agent_ra_body(plan, error=""):
+    """The 409 picker body for a plan from term_vt.resume_all_plan (idle is server-only and stripped)."""
+    opn, cannot = plan["open"], plan["cannot"]
+    msg = AGENT_RA_NONE if not opn and not cannot else AGENT_RA_MESSAGE + ("" if opn else AGENT_RA_NONE_OPENABLE)
+    free = plan["free"]
+    pick = AGENT_RA_PICK % (free, "" if free == 1 else "s", plan["in_use"], plan["max"]) \
+        if any(not r["checked"] for r in opn) else ""
+    return {"needs_confirm": True, "error": error, "message": msg, "pick": pick,
+            "already": AGENT_RA_ALREADY % ", ".join(plan["already"]) if plan["already"] else "",
+            "note": AGENT_RA_NOTE % config.TERM_IDLE_TTL_MIN if opn else "",
+            "open": opn, "cannot": cannot, "free": free, "max": plan["max"]}
+
+
+def _agent_ra_gate():
+    """-> (tv, None) or (None, (409, body)): the refusals shared by the preview and the start."""
+    tv = _agent_tv()
+    if tv is None:
+        return None, (409, {"error": AGENT_RA_NO_TERMS})
+    if not tv.term_gate.allowed():
+        return None, (409, {"error": AGENT_RA_DISABLED})
+    if agent_job_running():
+        return None, (409, {"error": "an agent job is already running", "job": _agent_snapshot()})
+    if _APPLY.locked():
+        return None, (409, {"error": "the tracker is updating itself — try again after it restarts"})
+    return tv, None
+
+
+def agent_plan_resume_all():
+    """POST /api/terminals/resume-all with no confirm -> (409, picker body). No side effects."""
+    tv, refusal = _agent_ra_gate()
+    return refusal if refusal else (409, _agent_ra_body(tv.resume_all_plan()))
+
+
+def agent_start_resume_all(confirm):
+    """POST /api/terminals/resume-all {confirm: [session ids]} -> (202 | 400 | 409 | 500, body)."""
+    if not (isinstance(confirm, list) and 1 <= len(confirm) <= 64 and all(
+            isinstance(c, str) and 0 < len(c) <= 200 for c in confirm)):
+        return 400, {"error": "confirm must be a list of 1 to 64 session ids"}
+    confirm = list(dict.fromkeys(confirm))
+    tv, refusal = _agent_ra_gate()
+    if refusal:
+        return refusal
+    plan = tv.resume_all_plan()
+    want = set(confirm)
+    picked = [r for r in plan["open"] if r["session"] in want]
+    if not picked:
+        return 409, _agent_ra_body(plan, AGENT_RA_NONE_PICKED)
+    need = tv._ra_need([r["cwd"] for r in picked], set(plan["idle"]))
+    if need > plan["free"]:
+        return 409, _agent_ra_body(plan, AGENT_RA_TOO_MANY % (
+            len(picked), need, "" if need == 1 else "s", plan["free"], "is" if plan["free"] == 1 else "are"))
+    return _agent_launch("claude", "resume_all", _agent_job_resume_all, (confirm,))
+
+
+def _agent_job_resume_all(job, confirm):
+    tv = _agent_tv()
+    cm = _pending_lock()
+    got = cm.__enter__()
+    try:
+        if not got:
+            return _agent_fail(job, AGENT_RA_FAIL_SCAN, "resume all")
+        plan = tv.resume_all_plan()
+        want = set(confirm)
+        opn = {r["session"]: r for r in plan["open"]}
+        bad = {r["session"]: r for r in plan["cannot"]}
+        todo = [r for r in plan["open"] if r["session"] in want]
+        for sid in confirm:
+            if sid not in opn:
+                r = bad.get(sid) or {"session": sid, "title": sid[:8], "reason": AGENT_RA_GONE, "command": []}
+                _agent_push(job, _agent_item(dict(r, target=sid), "failed", r["reason"]))
+        for i, r in enumerate(todo, 1):
+            _agent_set(job, step=AGENT_RA_STEP % (i, len(todo), r["title"]))
+            cand = {"tty": "", "session": r["session"], "target": r["session"], "title": r["title"],
+                    "command": r["command"], "cols": r["cols"], "rows": r["rows"]}
+            try:
+                _agent_resume(job, tv, cand, False, AGENT_RA_REUSED)    # mode "resume", no prompt key
+            except Exception as e:
+                _agent_push(job, _agent_item(cand, "failed", str(e)))
+    finally:
+        cm.__exit__(None, None, None)
+    summary = _agent_ra_summary(job["items"])
+    _agent_set(job, summary=summary, state="done")
+    print("ai-tracker: resume all: " + summary, flush=True)
+
+
+def _agent_ra_summary(items):
+    ok = [i for i in items if i["outcome"] == "unprompted"]
+    bad = [i for i in items if i["outcome"] == "failed"]
+    s = ("Started resuming %d of %d prior terminal%s in the background: %s." % (
+        len(ok), len(items), "" if len(items) == 1 else "s",
+        ", ".join(_agent_name(i) + (" (opened as a copy, --fork-session)" if i.get("forked") else "") for i in ok))
+        if ok else "No prior terminal started resuming.")
+    if bad:
+        s += " Not opened: %s." % "; ".join("%s (%s)" % (_agent_name(i), i["detail"]) for i in bad)
+    if ok:
+        s += " " + AGENT_RA_NOTE % config.TERM_IDLE_TTL_MIN
+    return s
 
 
 # --------------------------------------------------------------------------- jobs
@@ -614,7 +744,7 @@ def _agent_clear_thin(tv, cand, kids=(), st=""):
     return _agent_was_busy(st, len(kids)), None
 
 
-def _agent_resume(job, tv, cand, busy):
+def _agent_resume(job, tv, cand, busy, reused=AGENT_RESUME_REUSED):
     body = {"session": cand["target"], "mode": "resume", "cols": cand["cols"], "rows": cand["rows"]}
     if busy:
         body["prompt"] = AGENT_RESUME_PROMPT
@@ -623,7 +753,7 @@ def _agent_resume(job, tv, cand, busy):
     code, obj = tv.call_route(tv.open_pty, body)
     obj = obj if isinstance(obj, dict) else {}
     if code == 200 and obj.get("attached"):     # attached to a pane that still runs it: nothing was typed
-        item.update(outcome="failed", detail=AGENT_RESUME_REUSED % obj.get("tty"))
+        item.update(outcome="failed", detail=reused % obj.get("tty"))
     elif code == 200:
         item.update(tty_after=obj.get("tty"), forked=bool(obj.get("forked")))
     else:

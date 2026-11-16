@@ -362,6 +362,12 @@ def restart_in_place(port, held=None):
                 print(recover, flush=True)
         except Exception:                      # a dead stdout must not block the exec
             pass
+        tv = sys.modules.get("aitracker.term_vt")
+        if tv is not None:
+            try:
+                tv.remember_terminals(final=True)     # the panes are about to close: record them first
+            except Exception:
+                pass
         _cloexec_all()
         os.execv(sys.executable, argv)
     except BaseException as e:                 # exec or anything before it failed: stay up, report, unlock

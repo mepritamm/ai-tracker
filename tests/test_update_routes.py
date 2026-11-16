@@ -141,6 +141,12 @@ class RunWiring(unittest.TestCase):
         self._run(boom)
         boom.assert_called_once()
 
+    def test_run_starts_the_terminal_recorder(self):
+        from aitracker import term_vt
+        with mock.patch.object(term_vt, "start_remember") as sr:
+            self._run(mock.Mock(return_value={"action": "skipped", "reason": "x"}))
+        sr.assert_called_once()
+
     def test_autoinstall_called_once_and_opt_out_env(self):
         ok = mock.Mock(return_value={"action": "skipped", "reason": "x"})
         self._run(ok)

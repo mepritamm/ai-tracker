@@ -1306,29 +1306,119 @@
 
   // Agents (Config): every sentence is server-written (agent_cli.py); the JS owns only button labels.
   var _agentJobTimer = null, _agentToasted = null, _agentWatchId = null;
-  function agentWatchJob(id) {
+  var _agentJobDone = null;
+  function _agentFireDone(j) { var cb = _agentJobDone; _agentJobDone = null; if (cb) cb(j); }
+  function agentWatchJob(id, onDone) {
     if (_agentJobTimer) {
+      if (onDone && _agentWatchId === id) _agentJobDone = onDone;
       if (_agentWatchId === id) return;
       clearInterval(_agentJobTimer); _agentJobTimer = null;
+      _agentFireDone(null);
     }
+    if (onDone) _agentJobDone = onDone;
     _agentWatchId = id;
     _agentJobTimer = setInterval(function () {
       crCall('/api/agents').then(function (r) {
         if (_agentWatchId !== id) return;
         if (!r.ok) return;
         var j = r.body.job;
-        if (!j || j.id !== id) { clearInterval(_agentJobTimer); _agentJobTimer = null; return; }
+        if (!j || j.id !== id) { clearInterval(_agentJobTimer); _agentJobTimer = null; _agentFireDone(null); return; }
         if (j.state === 'running') return;
         clearInterval(_agentJobTimer); _agentJobTimer = null;
         if (_agentToasted !== j.id) { _agentToasted = j.id; toast({ title: j.summary, duration: 30000 }); }
+        _agentFireDone(j);
       });
     }, 2000);
+  }
+
+  // Resume all prior terminals: one widget, two hosts (Config -> Agents, Manage terminals). Every
+  // sentence comes from the server's plan; the JS owns the button labels only.
+  function resumeAllWidget(hooks) {
+    hooks = hooks || {};
+    var rp = null, busy = false, err = '', locked = false, boxes = [], confirmBtn = null;
+    var btn = crBtn('Resume all prior terminals', ask, 'cr-resume-all');
+    var panel = h('div', { class: 'cr-update-confirm cr-resume-all-confirm', role: 'alertdialog' });
+    panel.hidden = true;
+    function ticked() { return boxes.filter(function (b) { return b.cb.checked; }); }
+    function paintBtn() {
+      if (busy || locked) btn.setAttribute('disabled', 'disabled'); else btn.removeAttribute('disabled');
+    }
+    function paintConfirm() {
+      if (!confirmBtn) return;
+      var n = ticked().length;
+      confirmBtn.textContent = 'Resume ' + n + ' ticked';
+      if (n) confirmBtn.removeAttribute('disabled'); else confirmBtn.setAttribute('disabled', 'disabled');
+    }
+    function line(text) { return h('div', { class: 'cr-cfg-row-sub' }, [text]); }
+    function paint() {
+      paintBtn();
+      panel.innerHTML = '';
+      boxes = []; confirmBtn = null;
+      panel.className = 'cr-update-confirm cr-resume-all-confirm';
+      panel.hidden = !(rp || err);
+      var e = err || (rp && rp.error);
+      if (e) panel.appendChild(line(e));
+      if (!rp) return;
+      if (rp.message) panel.appendChild(h('div', { class: 'cr-update-confirm-text' }, [rp.message]));
+      if (rp.pick) panel.appendChild(line(rp.pick));
+      (rp.open || []).forEach(function (s) {
+        var cb = h('input', { type: 'checkbox' });
+        cb.checked = !!s.checked;
+        cb.addEventListener('change', paintConfirm);
+        boxes.push({ cb: cb, sid: s.session });
+        panel.appendChild(h('label', { class: 'cr-resume-all-row' }, [cb, ' ',
+          [s.title, cwdTail(s.cwd), timeAgo(s.seen)].filter(Boolean).join(' · ')]));
+      });
+      if (rp.already) panel.appendChild(line(rp.already));
+      (rp.cannot || []).forEach(function (c) {
+        panel.appendChild(line([c.title, c.reason].filter(Boolean).join(' · ')));
+        (c.command || []).forEach(function (cmd) { panel.appendChild(h('div', {}, [h('code', {}, [cmd])])); });
+      });
+      if (rp.note) panel.appendChild(line(rp.note));
+      if ((rp.open || []).length) {
+        confirmBtn = crBtn('Resume 0 ticked', go, 'cr-btn-danger');
+        panel.appendChild(confirmBtn);
+        paintConfirm();
+      }
+      panel.appendChild(crBtn('Cancel', function () { rp = null; err = ''; paint(); }));
+    }
+    function ask() {
+      err = ''; busy = true; paint();
+      crCall('/api/terminals/resume-all', 'POST', {}).then(function (r) {
+        if (r.status === 409 && r.body && r.body.needs_confirm) rp = r.body;
+        else err = (r.body && r.body.error) || 'request failed';
+        busy = false; paint();
+      });
+    }
+    function go() {
+      if (busy) return;
+      var ids = ticked().map(function (b) { return b.sid; });
+      var seen = boxes.map(function (b) { return b.sid; });   // the rows the user saw: their ticks survive a stale list
+      rp = null; busy = true; paint();
+      crCall('/api/terminals/resume-all', 'POST', { confirm: ids }).then(function (r) {
+        if (r.status === 202 && r.body && r.body.job) {
+          if (hooks.onStarted) hooks.onStarted(r.body.job);
+          agentWatchJob(r.body.job.id, function () { busy = false; paint(); if (hooks.onDone) hooks.onDone(); });
+          return;
+        }
+        busy = false;
+        if (r.status === 409 && r.body && r.body.needs_confirm) {
+          rp = r.body;
+          (rp.open || []).forEach(function (s) { if (seen.indexOf(s.session) >= 0) s.checked = ids.indexOf(s.session) >= 0; });
+        } else err = (r.body && r.body.error) || 'request failed';
+        paint();
+      });
+    }
+    paint();
+    return { btn: btn, panel: panel, lock: function (on) { locked = !!on; paintBtn(); } };
   }
 
   function agentsBlock() {
     if (crReadOnly()) return null;
     var wrap = h('div', { class: 'cr-agents-block' });
     var st = null, msg = '', plan = null, pending = false, poll = null;
+    var ra = resumeAllWidget({ onStarted: function (job) { st = st || {}; st.job = job; paint(); load(false); },
+      onDone: function () { load(false); } });
     function cmdLines(cmds) {
       return (cmds || []).map(function (c) { return h('div', {}, [h('code', {}, [c])]); });
     }
@@ -1389,6 +1479,7 @@
           if (running || !a.installed) u.setAttribute('disabled', 'disabled');
           ctl.appendChild(u);
         }
+        if (a.can_resume_all) { ra.lock(running); ctl.appendChild(ra.btn); }
         var sub = [h('div', {}, [a.error ? a.error : a.installed ? a.installed : a.checking ? 'checking…' : ''])];
         if (a.note) sub.push(h('div', {}, [a.note]));
         wrap.appendChild(h('div', { class: 'cr-cfg-row cr-agent-row' }, [
@@ -1400,6 +1491,7 @@
         ]));
       });
       if (msg && st) wrap.appendChild(h('div', { class: 'cr-cfg-row-sub' }, [msg]));
+      if (st && (st.agents || []).some(function (a) { return a.can_resume_all; })) wrap.appendChild(ra.panel);
       if (plan) wrap.appendChild(confirmBox());
       if (job) wrap.appendChild(jobView(job));
     }
@@ -2384,6 +2476,12 @@
     payload = payload || {};
     var chrome = buildChrome('manage-terminals', 'Manage terminals', null, '', false);
     var titleEl = chrome.panel.querySelector('.cr-dialog-title');
+    var ra = null;
+    function raParts() {
+      if (!payload.onRefresh || crReadOnly()) return null;
+      if (!ra) ra = resumeAllWidget({ onDone: function () { if (payload.onRefresh) payload.onRefresh(); } });
+      return ra;
+    }
     function paint() {
       chrome.body.innerHTML = '';
       if (payload.error) {
@@ -2404,6 +2502,8 @@
       titleEl.textContent = atCap ? (count + ' — free a slot') : ('Manage terminals — ' + count);
       if (!terms.length) {
         chrome.body.appendChild(emptyState({ title: 'No terminals running', body: 'Open one from the top bar’s + New terminal / + New Claude session.' }));
+        var r0 = raParts();
+        if (r0) { chrome.body.appendChild(h('div', { class: 'cr-cfg-footer' }, [r0.btn])); chrome.body.appendChild(r0.panel); }
         return;
       }
       var list = h('div', { class: 'cr-termcap-list' });
@@ -2507,11 +2607,12 @@
         // asking about — safe ONLY because of the two guards above.
         try { if (confirmBtn.focus) confirmBtn.focus(); } catch (e) {}
       } });
-      chrome.body.appendChild(h('div', { class: 'cr-cfg-footer' }, [
-        h('p', { class: 'cr-cfg-footer-note' }, ['Closing this dialog detaches; the kill button stops it.']),
-        closeAllBtn,
-        confirmRow,
-      ]));
+      var r1 = raParts();
+      var foot = [h('p', { class: 'cr-cfg-footer-note' }, ['Closing this dialog detaches; the kill button stops it.'])];
+      if (r1) foot.push(r1.btn);
+      foot.push(closeAllBtn, confirmRow);
+      chrome.body.appendChild(h('div', { class: 'cr-cfg-footer' }, foot));
+      if (r1) chrome.body.appendChild(r1.panel);
     }
     paint();
     // FIX: CR.dialogs.update(state) (dialogs.js's generic forwarder) hands its state blob

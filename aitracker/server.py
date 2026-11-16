@@ -11,7 +11,7 @@ from .registry import all_sessions, parse_any, search_all, search_session, drill
 from .pending import start_worker, load_report, item_detail, run_async
 from .schedule import sched_install, sched_uninstall, sched_status, autoinstall_once, _optout_path
 from .update import update_status, update_fetch, update_apply, start_restart, _APPLY
-from .agent_cli import agent_status, agent_plan_upgrade, agent_start, agent_job_running
+from .agent_cli import agent_status, agent_plan_upgrade, agent_start, agent_job_running, agent_plan_resume_all, agent_start_resume_all
 from .store import load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, save_model_keep, load_title_sync, save_title_sync, _load_json, _save_json
 # TITLES_FILE/PINS_FILE (below) are referenced live as config.TITLES_FILE/config.PINS_FILE at
 # their write sites, never imported by name -- a copied name freezes the value at import
@@ -717,6 +717,15 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(plan, 409)
             code, out = agent_start(agent, action, confirm)
             return self._json(out, code)
+        if p.path == "/api/terminals/resume-all":
+            ok, err = _local_caller(self)
+            if not ok:
+                return self._json({"error": err}, 403)
+            if not isinstance(body, dict):
+                return self._json({"error": "bad body: expected a JSON object"}, 400)
+            code, out = (agent_plan_resume_all() if body.get("confirm") is None
+                         else agent_start_resume_all(body.get("confirm")))
+            return self._json(out, code)
         if p.path == "/api/config":
             # Writes a runtime setting into config.json (see config.py's big module comment
             # for the precedence/liveness contract). ALLOWLIST-ONLY: `key` must be a member of
@@ -1062,6 +1071,9 @@ def run(host="127.0.0.1", port=8790, open_browser=True):
     actual = srv.server_address[1]
     publish_endpoint(actual)
     start_worker()
+    tv = sys.modules.get("aitracker.term_vt")     # literal module name (the bundler forbids package-relative lookups here)
+    if tv is not None:
+        tv.start_remember()                        # via the module attribute, so tests/__init__.py's stub applies
     if os.environ.get("TRACKER_SCHEDULER_AUTOINSTALL") != "0":
         threading.Thread(target=_autoinstall_thread, name="sched-autoinstall", daemon=True).start()
     tunnel.autostart(actual, host)   # config.json TUNNEL_ON=true from a previous run -> bring it back up

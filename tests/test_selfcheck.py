@@ -1491,4 +1491,11 @@ def _run():
             and __import__("aitracker.providers.claude", fromlist=["x"]).session_state("x", "shell") == "busy"), \
         "agent upgrade: descriptors / version parser / warning text / busy rule"
 
+    from aitracker import term_vt as _tv
+    _E = {"cwd": "/x", "title": "", "seen": 1, "cols": 80, "rows": 24}
+    _rd = {"a": dict(_E)}
+    assert _tv._merge_terms(_rd, {}) is False and _rd == {"a": _E}, "resume-all: an empty tick never rewrites the history"
+    assert _tv._merge_terms(_rd, {"b": dict(_E, seen=2)}) and set(_rd) == {"a", "b"}, "resume-all: closed sessions stay listed"
+    assert _tv._ra_need(["/a", "/a", "/b"], {"/a"}) == 2, "resume-all: an idle folder shell is reused once"
+
     print("selfcheck ok")

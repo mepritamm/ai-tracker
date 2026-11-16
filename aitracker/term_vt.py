@@ -4353,9 +4353,11 @@ def _claude_work_children(claude_pid, strict=False):
     return kids
 
 
-def upgrade_candidates():
+def upgrade_candidates(light=False):
     """The tracker panes whose foreground is a Claude, as agent-upgrade rows (plan 5.3). Forks `ps`:
-    never call under _LOCK. Never raises (-> [])."""
+    never call under _LOCK. Never raises (-> []). light=True (the last_terms recorder) keeps the pane walk,
+    the pid-file-beats-label session id and the daemon target, but skips the transcript parse, `ps` and
+    argv work only agent-upgrade needs (thin/needs_slot/stoppable/command come back as inert defaults)."""
     try:
         with _LOCK:
             _reap()
@@ -4382,18 +4384,20 @@ def upgrade_candidates():
             relabelled = label if (label and sid != label) else ""
             bg = _background_target(sid) if sid else ""
             daemon = bool(bg)
-            thin = bool(_thin_client_short(pg))
+            thin = False if light else bool(_thin_client_short(pg))
             target = bg or sid
             entry = e
             if daemon:
                 entry = next((r for r in run.values() if r.get("id") == bg and r.get("kind") == "bg"), None)
             version = entry.get("version", "") if entry else ""
             short = (entry.get("job") or "") if daemon and entry else ""
-            cwd_to = term_gate.session_cwd(target, resume=True) if target else ""
-            needs_slot = not any(q.folder and q.cwd == cwd_to and (q is p or (q.fg is None and _fg_pgid(q) == q.pid))
+            cwd_to = "" if light else (term_gate.session_cwd(target, resume=True) if target else "")
+            needs_slot = False if light else not any(q.folder and q.cwd == cwd_to and (q is p or (q.fg is None and _fg_pgid(q) == q.pid))
                                  for q in panes)
             stoppable, reason, argv = True, "", None
-            if not sid:
+            if light:
+                stoppable = False
+            elif not sid:
                 stoppable, reason = False, ("the tracker cannot tell which session this terminal runs "
                                             "(for example Claude's agent view)")
             elif not term_gate.allowed():
@@ -4410,7 +4414,9 @@ def upgrade_candidates():
                     stoppable, reason = False, "could not find its background job"
                 elif stoppable and thin and not daemon:
                     stoppable, reason = False, "could not find its background job"
-            if daemon:
+            if light:
+                command = []
+            elif daemon:
                 command = ["claude stop " + short, "claude --resume " + bg]
             else:
                 command = [shlex.join(argv)] if argv else []
@@ -4437,6 +4443,200 @@ def upgrade_candidates():
         return rows
     except Exception:
         return []
+
+
+# --- the "Resume all prior terminals" record (aitracker/last_terms.json) -----------------------------
+# One flat dict {session id: {cwd, title, seen, cols, rows}}, merged across every tracker run from this
+# checkout. Entries are only ever added or refreshed, never removed because a pane closed, and a tick with
+# no live Claude pane never writes. Written through store._update_json (locked, atomic).
+LAST_TERMS_MAX = 32
+REMEMBER_EVERY = 15.0          # s between fingerprint checks
+REMEMBER_FULL_EVERY = 60.0     # s between forced recomputes
+_REMEMBER_ON = False           # set only by start_remember(); False = never write (tests, bundle)
+_REMEMBER_STOP = threading.Event()
+_REMEMBER_LOCK = threading.Lock()  # serialises whole ticks (loop vs the restart thread)
+_LAST_FP, _LAST_FULL = None, 0.0
+
+
+def _pane_fingerprint():
+    """Cheap change detector for the open panes (syscalls only, no ps)."""
+    with _LOCK:
+        _reap()
+        return tuple(sorted((p.id, _fg_pgid(p) if p.folder else p.pid)
+                            for p in PTYS.values() if not p.done and not p.closing))
+
+
+def _entries(rows, now):
+    """{session id: entry} from upgrade_candidates() rows; rows with no target are skipped, first wins."""
+    out = {}
+    for r in rows:
+        t = r.get("target")
+        if t and t not in out:
+            out[t] = {"cwd": r["cwd"], "title": r["title"], "seen": now, "cols": r["cols"], "rows": r["rows"]}
+    return out
+
+
+def _merge_terms(d, live):
+    """Merge live entries into the stored dict d in place. False = do not write (no live entry)."""
+    if not live:
+        return False
+    for k in [k for k, v in d.items() if not (isinstance(k, str) and isinstance(v, dict)
+                                               and isinstance(v.get("seen"), (int, float)))]:
+        d.pop(k, None)
+    for sid, e in live.items():
+        old = d.get(sid) or {}
+        d[sid] = dict(e, seen=max(e["seen"], old.get("seen") or 0))
+    for k in sorted(d, key=lambda k: d[k]["seen"], reverse=True)[LAST_TERMS_MAX:]:
+        d.pop(k, None)
+    return True
+
+
+def remember_terminals(final=False):
+    """Merge the live Claude panes into the on-disk record. Never raises; a no-op unless start_remember ran."""
+    global _LAST_FP, _LAST_FULL
+    if not _REMEMBER_ON:
+        return
+    try:
+        with _REMEMBER_LOCK:
+            now, fp = time.time(), _pane_fingerprint()
+            if not fp:
+                return                                   # no pane open: nothing to record
+            if not final and fp == _LAST_FP and now - _LAST_FULL < REMEMBER_FULL_EVERY:
+                return
+            live = _entries(upgrade_candidates(light=True), now)   # forks ps: never under _LOCK (it isn't)
+            _LAST_FP, _LAST_FULL = fp, now
+            store._update_json(config.LAST_TERMS_FILE, lambda d: _merge_terms(d, live))
+    except Exception:
+        pass
+
+
+def _remember_loop():
+    while not _REMEMBER_STOP.wait(REMEMBER_EVERY):
+        remember_terminals()
+
+
+def start_remember():
+    """Turn recording on and start the daemon ticker. True when running."""
+    global _REMEMBER_ON
+    if _REMEMBER_ON:
+        return True
+    _REMEMBER_ON = True
+    _REMEMBER_STOP.clear()
+    try:
+        threading.Thread(target=_remember_loop, name="term-remember", daemon=True).start()
+    except RuntimeError:
+        _REMEMBER_ON = False
+        return False
+    return True
+
+
+def remembered_terminals():
+    """The remembered sessions, newest seen first, each entry plus "session". Never raises."""
+    try:
+        d = store._load_json(config.LAST_TERMS_FILE, {})
+        if not isinstance(d, dict):
+            return []
+        rows = [dict(v, session=k) for k, v in d.items()
+                if isinstance(k, str) and isinstance(v, dict) and isinstance(v.get("seen"), (int, float))]
+        rows.sort(key=lambda r: r["seen"], reverse=True)
+        return [r for r in rows if store._find_transcript(r["session"]) != ""][:LAST_TERMS_MAX]
+    except Exception:
+        return []
+
+
+# --- the "Resume all prior terminals" plan (read-only; plan 3.3) ---------------------------------------
+RA_ONLY_CLAUDE = "only Claude Code sessions can be resumed in a tracker terminal"
+RA_DAEMON = ("still running in Claude's background daemon; nothing was lost. Open it from its session row "
+             "to watch it")
+RA_DESKTOP = "open in the Claude desktop app"
+RA_TUI = ("running in another terminal (pid %d), outside this tracker's terminals; resuming it here would run it "
+          "twice. If you just restarted the tracker, wait a few seconds and press again")
+RA_ERROR = "could not check this session: %s"
+RA_NO_CWD = "its transcript or its folder no longer exists"
+
+
+def _ra_need(cwds, idle):
+    """Slots a list of open cwds costs. An idle folder shell takes one session free (typed into it);
+    every other open, or a second one for the same idle shell, is a new pty."""
+    used, n = set(), 0
+    for cwd in cwds:
+        if cwd in idle and cwd not in used:
+            used.add(cwd)
+        else:
+            n += 1
+    return n
+
+
+def resume_all_plan():
+    """What "Resume all prior terminals" would do, with no side effects: {open, cannot, already, free, max,
+    in_use, idle}. Forks `ps` (running_sessions): never call under _LOCK. Never raises (-> empty plan)."""
+    try:
+        ents = remembered_terminals()
+        c = _provider()
+        hosts = {}
+        if c is not None:
+            try:
+                for r in c.running_sessions():
+                    hosts.setdefault(r["id"], []).append(r)
+            except Exception:
+                hosts = {}
+        with _LOCK:
+            _reap()
+            in_use = _live_count()
+            idle = {p.cwd for p in PTYS.values()
+                    if p.folder and not p.done and not p.closing and p.fg is None and _fg_pgid(p) == p.pid}
+            is_open = {e["session"]: _session_pty(e["session"]) is not None for e in ents}
+        opened, cannot, already = [], [], []
+        for e in ents:
+            try:
+                sid, cwd = e["session"], e.get("cwd") or ""
+                title = ((c.session_label(sid) if c is not None else "") or e.get("title") or
+                         os.path.basename(cwd) or sid[:8])
+                row = {"session": sid, "title": title, "cwd": cwd, "seen": e.get("seen"),
+                       "cols": e.get("cols"), "rows": e.get("rows"), "reason": "", "command": [], "checked": False}
+                hs = hosts.get(sid, [])
+                reason = ""
+                if not _is_claude(sid):
+                    reason = RA_ONLY_CLAUDE
+                elif is_open.get(sid):
+                    already.append(title)
+                    continue
+                elif any(h.get("host") == "daemon" for h in hs) or _background_target(sid):
+                    reason = RA_DAEMON
+                elif any(h.get("host") == "desktop" for h in hs):
+                    reason = RA_DESKTOP
+                elif any(h.get("host") == "tui" for h in hs):
+                    reason = RA_TUI % next(h.get("pid") or 0 for h in hs if h.get("host") == "tui")
+                else:
+                    argv = None
+                    try:
+                        argv = term_gate.resume_argv(sid)
+                    except gateway.GatewayError as err:
+                        reason = str(err)
+                    if not reason:
+                        cwd2 = term_gate.session_cwd(sid, resume=True, fast=True)
+                        if cwd2:
+                            row["cwd"], row["command"] = cwd2, [shlex.join(argv)]
+                        else:
+                            reason = RA_NO_CWD
+                row["reason"] = reason
+                (cannot if reason else opened).append(row)
+            except Exception as err:
+                cannot.append({"session": e.get("session", ""), "title": str(e.get("session", ""))[:8],
+                               "cwd": e.get("cwd") or "", "seen": e.get("seen"), "cols": e.get("cols"),
+                               "rows": e.get("rows"), "reason": RA_ERROR % err, "command": [], "checked": False})
+        free = max(0, config.MAX_TERMS - in_use)
+        ticked = []
+        for row in opened:
+            row["checked"] = _ra_need(ticked + [row["cwd"]], idle) <= free
+            if row["checked"]:
+                ticked.append(row["cwd"])
+        return {"open": opened, "cannot": cannot, "already": already, "free": free, "max": config.MAX_TERMS,
+                "in_use": in_use, "idle": sorted(idle)}
+    except Exception as err:
+        print("ai-tracker: resume all: plan failed: %s" % err, flush=True)
+        return {"open": [], "cannot": [], "already": [], "free": 0, "max": getattr(config, "MAX_TERMS", 0),
+                "in_use": 0, "idle": []}
 
 
 def _claude_busy(pt):
