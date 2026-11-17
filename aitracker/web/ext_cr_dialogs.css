@@ -354,13 +354,14 @@
 .cr .cr-cfg-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 
 .cr .cr-cfg-row {
-  display: flex; align-items: center; gap: 12px;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 12px;
   padding: 10px 0; border-bottom: 1px solid var(--line-subtle, #E7E2D5);
 }
-.cr .cr-cfg-row-label { flex: 1; min-width: 0; }
+.cr .cr-cfg-row-label { flex: 1 1 200px; min-width: 0; }
 .cr .cr-cfg-row-name { font: 600 12.5px var(--font-sans, sans-serif); display: flex; align-items: center; gap: 6px; }
-.cr .cr-cfg-row-sub { font: 400 10px var(--font-mono, monospace); color: var(--text-muted, #877866); margin-top: 2px; }
-.cr .cr-restart-note { color: var(--text-awaiting, #9A4F19); }
+.cr .cr-cfg-row-sub { font: 400 11.5px/1.45 var(--font-sans, sans-serif); color: var(--text-muted, #877866); margin-top: 2px; }
+.cr .cr-restart-note { display: block; margin-top: 3px; font: 600 10.5px/1.3 var(--font-sans, sans-serif); color: var(--text-awaiting, #9A4F19); }
+.cr .cr-cfg-row-sub.cr-claude-login-status { color: var(--text-secondary, #4A4237); }
 .cr .cr-envchip {
   font: 600 9.5px var(--font-mono, monospace);
   padding: 1px 6px; border-radius: var(--radius-sm, 4px);
@@ -368,8 +369,9 @@
   border: 1px solid var(--line-default, #CFC7B7);
   color: var(--text-secondary, #4A4237);
 }
-.cr .cr-cfg-row-control { flex: none; }
-.cr .cr-readonly { color: var(--text-muted, #877866); }
+.cr .cr-cfg-row-control { flex: 0 1 auto; min-width: 0; max-width: 100%; margin-left: auto; }
+.cr .cr-cfg-row-control > .cr-btn + .cr-btn { margin-left: 6px; }
+.cr .cr-readonly { color: var(--text-muted, #877866); font-size: 12px; line-height: 1.4; }
 .cr .cr-restart-badge {
   font: 600 10px var(--font-mono, monospace); text-transform: uppercase;
   padding: 2px 8px; border-radius: var(--radius-pill, 999px);
@@ -658,3 +660,33 @@
 
 .cr .cr-dialog-login .cr-login-term { position: relative; height: min(60vh, 520px); overflow: hidden; }
 .cr .cr-dialog-login .cr-login-term .vttermwrap { height: 100%; }
+
+/* Confirm panels (Resume all, Agents upgrade, Update row): a readable card. Hidden via the [hidden] rule below. */
+.cr .cr-update-confirm {
+  margin-top: 10px; padding: 12px 14px;
+  border: 1px solid var(--line-subtle, #E7E2D5); border-radius: var(--radius-md-min, 8px);
+  background: var(--surface-sunken, #F4F1E8);
+  font: 400 12.5px/1.5 var(--font-sans, sans-serif); color: var(--text-secondary, #4A4237);
+}
+.cr .cr-update-confirm[hidden] { display: none; }
+.cr .cr-update-confirm > * + * { margin-top: 8px; }
+.cr .cr-update-confirm > button + button { margin-left: 6px; }
+.cr .cr-update-confirm-text { font: 400 12.5px/1.5 var(--font-sans, sans-serif); color: var(--text-primary, #1E1B17); }
+.cr .cr-cfg-row > .cr-update-confirm { flex: 1 1 100%; margin-top: 0; }
+.cr .cr-resume-all-list {
+  border: 1px solid var(--line-subtle, #E7E2D5); border-radius: 6px;
+  background: var(--surface-raised, #fff); overflow: hidden;
+}
+.cr .cr-resume-all-row {
+  display: flex; align-items: flex-start; gap: 10px; padding: 8px 10px; cursor: pointer;
+  border-bottom: 1px solid var(--line-subtle, #E7E2D5);
+}
+.cr .cr-resume-all-row:last-child { border-bottom: none; }
+.cr .cr-resume-all-row:hover { background: var(--surface-sunken, #F4F1E8); }
+.cr .cr-resume-all-row input { flex: none; margin: 2px 0 0; }
+.cr .cr-resume-all-row-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.cr .cr-resume-all-row-title { font: 600 12.5px/1.35 var(--font-sans, sans-serif); color: var(--text-primary, #1E1B17); overflow-wrap: anywhere; }
+.cr .cr-resume-all-row-meta { font: 400 10.5px var(--font-mono, monospace); color: var(--text-muted, #877866); }
+.cr .cr-resume-all-note { font: 400 11px/1.45 var(--font-sans, sans-serif); color: var(--text-muted, #877866); }
+.cr .cr-confirm-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 6px; padding-top: 2px; }
+.cr .cr-update-confirm code, .cr .cr-resume-all-row-meta { overflow-wrap: anywhere; }

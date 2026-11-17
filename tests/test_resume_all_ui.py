@@ -126,6 +126,9 @@ var T = [{ tty: '/dev/ttys1', cwd: '/p', started: 1, session: '', mode: '' }];
   btn.fire('click'); await settle();
   OUT.ask_call = calls[0];
   OUT.panel_text = text(panel);
+  OUT.list_n = all(panel, hasCls('cr-resume-all-list')).length;
+  OUT.row_n = all(panel, hasCls('cr-resume-all-row')).length;
+  OUT.actions_btns = all(all(panel, hasCls('cr-confirm-actions'))[0] || {children:[]}, function (x) { return x.tag === 'button'; }).map(function (b) { return b.textContent; });
   var cbs = all(panel, function (x) { return x.tag === 'input'; });
   OUT.cb_n = cbs.length; OUT.cb_checked = cbs.map(function (c) { return c.checked; });
   OUT.cmd = text(panel).indexOf('CMD-X') >= 0;
@@ -202,6 +205,11 @@ class ResumeAllNode(unittest.TestCase):
         self.assertTrue(self.O["cmd"])
         self.assertEqual(self.O["cb_n"], 2)
         self.assertEqual(self.O["cb_checked"], [True, False])
+
+    def test_panel_structure(self):
+        self.assertEqual(self.O["list_n"], 1)
+        self.assertEqual(self.O["row_n"], 2)
+        self.assertEqual(self.O["actions_btns"], ["Resume 1 ticked", "Cancel"])
 
     def test_picker_survives_update(self):
         self.assertTrue(self.O["kept_panel"])

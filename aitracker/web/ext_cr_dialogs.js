@@ -921,7 +921,7 @@
         h('div', { class: 'cr-cfg-row-name' }, [label, envVar ? h('code', { class: 'cr-envchip' }, [envVar]) : null]),
         h('div', { class: 'cr-cfg-row-sub' }, [
           sub,
-          restart ? h('span', { class: 'cr-restart-note' }, [' — takes effect on restart']) : null,
+          restart ? h('span', { class: 'cr-restart-note' }, ['Takes effect on restart']) : null,
         ]),
       ]),
       h('div', { class: 'cr-cfg-row-control' }, [].concat(control)),
@@ -1252,14 +1252,16 @@
         h('div', { class: 'cr-cfg-row-name' }, ['Update']),
         h('div', { class: 'cr-cfg-row-sub cr-update-status' }, lines.map(function (l) { return h('div', {}, [l]); })),
       ]));
+      wrap.appendChild(ctl);
       if (confirmText) {
-        ctl.appendChild(h('div', { class: 'cr-update-confirm', role: 'alertdialog' }, [
-          h('span', { class: 'cr-update-confirm-text' }, [confirmText]),
-          crBtn('Update anyway', function () { confirmText = ''; applyNow(true); }, 'cr-btn-danger cr-update-yes'),
-          crBtn('Cancel', function () { confirmText = ''; paint(); }, 'cr-update-no'),
+        wrap.appendChild(h('div', { class: 'cr-update-confirm', role: 'alertdialog' }, [
+          h('div', { class: 'cr-update-confirm-text' }, [confirmText]),
+          h('div', { class: 'cr-confirm-actions' }, [
+            crBtn('Update anyway', function () { confirmText = ''; applyNow(true); }, 'cr-btn-danger cr-update-yes'),
+            crBtn('Cancel', function () { confirmText = ''; paint(); }, 'cr-update-no'),
+          ]),
         ]));
       }
-      wrap.appendChild(ctl);
     }
     function load() {
       crCall('/api/update').then(function (r) {
@@ -1444,26 +1446,31 @@
       if (!rp) return;
       if (rp.message) panel.appendChild(h('div', { class: 'cr-update-confirm-text' }, [rp.message]));
       if (rp.pick) panel.appendChild(line(rp.pick));
+      var list = h('div', { class: 'cr-resume-all-list' });
       (rp.open || []).forEach(function (s) {
         var cb = h('input', { type: 'checkbox' });
         cb.checked = !!s.checked;
         cb.addEventListener('change', paintConfirm);
         boxes.push({ cb: cb, sid: s.session });
-        panel.appendChild(h('label', { class: 'cr-resume-all-row' }, [cb, ' ',
-          [s.title, cwdTail(s.cwd), timeAgo(s.seen)].filter(Boolean).join(' · ')]));
+        list.appendChild(h('label', { class: 'cr-resume-all-row' }, [cb, h('span', { class: 'cr-resume-all-row-text' }, [
+          h('span', { class: 'cr-resume-all-row-title' }, [s.title || s.session || '']),
+          h('span', { class: 'cr-resume-all-row-meta' }, [[cwdTail(s.cwd), timeAgo(s.seen)].filter(Boolean).join(' · ')])])]));
       });
+      if (boxes.length) panel.appendChild(list);
       if (rp.already) panel.appendChild(line(rp.already));
       (rp.cannot || []).forEach(function (c) {
         panel.appendChild(line([c.title, c.reason].filter(Boolean).join(' · ')));
         (c.command || []).forEach(function (cmd) { panel.appendChild(h('div', {}, [h('code', {}, [cmd])])); });
       });
-      if (rp.note) panel.appendChild(line(rp.note));
+      if (rp.note) panel.appendChild(h('div', { class: 'cr-resume-all-note' }, [rp.note]));
+      var actions = h('div', { class: 'cr-confirm-actions' });
       if ((rp.open || []).length) {
         confirmBtn = crBtn('Resume 0 ticked', go, 'cr-btn-danger');
-        panel.appendChild(confirmBtn);
+        actions.appendChild(confirmBtn);
         paintConfirm();
       }
-      panel.appendChild(crBtn('Cancel', function () { rp = null; err = ''; paint(); }));
+      actions.appendChild(crBtn('Cancel', function () { rp = null; err = ''; paint(); }));
+      panel.appendChild(actions);
     }
     function ask() {
       err = ''; busy = true; paint();

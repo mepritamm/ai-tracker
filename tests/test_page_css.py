@@ -347,6 +347,29 @@ class TestPageCSS(unittest.TestCase):
         for tok in ("--state-pending", "--surface-pending", "--line-pending"):
             self.assertGreaterEqual(css.count(tok + ":"), 2, tok)
 
+    def test_config_rows_and_confirm_card(self):
+        """Config rows: sans prose, wrapping rows, shrinkable control, sized readonly; confirm card hides via [hidden]."""
+        import re
+        css = _extract_style_content(_read_page())
+
+        def body(sel):
+            m = re.search(sel + r"\s*\{([^}]*)\}", css)
+            self.assertIsNotNone(m, sel)
+            return m.group(1)
+
+        sub = body(r"\.cr\s+\.cr-cfg-row-sub")
+        self.assertIn("--font-sans", sub)
+        self.assertNotIn("--font-mono", sub)
+        self.assertRegex(body(r"\.cr\s+\.cr-cfg-row"), r"flex-wrap\s*:\s*wrap")
+        self.assertRegex(body(r"\.cr\s+\.cr-cfg-row-label"), r"flex\s*:\s*1 1 200px")
+        ctl = body(r"\.cr\s+\.cr-cfg-row-control")
+        self.assertRegex(ctl, r"min-width\s*:\s*0")
+        self.assertRegex(ctl, r"max-width\s*:\s*100%")
+        self.assertRegex(css, r"\.cr\s+\.cr-cfg-row-control\s*>\s*\.cr-btn\s*\+\s*\.cr-btn\s*\{[^}]*margin-left")
+        self.assertRegex(body(r"\.cr\s+\.cr-readonly"), r"font-size")
+        self.assertRegex(css, r"\.cr\s+\.cr-update-confirm\[hidden\]\s*\{[^}]*display\s*:\s*none")
+        self.assertGreater(css.index(".cr .cr-cfg-row-sub.cr-claude-login-status {"), css.index(".cr .cr-cfg-row-sub {"))
+
 
 if __name__ == "__main__":
     unittest.main()

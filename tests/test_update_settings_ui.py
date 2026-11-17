@@ -94,6 +94,8 @@ const SRC = require('fs').readFileSync(process.argv[2], 'utf8');
     buttons: btns(c).map(b => b.textContent),
     disabled: btns(c).filter(b => b.attrs.disabled).map(b => b.textContent),
     hidden: q(c) ? q(c).style.display === 'none' : null,
+    confirmParent: (q(c) && q(c).querySelector('.cr-update-confirm')) ? q(c).querySelector('.cr-update-confirm').parentNode.className : null,
+    confirmActions: (q(c) && q(c).querySelector('.cr-update-confirm')) ? q(c).querySelector('.cr-update-confirm').querySelectorAll('.cr-confirm-actions').length : 0,
   });
   if (SCEN.tab === 'Board') {
     out.before = info('cr-sched-block');
@@ -275,6 +277,11 @@ class UpdateBlock(unittest.TestCase):
                     updateSeq=[_git(started_at=100), _git(started_at=200)])
         self.assertIn("2 open terminals will close", r["after_Update and restart"]["text"])
         self.assertEqual(r["after_Update and restart"]["buttons"], ["Update anyway", "Cancel"])
+        # the confirm is a full-width sibling of the control, not squeezed inside it
+        self.assertIn("cr-update-block", r["after_Update and restart"]["confirmParent"])
+        self.assertNotIn("cr-cfg-row-control", r["after_Update and restart"]["confirmParent"])
+        self.assertEqual(r["after_Update and restart"]["confirmActions"], 1)
+        self.assertIsNone(r["after_Update anyway"]["confirmParent"])
         self.assertEqual(r["posts"], [["/api/update/apply", {"confirm_terminals": False}],
                                       ["/api/update/apply", {"confirm_terminals": True}]])
         self.assertEqual(r["reloads"], 1)
