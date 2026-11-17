@@ -2603,5 +2603,28 @@ class TestPendingWorkEndToEnd(_CrServerCase):
         self.assertNotIn("stale tmp", after["card"]["summary"])
 
 
+class TestMakeServeEnv(unittest.TestCase):
+    """`make serve` must leave PORT unset unless the caller set it (cli --serve reuses the
+    LaunchAgent plist's port only when PORT is absent from the env)."""
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _dry(self, *args, port=None):
+        env = {k: v for k, v in os.environ.items() if k != "PORT"}
+        if port is not None:
+            env["PORT"] = port
+        r = subprocess.run(["make", "-n", "serve", *args], cwd=self.ROOT, env=env,
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    @unittest.skipUnless(shutil.which("make"), "make not on PATH")
+    def test_port_only_passed_when_caller_set_it(self):
+        out = self._dry()
+        self.assertIn("python3 -m aitracker --serve", out)
+        self.assertNotIn("PORT=", out)
+        self.assertIn("PORT=9000 python3 -m aitracker --serve", self._dry("PORT=9000"))
+        self.assertIn("PORT=9001", self._dry(port="9001"))
+
+
 if __name__ == "__main__":
     unittest.main()
