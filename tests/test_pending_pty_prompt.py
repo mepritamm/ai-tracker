@@ -61,7 +61,6 @@ class OpenPtyRoutePrompt(unittest.TestCase):
              mock.patch.object(term_vt, "_start_backstop", return_value=False), \
              mock.patch.object(term_vt, "resolve_spawned"), \
              mock.patch.object(term_vt, "spawn", side_effect=self._fake_spawn), \
-             mock.patch.object(term_vt, "_warm_root"), \
              mock.patch.object(term_vt, "_login_watch",
                                side_effect=lambda pt, sid: self._watched.set()) as self.watch:
             term_vt.open_pty(h, None, dict(body, cols=80, rows=24))

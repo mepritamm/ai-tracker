@@ -1377,10 +1377,16 @@
             '<span class="crd-row1-actions">' +
               '<button class="crd-iconbtn" data-act="toggle-search" title="Search this session" aria-label="Search this session"><span class="crd-ico"></span><span class="crd-btn-label">Search</span></button>' +
               '<button class="crd-iconbtn crd-flagbtn" data-act="toggle-flag" title="Flag an issue" aria-label="Flag an issue"><span class="crd-ico"></span><span class="crd-btn-label">Flag</span><span class="crd-flag-badge" hidden></span></button>' +
-              '<button class="crd-btn crd-btn-solid" data-act="open-terminal">Open terminal</button>' +
-              '<button class="crd-btn crd-btn-outline" data-act="resume">Resume</button>' +
+              // Split button (termSplit, app.js): Resume is the primary; "Open terminal" and
+              // "External" live in the caret's list. A non-Claude id (Auggie) can't resume, so its
+              // primary is Open terminal instead (renderHeader toggles the two, then termSplitSync).
+              termSplit(
+                '<button class="crd-btn crd-btn-solid" data-act="resume">Resume</button>' +
+                '<button class="crd-btn crd-btn-solid" data-act="open-terminal" data-primary hidden>Open terminal</button>',
+                '<button class="crd-btn crd-btn-bare tsplit-item" data-act="open-terminal">Open terminal</button>' +
+                '<button class="crd-btn crd-btn-bare tsplit-item" data-act="external" hidden>External</button>',
+                "crd-btn crd-btn-outline") +
               '<button class="crd-btn crd-btn-ai" data-act="toggle-note">Queue a note</button>' +
-              '<button class="crd-btn crd-btn-bare" data-act="external" hidden>External</button>' +
             "</span>" +
           "</div>" +
           '<div class="crd-id-row2">' +
@@ -1782,6 +1788,7 @@
         ui.narrAcc = null; ui.timelineEntries = null;
         ui.diagramEntries = []; ui.timelineSeen = 0; ui.timelineStuckLatest = true;
         ui.flagOpen = ui.noteOpen = ui.searchOpen = false;
+        termSplitClose();
         [".crd-flagcard", ".crd-notecard", ".crd-searchcard"].forEach(function (c) {
           var e = qs(node, c); if (e) e.hidden = true;
         });
@@ -2542,6 +2549,14 @@
 
     var isLocalhost = /^(localhost|127\.0\.0\.1)/.test(location.hostname);
     qs(node, '[data-act="external"]').hidden = !isLocalhost;
+    // Split button: Resume is the primary for a Claude id; a non-Claude id (Auggie) can't resume
+    // (the server answers 400), so its primary is Open terminal and the list's copy is hidden --
+    // the same Claude-id rule the overlay and the classic pane use.
+    var resumable = !/^(auggie|augment-vscode|augment-cursor):/.test(String(session.id || sid || ""));
+    qs(node, '[data-act="resume"]').hidden = !resumable;
+    qs(node, '[data-act="open-terminal"][data-primary]').hidden = resumable;
+    qs(node, '.tsplit-item[data-act="open-terminal"]').hidden = !resumable;
+    termSplitSync(qs(node, ".tsplit"));
   }
 
   // FIX (design-audit drift 3): 5b renders fork lineage as a small card at the

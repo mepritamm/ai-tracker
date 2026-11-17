@@ -100,6 +100,55 @@ window.icoScale = ()=>_icoScale;
 // Raw glyph char for a name under the CURRENT style, or null in "icons" style — for generators
 // elsewhere (ext_cr_boot.js, ext_vt.js) that build their own markup/DOM instead of calling ico().
 window.icoChar = name=>_icoStyle==="emoji"?ICO_EMOJI[name]:_icoStyle==="text"?ICO_TEXT[name]:null;
+// ---- split button: primary action + a "▾" disclosure holding the secondary ones ----
+// ONE helper for the Control Room header, the CR terminal overlay bar and the classic pane (the
+// secondary "Open terminal" / "External ..." actions hide behind the caret beside Resume). Plain
+// <details>/<summary> disclosure: no ARIA menu roles. Returns the primary alone when there are no items.
+function termSplit(primaryHtml, itemsHtml, caretCls, soloLabel){
+  if(!itemsHtml)return primaryHtml;
+  const lbl=soloLabel?'<span class="tsplit-solo-label">'+soloLabel+'</span>':"";
+  return '<span class="tsplit">'+primaryHtml+
+    '<details class="tsplit-menu"><summary class="'+(caretCls||"")+' tsplit-caret" aria-label="More terminal actions" title="More terminal actions">'+
+    lbl+'<span aria-hidden="true">▾</span></summary><div class="tsplit-list">'+itemsHtml+'</div></details></span>';
+}
+// Re-derive visibility after a caller toggled [hidden] on primary/list buttons: the caret disappears
+// when the list has nothing visible; with no visible primary the caret carries `soloLabel`.
+function termSplitSync(split){
+  if(!split||!split.querySelector)return;
+  const menu=split.querySelector(".tsplit-menu");
+  if(!menu)return;
+  const items=menu.querySelectorAll(".tsplit-list button");
+  let any=false;
+  for(let i=0;i<items.length;i++)if(!items[i].hidden){any=true;break;}
+  menu.hidden=!any;
+  if(!any)menu.open=false;
+  let prim=false;
+  const kids=split.children||[];
+  for(let i=0;i<kids.length;i++)if(kids[i]!==menu&&!kids[i].hidden){prim=true;break;}
+  if(split.classList)split.classList.toggle("tsplit-solo",!prim);
+}
+function termSplitClose(except){
+  document.querySelectorAll(".tsplit-menu[open]").forEach(m=>{if(m!==except)m.open=false;});
+}
+function termSplitOnClick(e){
+  const t=e&&e.target;
+  const m=t&&t.closest?t.closest(".tsplit-menu"):null;
+  if(m&&t.closest(".tsplit-list")){m.open=false;return;}   // picking an item closes its menu
+  termSplitClose(m);                                       // outside click / another menu's caret
+}
+function termSplitOnKey(e){
+  if(e.key!=="Escape")return;
+  const t=e.target;
+  const m=t&&t.closest?t.closest(".tsplit-menu[open]"):null;
+  if(!m){termSplitClose();return;}   // Escape from elsewhere (xterm, a dialog): close stale menus silently, let the key through
+  m.open=false;
+  const sm=m.querySelector("summary");
+  if(sm&&sm.focus)sm.focus();
+  e.stopPropagation();e.preventDefault();   // keep the overlay's / page's own Escape handlers from also firing
+}
+document.addEventListener("click",termSplitOnClick,true);
+document.addEventListener("keydown",termSplitOnKey,true);
+window.termSplit=termSplit;window.termSplitSync=termSplitSync;window.termSplitClose=termSplitClose;
 // Apply a style + size, the way setTheme() applies a theme: set the root attribute/var, cache it,
 // re-render what is already on the page, then announce it so other modules can redraw.
 function applyIconStyle(style,scalePercent){

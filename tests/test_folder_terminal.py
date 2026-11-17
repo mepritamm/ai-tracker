@@ -1137,10 +1137,159 @@ def _timeline_pgid(t0, phases, shell):
     return _pgid
 
 
-# (The deferred-start queue tests that lived here pinned `_deferred_folder_start`, removed by S3 (L5):
-# a cold open now execs claude in a dedicated pty at once and never waits on the shell's rc files --
-# see tests/test_term_s3.py. The base's slow-start note (bc0f44e) now lives on the settle watcher
-# (`_folder_settled(on_slow=_slow_start_note(fp))`), pinned below.)
+class TestFreshFolderShellQueuesInsteadOfOverflow(unittest.TestCase):
+    SHELL, STARTUP_JOB = 61616, 61617
+
+    def setUp(self):
+        self._terminal0, self._auth0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        self._ptys0 = dict(term_vt.PTYS)
+        term_vt.PTYS.clear()
+        self._session_cwd0 = term_gate.session_cwd
+        _stub_kill(self)
+
+    def tearDown(self):
+        config.TERMINAL, config.AUTH = self._terminal0, self._auth0
+        term_vt.PTYS.clear()
+        term_vt.PTYS.update(self._ptys0)
+        term_gate.session_cwd = self._session_cwd0
+
+    def _open(self, cwd, phases, startup_wait=None, quiesce=0.05, note_after=60,
+              diag=" (running: fake-rc-job)"):
+        term_gate.session_cwd = lambda sid, resume=False: cwd
+        fixture = term_vt.Pty(tid="fresh1", pid=self.SHELL, fd=99, cwd=cwd)
+        t0 = [time.time()]
+        typed = []
+        pending_seen = []
+
+        def _quiet(pt, quiet_since=None):
+            pending_seen.append(pt.fg_pending)
+            time.sleep(quiesce)
+            return True
+
+        patches = {
+            "spawn": mock.patch.object(term_vt, "spawn", return_value=fixture),
+            "pgid": mock.patch.object(term_vt, "_fg_pgid",
+                                      side_effect=_timeline_pgid(t0, phases, self.SHELL)),
+            "quiet_window": mock.patch.object(term_vt, "INJECT_QUIET_WINDOW", 0.2),
+            "max_wait": mock.patch.object(term_vt, "INJECT_MAX_WAIT", 0.3),
+            "poll": mock.patch.object(term_vt, "FOLDER_STARTUP_POLL", 0.01),
+            "key_gap": mock.patch.object(term_vt, "INJECT_KEY_GAP", 0),
+            "quiesce": mock.patch.object(term_vt, "_wait_for_quiescence", side_effect=_quiet),
+            "write": mock.patch.object(
+                term_vt, "_inject_write",
+                side_effect=lambda pt, data: typed.append((time.time() - t0[0], data)) or True),
+            "backstop": mock.patch.object(term_vt, "_start_backstop", return_value=True),
+            "note": mock.patch.object(term_vt, "_feed_note"),
+            "resolve": mock.patch.object(term_vt, "resolve_spawned"),
+        }
+        if startup_wait is not None:
+            patches["wait"] = mock.patch.object(term_vt, "FOLDER_STARTUP_WAIT", startup_wait)
+        patches["note_after"] = mock.patch.object(term_vt, "FOLDER_STARTUP_NOTE", note_after)
+        patches["diag"] = mock.patch.object(term_vt, "_startup_diag", return_value=diag)
+        with contextlib.ExitStack() as st:
+            m = {k: st.enter_context(p) for k, p in patches.items()}
+            h = _FakeHandler()
+            t0[0] = time.time()
+            term_vt.open_pty(h, None, {"session": "S1", "mode": "resume", "cols": 80, "rows": 24})
+            obj, code = h.calls[-1]
+            self.assertIsNotNone(fixture.deferred, "a fresh shell must start deferred")
+            fixture.deferred.join(15)
+            self.assertFalse(fixture.deferred.is_alive())
+        return fixture, obj, code, typed, pending_seen, m
+
+    def test_slow_shell_startup_queues_the_resume_instead_of_spawning_overflow(self):
+        S, J = self.SHELL, self.STARTUP_JOB
+        fixture, obj, code, typed, _p, m = self._open(
+            "/tmp/fresh-slow", [(0.05, S), (0.25, J), (0.30, S), (1.0, J)])
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(m["spawn"].call_count, 1, "exactly one pty may be spawned")
+        self.assertEqual(obj["tty"], "fresh1")
+        self.assertTrue(obj["folder"])
+        self.assertIsNone(obj["notice"])
+        self.assertIn(b"claude --resume S1", b"".join(d for _t, d in typed))
+        self.assertGreaterEqual(typed[0][0], 1.0, "typed while the rc files still held the tty")
+        m["note"].assert_not_called()
+        self.assertEqual([p for p in term_vt.PTYS.values() if p.overflow], [])
+        self.assertEqual(len(term_vt.PTYS), 1)
+        self.assertEqual(fixture.fg.get("session"), "S1")
+        self.assertFalse(fixture.fg_pending)
+
+    def test_rc_job_longer_than_inject_max_wait_still_starts_claude(self):
+        S, J = self.SHELL, self.STARTUP_JOB
+        fixture, obj, code, typed, _p, m = self._open("/tmp/fresh-longrc", [(0.05, S), (1.0, J)])
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(len([1 for _t, d in typed if d == b"\r"]), 1)
+        self.assertGreaterEqual(typed[0][0], 1.0)
+        m["note"].assert_not_called()
+        self.assertEqual(len(term_vt.PTYS), 1)
+
+    def test_job_after_settle_retries_with_claim_still_pending(self):
+        S, J = self.SHELL, self.STARTUP_JOB
+        # Timeline (INJECT_QUIET_WINDOW 0.2): SHELL until 0.55, JOB 0.55-1.35, SHELL after. The settle
+        # completes at ~0.2-0.3 (>=0.24s inside SHELL); the quiescence stub (0.6s) ends ~0.8-0.9, so the
+        # first typing check lands inside JOB (>=0.25s past 0.55, >=0.44s before 1.35) -> deferred attempt
+        # fails with the claim pending; the shell re-settles after 1.35 and types once.
+        fixture, obj, code, typed, pending_seen, m = self._open(
+            "/tmp/fresh-retry", [(0.55, S), (1.35, J)], quiesce=0.6)
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(len([1 for _t, d in typed if d == b"\r"]), 1)
+        self.assertGreaterEqual(typed[0][0], 1.35)
+        self.assertEqual(pending_seen, [True, True])
+        m["note"].assert_not_called()
+        self.assertFalse(fixture.fg_pending)
+
+    def test_startup_wait_expiry_feeds_a_note_and_still_leaves_one_pty(self):
+        S, J = self.SHELL, self.STARTUP_JOB
+        phases = [(0.05 * (k + 1), J if k % 2 else S) for k in range(200)]
+        fixture, obj, code, typed, _p, m = self._open("/tmp/fresh-stuck", phases, startup_wait=0.5)
+        self.assertEqual(code, 200, obj)
+        self.assertEqual(m["spawn"].call_count, 1)
+        self.assertEqual(typed, [], "nothing may be typed into a shell that never reached a prompt")
+        self.assertTrue(m["note"].called, "the failure must be surfaced in the terminal")
+        self.assertIsNone(fixture.fg, "the claim must be released")
+        self.assertFalse(fixture.fg_pending)
+        self.assertFalse(fixture.starting)
+        self.assertEqual(len(term_vt.PTYS), 1)
+
+
+    # -- slow startup: keep waiting while the rc files still run, and say what it waits on --------
+
+    def test_startup_wait_outlasts_a_stale_pyenv_lock(self):
+        """A stale pyenv lock costs a typical .zshrc exactly 2x60s (two rehashes, pyenv's own 60s
+        lock timeout each) -- the old FOLDER_STARTUP_WAIT, so Resume gave up the instant the shell
+        would have come up. The wait must clear that with real margin."""
+        self.assertGreaterEqual(term_vt.FOLDER_STARTUP_WAIT, 2 * 60 * 2)
+
+    def test_startup_wait_expiry_gives_up_with_the_diagnosis(self):
+        S, J = self.SHELL, self.STARTUP_JOB
+        t = time.time()
+        fixture, obj, code, typed, _p, m = self._open(
+            "/tmp/fresh-pastwait", [(0.05, S), (30, J)], startup_wait=0.5)
+        self.assertLess(time.time() - t, 5, "the wait must bound the start")
+        self.assertEqual(typed, [])
+        text = m["note"].call_args[0][1]
+        self.assertIn("never reached its prompt (running: fake-rc-job)", text)
+        self.assertIsNone(fixture.fg)
+        self.assertFalse(fixture.starting)
+
+    def test_slow_start_feeds_one_progress_note_naming_the_job(self):
+        """The pane must never sit blank and silent for minutes (the first screenshot)."""
+        S, J = self.SHELL, self.STARTUP_JOB
+        fixture, obj, code, typed, _p, m = self._open(
+            "/tmp/fresh-note", [(0.05, S), (1.0, J)], note_after=0.3,
+            diag=" (running: pyenv rehash)")
+        self.assertIn(b"claude --resume S1", b"".join(d for _t, d in typed))
+        texts = [c[0][1] for c in m["note"].call_args_list]
+        self.assertEqual(len(texts), 1, texts)
+        self.assertIn("waiting for your shell's startup files (running: pyenv rehash)", texts[0])
+        self.assertIn("claude starts at the prompt", texts[0])
+
+    def test_fast_start_feeds_no_progress_note(self):
+        S, J = self.SHELL, self.STARTUP_JOB
+        fixture, obj, code, typed, _p, m = self._open("/tmp/fresh-fast", [(0.05, S)], note_after=5)
+        self.assertTrue(typed)
+        m["note"].assert_not_called()
 
 
 class TestSlowStartNoteOnSettleWatcher(unittest.TestCase):
@@ -1156,7 +1305,7 @@ class TestSlowStartNoteOnSettleWatcher(unittest.TestCase):
                 mock.patch.object(term_vt, "_startup_diag", return_value=diag), \
                 mock.patch.object(term_vt, "_feed_note") as note:
             t0[0] = time.time()
-            ok = term_vt._folder_settled(fp, time.time() + wait, False, term_vt._slow_start_note(fp))
+            ok = term_vt._folder_settled(fp, time.time() + wait, term_vt._slow_start_note(fp))
         return ok, fp, note
 
     def test_startup_wait_outlasts_a_stale_pyenv_lock(self):
@@ -1339,7 +1488,7 @@ class TestUnsettledFolderShellDefersInsteadOfOverflow(_OpenFixtureBase):
             mock.patch.object(term_vt, "resolve_spawned"),
         ]
 
-    def test_resume_into_a_shell_spawned_moments_ago_goes_dedicated_without_typing(self):
+    def test_resume_into_a_shell_spawned_moments_ago_defers_not_overflows(self):
         cwd = "/tmp/young-shell"
         term_gate.session_cwd = lambda sid, resume=False: cwd
         fp = term_vt.Pty(tid="young1", pid=self.SHELL, fd=99, cwd=cwd)
@@ -1357,14 +1506,13 @@ class TestUnsettledFolderShellDefersInsteadOfOverflow(_OpenFixtureBase):
             if fp.deferred is not None:
                 fp.deferred.join(15)
         self.assertEqual(code, 200, obj)
-        # S3: an unsettled shell is never claimed or waited on; the opener gets its own claude now.
-        self.assertEqual(obj["tty"], "ovf")
-        self.assertFalse(obj["folder"])
-        self.assertEqual(ms[0].call_count, 1)
-        self.assertEqual(ms[0].call_args[0][1][-2:], ["--resume", "S1"])
-        self.assertIsNone(fp.deferred)
-        self.assertEqual(typed, [])
-        self.assertIsNone(fp.fg)
+        self.assertEqual(obj["tty"], "young1")
+        self.assertTrue(obj["reused"])
+        self.assertTrue(obj["folder"])
+        ms[0].assert_not_called()
+        self.assertIsNotNone(fp.deferred)
+        self.assertTrue(typed and typed[0][0] >= 0.6, typed)
+        self.assertEqual([p for p in term_vt.PTYS.values() if p.overflow], [])
 
     def test_second_open_same_session_during_deferred_start_attaches(self):
         cwd = "/tmp/young-attach"

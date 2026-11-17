@@ -38,7 +38,7 @@ var toasts = [], posts = [];
 function mkEl() { return {hidden: undefined, textContent: "", title: "", classList: {toggle: function(){}}}; }
 var el, st;
 function reset(s) {
-  el = {modelPill: mkEl(), effortPill: mkEl(), loginPill: mkEl(), primaryGroup: mkEl(), status: mkEl(), ctxreadout: mkEl()};
+  el = {modelPill: mkEl(), effortPill: mkEl(), loginPill: mkEl(), status: mkEl(), ctxreadout: mkEl()};
   st = Object.assign({attached: true, loginOk: false, tty: "t1", ctx: null, cumulative: 0}, s || {});
 }
 function esc(x){return x;} function fmtTok(x){return x;}
@@ -48,6 +48,7 @@ var respond = {ok: true, status: 200, j: {ok: true}};
 function post(u, b) { posts.push([u, b]); return Promise.resolve(respond); }
 function j(r) { return Promise.resolve(r); }
 function close(){}
+function _syncSplit(){}   // the split button's own sync is covered by test_term_split_menu.py
 var ctx = {dialog: function(){}};
 reset({attached: true, loginOk: false}); _syncStatusBar(); out.hidden_off = el.loginPill.hidden;
 st.loginOk = true; _syncStatusBar(); out.shown_on = el.loginPill.hidden;

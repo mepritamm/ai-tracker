@@ -781,6 +781,70 @@ class TestServerEndToEnd(unittest.TestCase):
         self.assertEqual(st, 400)          # resume is meaningless without a session
         self.assertIn("session", j["error"])
 
+    def test_resume_twice_real_spawn_yields_one_terminal(self):
+        """Real ptys, real HTTP (the eval for the terminal-resume regression): Resume of one session,
+        a double POST and a second Resume all end with ONE listed terminal and one tty. Hermetic: a
+        tmp HOME and no ENV, so `/bin/sh -l` sources nobody's profile; the "claude" typed into the
+        root shell is a sleeping python."""
+        import uuid
+        from aitracker import term_gate, term_vt
+        root = os.path.realpath(tempfile.mkdtemp())
+        home = os.path.realpath(tempfile.mkdtemp())
+        sid = str(uuid.uuid4())
+        env = {"SHELL": "/bin/sh", "HOME": home}
+        removed = {k: os.environ.pop(k) for k in ("ENV",) if k in os.environ}
+        t0, a0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, ""
+        ptys0 = set(term_vt.PTYS)
+        try:
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(term_gate, "resume_argv",
+                                      side_effect=lambda s: [sys.executable, "-c", "import time;time.sleep(30)"]), \
+                    mock.patch.object(term_gate, "session_cwd", side_effect=lambda s, resume=False: root), \
+                    mock.patch.object(term_gate, "recorded_run_dir", side_effect=lambda s, meta=None: ("", "")):
+                body = {"session": sid, "mode": "resume", "cols": 80, "rows": 24}
+                st, first = self._post("/api/term/pty", body)
+                self.assertEqual(st, 200, first)
+                out = []
+                ts = [threading.Thread(target=lambda: out.append(self._post("/api/term/pty", body)))
+                      for _ in range(2)]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join(15)
+                st2, again = self._post("/api/term/pty", body)
+                rows, stable_since, deadline = None, None, time.time() + 10
+                while time.time() < deadline:
+                    _, data = self._get("/api/term/list")
+                    now = sorted(t["tty"] for t in json.loads(data)["terminals"] if t["tty"] not in ptys0)
+                    if now != rows:
+                        rows, stable_since = now, time.time()
+                    elif time.time() - stable_since >= 1.0:
+                        break
+                    time.sleep(0.1)
+            self.assertEqual(st2, 200, again)
+            self.assertEqual([s_ for s_, _ in out], [200, 200], out)
+            self.assertEqual({first["tty"], again["tty"]} | {j["tty"] for _, j in out}, {first["tty"]})
+            self.assertEqual(rows, [first["tty"]], "one Resume must be ONE terminal")
+            fp = term_vt.PTYS[first["tty"]]
+            end = time.time() + 20
+            while time.time() < end and term_vt._fg_pgid(fp) == fp.pid:
+                time.sleep(0.2)
+            self.assertNotEqual(term_vt._fg_pgid(fp), fp.pid, "claude (the stand-in) was started in the root shell")
+            self.assertEqual(fp.fg["session"], sid)
+        finally:
+            for k, v in removed.items():
+                os.environ[k] = v
+            config.TERMINAL, config.AUTH = t0, a0
+            for tid in list(term_vt.PTYS):
+                if tid not in ptys0:
+                    try:
+                        term_vt.PTYS[tid].kill()
+                    except Exception:
+                        pass
+            shutil.rmtree(root, ignore_errors=True)
+            shutil.rmtree(home, ignore_errors=True)
+
 
 class TestTermCountBadge(unittest.TestCase):
     """The sidebar's "☰ Manage terminals" badge (aitracker/web/ext_launch.js) folds the live

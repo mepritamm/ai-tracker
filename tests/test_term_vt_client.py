@@ -270,8 +270,11 @@ class TestExtLaunchStillPassesTier1Contract(unittest.TestCase):
         self.assertIn("window.ExtVT.open(cur,", self.src)
 
     def test_in_browser_buttons_are_built_before_the_localonly_gate(self):
-        # vtHtml is assembled unconditionally; nativeHtml is the only thing gated by localOnly().
-        self.assertLess(self.src.index("const vtHtml ="), self.src.index("if (localOnly())"))
+        # The in-browser buttons (openHtml/resumeHtml) are built unconditionally; nativeHtml is the only
+        # thing gated by localOnly(). (Expected change: vtHtml is now assembled AFTER the gate, because
+        # it wraps both through termSplit() -- the buttons themselves are still built before it.)
+        self.assertLess(self.src.index("const openHtml ="), self.src.index("if (localOnly())"))
+        self.assertLess(self.src.index("const resumeHtml ="), self.src.index("if (localOnly())"))
 
     def test_native_button_kept_as_secondary_control(self):
         # What this protects is that the NATIVE launch pair still exists as a secondary

@@ -1539,9 +1539,10 @@ class TestRoutes(unittest.TestCase):
             obj, code = h.calls[-1]
             self.assertEqual(code, 200)
             shell_argv = [os.environ.get("SHELL", "/bin/bash"), "-l"]
-            # S3: a cold open execs claude at once in a dedicated pty; the shell warms beside it
-            self.assertEqual(spawn_argv, [["claude"], shell_argv])
-            self.assertEqual(injected, [], "nothing is typed into the warming shell")
+            self.assertEqual(spawn_argv, [shell_argv],
+                              "mode=new against a fresh folder must spawn only the shell")
+            joined = b"".join(injected)
+            self.assertIn(b"claude", joined, "the shell must have `claude` typed into it")
         finally:
             term_vt.spawn = original_spawn
 
@@ -1636,9 +1637,10 @@ class TestRoutes(unittest.TestCase):
             obj, code = h.calls[-1]
             self.assertEqual(code, 200)
             shell_argv = [os.environ.get("SHELL", "/bin/bash"), "-l"]
-            # S3: a cold open execs claude at once in a dedicated pty; the shell warms beside it
-            self.assertEqual(calls, [(d, ["claude"]), (d, shell_argv)])
-            self.assertEqual(injected, [], "nothing is typed into the warming shell")
+            self.assertEqual(calls, [(d, shell_argv)],
+                              "mode=new against a fresh folder must spawn only the shell")
+            joined = b"".join(injected)
+            self.assertIn(b"claude", joined, "the shell must have `claude` typed into it")
 
     def test_pty_cwd_form_expands_tilde(self):
         """`~` in a session-less `cwd` is expanded server-side (the browser has no shell to do
@@ -5687,7 +5689,7 @@ class TestStartingFieldOnOpenPty(_ResumeModeRoutes):
     def test_starting_true_for_resume_mode(self):
         original_spawn = term_vt.spawn
         made = []
-        # cold open (S3): a dedicated claude first, then the warming root shell -- distinct tids
+        # cold resume: the root shell is spawned and claimed (sf1)
         term_vt.spawn = lambda cwd, argv, cols, rows: made.append(1) or term_vt.Pty(tid="sf%d" % len(made))
         try:
             with mock.patch.object(term_vt, "_resume_backstop"):
@@ -6139,8 +6141,10 @@ class TestGatewayLaunch(_ResumeModeRoutes):
 
     @staticmethod
     def _await_typed(h, injected, timeout=5):
-        """A cold `new` open (S3) execs the launcher in a dedicated pty at once -- nothing is typed
-        and nothing is deferred, so there is nothing to wait for; the launcher shows in spawn()'s argv."""
+        """Wait (bounded) for the Enter that ends the typed launcher line, when the open succeeded."""
+        deadline = time.time() + timeout
+        while b"\r" not in b"".join(injected) and h.calls[-1][1] == 200 and time.time() < deadline:
+            time.sleep(0.02)
 
     def _open(self, body):
         """open_pty with spawn + injection faked; returns (handler, spawn_calls, injected_bytes)."""
@@ -6151,7 +6155,10 @@ class TestGatewayLaunch(_ResumeModeRoutes):
              mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True), \
              mock.patch.object(term_vt, "_inject_write", side_effect=lambda pt, d: injected.append(d) or True):
             term_vt.open_pty(h, None, dict(body, cwd=self.tmpd))
-        return h, spawned, b"".join(injected) + b"".join((" ".join(a) + "\r").encode() for a in spawned)
+            # A fresh folder shell is started by a background thread (one terminal per session),
+            # so the launcher line is typed after open_pty returns; wait for it while faked.
+            self._await_typed(h, injected)
+        return h, spawned, b"".join(injected)
 
     def test_pty_new_openrouter_unconfigured_is_400_and_spawns_nothing(self):
         h, spawned, injected = self._open({"mode": "new", "gateway": "openrouter"})
@@ -6182,8 +6189,7 @@ class TestGatewayLaunch(_ResumeModeRoutes):
         d2 = tempfile.mkdtemp()
         h2 = _FakeHandler()
         inj2 = []
-        with mock.patch.object(term_vt, "spawn", side_effect=lambda cwd, argv, c, r: inj2.append((" ".join(argv) + "\r").encode())
-                               or term_vt.Pty(tid="gw-an")), \
+        with mock.patch.object(term_vt, "spawn", side_effect=lambda *a: term_vt.Pty(tid="gw-an")), \
              mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True), \
              mock.patch.object(term_vt, "_inject_write", side_effect=lambda pt, d: inj2.append(d) or True):
             term_vt.open_pty(h2, None, {"mode": "new", "cwd": d2})
@@ -6198,8 +6204,7 @@ class TestGatewayLaunch(_ResumeModeRoutes):
         self.assertIn(self.launcher.encode(), injected)
         d2 = tempfile.mkdtemp()
         h2, inj2 = _FakeHandler(), []
-        with mock.patch.object(term_vt, "spawn", side_effect=lambda cwd, argv, c, r: inj2.append((" ".join(argv) + "\r").encode())
-                               or term_vt.Pty(tid="gw-bad")), \
+        with mock.patch.object(term_vt, "spawn", side_effect=lambda *a: term_vt.Pty(tid="gw-bad")), \
              mock.patch.object(term_vt, "_wait_for_quiescence", return_value=True), \
              mock.patch.object(term_vt, "_inject_write", side_effect=lambda pt, d: inj2.append(d) or True):
             term_vt.open_pty(h2, None, {"mode": "new", "cwd": d2, "gateway": "bedrock"})   # ignored -> config

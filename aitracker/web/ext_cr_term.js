@@ -157,14 +157,16 @@
     bar.setAttribute("role", "toolbar");
     bar.setAttribute("aria-label", "Terminal controls");
     bar.innerHTML =
+      // Split button (termSplit, app.js): Resume is the primary for a Claude id and "Open terminal
+      // here" moves into the caret's list (_placeOpenHere); a non-Claude id keeps Open terminal
+      // here as the primary. External terminal / External resume always live in the list.
       '<div class="cr-term-group" data-group="primary">' +
-        '<button type="button" class="cr-term-btn cr-term-btn-solid" data-action="open-here">Open terminal here</button>' +
-        '<button type="button" class="cr-term-btn cr-term-btn-outline" data-action="resume-here" hidden>Resume terminal here</button>' +
-      '</div>' +
-      '<div class="cr-term-divider"></div>' +
-      '<div class="cr-term-group" data-group="external">' +
-        '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="ext-terminal" title="Open an external Terminal/iTerm window, cd\'d here — this machine only" hidden>' + ico('external') + ' External terminal</button>' +
-        '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="ext-resume" title="Resume via claude --resume in an external Terminal/iTerm window — this machine only" hidden>' + ico('external') + ' External resume</button>' +
+        termSplit(
+          '<button type="button" class="cr-term-btn cr-term-btn-solid" data-action="open-here">Open terminal here</button>' +
+          '<button type="button" class="cr-term-btn cr-term-btn-solid" data-action="resume-here" hidden>Resume terminal here</button>',
+          '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="ext-terminal" title="Open an external Terminal/iTerm window, cd\'d here — this machine only" hidden>' + ico('external') + ' External terminal</button>' +
+          '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="ext-resume" title="Resume via claude --resume in an external Terminal/iTerm window — this machine only" hidden>' + ico('external') + ' External resume</button>',
+          "cr-term-btn cr-term-btn-outline", "External") +
       '</div>' +
       '<div class="cr-term-divider"></div>' +
       '<div class="cr-term-group" data-group="windows">' +
@@ -254,7 +256,8 @@
       cwd: head.querySelector('[data-el="cwd"]'),
       resumecmd: head.querySelector('[data-el="resumecmd"]'),
       homenote: head.querySelector('[data-el="homenote"]'),
-      primaryGroup: bar.querySelector('[data-group="primary"]'),
+      split: bar.querySelector(".tsplit"),
+      splitList: bar.querySelector(".tsplit-list"),
       openHere: bar.querySelector('[data-action="open-here"]'),
       resumeHere: bar.querySelector('[data-action="resume-here"]'),
       extTerminal: bar.querySelector('[data-action="ext-terminal"]'),
@@ -409,6 +412,7 @@
 
   function close() {
     st.open = false;
+    termSplitClose();
     el.overlay.classList.remove("is-open");
     _stopPoll();
     engineGen++;   // supersede guard: no in-flight _openInline resolution may touch state after this
@@ -1120,8 +1124,6 @@
           el.homenote.hidden = !hn;
         }
         var resumable = isClaudeId(sid);
-        el.resumeHere.hidden = !resumable;
-        el.extResume.hidden = !resumable || !localOnly();
         if (resumable) {
           // server owns the launcher name; an explicit null (OpenRouter unconfigured) means "none to show"
           if ("resume_cmd" in m) { st.resumeCmd = m.resume_cmd; } else { st.resumeCmd = "claude --resume " + sid; }
@@ -1138,6 +1140,28 @@
     el.extTerminal.hidden = !local || extAllowed === false;
     el.extResume.hidden = !local || extAllowed === false || !isClaudeId(st.sessionId);
     if (local && extAllowed === null) _probeExternal();
+    _syncSplit();
+  }
+  // Which of the split's buttons is the primary (Claude id: Resume; otherwise Open terminal here)
+  // and which are visible. Attached terminal: only the two "…here" buttons hide -- External stays
+  // reachable (the caret then carries the "External" label, see termSplitSync).
+  function _placeOpenHere(resumable) {
+    if (!el.split || !el.splitList) return;
+    if (resumable) {
+      if (el.openHere.parentNode !== el.splitList) el.splitList.insertBefore(el.openHere, el.splitList.firstChild);
+      el.openHere.className = "cr-term-btn cr-term-btn-ghost";
+    } else {
+      if (el.openHere.parentNode === el.splitList) el.split.insertBefore(el.openHere, el.split.firstChild);
+      el.openHere.className = "cr-term-btn cr-term-btn-solid";
+    }
+  }
+  function _syncSplit() {
+    if (!el.split) return;
+    var resumable = isClaudeId(st.sessionId);
+    _placeOpenHere(resumable);
+    el.openHere.hidden = !!st.attached;
+    el.resumeHere.hidden = !!st.attached || !resumable;
+    termSplitSync(el.split);
   }
 
   // ===== status bar readout ==================================================================
@@ -1173,7 +1197,7 @@
     el.effortPill.hidden = !st.attached;
     el.loginPill.hidden = !st.loginOk;   // server-owned `login_ok`; render only
     // Hide "Open terminal here" / "Resume terminal here" once a terminal is actually attached
-    if (el.primaryGroup) el.primaryGroup.hidden = st.attached;
+    _syncSplit();
     if (st.attached) {
       // model-update-nudge: prefer the server's display label; the ladder match (st.model)
       // stays the fallback (and still drives the picker's highlight — see _openModelDialog).

@@ -620,7 +620,10 @@ class TestRenamedLaunchButtonsAndNewControls(unittest.TestCase):
         body = self.src[start:end]
         # The buttons are exactly vtHtml + nativeHtml; the only thing appended after them is the
         # server-owned term_home_note (a <div>, not a button group -- terminal-at-root L4).
-        self.assertIn("el.innerHTML = vtHtml + nativeHtml +\n      (homeNote ? '<div class=\"extlaunchnote\"", body)
+        # (expected change: the pair is now assembled through termSplit() -- Resume primary, the rest
+        # behind the caret -- so nativeHtml is an argument of vtHtml, not a second concatenand.)
+        self.assertIn("const vtHtml = termSplit(", body)
+        self.assertIn("el.innerHTML = vtHtml +\n      (homeNote ? '<div class=\"extlaunchnote\"", body)
         self.assertEqual(body.count("<button"), 4)
         self.assertNotIn("newHtml", body)
         self.assertNotIn("+ New terminal", body)

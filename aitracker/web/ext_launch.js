@@ -74,7 +74,7 @@
           // only the native sub-section hides -- the in-browser buttons are a different
           // feature/gate entirely and must not disappear because native launch was refused.
           const nat = document.getElementById("extnative");
-          if (nat) { nat.style.display = "none"; nat.innerHTML = ""; }
+          if (nat) { nat.style.display = "none"; nat.innerHTML = ""; termSplitSync(nat.closest(".tsplit")); }
         }
         alert(j.error || "failed to open terminal");
         return;
@@ -428,15 +428,15 @@
     el.style.display = "";
     const resumable = isClaudeId(cur);
 
-    const vtHtml =
+    const openHtml =
       '<button class="mini extlaunchbtn" id=extvtopenbtn ' +
       'title="Open a terminal right here in the browser, cd\'d to this session\'s working directory">' +
-      ico("play") + " Open terminal here</button>" +
-      (resumable
-        ? '<button class="mini extlaunchbtn" id=extvtresumebtn ' +
-          'title="Resume this session in a terminal right here in the browser (claude --resume)">' +
-          ico("redo") + " Resume terminal here</button>"
-        : "");
+      ico("play") + " Open terminal here</button>";
+    const resumeHtml = resumable
+      ? '<button class="mini extlaunchbtn" id=extvtresumebtn ' +
+        'title="Resume this session in a terminal right here in the browser (claude --resume)">' +
+        ico("redo") + " Resume terminal here</button>"
+      : "";
 
     let nativeHtml = "";
     if (localOnly()) {
@@ -460,8 +460,21 @@
     // Server-owned note (registry.parse_any -> meta.term_home_note); rendered verbatim, never derived
     // here. Empty (Auggie, or nothing to say) renders nothing.
     const homeNote = d && d.meta && typeof d.meta.term_home_note === "string" ? d.meta.term_home_note : "";
-    el.innerHTML = vtHtml + nativeHtml +
+    // Split button (termSplit, app.js): Resume is the primary for a Claude id with "Open terminal
+    // here" + the External pair in the caret's list; a non-Claude id has no Resume, so Open
+    // terminal here is the primary (alone, no caret, when there is no External either).
+    const vtHtml = termSplit(resumable ? resumeHtml : openHtml, (resumable ? openHtml : "") + nativeHtml, "mini extlaunchbtn");
+    // The pane is rebuilt on every 2 s poll: carry an open menu and the caret's focus across it.
+    const wasOpen = !!el.querySelector(".tsplit-menu[open]");
+    const ae = document.activeElement;
+    const hadFocus = !!(ae && ae.closest && ae.closest("#ext_launch .tsplit-caret"));
+    const fid = ae && ae.id && el.contains && el.contains(ae) ? ae.id : "";   // focus on a list item
+    el.innerHTML = vtHtml +
       (homeNote ? '<div class="extlaunchnote" data-el="homenote">' + esc(homeNote) + "</div>" : "");
+    const menu = el.querySelector(".tsplit-menu");
+    if (menu && wasOpen) menu.open = true;
+    if (menu && hadFocus) { const sm = menu.querySelector("summary"); if (sm) sm.focus(); }
+    else if (fid) { const f = document.getElementById(fid); if (f && f.focus) f.focus(); }
     const vb = document.getElementById("extvtopenbtn");
     if (vb) vb.onclick = () => window.ExtVT ? window.ExtVT.open(cur, "cwd") : alert("in-browser terminal unavailable");
     const vr = document.getElementById("extvtresumebtn");

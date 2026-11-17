@@ -307,13 +307,13 @@ class TestPageBundle(unittest.TestCase):
 _HOME_NOTE_HARNESS = r"""
 const fs = require('fs');
 const src = fs.readFileSync(process.argv[2], 'utf8');
-const els = {ext_launch: {style: {}, innerHTML: ''}};
+const els = {ext_launch: {style: {}, innerHTML: '', querySelector: () => null}};
 const EXT = [];
-const run = new Function('document', 'location', 'fetch', 'EXT', 'SIDE_EXT', 'ico', 'esc', 'toast', 'cur', 'window',
+const run = new Function('document', 'location', 'fetch', 'EXT', 'SIDE_EXT', 'ico', 'esc', 'toast', 'cur', 'window', 'termSplit',
   src.replace(/\bcur\b/g, 'cur') + '; return EXT;');
 const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-const doc = {getElementById: id => els[id] || null};
-const fns = run(doc, {hostname: 'example.com'}, () => Promise.resolve({}), EXT, [], n => '', esc, () => {}, 'abc', {});
+const doc = {getElementById: id => els[id] || null, activeElement: null};
+const fns = run(doc, {hostname: 'example.com'}, () => Promise.resolve({}), EXT, [], n => '', esc, () => {}, 'abc', {}, (p, i) => p + i);
 const out = {};
 for (const [k, d] of Object.entries(JSON.parse(process.argv[3]))) {
   els.ext_launch.innerHTML = '';

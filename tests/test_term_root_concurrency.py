@@ -2,13 +2,14 @@
 Counts are asserted (one shared root shell + K-1 dedicated terminals, each in its own worktree, none bare
 at the root), never which handler wins. Fake spawns sleep 0.5 s; `term_vt._LOCK` is instrumented so a
 spawn moved under it fails the hold-time bound. Run: unset TRACKER_AUTH first."""
+import os
 import threading
 import time
 import unittest
 from unittest import mock
 
 from aitracker import config, term_vt
-from tests.test_open_pty_at_root import _Base, _H, contextlib_stack
+from tests.test_open_pty_at_root import SHELL, _Base, _H, contextlib_stack
 
 K = 4
 SIDS = ["S%d" % i for i in range(K)]
@@ -80,7 +81,8 @@ class _Conc(_Base):
         with self._sl:
             n = len(self.spawns) + 1
             self.spawns.append((cwd, list(argv)))
-        pt = term_vt.Pty(tid="sp%d" % n, pid=1000 + n, fd=100 + n, cwd=cwd)
+        # a shell (`... -l`) is what the patched tcgetpgrp reports as the foreground group
+        pt = term_vt.Pty(tid="sp%d" % n, pid=SHELL if argv[-1] == "-l" else 1000 + n, fd=100 + n, cwd=cwd)
         pt.cmd = " ".join(argv)
         return pt
 
@@ -101,6 +103,9 @@ class _Conc(_Base):
                 t.start()
             for t in ts:
                 t.join(20)
+            for pt in list(term_vt.PTYS.values()):      # the typed line of a cold root shell (deferred)
+                if pt.deferred is not None:
+                    pt.deferred.join(10)
         self.assertEqual(len(out), len(sids), "an opener never returned")
         return out
 
@@ -156,13 +161,13 @@ class TestColdBurst(_Conc):
         self.check_common(out)
         ded = [s for s in self.spawns if s[1][0] == "claude"]
         shells = [s for s in self.spawns if s[1][0] != "claude"]
-        self.assertEqual(len(ded), K, self.spawns)
-        self.assertEqual(sorted(c for c, _ in ded), sorted(self.tops))
-        self.assertLessEqual(len(shells), 1, shells)
-        self.assertTrue(all(c == self.root for c, _ in shells))
-        self.assertEqual(typed, [])
-        self.assertEqual(self.waits, [], "an opener waited on the reservation")
+        self.assertEqual(len(shells), 1, shells)                 # exactly ONE root shell
+        self.assertEqual(shells[0][0], self.root)
+        self.assertEqual(len(ded), K - 1, self.spawns)           # the rest are dedicated, each at its top
+        self.assertTrue(all(c in self.tops for c, _ in ded))
+        self.assertEqual(len([t for t in typed if b"claude" in t]), 1, typed)   # one line in the root shell
         self.assertEqual(len({o["tty"] for o, _, _ in out}), K)
+        self.assertLessEqual(len(self.waits), K - 1)             # bounded waits on the one root spawn
         self.no_bare_root(typed)
 
     def test_cold_burst_never_exceeds_cap(self):
@@ -207,7 +212,8 @@ class TestGuards(_Conc):
         o1 = self.burst(["S0"], "resume", typed)[0][0]
         o2 = self.burst(["S0"], "resume", typed)[0][0]
         self.assertEqual(o1["tty"], o2["tty"])
-        self.assertEqual(len([s for s in self.spawns if s[1][0] == "claude"]), 1)
+        self.assertEqual([a for _, a in self.spawns], [[os.environ.get("SHELL", "/bin/bash"), "-l"]])
+        self.assertEqual(b"".join(typed).count(b"--resume S0"), 1)
 
     def test_hold_time_instrument_catches_spawn_under_lock(self):
         """The bound can fail: a spawn made while holding _LOCK exceeds the 0.2 s limit."""

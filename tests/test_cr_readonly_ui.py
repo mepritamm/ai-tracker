@@ -173,7 +173,10 @@ class TestReadonlyUI(unittest.TestCase):
 
     def test_new_selectors_hidden_only_under_readonly(self):
         ext = [sel for sel, body in _rules(_read("ext_cr.css")) if "display: none" in body]
-        for s in (".tracker-next .cr-rail-pin", ".tracker-next .cr-rail-rename", ".tracker-next .crd-phone-input"):
+        # .crd-row1-actions .tsplit: the header's Resume/Open terminal/External now live in one split
+        # button (termSplit) -- the whole group hides read-only, where each button used to.
+        for s in (".tracker-next .cr-rail-pin", ".tracker-next .cr-rail-rename", ".tracker-next .crd-phone-input",
+                  ".tracker-next .crd-row1-actions .tsplit"):
             self.assertIn("html.tracker-readonly " + s, ext)
         app = [(sel, body) for sel, body in _rules(_read("app.css")) if sel.startswith("html.tracker-readonly")]
         hidden = [sel for sel, body in app if "display:none" in body.replace(" ", "")]
