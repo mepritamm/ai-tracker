@@ -7,7 +7,7 @@ help:
 	@echo "make serve | stop | tunnel | check | test | hooks | bundle | pending | pending-install | pending-uninstall | service-install | service-reinstall | service-uninstall | service-status   (PORT=$(PORT))"
 
 serve:
-	@PORT=$(PORT) python3 -m aitracker
+	@$(if $(filter command line environment,$(origin PORT)),PORT=$(PORT) ,)python3 -m aitracker --serve
 
 # stop everything: local tracker, the authed tunnel instance, and the Cloudflare tunnel
 stop:

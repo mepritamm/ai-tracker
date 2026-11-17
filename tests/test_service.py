@@ -275,6 +275,63 @@ class CliTest(unittest.TestCase):
                 cli.main()
         inst.assert_called_once_with(8799, "127.0.0.1")
 
+    def _serve(self, rc, baked, busy, env=None):
+        with mock.patch.object(sys, "argv", ["aitracker", "--serve"]), \
+                mock.patch.object(config, "SERVICE", False), \
+                mock.patch.dict(os.environ, env or {}, clear=False), \
+                mock.patch.object(cli, "svc_baked", return_value=baked), \
+                mock.patch.object(cli, "_port_busy", side_effect=busy) as pb, \
+                mock.patch.object(cli, "svc_spawn_deferred") as spawn, \
+                mock.patch.object(cli, "run") as run, \
+                mock.patch.object(cli, "svc_install", **({"side_effect": rc} if callable(rc) else {"return_value": rc})) as inst:
+            for k in ("PORT", "HOST", "TRACKER_AUTH", "AITRACKER_SERVICE_PID"):
+                if not env or k not in env:
+                    os.environ.pop(k, None)
+            code = None
+            try:
+                cli.main()
+            except SystemExit as e:
+                code = e.code
+        return code, inst, pb, spawn, run
+
+    def test_cli_serve_picks_next_free_port(self):
+        code, inst, _, _, run = self._serve(0, None, lambda h, p: p == 8790)
+        self.assertEqual(code, 0)
+        inst.assert_called_once_with(8791, "127.0.0.1")
+        run.assert_not_called()
+
+    def test_cli_serve_reuses_baked_port_without_probing(self):
+        code, inst, pb, _, _ = self._serve(0, (8795, "127.0.0.1"), lambda h, p: True)
+        self.assertEqual(code, 0)
+        inst.assert_called_once_with(8795, "127.0.0.1")
+        pb.assert_not_called()
+
+    def test_cli_serve_refused_falls_back_to_foreground(self):
+        code, inst, _, _, run = self._serve(2, None, lambda h, p: False)
+        self.assertIsNone(code)
+        run.assert_called_once()
+
+    def test_cli_serve_inside_service_defers(self):
+        def inst(p, h):
+            return 3 if config.SERVICE else 0
+        code, _, _, spawn, _ = self._serve(inst, None, lambda h, p: False, env={"AITRACKER_SERVICE_PID": "1"})
+        self.assertEqual(code, 0)
+        spawn.assert_called_once_with(True)
+
+    def test_cli_serve_install_failure_exits_1(self):
+        code, _, _, _, run = self._serve(1, None, lambda h, p: False)
+        self.assertEqual(code, 1)
+        run.assert_not_called()
+
+    def test_cli_serve_baked_port_never_overrides_host(self):
+        code, inst, _, _, run = self._serve(2, (8790, "127.0.0.1"), lambda h, p: p == 8790, env={"HOST": "0.0.0.0"})
+        self.assertEqual(run.call_args[1]["host"], "0.0.0.0")
+
+    def test_cli_serve_env_port_overrides_baked(self):
+        code, inst, pb, _, _ = self._serve(0, (8790, "127.0.0.1"), lambda h, p: False, env={"PORT": "8795"})
+        inst.assert_called_once_with(8795, "127.0.0.1")
+        pb.assert_called_once_with("127.0.0.1", 8795)
+
     def test_run_service_sets_marker(self):
         with mock.patch.dict(os.environ, {}, clear=False), \
                 mock.patch.object(config, "SERVICE", False), mock.patch.object(config, "BIND_PORT", 8790), \

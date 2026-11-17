@@ -49,13 +49,13 @@ python3 -m aitracker
 
 That's it. It starts a local server on **http://localhost:8790** and opens your browser. Pick a session from the sidebar (or paste a session id) and watch it work. If `8790` is already taken it automatically uses the next free port (and prints the one it picked, plus records it in `aitracker/port` so the notes drain hook can still find it).
 
-Prefer the Makefile — it restarts cleanly (frees a stuck port so UI changes always take effect):
+Prefer the Makefile (re-running `make serve` restarts the background service so UI changes take effect):
 
 ```bash
-make serve            # run locally on http://localhost:8790 — no tunnel, no login (the default)
-make stop             # stop the tracker (and any running tunnel)
+make serve            # installs a background service on http://localhost:8790 (or the next free port, then locked) and returns; re-run to restart
+make stop             # stops a foreground server (and any tunnel); the background service restarts (KeepAlive) — use `make service-uninstall` to stop it
 make serve PORT=9000  # use a different port
-make tunnel           # shell alternative: Cloudflare tunnel (also available via Config → Tunnel switch)
+make tunnel           # the background service does not auto-restore a tunnel; shell alternative: Cloudflare tunnel (also available via Config → Tunnel switch)
 make check            # the gate: --selfcheck + unit tests (must be green)
 make test             # just the unit-test suite
 make hooks            # install the pre-commit gate (blocks commits that fail; one test module per process)

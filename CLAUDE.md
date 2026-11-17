@@ -19,8 +19,8 @@ Run from a clone via `python -m aitracker`, or install with `uv` → the `ai-tra
 
 ## Commands
 ```bash
-make serve            # start on PORT (default 8790), or the next free port if busy; does not stop a running one (make stop first)
-make stop
+make serve            # macOS primary checkout: install/restart the background service on 8790 (or next free, then locked) and return; worktree/other: foreground server
+make stop             # stops a foreground server only; the background service restarts (KeepAlive) — `make service-uninstall` to stop it
 make check            # the gate: python -m unittest discover -s tests  → prints "selfcheck ok"
 make bundle           # regenerate the standalone dist/tracker.py
 python -m aitracker --version | --help | --selfcheck
