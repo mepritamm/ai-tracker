@@ -47,7 +47,7 @@ class AuthRouteTests(_ServerCase):
 
     def test_local_200(self):
         st, j = self.req()
-        self.assertEqual((st, j), (200, OK))
+        self.assertEqual((st, j), (200, dict(OK, last_login=None)))
         self.stub.assert_called_once_with(fresh=False)
 
     def test_fresh_passes_through(self):
@@ -83,9 +83,19 @@ class AuthRouteTests(_ServerCase):
         self.stub.return_value = dict(OK, email="a@b.c", org="Acme", orgId="o1", accountUuid="u1", userId="x")
         st, j = self.req()
         self.assertEqual(st, 200)
-        self.assertEqual(set(j), set(OK))
+        self.assertEqual(set(j), set(OK) | {"last_login"})
         for bad in ("a@b.c", "Acme", "o1", "u1"):
             self.assertNotIn(bad, json.dumps(j))
+
+    def test_last_login_rides_the_auth_body(self):
+        ll = os.path.join(tempfile.mkdtemp(), "last_login.json")
+        with mock.patch.object(config, "LAST_LOGIN_FILE", ll, create=True):
+            from aitracker import store
+            store.record_login("closed", now=50)
+            st, j = self.req()
+        self.assertEqual(st, 200)
+        self.assertEqual(set(j["last_login"]), {"at", "ok_at", "outcome", "label"})
+        self.assertEqual((j["last_login"]["outcome"], j["last_login"]["label"]), ("closed", "login cancelled"))
 
 
 if __name__ == "__main__":

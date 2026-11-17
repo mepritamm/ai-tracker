@@ -3,7 +3,6 @@ import subprocess
 import tempfile
 import threading
 import unittest
-import uuid
 from unittest import mock
 
 from aitracker import config, term_gate, term_vt
@@ -62,28 +61,29 @@ class OpenPtyRoutePrompt(unittest.TestCase):
              mock.patch.object(term_vt, "resolve_spawned"), \
              mock.patch.object(term_vt, "spawn", side_effect=self._fake_spawn), \
              mock.patch.object(term_vt, "_login_watch",
-                               side_effect=lambda pt, sid: self._watched.set()) as self.watch:
+                               side_effect=lambda pt: self._watched.set()) as self.watch:
             term_vt.open_pty(h, None, dict(body, cols=80, rows=24))
         return h.calls[-1], inj
 
-    def _fake_spawn(self, cwd, argv, cols, rows):
+    def _fake_spawn(self, cwd, argv, cols, rows, login=""):
         # No real claude is ever forked: a login open (dedicated pty) lands here.
         self.spawned.append(list(argv))
-        return term_vt.Pty(tid="dd1", pid=42425, fd=98, cwd=self._tmpdir)
+        pt = term_vt.Pty(tid="dd1", pid=42425, fd=98, cwd=self._tmpdir)
+        pt.login = login
+        return pt
 
-    def _assert_dedicated_login(self, obj):
+    def _assert_dedicated_login(self, obj, argv_tail=("auth", "login"), login="claudeai"):
         self.assertEqual(len(self.spawned), 1)
         argv = self.spawned[0]
-        self.assertEqual(argv[1], "--session-id")
-        self.assertEqual(argv[3], "/login")
-        self.assertEqual(uuid.UUID(argv[2]).version, 4)
+        self.assertEqual(argv, ["claude"] + list(argv_tail))
         self.assertFalse(obj["folder"])
         pt = term_vt.PTYS["dd1"]
         self.assertTrue(pt.overflow)
-        self.assertEqual(pt.spawned, argv[2])
+        self.assertEqual(pt.login, login)
+        self.assertEqual(pt.spawned, "")
         self.assertTrue(self._watched.wait(2))
         self.watch.assert_called_once()
-        self.assertEqual(self.watch.call_args[0], (pt, argv[2]))
+        self.assertEqual(self.watch.call_args[0], (pt,))
         return argv
 
     def test_new_mode_prompt_reaches_the_injected_argv(self):
@@ -127,6 +127,39 @@ class OpenPtyRoutePrompt(unittest.TestCase):
         self.assertEqual(inj.call_args[0][1], ["/opt/or/claude-or", "/login"])
         self.assertEqual(self.spawned, [])
         self.watch.assert_not_called()
+
+
+    def test_console_login_prompt_spawns_console_argv(self):
+        body = {"session": "", "mode": "new", "cwd": self._tmpdir, "prompt": "/login --console"}
+        (obj, code), inj = self._open(body)
+        self.assertEqual(code, 200, obj)
+        inj.assert_not_called()
+        self._assert_dedicated_login(obj, ("auth", "login", "--console"), "console")
+
+    def test_login_argv_table_is_fixed(self):
+        self.assertEqual(term_vt.LOGIN_ARGV, {
+            "/login": ("claudeai", ("auth", "login")),
+            "/login --console": ("console", ("auth", "login", "--console"))})
+
+    def test_console_prompt_off_anthropic_or_near_miss_is_plain(self):
+        plain = (("/LOGIN --console", None), ("/login --console --sso", None), ("/login  --console", None),
+                 ("/login --console", "openrouter"))
+        for prompt, gw in plain:
+            with self.subTest(prompt=prompt, gw=gw):
+                self.spawned.clear()
+                body = {"session": "", "mode": "new", "cwd": self._tmpdir, "prompt": prompt}
+                if gw:
+                    body["gateway"] = gw
+                (obj, code), inj = self._open(body, or_launcher="/opt/or/claude-or" if gw else None)
+                self.assertEqual(code, 200, obj)
+                self.assertEqual(self.spawned, [])
+                self.watch.assert_not_called()
+                self.assertNotIn("auth", inj.call_args[0][1])
+        self.spawned.clear()
+        (obj, code), inj = self._open({"session": "", "mode": "new", "cwd": self._tmpdir,
+                                       "prompt": " /login --console "})
+        self.assertEqual(code, 200, obj)
+        self._assert_dedicated_login(obj, ("auth", "login", "--console"), "console")
 
 
 class InjectArgvQuoting(unittest.TestCase):

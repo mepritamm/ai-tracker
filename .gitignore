@@ -11,6 +11,8 @@ forks.json
 forks.json.lock
 last_terms.json
 last_terms.json.lock
+last_login.json
+last_login.json.lock
 config.json
 port
 token

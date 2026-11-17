@@ -16,7 +16,7 @@ except ImportError:  # run as a bare file
 _BODY = r"""
 const SCEN = JSON.parse(process.argv[3]);
 const realST = setTimeout;
-const gets = [], opens = [], listeners = {};
+const gets = [], opens = [], listeners = {}, events = [];
 global.setTimeout = (f, ms) => ms === 8000 ? 0 : realST(f, 0);   // toast auto-dismiss never fires
 global.window.location = {host: 'x', reload() {}};
 global.addEventListener = (t, f) => { (listeners[t] = listeners[t] || []).push(f); };
@@ -53,7 +53,7 @@ global.fetch = (url, opt) => {
   if (url === '/api/config') return json({});
   if (url === '/api/update') return json({kind: 'package', version: '1'});
   if (url.indexOf('/api/claude/auth') === 0) {
-    gets.push(url);
+    gets.push(url); events.push('auth');
     const rep = SCEN.authSeq ? SCEN.authSeq[Math.min(gets.length - 1, SCEN.authSeq.length - 1)] : SCEN.auth;
     return json(rep.body, rep.status < 400, rep.status);
   }
@@ -62,7 +62,11 @@ global.fetch = (url, opt) => {
     if (st === 0) return Promise.reject(new Error('net'));
     return json(st === 200 ? {claude_attached: true, login_ok: false} : {error: 'e' + st}, st < 400, st);
   }
-  if (url === '/api/term/close') { closes.push(JSON.parse(opt.body)); return json({ok: true}); }
+  if (url === '/api/term/close') {
+    closes.push(JSON.parse(opt.body));
+    if (SCEN.closeDelay) return new Promise(r => realST(() => { events.push('close-done'); r({ok: true, status: 200, json: () => Promise.resolve({ok: true})}); }, SCEN.closeDelay * 5));
+    return json({ok: true});
+  }
   return json({});
 };
 const tick = async (n=6) => { for (let i = 0; i < n; i++) await new Promise(r => realST(r, 5)); };
@@ -80,7 +84,7 @@ const SRC = require('fs').readFileSync(process.argv[2], 'utf8');
     buttons: b.querySelectorAll('button').map(x => x.textContent)} : null; };
   const out = {before: info(), getsAfterOpen: gets.slice()};
   if (SCEN.click && out.before) {
-    q('cr-claude-login-block').querySelectorAll('button')[0].fire('click'); await tick(10);
+    q('cr-claude-login-block').querySelectorAll('button')[SCEN.clickIdx || 0].fire('click'); await tick(10);
     out.afterClick = info(); out.opens = opens;
   }
   if (SCEN.vt && SCEN.click) {
@@ -99,6 +103,8 @@ const SRC = require('fs').readFileSync(process.argv[2], 'utf8');
     out.end = snap(); out.destroyed = M.destroyed; out.closes = closes; out.focused = M.focused;
     out.conn = (q('cr-claude-login-conn') || {}).textContent; out.gets = gets;
     const btn = q('cr-claude-login-block'); out.btnDisabled = btn ? !!btn.querySelectorAll('button')[0].attrs.disabled : null;
+    out.btnsDisabled = btn ? btn.querySelectorAll('button').map(x => !!x.attrs.disabled) : null;
+    out.events = events;
     out.attached = attached.length;
     out.toasts = root.querySelectorAll('.cr-toast-title').map(x => x.textContent);
     out.block = btn ? btn.textContent : null;
@@ -132,6 +138,9 @@ def _run(scen):
     return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
+_LL_OK = {"at": 1, "ok_at": 1, "outcome": "ok", "label": "logged in"}
+
+
 def _auth(logged_in, **kw):
     d = {"available": True, "logged_in": logged_in, "auth_method": "claude.ai" if logged_in else "none",
          "subscription": "max" if logged_in else None,
@@ -151,13 +160,13 @@ class ClaudeLoginBlock(unittest.TestCase):
         self.assertEqual(r["before"]["name"], "Claude Code login (/login)")
         self.assertIn("every Claude Code session on this machine", r["before"]["text"])
         self.assertIn("not logged in", r["before"]["text"])
-        self.assertEqual(r["before"]["buttons"], ["Log in"])
+        self.assertEqual(r["before"]["buttons"], ["Log in", "Log in with Console (API)"])
         self.assertTrue(r["getsAfterOpen"] and set(r["getsAfterOpen"]) == {"/api/claude/auth"})
 
     def test_logged_in_shows_switch_account(self):
         r = self.go(_auth(True))
         self.assertIn("Claude subscription", r["before"]["text"])
-        self.assertEqual(r["before"]["buttons"], ["Switch account"])
+        self.assertEqual(r["before"]["buttons"], ["Switch account", "Log in with Console (API)"])
 
     def test_click_opens_login_terminal_once(self):
         r = self.go(_auth(True), click=True)
@@ -213,8 +222,50 @@ class ClaudeLoginBlock(unittest.TestCase):
 
     def test_pty_exit_after_login_toasts_once(self):
         r = self.go(_auth(False), click=True, vt=True, openReply={"ok": True, "tty": "L1", "renderer": "grid"},
-                    attachedSeq=[200, 404], authSeq=[_auth(False), _auth(True)])
+                    attachedSeq=[200, 404], authSeq=[_auth(False), _auth(False), _auth(True, last_login=_LL_OK)])
         self.assertEqual(r["toasts"].count("Logged in"), 1)
+
+    def test_failed_switch_no_logged_in_toast(self):
+        # still logged in as before, but THIS attempt was cancelled: no "Logged in" toast, the line says so
+        cancelled = {"at": 2, "ok_at": 1, "outcome": "closed", "label": "login cancelled"}
+        r = self.go(_auth(True), click=True, vt=True, openReply={"ok": True, "tty": "L1", "renderer": "grid"},
+                    attachedSeq=[200, 404], authSeq=[_auth(True), _auth(True), _auth(True, last_login=cancelled)])
+        self.assertNotIn("Logged in", r["toasts"])
+        self.assertIn("login cancelled", r["toasts"])
+
+    def test_stale_ok_record_no_logged_in_toast(self):
+        # the pty ended but no NEW record was written: the previous attempt's ok record must not be re-announced
+        r = self.go(_auth(True, last_login=_LL_OK), click=True, vt=True, openReply={"ok": True, "tty": "L1", "renderer": "grid"},
+                    attachedSeq=[200, 404], authSeq=[_auth(True, last_login=_LL_OK), _auth(True, last_login=_LL_OK)])
+        self.assertNotIn("Logged in", r["toasts"])
+
+    def test_console_button_opens_console_login(self):
+        r = self.go(_auth(True), click=True, clickIdx=1)
+        self.assertEqual(r["opens"], [["~", "new", "/login --console", {"gateway": "anthropic"}]])
+
+    def test_busy_disables_both_buttons(self):
+        r = self.vt(openReply={"ok": True, "tty": "L1", "renderer": "grid"}, attachedSeq=[200], ticks=12)
+        self.assertEqual(r["btnsDisabled"], [True, True])
+
+    def test_close_waits_before_refetch(self):
+        r = self.vt(openReply={"ok": True, "tty": "L1", "renderer": "grid"}, attachedSeq=[200], escape=True,
+                    closeDelay=3)
+        self.assertIn("close-done", r["events"])
+        self.assertLess(r["events"].index("close-done"), len(r["events"]) - 1 - r["events"][::-1].index("auth"))
+
+    def test_last_login_line_rendered(self):
+        ll = {"at": 1, "ok_at": 1, "outcome": "ok", "label": "logged in"}
+        r = self.go(_auth(True, last_login=ll))
+        self.assertIn("Last login:", r["before"]["text"])
+        ll = {"at": 2, "ok_at": None, "outcome": "failed", "label": "login failed"}
+        r = self.go(_auth(False, last_login=ll))
+        self.assertIn("Last login: never", r["before"]["text"])
+        self.assertIn("last attempt", r["before"]["text"])
+        self.assertIn("login failed", r["before"]["text"])
+
+    def test_no_last_login_no_line(self):
+        r = self.go(_auth(True, last_login=None))
+        self.assertNotIn("Last login", r["before"]["text"])
 
     def test_blips_capped(self):
         r = self.vt(openReply={"ok": True, "tty": "L1", "renderer": "grid"}, attachedSeq=[0], ticks=14)
@@ -246,7 +297,7 @@ class ClaudeLoginBlock(unittest.TestCase):
 
     def test_unknown_status_offers_log_in(self):
         r = self.go(_auth(False, available=False, label="", error="claude not found"))
-        self.assertEqual(r["before"]["buttons"], ["Log in"])
+        self.assertEqual(r["before"]["buttons"], ["Log in", "Log in with Console (API)"])
         self.assertIn("claude not found", r["before"]["text"])
 
     def test_closed_dialog_listener_removes_itself_and_reopen_registers_once(self):
@@ -269,7 +320,7 @@ class ClaudeLoginBlock(unittest.TestCase):
         r = self.go(None, authSeq=[_auth(False), _auth(True)], focus=True)
         self.assertEqual(r["gets"][0], "/api/claude/auth")
         self.assertIn("/api/claude/auth?fresh=1", r["gets"])
-        self.assertEqual(r["afterFocus"]["buttons"], ["Switch account"])
+        self.assertEqual(r["afterFocus"]["buttons"], ["Switch account", "Log in with Console (API)"])
 
 
 if __name__ == "__main__":

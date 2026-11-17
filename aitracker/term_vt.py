@@ -1467,6 +1467,10 @@ class Pty:
                                     # life -- a resume/new does not respawn it, it is TYPED into it
                                     # as a foreground job, and `fg` below says which one is running.
         self.deferred = None       # the `_deferred_folder_start` thread, when one was spawned
+        self.login = ""            # "claudeai"/"console" for a Config login terminal (`claude auth login`): never
+                                    # listed in Manage terminals, never latched to a session, never a restart
+                                    # candidate; finish() records its outcome (see _login_finished)
+        self.login_timed_out = False   # _login_watch killed it at LOGIN_WATCH_MAX
         self.overflow = False      # a DEDICATED pty opened because the folder shell was busy
                                     # (open_pty()'s fallback). Lives exactly as long as its child:
                                     # `_reap()` drops it with no linger and close_pty() deletes it
@@ -1662,6 +1666,8 @@ class Pty:
         # open starts a `_resume_backstop` whose `finally` clears the flag unconditionally within
         # BACKSTOP_WINDOW -- so no pty can be stuck even if the child dies in a way nobody
         # examined. See open_pty()'s readiness-state section.
+        if self.login:
+            _login_finished(self)       # BEFORE done: the record exists by the time anything sees it end
         self.done = True
         self.ended = time.time()
 
@@ -1788,13 +1794,14 @@ def _fork_child(cwd, argv, cols, rows):
     return pid, fd
 
 
-def spawn(cwd, argv, cols, rows):
+def spawn(cwd, argv, cols, rows, login=""):
     """`_fork_child` plus the bookkeeping a caller actually wants: a `Screen`, a `Pty` record,
     and the reader thread that drains the pty into that Screen. See `_fork_child` for the
     fork/exec details."""
     pid, fd = _fork_child(cwd, argv, cols, rows)
     screen = Screen(cols=cols, rows=rows)
     pt = Pty(pid=pid, fd=fd, screen=screen, cwd=cwd, cmd=" ".join(argv))
+    pt.login = login                # before the reader can run, so finish() sees it
     t = threading.Thread(target=_reader, args=(pt,), daemon=True)
     t.start()
     return pt
@@ -2215,7 +2222,7 @@ def resolve_spawned(throttle=5.0, new_only=False):
         forked_cwds = set()
         cands = []
         for p in PTYS.values():
-            if p.done:
+            if p.done or p.login:
                 continue
             if p.session:
                 claimed.add(p.session)
@@ -2340,7 +2347,7 @@ def _term_title(p, or_launcher=""):
     return " - ".join([folder] + tail if folder else tail)
 
 
-def _live_list(orl=None):
+def _live_list(orl=None, hide_login=False):
     """The live PTYs as plain dicts, oldest first -- what `open_pty()`'s 429 hands back so the
     client can show WHICH terminals hold the slots and close one, and what `GET /api/term/list`
     (below) hands back on demand for the same purpose. Call under `_LOCK`.
@@ -2378,7 +2385,7 @@ def _live_list(orl=None):
              "title": _term_title(p, orl),
              "folder": p.folder, "overflow": p.overflow, "fg": _fg_public(p.fg),
              "idle_s": int(now - p.last_active), "viewers": p.viewers, "last_hold": p.last_hold}
-            for p in sorted(PTYS.values(), key=lambda p: p.started) if not p.done]
+            for p in sorted(PTYS.values(), key=lambda p: p.started) if not p.done and not (hide_login and p.login)]
 
 
 def _reap():
@@ -3312,7 +3319,7 @@ def _open_pty(handler, parsed, body, own):
     cols = _clamp_int(body.get("cols"), MIN_COLS, MAX_COLS, DEFAULT_COLS)
     rows = _clamp_int(body.get("rows"), MIN_ROWS, MAX_ROWS, DEFAULT_ROWS)
     forked = False
-    login_sid = ""      # set only for a Log in / Switch account open (mode=new, Anthropic, prompt "/login")
+    login = ""          # set only for a Config login open (mode=new, Anthropic, prompt in LOGIN_ARGV)
     if mode == "resume":
         try:   # [launcher, "--resume", sid] -- no proactive fork; see term_gate.resume_argv's docstring
             argv = term_gate.resume_argv(sid)
@@ -3328,10 +3335,11 @@ def _open_pty(handler, parsed, body, own):
         except gateway.GatewayError as e:
             return handler._json({"error": str(e), "openrouter_configured": False}, 400)
         lp = body.get("prompt")
-        if gw_eff == gateway.ANTHROPIC and isinstance(lp, str) and lp.strip() == LOGIN_PROMPT:
-            # A login open: a dedicated pty on a session id the server chose, so its transcript is known.
-            login_sid = str(uuid.uuid4())
-            argv = [argv[0], "--session-id", login_sid, LOGIN_PROMPT]
+        row = LOGIN_ARGV.get(lp.strip()) if gw_eff == gateway.ANTHROPIC and isinstance(lp, str) else None
+        if row:
+            # A login open: `claude auth login` (never the /login REPL command), argv from the fixed table.
+            login = row[0]
+            argv = [argv[0]] + list(row[1])
         else:
             argv = _with_prompt(argv, lp)
     else:
@@ -3375,7 +3383,7 @@ def _open_pty(handler, parsed, body, own):
                                           "attached": True, "folder": hit.folder})
             fp = _folder_pty(cwd)
             reused = fp is not None
-            if login_sid:
+            if login:
                 # A login open is ALWAYS its own dedicated pty (never typed into a shared shell).
                 # Reserve its slot HERE, under the lock that counts them, then fork outside it.
                 free = config.MAX_TERMS - _live_count() - _SLOTS_RESERVED
@@ -3409,7 +3417,7 @@ def _open_pty(handler, parsed, body, own):
         waited = True
     if dedicated_now:
         return handler._json(*_spawn_dedicated(run_dir or cwd, argv, mode, sid, forked, cols, rows, held=True,
-                                               login_sid=login_sid))
+                                               login=login))
     if fp is None:
         try:
             try:
@@ -3556,21 +3564,19 @@ def _open_pty(handler, parsed, body, own):
     handler._json(*_spawn_dedicated(run_dir or cwd, argv, mode, sid, forked, cols, rows, held=True))
 
 
-def _spawn_dedicated(spawn_cwd, argv, mode, sid, forked, cols, rows, held=False, login_sid=""):
+def _spawn_dedicated(spawn_cwd, argv, mode, sid, forked, cols, rows, held=False, login=""):
     """Spawn a dedicated overflow pty running `argv` in `spawn_cwd` and register it. Returns the
     `(body, status)` for `_json`. `held`: the caller reserved one slot in `_SLOTS_RESERVED`; it is
     given back once the pty is in PTYS or the spawn failed (never under `_LOCK` while forking)."""
     try:
         try:
-            pt = spawn(spawn_cwd, argv, cols, rows)    # a dedicated pty runs IN the worktree
+            pt = spawn(spawn_cwd, argv, cols, rows, login=login)    # a dedicated pty runs IN the worktree
         except OSError as e:
             return {"error": "spawn failed: %s" % e}, 500
         pt.session = sid
         pt.mode = mode
         pt.forked = forked
         pt.overflow = True
-        if login_sid:
-            pt.spawned = login_sid      # the session this terminal CREATED, known up front
         starting = mode == "resume"
         if starting:
             # Set BEFORE the backstop thread starts (and thus before any viewer can possibly learn
@@ -3585,12 +3591,12 @@ def _spawn_dedicated(spawn_cwd, argv, mode, sid, forked, cols, rows, held=False,
     finally:
         if held:
             _slots_release()
-    if login_sid:
+    if login:
         try:
-            threading.Thread(target=_login_watch, args=(pt, login_sid), name="login-watch-%s" % pt.id,
+            threading.Thread(target=_login_watch, args=(pt,), name="login-watch-%s" % pt.id,
                              daemon=True).start()
         except RuntimeError:
-            pass        # no watcher: login still works and nothing is removed
+            pass        # no watcher: login still works; it just has no timeout
     if mode == "resume":
         starting = _start_backstop(pt, sid, forked, cols, rows)
     # `renderer` is server-owned policy handed to the client, never asked of it (conventions rule
@@ -3621,50 +3627,45 @@ reporting, a hidden cursor. Fed to the Screen and the raw viewers before the nex
 
 
 LOGIN_PROMPT = "/login"
-LOGIN_POLL = 2.0
-LOGIN_SETTLE = 3.0
+LOGIN_CONSOLE_PROMPT = "/login --console"
+# Config's two login buttons send one of these prompts; the request only SELECTS a row, argv text never comes
+# from it. Each runs the CLI's own `claude auth login` (no REPL, so no session, transcript or trust prompt).
+LOGIN_ARGV = {LOGIN_PROMPT: ("claudeai", ("auth", "login")),
+              LOGIN_CONSOLE_PROMPT: ("console", ("auth", "login", "--console"))}
+LOGIN_POLL = 0.5
 LOGIN_WATCH_MAX = 1800.0
-LOGIN_DONE_NOTE = "Login complete \u2014 closing this terminal and removing its /login session."
 
 
-def _login_watch(pt, sid):
-    """Own thread per login open (`open_pty`'s `/login` case). Once the transcript `sid` records
-    `Login successful`, stop this terminal's claude and, after it exited, delete that one
-    /login-only transcript. A transcript that only recorded an interrupted /login is deleted too,
-    but only once the terminal is done (the user closed it); a real prompt or a timeout keeps it."""
+def _login_outcome(pt):
+    """ok / timeout / closed (closed by the user, signalled or never reaped) / failed, from how the pty ended."""
+    if pt.rc == 0:
+        return "ok"
+    if pt.login_timed_out:
+        return "timeout"
+    if pt.closing or pt.rc is None or pt.rc == 130 or pt.rc < 0:
+        return "closed"
+    return "failed"
+
+
+def _login_finished(pt):
+    """Pty.finish(): the one thing a login leaves behind is its outcome (store.record_login). Never raises."""
     try:
-        prov = _provider()
-        if prov is None:
-            return                                   # flattened bundle: never deletes
+        store.record_login(_login_outcome(pt))
+    except Exception:
+        pass
+
+
+def _login_watch(pt):
+    """Own thread per login open: a login still running at LOGIN_WATCH_MAX is killed (its own process group).
+    Records nothing (finish() does) and deletes nothing."""
+    try:
         deadline = time.time() + LOGIN_WATCH_MAX
-        while not (pt.done or pt.closing):
+        while not pt.done:
             if time.time() >= deadline:
+                pt.login_timed_out = True
+                pt.kill()
                 return
-            st = prov.login_transcript_state(sid)
-            if st == "other":
-                return
-            if st == "ok":
-                _feed_note(pt, LOGIN_DONE_NOTE)
-                time.sleep(LOGIN_SETTLE)             # F4: a prompt typed meanwhile turns it "other"
-                if pt.done or pt.closing:
-                    break
-                if prov.login_transcript_state(sid) != "ok":
-                    return
-                r = stop_for_upgrade(pt.id, sid, pt.pid) or {}
-                if not (r.get("confirmed") or r.get("closed")):
-                    return                           # never delete under a live process
-                break
             time.sleep(LOGIN_POLL)
-        end = time.time() + CLOSE_CONFIRM_WAIT
-        while not pt.done and time.time() < end:
-            time.sleep(CLOSE_CONFIRM_POLL)
-        if pt.done and prov.remove_login_transcript(sid):    # re-reads; refuses unless ok/interrupted
-            with _LOCK:                                      # F5: plain stores, no I/O
-                for q in PTYS.values():
-                    if q is not pt and q.spawned == sid:
-                        q.spawned = ""
-                    if q is not pt and q.folder and q.fg and q.fg.get("session") == sid:
-                        q.fg["session"] = ""
     except Exception:
         pass
 
@@ -4386,7 +4387,7 @@ def term_list(handler, parsed):
         for p in PTYS.values():
             if p.folder and not p.done:
                 _refresh_fg(p)      # one syscall each -- the poll IS the clock for `fg`, too
-        terminals = _live_list(orl)
+        terminals = _live_list(orl, hide_login=True)     # a login terminal is a modal, not a managed terminal
     handler._json({"terminals": terminals, "max": config.MAX_TERMS})
 
 
@@ -4466,7 +4467,7 @@ def upgrade_candidates(light=False):
     try:
         with _LOCK:
             _reap()
-            panes = [p for p in PTYS.values() if not p.done and not p.closing]
+            panes = [p for p in PTYS.values() if not p.done and not p.closing and not p.login]
             for p in panes:
                 if p.folder:
                     _refresh_fg(p)

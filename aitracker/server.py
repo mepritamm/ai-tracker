@@ -13,7 +13,7 @@ from .schedule import sched_install, sched_uninstall, sched_status, autoinstall_
 from .schedule import svc_install, svc_uninstall, svc_status, svc_baked, svc_spawn_deferred, SVC_WAIT, SVC_GRACE
 from .update import update_status, update_fetch, update_apply, start_restart, _APPLY
 from .agent_cli import agent_status, agent_plan_upgrade, agent_start, agent_job_running, agent_plan_resume_all, agent_start_resume_all
-from .store import set_hidden, load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, save_model_keep, load_title_sync, save_title_sync, _load_json, _save_json
+from .store import set_hidden, load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, save_model_keep, load_title_sync, save_title_sync, _load_json, _save_json, load_last_login
 # TITLES_FILE/PINS_FILE (below) are referenced live as config.TITLES_FILE/config.PINS_FILE at
 # their write sites, never imported by name -- a copied name freezes the value at import
 # time, so a caller that repoints config.TITLES_FILE (e.g. a test's temp-dir override) would
@@ -513,7 +513,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": err}, 403)
             st = claude_auth_status(fresh=parse_qs(p.query).get("fresh") == ["1"])
             # belt: whitelist the non-identifying keys, so email/org/ids can never reach the wire
-            return self._json({k: st.get(k) for k in _CLAUDE_AUTH_KEYS if k in st})
+            body = {k: st.get(k) for k in _CLAUDE_AUTH_KEYS if k in st}
+            body["last_login"] = load_last_login()      # when the last Config login ended + how (never an identity)
+            return self._json(body)
         elif p.path == "/api/config":
             # The Config dialog's live read: every config.json-overridable setting's current
             # effective value (config.json > env > default -- see config.py's big module

@@ -65,6 +65,10 @@ FORKS_FILE = os.path.join(_HERE, "forks.json")
 # checkout. Written only by term_vt.remember_terminals through store._update_json; read live.
 LAST_TERMS_FILE = os.path.join(_HERE, "last_terms.json")
 
+# {"at": unix, "outcome": "ok|failed|closed|timeout", "ok_at": unix} -- the outcome of the last Config login
+# terminal. Written only by term_vt via store.record_login; read live (GET /api/claude/auth).
+LAST_LOGIN_FILE = os.path.join(_HERE, "last_login.json")
+
 
 # Where the server is actually listening, written at startup. `run()` falls back to the next
 # free port when 8790 is taken, so anything outside the browser (the notes drain hook) has to

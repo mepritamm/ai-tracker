@@ -444,7 +444,7 @@ class TestConcurrentFirstOpenSpawnsOneFolderShell(unittest.TestCase):
     def test_two_simultaneous_first_opens_share_one_folder_shell(self):
         real_spawn = term_vt.spawn
 
-        def _slow_spawn(cwd, argv, cols, rows):
+        def _slow_spawn(cwd, argv, cols, rows, login=""):
             time.sleep(0.4)    # hold the lookup-to-register window open so BOTH threads are in it
             return real_spawn(cwd, argv, cols, rows)
 

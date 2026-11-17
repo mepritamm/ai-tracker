@@ -1619,40 +1619,51 @@
   }
 
   // Settings > Server "Claude Code login (/login)". Status comes from GET /api/claude/auth (fetched
-  // only when this block is built, that is, when the Server tab renders; never polled). The button opens
-  // a terminal in ~ running `claude "/login"` through the normal launch path (ExtLaunch.openAt).
+  // only when this block is built, that is, when the Server tab renders; never polled). The buttons open
+  // a terminal in ~ running `claude auth login` (or `--console`) through the normal launch path (ExtLaunch.openAt).
   function claudeLoginBlock() {
     if (crReadOnly()) return null;
     var wrap = h('div', { class: 'cr-cfg-row cr-claude-login-block' });
-    var loginSt = null, msg = '', denied = false, busy = false;
+    var loginSt = null, msg = '', denied = false, busy = false, clickAt = null;
     function paint() {
       var status = denied ? 'Login status is shown on this machine only' : (msg || (loginSt ? (loginSt.error || loginSt.label || '') : 'Loading…'));
       wrap.innerHTML = '';
       wrap.appendChild(h('div', { class: 'cr-cfg-row-label' }, [
         h('div', { class: 'cr-cfg-row-name' }, ['Claude Code login (/login)']),
         h('div', { class: 'cr-cfg-row-sub cr-claude-login-status' }, [status]),
-        h('div', { class: 'cr-cfg-row-sub cr-claude-login-warn' }, ['Signs in for every Claude Code session on this machine — choosing a different login method signs out the existing claude.ai login. Opens Claude Code’s own /login in a terminal window over this page.']),
-      ]));
+        h('div', { class: 'cr-cfg-row-sub cr-claude-login-warn' }, ['Signs in for every Claude Code session on this machine. Log in uses your Claude subscription; Console uses Anthropic Console API billing, and switching method replaces the current login. Opens `claude auth login` in a terminal over this page; nothing of it is kept once it ends.']),
+      ].concat(loginSt && loginSt.last_login ? [h('div', { class: 'cr-cfg-row-sub cr-claude-login-last' }, [lastLoginText(loginSt.last_login)])] : [])));
       var ctl = h('div', { class: 'cr-cfg-row-control' });
-      var b = crBtn(loginSt && loginSt.logged_in ? 'Switch account' : 'Log in', login);
-      if (busy) b.setAttribute('disabled', 'disabled');
-      ctl.appendChild(b);
+      var b = crBtn(loginSt && loginSt.logged_in ? 'Switch account' : 'Log in', function () { login('claudeai'); });
+      var bc = crBtn('Log in with Console (API)', function () { login('console'); });
+      if (busy) { b.setAttribute('disabled', 'disabled'); bc.setAttribute('disabled', 'disabled'); }
+      ctl.appendChild(b); ctl.appendChild(bc);
       wrap.appendChild(ctl);
+    }
+    function lastLoginText(ll) {
+      return 'Last login: ' + (ll.ok_at ? timeAgo(ll.ok_at) : 'never') +
+        (ll.outcome !== 'ok' ? ' · last attempt ' + timeAgo(ll.at) + ': ' + ll.label : '');
     }
     function load(fresh, announce) {
       crCall('/api/claude/auth' + (fresh ? '?fresh=1' : '')).then(function (r) {
         denied = r.status === 403;
         if (r.ok) { loginSt = r.body; msg = ''; } else if (!denied) msg = (r.body && r.body.error) || 'request failed';
         paint();
-        if (announce && r.ok && r.body && r.body.logged_in) toast({ title: 'Logged in', meta: r.body.label || '' });
+        var ll = r.ok && r.body && r.body.last_login;
+        if (announce && ll && ll.at !== clickAt) {
+          if (ll.outcome === 'ok' && r.body.logged_in) toast({ title: 'Logged in', meta: r.body.label || '' });
+          else toast({ title: ll.label });
+        }
       });
     }
-    function login() {
+    function login(method) {
       var L = window.ExtLaunch;
       if (!L || typeof L.openAt !== 'function') { msg = 'Log in failed: terminals are unavailable in this build'; paint(); return; }
+      clickAt = loginSt && loginSt.last_login ? loginSt.last_login.at : 0;
       busy = true; msg = ''; paint();
       var pr, inline = !!(window.ExtVT && typeof window.ExtVT.mountInto === 'function');
-      try { pr = L.openAt('~', 'new', '/login', inline ? { gateway: 'anthropic', tab: false } : { gateway: 'anthropic' }); } catch (e) { pr = { ok: false, error: String(e) }; }
+      var prompt = method === 'console' ? '/login --console' : '/login';
+      try { pr = L.openAt('~', 'new', prompt, inline ? { gateway: 'anthropic', tab: false } : { gateway: 'anthropic' }); } catch (e) { pr = { ok: false, error: String(e) }; }
       Promise.resolve(pr).then(function (x) {
         if (x && x.ok && inline && x.tty) {
           try {
@@ -1678,9 +1689,9 @@
     return wrap;
   }
 
-  // Claude login modal: the /login pty (opened by claudeLoginBlock) mounted inline over Config.
-  // Polls the existing GET /api/term/attached: 404 = the pty is gone (the server stops claude and
-  // removes it when login completes) -> close. Esc closes the modal even while the terminal has focus (capture-phase listener below).
+  // Claude login modal: the `claude auth login` pty (opened by claudeLoginBlock) mounted inline over Config.
+  // Polls the existing GET /api/term/attached: 404 = the pty is gone (`claude auth login` exits when it
+  // finishes, or the window was closed) -> close. Esc closes the modal even while the terminal has focus (capture-phase listener below).
   function renderClaudeLogin(payload) {
     var tty = payload.tty;
     var chrome = buildChrome('claude-login', 'Claude Code login', 'gear', '~', true);
@@ -1723,8 +1734,9 @@
     timer = setTimeout(poll, 2000);
     function onClose() {
       var wasGone = gone; teardown();
-      if (!wasGone) crCall('/api/term/close', 'POST', window.ExtVT.ttyBody(tty, {}, ''));
-      if (payload.onDone) payload.onDone(wasGone);
+      var fin = function () { if (payload.onDone) payload.onDone(wasGone); };   // after the close POST settles: the outcome is recorded by then
+      if (wasGone) fin();
+      else Promise.resolve(crCall('/api/term/close', 'POST', window.ExtVT.ttyBody(tty, {}, ''))).then(fin, fin);
     }
     return { backdrop: chrome.backdrop, panel: chrome.panel, onClose: onClose };
   }

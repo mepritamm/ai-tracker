@@ -76,7 +76,7 @@ class _Conc(_Base):
         term_vt._SLOTS_RESERVED = self._slots0
         term_vt._FOLDER_SPAWNING.clear()
 
-    def fake_spawn(self, cwd, argv, cols, rows):
+    def fake_spawn(self, cwd, argv, cols, rows, login=""):
         time.sleep(self.SPAWN_DELAY)
         with self._sl:
             n = len(self.spawns) + 1

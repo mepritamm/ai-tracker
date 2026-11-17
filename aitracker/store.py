@@ -404,6 +404,42 @@ def _update_json(path, mutate):
         lockfh.close()
 
 
+# The only thing a Config login leaves behind: when it ended and how (see term_vt._login_finished).
+LOGIN_OUTCOMES = {"ok": "logged in", "failed": "login failed", "closed": "login cancelled",
+                  "timeout": "login timed out"}
+
+
+def record_login(outcome, now=None):
+    """Stamp config.LAST_LOGIN_FILE with this login's outcome; `ok_at` moves only on "ok". False (nothing
+    written) for an unknown outcome. Never raises."""
+    if outcome not in LOGIN_OUTCOMES:
+        return False
+    t = int(time.time() if now is None else now)
+
+    def mutate(d):
+        d["at"], d["outcome"] = t, outcome
+        if outcome == "ok":
+            d["ok_at"] = t
+    try:
+        _update_json(config.LAST_LOGIN_FILE, mutate)
+    except Exception:
+        return False
+    return True
+
+
+def load_last_login():
+    """{at, ok_at, outcome, label} from config.LAST_LOGIN_FILE, or None when absent or malformed."""
+    d = _load_json(config.LAST_LOGIN_FILE, None)
+    if not isinstance(d, dict) or d.get("outcome") not in LOGIN_OUTCOMES:
+        return None
+    at, ok = d.get("at"), d.get("ok_at")
+    if isinstance(at, bool) or not isinstance(at, (int, float)):
+        return None
+    if ok is not None and (isinstance(ok, bool) or not isinstance(ok, (int, float))):
+        return None
+    return {"at": at, "ok_at": ok, "outcome": d["outcome"], "label": LOGIN_OUTCOMES[d["outcome"]]}
+
+
 def _find_transcript(sid):
     """The one file config.PROJECTS/*/<sid>.jsonl for a KNOWN session id --
     globbing on the filename itself, not a scan of every file's contents."""

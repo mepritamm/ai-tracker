@@ -40,7 +40,7 @@ class _Budget(_Base):
         term_vt._FOLDER_SPAWNING.clear()
         term_vt._RESUME_SPAWNING.clear()
 
-    def fake_spawn(self, cwd, argv, cols, rows):
+    def fake_spawn(self, cwd, argv, cols, rows, login=""):
         time.sleep(self.delay)
         if self.fail_spawn:
             raise OSError("boom")
@@ -49,6 +49,7 @@ class _Budget(_Base):
             self.spawns.append((cwd, list(argv)))
         # a shell (`... -l`) is what the patched tcgetpgrp reports as the foreground group
         pt = term_vt.Pty(tid="sp%d" % n, pid=SHELL if argv[-1] == "-l" else 1000 + n, fd=100 + n, cwd=cwd)
+        pt.login = login
         pt.cmd = " ".join(argv)
         return pt
 

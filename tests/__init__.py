@@ -35,5 +35,8 @@ _atexit.register(_shutil.rmtree, _ZDOTDIR, True)
 from aitracker import config as _config
 _config.LAST_TERMS_FILE = _os.path.join(_tempfile.mkdtemp(prefix="ait-lastterms-"), "last_terms.json")
 _atexit.register(_shutil.rmtree, _os.path.dirname(_config.LAST_TERMS_FILE), True)
+# Same for the Config login outcome (aitracker/last_login.json, written via store.record_login).
+_config.LAST_LOGIN_FILE = _os.path.join(_tempfile.mkdtemp(prefix="ait-lastlogin-"), "last_login.json")
+_atexit.register(_shutil.rmtree, _os.path.dirname(_config.LAST_LOGIN_FILE), True)
 _term_vt._real_start_remember = _term_vt.start_remember
 _term_vt.start_remember = lambda: False
