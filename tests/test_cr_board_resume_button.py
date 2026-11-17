@@ -2,13 +2,13 @@
 
 Board: awaiting + resumable tiles get a Resume button (hero: play icon + label; others: icon-only
 `.cr-tile-resume`), read-only hides every write control, Auggie keeps its old behaviour.
-Boot: `session:answer` -> `CR.answerSession(payload)` -> POST /api/term/open {mode:'resume'}, with the
-in-browser fallback only on 403 {remote:true} (and not readonly); everything else notifies once.
+Parity with the session header's Resume: the tile emits the SAME `session:resume` {id}, which boot turns
+into the in-app terminal `CR.term.open(id, {mode:'resume'})` — never POST /api/term/open (external window).
 
 Runs the real assembled page in the node DOM harness from test_working_glow_board. The boot file's
 event bus is private, so the driver lets the real boot init() run (setTimeout captured, ui mode
 'next'), swaps CR.dialogs for a stub whose mount() captures the real boot ctx, and listens to
-`notify` / `session:resume` through that ctx.
+`session:resume` through that ctx.
 """
 import json
 import os
@@ -100,32 +100,14 @@ function __byId(id) { return __fx.filter(function (s) { return s.id === id; })[0
     window.CR.dialogs = { mount: function (root, c) { ctxCap = c; } };
     __timers.slice().forEach(function (fn) { try { fn(); } catch (e) {} });
     __o.ctxCaptured = !!ctxCap;
-    var __nt = [], resumes = [], opened = [], fetched = [];
-    ctxCap.on('notify', function (p) { __nt.push(p.text); });
-    ctxCap.on('session:resume', function (p) { resumes.push(p.id); });
+    var opened = [], fetched = [];
     window.CR.term = { open: function (id, o) { opened.push([id, o]); } };
+    window.fetch = function (url, init) { fetched.push(url); return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({}); } }); };
     __o.readOnlyDefault = ctxCap.readOnly();
-    async function run(label, payload, ro, resp, viaBus) {
-      __nt.length = 0; resumes.length = 0; opened.length = 0; fetched.length = 0;
-      trackerReadOnly = ro;
-      window.fetch = function (url, init) {
-        fetched.push([url, JSON.parse(init.body)]);
-        return Promise.resolve({ ok: resp.ok, status: resp.status, json: function () { return Promise.resolve(resp.body); } });
-      };
-      if (viaBus) ctxCap.emit('session:answer', payload); else window.CR.answerSession(payload);
-      await __flush(); await __flush();
-      __o[label] = { fetched: fetched.slice(), opened: opened.slice(), notes: __nt.slice(), resumes: resumes.slice() };
-    }
-    await run('ok', { id: 'cc1', resumable: true }, false, { ok: true, status: 200, body: { ok: true } });
-    await run('okBus', { id: 'cc1', resumable: true }, false, { ok: true, status: 200, body: { ok: true } }, true);
-    await run('remote', { id: 'cc1', resumable: true }, false, { ok: false, status: 403, body: { error: 'x', remote: true } });
-    await run('termDisabled', { id: 'cc1', resumable: true }, false, { ok: false, status: 403, body: { error: 'terminal disabled' } });
-    await run('readonly403', { id: 'cc1', resumable: true }, false, { ok: false, status: 403, body: { error: 'ro', readonly: true, remote: true } });
-    await run('serverError', { id: 'cc1', resumable: true }, false, { ok: false, status: 500, body: { error: 'boom' } });
-    await run('auggie', { id: 'auggie:x', resumable: false }, false, { ok: true, status: 200, body: {} });
-    await run('claudeIdNotResumable', { id: 'cc1', resumable: false }, false, { ok: true, status: 200, body: {} });
-    await run('auggieIdResumableTrue', { id: 'auggie:x', resumable: true }, false, { ok: true, status: 200, body: {} });
-    await run('roBoot', { id: 'cc1', resumable: true }, true, { ok: true, status: 200, body: {} });
+    // replay exactly what the board tile emitted through the real boot bus
+    __o.emitted.filter(function (e) { return e[0] === 'session:resume'; }).forEach(function (e) { ctxCap.emit(e[0], e[1]); });
+    await __flush(); await __flush();
+    __o.boot = { opened: opened, fetched: fetched };
     console.log(__MARK__);
     console.log(JSON.stringify(__o));
   } catch (e) {
@@ -164,8 +146,6 @@ def _run():
     return _extract_marker_json(stdout, MARK)
 
 
-_OPEN_POST = [["/api/term/open", {"session": "cc1", "mode": "resume"}]]
-
 
 @unittest.skipUnless(_HAS_NODE, "node not available")
 class TestResumeButtons(unittest.TestCase):
@@ -186,9 +166,9 @@ class TestResumeButtons(unittest.TestCase):
         self.assertEqual(b["aria"], "Resume this session to answer")
         self.assertEqual(self.O["heroSmall"], 0)
 
-    def test_hero_click_emits_answer_with_resumable_and_stops_propagation(self):
+    def test_hero_click_emits_session_resume_and_stops_propagation(self):
         self.assertTrue(self.O["heroStopped"])
-        self.assertIn(["session:answer", {"id": "cc_hero", "resumable": True}], self.O["emitted"])
+        self.assertIn(["session:resume", {"id": "cc_hero"}], self.O["emitted"])
 
     def test_non_hero_is_icon_only(self):
         (b,) = self.O["plainResume"]
@@ -198,7 +178,7 @@ class TestResumeButtons(unittest.TestCase):
         self.assertEqual(b["aria"], "Resume this session to answer")
         self.assertEqual(self.O["plainAction"], 0)
         self.assertTrue(self.O["plainStopped"])
-        self.assertIn(["session:answer", {"id": "cc_plain", "resumable": True}], self.O["emitted"])
+        self.assertIn(["session:resume", {"id": "cc_plain"}], self.O["emitted"])
 
     def test_enter_on_inner_button_does_not_activate_tile(self):
         self.assertEqual(self.O["goAfterClicks"], 0)
@@ -238,14 +218,15 @@ class TestResumeButtons(unittest.TestCase):
             with open(os.path.join(_WEB, f), encoding="utf-8") as fh:
                 src = fh.read()
             if f == "ext_cr_boot.js":
-                src = src[src.index("function answerSession"):src.index("window.CR.answerSession")]
+                src = src[src.index("on('session:resume'"):src.index("on('session:openExternal'")]
             else:
                 src = src[src.index("var canResume"):src.index("var canResume") + 2500]
             self.assertNotIn("hostname", src)
 
 
 @unittest.skipUnless(_HAS_NODE, "node not available")
-class TestAnswerSession(unittest.TestCase):
+class TestBoardResumeParity(unittest.TestCase):
+    """The tile's Resume runs what the session header's Resume runs (ext_cr_detail.js `case "resume"`)."""
     @classmethod
     def setUpClass(cls):
         cls.O = _run()
@@ -254,49 +235,14 @@ class TestAnswerSession(unittest.TestCase):
         self.assertTrue(self.O["ctxCaptured"])
         self.assertFalse(self.O["readOnlyDefault"])
 
-    def test_ok_posts_resume_notifies_no_fallback(self):
-        for k in ("ok", "okBus"):
-            o = self.O[k]
-            self.assertEqual(o["fetched"], _OPEN_POST, k)
-            self.assertEqual(o["opened"], [], k)
-            self.assertEqual(o["resumes"], [], k)
-            self.assertEqual(len(o["notes"]), 1, k)
+    def test_same_event_as_session_header_resume(self):
+        with open(os.path.join(_WEB, "ext_cr_detail.js"), encoding="utf-8") as fh:
+            self.assertIn('ctx.emit("session:resume", { id: sid });', fh.read())
+        self.assertNotIn("session:answer", [e[0] for e in self.O["emitted"]])
 
-    def test_remote_403_falls_back_to_in_browser_resume(self):
-        o = self.O["remote"]
-        self.assertEqual(o["fetched"], _OPEN_POST)
-        self.assertEqual(o["resumes"], ["cc1"])
-        self.assertEqual(o["opened"], [["cc1", {"mode": "resume"}]])
-
-    def test_terminal_disabled_403_no_fallback_one_notify(self):
-        o = self.O["termDisabled"]
-        self.assertEqual((o["resumes"], o["opened"]), ([], []))
-        self.assertEqual(o["notes"], ["terminal disabled"])
-
-    def test_readonly_403_no_fallback(self):
-        o = self.O["readonly403"]
-        self.assertEqual((o["resumes"], o["opened"]), ([], []))
-        self.assertEqual(o["notes"], ["ro"])
-
-    def test_other_error_notifies_error_text(self):
-        self.assertEqual(self.O["serverError"]["notes"], ["boom"])
-        self.assertEqual(self.O["serverError"]["resumes"], [])
-
-    def test_non_resumable_opens_cwd_terminal_without_post(self):
-        # branches on payload.resumable, never on the id shape
-        for k, sid in (("auggie", "auggie:x"), ("claudeIdNotResumable", "cc1")):
-            o = self.O[k]
-            self.assertEqual(o["fetched"], [], k)
-            self.assertEqual(o["opened"], [[sid, {"mode": "cwd"}]], k)
-
-    def test_resumable_flag_wins_over_id_regex(self):
-        o = self.O["auggieIdResumableTrue"]
-        self.assertEqual(o["fetched"], [["/api/term/open", {"session": "auggie:x", "mode": "resume"}]])
-
-    def test_read_only_does_nothing_but_notify(self):
-        o = self.O["roBoot"]
-        self.assertEqual((o["fetched"], o["opened"], o["resumes"]), ([], [], []))
-        self.assertEqual(len(o["notes"]), 1)
+    def test_board_resume_opens_in_app_terminal_not_external(self):
+        self.assertEqual(self.O["boot"]["opened"], [["cc_hero", {"mode": "resume"}], ["cc_plain", {"mode": "resume"}]])
+        self.assertEqual(self.O["boot"]["fetched"], [])
 
 
 if __name__ == "__main__":

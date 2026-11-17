@@ -782,7 +782,7 @@ window.CR = window.CR || {};
   // new endpoint, just a third caller of an existing one. Resume when the
   // session is Claude's own (mirrors ext_launch.js's isClaudeId check),
   // otherwise a plain cwd shell.
-  // POST /api/term/open, shared by openExternal and answerSession. Resolves
+  // POST /api/term/open, used by openExternal. Resolves
   // { ok, status, j } (j = {} when the body isn't JSON); rejects on network failure.
   function postTermOpen(id, mode, extra) {
     var body = { session: id, mode: mode };
@@ -819,49 +819,6 @@ window.CR = window.CR || {};
     });
   });
 
-  // "Waiting on you" tiles: resume the session natively (the server opens the
-  // window on this machine). payload = { id, resumable } — resumable is the
-  // server's own list-row flag, never re-derived from the id here. A remote
-  // caller is refused with 403 {remote:true} (and NOT readonly): fall back to
-  // the in-browser terminal ('session:resume'). Every other failure is notified.
-  function answerSession(payload) {
-    var id = payload && payload.id;
-    if (!id) return;
-    if (ctx.readOnly()) {
-      emit('notify', { text: 'This tracker is shared view-only.' });
-      return;
-    }
-    if (!payload.resumable) {
-      if (window.CR.term && typeof window.CR.term.open === 'function') {
-        window.CR.term.open(id, { mode: 'cwd' });
-      } else {
-        emit('notify', { text: 'Terminal isn’t available right now.' });
-      }
-      return;
-    }
-    if (typeof fetch !== 'function') return;
-    return postTermOpen(id, 'resume').then(function (res) {
-      var j = res.j || {};
-      if (res.status === 409 && j.recreate && window.ExtVT && window.ExtVT.confirmRecreate) {   // E1 (lazy: ext_vt.js loads last)
-        window.ExtVT.confirmRecreate(j, function (x) {
-          postTermOpen(id, 'resume', x).then(function (r2) {
-            emit('notify', { text: (r2.ok && !(r2.j && r2.j.error)) ? 'Resuming in an external window — this machine only.'
-              : ((r2.j && r2.j.error) || 'Couldn’t resume that session.') });
-          });
-        }, function () { return true; });
-      } else if (res.ok && !j.error) {
-        emit('notify', { text: 'Resuming in an external window — this machine only.' });
-      } else if (res.status === 403 && j['remote'] && !j['readonly']) {
-        emit('session:resume', { id: id });
-      } else {
-        emit('notify', { text: j.error || 'Couldn’t resume that session.' });
-      }
-    }).catch(function () {
-      emit('notify', { text: 'Couldn’t reach the server to resume that session.' });
-    });
-  }
-  on('session:answer', answerSession);
-  window.CR.answerSession = answerSession;
   window.CR.openSession = function (id) { if (getUiMode() === 'next') go('detail', id); else if (typeof pick === 'function') pick(id); };
 
   // Terminal model/effort controls from the detail view — REQUIRED ADDITION,

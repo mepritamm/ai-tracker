@@ -2970,17 +2970,17 @@ window.CR = window.CR || {};
       attrs.title = (s.prompt || s.title || '(no prompt)') + '\n' + (s.cwd || '') +
         (s.model ? '\nModel: ' + s.model : '');
 
-      // Awaiting Claude tiles resume natively (server flag `resumable`); read-only
+      // Awaiting Claude tiles (server flag `resumable`) get Resume — the SAME 'session:resume'
+      // (in-app terminal) the session header's Resume emits, so both behave alike; read-only
       // viewers get no write control at all. Other awaiting tiles keep the old button.
       var readOnly = !!(ctx && typeof ctx.readOnly === 'function' && ctx.readOnly());
       var canResume = state === 'awaiting' && !!s.resumable && !readOnly;
-      var answerPayload = { id: s.id, resumable: s.resumable };
       var head = tileHead(s, state, now);
       if (canResume && !t.hero) {
         head.appendChild(h('button', {
           class: 'cr-tile-resume', type: 'button', 'data-act': 'resume',
           title: 'Resume this session to answer', 'aria-label': 'Resume this session to answer',
-          onclick: function (e) { e.stopPropagation(); ctx && ctx.emit && ctx.emit('session:answer', answerPayload); }
+          onclick: function (e) { e.stopPropagation(); ctx && ctx.emit && ctx.emit('session:resume', { id: s.id }); }
         }, [icon('play', '<path d="M8 4.5l11.5 7.5L8 19.5z"/>')]));
       }
       if (s.agent_map_n > 0) {
@@ -3024,7 +3024,7 @@ window.CR = window.CR || {};
           canResume ? h('button', {
             class: 'cr-tile-action', type: 'button', 'data-act': 'resume',
             title: 'Resume this session to answer', 'aria-label': 'Resume this session to answer',
-            onclick: function (e) { e.stopPropagation(); ctx && ctx.emit && ctx.emit('session:answer', answerPayload); }
+            onclick: function (e) { e.stopPropagation(); ctx && ctx.emit && ctx.emit('session:resume', { id: s.id }); }
           }, [icon('play', '<path d="M8 4.5l11.5 7.5L8 19.5z"/>'), 'Resume'])
           : readOnly ? null
           : h('button', {

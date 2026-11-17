@@ -425,7 +425,7 @@ var __o = {};
     if (btn) btn.onclick();
     __o.afterClick = got.slice();
     __o.noRecreate = CRV({ error: 'x' }, function () {}, function () { return true; });
-    // end to end through the real assembled boot: answerSession 409 -> confirm -> same POST + token
+    // end to end through the real assembled boot: External (session:openExternal) 409 -> confirm -> same POST + token
     var ctxCap = null;
     window.CR.dialogs = { mount: function (root, c) { ctxCap = c; } };
     __timers.slice().forEach(function (fn) { try { fn(); } catch (e) {} });
@@ -437,7 +437,7 @@ var __o = {};
       return Promise.resolve({ ok: !first, status: first ? 409 : 200,
         json: function () { return Promise.resolve(first ? body : { ok: true }); } });
     };
-    window.CR.answerSession({ id: 'cc1', resumable: true });
+    ctxCap.emit('session:openExternal', { id: 'cc1' });
     await __flush(); await __flush(); await __flush();
     __o.posts = posts;
     console.log(__MARK__);
