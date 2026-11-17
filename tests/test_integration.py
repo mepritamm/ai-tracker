@@ -2577,7 +2577,9 @@ class TestPendingWorkEndToEnd(_CrServerCase):
         self.assertEqual(st, 200)
         self.assertIn("add feature", u["md"])                            # the unpushed commit
         self.assertEqual(u["resume"]["cwd"], fx.repo)
-        self.assertIn("1 unpushed", u["resume"]["prompt"])
+        # its transcript links the worktree: Resume reopens that session with the live git state
+        self.assertEqual(u["resume"]["session"], "sess-unpushed")
+        self.assertIn("1 commits on no remote", u["resume"]["prompt"])
         self.assertNotRegex(u["resume"]["prompt"], r"[\x00-\x1f]")
         self.assertEqual(self._get_json("/api/pending/item?id=nope")[0], 404)
         self.assertEqual({k: _tree_digest(v) for k, v in trees.items()}, before)    # reading is read-only too

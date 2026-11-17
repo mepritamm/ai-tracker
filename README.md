@@ -303,6 +303,8 @@ Add its source label to the `SRC` map in the page (e.g. `"mytool": "◆ MyTool"`
 
 A scheduled scan finds work that sessions left behind and writes a report to `pending.json` (git-ignored). The board shows it as a **Pending work** card; the classic view has no card.
 
+A worktree's item links the Claude session that created it and the one that last worked there (when this machine still has their transcripts). Resume reopens that session with what is left to commit, push and merge.
+
 - **What is scanned.** Repos, found from the first working directory of each Claude transcript plus the repos from the previous report. For each repo: its git worktrees. Also scratch trees under `~/.claude/jobs/<id>/tmp/` and any directory two levels under `/tmp/claude-<uid>/` for sessions that are no longer live. Transcripts are read, never changed.
 - **How the job runs.** The server runs a scan every `PENDING_INTERVAL` (default `90d`; accepts `Nd`, `Nw`, `Nm` for 30-day months, or `off`). One interval governs the whole run. Between runs the card shows the age of the last report. **Scan now** on the card, or `make pending`, refreshes it. A change to the interval applies within an hour. The in-server worker does not scan from a linked-worktree checkout, a temp dir or a test run. **Scan now** and `make pending` work from any checkout.
 - **First run.** A new install runs about 60 seconds after the first server start, because there is no report yet. The first scan runs in the background and takes about 4 minutes; the card appears when it finishes.

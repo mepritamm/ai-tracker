@@ -558,3 +558,205 @@ Spot-checked against the code: `config.py:504` returns `"90d"` (R3); `build_ctx(
 - [ ] D2 replace "new session + worktree-cleanup" for linked items (recommended) / keep both buttons
 - [ ] D3 prompt asks the session to recap (recommended) / tracker-built digest
 - No code until signed off (rule 8).
+
+## 5b. Implementation review — client (opus)
+
+Scope: `ext_launch.js` pickDirectory, `app.js` pendingResume / openPendingItem / pendingOpenSession / openPendingList, `ext_cr_boot.js` CR.openSession, and the three client test modules. Counts: 0 blocker, 1 major, 3 minor, 4 nit.
+
+**Checked and clean (no finding):**
+- XSS: session titles, roles and `session_note` reach the DOM only through `textContent` (`_pendBtn`, the new `.ps` div). The md goes through `mdBlock` → `md()` → `esc()` first.
+- No unbounded 409 loop: every retry needs a fresh user confirm, and a stale token makes `term_gate.place` return a new plan, not a silent loop.
+- The recreate token, session, prompt and mode are all forwarded through `Object.assign({}, opts, x)`.
+- `bindTty` prefers the server's `res.j.session`, which is the bound or job id and matches the grants that `term_vt` adds on both `attached` paths (`term_vt.py:3343-3347`, `3469-3475`).
+- Existing callers are unaffected: the sidebar picker (`ext_launch.js:261/266/268`, opts undefined), the Log in dialog (`ext_cr_dialogs.js:1647`, gateway/tab), and `ext_cr_term.js`, which has its own `_pickDirectory`. The signature text is intact (`test_term_launch` 101/101).
+- `node --check` passes on all three files and on the concatenated `app.js` + sorted `ext_*.js` bundle.
+- Open session is not host-gated, and it routes in both UI modes.
+- The client reads exactly what `pending.py:1371-1373` returns: `sessions[{id,title,role,resumable,target}]` and `resume{cwd,prompt,session}`. Scratch and repo items carry no `session`, so they fall through to today's `openAt(cwd,"new",prompt)`.
+- Test modules pass one per process: ext_launch 1/1, ui_classic 15/15, ui_board 7/7.
+
+**C1 (major): a 409 recreate during Resume shows "Resume failed", and the retry's outcome is dropped.**
+- *Defect.*
+  - `ext_launch.js:353-356` returns `{ok:false, error, recreate:true}` right after `confirmRecreate` and discards the promise of the retry `pickDirectory(...)`.
+  - `app.js:2408` treats any `ok===false` as a failure.
+- *Repro.*
+  - Setup: a pending worktree item whose directory is missing (prunable) and has a linked Claude target.
+  - Resume makes the server 409 with `{recreate}`, and the confirm dialog appears.
+  - The user presses OK. The worktree is recreated (a git write) and a tab opens.
+  - Actual: the modal still reads "Resume failed: Worktree `…` was removed…". If the retry itself fails (429 too many terminals, "worktree recreated but not usable", a 403 recreate on read-only), nothing is shown at all, because `showPickerError` (`ext_launch.js:314`) is a no-op without `#cwderrmsg`.
+  - Expected: no "failed" message while the confirm is pending, and the retry's real result shown in the modal.
+- *Fix direction.*
+  - The caller must learn the retry's result.
+  - Do NOT change the `pickDirectory(raw, mode, prompt, opts)` signature text, the return shape `{ok:false,error,recreate:true}` (pinned by the test), or `ExtVT.confirmRecreate`.
+- *Way.*
+  - `ext_launch.js:354`: `function (x) { var p = pickDirectory(raw, mode, prompt, Object.assign({}, opts, x)); if (opts && typeof opts.onResult === "function") p.then(opts.onResult); }`. `onResult` is never copied into `body`, and nested 409s recurse with it.
+  - `app.js:2407-2408`: pass `{session:r.session, onResult:x=>{ if(x&&x.ok===false&&!x.recreate) say("Resume failed: "+(x.error||"unknown error")); else if(x&&x.ok) say(""); }}`.
+  - In the `.then`, handle `x&&x.recreate` first with `say("Confirm recreating the worktree to resume")` before the `ok===false` branch.
+- *Test.*
+  - `test_pending_ext_launch.py`: pass `onResult` in the 409 call, set the retry reply to `{status:429, j:{error:'too many'}}`, call `out.retry({recreate:'T'})`, and assert that `onResult` got `{ok:false, error:'too many'}`. Red today: it is never called.
+  - `test_pending_ui_classic.py`: mock `openAt` to resolve `{ok:false, recreate:true, error:'gone'}` and assert that the `.pendmsg` text does not start with "Resume failed". Red today.
+
+**C2 (minor): the "already open, nothing was typed" notice (R8's mitigation) is invisible in Control Room mode.**
+- *Defect.* `ext_launch.js:369` reports `attached` only through `toast()`. `toast()` writes into `#toasts` (`app.js:1647`), which `setUiMode('next')` hides (`ext_cr_boot.js:228` CLASSIC_SIBLINGS, `ext_cr_boot.css:158` `display:none !important`; also noted at `ext_cr_boot.js:1137`).
+- *Repro.* In 'next' mode, take a pending item whose target session is already in a tracker terminal and press Resume. The server answers `attached:true` and the tab opens with no prompt typed. Actual: no message anywhere, since `pendingResume` sees `{ok:true}`. Expected: a visible "nothing was typed — use Copy prompt".
+- *Fix direction.* Surface `attached` in the modal's own `.pendmsg`, which is visible in both modes. Keep the toast. Do NOT change the `{ok:true}` shape for non-attached opens (the existing test asserts `{"ok": True}` exactly).
+- *Way.*
+  - `ext_launch.js:388`: `return res.j.attached ? { ok: true, attached: true } : { ok: true };`.
+  - `app.js:2408` `.then`: `if(x&&x.attached) say("Session already open in a terminal — nothing was typed; use Copy prompt");`.
+- *Test.*
+  - ext_launch harness: capture the attached call's result and assert `{ok:true, attached:true}`.
+  - Classic harness: mock `openAt` to resolve `{ok:true, attached:true}` and assert the `.pendmsg` text contains "nothing was typed".
+  - Both are red today.
+
+**C3 (minor): the retry test passes when the retry drops the prompt and mode.**
+- *Defect.* `test_pending_ext_launch.py:113-115` asserts only `recreate` and `session` on `calls409[1]`.
+- *Repro (run).* Replace `ext_launch.js:354` with `pickDirectory(raw, "new", null, …)` in a copy and run `OpenAt` against it: OK, the mutant survives.
+- *Fix direction.* Test only.
+- *Way.* Add `self.assertEqual(o["calls409"][1]["prompt"], "go")`, `self.assertEqual(o["calls409"][1]["mode"], "resume")`, and `self.assertNotIn("recreate", o["calls409"][0])`.
+- *Test.* The mutant above goes red.
+
+**C4 (minor): the Open-session buttons overflow the bar in a narrow window and push the status message out of view.**
+- *Defect.* `app.css:644` `.pendbar{display:flex}` has no `flex-wrap`, and `.pendbtn` is `white-space:nowrap` (`app.css:649`). The flex items' `min-width:auto` keeps them at their full text width.
+- *Repro.* `app.js:2428` adds up to three "Open session: <full title>" buttons; titles come from titles.json or the AI/custom title and are unbounded. At a window width under about 700px, Resume, Copy prompt and two titled buttons exceed the width of `.msgbody`. `.msgbody` scrolls horizontally (`overflow:auto`, `app.css:388`), and `.pendmsg` (where "Resume failed…" appears) sits off-screen. The route is loopback-only, so this affects narrow and split desktop windows, not phones.
+- *Fix direction.* Let the bar wrap and bound the label. Do NOT change the button order (Resume, Copy prompt, Open session…, msg) or the `"Open session: "+title` prefix the harness finds.
+- *Way.*
+  - `app.css:644`: add `flex-wrap:wrap`.
+  - Optionally, in `app.js:2428`, cap the label at 40 characters with "…" and set `b.title` to the full title.
+- *Test.* `test_pending_ui_classic.py`: `re.search(r"\.pendbar\{[^}]*flex-wrap:\s*wrap", app_css)`. Red today.
+
+**C5 (nit): the Open-session buttons don't say which role each one is.**
+- *Defect.* `app.js:2428` labels with the title only. A creator and a "last worked here" session with the same title (a fork, or identical AI titles) give two identical "Open session: T" buttons, and nothing in the bar marks which one is the Resume target.
+- *Fix direction.* Expose the role without changing the label prefix.
+- *Way.* After `_pendBtn(...)`, set `btn.title = row.role + (row.target ? " — Resume target" : "")`. This is the `title` attribute (textContent-safe), not innerHTML.
+- *Test.* Classic harness: assert that the "Open session: T" element's `title` is "created this worktree — Resume target".
+
+**C6 (nit): the CR.openSession test is a regex that pins neither branch.**
+- *Defect.* `test_pending_ui_board.py:141-144` only asserts that `go('detail'` appears. The mutants `getUiMode() !== 'next'` and dropping the `pick(id)` fallback both pass.
+- *Fix direction.* Test only.
+- *Way.* Also assert `"getUiMode() === 'next'"` and `"pick(id)"` in `m.group(0)`.
+- *Test.* Both mutants go red.
+
+**C7 (nit): stale comments in `ext_launch.js` now contradict the code.**
+- *Defect.* These comments are out of date:
+  - `:323-326` says mode is "cwd" or "new" (session-less only);
+  - `:339` says "first prompt for a `new` session";
+  - `:373-376` says "`sid` is deliberately omitted", but `:384` now adds it;
+  - `:397-398` says "open a session-less terminal".
+- *Fix direction.* Comments only.
+- *Way.* Say that a `session` in opts switches to the session-scoped form (the server ignores `cwd`), and that `&sid=` is added when a session is set.
+- *Test.* None.
+
+**C8 (nit, cross-scope, for §5a): the prompt says the worktree is missing even when this Resume recreates it.**
+- *Defect.* `resume_work_prompt` writes "the worktree directory is missing" when it is built, but C1's confirm path then recreates that directory before claude starts.
+- *Repro.* A prunable item with a target, Resume, then OK. The resumed session is told that a now-existing directory is missing.
+- *Fix direction.* Wording only, in `pending.py`'s `{tree}` branch.
+- *Way.* Use "the worktree directory was missing at {when} (Resume may have recreated it — check `git status`)".
+- *Test.* In `test_pending_item_detail`, assert the new phrase for a missing-path item.
+
+## 5a. Implementation review — server (opus)
+
+Scope: `providers/claude.py` (`worktree_states`, `_WT_CACHE`), `registry.other_sessions`, `pending.py` (`session_evidence`, `attach_sessions`, the `scan()` call, `_safe_ref`, `_tick`, `resume_work_prompt`, `item_detail`), the fixture and the server tests. Every finding below was reproduced. Throwaway repros are in `~/.claude/jobs/78d1ccfd/tmp/rv-server/` (`test_rv.py` A–G, `test_rv2.py` H, `t1.py` timing, `t_wt.py`, `t_vac.py`). They fail today as quoted.
+Green as shipped (one module per process): `tests.test_pending_sessions` (11), `tests.test_pending_item_detail` (11), `tests.test_integration.TestPendingWorkEndToEnd`. The R5 guard `test_clean_does_not_walk_transcripts` is not vacuous: a mutant `build_ctx` that calls `worktree_states` turns it red (3 != 2).
+Checked and clean:
+- No transcript text reaches the prompt. Only `role`'s "created" substring is used, never the title or `last_text`.
+- The prompt is one line, and nothing in it can start with '-'.
+- Argv stays inside the conventions. The only new argv is the read-only `log … --not <base>`, gated by `_safe_ref`.
+- The fork tie, nested deepest-owner, kind filter, dedupe and Auggie link-only row behave as specified. On real data, `job-summary-header` (two creators with equal `first`) picks the older mtime.
+- The `/api/term/pty` resume path ignores `cwd` when `session` is set, and it returns `attached` and the 409 `recreate` that the client relies on.
+
+**S1 — major — a stored row whose transcript has since been deleted is still the Resume target.**
+- *Defect.* `pending.py:1316-1321` re-adds every stored `it["sessions"]` row with its scan-time `resumable`. `attach_sessions` then picks it as the target although the file is gone. Claude Code deletes transcripts after `cleanupPeriodDays` (30 by default), while the scan runs every 90 days, so this happens often.
+- *Repro.* `test_rv.py::test_A`: scan with S1, `os.remove(S1.jsonl)`, then `item_detail`. Actual: `resume.session == "S1"`. The client posts `mode=resume`, `term_gate.session_cwd` returns "", and `/api/term/pty` answers 404 "session not found". The user loses both the resume and the old cleanup flow that D2 replaced. Expected: `session == ""` and `prompt == resume_prompt(it)`, with no row for S1.
+- *Fix direction.* At click time, only a Claude session whose transcript exists can be a row or the target. Do NOT change `attach_sessions` (it is pure), and do not touch non-Claude rows.
+- *Way.* In the stored-row loop at `pending.py:1316`, `continue` when `":" not in str(row["id"]) and find_session(row["id"]) is None`. That is at most 3 globs, so it is cheap.
+- *Test.* In `test_pending_item_detail`, add `test_deleted_transcript_falls_back_to_old_flow` (the repro above). Assert `out["sessions"] == []` and the old prompt. It is red today.
+
+**S2 — major — every click re-reads all 266 transcript tails and evicts the `/api/list` poll's tail memo.**
+- *Defect.* `pending.py:286` calls `_tail_scan(fp)` for every `PROJECTS/*/*.jsonl` on the request path. `_TAIL_MEMO` is a FIFO capped at `_TAIL_MEMO_MAX = 256` (`claude.py:99`). This machine has 266 transcripts, and cycling 266 keys through a 256-slot FIFO gives a 0 % hit rate. So the plan's "≈266 stats plus memo hits" does not hold, and each click also flushes the entries that the 2 s list poll needs.
+- *Repro.*
+  - `t1.py` against the real `~/.claude`: `session_evidence(full=False)` takes 2.28 s cold, then 0.39 / 0.52 / 0.40 s warm. Counting `_tail_scan_raw` calls on a warm run gives **266**.
+  - `test_rv.py::test_C`: with `_TAIL_MEMO_MAX` patched to 2 and 3 transcripts, the second unchanged call does 3 raw reads (expected 0).
+- *Fix direction.* Give the evidence its own per-file memo, keyed on `(st_mtime_ns, st_size)`, so an unchanged transcript costs one stat. Do NOT raise `_TAIL_MEMO_MAX` (it moves the cliff), and do not change `_tail_scan`.
+- *Way.* In `pending.py`, add `_EV_MEMO = {}  # fp -> (sig, (cwd, tuple(cwds), wt_or_None, first, meta_title))` and `def _tx_evidence(fp)`. It does `os.stat`, returns the cached tuple when the sig matches, and otherwise calls `_session_meta` and `_tail_scan` once and stores the tuple. `session_evidence` calls it in place of lines 286-292's direct reads. After the walk, drop the keys that were not seen in this listing, so the memo stays bounded by the real file count. `titles.json` stays read per call.
+- *Test.* `test_pending_sessions::Evidence::test_unchanged_transcripts_cost_no_tail_read` is `test_C`: patch `claude._TAIL_MEMO_MAX = 2` and wrap `claude._tail_scan_raw` with a counter. The second `session_evidence(full=False)` must make 0 calls. It is red today (3).
+
+**S3 — minor — a squash-merged prompt says "PR #?" and the wrong base.**
+- *Defect.* At `pending.py:1268` the code reads `gh["pr"]` as a dict. `gh_merged` (`pending.py:763-764`) stores `{"state":"merged","pr":<url str>,"number":N,"base":baseRefName}`, so the result is always `#?`, and the base falls back to the item's base.
+- *Repro.* `test_rv.py::test_B`: `gh={"state":"merged","pr":"https://x/pull/42","number":42,"base":"main"}`. Actual: "squash-merged as PR #? into `origin/main`". Expected: "PR #42 into `main`".
+- *Fix direction.* Read the real shape. Keep the dict branch only if an older report could carry one; nothing writes one.
+- *Way.* `merge = "squash-merged as PR #%s into %s (as of the last scan)" % (gh.get("number") or "?", _tick(gh.get("base") or base or "?"))`.
+- *Test.* In `test_pending_item_detail`, add `test_squash_merged_prompt_names_pr` (test_B). It is red today.
+
+**S4 — minor — repo (primary checkout) items now run and show a 5th git section.**
+- *Defect.* At `pending.py:1344` the `_safe_ref(base)` job is outside the `kind == "worktree"` branch. A repo item's md gains `**git log --oneline HEAD --not origin/main**` and an extra subprocess. This contradicts §3.0 ("repo items byte-for-byte unchanged") and §3.2 B.5, which scopes the job to `kind == "worktree"`.
+- *Repro.* `test_rv.py::test_D`: the repo item's md contains that header.
+- *Fix direction.* Gate on the kind. Worktree items keep the job.
+- *Way.* `if it.get("kind") == "worktree" and _safe_ref(it.get("base")):`.
+- *Test.* `ItemDetailSessionResume::test_repo_item_never_gets_a_session` additionally asserts `"--not origin/main**" not in out["md"]`. It is red today.
+
+**S5 — minor — the prompt stamps live git counts with the scan's date.**
+- *Defect.* `resume_work_prompt(it, tgt, live, when)` at `pending.py:1370` receives `when` = `report.generated_at`, which can be up to 90 days old. "(git, checked {when})" then labels counts that were computed seconds ago. The resumed session is told the state is stale when it is not, or it trusts an old date. The plan's template has the same slip, so both missed it.
+- *Repro.* `test_rv2.py::test_H`: `generated_at = 400 days`, then an untracked file is added. Actual: "checked 1971-02-05 05:30): 0 uncommitted and 1 untracked files". The 1 untracked is live.
+- *Fix direction.* Stamp the time the counts came from. The gh clause already says "as of the last scan" and stays as it is.
+- *Way.* In `item_detail`, pass `time.strftime("%Y-%m-%d %H:%M") if live else when`. `resume_work_prompt` is unchanged. This composes with §5b's missing-dir wording, which uses `when` for the missing case.
+- *Test.* test_H in `test_pending_item_detail` asserts the scan year is not in the prompt. It is red today.
+
+**S6 — minor — a truncated `_git_capped` output undercounts live counts, and the undercount beats the correct scan count.**
+- *Defect.* `pending.py:1360-1367` counts lines of output that `_git_capped` cut at `ITEM_GIT_BYTES` (256 KB), and it still returns rc 0. For a local-only repo, `HEAD --not --remotes` is the whole history, so a branch with more than about 4k commits, or more than about 5k status entries, reports a smaller live number than `item["unpushed"]`.
+- *Repro.* `test_rv.py::test_F`: `ITEM_GIT_BYTES` patched to 200, with 31 unpushed commits. Actual: "12 commits on no remote". Expected: 31 (the scan count).
+- *Fix direction.* When the output may be truncated, use no live count, so the scan value is used. Do not add a new git argv.
+- *Way.* At the top of the `if rc == 0:` block, `if len(out.encode("utf-8", "replace")) >= ITEM_GIT_BYTES: continue`. Leaving the count as None falls back to the item.
+- *Test.* `test_F` in `test_pending_item_detail`. It is red today.
+
+**S7 — minor — the `worktree_states` memo thrashes past 512 transcripts and re-reads every whole file on every scan.**
+- *Defect.* At `claude.py:335` the cache is a FIFO with 512 slots. With N > 512 transcripts, each cyclic walk misses on every file. That is a full read of every byte: 3.4 GB in `~/.claude/projects` here, at 266 files today.
+- *Repro.* `t_wt.py`: 513 files, then a second unchanged pass re-opens **513** files. The expected count is 0.
+- *Fix direction.* Bound the cache by the files that exist, not by a constant.
+- *Way.* Drop the 512 pop. In `session_evidence(full=True)`, after the walk, prune the `claude._WT_CACHE` keys that are not in the current listing's realpaths. This is the same prune as S2's `_EV_MEMO`.
+- *Test.* In `test_pending_sessions::WorktreeStates`, write 513 tiny files, call twice, and count `open` on the second pass: it must be 0. It is red today.
+
+**S8 — nit — a base ref that is also a path in the worktree makes the 5th job fail.**
+- *Defect.* At `pending.py:1346`, `git log … --not origin/main` exits 128 ("ambiguous argument: both revision and filename") when the worktree holds `origin/main` as a path. The section shows "(git failed)", and the live unmerged count is lost.
+- *Repro.* `test_rv.py::test_G`.
+- *Fix.* Append `"--"` to that argv tuple only. The header text and the other four jobs are unchanged.
+- *Test.* test_G. It is red today.
+
+**S9 — nit — the command hints embed the raw path, unquoted and with backticks kept.**
+- *Defect.* At `pending.py:1279` and in the template, `git -C %s` uses the raw `path`. A space breaks the suggested command, and a backtick breaks the "values in backticks are data" framing (R10).
+- *Repro.* `test_rv.py::test_E`: path `/tmp/a b\`c` gives "`git -C /tmp/a b\`c status --short`".
+- *Fix.* Use `qp = shlex.quote(str(path).replace("`", "'"))` in both hints. `_tick(path)` stays the display.
+- *Test.* test_E. It is red today.
+
+**S10 — nit — a NUL in a later-record `cwd` or a `worktreePath` makes the whole scan raise.**
+- *Defect.* `_rp()` raises `ValueError: embedded null byte` (`os.path.realpath`) at `pending.py:293-297`, and nothing catches it, so `scan()` dies. A NUL in the head `cwd` already crashes `build_ctx` (same as base). The new surface is the tail `cwds` and `worktreePath`.
+- *Fix.* `continue` on any string containing "\x00" before `add(_rp(...))`, in both loops.
+- *Test.* A transcript whose second record has `"cwd": "/a\u0000b"`. `session_evidence(full=True)` must not raise. It is red today.
+
+**S11 — nit, no change — the old-flow integration guard was edited.**
+- *Finding.* §3.4 listed `test_integration.py:2573-2581` as "must stay green unchanged". It now asserts `session == "sess-unpushed"` / "1 commits on no remote" instead of "1 unpushed". This is an expected consequence: that fixture has a transcript in the worktree, so D2 applies.
+- *Coverage.* The no-session old flow keeps unit coverage through `test_no_session_keeps_the_old_prompt`.
+- *Direction.* No change. Note it in the PR.
+- *Related nit.* `WorktreeStates` proves only the size half of the memo key; an mtime-only change is untested. Add one `os.utime` bump with the same size.
+
+Counts: 0 blocker, 2 major (S1, S2), 5 minor (S3–S7), 4 nit (S8–S11).
+
+---
+
+## 6. Reconciliation of the implementation review (main thread)
+
+The gate before the fixes: 164 of 165 modules were green. `tests/test_term_vt_client.py:2936` pinned the old `bindTty(res.j.tty, "")` text in `ext_launch.js`. That is an **expected** consequence: the call now binds `res.j.session || (opts && opts.session) || ""`, the same pattern `ext_vt.js` uses. The guard's expected text was updated, and its module now passes (4/4).
+
+| # | Verdict | Fixer note |
+|---|---|---|
+| S1 | confirmed (major) | Apply as written. |
+| S2 | confirmed (major) | Apply the separate `_EV_MEMO` in `pending.py`. Do NOT change `_TAIL_MEMO_MAX`, because the list poll's cache must stay its own. |
+| S3–S6 | confirmed | Apply as written. |
+| S7 | confirmed | Prune to the files that exist; drop the 512 pop. |
+| S8–S10 | confirmed (nit) | Apply as written. |
+| S11 | confirmed, no change | Note it in the PR or commit body. |
+| C1 | confirmed (major) | Apply the `opts.onResult` way. |
+| C2–C3 | confirmed | Apply as written. |
+| C4 | confirmed | One `flex-wrap` rule in `app.css` is allowed, overriding §3's "app.css untouched", because this is a real overflow. |
+| C5–C7 | confirmed (nit) | Apply as written. |
+| C8 | confirmed | The server fixer owns it, because it changes the prompt text in `resume_work_prompt`. |
+
+Overengineered fixes cut: none. Missed by both: none found.

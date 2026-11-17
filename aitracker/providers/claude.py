@@ -297,6 +297,46 @@ def _tail_fields(path, nbytes=96000):
     return s["ai"], s["custom"], s["entry"], s["waiting"], s["ended"]
 
 
+_WT_CACHE = {}   # realpath -> ((st_mtime_ns, st_size), [(worktreePath, entered)]); unbounded here, pruned to the
+                 # files that exist by pending.session_evidence(full=True)
+
+
+def worktree_states(path):
+    """[(worktreePath, entered)] first-seen order, one per distinct path, over the WHOLE file:
+    raw-bytes prefilter b'"worktree-state"', json.loads only on hit lines; worktreeSession null or
+    non-dict skipped; entered = bool(enteredExisting), and False if ANY record for that path is a
+    create. Memoised on (st_mtime_ns, st_size); [] on OSError."""
+    try:
+        st = os.stat(path)
+        rp = os.path.realpath(path)
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return []
+    ent = _WT_CACHE.get(rp)
+    if ent is not None and ent[0] == sig:
+        return list(ent[1])
+    seen = {}
+    try:
+        with open(path, "rb") as fh:
+            for line in fh:
+                if b'"worktree-state"' not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                ws = o.get("worktreeSession") if isinstance(o, dict) else None
+                if not isinstance(ws, dict) or not isinstance(ws.get("worktreePath"), str) or not ws["worktreePath"]:
+                    continue
+                p = ws["worktreePath"]
+                seen[p] = seen.get(p, True) and bool(ws.get("enteredExisting"))
+    except OSError:
+        return []
+    res = list(seen.items())
+    _WT_CACHE[rp] = (sig, res)
+    return list(res)
+
+
 def _session_meta(path):
     """cwd + best title (custom > ai > opening prompt) + entrypoint + sessionKind, cached by mtime."""
     try:

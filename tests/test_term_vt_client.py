@@ -2933,7 +2933,7 @@ class TestTtyAddressedCallsCarryTheirSession(unittest.TestCase):
                        "bindTty(tty, sid);", "bindTty(ttyId, sid, true)", "bindRows("):
             self.assertIn(needle, src)
         self.assertIn('bindTty(res.j.tty, "")', _read("ext_cr_term.js"))
-        self.assertIn('bindTty(res.j.tty, "")', _read("ext_launch.js"))
+        self.assertIn('bindTty(res.j.tty, res.j.session || (opts && opts.session) || "")', _read("ext_launch.js"))
 
 
 class TestRedirectedSessionBinds(unittest.TestCase):

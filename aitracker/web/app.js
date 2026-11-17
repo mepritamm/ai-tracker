@@ -2394,6 +2394,7 @@ function openPendingList(p){
     const t=document.createElement("div"); t.className="pt"; t.textContent=it.label||it.reason||it.verdict||it.path||"";
     const s=document.createElement("div"); s.className="ps"; s.textContent=[it.path,it.branch].filter(Boolean).join("  ·  ");
     r.appendChild(t); r.appendChild(s);
+    if(it.session_note){const n=document.createElement("div"); n.className="ps"; n.textContent=it.session_note; r.appendChild(n);}
     if(it.id){r.onclick=()=>openPendingItem(it.id); r.className+=" click";
       r.tabIndex=0; r.setAttribute("role","button");
       r.onkeydown=e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); openPendingItem(it.id); } };}
@@ -2403,9 +2404,10 @@ function openPendingList(p){
 function pendingResume(r,say){
   const L=window.ExtLaunch;
   if(!L||typeof L.openAt!=="function"){say("Resume unavailable in this build — use Copy prompt");return;}
-  let pr; try{pr=L.openAt(r.cwd,"new",r.prompt);}catch(e){say("Resume failed: "+e);return;}
-  Promise.resolve(pr).then(x=>{if(x&&x.ok===false)say("Resume failed: "+(x.error||"unknown error"));}).catch(e=>say("Resume failed: "+e));
+  let pr; try{pr=r.session?L.openAt(r.cwd,"resume",r.prompt,{session:r.session,onResult:x=>{if(x&&x.ok===false&&!x.recreate)say("Resume failed: "+(x.error||"unknown error"));else if(x&&x.ok)say("");}}):L.openAt(r.cwd,"new",r.prompt);}catch(e){say("Resume failed: "+e);return;}
+  Promise.resolve(pr).then(x=>{if(x&&x.recreate)say("Confirm recreating the worktree to resume");else if(x&&x.ok===false)say("Resume failed: "+(x.error||"unknown error"));else if(x&&x.attached)say("Session already open in a terminal — nothing was typed; use Copy prompt");}).catch(e=>say("Resume failed: "+e));
 }
+function pendingOpenSession(id){ closeMsg(); if(window.CR&&typeof window.CR.openSession==="function")window.CR.openSession(id); else pick(id); }
 function pendingCopyPrompt(text,btn){
   const old=btn.textContent, done=()=>{btn.textContent="Copied";setTimeout(()=>{btn.textContent=old;},1200);};
   const fb=()=>{const t=document.createElement("textarea");t.value=text;fallbackCopy(t,done);};
@@ -2422,7 +2424,9 @@ async function openPendingItem(id){
   const msg=document.createElement("span"); msg.className="muted pendmsg";
   bar.appendChild(_pendBtn("Resume",()=>pendingResume(r,t=>{msg.textContent=t;})));
   const cp=_pendBtn("Copy prompt",()=>pendingCopyPrompt(r.prompt||"",cp));   // ALWAYS shown: fallback when a launcher drops the prompt
-  bar.appendChild(cp); bar.appendChild(msg);
+  bar.appendChild(cp);
+  (d.sessions||[]).forEach(row=>{const full=row.title||row.id, lab=full.length>40?full.slice(0,40)+"…":full, btn=_pendBtn("Open session: "+lab,()=>pendingOpenSession(row.id)); btn.title=row.role+(row.target?" — Resume target":""); bar.appendChild(btn);});   // AFTER Copy prompt
+  bar.appendChild(msg);
   body.insertBefore(bar,body.firstChild||null);
 }
 window.openPendingList=openPendingList; window.openPendingItem=openPendingItem; window.loadPending=loadPending;

@@ -50,6 +50,28 @@ vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
   out.notab = await win.ExtLaunch.openAt('~', 'new', '/login', {gateway: 'anthropic', tab: false});
   out.notabOpens = wo.length;
   out.tabOpens = (await win.ExtLaunch.openAt('~', 'new', '/login', {gateway: 'anthropic'}), wo.length);
+  reply = {status: 200, j: {tty: 'R1', session: 'S9'}};
+  calls.length = 0; wo.length = 0;
+  await win.ExtLaunch.openAt('/w', 'resume', 'go', {session: 'S9'});
+  out.sess = calls[0].body;
+  out.sessUrl = wo[0][0];
+  const binds = []; win.ExtVT = {bindTty: (t, s) => binds.push([t, s]), confirmRecreate: (j, retry) => { out.confirmArg = j; out.retry = retry; }};
+  reply = {status: 409, j: {error: 'gone', recreate: {token: 'T'}}};
+  calls.length = 0;
+  const onRes = [];
+  out.r409 = await win.ExtLaunch.openAt('/w', 'resume', 'go', {session: 'S9', onResult: x => onRes.push(x)});
+  reply = {status: 429, j: {error: 'too many'}};
+  out.retry({recreate: 'T'});
+  await new Promise(r => setTimeout(r, 20));
+  out.onRes = onRes;
+  reply = {status: 200, j: {tty: 'R2', session: 'S9'}};
+  out.retry({recreate: 'T'});
+  await new Promise(r => setTimeout(r, 20));
+  out.calls409 = calls.map(c => c.body);
+  reply = {status: 200, j: {tty: 'R3', session: 'S9', attached: true}};
+  const toasts = []; ctx.toast = (...a) => toasts.push(a);
+  out.attached = await win.ExtLaunch.openAt('/w', 'resume', 'go', {session: 'S9'});
+  out.toasts = toasts; out.binds = binds;
   reply = {fail: true};
   out.empty = await win.ExtLaunch.openAt('  ', 'new', 'x');
   console.log(JSON.stringify(out));
@@ -85,6 +107,27 @@ class OpenAt(unittest.TestCase):
         self.assertEqual(o["notab"], {"ok": True, "tty": "L1", "renderer": "xterm", "notice": "n"})
         self.assertEqual(o["notabOpens"], 0)
         self.assertEqual(o["tabOpens"], 1)
+        # resume a specific session: body carries it, the tab URL gets &sid=
+        self.assertEqual(o["sess"]["session"], "S9")
+        self.assertEqual(o["sess"]["mode"], "resume")
+        self.assertIn("&sid=S9", o["sessUrl"])
+        # 409 {recreate} -> confirm hook, then a retry carrying the token and the session
+        self.assertEqual(o["r409"], {"ok": False, "error": "gone", "recreate": True})
+        self.assertEqual(o["confirmArg"]["recreate"], {"token": "T"})
+        self.assertEqual(o["onRes"][0], {"ok": False, "error": "too many"})   # C1: retry result reaches the caller
+        self.assertEqual(o["onRes"][1], {"ok": True})
+        self.assertNotIn("onResult", o["calls409"][1])
+        self.assertEqual(len(o["calls409"]), 3)
+        self.assertNotIn("recreate", o["calls409"][0])                         # C3
+        for c in o["calls409"][1:]:
+            self.assertEqual(c["prompt"], "go")
+            self.assertEqual(c["mode"], "resume")
+        self.assertEqual(o["calls409"][1]["recreate"], "T")
+        self.assertEqual(o["calls409"][1]["session"], "S9")
+        # attached -> the "nothing was typed" toast
+        self.assertEqual(o["attached"], {"ok": True, "attached": True})        # C2
+        self.assertEqual(o["toasts"][-1][0], "Session already open in a terminal")
+        self.assertIn(["R3", "S9"], o["binds"])
 
 
 if __name__ == "__main__":

@@ -862,6 +862,7 @@ window.CR = window.CR || {};
   }
   on('session:answer', answerSession);
   window.CR.answerSession = answerSession;
+  window.CR.openSession = function (id) { if (getUiMode() === 'next') go('detail', id); else if (typeof pick === 'function') pick(id); };
 
   // Terminal model/effort controls from the detail view — REQUIRED ADDITION,
   // not wired here: cr_term.js's own model/effort switch (_openModelDialog/

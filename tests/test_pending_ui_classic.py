@@ -183,6 +183,50 @@ _DRIVER = r"""
   document.activeElement = null;
   await loadSide(); await flush();
   OUT.reloaded_after_typing = RELOADS === before + 1;
+  // session link: resume with a session id, "Open session" buttons after Copy prompt, session_note via textContent
+  ITEM = { title: "t", when: "now", md: "m", sessions: [{ id: "S1", title: "T", role: "created this worktree", resumable: true, target: true }],
+    resume: { cwd: "/w", prompt: "go", session: "S1" } };
+  var launched2 = [];
+  window.ExtLaunch = { openAt: (c, m, p, o) => { launched2.push([c, m, p, o]); return Promise.resolve({ ok: true }); } };
+  await openPendingItem("abc123abc123");
+  find($("msgbody"), (e) => e.textContent === "Resume").onclick(); await flush();
+  OUT.launched_session = launched2;
+  var bar2 = find($("msgbody"), (e) => e.className === "pendbar");
+  OUT.bar_labels = bar2.children.map((c) => c.textContent);
+  var picked = [];
+  pick = (id) => { picked.push(id); };
+  delete window.CR;
+  find($("msgbody"), (e) => e.textContent === "Open session: T").onclick();
+  OUT.picked = picked;
+  var viaCR = [];
+  window.CR = { openSession: (id) => { viaCR.push(id); } };
+  await openPendingItem("abc123abc123");
+  find($("msgbody"), (e) => e.textContent === "Open session: T").onclick();
+  OUT.via_cr = viaCR;
+  openPendingList({ items: [{ id: "abc123abc123", label: "l", path: "/w/x", branch: "b", session_note: "created this worktree: <b>T</b>" }], tmp: [], running: false });
+  var note = find($("msgbody"), (e) => e.className === "ps" && e.textContent.indexOf("created this worktree") === 0);
+  OUT.note_text = note ? note.textContent : null;
+  OUT.note_html_untouched = note ? note._h === "" : false;
+  // C5: role + resume target exposed via title attr
+  await openPendingItem("abc123abc123");
+  var ob = find($("msgbody"), (e) => e.textContent === "Open session: T");
+  OUT.open_title = ob ? ob.title : null;
+  // C1: recreate confirm pending -> not "Resume failed"; retry result arrives via opts.onResult
+  var cap = {};
+  window.ExtLaunch = { openAt: (c, m, p, o) => { cap.o = o; return Promise.resolve({ ok: false, recreate: true, error: "gone" }); } };
+  await openPendingItem("abc123abc123");
+  find($("msgbody"), (e) => e.textContent === "Resume").onclick(); await flush(); await flush();
+  var pm = find($("msgbody"), (e) => (e.className || "").indexOf("pendmsg") >= 0);
+  OUT.recreate_msg = pm.textContent;
+  cap.o.onResult({ ok: false, error: "too many" }); await flush();
+  OUT.retry_fail_msg = pm.textContent;
+  cap.o.onResult({ ok: true }); await flush();
+  OUT.retry_ok_msg = pm.textContent;
+  // C2: attached surfaces in the modal's own message
+  window.ExtLaunch = { openAt: () => Promise.resolve({ ok: true, attached: true }) };
+  await openPendingItem("abc123abc123");
+  find($("msgbody"), (e) => e.textContent === "Resume").onclick(); await flush(); await flush();
+  OUT.attached_msg = find($("msgbody"), (e) => (e.className || "").indexOf("pendmsg") >= 0).textContent;
   console.log("@@OUT@@" + JSON.stringify(OUT));
 })().catch((e) => { console.log("@@ERR@@" + (e && e.stack || e)); });
 """
@@ -222,6 +266,24 @@ class TestPendingUiClassic(unittest.TestCase):
     def test_resume_calls_openat_with_server_prompt(self):
         self.assertTrue(self.O["has_resume"])
         self.assertEqual(self.O["launched"], [["/w", "new", "Use the worktree-cleanup skill on /w/x"]])
+
+    def test_session_resume_open_session_and_note(self):
+        self.assertEqual(self.O["launched_session"], [["/w", "resume", "go", {"session": "S1"}]])
+        self.assertEqual(self.O["bar_labels"][:3], ["Resume", "Copy prompt", "Open session: T"])
+        self.assertEqual(self.O["picked"], ["S1"])      # no window.CR -> classic pick()
+        self.assertEqual(self.O["via_cr"], ["S1"])      # window.CR.openSession preferred
+        self.assertEqual(self.O["note_text"], "created this worktree: <b>T</b>")
+        self.assertTrue(self.O["note_html_untouched"])  # textContent, not innerHTML
+
+    def test_resume_recreate_attached_title_and_wrap(self):
+        self.assertEqual(self.O["open_title"], "created this worktree \u2014 Resume target")          # C5
+        self.assertFalse(self.O["recreate_msg"].startswith("Resume failed"))                          # C1
+        self.assertIn("Confirm recreating", self.O["recreate_msg"])
+        self.assertEqual(self.O["retry_fail_msg"], "Resume failed: too many")
+        self.assertEqual(self.O["retry_ok_msg"], "")
+        self.assertIn("nothing was typed", self.O["attached_msg"])                                    # C2
+        with open(os.path.join(os.path.dirname(_APP), "app.css"), encoding="utf-8") as fh:            # C4
+            self.assertRegex(fh.read(), r"\.pendbar\{[^}]*flex-wrap:\s*wrap")
 
     def test_copy_prompt_always_present_and_copies(self):
         self.assertTrue(self.O["has_copy_with"])

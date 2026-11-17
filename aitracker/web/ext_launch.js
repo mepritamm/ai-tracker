@@ -320,10 +320,10 @@
     err.style.display = "";
   }
 
-  // mode is "cwd" (a plain shell) or "new" (a fresh `claude`) -- the session-less form of the
-  // same POST /api/term/pty route ext_vt.js's openVT() already uses for the "…here" pair, just
-  // keyed by `cwd` instead of `session` (Tier 2's addition; may 404/400 in a worktree where it
-  // hasn't landed yet -- handled below, not left to fail silently or hang).
+  // mode is "cwd" (a plain shell), "new" (a fresh `claude`) or "resume". Without opts.session this
+  // is the session-less form of the POST /api/term/pty route ext_vt.js's openVT() uses; a
+  // `session` in opts switches to the session-scoped form (the server ignores `cwd` then). May
+  // 404/400 where unsupported -- handled below, not left to fail silently or hang.
   function pickDirectory(raw, mode, prompt, opts) {
     var path = (raw == null ? "" : String(raw)).trim();
     // A leading "~" is left exactly as typed -- this file never invents a home directory of its
@@ -336,7 +336,9 @@
     }
     showPickerBusy();
     var body = { cwd: path, cols: 100, rows: 30, mode: mode };
-    if (prompt) body.prompt = prompt;   // optional first prompt for a `new` session (ExtLaunch.openAt)
+    if (prompt) body.prompt = prompt;   // optional first prompt for a `new` or `resume` session (ExtLaunch.openAt)
+    if (opts && opts.session) body.session = opts.session;       // resume a specific session (pending work)
+    if (opts && opts.recreate) body.recreate = opts.recreate;    // token from a confirmed worktree recreate
     if (opts && (opts.gateway === "anthropic" || opts.gateway === "openrouter")) body.gateway = opts.gateway;
     return fetch("/api/term/pty", {
       method: "POST",
@@ -348,7 +350,14 @@
           .then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
       })
       .then(function (res) {
-        if (res.j && res.j.tty && window.ExtVT && window.ExtVT.bindTty) window.ExtVT.bindTty(res.j.tty, "");   // session-less shell
+        if (res.status === 409 && res.j && res.j.recreate && window.ExtVT && window.ExtVT.confirmRecreate) {
+          window.ExtVT.confirmRecreate(res.j, function (x) {
+            var p = pickDirectory(raw, mode, prompt, Object.assign({}, opts, x));
+            if (opts && typeof opts.onResult === "function") p.then(opts.onResult);   // the retry's real outcome (nested 409s recurse with onResult)
+          });
+          return { ok: false, error: res.j.error, recreate: true };
+        }
+        if (res.j && res.j.tty && window.ExtVT && window.ExtVT.bindTty) window.ExtVT.bindTty(res.j.tty, res.j.session || (opts && opts.session) || "");   // "" = session-less shell
         if (!res.ok || !res.j || !res.j.tty) {
           var emsg = (res.j && res.j.error) ||
             (res.status === 404 ? "opening a terminal at a chosen directory isn't available on this server yet" :
@@ -360,13 +369,13 @@
         closePicker();
         // opts.tab === false: the caller mounts the terminal itself (ExtVT.mountInto) -- open no tab.
         if (opts && opts.tab === false) return { ok: true, tty: res.j.tty, renderer: res.j.renderer || "grid", notice: res.j.notice || "" };
-        toast(mode === "new" ? "Starting a new Claude session" : "Terminal opened", path);
+        if (res.j.attached) toast("Session already open in a terminal", "nothing was typed — use Copy prompt");
+        else toast(mode === "new" ? "Starting a new Claude session" : mode === "resume" ? "Resuming session" : "Terminal opened", path);
         // Reuses ext_vt.js's EXISTING standalone-tab path (?tty=...) -- the same URL scheme its
         // own openNewTab() builds -- instead of duplicating the grid/xterm renderer in this
-        // file (conventions rule 4: don't fork a capability that already exists). `sid` is
-        // deliberately omitted: there is none for a session-less terminal, and
-        // ext_vt.js's bootStandalone() already treats a missing ?sid= as "no context bar",
-        // not an error.
+        // file (conventions rule 4: don't fork a capability that already exists). `&sid=` is added
+        // only when a session is set; a session-less terminal omits it, and ext_vt.js's
+        // bootStandalone() treats a missing ?sid= as "no context bar", not an error.
         // F9: per-tab hostname via ext_vt.js's termTabOrigin -- NOT location.origin -- so this
         // tab gets its own Chrome per-host connection budget. Same helper as ext_vt.js/
         // ext_cr_term.js, no second copy.
@@ -374,10 +383,11 @@
           "&mode=" + encodeURIComponent(mode) +
           "&renderer=" + encodeURIComponent(res.j.renderer || "grid") +
           "&forked=" + (res.j.forked ? "1" : "0") +
+          ((res.j.session || (opts && opts.session)) ? "&sid=" + encodeURIComponent(res.j.session || opts.session) : "") +
           (res.j.notice ? "&notice=" + encodeURIComponent(res.j.notice) : "");
         var w = window.open(url, "_blank");
         if (!w) alert("Popup blocked — allow popups for this page to open a new tab.");
-        return { ok: true };
+        return res.j.attached ? { ok: true, attached: true } : { ok: true };
       })
       .catch(function (e) {
         var cmsg = "failed to reach the server: " + e;
@@ -386,8 +396,8 @@
       });
   }
 
-  // The single Resume path (pending-work modal, both views): open a session-less terminal at a
-  // cwd, optionally with a first prompt. Resolves {ok, error}; never rejects.
+  // The single Resume path (pending-work modal, both views): open a terminal at a
+  // cwd (session-less, or resuming opts.session), optionally with a first prompt. Resolves {ok, error}; never rejects.
   window.ExtLaunch = { openAt: function (p, m, pr, o) { return pickDirectory(p, m, pr, o); } };
 
   buildSideControls();

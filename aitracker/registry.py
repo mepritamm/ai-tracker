@@ -150,6 +150,18 @@ def all_cwds():
     return out
 
 
+def other_sessions():
+    """Session-list rows of every available non-Claude provider that carry an id and a cwd."""
+    out = []
+    for p in PROVIDERS:
+        try:
+            if p.prefix != "" and p.available():
+                out += [r for r in p.list() if r.get("id") and r.get("cwd")]
+        except Exception:
+            pass  # one broken provider must not sink the scan
+    return out
+
+
 def newest_models():
     """{family: model_id} -- the single newest-VERSION real model id seen across every
     provider's session-list `model` field (opus/sonnet/haiku/fable). Feeds parse_any()'s

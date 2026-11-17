@@ -138,6 +138,13 @@ class TestPendingTokensAndHook(unittest.TestCase):
         self.assertNotIn("color-mix", self._read("ext_cr_board.css"))
         self.assertNotIn("grid-column", re.search(r"\.cr-tile--pending\s*\{[^}]*\}", self._read("ext_cr_board.css")).group(0))
 
+    def test_cr_open_session_goes_to_detail_view(self):
+        m = re.search(r"window\.CR\.openSession\s*=\s*function[^\n]*", self._read("ext_cr_boot.js"))
+        self.assertIsNotNone(m)
+        self.assertIn("go('detail'", m.group(0))
+        self.assertIn("getUiMode() === 'next'", m.group(0))
+        self.assertIn("pick(id)", m.group(0))
+
 
 
 _SIDE_PRE = _PRE + r"""

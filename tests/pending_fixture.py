@@ -17,7 +17,7 @@ from aitracker import config
 requires_git = unittest.skipUnless(shutil.which("git"), "git not installed")
 _ID = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
 _CFG = ("PENDING_FILE", "PENDING_LOG", "PENDING_LOCK", "JOBS_DIR", "SCRATCH_ROOT", "LIVE_SESSIONS_DIR",
-        "PROJECTS", "CONFIG_FILE")
+        "PROJECTS", "CONFIG_FILE", "TITLES_FILE")
 
 
 _TEMPLATE = []          # [root]: a bare remote.git + repo with one pushed commit, built once per process
@@ -53,7 +53,8 @@ class Fx:
         self.remote, self.repo = j("remote.git"), j("repo")
         self.paths = {"PENDING_FILE": j("pending.json"), "PENDING_LOG": j("pending.log"),
                       "PENDING_LOCK": j("pending.lock"), "JOBS_DIR": j("jobs"), "SCRATCH_ROOT": j("scratch"),
-                      "LIVE_SESSIONS_DIR": j("sessions"), "PROJECTS": j("projects"), "CONFIG_FILE": j("config.json")}
+                      "LIVE_SESSIONS_DIR": j("sessions"), "PROJECTS": j("projects"), "CONFIG_FILE": j("config.json"),
+                      "TITLES_FILE": j("titles.json")}
         for k in ("JOBS_DIR", "SCRATCH_ROOT", "LIVE_SESSIONS_DIR", "PROJECTS"):
             os.makedirs(self.paths[k])
         for k, v in self.paths.items():
@@ -64,6 +65,10 @@ class Fx:
         from aitracker import pending
         self.cwds = set()
         p = mock.patch.object(pending, "all_cwds", lambda: set(self.cwds))
+        p.start()
+        tc.addCleanup(p.stop)
+        self.other = []
+        p = mock.patch.object(pending, "other_sessions", lambda: list(self.other))
         p.start()
         tc.addCleanup(p.stop)
         tpl = _template(self)
