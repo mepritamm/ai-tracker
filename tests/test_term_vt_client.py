@@ -967,7 +967,7 @@ class TestNoticeBannerLayoutContract(unittest.TestCase):
         asserted by test_notice_css_is_flex_container_item below."""
         css = _read("ext_vt.css")
         self.assertIn(".vtmodal .mb.vtmb { padding: 0; display: flex; flex-direction: column;", css)
-        full_start = css.index("#ext_vt.vtfull {")
+        full_start = css.index("\n#ext_vt.vtfull {")   # line-start: TERM_THEME selector lists also contain the literal
         full_block = css[full_start:css.index("}", full_start)]
         self.assertIn("display: flex;", full_block)
         self.assertIn("flex-direction: column;", full_block)
@@ -2043,7 +2043,7 @@ class TestThemeFlipperInTerminal(unittest.TestCase):
         xterm_start = self.src.index("function XtermTerminal(container, ttyId")
         xterm_ctor_body = self.src[xterm_start:self.src.index("XtermTerminal.prototype.attach")]
         self.assertIn(
-            "this._onThemeChange = function () { if (self.term) self.term.options.theme = _xtermTheme(); };",
+            "this._onThemeChange = function () { if (self.term) self.term.options.theme = _xtermTheme(self.container); };",
             xterm_ctor_body)
         self.assertIn('document.addEventListener("themechange", this._onThemeChange);', xterm_ctor_body)
         # remove: in destroy, or the listener leaks for the life of the tab.
@@ -2682,6 +2682,8 @@ class TestTerminalManagerPanel(unittest.TestCase):
         self.assertIn("flex-wrap: wrap;", foot)
         self.assertNotIn("width:", foot)               # no fixed widths anywhere in the panel
         tail = self.css[self.css.index("/* ---- manager panel: narrow breakpoints"):]
+        # the one TERM_THEME hide rule is not the panel's; everything else after it stays checked
+        tail = tail.replace('html[data-term-theme="black"]:not(.vt-standalone) .vtthemebtn { display: none; }', "")
         self.assertIn("@media(min-width:601px) and (max-width:900px) {", tail)   # tablet
         self.assertIn("@media(max-width:600px) {", tail)                          # phone
         self.assertIn(".vtmgrfoot", tail)

@@ -416,13 +416,13 @@
    --red-bg (.14 dark / .12 light) -- so these stay theme-correct without hardcoding a hex value
    that would go stale if app.css's palette ever changes. `vt-` prefixed so a future app.css token
    of the same short name can never silently collide with this file's own. */
-:root {
+:root, html[data-term-theme="black"] .vttermwrap, html[data-term-theme="black"] .vtmodal, html[data-term-theme="black"] #ext_vt.vtfull {
   --vt-black-bg: rgba(107, 117, 133, .14);
   --vt-violet-bg: rgba(167, 139, 250, .14);
   --vt-cyan-bg: rgba(41, 211, 152, .14);
   --vt-white-bg: rgba(201, 212, 224, .14);
 }
-html.light {
+html.light, html[data-term-theme="light"] #ext_vt.vtfull {
   --vt-black-bg: rgba(149, 140, 118, .12);
   --vt-violet-bg: rgba(122, 92, 192, .12);
   --vt-cyan-bg: rgba(31, 157, 107, .12);
@@ -568,3 +568,8 @@ html.light {
   cursor: pointer;
   box-shadow: 0 4px 16px rgba(0,0,0,.3);
 }
+/* TERM_THEME (config.py, served as <html data-term-theme>): black terminals are dark-scheme; the
+   per-terminal theme button exists only in the full tab (html.vt-standalone), see _flipTabTermTheme. */
+html[data-term-theme="black"] .vttermwrap, html[data-term-theme="black"] .vtmodal, html[data-term-theme="black"] #ext_vt.vtfull { color-scheme: dark; color: var(--text); }
+html[data-term-theme="black"]:not(.vt-standalone) .vtthemebtn { display: none; }
+html[data-term-theme="light"] #ext_vt.vtfull { color: var(--text); }

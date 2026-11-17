@@ -650,7 +650,7 @@
     ['Alt+Enter', 'Sends newline-without-submit, not a submit.'],
     ['Ctrl+Space', 'Sends NUL.'],
     ['Mouse reporting', 'Press/drag/release/wheel forwarded to any program that asks for it.'],
-    ['Renderer switch', 'Toolbar theme toggle and a renderer control — xterm (default) or grid, per terminal.'],
+    ['Renderer switch', 'Renderer control — xterm (default) or grid, per terminal. Colours: Config → Terminal → Terminal colours. The toolbar theme button shows in a full-tab terminal (flips that tab until reload) and everywhere with Follow app theme.'],
     ['Model / effort', '/model <name> and /effort <level> typed into the CLI when it is in the foreground.'],
   ];
 
@@ -860,6 +860,7 @@
   var _ENVCHIP = {
     LIVE_WINDOW: null,   // never had an env var of its own — config.json > built-in default
     HEADER_LINE: null,   // ditto
+    TERM_THEME: null,    // no env var -- config.json > built-in default
     ICON_STYLE: null,    // ditto — no env var, config.json > built-in default
     ICON_SCALE: null,    // ditto — no env var, config.json > built-in default
     TERM_RENDERER: 'TRACKER_TERM_RENDERER',
@@ -1949,6 +1950,18 @@
         var schedEl = schedulerBlock();
         if (schedEl) body.appendChild(schedEl);
       } else if (active === 'Terminal') {
+        function revertTermTheme() {
+          if (typeof window.applyTermTheme !== 'function') return;
+          window.applyTermTheme((srv.cfg && srv.cfg.TERM_THEME && srv.cfg.TERM_THEME.value) || 'black');
+        }
+        body.appendChild(serverRow('Terminal colours', 'TERM_THEME',
+          'Black: every terminal (pop-up, full tab, Control Room pane, login window) stays black in light and dark theme. Follow app theme: terminals use the app\'s light/dark colours; the Control Room pane stays dark. A full-tab terminal\'s own button flips that tab only, until reload.',
+          function (value, onCommit) {
+            return segmented([['black', 'Black'], ['app', 'Follow app theme']], value || 'black', function (v) {
+              if (typeof window.applyTermTheme === 'function') window.applyTermTheme(v);   // live preview
+              onCommit(v);
+            });
+          }, revertTermTheme));
         body.appendChild(serverRow('Terminal renderer', 'TERM_RENDERER',
           'Default for newly-opened terminals — already switchable live per-terminal from its own toolbar.',
           function (value, onCommit) {

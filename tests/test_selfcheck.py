@@ -929,6 +929,7 @@ def _run():
             os.environ["TRACKER_TERM_IDLE_TTL_MIN"] = _ttl_env0
     assert "SNAPSHOT_TTL_MIN" in config.EDITABLE and "SNAPSHOT_TTL_MIN" not in config.RESTART_REQUIRED
     assert all(k in config.EDITABLE and k not in config.RESTART_REQUIRED for k in ("PENDING_INTERVAL", "PENDING_CLEAN"))
+    assert "TERM_THEME" in config.EDITABLE and "TERM_THEME" not in config.RESTART_REQUIRED and config.resolve_term_theme({}) == "black" and config.VALIDATORS["TERM_THEME"]("light") == (False, None)
     assert config.interval_seconds("3m") == 7776000
     _snap_env0 = os.environ.get("TRACKER_SNAPSHOT_TTL_MIN")
     os.environ["TRACKER_SNAPSHOT_TTL_MIN"] = "10"

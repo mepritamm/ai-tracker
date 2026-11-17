@@ -38,7 +38,7 @@ _PATHS = ("PROJECTS", "AUGMENT_DIR", "AUGGIE_SESSIONS", "VSCODE_WS_ROOT", "CURSO
           "TOKEN_FILE", "CONFIG_FILE", "FORKS_FILE", "HIDDEN_FILE")
 
 _CFG_ATTRS = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL", "TERM_IDLE_TTL_MIN", "SNAPSHOT_TTL_MIN",
-              "GATEWAY", "OPENROUTER_LAUNCHER", "OPENROUTER_SLOTS_FILE", "HEADER_LINE")
+              "GATEWAY", "OPENROUTER_LAUNCHER", "OPENROUTER_SLOTS_FILE", "HEADER_LINE", "TERM_THEME")
 
 
 
@@ -378,6 +378,30 @@ class TestApiConfigIconKeys(_ServerCase):
         self.assertEqual(st, 200)
         self.assertEqual(j["ICON_STYLE"], {"value": "icons", "overridden": False, "restart": False})
         self.assertEqual(j["ICON_SCALE"], {"value": 100, "overridden": False, "restart": False})
+
+
+class TestApiConfigTermTheme(_ServerCase):
+    """TERM_THEME (Config -> Terminal -> Terminal colours): black (default) | app, baked into
+    <html data-term-theme> by page.build_page()."""
+
+    def test_default_is_black_and_page_carries_it(self):
+        st, j = self._get_json("/api/config")
+        self.assertEqual(st, 200)
+        self.assertEqual(j["TERM_THEME"], {"value": "black", "overridden": False, "restart": False})
+        self.assertIn(b'<html data-term-theme="black">', self._get("/")[1])
+
+    def test_app_round_trips_to_disk_and_page(self):
+        st, j = self._post("/api/config", {"key": "TERM_THEME", "value": "app"})
+        self.assertEqual((st, j), (200, {"ok": True, "key": "TERM_THEME", "value": "app", "restart": False}))
+        st, j = self._get_json("/api/config")
+        self.assertEqual(j["TERM_THEME"], {"value": "app", "overridden": True, "restart": False})
+        self.assertEqual(json.load(open(config.CONFIG_FILE))["TERM_THEME"], "app")
+        self.assertIn(b'<html data-term-theme="app">', self._get("/")[1])
+
+    def test_invalid_value_is_rejected_and_never_reaches_disk(self):
+        st, j = self._post("/api/config", {"key": "TERM_THEME", "value": "light"})
+        self.assertEqual((st, j), (400, {"error": "invalid value for TERM_THEME"}))
+        self.assertFalse(os.path.exists(config.CONFIG_FILE))
 
 
 # =============================================================================

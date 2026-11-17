@@ -512,6 +512,17 @@
   // row 0's real content. Both renderers (Terminal below and XtermTerminal further down) build
   // this the same way and append it as a sibling BEFORE their own pane, so the fix covers both
   // paths from one place rather than being reimplemented per-renderer. =====
+  // Terminal colours for THIS page: "black" | "app" (server, config TERM_THEME, baked into <html> by page.py)
+  // or "light" (full-tab only, set by the toolbar button below -- DOM only, never saved; reload resets it).
+  function _termThemeAttr() {
+    var r = document.documentElement;
+    return (r && r.getAttribute && r.getAttribute("data-term-theme")) || "app";
+  }
+  function _flipTabTermTheme() {
+    var next = _termThemeAttr() === "light" ? "black" : "light";
+    document.documentElement.setAttribute("data-term-theme", next);
+    document.dispatchEvent(new CustomEvent("termthemechange", { detail: { termTheme: next } }));
+  }
   function buildToolbar(onZoomOut, onZoomIn, onAfterZoom, mouseToggle, rendererSwitch) {
     var bar = document.createElement("div");
     bar.className = "vttoolbar";
@@ -533,12 +544,13 @@
       // sun icon while dark (tap for light) -- read live off <html>'s class rather than cached, since
       // this can be re-rendered long after the button was built (top-bar toggle, another pane's
       // toggle, or this same button).
-      var light = document.documentElement.classList.contains("light");
+      var a = _termThemeAttr(), light = a === "app" ? document.documentElement.classList.contains("light") : a === "light";
+      themeBtn.title = a === "app" ? "Toggle dark/light theme" : "Toggle this tab's terminal black/light (not saved; default is Config \u2192 Terminal colours)";
       _iconOnly(themeBtn, light ? 'moon' : 'sun');
       themeBtn.setAttribute("aria-pressed", light ? "true" : "false");
     }
     function activateThemeBtn() {
-      toggleTheme();   // app.js global -- flips the class, persists it, fires "themechange"
+      if (_termThemeAttr() === "app") toggleTheme(); else _flipTabTermTheme();   // app mode: app.js global (flips, persists, fires "themechange"); else this tab's terminal only
       onAfterZoom();   // refocus the capture textarea, exactly like the zoom/mouse buttons above
     }
     themeBtn.addEventListener("click", activateThemeBtn);
@@ -552,6 +564,7 @@
     // `bar.refreshMouseToggle` above so each owning class (Terminal/XtermTerminal) can save it and
     // call it from its own destroy() -- see those constructors/destroy methods.
     document.addEventListener("themechange", renderThemeBtn);
+    document.addEventListener("termthemechange", renderThemeBtn);
     // Same idea for icon style: app.js dispatches "iconstylechange" on document (icons/emoji/text
     // + size) whenever the setting changes. Both icon-bearing buttons in this bar have their own
     // render closures already (renderThemeBtn above, renderMouseBtn below) -- re-running them is
@@ -563,6 +576,7 @@
     document.addEventListener("iconstylechange", refreshToolbarIcons);
     bar.disposeThemeBtn = function () {
       document.removeEventListener("themechange", renderThemeBtn);
+      document.removeEventListener("termthemechange", renderThemeBtn);
       document.removeEventListener("iconstylechange", refreshToolbarIcons);
     };
     renderThemeBtn();
@@ -1725,12 +1739,7 @@
   // once so both light/dark themes (app.css's html.light) carry straight over instead of a second,
   // hardcoded palette drifting from the SGR classes in ext_vt.css.
   //
-  // `el` (added for mountInto() -- see that function's own comment): defaults to the document
-  // root, exactly the element every existing caller (XtermTerminal._build/_onThemeChange) reads
-  // from today -- passing no `el` is byte-for-byte the old behaviour. mountInto() instead reads
-  // off the CALLER's own container, so a `setTheme()` override written as inline custom
-  // properties on that one element (which normally just inherits the root's values verbatim,
-  // hence no change for every OTHER call site) is what getComputedStyle sees here.
+  // `el`: every caller passes the terminal's own wrap; with no `el` it reads the document root.
   function _xtermTheme(el) {
     var cs = getComputedStyle(el || document.documentElement);
     function v(name, fallback) { var val = cs.getPropertyValue(name); return val ? val.trim() : fallback; }
@@ -1798,17 +1807,10 @@
     // of this instance, including the window between attach() and the deferred _build() actually
     // running -- self._onThemeChange checks `self.term` itself and is a no-op until _build() sets
     // it. Removed in destroy() below; see that method's own comment for why.
-    // NOTE: kept calling _xtermTheme() with NO argument here (root-scoped), byte-for-byte the
-    // pre-existing literal an existing test pins exactly
-    // (test_xterm_adds_and_removes_the_themechange_listener) -- unlike _build()'s own call just
-    // below, a GLOBAL themechange (the classic app's light/dark toggle) always re-reads the
-    // document root, so it can't be fooled into keeping a mountInto() setTheme() override that
-    // isn't the classic app's own theme. setTheme() itself still re-applies its override
-    // synchronously against `container` on every call; only a SUBSEQUENT global toggle event, if
-    // one ever fires while a caller-set override is active, would revert it -- a narrow, callable-
-    // again edge case, not a structural break.
-    this._onThemeChange = function () { if (self.term) self.term.options.theme = _xtermTheme(); };
+    // NOTE: reads the wrap (`self.container`), which carries the terminal-colour tokens (TERM_THEME) or, in app mode, inherits the app's / a mountInto caller's override.
+    this._onThemeChange = function () { if (self.term) self.term.options.theme = _xtermTheme(self.container); };
     document.addEventListener("themechange", this._onThemeChange);
+    document.addEventListener("termthemechange", this._onThemeChange);
   }
 
   XtermTerminal.prototype.attach = function () {
@@ -2019,6 +2021,7 @@
     // up by container.innerHTML = "" or any other DOM teardown, so both must be removed explicitly
     // here or every terminal open leaks one more "themechange" handler for the life of the tab.
     if (this._disposeThemeBtn) { this._disposeThemeBtn(); this._disposeThemeBtn = null; }
+    if (this._onThemeChange) document.removeEventListener("termthemechange", this._onThemeChange);
     if (this._onThemeChange) { document.removeEventListener("themechange", this._onThemeChange); this._onThemeChange = null; }
     // The onBell subscription (see _build's own comment) -- disposed explicitly here rather than
     // left to term.dispose() below, matching every other listener this method tears down by hand.
@@ -3796,16 +3799,15 @@
     // entire palette is already CSS custom properties (ext_vt.css's var(--app)/var(--text)/
     // var(--ring2), inherited from :root) -- setting them as inline overrides on `container` alone
     // repaints every descendant for free, no code change needed there. xterm.js takes an explicit
-    // JS colour object instead of CSS, so it needs an explicit push: `_xtermTheme(container)` (see
-    // that function's own updated comment) reads the SAME properties back off `container`'s
-    // computed style, which is exactly the override just set -- one read path for both renderers.
+    // JS colour object instead of CSS, so it needs an explicit push: `_xtermTheme(wrap)` reads the wrap,
+    // which inherits this override in app mode -- one read path for both renderers.
     function setTheme(theme) {
       if (!theme) return;
       if (theme.background) container.style.setProperty("--app", theme.background);
       if (theme.foreground) container.style.setProperty("--text", theme.foreground);
       if (theme.cursor) container.style.setProperty("--ring2", theme.cursor);
       if (curRenderer === "xterm" && curTerm && curTerm.term) {
-        curTerm.term.options.theme = _xtermTheme(container);
+        curTerm.term.options.theme = _xtermTheme(wrap);
       }
     }
 

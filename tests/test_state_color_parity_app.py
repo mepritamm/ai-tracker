@@ -50,9 +50,10 @@ def _extract_declarations(css, selector):
     optional whitespace and '{' -- this deliberately does NOT match '.tracker-next'
     as a prefix of '.tracker-next.is-dark' (no whitespace-only gap between them), nor
     as a prefix of a descendant selector like '.tracker-next .tn-emo'. `css` must
-    already be comment-stripped (see `_strip_comments`)."""
+    already be comment-stripped (see `_strip_comments`). Also matches when `selector` is the
+    first item of a selector list (`:root,html[...] .vttermwrap{`)."""
     out = {}
-    pattern = re.compile(re.escape(selector) + r"\s*\{")
+    pattern = re.compile(re.escape(selector) + r"\s*(?:,[^{}]*)?\{")
     pos = 0
     while True:
         m = pattern.search(css, pos)

@@ -169,6 +169,9 @@ function applyIconStyle(style,scalePercent){
   document.dispatchEvent(new CustomEvent("iconstylechange",{detail:{style:s,scale:k}}));
 }
 window.applyIconStyle=applyIconStyle;
+// Terminal colours (config TERM_THEME, served pre-paint as <html data-term-theme>). Only the Config row calls this.
+function applyTermTheme(v){const t=v==="app"?"app":"black";document.documentElement.setAttribute("data-term-theme",t);document.dispatchEvent(new CustomEvent("termthemechange",{detail:{termTheme:t}}));}
+window.applyTermTheme=applyTermTheme;
 // Sync with what the <head> pre-paint script already restored (it set the attribute/var but can't
 // convert the static markup), then correct from server config — non-blocking, never throws.
 try{applyIconStyle(localStorage.iconStyle,parseFloat(localStorage.iconScale)*100)}catch(e){}

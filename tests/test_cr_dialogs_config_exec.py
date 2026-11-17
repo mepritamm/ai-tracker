@@ -100,11 +100,52 @@ const SRC = require('fs').readFileSync(process.argv[2], 'utf8');
 """
 
 
-def _run():
+_TERM_TAIL = r"""
+const rec = [], posts = [];
+let failNext = false;
+global.applyTermTheme = v => rec.push(v);
+global.fetch = (url, opt) => {
+  const json = (body, ok=true) => Promise.resolve({ok, json: () => Promise.resolve(body)});
+  if (url === '/api/tunnel') return json({on:false});
+  if (url === '/api/config' && opt && opt.method === 'POST') {
+    const b = JSON.parse(opt.body); posts.push(b);
+    if (failNext) return json({error: 'invalid value for TERM_THEME'}, false);
+    return json({value: b.value});
+  }
+  if (url === '/api/config') return json({TERM_THEME: {value: 'black', overridden: false, restart: false}});
+  return json({});
+};
+const tick = () => new Promise(r => setTimeout(r, 20));
+const SRC = require('fs').readFileSync(process.argv[2], 'utf8');
+(async () => {
+  (0, eval)(SRC);
+  const root = new El('div');
+  window.CR.dialogs.mount(root, {icon: () => ''});
+  await tick();
+  window.CR.dialogs.open('config', {section: 'Terminal'});
+  await tick();
+  const row = () => root.querySelectorAll('.cr-cfg-row')
+    .filter(r => r.querySelector('.cr-cfg-row-name').textContent.startsWith('Terminal colours'))[0];
+  const btn = (label) => row().querySelectorAll('.cr-seg-btn').filter(b => b.textContent === label)[0];
+  const active = () => row().querySelectorAll('.cr-seg-btn').filter(b => b.classList.contains('is-active'))[0].textContent;
+  btn('Follow app theme').fire('click');
+  await tick(); await tick();
+  const out = {afterOk: rec.slice(), badge: row().querySelector('.cr-cfg-status').textContent};
+  failNext = true;
+  btn('Black').fire('click');
+  await tick(); await tick();
+  out.rec = rec; out.posts = posts; out.active = active();
+  console.log(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });
+"""
+_TERM_HARNESS = _HARNESS.split("// server state the stubbed fetch serves")[0] + _TERM_TAIL
+
+
+def _run(harness=None):
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "h.js")
         with open(p, "w", encoding="utf-8") as fh:
-            fh.write(_HARNESS)
+            fh.write(harness or _HARNESS)
         proc = subprocess.run(["node", p, os.path.join(_WEB, "ext_cr_dialogs.js")],
                               capture_output=True, text=True, timeout=30)
     if proc.returncode != 0:
@@ -122,6 +163,18 @@ class ConfigOpenRouterNoteLive(unittest.TestCase):
         self.assertTrue(r["sameSlot"], "no re-render: other inputs keep identity/focus")
         self.assertEqual(r["slotRefetch"], 0, "slot file commit must not refetch config")
         self.assertTrue(r["afterClear"], "note must reappear after launcher cleared")
+
+
+@unittest.skipUnless(_HAS_NODE, "node not on PATH")
+class ConfigTermThemeLivePreview(unittest.TestCase):
+    def test_preview_then_revert_on_failed_save(self):
+        r = _run(_TERM_HARNESS)
+        self.assertEqual(r["afterOk"], ["app"], "live preview applied on click")
+        self.assertEqual(r["badge"], "Saved")
+        self.assertEqual(r["posts"], [{"key": "TERM_THEME", "value": "app"},
+                                      {"key": "TERM_THEME", "value": "black"}])
+        self.assertEqual(r["rec"], ["app", "black", "app"], "failed save reverts to last-good value")
+        self.assertEqual(r["active"], "Follow app theme", "control snaps back to last-good")
 
 
 if __name__ == "__main__":

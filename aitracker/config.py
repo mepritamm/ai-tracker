@@ -225,7 +225,7 @@ CONFIG_FILE = os.path.join(_HERE, "config.json")
 EDITABLE = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL",
             "TERM_APP", "TERM_ALLOW", "PORT", "HOST", "ICON_STYLE", "ICON_SCALE",
             "TERM_IDLE_TTL_MIN", "SNAPSHOT_TTL_MIN", "GATEWAY", "OPENROUTER_LAUNCHER", "OPENROUTER_SLOTS_FILE", "HEADER_LINE",
-            "PENDING_INTERVAL", "PENDING_CLEAN")
+            "PENDING_INTERVAL", "PENDING_CLEAN", "TERM_THEME")
 
 # Keys that only bind at process startup -- the dialog labels these "takes effect on
 # restart" and never claims a live apply for them.
@@ -309,6 +309,7 @@ VALIDATORS = {
     "PORT":          _v_int(1, 65535),
     "HOST":          _v_str(255),
     "ICON_STYLE":    _v_enum(("icons", "emoji", "text")),
+    "TERM_THEME":    _v_enum(("black", "app")),  # terminal colours; read at page build
     "HEADER_LINE":   _v_enum(("summary", "narration")),  # the session line (header, board, rails); read live per request
     "GATEWAY":       _v_enum(("anthropic", "openrouter")),  # launcher for NEW sessions only; resumes keep their own
     "OPENROUTER_LAUNCHER":   _v_str(1024),      # empty string clears (= not configured)
@@ -495,6 +496,13 @@ def resolve_header_line(overrides):
     return v if v in ("summary", "narration") else "summary"
 
 
+def resolve_term_theme(overrides):
+    """Terminal colours: "black" (default; every terminal, whatever the app theme) or "app"
+    (follow the app's light/dark). No env var -- config.json > built-in "black"."""
+    v = overrides.get("TERM_THEME")
+    return v if v in ("black", "app") else "black"
+
+
 def resolve_pending_interval(overrides):
     """config.json > env TRACKER_PENDING_INTERVAL (through _v_interval) > "90d"."""
     for raw in (overrides.get("PENDING_INTERVAL"), os.environ.get("TRACKER_PENDING_INTERVAL")):
@@ -593,6 +601,7 @@ _RESOLVERS = {
     "ICON_SCALE": resolve_icon_scale,
     "GATEWAY": resolve_gateway,
     "HEADER_LINE": resolve_header_line,
+    "TERM_THEME": resolve_term_theme,
     "OPENROUTER_LAUNCHER": resolve_openrouter_launcher,
     "OPENROUTER_SLOTS_FILE": resolve_openrouter_slots_file,
     "PENDING_INTERVAL": resolve_pending_interval,
@@ -604,7 +613,8 @@ _RESOLVERS = {
 # attribute was reverted in favour of this).
 _PLAIN_ATTR_KEYS = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL",
                     "TERM_IDLE_TTL_MIN", "SNAPSHOT_TTL_MIN", "GATEWAY", "OPENROUTER_LAUNCHER",
-                    "OPENROUTER_SLOTS_FILE", "HEADER_LINE", "PENDING_INTERVAL", "PENDING_CLEAN")
+                    "OPENROUTER_SLOTS_FILE", "HEADER_LINE", "PENDING_INTERVAL", "PENDING_CLEAN",
+                    "TERM_THEME")
 
 # Seeded here from env/default ONLY (an explicit `{}`, never a file read) -- this module has
 # no filesystem access of its own (see the big comment above), so at its own import time
@@ -619,6 +629,7 @@ TERM_IDLE_TTL_MIN = resolve_term_idle_ttl_min({})
 SNAPSHOT_TTL_MIN = resolve_snapshot_ttl_min({})
 GATEWAY = resolve_gateway({})
 HEADER_LINE = resolve_header_line({})
+TERM_THEME = resolve_term_theme({})
 OPENROUTER_LAUNCHER = resolve_openrouter_launcher({})
 OPENROUTER_SLOTS_FILE = resolve_openrouter_slots_file({})
 PENDING_INTERVAL = resolve_pending_interval({})
