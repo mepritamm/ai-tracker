@@ -190,8 +190,8 @@ const esc=s=>(s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]
 // tiny inline markdown for narration/requests: escape first, then `code`,
 // **bold**, *italic*, [text](url). No `_` italics — identifiers use underscores.
 function md(s,safe){
-  let h=esc(s);
-  h=h.replace(/`([^`]+)`/g,(m,c)=>`<code>${c}</code>`);
+  let h=esc(s).replace(/\u0000/g,"");                                  // NUL is the parking marker below; strip any in the input
+  const cs=[]; h=h.replace(/`([^`]+)`/g,(m,c)=>"\u0000"+(cs.push(c)-1)+"\u0000");   // park code spans: **/* never run inside code
   h=h.replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>");
   // `safe` (mdSafe below) drops single-asterisk italics only -- machine output (shell
   // stdout, agent last-message/task text) legitimately contains literal `*` in globs
@@ -199,14 +199,17 @@ function md(s,safe){
   // and corrupting them (`*.py and *.js` -> `<em>.py and </em>.js`). `**bold**`, `code`,
   // and links above are unaffected -- they don't collide with real machine output.
   if(!safe)h=h.replace(/(^|[^*])\*(?!\s)([^*\n]+?)\*/g,"$1<em>$2</em>");
+  h=h.replace(/\u0000(\d+)\u0000/g,(m,i)=>`<code>${cs[+i]}</code>`);   // restore; links inside code are still linked below
   // [text](url) AND bare http(s) URLs, in ONE pass so a link's own href is never re-linked.
   // `"` never enters a URL (it would break out of href="..."). Bare URLs stop at whitespace,
   // quotes and tags (`</code>`, `</strong>`) and shed trailing punctuation / an escaped `>`.
   // ponytail: a trailing `)` is always shed (wiki-style `Foo_(bar)` loses it); balance parens if that bites.
   h=h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)"]+)\)|https?:\/\/[^\s"'<]+/g,(m,t,u)=>{
-    if(t)return `<a href="${u}" target=_blank rel=noopener>${t}</a>`;
+    // Claude Artifact links get a visible Copy chip; it copies its preceding anchor's href at click time (see lnkcopy handler).
+    const chip=x=>/^https?:\/\/claude\.ai\/(?:code\/)?artifact\//.test(x)?'<button type=button class="codecopy lnkcopy" title="Copy link" aria-label="Copy link"></button>':"";
+    if(t)return `<a href="${u}" target=_blank rel=noopener>${t}</a>${chip(u)}`;
     const tail=(m.match(/(?:&gt;|[.,;:!?)\]*])+$/)||[""])[0], url=m.slice(0,m.length-tail.length);
-    return url.split("//")[1]?`<a href="${url}" target=_blank rel=noopener>${url}</a>${tail}`:m;
+    return url.split("//")[1]?`<a href="${url}" target=_blank rel=noopener>${url}</a>${chip(url)}${tail}`:m;
   });
   return h;
 }
@@ -2486,7 +2489,7 @@ function paintHeadline(d){
 }
 // the server's headline -> band pill + inline-md text; no policy here (server owns mode/text/label).
 // inline=true (session rows): anchors unwrapped -- a row is one click/Enter target, no inner tab stops.
-function hlHtml(hl,inline){let t=md(hl.text||"");if(inline)t=t.replace(/<a href="[^"]*"[^>]*>([\s\S]*?)<\/a>/g,"$1");return (hl.label?'<span class="hlband hl-'+esc(hl.band||"")+(hl.state==="failed"?" hl-failed":"")+'">'+esc(hl.label)+'</span> ':'')+t;}
+function hlHtml(hl,inline){let t=md(hl.text||"");if(inline)t=t.replace(/<a href="[^"]*"[^>]*>([\s\S]*?)<\/a>(?:<button[^>]*\blnkcopy\b[^>]*>[^<]*<\/button>)?/g,"$1");return (hl.label?'<span class="hlband hl-'+esc(hl.band||"")+(hl.state==="failed"?" hl-failed":"")+'">'+esc(hl.label)+'</span> ':'')+t;}
 function openMsg(i){const n=curNarr[i]; if(!n)return; _setNav(openMsg,i,curNarr.length,{len:()=>curNarr.length,live:true}); openText("Narration",tago(n.t),n.text);}
 // the Now banner → jump to the panel that reflects the CURRENT activity (server says which via
 // now_kind), flash it so you see WHERE it's happening, AND open that item's live dialog.
@@ -2619,6 +2622,61 @@ function copyCode(btn){
   if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(()=>fallbackCopy(code,done));}
   else fallbackCopy(code,done);
 }
+// Copy for inline code and links: ONE floating button in <body>, shown after a short hover (mouse only) next
+// to the md()-rendered (classless) inline `code` or http(s) link under the pointer. It lives outside every row,
+// so clicking it never opens the row under it. Headline rows (anchors unwrapped, one click target) and <pre>
+// (fences have their own Copy) are skipped. Touch: none by design -- WebKit would swallow the row's first tap.
+const FLCOPY_SKIP=".shline,.cr-rail-hl,.cr-tile-line--hl,pre,.xterm";
+function copyTargetOf(t){
+  if(!t||!t.closest)return null;
+  if(t.closest(".lnkcopy"))return null;                               // the artifact chip is its own Copy
+  const a=t.closest('a[href^="http"]'), k=t.closest("code");
+  const el=a&&k?(a.contains(k)?a:k):(a||k);           // the OUTER one: [`x`](url) -> url; `curl https://...` -> the command
+  if(!el||el.className||el.closest(FLCOPY_SKIP))return null;   // md() emits classless <code>/<a>; classed ones have their own Copy
+  if(el.tagName==="A"&&el.nextElementSibling&&/\blnkcopy\b/.test(el.nextElementSibling.className||""))return null;   // already has its chip
+  const link=el.tagName==="A", text=link?el.getAttribute("href"):(el.textContent||"");
+  return text?{el,text,kind:link?"link":"code"}:null;
+}
+let _flBtn=null,_flEl=null,_flText="",_flHide=0,_flT=0;
+function _flOff(){ if(_flBtn)_flBtn.hidden=true; _flEl=null; }
+function _flShow(c){
+  if(_flBtn&&_flBtn.classList.contains("ok"))return;                 // hold still while it says "Copied"
+  if(!c.el.isConnected)return;                                        // the 2 s repaint detached it
+  const rs=[...c.el.getClientRects()]; if(!rs.length)return;
+  const r=rs[rs.length-1];
+  if(!_flBtn){ _flBtn=document.createElement("button"); _flBtn.type="button"; _flBtn.className="codecopy flcopy";
+    _flBtn.onclick=()=>copyText(_flText,()=>{_flBtn.classList.add("ok");_flBtn.innerHTML=ico('check')+" Copied";setTimeout(()=>{_flBtn.classList.remove("ok");_flOff();},900);}); document.body.appendChild(_flBtn); }
+  if(_flEl===c.el&&!_flBtn.hidden)return;
+  _flEl=c.el; _flText=c.text;
+  const lbl=c.kind==="link"?"Copy link":"Copy";
+  _flBtn.innerHTML=ico('copy')+" Copy"; _flBtn.title=lbl; _flBtn.setAttribute("aria-label",lbl);
+  _flBtn.style.left=Math.max(4,Math.min(innerWidth-80,r.right+4))+"px"; _flBtn.style.top=Math.max(4,r.top-3)+"px";
+  _flBtn.hidden=false;
+}
+function copyText(text,done){
+  if(!text)return;
+  const fb=()=>{const t=document.createElement("textarea");t.value=text;fallbackCopy(t,done);};
+  if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(text).then(done).catch(fb); else fb();
+}
+function _flOver(e){
+  if(e.pointerType!=="mouse")return;                                  // touch/pen: no floating button
+  if(_flBtn&&_flBtn.contains(e.target)){clearTimeout(_flHide);return;}
+  clearTimeout(_flT); clearTimeout(_flHide);
+  const c=e.buttons?null:copyTargetOf(e.target);                      // mid-drag (selecting): never pop over the text
+  if(c)_flT=setTimeout(()=>_flShow(c),300); else _flHide=setTimeout(_flOff,250);
+}
+function _flAway(e){ if(!_flBtn||!_flBtn.contains(e.target)){clearTimeout(_flT);_flOff();} }
+document.addEventListener("pointerover",_flOver);
+document.addEventListener("pointerdown",_flAway,true);                // a press elsewhere (row click, drag start) hides it
+document.addEventListener("scroll",()=>{clearTimeout(_flT);_flOff();},true);
+// Claude Artifact chip (md() emits button.lnkcopy right after the link): copies its preceding anchor's href at click time.
+function _lnkCopyClick(e){
+  const b=e.target&&e.target.closest&&e.target.closest(".lnkcopy"); if(!b)return;
+  e.stopPropagation(); e.preventDefault();                            // capture phase: the row/modal under it never sees the click
+  const a=b.previousElementSibling, href=a&&a.getAttribute&&a.getAttribute("href");
+  copyText(href,()=>{b.classList.add("ok");setTimeout(()=>b.classList.remove("ok"),1200);});
+}
+document.addEventListener("click",_lnkCopyClick,true);
 function popOut(titleId,bodyId){
   const body=$(bodyId); if(!body)return;
   const title=($(titleId)&&$(titleId).textContent)||"Tracker";

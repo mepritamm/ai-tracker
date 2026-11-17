@@ -615,5 +615,87 @@ console.log(JSON.stringify(OUT));
         self.assertNotIn("<a ", self.OUT["js"])
 
 
+
+@unittest.skipUnless(_HAS_NODE, "node not available")
+class TestCodeSpansAndArtifactChip(unittest.TestCase):
+    """F1: md() never runs **/* inside a code span. Artifact links get a Copy chip (no URL in an attribute)."""
+
+    @classmethod
+    def setUpClass(cls):
+        art = "https://claude.ai/artifact/abc-123"
+        driver = _APP_JS_STUB_PREAMBLE + _read_app_js() + r"""
+var OUT = {}, ART = %s;
+OUT["glob"] = md("run `rm *.pyc *.pyo` now");
+OUT["fmt"] = md("`git log --format=*%%h*`");
+OUT["safe_bold"] = mdSafe("`a **b** c`");
+OUT["bold_around"] = md("**x `c*d*` y**");
+OUT["nul"] = md("\u00000\u0000 `<b>`");
+OUT["nul_oob"] = md("a \u00005\u0000 b");
+OUT["xss_code"] =md("`<img onerror=x>`");
+OUT["js"] = md("[x](javascript:alert(1)) `a`");
+OUT["bare"] = md("see " + ART + " now");
+OUT["bare_tail"] = md("see " + ART + ".");
+OUT["mdlink"] = md("[the page](https://claude.ai/code/artifact/zz9)");
+OUT["plain_link"] = md("[p](https://example.com/p) https://example.com/q");
+OUT["quote_url"] = md("https://claude.ai/artifact/a\"<img onerror=x>");
+OUT["plain_text"] = md("see " + ART + " now").replace(/<[^>]+>/g, "");
+OUT["code_text"] = md("`" + ART + "`").replace(/<[^>]+>/g, "");
+OUT["hl"] = hlHtml({text: "see " + ART + " ok"}, true);
+OUT["hl_kept"] = hlHtml({text: "see " + ART + " ok"}, false);
+OUT["board_md"] = md("see [the page](https://claude.ai/artifact/q1) ok");
+console.log("===CHIP_JSON_START===");
+console.log(JSON.stringify(OUT));
+""" % json.dumps(art)
+        rc, out, err = _run_node(driver)
+        if rc != 0:
+            raise AssertionError("chip harness failed (%d)\n%s\n%s" % (rc, out, err))
+        cls.OUT = _extract_after_marker(out, "===CHIP_JSON_START===")
+        cls.ART = art
+
+    def test_asterisks_inside_code_are_kept(self):
+        self.assertIn("<code>rm *.pyc *.pyo</code>", self.OUT["glob"])
+        self.assertIn("<code>git log --format=*%h*</code>", self.OUT["fmt"])
+        self.assertIn("<code>a **b** c</code>", self.OUT["safe_bold"])
+        self.assertEqual(self.OUT["bold_around"], "<strong>x <code>c*d*</code> y</strong>")
+
+    def test_forged_marker_and_html_in_code_stay_inert(self):
+        self.assertNotIn("<b>", self.OUT["nul"])
+        self.assertNotIn("\u0000", self.OUT["nul"])
+        self.assertNotIn("undefined", self.OUT["nul_oob"])                   # a forged out-of-range marker is dropped, not restored
+        self.assertNotIn("<img", self.OUT["xss_code"])
+        self.assertIn("&lt;img onerror=x&gt;", self.OUT["xss_code"])
+        self.assertNotIn("<a ", self.OUT["js"])
+
+    def test_artifact_link_gets_chip_right_after_the_anchor(self):
+        chip = '<button type=button class="codecopy lnkcopy" title="Copy link" aria-label="Copy link"></button>'
+        self.assertIn("</a>" + chip, self.OUT["bare"])
+        self.assertIn("</a>" + chip, self.OUT["mdlink"])
+        self.assertIn("</a>" + chip + ".", self.OUT["bare_tail"])           # trailing punctuation stays after the chip
+        self.assertNotIn("claude.ai", self.OUT["bare"].split("</a>", 1)[1])   # the URL lives only in the anchor, not the chip
+        self.assertNotIn("lnkcopy", self.OUT["plain_link"])
+        self.assertNotIn("<img", self.OUT["quote_url"])
+
+    def test_chip_label_is_never_text_content(self):                      # I1: Copy via ::after, so copyModal/Cmd+C stay clean
+        self.assertEqual(self.OUT["plain_text"], "see " + self.ART + " now")
+        self.assertEqual(self.OUT["code_text"], self.ART)
+
+    def test_headline_unwrap_strips_the_chip_too(self):
+        self.assertNotIn("<a ", self.OUT["hl"])
+        self.assertNotIn("lnkcopy", self.OUT["hl"])
+        self.assertIn("lnkcopy", self.OUT["hl_kept"])                         # non-inline (overview card) keeps anchor + chip
+
+    def test_board_headline_unwrap_regex_strips_the_chip(self):
+        with open(os.path.join(os.path.dirname(__file__), "..", "aitracker", "web", "ext_cr_board.js"), encoding="utf-8") as f:
+            src = f.read()
+        line = next(l for l in src.splitlines() if "md(hl.text)" in l and ".replace(" in l)
+        rx = re.search(r"\.replace\((/<a href=.*?/g), '\$1'\)", line).group(1)
+        script = "var o=%s;console.log(JSON.stringify(%s.test('x')?0:0));console.log(JSON.stringify(%s));" % (
+            json.dumps(self.OUT["board_md"]), rx, "o.replace(" + rx + ",'$1')")
+        rc, out, err = _run_node(script)
+        self.assertEqual(rc, 0, err)
+        res = json.loads(out.strip().splitlines()[-1])
+        self.assertEqual(res, "see the page ok")
+
+
 if __name__ == "__main__":
     unittest.main()

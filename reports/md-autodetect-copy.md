@@ -431,3 +431,588 @@ A sonnet fixer was applying I1–I5 when the session stopped — it may have fin
 2. Targeted tests: `unset TRACKER_AUTH; python -m unittest tests.test_draft_copy tests.test_md_fence_xss tests.test_job_headline tests.test_mermaid`.
 3. Full gate one module per process (script: ~/.claude/jobs/c57b10c7/tmp/gate.sh). Known pre-existing red: tests.test_agent_map (10 failures, hardcoded 2026-07-13 dates, touches no staged file). A second module was also reported failing mid-run — identify it and check whether it is ours.
 4. If the only reds are pre-existing: commit with `git commit --no-verify -F <msg>`, saying in the commit body why the hook was bypassed (msg draft: ~/.claude/jobs/c57b10c7/tmp/commit-msg.txt). Then /branch-sync, then `git push personal worktree-md-autodetect-copy`.
+
+## Round 2 — Contract (user ask, verbatim)
+
+> "the copy button should automatically be shared whenever some code or something with the claude/AI asks me to do it myself, slack draft messages in quotes, code, etc etc. Any links, Claude Artifacts, etc"
+
+| Clause | Discharged by |
+|---|---|
+| R2-C1 "asks me to do it myself" (commands to run) | Step A (inline `code` gets Copy); fenced commands already have Copy (round 1) |
+| R2-C2 "slack draft messages in quotes" | round 1 (every top-level blockquote + every fence); real data shows no third shape (below) |
+| R2-C3 "code" | fences: round 1; inline code: Step A |
+| R2-C4 "Any links, Claude Artifacts" | Step A (every http(s) link md() renders, artifact links included) |
+
+## Round 2 — Plan
+
+Base: HEAD `91b41c5` (round 1 committed). Plan author: opus. No source edited.
+
+### Real data (conventions rule 7)
+
+Read-only scans of assistant `text` blocks in `~/.claude/projects/*/*.jsonl`. Shape counts only, nothing quoted. Scripts: `~/.claude/jobs/c57b10c7/tmp/shape_scan.py` (latest 120 files, 5,375 text blocks) and `shape_scan2.py` (all 281 files, 12,373 main-thread text blocks).
+
+| Gap | What the data shows | Covered today? |
+|---|---|---|
+| 1. "do it yourself" asks | Almost always **inline code**: 446 "run/type/paste `…`" spans and 27 `` `! cmd` `` spans (for example `` `! gcloud auth login` ``). `!` lines appear **only inside fences** (18 in fences, 0 outside). 81 of 278 fences are shell. | Fenced: yes (round 1). **Inline: no** |
+| 2. Slack/email drafts | After a draft/post/send lead line, the next block is a **fence (14)** or a **`>` quote (12)**. The 35 "list" and 4 "plain" hits are all false positives on inspection: review briefs ("Before you post:" + bullets), PR status ("open as a draft at `sha`") and one inline-code command (`/remove @bot`). There are **no real plain-paragraph drafts.** | Yes, both real shapes (round 1) |
+| 3. Inline code | 19,964 spans in 3,637 of 5,375 blocks, **~3.7 per block**: 15.2k identifiers, 2.9k paths, 1.9k commands. A visible button on every span would bury the text. | No |
+| 4. Links | 344 markdown links and 251 bare URLs (120 files). Artifact links in main-thread text: **39 bare, 1 markdown link, 0 in inline code**. Most are on a "Published …: <url>" line. md() already turns every one into an `<a>`. Only 10 URLs sit inside inline code, and md() links those inside the `<code>` too (test_classic_markdown_and_links:608). | No |
+| 5. Inline-only paths | md() alone (no mdBlock) renders: classic `.narr` rows (:2090), todo/request rows (:2132/:2138), overview goal/now (:2047-2062), decisions (:2114/:2119), notes (:2626), agent/shell `last` (:1993/:2021), CR timeline entries that the detector does not flag, CR summary/notes/decisions/ask/phone, and the headlines (`hlHtml` :2440 and the board's `headlineEl` ext_cr_board.js:2944). The headlines **unwrap anchors on purpose**: "a rail row / tile is a single click+Enter target -- no inner tab stops". | No |
+
+### Design: one floating Copy button, shown on hover (no change to md()'s output)
+
+A single `<button class="codecopy flcopy">` is created lazily and appended to `<body>`. When the pointer is over an inline `code` or an http(s) `<a>` that md() rendered, the button moves next to it. Clicking it copies the code's `textContent`, or the link's `getAttribute("href")`.
+
+Why this design, and not markup inside md():
+- **Rows keep a single click target.** The button is not inside the row's DOM, so its click never bubbles to the `.narr`/todo `onclick`, to the CR `timeline-entry-open` listener, or to a board tile. No `stopPropagation` plumbing, and nothing new for the round-1 `.codecopy` guard to cover.
+- **md()'s HTML is unchanged.** So: no test churn (test_classic_markdown_and_links:602/:605 and test_integration:1455 pin exact link HTML); no fallout in the two anchor-unwrap regexes (`hlHtml`, `headlineEl`), which would otherwise leave an orphan button behind; and no extra icon per span, where real messages average 3.7 code spans each.
+- **One mechanism covers code and links on every surface md() renders**, classic and CR alike: same document, same listener, no change to ext_cr_*.
+- **Nothing becomes clickable that was not clickable before.** A click on the text still selects it, a click on a link still opens it, and a drag still selects. The brief's "must not copy while selecting" holds by construction: copying needs a click on the button.
+
+Not chosen: click-to-copy on the `<code>` itself. It would steal clicks from the `.narr`/todo/timeline rows that use those spans as part of their open target, it fights double-click word selection, and it is invisible.
+
+### Step A: `aitracker/web/app.js`, right after `copyCode` (:2563-2572)
+
+```js
+// Copy for inline code and links: ONE floating button in <body>, moved next to whatever inline
+// `code` (fences have their own) or http(s) link md() rendered is under the pointer. It lives outside
+// every row, so clicking it never opens the row/timeline entry under it. Headline rows unwrap their
+// anchors to stay a single click target (hlHtml / ext_cr_board headlineEl), so they get none either.
+const FLCOPY_SKIP=".shline,.cr-rail-hl,.cr-tile-line--hl,pre,.flcopy,.xterm";
+function copyTargetOf(t){
+  if(!t||!t.closest)return null;
+  const el=t.closest('a[href^="http"]')||t.closest("code");   // a link wins: `[`x`](url)` copies the url
+  if(!el||el.closest(FLCOPY_SKIP))return null;
+  const text=el.tagName==="A"?el.getAttribute("href"):(el.textContent||"");
+  return text?{el,text,kind:el.tagName==="A"?"link":"code"}:null;
+}
+let _flBtn=null,_flEl=null,_flText="",_flHide=0;
+function _flOff(){ if(_flBtn)_flBtn.hidden=true; _flEl=null; }
+function _flShow(c){
+  if(!_flBtn){ _flBtn=document.createElement("button"); _flBtn.type="button"; _flBtn.className="codecopy flcopy";
+    _flBtn.onclick=()=>copyFloat(_flBtn,_flText); document.body.appendChild(_flBtn); }
+  if(_flEl===c.el&&!_flBtn.hidden)return;
+  _flEl=c.el; _flText=c.text;
+  const rs=c.el.getClientRects(), r=rs.length?rs[rs.length-1]:c.el.getBoundingClientRect();   // wrapped code: its last line
+  const lbl=c.kind==="link"?"Copy link":"Copy";
+  _flBtn.innerHTML=ico('copy')+" Copy"; _flBtn.title=lbl; _flBtn.setAttribute("aria-label",lbl);
+  _flBtn.style.left=Math.max(4,Math.min(innerWidth-80,r.right+4))+"px"; _flBtn.style.top=Math.max(4,r.top-3)+"px";
+  _flBtn.hidden=false;
+}
+function copyFloat(btn,text){
+  if(!text)return;
+  const done=()=>{btn.classList.add("ok");btn.innerHTML=ico('check')+" Copied";setTimeout(()=>{btn.classList.remove("ok");_flOff();},900);};
+  const fb=()=>{const t=document.createElement("textarea");t.value=text;fallbackCopy(t,done);};   // fresh textarea: same iOS-safe path as pendingCopyPrompt
+  if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(text).then(done).catch(fb); else fb();
+}
+document.addEventListener("mouseover",e=>{
+  if(_flBtn&&_flBtn.contains(e.target)){clearTimeout(_flHide);return;}   // pointer moved onto the button: keep it
+  const c=copyTargetOf(e.target); clearTimeout(_flHide);
+  if(c)_flShow(c); else _flHide=setTimeout(_flOff,250);                    // 250 ms grace to travel from text to button
+});
+document.addEventListener("scroll",_flOff,true);   // fixed-position button: any scroll (page, modal, CR pane) hides it
+window.copyTargetOf=copyTargetOf;
+```
+
+Notes:
+- **Signatures:** `copyTargetOf(el) -> {el,text,kind:"code"|"link"} | null`, `copyFloat(btn,text)`, and the private helpers `_flShow(c)` / `_flOff()`. No other function changes.
+- **XSS:** the copied text goes only to the clipboard (`writeText`, or a textarea's `.value`). The button's `innerHTML` is static (`ico()` plus a literal word). The label goes through `.title`/`setAttribute`. No raw text ever reaches `innerHTML`. `getAttribute("href")` returns md()'s already-escaped href with entities decoded (`&amp;` becomes `&`), which is the URL the user wants. `^="http"` keeps out anything that is not http(s). md() only emits http(s) links anyway.
+- **Feedback** is a word ("Copied") plus `.ok` colour, the same as `copyCode` and not colour alone. "Copied" shows only when the copy really happened, because `fallbackCopy` calls `done` only on success.
+- **Re-render:** the poll repaints every 2 s and can detach `_flEl`. The next `mouseover` re-targets or hides the button, so no mutation observer is needed.
+- **Touch:** a tap on inline code fires the emulated `mouseover`, so the button appears and a second tap copies. A tap on a link navigates, as today. The OS long-press "Copy link" still works. Known gap: no in-app link Copy on touch.
+- **Keyboard:** the button is a real `<button>` with an aria-label, but it is not in the tab order: it follows the pointer, and putting thousands of spans in the tab order is worse. Keyboard users keep the native ways to copy (select plus Cmd/Ctrl-C, and the link context menu). Known gap, documented.
+
+### Step B: `aitracker/web/app.css`, after `.codecopy.ok` (:408)
+
+```css
+.flcopy{position:fixed;top:auto;right:auto;z-index:4100;padding:3px 7px;font-size:10px}   /* the floating inline Copy: above every overlay (max z 4000) */
+```
+It inherits the `.codecopy` look. In Control Room the button lives in `<body>`, outside the `.cr` root, so the `.cr .codecopy` theme does not apply and it shows the app.css look. That mismatch is cosmetic and accepted. Re-check that the file has no stray `*/` (memory: one bad CSS comment kills the rest of the style tag).
+
+### Step C: README.md:187 (the Narration capability row)
+Append one clause: "…and every inline `code` span and link (Claude Artifacts included) shows a **Copy** on hover."
+
+### Sibling paths
+- Classic, CR detail, CR dialogs, the Agent modal and `.md` previews all share one document, so the one listener covers them. **No ext_cr_*.js change.**
+- `mdSafe` surfaces (agent/shell `last`) are covered too, through the same `<code>`/`<a>`.
+- Not covered: `popOut()` windows, which copy styles but no scripts (the existing fence Copy already does nothing there), and terminals (`.xterm` is skipped).
+
+### Tests: `tests/test_draft_copy.py` (extend DRIVER and add a class; no new file)
+
+Add a tiny fake-element factory to the DRIVER: `fk(tag, {href, text, cls}, parent)`. Its `closest(sel)` walks self then parents and matches comma-split selectors by tag (`code`, `pre`), by `.class`, or by `a[href^="http"]`. Then:
+- `OUT["ct"]` = `copyTargetOf` over these cases, mapped to `[kind, text]` or null:
+  1. `code` "! gcloud auth login" → `["code","! gcloud auth login"]`
+  2. `code` inside `pre` → null
+  3. `a` href `https://claude.ai/code/artifact/x` → `["link", that href]`
+  4. `code` inside such an `a` → `["link", href]`
+  5. `code` inside `.shline` → null; inside `.cr-tile-line--hl` → null; inside `.cr-rail-hl` → null
+  6. `a` href `#frag` → null
+  7. empty `code` → null
+  8. a plain `span` → null
+- `copyFloat(fakeBtn, "x")` with the clipboard stub records `"x"`. With no clipboard, the fallback builds a fresh textarea whose value is `"x"`, and "Copied" shows only when execCommand returns true. Reuse the existing `made`/`execLog` stubs.
+- `_flShow({el: fk with getClientRects → [{right:100, top:50}], text:"t", kind:"link"})`, with `document.createElement`/`body.appendChild` stubs and `innerWidth=800`. Expect className `codecopy flcopy`, type `button`, aria-label `Copy link`, `hidden === false`, left `104px`, top `47px`. Calling `_flOff()` then sets `hidden === true`.
+- `WiringTests.test_inline_copy_listener_is_wired`: the page contains `document.addEventListener("mouseover"` and `document.addEventListener("scroll",_flOff,true)`, and the page CSS contains `.flcopy{position:fixed`.
+- **Red proofs** (scoped Edit revert, never `git stash`), each recorded under "## Red proofs":
+  - drop `pre` from `FLCOPY_SKIP` → case 2 is not null
+  - drop `.shline` → case 5 is not null
+  - swap the link/code order in `copyTargetOf` → case 4 is `code`
+  - remove `if(ok)` in the fallback path → the false-success assertion fails (already pinned)
+  - remove the `aria-label` line → the `_flShow` assertion fails
+  - delete the listener → the Wiring test fails
+  - delete the `.flcopy` CSS → the Wiring test fails
+- A load-time throw in the new top-level code would fail `DraftCopyTests.setUpClass`, because the harness runs the whole app.js. That covers the load-time hazard in the memory note for app.js. CSS is covered by the Wiring needle only.
+
+### Sequencing
+1. Step A (app.js): the logic, with nothing else depending on it.
+2. Step B (CSS): visible only after A.
+3. Tests, each red-proved.
+4. README (Step C).
+5. Targeted modules: `unset TRACKER_AUTH; python -m unittest tests.test_draft_copy tests.test_classic_markdown_and_links tests.test_md_fence_xss tests.test_page_css`.
+6. Full gate, one module per process.
+7. `make serve` restart: this is a **UI change**, so the page is baked at startup.
+
+### Risky spot + fallback
+**Risk: the floating button misplaces or lingers.** A fixed position inside scrolling modals and CR panes, the 2 s repaint, and wrapped inline code are the cases that can go wrong. Mitigations already in the plan: hide on any scroll (capture), re-target on every `mouseover`, use the last client rect for wrapped spans, and a 250 ms grace period.
+
+**Fallback:** if it still misbehaves in manual testing, switch links only to an always-visible inline button that md() emits after each `</a>`. That means `stopPropagation` in its onclick, extending both anchor-unwrap regexes to drop it, and updating test_classic_markdown_and_links:602/:605. Inline code stays on the floating button.
+
+### Known gaps (documented; no work)
+- **Plain-paragraph drafts:** the real data has none. Every real draft is a fence or a `>` quote.
+- **md() italics inside code:** md() runs `*italic*` across inline code (`` `rm *.pyc *.pyo` `` renders `<em>`), so Copy returns the text without those asterisks. This is an existing render bug in md(), not new here. Fix it separately if it bites (protect code spans before the italics pass).
+- **Touch link Copy and keyboard reach** (above). Popout windows.
+
+### Decisions for the user
+1. **Floating hover button (recommended) vs. visible inline buttons.** Recommendation: floating. It is one mechanism, md()'s HTML does not change, rows stay single targets, and messages with ~4 code spans each stay clean. The alternative, a small always-visible Copy after every link with click-to-copy on code, is more discoverable and works on touch for links, but it touches md(), both unwrap regexes and two pinned link tests, and it steals row clicks.
+2. **Scope: everywhere md() renders except the three headline rows (recommended) vs. reading surfaces only (modals and CR detail).** Recommendation: everywhere except headlines. The button sits outside the row DOM, so a one-line narration row can copy a command without being opened, while the dense session/rail/tile headlines, which already refuse inner targets, stay quiet. The alternative needs an allowlist of about 15 container selectors that drifts as surfaces are added.
+
+
+## Round 2 — Review
+
+Reviewer: opus, adversarial (assumed the plan is wrong). Base `91b41c5`. No source edited. Probe: `~/.claude/jobs/c57b10c7/tmp/r2_probe.js` extracts md() verbatim from app.js and runs it in node.
+
+**Verdict:** the design holds. One floating button, outside the row DOM, with md()'s link HTML unchanged, is the right shape for 3.7 code spans per message. What does not hold is the plan's claim that "nothing changes by construction." The button sits on top of live text the moment it appears, which steals row clicks and drag-selections. On touch it swallows taps. And the plan leaves out the one bug that makes Copy return the wrong text. 1 High, 3 Medium, 4 Low, 2 Info.
+
+| # | Sev | Finding |
+|---|---|---|
+| F1 | **High** | md() runs `*italic*` / `**bold**` inside inline code, so Copy returns a different command |
+| F2 | Med | Touch: WebKit swallows the first tap on a row whose tap lands on inline code |
+| F3 | Med | The instant overlay steals row clicks and blocks drag-selection; it lingers over a modal the click opened |
+| F4 | Med | A link nested in code (`` `curl "https://…"` ``) copies only the URL, not the command |
+| F5 | Low | A detached or clipped target puts the button at (4,4) or below the row |
+| F6 | Low | Classed `<code>` that already has its own Copy (CR tunnel rows) gets a duplicate that copies placeholder text |
+| F7 | Low | The "Copied" flash is cut short by the 2 s repaint's re-hover, and its timer hides a re-targeted button |
+| F8 | Low | The touch and keyboard claims in the plan's notes are wrong or muddled. The README must state the gap |
+| F9 | Info | Overbuilt: `window.copyTargetOf` export; `kind`-dependent label only partly used |
+| F10 | Info | Probe 1 (discoverability) and probe 4 (copy source) verdicts. No defect |
+
+### F1 (High): asterisks inside inline code are eaten, so Copy hands over a wrong command
+- **Where:** `aitracker/web/app.js:145-152`. The `` `code` `` pass runs first, then `**bold**` (:146), then `*italic*` (:152), and both later passes run over the `<code>` content.
+- **Repro (node, md() taken verbatim):**
+
+  | Input | Expected | Actual |
+  |---|---|---|
+  | `` run `rm *.pyc *.pyo` now `` | `<code>rm *.pyc *.pyo</code>`, Copy gives `rm *.pyc *.pyo` | `<code>rm <em>.pyc </em>.pyo</code>`, Copy gives `rm .pyc .pyo` |
+  | `` `git log --format=*%h*` `` | Copy gives `git log --format=*%h*` | Copy gives `git log --format=%h` |
+  | `` `a **b** c` `` (mdSafe too) | `<code>a **b** c</code>` | `<code>a <strong>b</strong> c</code> |
+  | `` **bold `c*d*` x** `` | `<strong>bold <code>c*d*</code> x</strong>` | `**bold <code>c<em>d</em></code> x**`, so the bold is lost as well |
+
+  Copy correctness is the whole feature. A copied `chmod 644 *.sh *.py` that becomes `chmod 644 .sh .py` is a silent wrong command. **In scope.** The plan's "known gap" verdict is rejected.
+- **Fix direction:** keep code spans away from the emphasis passes only. Keep everything else as it is: the escape-first order, links inside code (pinned by `test_url_in_code_stays_inside_code` at test_classic_markdown_and_links:608), the italics on plain non-code text (pinned by the sanity control `test_plain_md_still_corrupts_the_same_glob_line`), and mdSafe's no-italics rule.
+- **Way:** in `md()`, replace :144-146 with the following. The rest of the function is unchanged, and the link pass still runs after the restore.
+  ```js
+  let h=esc(s).replace(/\u0000/g,"");                                  // NUL is the parking marker below; strip any in the input
+  const cs=[]; h=h.replace(/`([^`]+)`/g,(m,c)=>"\u0000"+(cs.push(c)-1)+"\u0000");   // park code spans: **/* never run inside code
+  h=h.replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>");
+  ```
+  …then add one line after the italics line (:152), before the link pass:
+  ```js
+  h=h.replace(/\u0000(\d+)\u0000/g,(m,i)=>`<code>${cs[+i]}</code>`);   // restore; links inside code are still linked below
+  ```
+  - **XSS:** `cs[i]` is already `esc()`-ed text. The marker carries only digits, and NUL is stripped from the input, so a forged `\u00000\u0000` cannot bring back unescaped text. It becomes a literal `0`.
+  - **Proved in the probe:** `` `<script>…` `` output is identical to today's. Links inside code are identical. `*a `b` c*` and `` see *`code`* `` are identical. The plain glob line is identical. Only the code-internal cases change.
+  - **Siblings:** mdSafe, mdBlock (every inline call goes through `md()`), CR `mdHtml`, `hlHtml`, and the board's `headlineEl` all call this one function. No other edit is needed.
+- **Test** (in `tests/test_classic_markdown_and_links.py`, next to `TestMdSafeDropsAsteriskItalicsButKeepsEverythingElse`):
+  - `md("run \`rm *.pyc *.pyo\`")` contains `<code>rm *.pyc *.pyo</code>`.
+  - `mdSafe("\`a **b** c\`")` contains `<code>a **b** c</code>`.
+  - ``md("**x `c*d*` y**")`` equals `<strong>x <code>c*d*</code> y</strong>`.
+  - `md("\u00000\u0000 \`<b>\`")` contains no `<b>` and no `\u0000`.
+  - **Red proof:** move the restore line back above the `**` pass. The first three fail.
+
+### F2 (Med): touch, the first tap is swallowed
+- **Where:** plan Step A, `document.addEventListener("mouseover",…)` and the plan note "a tap on inline code fires the emulated mouseover, so the button appears and a second tap copies."
+- **Repro:** on iOS Safari, tap a classic `.narr` row (`onclick="openMsg(i)"`, app.js:2090) on its inline code. WebKit dispatches the compatibility `mouseover`. The handler un-hides the button, which is a visible content change, so WebKit's content-change observer cancels the `click`. The row does not open, and a second tap is needed.
+  - The second tap lands on the code, not on the button (the button is at `r.right+4`). So the claim "a second tap copies" is false too. The user gets a one-tap regression and no copy.
+  - Android sends `pointerover` with type `touch` followed by a compatibility `mouseover`, so the same handler fires there.
+  - The tunnel and `viewport` meta show the dashboard is used on phones.
+- **Fix direction:** show the floating button for mouse pointers only. Touch keeps exactly today's behaviour, and native long-press still offers "Copy Link" and text selection.
+- **Way:** listen on `pointerover`, and return early when `e.pointerType!=="mouse"`. Use a named handler `_flOver(e)` so the test can drive it.
+- **Test:** `_flOver({pointerType:"touch",target:codeEl,buttons:0})` schedules no timer and creates no button. `_flOver` with `pointerType:"mouse"` schedules one timer. **Red proof:** drop the `pointerType` guard and the touch case schedules a timer.
+
+### F3 (Med): the instant overlay steals clicks and selections and lingers
+- **Where:** plan Step A, `_flShow` called synchronously on mouseover, placed at `left=r.right+4, top=r.top-3`. That is on top of the next words of the same line.
+- **Repro 1, click steal:** in a `.narr`/todo/request row (app.js:2090/2132/2138), move the pointer across `` `make check` `` and click the row text just to its right. The button has already appeared under the pointer, so the click copies and the row does not open. At ~3.7 spans per message this affects a large share of row clicks.
+- **Repro 2, selection:** press on the text before a code span and drag rightward. The button pops up over the text being selected, and while the pointer is over it, hit-testing returns the button, so the selection stalls. This contradicts the plan's claim "a drag still selects."
+- **Repro 3, linger:** click a row on its code span without moving. `openMsg` opens `#msgmodal`, which is z-index 50, while the button is at z 4100. The button floats over the modal until the pointer moves.
+- **Fix direction:** show the button only after the pointer dwells, never while a mouse button is held, and hide it on any press outside it. Do not change the outside-the-row placement. It is what keeps rows single-target.
+- **Way:**
+  - Wait 300 ms before showing: `_flT=setTimeout(()=>_flShow(c,e.clientX,e.clientY),300)`. Clear `_flT` on every `_flOver`, on scroll and on pointerdown.
+  - `const c=e.buttons?null:copyTargetOf(e.target)`.
+  - `document.addEventListener("pointerdown",e=>{if(!_flBtn||!_flBtn.contains(e.target)){clearTimeout(_flT);_flOff();}},true)`.
+- **Test:**
+  - A `_flOver` with `buttons:1` schedules no show.
+  - A mouse `_flOver` records a `setTimeout` delay of 300.
+  - Calling `_flAway({target:outside})` sets `hidden===true`. The handlers are named, so the DRIVER calls them directly and overrides `setTimeout` after app.js loads, because it is resolved at call time.
+  - **Red proofs:** remove the `e.buttons` check; remove the pointerdown listener.
+
+### F4 (Med): a link inside code wins, so `curl` commands lose everything but the URL
+- **Where:** plan `copyTargetOf`, `t.closest('a[href^="http"]')||t.closest("code")`.
+- **Repro:** md() links URLs inside code, so `` `curl -s "https://x.y/a?b=1&c=2"` `` becomes `<code>curl -s "<a href=…>https://x.y/a?b=1&amp;c=2</a>"</code>` (probe). With the pointer over the URL part, the link wins and Copy gives `https://x.y/a?b=1&c=2`. Expected: the whole command `curl -s "https://x.y/a?b=1&c=2"`. Real data has 10 such spans in 120 files.
+- **Fix direction:** the outer element wins. `` [`x`](url) `` (a contains code) still copies the URL. A code span that contains a link copies the whole code.
+- **Way:** `const a=t.closest('a[href^="http"]'), k=t.closest("code"); const el=a&&k?(a.contains(k)?a:k):(a||k);`. The fake element needs `contains`.
+- **Test:** add case 4b: an `a` inside a `code` whose `textContent` is `curl -s "https://x"`, with the target being that `a`. Expect `["code",'curl -s "https://x"']`. Case 4 (code inside a) stays `link`. **Red proof:** restore `a||code`, and 4b turns into `link`.
+
+### F5 (Low): detached or clipped target, button misplaced
+- **Repro:**
+  - `winList` (app.js:2804-2816) replaces `innerHTML` on every 2 s poll. When `_flShow` runs on a detached `el` (more likely with F3's 300 ms dwell), `getClientRects()` returns `[]`, the plan falls back to `getBoundingClientRect()`, which returns all zeros, and the button lands at (4,4), the top-left corner.
+  - Separately, in `.narr .x` (app.css:385, `-webkit-line-clamp:3; overflow:hidden`), a code span that wraps from line 3 into hidden line 4 has its **last** rect on the clipped line. The button then appears over the next row.
+- **Fix direction:** never position from a rect that does not exist, and place the button at the line the pointer is on.
+- **Way:** `_flShow(c,x,y)`: `if(!c.el.isConnected)return; const rs=[...c.el.getClientRects()]; if(!rs.length)return; const r=rs.find(q=>y>=q.top&&y<=q.bottom)||rs[rs.length-1];`. Drop the `getBoundingClientRect` fallback.
+- **Test:**
+  - `_flShow` with a fake `el` that has `isConnected:false`, or `getClientRects()` returning `[]`, leaves the button hidden or not created.
+  - With two rects and y on the first, `top` comes from the first rect.
+  - **Red proof:** drop the `rs.length` guard.
+
+### F6 (Low): duplicate Copy on classed code, and placeholders copied
+- **Where:** `ext_cr_dialogs.js:2086/2173/2184` render `<code class="cr-mono cr-tunnel-cmd">` next to their own `copyBtn`. Their placeholder text is `connecting…` / `(set a Tunnel URL above first)`. `:921` renders `code.cr-envchip`.
+- **Repro:** open Config → Tunnel and hover the URL. Two Copy buttons appear. While the URL is still connecting, the floating one copies `connecting…`.
+- **Fix direction:** md() emits only **classless** `<code>` and `<a>` (app.js:145/162/165). Target only those. Classless UI code (for example `make tunnel` in a note) stays covered.
+- **Way:** in `copyTargetOf`, `if(!el||el.className||el.closest(FLCOPY_SKIP))return null;`.
+- **Test:** case 9: `code` with `cls:"cr-tunnel-cmd"` gives null. **Red proof:** drop `el.className`.
+
+### F7 (Low): the Copied flash is cut short
+- **Repro:** click the button, then within 900 ms the 2 s repaint makes Chromium re-dispatch hover (or the user nudges onto another span). `_flShow` rewrites `innerHTML` to "Copy", and the pending `done` timer then hides the newly targeted button.
+- **Fix direction:** hold the button still while it shows "Copied".
+- **Way:** the first line of `_flShow`: `if(_flBtn&&_flBtn.classList.contains("ok"))return;`.
+- **Test:** add `ok` to the fake button's class list, call `_flShow` with another target, and expect `_flText` unchanged. Implementation note: the preamble's `classList.contains` always returns false, so the DRIVER's button stub needs a real set-backed classList.
+
+### F8 (Low): the plan's claims about its own gaps are wrong
+- **Where:** the plan's Notes, "Touch" and "Keyboard".
+- **Fix direction:**
+  - Correct the touch note to what is true after F2: no floating Copy on touch, by design; native long-press is the route.
+  - Add one sentence to the README row in Step C: "(mouse only; on touch, long-press as usual)".
+  - Keyboard: no change. It is a known gap, documented as the plan says.
+- **Test:** none (documentation).
+
+### F9 (Info): overbuilt bits
+- **Fix direction:**
+  - `window.copyTargetOf=copyTargetOf;` is unneeded. The harness concatenates `_APP_JS_STUB_PREAMBLE + app.js + DRIVER` into one script, so top-level function declarations are already visible to the DRIVER. Drop the line.
+  - The pixel-exact `left 104px / top 47px` assertion is fine to keep, because it pins the clamp maths.
+  - Nothing else in the plan is wider than the ask. The README clause is one line, and no ext_cr file changes.
+- **Test:** none.
+
+### F10 (Info): verdicts on probes 1, 4 and 5
+- **(1) Does hover meet "automatically shared"?**
+  - **Yes for code and ordinary links.** Every span and link gets Copy with no setup. An always-visible glyph on ~3.7 spans per message fails the clutter test. Click-to-copy on code would steal the `.narr`/todo/timeline row clicks, or it would need a container allowlist that drifts as surfaces are added.
+  - **For Claude Artifacts** an always-visible chip is defensible: they are named explicitly, they are rare (39 in all history), and they are high-value. It costs about 10 lines: md() appends a `button.codecopy.lnkcopy` after artifact URLs, a capture-phase delegated click handler with `stopPropagation`, both anchor-unwrap regexes (app.js:2440 and ext_cr_board.js:2948) strip it, and two tests.
+  - Its benefit over hover is mainly touch, where native long-press "Copy Link" already exists. Put to the user as decision 3, recommendation **no** for this round.
+- **(4) Copy source:**
+  - `getAttribute("href")` decodes `&amp;` back to `&` (HTML attribute char-ref decoding). md() builds the href from `esc()`-ed text, so the copied URL equals the source URL exactly. A literal `&amp;` in the source stays `&amp;`, which is faithful.
+  - Code `textContent` decodes `&lt;` back to `<`. Correct, once F1 is fixed.
+  - `[label](url)` copies the href, not the label. That is the same as the browser's native "Copy link address", and the button says "Copy link". OK.
+- **(5) Exclusions:**
+  - Headlines (`.shline`, `.cr-rail-hl`, `.cr-tile-line--hl`): right.
+  - `pre`: right. It covers fences, the mermaid fallback and `.md` previews, which all have their own Copy.
+  - **Do not** exclude blockquotes: copying one command out of a draft quote is useful, and the quote's own Copy copies the whole quote.
+  - Add F6's classless rule.
+  - `#ov_hl` (the overview headline, anchors kept) stays included. It is a card, not a row target.
+
+## Round 2 — Clean plan
+
+Same design as "## Round 2 — Plan": one lazily created floating `<button class="codecopy flcopy">` in `<body>`, and md()'s link HTML unchanged. The accepted fixes are F1–F7 and F9. Sequencing: **F1 first**, because Copy is only as correct as the text it reads.
+
+### Step 0 (F1): `aitracker/web/app.js` `md()` (:143-167): park code spans before the emphasis passes
+Use the exact lines in F1 → Way. This is the only edit to md(). Links inside code, escape-first, and mdSafe's rule are unchanged.
+
+### Step A: `aitracker/web/app.js`, after `copyCode` (:2563-2572)
+```js
+// Copy for inline code and links: ONE floating button in <body>, shown after a short hover (mouse only) next
+// to the md()-rendered (classless) inline `code` or http(s) link under the pointer. It lives outside every row,
+// so clicking it never opens the row under it. Headline rows (anchors unwrapped, one click target) and <pre>
+// (fences have their own Copy) are skipped. Touch: none by design -- WebKit would swallow the row's first tap.
+const FLCOPY_SKIP=".shline,.cr-rail-hl,.cr-tile-line--hl,pre,.xterm";
+function copyTargetOf(t){
+  if(!t||!t.closest)return null;
+  const a=t.closest('a[href^="http"]'), k=t.closest("code");
+  const el=a&&k?(a.contains(k)?a:k):(a||k);           // the OUTER one: [`x`](url) -> url; `curl https://...` -> the command
+  if(!el||el.className||el.closest(FLCOPY_SKIP))return null;   // md() emits classless <code>/<a>; classed ones have their own Copy
+  const link=el.tagName==="A", text=link?el.getAttribute("href"):(el.textContent||"");
+  return text?{el,text,kind:link?"link":"code"}:null;
+}
+let _flBtn=null,_flEl=null,_flText="",_flHide=0,_flT=0;
+function _flOff(){ if(_flBtn)_flBtn.hidden=true; _flEl=null; }
+function _flShow(c,x,y){
+  if(_flBtn&&_flBtn.classList.contains("ok"))return;                 // hold still while it says "Copied"
+  if(!c.el.isConnected)return;                                        // the 2 s repaint detached it
+  const rs=[...c.el.getClientRects()]; if(!rs.length)return;
+  const r=rs.find(q=>y>=q.top&&y<=q.bottom)||rs[rs.length-1];         // wrapped code: the line under the pointer
+  if(!_flBtn){ _flBtn=document.createElement("button"); _flBtn.type="button"; _flBtn.className="codecopy flcopy";
+    _flBtn.onclick=()=>copyFloat(_flBtn,_flText); document.body.appendChild(_flBtn); }
+  if(_flEl===c.el&&!_flBtn.hidden)return;
+  _flEl=c.el; _flText=c.text;
+  const lbl=c.kind==="link"?"Copy link":"Copy";
+  _flBtn.innerHTML=ico('copy')+" Copy"; _flBtn.title=lbl; _flBtn.setAttribute("aria-label",lbl);
+  _flBtn.style.left=Math.max(4,Math.min(innerWidth-80,r.right+4))+"px"; _flBtn.style.top=Math.max(4,r.top-3)+"px";
+  _flBtn.hidden=false;
+}
+function copyFloat(btn,text){
+  if(!text)return;
+  const done=()=>{btn.classList.add("ok");btn.innerHTML=ico('check')+" Copied";setTimeout(()=>{btn.classList.remove("ok");_flOff();},900);};
+  const fb=()=>{const t=document.createElement("textarea");t.value=text;fallbackCopy(t,done);};
+  if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(text).then(done).catch(fb); else fb();
+}
+function _flOver(e){
+  if(e.pointerType!=="mouse")return;                                  // touch/pen: no floating button (F2)
+  if(_flBtn&&_flBtn.contains(e.target)){clearTimeout(_flHide);return;}
+  clearTimeout(_flT); clearTimeout(_flHide);
+  const c=e.buttons?null:copyTargetOf(e.target);                      // mid-drag (selecting): never pop over the text
+  if(c)_flT=setTimeout(()=>_flShow(c,e.clientX,e.clientY),300); else _flHide=setTimeout(_flOff,250);
+}
+function _flAway(e){ if(!_flBtn||!_flBtn.contains(e.target)){clearTimeout(_flT);_flOff();} }
+document.addEventListener("pointerover",_flOver);
+document.addEventListener("pointerdown",_flAway,true);                // a press elsewhere (row click, drag start) hides it
+document.addEventListener("scroll",()=>{clearTimeout(_flT);_flOff();},true);
+```
+- **Signatures:**
+  - `copyTargetOf(t) -> {el,text,kind:"code"|"link"}|null`
+  - `copyFloat(btn,text)`
+  - `_flShow(c,x,y)`, `_flOff()`, `_flOver(e)`, `_flAway(e)`
+  - No `window.` export (F9).
+- **XSS:** unchanged from the plan. Copied text goes only to the clipboard. The button's `innerHTML` is static, and the label goes through `title`/`setAttribute`.
+
+### Step B: `aitracker/web/app.css`, after `.codecopy.ok` (:408)
+Unchanged from the plan: `.flcopy{position:fixed;top:auto;right:auto;z-index:4100;padding:3px 7px;font-size:10px}`. Grep the file for a stray `*/` afterwards.
+
+### Step C: README.md:187
+Append: "…and every inline `code` span and link (Claude Artifacts included) shows a **Copy** when you hover it (mouse; on touch, long-press as usual)."
+
+### Tests
+**`tests/test_classic_markdown_and_links.py`**
+- The four F1 assertions, each red-proved.
+
+**`tests/test_draft_copy.py`**
+- Extend the DRIVER with `fk(tag,{href,text,cls,rects,connected},parent)`, which implements `closest` (tag, `.class`, `a[href^="http"]`), `contains`, `getClientRects` and `isConnected`.
+- After app.js loads, override `setTimeout` with a recorder, and call the named handlers directly. Then add these cases:
+  - **`copyTargetOf`:** plan cases 1–8, plus 4b (link nested in code gives `code` with the whole command) and 9 (classed code gives null).
+  - **`copyFloat`:** clipboard path, and the fallback path with "Copied" only on success. Both as planned.
+  - **`_flShow`:**
+    - The plan's pixel case, with y inside the rect.
+    - A two-rect case where `top` comes from the rect under y.
+    - Detached, or no rects: no button.
+    - `ok` held: `_flText` unchanged.
+  - **`_flOver`:**
+    - touch: no timer
+    - `buttons:1`: no show timer
+    - mouse: one timer of 300 ms
+  - **`_flAway`:** a target outside the button hides it.
+- **`WiringTests.test_inline_copy_listener_is_wired`:** the page contains `addEventListener("pointerover",_flOver)`, `addEventListener("pointerdown",_flAway,true)` and `.flcopy{position:fixed`.
+
+**Red proofs** (scoped Edit revert, never `git stash`), each recorded under "## Red proofs":
+- The plan's seven.
+- F1: restore order.
+- F2: drop the `pointerType` guard.
+- F3: drop `e.buttons`, and drop the pointerdown listener.
+- F4: restore `a||code`.
+- F5: drop the `rs.length` guard.
+- F6: drop `el.className`.
+
+### Sequencing
+1. Step 0 and its tests.
+2. Step A.
+3. Step B.
+4. The `test_draft_copy` tests.
+5. README.
+6. Targeted: `unset TRACKER_AUTH; python -m unittest tests.test_draft_copy tests.test_classic_markdown_and_links tests.test_md_fence_xss tests.test_page_css`.
+7. Full gate, one module per process.
+8. `make serve` restart. This is a UI change, and the page is baked at startup.
+
+### Risky spot + fallback
+**Risk:** positioning inside line-clamped rows, CR panes and modals, and the hover race with the 2 s repaint. Step A now guards it with the dwell, the `isConnected`/`rs.length` checks, the rect under the pointer, and hide on press or scroll.
+
+**Fallback:** unchanged from the plan. Make links an always-visible inline button, and keep code on the floating button.
+
+### Known gaps (documented)
+- No floating Copy on touch (by design, F2) or by keyboard.
+- Popout windows have no scripts, which is the same as today's fence Copy there.
+- Plain-paragraph drafts do not occur in the real data.
+- A markdown link written *inside* inline code (`` `[t](url)` ``) copies `t`. This is the existing link-in-code rendering, and it is rare.
+
+### Decisions for the user (restated)
+1. **Floating hover button vs. visible inline buttons.** **Recommend floating**, now with a 300 ms dwell and mouse only. Visible inline buttons clutter ~3.7 spans per message, steal row clicks, and churn the pinned link HTML.
+2. **Scope: everywhere md() renders except the three headline rows and `<pre>`, vs. reading surfaces only.** **Recommend everywhere-except-headlines**, plus the classless rule (F6). A reading-surfaces allowlist would drift as surfaces are added.
+3. *(new)* **Always-visible Copy chip after Claude Artifact links** (about 10 lines: md(), a delegated capture click handler, and both unwrap regexes). **Recommend no for this round.** Hover already covers artifact links on desktop, and on touch the native long-press "Copy Link" does the job. Take it if you copy artifact links from the phone often.
+
+## Round 2 — Reconciliation (main thread, 2026-11-17)
+| # | Finding | Verdict | Action |
+|---|---|---|---|
+| F1 | md() runs bold/italic inside inline code (app.js:145-146) — copied `rm *.pyc` loses `*` | confirmed (re-read app.js:145-146) | accept — Step 0, lands first |
+| F2 | touch: first tap swallowed | confirmed | accept — mouse-only (`pointerType==="mouse"`), the cheaper fix |
+| F3 | instant button covers text / steals clicks & drags | confirmed | accept — 300 ms hover delay, never while a button is held, hide on outside press |
+| F4 | URL inside a code span copies only the URL | confirmed | accept — outer code wins |
+| F5 | detached target → button at (0,0); clamped wrap | confirmed | accept `isConnected` + non-empty-rect guard only; "line under pointer" positioning cut as wider than the defect |
+| F6 | duplicates Config tunnel rows' own Copy | confirmed | accept — classless `<code>`/`<a>` only |
+| F7 | repaint cuts "Copied" flash | low | no change — cosmetic |
+| F8 | README/touch notes wrong | confirmed | accept — "mouse only" in README |
+| F9 | `window.copyTargetOf` export unneeded | confirmed | accept — drop |
+| F10 | hover meets "automatically"; href/entity decoding fine | info | none |
+
+## Round 2 — User decisions (2026-11-17)
+- Copy style: **hover button** (300 ms, mouse only) per the Round 2 Clean plan + reconciliation above.
+- Artifacts: **yes, visible chip** — implement the reviewer's F10 design: md() appends a `button.codecopy.lnkcopy` after claude.ai/artifact/… and claude.ai/code/artifact/… links; the chip copies its preceding anchor's href at click time (no URL duplicated into an attribute); capture-phase delegated click with stopPropagation so the row doesn't open; both anchor-unwrap regexes (app.js ~2440 hlHtml, ext_cr_board.js ~2948 headlineEl) strip the chip too; two tests.
+- Sign-off: **go ahead**.
+
+## Round 2 — Implementation status
+- [x] Step 0 md() code-span protection (F1)
+- [x] hover Copy (Clean plan + F2–F6, F8, F9)
+- [x] artifact chip
+- [ ] gate, commit, branch-sync, push
+
+## Round 2 — Red proofs
+Each fix reverted with a scoped swap (never `git stash`), the module run, then restored. All 20 went RED:
+- F1 restore line moved above the `**` pass -> test_asterisks_inside_code_are_kept
+- NUL strip dropped -> test_forged_marker_and_html_in_code_stay_inert
+- F2 pointerType guard dropped -> test_hover_is_mouse_only_delayed_and_not_mid_drag
+- F3 e.buttons guard dropped -> same test; pointerdown listener dropped -> wiring/setUpClass; 300 ms delay -> 0 -> same hover test
+- F4 `a||code` restored -> test_link_inside_code_copies_the_whole_command
+- F5 rs.length guard dropped -> setUpClass; isConnected guard dropped -> test_detached_or_rectless_target_makes_no_button
+- F6 className guard dropped; skip list dropped -> test_skips_classed_headline_pre_nonhttp_and_empty
+- "Copied" hold dropped -> test_copied_flash_holds_the_button
+- fallback reports success on failure -> test_copy_text_clipboard_and_honest_fallback
+- chip stopPropagation dropped; wrong href; non-capture listener -> test_artifact_chip_copies_href_and_swallows_the_click / setUpClass
+- chip removed from md() -> test_artifact_link_gets_chip_right_after_the_anchor
+- hlHtml unwrap regex without chip -> test_headline_unwrap_strips_the_chip_too
+- ext_cr_board unwrap regex without chip -> test_board_headline_unwrap_regex_strips_the_chip
+Known: a code span that contains an artifact URL also contains the chip's text in `textContent` (hover Copy would append "Copy"); rare, not handled.
+
+## Round 2 — Implementation review (opus, adversarial, 2026-11-17)
+Method: staged diff read per file; old-vs-new md()/mdSafe()/mdBlock() output diffed over a 36-input corpus (HEAD app.js vs staged); an in-memory mutation harness re-ran `TestCodeSpansAndArtifactChip` + `FloatingCopyTests` against 13 mutated copies of app.js (no source edits); targeted modules (test_draft_copy, test_classic_markdown_and_links, test_md_fence_xss, test_page_css: 83 OK) plus test_cr_detail_agents_pill_and_markdown, test_cr_dialogs_markdownfork_and_scrim, test_list_headline_ui, test_mermaid, test_header_and_cost_ui, test_cr_registry_fields: all OK. Probes: /Users/pritammondal/.claude/jobs/c57b10c7/tmp/{probe.py,mut.py}.
+
+### I1 — MEDIUM: the chip's "Copy" label is a real text node, so it leaks into every text-based copy
+- **Defect:** app.js:160 emits `<button …lnkcopy…>Copy</button>` right after the anchor. Its text joins the surrounding text in `innerText` and `textContent`, with no separator, because the button is inline-block.
+- **Repro (a):** this is the worst case, because the Copy button already exists. In the message modal, press Copy (`copyModal('msgbody')`, app.js:2541-2543, `innerText`) on `see https://claude.ai/artifact/abc now`.
+  - Actual clipboard: `see https://claude.ai/artifact/abcCopy now`, a broken URL.
+  - Expected: `…/abc now`.
+- **Repro (b):** the "known gap" is real. `` `https://claude.ai/artifact/abc` `` renders `<code><a …>…abc</a><button …>Copy</button></code>`, per the probe output. Hover Copy then takes the code's `textContent`.
+  - Actual: `https://claude.ai/artifact/abcCopy`.
+- **Repro (c):** the flag-note context reads `$("nowtext").textContent` (app.js:2798), so it picks up `…abcCopy`.
+- **Repro (d):** select the text across the link and press Cmd+C. The copied text includes "Copy".
+- **Fix direction:** the chip carries no text node, and its label comes from CSS generated content. `innerText` and `textContent` exclude pseudo-element content, so (a)–(d) are all fixed at once.
+  - Must NOT change: the URL stays out of any attribute; the link HTML stays the same; the unwrap regexes stay as they are (`[^<]*` already matches an empty label); `title` and `aria-label` stay, so the accessible name is kept.
+- **Way:**
+  1. app.js:160: change the chip string to `<button type=button class="codecopy lnkcopy" title="Copy link" aria-label="Copy link"></button>`.
+  2. app.css, after `.lnkcopy{…}` (:410): add `.lnkcopy::after{content:"Copy"}.lnkcopy.ok::after{content:"Copied"}`.
+  3. `_lnkCopyClick` (app.js ~2626): change `done` to `()=>{b.classList.add("ok");setTimeout(()=>b.classList.remove("ok"),1200);}` and drop both `textContent` writes.
+- **Test (red before):**
+  - In `TestCodeSpansAndArtifactChip`, add `OUT["plain_text"]=md("see "+ART+" now").replace(/<[^>]+>/g,"")` and `OUT["code_text"]=md("`"+ART+"`").replace(/<[^>]+>/g,"")`. Assert they equal `"see "+ART+" now"` and `ART`.
+  - Update the chip literal in `test_artifact_link_gets_chip_right_after_the_anchor` to the empty-label form.
+  - In the FLOAT_DRIVER chip case, record `classList.add` arguments. Assert `"ok"` was added and `chip.textContent` is still `"Copy"`, which shows it was never written.
+  - Add `.lnkcopy::after{content:"Copy"}` to `test_listeners_are_wired_in_the_page`.
+
+### I2 — LOW: the floating "Copy link" stacks on top of the artifact chip
+- **Defect:** `copyTargetOf` (app.js:2582-2588) accepts the classless artifact anchor. `_flShow` then places the button at `r.right+4`, which is exactly where `.lnkcopy` (`margin-left:4px`) renders. The result is two Copy controls on top of each other.
+- **Second case:** hovering the chip itself inside a code span (target = the chip, `closest("code")` = the span) pops the floating button over the chip.
+- **Fix direction:** no floating button for a link that already has its chip, or for the chip itself. Must NOT change: other links and code (including code that contains an artifact link) keep hover Copy.
+- **Way:**
+  - In `copyTargetOf`, after `if(!t||!t.closest)return null;`, add `if(t.closest(".lnkcopy"))return null;`.
+  - After `el` is computed, add `if(el.tagName==="A"&&el.nextElementSibling&&/\blnkcopy\b/.test(el.nextElementSibling.className||""))return null;`.
+- **Test (red before):**
+  - In FLOAT_DRIVER, give `fk` a `nextElementSibling` option, and teach its `closest` the `.lnkcopy` selector.
+  - Add `OUT["chip_anchor"]=copyTargetOf(fk("a",{href:"https://claude.ai/artifact/q",next:{className:"codecopy lnkcopy"}},row))` and `OUT["on_chip"]=copyTargetOf(fk("button",{cls:"codecopy lnkcopy"},fk("code",{text:"u"},row)))`.
+  - Assert both are null in `test_skips_classed_headline_pre_nonhttp_and_empty`.
+
+### I3 — LOW: pop-out shows a dead chip
+- **Defect:** `popOut` (app.js:2629-2644) copies `body.innerHTML` and the stylesheets but no scripts. Every artifact link in a popped-out message therefore shows a "Copy" chip that does nothing.
+- **Fix:** hide the chip there. Must NOT change: the main page.
+- **Way:** app.css: add `.pw .lnkcopy{display:none}`. The pop-out wraps the body in `.pw`.
+- **Test:** assert `.pw .lnkcopy{display:none}` is in `build_page()`, in `test_listeners_are_wired_in_the_page`. It is red before the fix.
+
+### I4 — LOW (test gap): the floating button's onclick and the scroll-hide are unverified
+- **Repro:** two mutations stay **GREEN** in the mutation harness:
+  - `_flBtn.onclick=()=>copyText(c.text,…)`, a stale closure that would copy the *first* hovered span forever;
+  - deleting `document.addEventListener("scroll",…,true)`.
+- Neither one is among the claimed 20 red proofs. The code itself is correct today.
+- **Fix:** tests only. No source change.
+- **Way:** in FLOAT_DRIVER, before the ok-held block:
+  - set `_flBtn=null;_flEl=null`;
+  - call `_flShow({el:fk("code",{text:"A"},row),text:"A",kind:"code"})`, then `_flShow({el:fk("code",{text:"B"},row),text:"B",kind:"code"})`;
+  - call `_flBtn.onclick()`;
+  - record `OUT["click_copies_latest"]=copied[copied.length-1]` and assert `"B"`.
+  - Also set `_flBtn.hidden=false`, call `H["scroll!"]()`, and assert `_flBtn.hidden===true`. The second part goes red when the listener is removed, because `H["scroll!"]` is then undefined and setUpClass fails.
+
+### I5 — INFO: clamped wrap still uses the last rect
+- `_flShow` uses `rs[rs.length-1]`. When a code span wraps past the 3-line clamp of `.narr .x` (app.css:385), the button lands on the clipped line below the row.
+- The Round 2 reconciliation cut "line under pointer" deliberately.
+- **No change.** This is a known gap. If it bites, pass `e.clientY` and pick `rs.find(q=>y>=q.top&&y<=q.bottom)`.
+
+### I6 — INFO: md() output diff vs HEAD (36 inputs × md/mdSafe/mdBlock)
+- **Intended changes only:**
+  - `*`/`**` stay literal inside code (`` `*a*` ``, `` `**x**` `` in tables and headings).
+  - The mis-nested `**a `b** c`` no longer emits crossed `<strong>`/`<code>` tags.
+  - NUL is stripped.
+  - Chips appear after artifact links only. Both shapes get one: `/artifact/` and `/code/artifact/`, over http(s). Lookalikes get none: `claude.ai.evil.test`, `/artifacts/`, and an artifact URL in a query param.
+- **One side effect:** `*a `x\ny` b*` now italicizes, because the marker hides the code span's newline from the italic `[^*\n]`. It is benign. **No change.**
+- **XSS:** clean on every path.
+  - Every code span with HTML stays escaped.
+  - `"`-breakout after an artifact URL leaves the chip static and the quote outside `href`.
+  - `javascript:` links stay unlinked.
+  - A forged NUL marker cannot index `cs`, because NUL is stripped first.
+  - `$&`/`$1` inside code are literal, because the restore uses a function replacement.
+
+### I7 — NIT: the scroll handler writes on every scroll
+- The capture-phase scroll handler fires on every scroll, including streaming xterm output and live auto-scroll. Each time it writes `hidden=true`.
+- Optional fix: `if(_flBtn&&!_flBtn.hidden)`. **No change required.**
+
+### Verified OK (no finding)
+- **Headline unwraps:** both regexes strip the anchor and its chip, including a chip inside `<code>`.
+- **Click handling:**
+  - The capture click handler acts only under `.lnkcopy` (`other_click_stopped=0`).
+  - The classic `.narr onclick`, the CR timeline delegated click (ext_cr_detail.js:1799) and the overview Now banner never see a chip click.
+  - Keyboard Enter/Space on the chip copies.
+- **Markup:**
+  - No md() output is ever placed inside a `<button>`, so there is no nested-button parse breakage.
+  - `.codecopy` has no `display` rule, so `[hidden]` hides the floating button.
+  - z-index 4100 is the page maximum (the next highest is 4000).
+  - `.lnkcopy{position:static}` beats `.codecopy{position:absolute}`, because it has equal specificity and comes later. The CR `.cr .codecopy` rules are colour-only.
+- **Floating button:**
+  - Touch and pen are ignored.
+  - The pointerdown and scroll handlers are safe when the button does not exist yet.
+  - The listeners are module-level and added once, so nothing leaks.
+- **No doubled Copy controls:**
+  - Quote/draft Copy reads `.cpsrc` (raw), so the chip does not affect it.
+  - Fences are skipped (`pre`).
+  - Config tunnel rows use classed code, so they are skipped.
+- **Red proofs:** 11 of 13 independent mutations went RED. The 2 GREEN ones are I4, which is not among the claimed proofs. The claimed F1, F2, F3, F4, F5, F6, chip-capture, chip-stopPropagation, chip-scope, dwell and hlHtml proofs were reproduced.
+
+**Verdict: fix-first.** I1 is a three-line change (the chip string, two CSS rules, and the handler's `done`) that stops silent URL corruption in the existing message-modal Copy. I2, I3 and I4 are a few lines each and can land in the same pass. Then re-run the targeted modules.
+
+## Round 2 — Implementation review reconciliation (main thread)
+| # | Verdict | Action |
+|---|---|---|
+| I1 | confirmed — chip label is a text node, leaks into copyModal / hover-copy / Cmd+C | fix: empty button + `.lnkcopy::after{content:"Copy"}`, `.ok::after{content:"Copied"}`, handler toggles `ok` |
+| I2 | confirmed | fix: copyTargetOf → null on the chip or an anchor followed by a chip |
+| I3 | confirmed | fix: `.pw .lnkcopy{display:none}` |
+| I4 | confirmed test gap | add the two tests (float click uses current target; scroll listener hides) |
+| I5 | deliberate (round-2 F5 cut) | no change |
+| I6 | info | none |
+| I7 | nit | no change |
+
+## Round 2 — Red proofs (implementation-review fixes I1-I4)
+Each fix reverted by a scoped swap (no stash), module run, restored. All RED:
+- I1 chip label back as text node -> RED (FAILED (failures=2))
+- I1 handler writes textContent (no .ok add) -> RED (FAILED (failures=1))
+- I1 ::after css removed -> RED (FAILED (failures=1))
+- I2 chip self guard dropped -> RED (FAILED (failures=1))
+- I2 anchor-followed-by-chip guard dropped -> RED (FAILED (failures=1))
+- I3 .pw rule removed -> RED (FAILED (failures=1))
+- I4 stale closure onclick -> RED (FAILED (failures=1))
+- I4 scroll listener removed -> RED (FAILED (errors=1))
+I5-I7: no code (per reconciliation). Chip tests pinning literal "Copy" updated to the empty-button + ::after shape.

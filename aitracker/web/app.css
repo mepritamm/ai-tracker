@@ -406,6 +406,10 @@ header.hd{padding:22px 28px 18px;border-bottom:1px solid var(--line)}
 .hlband.hl-working{color:var(--green);border-color:var(--green-line);background:var(--green-bg)}
 .hlband.hl-failed{color:var(--red);border-color:var(--red-line);background:var(--red-bg)}
 .codecopy.ok{color:var(--green);border-color:var(--green-line);opacity:1}
+.flcopy{position:fixed;top:auto;right:auto;z-index:4100;padding:3px 7px;font-size:10px}
+.lnkcopy{position:static;margin-left:4px;padding:1px 5px;font-size:10px;vertical-align:baseline}
+.lnkcopy::after{content:"Copy"}.lnkcopy.ok::after{content:"Copied"}
+.pw .lnkcopy{display:none}
 /* mermaid flowcharts rendered inline (mermaidSvg in app.js) — themed via tokens so
    light/dark both read; a classDef fill/stroke/color in the diagram overrides them */
 .mmd{background:var(--side);border:1px solid var(--line);border-radius:8px;padding:12px;margin:0 0 11px;overflow-x:auto}
