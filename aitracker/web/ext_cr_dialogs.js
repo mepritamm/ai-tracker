@@ -2305,7 +2305,7 @@
         // deleted) that silently dropped italics/links/headings/lists/tables/fences —
         // same text, worse rendering, purely because of which dialog showed it.
         var pre = h('div', { class: 'cr-rendered-md' });
-        pre.innerHTML = mdBlock((payload.lines || []).map(function (l) { return l.text; }).join('\n'));
+        pre.innerHTML = mdBlock((payload.lines || []).map(function (l) { return l.text; }).join('\n'), false, true);
         body.appendChild(pre);
       } else if (mode === 'output') {
         var pre2 = h('pre', { class: 'cr-outputtext' }, [payload.text || '']);

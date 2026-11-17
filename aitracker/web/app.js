@@ -227,27 +227,26 @@ function draftLabelBefore(L,start){
   let j=start-1; while(j>=0&&!L[j].trim()) j--;
   return j>=0&&!/^\s*>/.test(L[j])&&draftLabel(L[j]);
 }
-// does this text hold a draft quote? (the CR timeline routes such text through mdBlock)
-function hasDraftQuote(s){
-  const L=(s||"").replace(/\r/g,"").split("\n");
-  let fence=0;   // length of the open fence's backtick run (0 = none); closes only on a run at least as long
+// Does this text need the block renderer? (ext_cr_detail.js's mdHtml routes to mdBlock when true.)
+// Counts only markers mdBlock itself renders. A fence, a heading, a blockquote or a table is decisive.
+// List items need >= 2 lines, so prose like "- that's it" or "1. first" stays inline.
+function looksLikeBlockMd(s){
+  s=(s||"").replace(/\r/g,"");
+  if(s.indexOf("```")!==-1) return true;
+  const L=s.split("\n"); let items=0;
   for(let i=0;i<L.length;i++){
-    const fo=L[i].match(/^\s*(`{3,})/);
-    if(fence){ if(fo&&fo[1].length>=fence&&/^\s*`+\s*$/.test(L[i])) fence=0; continue; }
-    if(fo){ fence=fo[1].length; continue; }
-    if(/^\s*>/.test(L[i])&&(i===0||!/^\s*>/.test(L[i-1]))){
-      if(draftLabelBefore(L,i)) return true;
-      const q=[]; let j=i;   // like mdBlock: look inside the quote for a nested draft
-      while(j<L.length&&/^\s*>/.test(L[j])){ q.push(L[j].replace(/^\s*>\s?/,"")); j++; }
-      if(hasDraftQuote(q.join("\n"))) return true;
-      i=j-1;
-    }
+    const l=L[i];
+    if(/^#{1,6}\s+\S/.test(l)||/^\s*>/.test(l)) return true;
+    if(l.includes("|")&&i+1<L.length&&/^[\s|:-]+$/.test(L[i+1])&&L[i+1].includes("-")&&L[i+1].includes("|")) return true;
+    if(/^\s*(?:[-*+]|\d+\.)\s+/.test(l)&&++items>=2) return true;
   }
   return false;
 }
-window.hasDraftQuote=hasDraftQuote;
+window.looksLikeBlockMd=looksLikeBlockMd;
 // block-level markdown for the full-text modal: headers, tables, lists, code fences
-function mdBlock(s){
+// indented list item (a sub-bullet) -> inline indent, no nested-list parser: 0.6em per leading space, capped at 8
+function _liInd(l){ const n=l.match(/^\s*/)[0].length; return n?` style="margin-left:${Math.min(n,8)*0.6}em"`:""; }
+function mdBlock(s,inQ,file){
   const L=(s||"").replace(/\r/g,"").split("\n"), out=[]; let i=0;
   const sep=l=>/^[\s|:-]+$/.test(l)&&l.includes("-")&&l.includes("|");
   const cells=l=>l.trim().replace(/^\|/,"").replace(/\|$/,"").split("|").map(c=>c.trim());
@@ -280,11 +279,11 @@ function mdBlock(s){
       out.push("<table class=mdt><thead><tr>"+hd.map(c=>`<th>${md(c)}</th>`).join("")+"</tr></thead><tbody>"+
         rs.map(r=>"<tr>"+r.map(c=>`<td>${md(c)}</td>`).join("")+"</tr>").join("")+"</tbody></table>"); continue; }
     if(/^\s*[-*+]\s+/.test(l)){ const it=[];
-      while(i<L.length&&/^\s*[-*+]\s+/.test(L[i])){ it.push(`<li>${md(L[i].replace(/^\s*[-*+]\s+/,""))}</li>`); i++; }
+      while(i<L.length&&/^\s*[-*+]\s+/.test(L[i])){ it.push(`<li${_liInd(L[i])}>${md(L[i].replace(/^\s*[-*+]\s+/,""))}</li>`); i++; }
       out.push("<ul class=mdul>"+it.join("")+"</ul>"); continue; }
-    if(/^\s*\d+\.\s+/.test(l)){ const it=[];
-      while(i<L.length&&/^\s*\d+\.\s+/.test(L[i])){ it.push(`<li>${md(L[i].replace(/^\s*\d+\.\s+/,""))}</li>`); i++; }
-      out.push("<ol class=mdul>"+it.join("")+"</ol>"); continue; }
+    if(/^\s*\d+\.\s+/.test(l)){ const it=[], n=parseInt(l,10)||1;
+      while(i<L.length&&/^\s*\d+\.\s+/.test(L[i])){ it.push(`<li${_liInd(L[i])}>${md(L[i].replace(/^\s*\d+\.\s+/,""))}</li>`); i++; }
+      out.push("<ol class=mdul"+(n>1?" start="+n:"")+">"+it.join("")+"</ol>"); continue; }
     if(/^\s*>/.test(l)){ const start=i, q=[], isDraft=draftLabelBefore(L,start);
       while(i<L.length){
         if(/^\s*>/.test(L[i])){ q.push(L[i].replace(/^\s*>\s?/,"")); i++; continue; }
@@ -294,15 +293,15 @@ function mdBlock(s){
         }
         break;
       }
-      const raw=q.join("\n"), inner=mdBlock(raw);
-      // a quote under a "draft" label (a drafted Slack/Jira/email reply) gets the code-block copy button
-      out.push(isDraft
-        ? `<div class="cblock dq"><button class=codecopy onclick="copyCode(this)" title="Copy this draft">${ico('copy')} Copy</button><textarea class=cpsrc hidden readonly>${esc(raw)}</textarea><blockquote class=mdq>${inner}</blockquote></div>`
-        : `<blockquote class=mdq>${inner}</blockquote>`); continue; }
+      const raw=q.join("\n"), inner=mdBlock(raw,true,file);
+      // every top-level quote gets the code-block copy button (its source, `> ` stripped, in .cpsrc). A "draft" label
+      // only sets the title and lets blank-line-split `>` runs join into one quote (above). A nested plain quote stays bare.
+      out.push(inQ&&!isDraft ? `<blockquote class=mdq>${inner}</blockquote>`
+        : `<div class="cblock dq"><button class=codecopy onclick="copyCode(this)" title="${isDraft?"Copy this draft":"Copy this quote"}">${ico('copy')} Copy</button><textarea class=cpsrc hidden readonly>${esc(raw)}</textarea><blockquote class=mdq>${inner}</blockquote></div>`); continue; }
     if(!l.trim()){ i++; continue; }
     const p=[];
     while(i<L.length&&L[i].trim()&&!/^\s*>/.test(L[i])&&!/^#{1,6}\s/.test(L[i])&&!/^\s*[-*+]\s+/.test(L[i])&&!/^\s*\d+\.\s+/.test(L[i])&&!/^\s*```/.test(L[i])&&!(L[i].includes("|")&&i+1<L.length&&sep(L[i+1]))){ p.push(L[i]); i++; }
-    out.push(`<p class=mdp>${md(p.join(" "))}</p>`);
+    out.push(`<p class=mdp>${file?md(p.join(" ")):md(p.join("\n")).replace(/\n/g,"<br>")}</p>`);
   }
   return out.join("");
 }
@@ -2295,7 +2294,7 @@ function diffExpandMore(idx,dir){
 async function renderMdView(){
   const content=(curDiffText!=null?curDiffText:"")||reconstructAfter(curDiffOps);
   $("diffbody").innerHTML=content
-    ? `<div class="msgbody mdmode" style=overflow:visible>${mdBlock(content)}</div>`
+    ? `<div class="msgbody mdmode" style=overflow:visible>${mdBlock(content,false,true)}</div>`
     : "<div class=empty>could not read the file to render</div>";
   upgradeMermaidIn($("diffbody"));
 }
@@ -2569,7 +2568,8 @@ async function openAgent(i,quiet){
   if(d===STALE)return;
   $("msgbody").innerHTML=(d.task?`<div class=cmdcode>${esc(d.task)}</div>`:"")+
     `<div class="muted mono" style=margin-bottom:10px>${d.tools||0} tool calls · ${d.running?'running':'done'}</div>`+
-    (d.narration?md(d.narration):"<div class=empty>no narration recorded</div>");
+    (d.narration?(looksLikeBlockMd(d.narration)?mdBlock(d.narration):md(d.narration)):"<div class=empty>no narration recorded</div>");
+  upgradeMermaidIn($("msgbody"));
   if(quiet)body.scrollTop=st;
 }
 function closeMsg(){$("msgmodal").style.display="none";}

@@ -32,9 +32,6 @@ OUT.hostile = mdBlock("**git diff**\n" + IN.fenced);
 OUT.mmd = mermaidSvg(IN.mmd);
 OUT.plain = mdBlock("```js\nvar a = 1 < 2;\n```\nafter");
 OUT.nested = mdBlock("````\n```\nstill code\n```\n````\nafter");
-OUT.draft_open = hasDraftQuote("````\n```\n**Draft plan**\n> hi\n````");
-OUT.draft_real = hasDraftQuote("**Draft plan**\n> hi");
-OUT.draft_after_fence = hasDraftQuote("```\ncode\n```\n**Draft plan**\n> hi");
 console.log("@@OUT@@" + JSON.stringify(OUT));
 """
 
@@ -81,13 +78,6 @@ class TestMdFenceXss(unittest.TestCase):
         n = self.O["nested"]
         self.assertEqual(n.count("<pre class=mdpre>"), 1)
         self.assertIn("still code", n.split("</pre>", 1)[0])
-
-    def test_draft_quote_scan_agrees_on_fence_length(self):
-        # a 4-backtick fence holds a 3-backtick line: the draft quote inside it is code, not a draft
-        self.assertFalse(self.O["draft_open"])
-        # positive controls: the same quote outside a fence IS a draft (so False above is the fence's doing)
-        self.assertTrue(self.O["draft_real"])
-        self.assertTrue(self.O["draft_after_fence"])
 
 
 if __name__ == "__main__":

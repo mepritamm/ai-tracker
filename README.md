@@ -247,7 +247,7 @@ All providers emit the **same result shape**, so the browser renders them identi
 | Header headline (`HEADER_LINE`) | ✅ job-list summary for background jobs, else last narration | 🟡 last narration only — Auggie has no job files | ➖ n/a |
 | Model marker chip (board, rail, headers, classic sidebar) | ✅ | ✅ (Auggie's `model_id`) | ➖ no model on disk — no chip |
 | Session cost chip + modal (caching savings, agent spend) | ✅ priced from per-message usage | ✅ from Auggie's recorded cost and subagent entries | ➖ n/a |
-| Draft-reply copy button in narration | ✅ | ✅ (shared renderer) | ✅ (same shared renderer) |
+| Copy button on every quote; Control Room auto-detects block markdown (lists, quotes, headings, tables, fences) | ✅ | ✅ (shared renderer) | ✅ (same shared renderer) |
 | Notes — write, copy, N badge | ✅ | ✅ | ✅ |
 | Push a note into the session | ✅ live → next turn-end; idle → next prompt/resume (`Stop` + `UserPromptSubmit` + `SessionStart` hooks) | ➖ queues fine, but Auggie has no hooks to deliver it — use copy | ➖ same — no hook, use copy |
 | Degraded-transcript notice ("Couldn't read this session — a line failed to parse, everything before it is shown") | ✅ reports the failing line **number** (1-based JSONL line) | 🟡 reports the same notice, but with **no line number** — Auggie's task-storage is a family of separate files, not one file with lines. A session file that's corrupt *outright* (fails to parse at all) now degrades the same honest way when you open it directly — "couldn't read this session," not missing; it still won't turn up in the sidebar **list** itself, which silently skips a file it can't parse | ➖ n/a |

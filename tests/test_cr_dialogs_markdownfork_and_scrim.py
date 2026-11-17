@@ -126,7 +126,7 @@ class TestMdLiteForkIsDeleted(unittest.TestCase):
         self.assertNotIn("mdLite(", src)
         # Site 1: the diff pop-out's "Rendered" view of a .md file's diff text.
         self.assertIn(
-            "mdBlock((payload.lines || []).map(function (l) { return l.text; }).join('\\n'))",
+            "mdBlock((payload.lines || []).map(function (l) { return l.text; }).join('\\n'), false, true)",
             src,
         )
         # Site 2: the narration/prompt full-text pop-out ('text' mode).

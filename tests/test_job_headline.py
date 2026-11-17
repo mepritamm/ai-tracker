@@ -219,9 +219,9 @@ class ConfigRoundtripTests(_ServerCase):
         self.assertAlmostEqual(j["cost"]["total_usd"], 4.0)
         st, body = self._get("/")
         page = body.decode()
-        for needle in ("openCostModal", "hasDraftQuote", "paintGoalLine", 'data-act', "ov_hlrow"):
+        for needle in ("openCostModal", "looksLikeBlockMd", "paintGoalLine", 'data-act', "ov_hlrow"):
             self.assertIn(needle, page)
-        self.assertNotRegex(page, r"location\.hostname[^;\n]*(openCostModal|paintGoalLine|hasDraftQuote)")
+        self.assertNotRegex(page, r"location\.hostname[^;\n]*(openCostModal|paintGoalLine|looksLikeBlockMd)")
 
 
 if __name__ == "__main__":

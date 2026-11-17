@@ -215,9 +215,9 @@
     // SVG for the 8 known families, an honestly-labelled readable code block
     // otherwise), upgraded to the real vendored mermaid.js by
     // upgradeMermaidIn() — see setPanelBody() below and renderTimelineEntries()
-    // above, which already call it. Fence-free text keeps the original
-    // inline-only path, unchanged.
-    if (text && (text.indexOf("```") !== -1 || (typeof hasDraftQuote === "function" && hasDraftQuote(text)))) {
+    // above, which already call it. Text the detector flags (fence, heading,
+    // quote, table, 2+ list items) goes to mdBlock; everything else keeps the inline path.
+    if (text && typeof looksLikeBlockMd === "function" && looksLikeBlockMd(text)) {
       try {
         if (typeof mdBlock === "function") return mdBlock(text);
       } catch (e) {}
@@ -1803,6 +1803,7 @@
 
     // ---- single delegated click handler ----
     node.addEventListener("click", function (ev) {
+      if (ev.target.closest(".codecopy")) return;   // Copy inside a timeline entry copies; it must not also open the entry
       var t = ev.target.closest("[data-act]");
       if (!t) return;
       var act = t.getAttribute("data-act");
