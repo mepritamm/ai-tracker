@@ -82,7 +82,7 @@ const SRC = require('fs').readFileSync(process.argv[2], 'utf8');
     const btn = (label) => qa('cr-or-key-block')[0].querySelectorAll('button').filter(b => b.textContent === label)[0];
     out.before = q('cr-or-key-block').textContent;
     btn(SCEN.firstBtn).fire('click'); await tick(4);
-    out.inputAttrs = input() ? {type: input().attrs.type, ac: input().attrs.autocomplete, name: input().attrs.name, id: input().attrs.id, value: input().value || '', inForm: false} : null;
+    out.inputAttrs = input() ? {type: input().attrs.type, ac: input().attrs.autocomplete, name: input().attrs.name, id: input().attrs.id, value: input().value || '', vattr: input().attrs.value, inForm: false} : null;
     input().value = SCEN.typed;
     btn('Save').fire('click'); await tick(10);
     out.posts = posts;
@@ -105,6 +105,7 @@ const SRC = require('fs').readFileSync(process.argv[2], 'utf8');
     out.gets = gets;
   }
   if (SCEN.act === 'focus') {
+    out.focusBefore = (listeners.focus || []).length;
     window.CR.dialogs.close(); await tick();
     (listeners.focus || []).slice().forEach(f => f()); await tick(8);
     out.removed = removed.slice(); out.left = (listeners.focus || []).length;
@@ -174,12 +175,13 @@ class UsageTab(unittest.TestCase):
         self.assertEqual((r["rows"], r["credits"]), (0, 1))
         self.assertIn("$758.44 spent of $2000.00 this month", r["text"])
         self.assertNotIn("nlimited", r["text"])
-        nolimit = dict(cred, credits={"text": "$12.34 spent this month · no monthly limit of its own", "utilization": 0,
+        nolimit = dict(cred, credits={"text": "$12.34 spent this month · no monthly limit of its own", "utilization": None,
                                        "note": "your organisation's limits apply"})
         r = _run({"tab": "Usage", "routes": usage_routes(**{"/api/usage/claude": ok(nolimit)})})
         self.assertIn("no monthly limit of its own", r["text"])
         self.assertIn("your organisation's limits apply", r["text"])
         self.assertNotIn("nlimited", r["text"])
+        self.assertEqual(r["fills"], [])              # no limit, nothing to measure: text only, no 0% bar
 
     def test_empty_limits_message_only_without_credits(self):
         none = dict(CLAUDE_A, limits=[], credits=None, message="No plan limits reported for this login.")
@@ -260,6 +262,12 @@ class ServerTabBlocks(unittest.TestCase):
         self.assertIsNone(r["inputAfter"])            # editing closed, input gone
         self.assertFalse(r["leaked"])
 
+    def test_save_with_an_empty_box_posts_nothing(self):
+        for typed in ("", "   "):
+            r = _run({"tab": "Server", "routes": self.routes(), "act": "key", "firstBtn": "Replace", "typed": typed})
+            self.assertEqual(r["posts"], [])
+            self.assertIn("Paste a key first", r["afterSave"])
+
     def test_400_keeps_the_editor_empty_and_shows_the_fixed_error(self):
         key = "bad key value with spaces"
         r = _run({"tab": "Server", "routes": self.routes(), "act": "key", "firstBtn": "Replace", "typed": key,
@@ -293,7 +301,9 @@ class ServerTabBlocks(unittest.TestCase):
 
     def test_focus_listener_removes_itself_after_close(self):
         r = _run({"tab": "Server", "routes": self.routes(), "act": "focus"})
-        self.assertIn("focus", r["removed"])
+        self.assertGreaterEqual(r["focusBefore"], 2)         # the Claude and the Auggie block each listen
+        self.assertEqual(r["removed"].count("focus"), r["focusBefore"])
+        self.assertEqual(r["left"], 0)
 
 
 class StaticChecks(unittest.TestCase):

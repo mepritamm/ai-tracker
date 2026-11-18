@@ -246,6 +246,14 @@ def _local_caller(handler):
 _USAGE_GET = ("/api/usage/claude", "/api/usage/openrouter", "/api/usage/auggie", "/api/auggie/auth")
 
 
+def _is_config_file(fp):
+    """True when fp is config.json (samefile: symlinks and case-insensitive disks included)."""
+    try:
+        return os.path.exists(config.CONFIG_FILE) and os.path.samefile(fp, config.CONFIG_FILE)
+    except OSError:
+        return False
+
+
 def _same_site(handler):
     """Browsers send Sec-Fetch-Site; CLI callers send none (treated as same-origin), the SPA sends same-origin."""
     return handler.headers.get("Sec-Fetch-Site", "same-origin") in ("same-origin", "none")
@@ -603,6 +611,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if not fp or not os.path.isfile(fp):
                     self._json({"error": "not found", "content": ""}, 404)
+                elif _is_config_file(fp):
+                    self._json({"error": "refused: config.json holds credentials", "content": ""}, 403)
                 elif os.path.getsize(fp) > 500_000:
                     self._json({"error": "file too large to render", "content": ""})
                 else:

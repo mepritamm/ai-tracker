@@ -1,10 +1,11 @@
 """accounts: `claude -p /usage` producer + usage_report parser. The real CLI is never spawned (accounts._run is a fake)."""
 import json
 import os
+import threading
 import unittest
 from unittest import mock
 
-from aitracker import accounts, gateway
+from aitracker import accounts
 
 SENT = "SENT-email@x.test"
 A_LIMITS = [  # the probed Max account's shape, verbatim types
@@ -36,12 +37,14 @@ def report(limits=A_LIMITS, extra_usage=None, **kw):
 class Base(unittest.TestCase):
     def setUp(self):
         self.calls = []
+        self.auth = {"label": "Logged in · Claude Max subscription", "subscription": "max"}
         self.out = (0, stream(report()), b"")
         self.spec = {"id": "claude", "path": "/usr/bin/claude"}
         for p in (mock.patch.object(accounts, "_run", self.fake_run),
                   mock.patch.object(accounts, "_agent_spec", lambda i: self.spec),
                   mock.patch.object(accounts, "or_launcher", return_value=("/opt/or-launch", "")),
-                  mock.patch.object(accounts, "claude_auth_cached", return_value={"label": "Logged in · Claude Max subscription", "subscription": "max"})):
+                  mock.patch.object(accounts, "claude_auth_status", side_effect=lambda: self.auth),
+                  mock.patch.object(accounts, "claude_auth_cached", return_value=None)):
             p.start()
             self.addCleanup(p.stop)
 
@@ -94,12 +97,14 @@ class ClaudeUsageTests(Base):
         eu = {"is_enabled": True, "monthly_limit": None, "used_credits": 1234, "utilization": None, "currency": "USD"}
         self.out = (0, stream(report(limits=[], extra_usage=eu)), b"")
         for sub in ("team", "enterprise"):
-            with self.subTest(sub=sub), mock.patch.object(accounts, "claude_auth_cached", return_value={"label": "x", "subscription": sub}):
+            self.auth = {"label": "x", "subscription": sub}
+            with self.subTest(sub=sub):
                 body = self.run_it()[0]
                 c = body["credits"]
                 self.assertEqual(c["text"], "$12.34 spent this month · no monthly limit of its own")
                 self.assertEqual((c["note"], c["limit_minor"], c["utilization"]), ("your organisation's limits apply", None, None))
                 self.assertNotIn("nlimited", json.dumps(body))
+        self.auth = {"label": "x", "subscription": "max"}
         self.assertEqual(self.run_it()[0]["credits"]["note"], "")        # a max login: no organisation note
 
     def test_credits_alongside_limits_and_other_currency(self):
@@ -182,14 +187,29 @@ class ClaudeUsageTests(Base):
         self.assertEqual(self.run_it()[0]["state"], "unavailable")
         self.assertEqual(len(self.calls), 0)
 
-    def test_never_runs_claude_auth_status(self):
-        with mock.patch.object(gateway, "_auth_run", side_effect=AssertionError("auth status must not run")):
+    def test_label_and_plan_come_from_the_run_not_the_server_tab_cache(self):
+        # the Server tab's cache is empty (None) or names another login: the body carries its own run's label
+        self.assertEqual(self.run_it()[0]["account"], "Logged in · Claude Max subscription")
+        eu = {"is_enabled": True, "monthly_limit": None, "used_credits": 1234, "utilization": None, "currency": "USD"}
+        self.out = (0, stream(report(limits=[], extra_usage=eu)), b"")
+        self.auth = {"label": "L", "subscription": "team"}
+        body = self.run_it()[0]
+        self.assertEqual((body["account"], body["credits"]["note"]), ("L", "your organisation's limits apply"))
+        self.out = (0, stream(None), b"")
+        self.assertEqual(self.run_it()[0]["account"], "L")          # no_report body is stamped too
+
+    def test_claude_usage_prefers_stamped_account_and_status_runs_on_the_bg_thread_only(self):
+        seen = []
+        self.auth = {"label": "Stamped", "subscription": "max"}
+        real = self.__dict__.get("auth")
+        with mock.patch.object(accounts, "claude_auth_status", side_effect=lambda: seen.append(threading.current_thread()) or real), \
+                mock.patch.object(accounts, "claude_auth_cached", return_value={"label": "Other", "subscription": "max"}):
             accounts.usage_invalidate("claude")
             accounts.claude_usage()
             accounts._CLAUDE._th.join(5)
             body = accounts.claude_usage()
-        self.assertEqual(body["account"], "Logged in · Claude Max subscription")
-        self.assertEqual(body["state"], "ok")
+        self.assertEqual((body["account"], body["state"]), ("Stamped", "ok"))
+        self.assertTrue(seen and all(t is not threading.main_thread() for t in seen))
         accounts.usage_invalidate("claude")
 
 

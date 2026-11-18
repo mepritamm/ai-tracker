@@ -147,6 +147,25 @@ class BgTests(unittest.TestCase):
         self.assertEqual(b["error"], "internal error")
         self.assertNotIn("SECRET", repr(b))
 
+    def test_invalidate_after_locked_section_does_not_wedge(self):
+        park = threading.Event()
+        bg = self.mk(self.ok)
+        orig = bg._work
+
+        def parked(gen):
+            orig(gen)               # the locked section is over, but the thread is still alive
+            park.wait(5)
+        bg._work = parked
+        bg.get()
+        time.sleep(0.2)
+        bg.invalidate()
+        park.set()
+        self.settle(bg)
+        bg.get()
+        self.settle(bg)
+        out = bg.get()
+        self.assertEqual((self.calls, out["state"], out["refreshing"]), (2, "ok", False))
+
 
 if __name__ == "__main__":
     unittest.main()

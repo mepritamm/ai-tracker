@@ -135,7 +135,7 @@ CURSOR_WS_ROOT = os.environ.get(
 # (reachable read-only through a tunnel) never carries it. Only POST /api/config's secret branch writes
 # it, from a local caller; that write creates config.json's temp file at 0600, and store._save_json keeps
 # that exact mode on every later write. No route returns it: the only status is "set"/"not set" from the
-# local-only /api/usage/openrouter?peek=1, and /api/file refuses rebinding requests. It never enters
+# local-only /api/usage/openrouter?peek=1, and /api/file refuses config.json for every caller. It never enters
 # os.environ, the launchd plist or a log. TRACKER_AUTH stays env-only.
 AUTH = os.environ.get("TRACKER_AUTH", "")
 

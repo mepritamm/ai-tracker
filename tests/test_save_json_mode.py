@@ -45,6 +45,17 @@ class SaveJsonModeTests(unittest.TestCase):
         self.assertEqual(seen, [0o600])
         self.assertEqual(_mode(self.p), 0o600)
 
+    def test_existing_file_write_without_fchmod(self):
+        store._save_json(self.p, {"a": 1})
+        saved = os.fchmod
+        del os.fchmod                   # Windows before 3.13 has none
+        try:
+            store._save_json(self.p, {"a": 2})
+        finally:
+            os.fchmod = saved
+        self.assertEqual(store._load_json(self.p, {}), {"a": 2})
+        self.assertEqual([f for f in os.listdir(self.d) if f.endswith(".tmp")], [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -224,3 +224,23 @@ Done: steps 1, 2, 3a, 4, 5, 6 and 7 (doc lines) of `docs/usage-panel-plan.md`. P
 ## Step 3b done (2026-11-18)
 
 Commit 3c9a943: the Claude usage-credits branch. `credits` is read from `usage_report.rate_limits.extra_usage` (the probed shape, not the plan's field names) and set only when `is_enabled is True`; amounts are minor units of `currency`; a null `monthly_limit` renders "no monthly limit of its own" (never "Unlimited"), with the organisation note for team/enterprise logins. "No plan limits reported for this login." now shows only when there are no limits and no credits. Fixtures B (probed credits account, neutral numbers) and C (null limit, team/enterprise) are in `tests/test_accounts_claude_usage.py`; the Max shape is unchanged. Pending, user-gated: step 3c (Auggie sessions-v2 reader).
+
+## Implementation review → reconcile (2026-11-18)
+
+Reviews (opus): `docs/usage-panel-impl-review-security.md` (0 blocker/1 major/2 medium/2 low) · `docs/usage-panel-impl-review-ui.md` (0/1 major/5 minor/7 nits).
+
+| # | Finding | Verdict | Disposition |
+|---|---|---|---|
+| S-M1 | `/api/file` (`server.py:597-613`) returns `config.json` (OpenRouter key + `TUNNEL_PASS`) to a logged-in tunnel/LAN caller | **Confirmed** (live repro) | Fix: refuse the config file to every caller via `os.path.samefile` (case-insensitive disk). Test: tunnel + LAN-with-login + upper-case path variant all 403 |
+| S-M2 | `invalidate()` right after a run finishes leaves `running=True` forever (`accounts.py:45-49`) | Confirmed (deterministic repro) | Fix as the review says: `invalidate()` keeps `running`. Fold **S-L2** (an OpenRouter in-flight run mutates backoff after the key is replaced) into the same generation check only if it takes ≤ a few lines; otherwise document it |
+| S-M3 | `os.fchmod` missing on Windows before 3.13 (`store.py:37-39`) | **Overstated**: the app is macOS/POSIX (launchd, pty) | Trim the fix: `hasattr(os, "fchmod")` guard plus tmp cleanup on error. No Windows test matrix |
+| S-L1 | Missing `Sec-Fetch-Site` treated as same-origin | Confirmed, low | No change; known gap in the PR (rate-limited, no leak) |
+| U-M1 | The Claude card's account label/plan type comes from the Server tab's auth cache, not the run that produced the numbers, so it's wrong or missing after an account switch (the user's two-account case) | **Confirmed** | Fix: capture label and plan type inside the background `/usage` run and return them with its result. **Cut** "mark stale when the login differs" (overengineered; same-run capture is enough) |
+| U-m1 | Save with an empty key box deletes the key without a confirm | Confirmed | Empty Save = no-op with an inline hint; only Clear deletes (with its confirm) |
+| U-m2, U-m3 | Auggie focus-listener test and key-never-prefilled test pass with the fix removed (mutation-proved) | Confirmed | Tighten both tests; prove red by mutation |
+| U-m4 | No test pins UTC month start | Confirmed | Add a TZ-shifted test |
+| U-m5 | Credits with null monthly limit draws an empty 0% bar | Confirmed | No bar when `monthly_limit` is null; text only |
+| U-nits | 7 nits | Not examined individually | No change unless the fixer finds one is a one-liner in a touched line |
+| — | Not examined: cents scale for `used_credits` confirmed only from docs (the live report shows no $) | Main thread | Keep; flag in the PR. The user can eyeball it against claude.ai Settings → Usage after restart |
+
+Fixes applied in COMMITSHA: S-M1, S-M2, S-M3 (trimmed), U-M1 (same-run label and plan, no stale), U-m1..m5 done. S-L1 no change. S-L2 documented only (it needs the generation threaded through the six `_acct_or_fail` sites; known small gap). U-nits untouched.

@@ -35,9 +35,15 @@ def _save_json(path, obj, mode=None):
         except OSError:
             mode = None
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666 if mode is None else mode)
-    if mode is not None:
-        os.fchmod(fd, mode)   # exact, not masked by the umask
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    try:
+        if mode is not None and hasattr(os, "fchmod"):
+            os.fchmod(fd, mode)   # exact, not masked by the umask (no fchmod on Windows < 3.13)
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        os.unlink(tmp)
+        raise
+    with fh:
         json.dump(obj, fh, indent=2)
     os.replace(tmp, path)
 

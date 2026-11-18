@@ -1754,7 +1754,7 @@
       if (s.credits) {
         box.appendChild(h('div', { class: 'cr-usage-credits' }, [
           h('div', { class: 'cr-usage-label' }, [s.credits.text]),
-          usageBar(s.credits.utilization, 'normal'),
+          typeof s.credits.utilization === 'number' ? usageBar(s.credits.utilization, 'normal') : null,
           s.credits.note ? h('div', { class: 'cr-cfg-row-sub' }, [s.credits.note]) : null,
         ]));
       }
@@ -1858,7 +1858,10 @@
       if (editing) {
         input = h('input', { type: 'password', autocomplete: 'new-password', spellcheck: 'false', class: 'cr-or-key-input', placeholder: 'sk-or-…' });
         ctl.appendChild(input);
-        ctl.appendChild(crBtn('Save', function () { save(input.value); }));
+        ctl.appendChild(crBtn('Save', function () {
+          if (!input.value.trim()) { msg = 'Paste a key first (Clear removes the saved key)'; paint(); return; }
+          save(input.value);
+        }));
         ctl.appendChild(crBtn('Cancel', function () { editing = false; msg = ''; paint(); }));
       } else if (!denied) {
         ctl.appendChild(crBtn(peek && peek.key_set ? 'Replace' : 'Set', function () { editing = true; msg = ''; paint(); }));

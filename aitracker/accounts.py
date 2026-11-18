@@ -8,7 +8,7 @@ unique (`_acct_*`, `usage_*`) and server.py imports them by name (never `account
 import datetime, json, os, re, ssl, threading, time, urllib.error, urllib.request
 from . import config
 from .update import _run
-from .gateway import claude_auth_cached, or_launcher, openrouter_configured
+from .gateway import claude_auth_cached, claude_auth_status, or_launcher, openrouter_configured
 from .agent_cli import _agent_spec
 from .providers.auggie import month_cost
 from .store import _load_json
@@ -45,8 +45,9 @@ class _Bg:
     def invalidate(self):
         with self._lock:
             self._gen += 1
+            running = self.running      # owned by get()/_work() under this lock; never infer it from is_alive()
             self._reset()
-            self.running = self._th is not None and self._th.is_alive()
+            self.running = running
 
     def get(self, fresh=False):
         with self._lock:
@@ -165,8 +166,9 @@ def _acct_iso(s):
     return len(s) <= 40 and bool(_ACCT_ISO_RE.fullmatch(s))
 
 
-def _acct_claude_body(state, error="", message="", limits=None, credits=None):
-    return {"state": state, "error": error, "message": message, "limits": limits or [], "credits": credits}
+def _acct_claude_body(state, error="", message="", limits=None, credits=None, account=""):
+    return {"state": state, "error": error, "message": message, "limits": limits or [], "credits": credits,
+            "account": account}
 
 
 def _acct_claude_producer():
@@ -181,6 +183,8 @@ def _acct_claude_producer():
     if rc is None:
         return _acct_claude_body("error", "claude /usage timed out after 150 s" if err == b"timeout"
                                  else "claude couldn't be started"), False, 60.0
+    st = claude_auth_status() or {}     # this background thread, gateway's 60 s cache: label and plan of the same login
+    account = st.get("label", "")
     report, is_err = None, False
     for line in (out or b"").decode("utf-8", "replace").splitlines():
         try:
@@ -197,13 +201,13 @@ def _acct_claude_producer():
         return _acct_claude_body("error", "claude /usage failed"), False, 60.0
     if report is None:
         return _acct_claude_body("no_report", message="Claude Code returned no plan usage for this login (API key, "
-                                 "OpenRouter, setup-token or usage-based billing logins don't report it)."), True, 0.0
+                                 "OpenRouter, setup-token or usage-based billing logins don't report it).", account=account), True, 0.0
     if not isinstance(report, dict):
         return _acct_claude_body("error", "unrecognised usage report"), False, 60.0
-    sub = (claude_auth_cached() or {}).get("subscription", "")
+    sub = st.get("subscription", "")
     limits, credits = _acct_parse_usage_report(report, sub)
     msg = "" if limits or credits else "No plan limits reported for this login."
-    return _acct_claude_body("ok", limits=limits, credits=credits, message=msg), True, 0.0
+    return _acct_claude_body("ok", limits=limits, credits=credits, message=msg, account=account), True, 0.0
 
 
 _CLAUDE = _Bg(300, 60, _acct_claude_producer, dict(_acct_claude_body("loading"), account=""))
@@ -211,7 +215,8 @@ _CLAUDE = _Bg(300, 60, _acct_claude_producer, dict(_acct_claude_body("loading"),
 
 def claude_usage(fresh=False):
     out = _CLAUDE.get(fresh)
-    out["account"] = (claude_auth_cached() or {}).get("label", "")   # never runs `claude auth status`
+    if not out.get("account"):
+        out["account"] = (claude_auth_cached() or {}).get("label", "")   # never runs `claude auth status` here
     return out
 
 

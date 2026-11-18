@@ -1,5 +1,6 @@
 """POST /api/config for OPENROUTER_API_KEY: local-only, 0600 from the first byte, never echoed, never published
 (GET /api/config, /api/file under a rebinding Host, every usage/auth/agent route), never in os.environ or the plist."""
+import base64
 import http.client
 import io
 import json
@@ -139,7 +140,7 @@ class KeyRouteTests(_ServerCase):
         self.post_key()
         paths = ("/api/config", "/api/tunnel", "/api/usage/claude", "/api/usage/openrouter",
                  "/api/usage/openrouter?peek=1", "/api/usage/openrouter?fresh=1", "/api/usage/auggie", "/api/auggie/auth",
-                 "/api/claude/auth", "/api/agents")
+                 "/api/claude/auth", "/api/agents", "/api/file?path=" + config.CONFIG_FILE)
         for p in paths:
             with self.subTest(p):
                 st, raw = self.call("GET", p)
@@ -153,8 +154,34 @@ class KeyRouteTests(_ServerCase):
         st, raw = self.call("GET", q, headers={"Host": "rebind.example:%d" % self.port})
         self.assertEqual(st, 403)
         self.assertNotIn(KEY.encode(), raw)
-        st, raw = self.call("GET", q, headers={"Host": "localhost:%d" % self.port})
-        self.assertEqual(st, 200)
+
+    def test_api_file_refuses_config_json_to_every_caller(self):
+        self.post_key()
+        q = "/api/file?path=" + config.CONFIG_FILE
+        b64 = base64.b64encode(b"tu:tp").decode()
+        tun = {"Cf-Ray": "abc", "Cf-Connecting-Ip": "203.0.113.9", "Host": "x.trycloudflare.com",
+               "Authorization": "Basic " + b64}
+        cases = [("local", {}, None), ("tunnel visitor", tun, None)]
+        d, b = os.path.split(config.CONFIG_FILE)
+        upper = os.path.join(d, b.upper())
+        if os.path.exists(upper):                        # case-insensitive disk only
+            cases.append(("upper-case variant", {}, "/api/file?path=" + upper))
+        for name, h, path in cases:
+            with self.subTest(name), mock.patch.object(_server.tunnel, "cred", return_value="tu:tp"):
+                st, raw = self.call("GET", path or q, headers=h)
+                self.assertEqual(st, 403)
+                self.assertNotIn(KEY.encode(), raw)
+        with mock.patch.object(config, "AUTH", "u:p"):
+            st, raw = self.call("GET", q, headers={"Authorization": "Basic " + base64.b64encode(b"u:p").decode(),
+                                                   "Host": "mybox.lan:%d" % self.remote.server_address[1]},
+                                port=self.remote.server_address[1])
+            self.assertEqual(st, 403)
+            self.assertNotIn(KEY.encode(), raw)
+        other = os.path.join(d, "other.txt")             # every other file still reads
+        with open(other, "w") as fh:
+            fh.write("hello")
+        st, raw = self.call("GET", "/api/file?path=" + other)
+        self.assertEqual((st, json.loads(raw)["content"]), (200, "hello"))
 
     def test_key_never_reaches_environ_or_plist(self):
         self.post_key()

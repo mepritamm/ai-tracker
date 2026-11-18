@@ -2,10 +2,12 @@
 (shape: chatHistory[i].finishedAt, .exchange.response_nodes[].billing_metadata.cost_usd as a string,
 top-level `modified` and subAgentCostUsd)."""
 import builtins
+import calendar
 import datetime
 import json
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -131,6 +133,21 @@ class AuggieUsageBodyTests(unittest.TestCase):
         b = accounts.auggie_usage()
         self.assertEqual((b["cost_text"], b["sessions"]), ("$1.23", 1))
         self.assertIn("1 billed entry had no readable price", b["note"])
+
+    def test_month_start_is_utc_midnight_even_when_local_time_is_ahead(self):
+        class Frozen(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 12, 1, 2, 0, tzinfo=tz)       # IST is already Dec 1 07:30; a local midnight is 5.5 h early
+        old = os.environ.get("TZ")
+        os.environ["TZ"] = "Asia/Kolkata"
+        time.tzset()
+        self.addCleanup(lambda: (os.environ.__setitem__("TZ", old) if old is not None else os.environ.pop("TZ", None), time.tzset()))
+        spy = mock.Mock(return_value={"usd": 0, "sessions": 0, "unpriced": 0, "sources": []})
+        with mock.patch.object(accounts.datetime, "datetime", Frozen), mock.patch.object(accounts, "month_cost", spy):
+            b = accounts.auggie_usage()
+        self.assertEqual(spy.call_args[0][0], calendar.timegm((2026, 12, 1, 0, 0, 0)))
+        self.assertIn("from Dec 1", b["window"])
 
 
 if __name__ == "__main__":
