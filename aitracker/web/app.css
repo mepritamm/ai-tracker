@@ -654,18 +654,25 @@ main[data-sess=refreshing] #hmeta::after{content:" · " attr(data-snap)}
 .pendbar .pendbtn{background:none;font:inherit;font-size:11px}
 .pendside .pasof{opacity:.7}
 .pendbar .pendbtn:hover{color:var(--text);border-color:var(--violet)}
-/* Split button (termSplit in app.js): primary + "▾" disclosure holding the secondary actions. */
-.tsplit{display:inline-flex;flex-wrap:nowrap;align-items:center;gap:2px;position:relative;white-space:nowrap}
-.tsplit-menu{position:relative;display:inline-flex}
-.tsplit-menu[hidden]{display:none}
-.tsplit-caret{list-style:none;cursor:pointer;display:inline-flex;align-items:center;gap:4px}
-.tsplit-caret::-webkit-details-marker{display:none}
-.tsplit-solo-label{display:none}
-.tsplit-solo .tsplit-solo-label{display:inline}
-.tsplit-list{position:absolute;left:0;top:100%;margin-top:4px;z-index:60;display:flex;flex-direction:column;align-items:stretch;gap:2px;min-width:100%;padding:4px;background:var(--surface-raised,var(--raised));border:1px solid var(--line-subtle,var(--line3));border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,.25)}
-.tsplit-list [hidden]{display:none!important}
-.tsplit-list #extnative{display:contents}
-.tsplit-list button{text-align:left;white-space:nowrap}
+/* Split button (termSplit in app.js): primary + joined menu button. One block for every caller. */
+.tsplit{display:inline-flex;flex-wrap:nowrap;align-items:stretch;gap:0;position:relative;white-space:nowrap}
+.tsplit[hidden],.tsplit-list[hidden],.tsplit [hidden]{display:none!important}
+.tsplit>button.tsplit-primary,.tsplit>button.tsplit-caret{align-self:stretch}
+.tsplit:not(.tsplit-solo):not(.tsplit-nomenu)>.tsplit-primary{border-top-right-radius:0;border-bottom-right-radius:0;border-right-width:0}
+.tsplit:not(.tsplit-solo):not(.tsplit-nomenu)>.tsplit-caret{border-top-left-radius:0;border-bottom-left-radius:0;
+  border-left:1px solid color-mix(in srgb,currentColor 35%,transparent);padding-left:6px;padding-right:6px;min-width:24px}
+.tsplit-caret{cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:4px}
+.tsplit-solo-label{display:none}.tsplit-solo .tsplit-solo-label{display:inline}
+.tsplit-list{position:absolute;top:100%;right:0;left:auto;margin-top:4px;z-index:80;display:flex;flex-direction:column;
+  align-items:stretch;gap:2px;min-width:100%;padding:4px;background:var(--surface-raised,var(--raised));
+  border:1px solid var(--line-subtle,var(--line3));border-radius:8px;box-shadow:var(--shadow-overlay,0 6px 18px rgba(0,0,0,.25))}
+.tsplit.tsplit-start .tsplit-list{left:0;right:auto}
+.tsplit-item{display:flex;align-items:center;gap:12px;width:100%;padding:6px 10px;border:0;border-radius:6px;background:none;
+  color:var(--text-primary,var(--text));font:inherit;font-size:12px;text-align:left;white-space:nowrap;cursor:pointer}
+.tsplit-item:hover,.tsplit-item:focus-visible{background:var(--fill-row-hover,var(--selbg))}
+.tsplit-item:focus-visible{outline:2px solid var(--line-focus,var(--ring1));outline-offset:-2px}
+.tsplit-hint{margin-left:auto;color:var(--text-muted,var(--muted));font-size:11px}
+html.tracker-readonly .tsplit{display:none!important}
 /* Read-only view: cosmetic hide of classic-UI write controls (server still 403s). */
 html.tracker-readonly .ren,html.tracker-readonly .pin:not(.on),html.tracker-readonly .addflag,html.tracker-readonly .addnote{display:none!important}
 html.tracker-readonly .pin{pointer-events:none}

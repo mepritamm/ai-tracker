@@ -109,7 +109,7 @@ class TestAssetsAreInlined(unittest.TestCase):
         # `window.ExtVT && ...` reads (lazy precisely BECAUSE ext_cr_term.js is inlined first) --
         # so indexing the bare name pinned whichever comment happened to come first rather than
         # the concatenation order this test is actually about.
-        self.assertLess(self.page.index("function localOnly"),   # ext_launch.js
+        self.assertLess(self.page.index("window.ExtLaunch = {"),   # ext_launch.js
                          self.page.index("window.ExtVT = {"))     # ext_vt.js's own definition
 
 
@@ -270,20 +270,24 @@ class TestExtLaunchStillPassesTier1Contract(unittest.TestCase):
         self.assertIn("window.ExtVT.open(cur,", self.src)
 
     def test_in_browser_buttons_are_built_before_the_localonly_gate(self):
-        # The in-browser buttons (openHtml/resumeHtml) are built unconditionally; nativeHtml is the only
-        # thing gated by localOnly(). (Expected change: vtHtml is now assembled AFTER the gate, because
-        # it wraps both through termSplit() -- the buttons themselves are still built before it.)
-        self.assertLess(self.src.index("const openHtml ="), self.src.index("if (localOnly())"))
-        self.assertLess(self.src.index("const resumeHtml ="), self.src.index("if (localOnly())"))
+        # Expected change: the buttons are built by the shared termSplit (app.js), which always builds
+        # Resume / Open terminal; only the external item is gated, by termExtAllowed() (loopback + server
+        # policy), via termSplitSet's `ext` flag -- never by hiding the in-browser pair.
+        body = self.src[self.src.index("function render(d) {"):self.src.index("EXT.push(render)")]
+        self.assertIn("termSplit({", body)
+        self.assertIn("ext: ext === true", body)
+        self.assertNotIn("if (localOnly())", body)
+        self.assertNotIn("openHtml", body)
 
     def test_native_button_kept_as_secondary_control(self):
-        # What this protects is that the NATIVE launch pair still exists as a secondary
-        # control -- it was not deleted when the in-browser terminal became primary. Only
-        # the label text moved: the pair is now qualified "External" so that which-opens-
-        # where is obvious beside the two "here" buttons.
-        self.assertIn("External terminal", self.src)
-        self.assertIn("External resume", self.src)
-        self.assertIn('ico("external")', self.src)
+        # What this protects is that the NATIVE launch still exists as a secondary control -- it was
+        # not deleted when the in-browser terminal became primary. Expected change: it is now the
+        # split's external item ("Resume externally" / "Open externally", labels in app.js), wired to
+        # openTerm() through termSplitOn's `external` handler.
+        self.assertIn("external: () => openTerm(", self.src)
+        app = _read("app.js")
+        self.assertIn("Resume externally", app)
+        self.assertIn("Open externally", app)
 
 
 class TestContextBarModelSwitcher(unittest.TestCase):

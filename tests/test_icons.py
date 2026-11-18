@@ -218,7 +218,7 @@ _KEPT_TYPOGRAPHIC = set("✓✗▾▸▶○◆⚙⎇✎⧉⇕↑↓✕☰⌕＋�
 # checked against its actual call site below to confirm it's live UI chrome, not
 # a leftover emoji.
 _KEPT_TYPOGRAPHIC |= set("←→↗⇒")     # plain arrows (app.js, ext_cr_term.js, ext_cr_dialogs.js, ...)
-_KEPT_TYPOGRAPHIC |= set("⌘")        # Command-key glyph (ext_cr_board.js/_dialogs.js kbd hints)
+_KEPT_TYPOGRAPHIC |= set("⌘⌥")       # Command-key glyph (ext_cr_board.js/_dialogs.js kbd hints) and the Option-key glyph in the split button's ⌥-click hint
 _KEPT_TYPOGRAPHIC |= set("▼◐◑■▤▦")   # geometric-shape button/indicator glyphs (ext_vt.js, index.html)
 # ⧖ (U+29D6) is the server's "waiting" status prefix on now_line, emitted by
 # providers/claude.py + providers/auggie.py and stripped by app.js's prefix regex.

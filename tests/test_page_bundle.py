@@ -304,23 +304,36 @@ class TestPageBundle(unittest.TestCase):
         )
 
 
+# Expected change: ext_launch.js render() now mounts the real termSplit family (createElement, listeners),
+# so the note is checked under the shared split fake DOM (tests/_tsplit_dom.py) with the real helpers from
+# app.js instead of the old createElement-less stub. The pane's innerHTML setter records the note markup.
+_HOME_NOTE_NAMES = ("trackerIsLocal", "termExtProbe", "termExtAllowed", "termExtDeny", "termResumable",
+                    "termSplit", "termSplitSet", "termSplitOn", "termSplitSnapshot", "termSplitRestore")
+
 _HOME_NOTE_HARNESS = r"""
-const fs = require('fs');
-const src = fs.readFileSync(process.argv[2], 'utf8');
-const els = {ext_launch: {style: {}, innerHTML: '', querySelector: () => null}};
-const EXT = [];
-const run = new Function('document', 'location', 'fetch', 'EXT', 'SIDE_EXT', 'ico', 'esc', 'toast', 'cur', 'window', 'termSplit',
-  src.replace(/\bcur\b/g, 'cur') + '; return EXT;');
-const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-const doc = {getElementById: id => els[id] || null, activeElement: null};
-const fns = run(doc, {hostname: 'example.com'}, () => Promise.resolve({}), EXT, [], n => '', esc, () => {}, 'abc', {}, (p, i) => p + i);
-const out = {};
-for (const [k, d] of Object.entries(JSON.parse(process.argv[3]))) {
-  els.ext_launch.innerHTML = '';
-  fns[0](d);
-  out[k] = els.ext_launch.innerHTML;
-}
-console.log('OUT:' + JSON.stringify(out));
+var pane = new El("div"); pane.id = "ext_launch";
+Object.defineProperty(pane, "innerHTML", {
+  get: function () { return pane._home || ""; },
+  set: function (v) { pane.children.forEach(function (c) { c.parentNode = null; }); pane.children = []; pane._home = String(v); },
+});
+Object.defineProperty(pane, "firstChild", {get: function () { return pane.children[0] || null; }});
+pane.insertBefore = function (n, ref) {
+  if (n.parentNode) n.parentNode.removeChild(n);
+  pane.children.splice(pane.children.indexOf(ref), 0, n); n.parentNode = pane; return n;
+};
+mount(pane);
+document.getElementById = function (id) { return id === "ext_launch" ? pane : null; };
+var EXT = [];
+var esc = function (s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); };
+var factory = new Function("document", "location", "fetch", "EXT", "SIDE_EXT", "ico", "esc", "toast", "cur", "window", "alert",
+  %(names)s, SRC + "; return EXT;");
+factory(document, location, fetch, EXT, [], function () { return ""; }, esc, function () {}, "abc", {}, function () {}, %(args)s);
+var cases = CASES;
+Object.keys(cases).forEach(function (k) {
+  pane._home = "";
+  EXT[0](cases[k]);
+  out[k] = pane.innerHTML;
+});
 """
 
 
@@ -355,15 +368,12 @@ class TestTermHomeNoteRendered(unittest.TestCase):
             "empty": {"meta": {"term_home_note": ""}},
             "absent": {"meta": {}},
         }
-        with tempfile.TemporaryDirectory() as d:
-            h = os.path.join(d, "h.js")
-            with open(h, "w", encoding="utf-8") as fh:
-                fh.write(_HOME_NOTE_HARNESS)
-            proc = subprocess.run(
-                ["node", h, os.path.join(_WEB, "ext_launch.js"), json.dumps(cases)],
-                capture_output=True, text=True, timeout=30)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        out = json.loads(proc.stdout.split("OUT:", 1)[1])
+        from tests import _tsplit_dom as D
+        js = _HOME_NOTE_HARNESS % {"names": ", ".join('"%s"' % n for n in _HOME_NOTE_NAMES),
+                                   "args": ", ".join(_HOME_NOTE_NAMES)}
+        with open(os.path.join(_WEB, "ext_launch.js"), encoding="utf-8") as fh:
+            js = js.replace("SRC", json.dumps(fh.read()), 1)
+        out = D.go(js.replace("CASES", json.dumps(cases), 1))
         self.assertIn('class="extlaunchnote"', out["note"])
         self.assertIn("Worktree &lt;b&gt;x&lt;/b&gt; was removed", out["note"])
         for k in ("empty", "absent"):

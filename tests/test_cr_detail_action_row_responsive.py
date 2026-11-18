@@ -69,10 +69,16 @@ class TestDetailActionRowCompactsBeforeItWraps(unittest.TestCase):
     def test_the_four_wide_buttons_are_plain_crd_btn_text_not_crd_btn_label(self):
         """Ground truth check: confirms the bug's premise still holds -- these
         four are NOT using the .crd-btn-label the 900px rule already covers."""
-        for action in ("open-terminal", "resume", "toggle-note", "external"):
-            m = re.search(r'data-act="%s"[^>]*>([^<]*)</button>' % re.escape(action), self.js)
-            self.assertIsNotNone(m, "button for data-act=%r not found" % action)
-            self.assertNotIn("crd-btn-label", self.js[max(0, m.start() - 80):m.start()])
+        # Expected change: Open terminal / Resume / External are now one termSplit (app.js) mounted by
+        # mountHeaderSplit with the plain `crd-btn crd-btn-solid` classes -- no data-act buttons any more.
+        # "Queue a note" is still a hand-written plain button.
+        m = re.search(r'data-act="toggle-note"[^>]*>([^<]*)</button>', self.js)
+        self.assertIsNotNone(m, "button for data-act='toggle-note' not found")
+        self.assertNotIn("crd-btn-label", self.js[max(0, m.start() - 80):m.start()])
+        a = self.js.index("function mountHeaderSplit")
+        mount = self.js[a:self.js.index("function syncHeaderSplit")]
+        self.assertIn('primaryCls: "crd-btn crd-btn-solid"', mount)
+        self.assertNotIn("crd-btn-label", mount)
 
     def test_a_901_to_1300_band_exists_and_compacts_the_wide_buttons(self):
         self.assertIn("max-width: 1300px", self.css)

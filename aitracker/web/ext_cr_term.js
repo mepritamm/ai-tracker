@@ -41,10 +41,10 @@
     return Math.round(n).toLocaleString("en-US");
   }
   function localOnly() {
-    return location.hostname === "localhost" || location.hostname === "127.0.0.1";
+    return trackerIsLocal();   // app.js: the one cosmetic hostname check
   }
   function isClaudeId(sid) {
-    return !!sid && !/^(auggie|augment-vscode|augment-cursor):/.test(sid);
+    return termResumable(sid);   // app.js: server flag first, id rule as fallback
   }
   function j(r) {
     return r.json().catch(function () { return {}; }).then(function (body) {
@@ -157,17 +157,8 @@
     bar.setAttribute("role", "toolbar");
     bar.setAttribute("aria-label", "Terminal controls");
     bar.innerHTML =
-      // Split button (termSplit, app.js): Resume is the primary for a Claude id and "Open terminal
-      // here" moves into the caret's list (_placeOpenHere); a non-Claude id keeps Open terminal
-      // here as the primary. External terminal / External resume always live in the list.
-      '<div class="cr-term-group" data-group="primary">' +
-        termSplit(
-          '<button type="button" class="cr-term-btn cr-term-btn-solid" data-action="open-here">Open terminal here</button>' +
-          '<button type="button" class="cr-term-btn cr-term-btn-solid" data-action="resume-here" hidden>Resume terminal here</button>',
-          '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="ext-terminal" title="Open an external Terminal/iTerm window, cd\'d here — this machine only" hidden>' + ico('external') + ' External terminal</button>' +
-          '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="ext-resume" title="Resume via claude --resume in an external Terminal/iTerm window — this machine only" hidden>' + ico('external') + ' External resume</button>',
-          "cr-term-btn cr-term-btn-outline", "External") +
-      '</div>' +
+      // Split button (termSplit, app.js) is mounted into this group right after the innerHTML.
+      '<div class="cr-term-group" data-group="primary"></div>' +
       '<div class="cr-term-divider"></div>' +
       '<div class="cr-term-group" data-group="windows">' +
         '<button type="button" class="cr-term-btn cr-term-btn-ghost" data-action="new-tab" disabled>' + ico('expand') + ' New tab</button>' +
@@ -256,12 +247,7 @@
       cwd: head.querySelector('[data-el="cwd"]'),
       resumecmd: head.querySelector('[data-el="resumecmd"]'),
       homenote: head.querySelector('[data-el="homenote"]'),
-      split: bar.querySelector(".tsplit"),
-      splitList: bar.querySelector(".tsplit-list"),
-      openHere: bar.querySelector('[data-action="open-here"]'),
-      resumeHere: bar.querySelector('[data-action="resume-here"]'),
-      extTerminal: bar.querySelector('[data-action="ext-terminal"]'),
-      extResume: bar.querySelector('[data-action="ext-resume"]'),
+      split: null,
       newTab: bar.querySelector('[data-action="new-tab"]'),
       newTerminal: bar.querySelector('[data-action="new-terminal"]'),
       newClaude: bar.querySelector('[data-action="new-claude"]'),
@@ -285,6 +271,22 @@
       toast: toast,
     };
 
+    // Split button (termSplit, app.js). Its buttons carry no data-action, so _wireStaticHandlers never
+    // double-wires them; the shared document-level listeners handle keys/outside presses.
+    var ts = termSplit({
+      key: "cr-term", primaryCls: "cr-term-btn cr-term-btn-solid", caretCls: "cr-term-btn cr-term-btn-solid",
+      resumable: false,
+      titles: { resume: "Resume this session in a terminal right here (claude --resume)",
+                open: "Open a terminal right here, cd'd to this session's folder" },
+    });
+    bar.querySelector('[data-group="primary"]').appendChild(ts);
+    termSplitOn(ts, {
+      resume: function () { _openInline(st.sessionId, "resume"); },
+      open: function () { _openInline(st.sessionId, "cwd"); },
+      external: function () { _openExternal(isClaudeId(st.sessionId) ? "resume" : "cwd"); },
+    });
+    el.split = ts;
+
     _wireStaticHandlers();
   }
 
@@ -302,10 +304,6 @@
       case "close": close(); return;
       case "config": ctx.dialog("config", {}); return;
       case "help": ctx.dialog("help", {}); return;
-      case "open-here": _openInline(st.sessionId, "cwd"); return;
-      case "resume-here": _openInline(st.sessionId, "resume"); return;
-      case "ext-terminal": _openExternal("cwd"); return;
-      case "ext-resume": _openExternal("resume"); return;
       case "new-tab": _openNewTab(); return;
       case "new-terminal": _openDirectoryPicker("cwd"); return;
       case "new-claude": _openDirectoryPicker("new"); return;
@@ -559,15 +557,6 @@
   }
 
   // ===== External terminal / External resume — POST /api/term/open, exactly ext_launch.js =====
-  var extAllowed = null, extProbing = null;
-  function _probeExternal() {
-    if (!extProbing) {
-      extProbing = post("/api/term/open", { session: "" })
-        .then(function (r) { extAllowed = r.status !== 403; _syncControlVisibility(); })
-        .catch(function () { extAllowed = false; _syncControlVisibility(); });
-    }
-    return extProbing;
-  }
   function _openExternal(mode, extra) {
     if (!st.sessionId) return;
     var sidAtClick = st.sessionId;
@@ -580,7 +569,7 @@
         return;
       }
       if (!res.ok || (res.j && res.j.error)) {
-        if (res.status === 403) { extAllowed = false; _syncControlVisibility(); }
+        if (res.status === 403) { termExtDeny(); _syncControlVisibility(); }
         showToast((res.j && res.j.error) || "Failed to open terminal.");
         return;
       }
@@ -1136,32 +1125,16 @@
       }).catch(function () {});
   }
   function _syncControlVisibility() {
-    var local = localOnly();
-    el.extTerminal.hidden = !local || extAllowed === false;
-    el.extResume.hidden = !local || extAllowed === false || !isClaudeId(st.sessionId);
-    if (local && extAllowed === null) _probeExternal();
-    _syncSplit();
+    var ext = termExtAllowed();   // null until the single shared probe answers: external stays hidden meanwhile
+    _syncSplit(ext === true);
+    if (ext === null) termExtProbe().then(_syncControlVisibility);
   }
-  // Which of the split's buttons is the primary (Claude id: Resume; otherwise Open terminal here)
-  // and which are visible. Attached terminal: only the two "…here" buttons hide -- External stays
-  // reachable (the caret then carries the "External" label, see termSplitSync).
-  function _placeOpenHere(resumable) {
-    if (!el.split || !el.splitList) return;
-    if (resumable) {
-      if (el.openHere.parentNode !== el.splitList) el.splitList.insertBefore(el.openHere, el.splitList.firstChild);
-      el.openHere.className = "cr-term-btn cr-term-btn-ghost";
-    } else {
-      if (el.openHere.parentNode === el.splitList) el.split.insertBefore(el.openHere, el.split.firstChild);
-      el.openHere.className = "cr-term-btn cr-term-btn-solid";
-    }
-  }
-  function _syncSplit() {
+  // Attached terminal: only the two "here" buttons hide (here:false) -- External stays reachable and the
+  // caret carries the "External" label (termSplitSet's solo mode).
+  function _syncSplit(ext) {
     if (!el.split) return;
-    var resumable = isClaudeId(st.sessionId);
-    _placeOpenHere(resumable);
-    el.openHere.hidden = !!st.attached;
-    el.resumeHere.hidden = !!st.attached || !resumable;
-    termSplitSync(el.split);
+    termSplitSet(el.split, { resumable: isClaudeId(st.sessionId), here: !st.attached,
+      ext: ext === undefined ? termExtAllowed() === true : ext });
   }
 
   // ===== status bar readout ==================================================================

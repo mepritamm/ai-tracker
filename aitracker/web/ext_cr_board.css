@@ -1775,6 +1775,11 @@
 }
 .tracker-next .cr-tile-action[data-act="resume"] { white-space: nowrap; }
 .tracker-next .cr-tile-action svg { width: calc(12px * var(--ico-scale)); height: calc(12px * var(--ico-scale)); flex: 0 0 auto; }
+/* Hero Resume split (S1): shrink inside the 124px sidebar; the shared .cr-tile-action rule is untouched. */
+.tracker-next .cr-tile-sidebar .tsplit{max-width:100%;white-space:normal}
+.tracker-next .cr-tile-sidebar .tsplit-primary{min-width:0;padding:7px 10px;text-align:left;overflow:hidden;text-overflow:ellipsis}
+.tracker-next .cr-tile-sidebar .tsplit-txt{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.tracker-next .cr-tile-sidebar .tsplit-caret{padding:7px 6px;flex:none}
 
 /* Icon-only resume on non-hero "Waiting on you" tiles (the hero carries icon + label). */
 .tracker-next .cr-tile-resume {

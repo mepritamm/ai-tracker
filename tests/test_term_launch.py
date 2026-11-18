@@ -551,80 +551,84 @@ _INDEX_HTML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 
 
 class TestButtonsFollowServerPolicy(unittest.TestCase):
-    """Defect 4. config.TERMINAL is server-side only, so on a default install the buttons used to
-    render and 403 on click (conventions rule 5 inverted). Tier 2 owns GET /api/term/status and
-    server.py/app.js are off-limits here, so the SPA asks the route it already has and latches
-    off on a 403. Asserted against the asset's source: there is no JS engine in the stdlib."""
+    """Defect 4. config.TERMINAL is server-side only, so on a default install the external item used
+    to render and 403 on click (conventions rule 5 inverted). Tier 2 owns GET /api/term/status, so the
+    SPA asks the route it already has and latches off on a 403. Expected change: the probe/latch moved
+    from ext_launch.js into the shared termExtProbe/termExtAllowed/termExtDeny in app.js (one policy for
+    every Resume split), and ext_launch.js's `allowed === null` / `extopenbtn` markup is gone with the
+    old <details> list. Asserted against the asset's source: there is no JS engine in the stdlib."""
 
     def setUp(self):
         self.src = open(_EXT_LAUNCH_JS, encoding="utf-8").read()
+        self.app = open(_APP_JS, encoding="utf-8").read()
 
     def test_it_probes_the_existing_route_and_not_a_new_one(self):
-        self.assertIn('post({ session: "" })', self.src)
+        self.assertIn('body:JSON.stringify({session:""})', self.app)
+        self.assertIn('fetch("/api/term/open"', self.app)
         # Tier 2 owns that path; the comment may name it, but nothing here may CALL it.
         self.assertNotIn('"/api/term/status"', self.src)
+        self.assertNotIn('"/api/term/status"', self.app)
 
     def test_a_403_latches_the_buttons_off(self):
+        self.assertIn("r.status!==403", self.app)
+        self.assertIn("function termExtDeny(){\n  TERM_EXT.allowed=false;", self.app)
+        # ext_launch.js latches on the real 403 of a click, then redraws without the external item
         self.assertIn("r.status === 403", self.src)
-        self.assertIn("allowed = false", self.src)
+        self.assertIn("termExtDeny();", self.src)
 
     def test_buttons_are_not_drawn_before_the_server_has_answered(self):
-        self.assertIn("allowed === null", self.src)
-        self.assertIn("allowed === false", self.src)
-        # the probe must resolve before any button markup is produced
-        self.assertLess(self.src.index("allowed === null"), self.src.index("extopenbtn"))
+        # the external item shows only on a definite `true`; null (probe pending) renders it hidden
+        # and the pane re-renders once the probe resolves
+        self.assertIn("ext: ext === true", self.src)
+        self.assertIn("if (ext === null) termExtProbe().then(() => render(d));", self.src)
+        self.assertIn("if(!trackerIsLocal())return false;", self.app)
 
     def test_prefix_mirror_points_at_the_source_of_truth(self):
         self.assertIn("registry.PROVIDERS", self.src)    # defect 5: one-line pointer, by choice
 
 
 class TestRenamedLaunchButtonsAndNewControls(unittest.TestCase):
-    """The four Tier 1/3 detail-pane buttons are named by WHERE the terminal opens ('…here' =
-    in-browser, 'External …' = the Mac's own Terminal/iTerm, this-machine-only). Asserted
-    against the asset's source, same as TestButtonsFollowServerPolicy above: there is no JS
-    engine here."""
+    """The classic detail pane is one Resume split (Resume primary; the menu holds Open terminal plus
+    one external item). Expected change: the four '...here' / 'External ...' buttons and their labels
+    were replaced by the shared termSplit labels in app.js. Asserted against the asset's source, same
+    as TestButtonsFollowServerPolicy above: there is no JS engine here."""
 
     def setUp(self):
         self.src = open(_EXT_LAUNCH_JS, encoding="utf-8").read()
+        self.app = open(_APP_JS, encoding="utf-8").read()
 
     def test_here_pair_labels(self):
-        # Symbols became inline <svg><use href="#i-NAME"/></svg> icons emitted by ico(name) --
-        # the icon builds its href at runtime by concatenation, so the literal call site
-        # (ico("play")/ico("redo")) is what the static source actually shows. The words remain
-        # the durable part of the label.
-        self.assertIn("Open terminal here", self.src)
         self.assertIn('ico("play")', self.src)
-        self.assertIn("Resume terminal here", self.src)
         self.assertIn('ico("redo")', self.src)
+        self.assertIn('"Open terminal"', self.app)
+        self.assertIn('"Resume"', self.app)
 
     def test_external_pair_is_renamed(self):
-        self.assertIn("External terminal", self.src)
-        self.assertIn("External resume", self.src)
-        self.assertIn('ico("external")', self.src)
-        # the old, unqualified labels must not survive the rename
+        self.assertIn("Resume externally", self.app)
+        self.assertIn("Open externally", self.app)
+        # the old, unqualified and old 'External ...' labels must not survive the rename
+        self.assertNotIn("External terminal", self.src)
+        self.assertNotIn("External resume", self.src)
         self.assertNotIn(">Terminal</button>", self.src)
         self.assertNotIn(">Resume</button>", self.src)
 
     def test_external_pair_is_still_host_gated(self):
-        # Unchanged: the native "External …" buttons are still built inside the localOnly()
-        # branch, so they stay off the DOM entirely off-localhost.
-        gate_idx = self.src.index("if (localOnly())")
-        ext_idx = self.src.index("External terminal")
-        self.assertGreater(ext_idx, gate_idx)
+        # Unchanged intent: the external item stays off the DOM unless the page is loopback AND the
+        # server allowed it -- now enforced once, in termExtAllowed (trackerIsLocal first).
+        self.assertIn("termExtAllowed()", self.src)
+        self.assertIn('location.hostname==="localhost"||location.hostname==="127.0.0.1"', self.app)
+        self.assertIn("if(!trackerIsLocal())return false;", self.app)
 
     def test_detail_pane_render_is_back_to_four_buttons(self):
-        # render()'s own innerHTML assembly must be exactly vtHtml + nativeHtml -- the "+ New …"
-        # pair (a THIRD group that used to be spliced in here) is gone from this function.
+        # render() mounts exactly one termSplit; the "+ New ..." pair is gone from this function and the
+        # only thing added besides the split is the server-owned term_home_note (a <div>).
         start = self.src.index("function render(d) {")
         end = self.src.index("EXT.push(render)")
         body = self.src[start:end]
-        # The buttons are exactly vtHtml + nativeHtml; the only thing appended after them is the
-        # server-owned term_home_note (a <div>, not a button group -- terminal-at-root L4).
-        # (expected change: the pair is now assembled through termSplit() -- Resume primary, the rest
-        # behind the caret -- so nativeHtml is an argument of vtHtml, not a second concatenand.)
-        self.assertIn("const vtHtml = termSplit(", body)
-        self.assertIn("el.innerHTML = vtHtml +\n      (homeNote ? '<div class=\"extlaunchnote\"", body)
-        self.assertEqual(body.count("<button"), 4)
+        self.assertIn("const split = termSplit(", body)
+        self.assertEqual(body.count("termSplit("), 1)
+        self.assertIn('<div class="extlaunchnote"', body)
+        self.assertEqual(body.count("<button"), 0)    # buttons are built by termSplit, not here
         self.assertNotIn("newHtml", body)
         self.assertNotIn("+ New terminal", body)
         self.assertNotIn("+ New Claude session", body)

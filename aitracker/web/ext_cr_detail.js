@@ -1377,15 +1377,8 @@
             '<span class="crd-row1-actions">' +
               '<button class="crd-iconbtn" data-act="toggle-search" title="Search this session" aria-label="Search this session"><span class="crd-ico"></span><span class="crd-btn-label">Search</span></button>' +
               '<button class="crd-iconbtn crd-flagbtn" data-act="toggle-flag" title="Flag an issue" aria-label="Flag an issue"><span class="crd-ico"></span><span class="crd-btn-label">Flag</span><span class="crd-flag-badge" hidden></span></button>' +
-              // Split button (termSplit, app.js): Resume is the primary; "Open terminal" and
-              // "External" live in the caret's list. A non-Claude id (Auggie) can't resume, so its
-              // primary is Open terminal instead (renderHeader toggles the two, then termSplitSync).
-              termSplit(
-                '<button class="crd-btn crd-btn-solid" data-act="resume">Resume</button>' +
-                '<button class="crd-btn crd-btn-solid" data-act="open-terminal" data-primary hidden>Open terminal</button>',
-                '<button class="crd-btn crd-btn-bare tsplit-item" data-act="open-terminal">Open terminal</button>' +
-                '<button class="crd-btn crd-btn-bare tsplit-item" data-act="external" hidden>External</button>',
-                "crd-btn crd-btn-outline") +
+              // Split button: mountHeaderSplit() builds termSplit (app.js) into this slot.
+              '<span class="crd-split-slot"></span>' +
               '<button class="crd-btn crd-btn-ai" data-act="toggle-note">Queue a note</button>' +
             "</span>" +
           "</div>" +
@@ -1602,6 +1595,8 @@
       flagOpen: false,
       noteOpen: false
     };
+
+    mountHeaderSplit(node, ctx, ui);
 
     var stateBody = qs(node, ".crd-col-state .crd-col-body");
     var evidenceBody = qs(node, ".crd-col-evidence .crd-col-body");
@@ -1915,24 +1910,6 @@
           qs(node, ".crd-notecard").hidden = true;
           break;
         }
-        case "open-terminal":
-          // NOTE: 'terminal:open' + {id} is the EXACT event/payload aitracker/web/cr_board.js
-          // already emits for its own "open terminal" tile action (cr_board.js:737,812) —
-          // reused verbatim instead of inventing a second event for the same action.
-          ctx.emit("terminal:open", { id: sid });
-          break;
-        case "resume":
-          // REQUIRED ADDITION: no existing sibling event covers "resume this session in a
-          // terminal" (cr_board.js only has terminal:open, which cr_term.js treats as "attach/
-          // open a pty", not "run `claude --resume <sid>`"). Named to match the session:* /
-          // terminal:* namespaces already in use; the bootstrap needs to wire this one up.
-          ctx.emit("session:resume", { id: sid });
-          break;
-        case "external":
-          // REQUIRED ADDITION: the external URL needs the bound port (aitracker/config.py's
-          // PORT_FILE), which the detail dict never carries — the bootstrap must resolve it.
-          ctx.emit("session:openExternal", { id: sid });
-          break;
         case "fork-open":
           if (ui.forkTarget) ctx.go("detail", ui.forkTarget);
           break;
@@ -2390,6 +2367,38 @@
     return /auggie/i.test(raw) ? "Auggie" : (/augment/i.test(raw) ? "Augment" : "Claude CLI");
   }
 
+  // Header split button (termSplit, app.js): Resume is the primary; "Open terminal" and
+  // "Resume externally" live in the caret's menu. A non-resumable id (Auggie) gets Open terminal as
+  // its primary and "Open externally" (syncHeaderSplit sets that on every render).
+  function mountHeaderSplit(node, ctx, ui) {
+    var s = termSplit({key: "crd-head", primaryCls: "crd-btn crd-btn-solid", caretCls: "crd-btn crd-btn-solid", resumable: true});
+    qs(node, ".crd-split-slot").appendChild(s);
+    node._crSplit = s;
+    termSplitOn(s, {
+      // REQUIRED ADDITION: no existing sibling event covers "resume this session in a terminal"
+      // (cr_board.js only has terminal:open, which cr_term.js treats as "attach/open a pty", not
+      // "run `claude --resume <sid>`"). Named to match the session:* / terminal:* namespaces.
+      resume: function () { var sid = ui.sid; if (sid) ctx.emit("session:resume", { id: sid }); },
+      // 'terminal:open' + {id} is the EXACT event/payload cr_board.js already emits for its own
+      // "open terminal" tile action -- reused verbatim instead of a second event.
+      open: function () { var sid = ui.sid; if (sid) ctx.emit("terminal:open", { id: sid }); },
+      // The external URL needs the bound port, which the detail dict never carries -- the bootstrap
+      // (ext_cr_boot.js) resolves it.
+      external: function () { var sid = ui.sid; if (sid) ctx.emit("session:openExternal", { id: sid }); }
+    });
+  }
+
+  function syncHeaderSplit(node, sid) {
+    var split = node._crSplit;
+    if (!split) return;
+    split.setAttribute("data-sid", sid);
+    var ext = termExtAllowed();
+    termSplitSet(split, {resumable: termResumable(sid), ext: ext === true});
+    if (ext === null) termExtProbe().then(function () {
+      if (split.getAttribute("data-sid") === sid) termSplitSet(split, {resumable: termResumable(sid), ext: termExtAllowed() === true});
+    });
+  }
+
   function renderHeader(node, ctx, session, nowSec) {
     var meta = session.meta || {};
     qs(node, ".crd-src").textContent = sourceLabel(meta);
@@ -2468,8 +2477,8 @@
     // both invisible AND out of the tab order (no separate disabled/inert flag
     // needed). Title + aria-label spell out what clicking it does, matching the
     // pattern the pin/search/flag buttons in this same row already follow.
-    // Deliberately NOT gated on location.hostname/isLocalhost (see the comment
-    // on the "external" button below for the ONE control that is) -- this has
+    // Deliberately NOT gated on the local-host check (see trackerIsLocal in
+    // app.js for the ONE control that is) -- this has
     // to work from a phone/tablet over a tunnel same as every other control here.
     var agentsRunning = (session.agents_bg || []).filter(function (a) { return a.running; }).length;
     var agentsPill = qs(node, ".crd-pill-agents");
@@ -2548,16 +2557,7 @@
     flagTextEl.hidden = !(flagCount && session.flag_text);
     flagTextEl.textContent = (flagCount && session.flag_text) || "";
 
-    var isLocalhost = /^(localhost|127\.0\.0\.1)/.test(location.hostname);
-    qs(node, '[data-act="external"]').hidden = !isLocalhost;
-    // Split button: Resume is the primary for a Claude id; a non-Claude id (Auggie) can't resume
-    // (the server answers 400), so its primary is Open terminal and the list's copy is hidden --
-    // the same Claude-id rule the overlay and the classic pane use.
-    var resumable = !/^(auggie|augment-vscode|augment-cursor):/.test(String(session.id || sid || ""));
-    qs(node, '[data-act="resume"]').hidden = !resumable;
-    qs(node, '[data-act="open-terminal"][data-primary]').hidden = resumable;
-    qs(node, '.tsplit-item[data-act="open-terminal"]').hidden = !resumable;
-    termSplitSync(qs(node, ".tsplit"));
+    syncHeaderSplit(node, String(session.id || sid || ""));
   }
 
   // FIX (design-audit drift 3): 5b renders fork lineage as a small card at the

@@ -459,13 +459,8 @@
   color: var(--text-link);
   padding: 7px 4px;
 }
-/* Split button in the header row (termSplit, app.js): the row is right-aligned, so the list opens
-   toward the left and stays inside `.crd{overflow:hidden}`; items are real list rows, never hidden
-   by a band (the <=480px `.crd-btn-bare` hide excludes `.tsplit-item`). */
-.cr .crd-row1-actions .tsplit-list { left: auto; right: 0; }
-.cr .tsplit-item { padding: 7px 12px; color: var(--text-primary); text-align: left; }
-.cr .tsplit-item:hover { background: var(--fill-row-hover); }
-.cr .crd-row1-actions .tsplit-caret { padding: 7px 9px; }
+/* Split button slot in the header row (mountHeaderSplit): the slot adds no box of its own. */
+.cr .crd-split-slot{display:contents}
 /* FIX 2: an honestly-disabled control (Evidence panel's model/effort mirror,
    which has no real route to drive a terminal from here) reads as disabled,
    not as a live button that happens to fail on click. */

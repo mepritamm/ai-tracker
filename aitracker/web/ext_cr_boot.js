@@ -780,7 +780,7 @@ window.CR = window.CR || {};
   // request shape) ext_launch.js's own openTerm()/ext_cr_term.js's own
   // _openExternal() already call for their "↗ External …" buttons — not a
   // new endpoint, just a third caller of an existing one. Resume when the
-  // session is Claude's own (mirrors ext_launch.js's isClaudeId check),
+  // session is Claude's own (termResumable in app.js),
   // otherwise a plain cwd shell.
   // POST /api/term/open, used by openExternal. Resolves
   // { ok, status, j } (j = {} when the body isn't JSON); rejects on network failure.
@@ -798,11 +798,13 @@ window.CR = window.CR || {};
   on('session:openExternal', function (payload) {
     var id = payload && payload.id;
     if (!id || typeof fetch !== 'function') return;
-    var resumable = !/^(auggie|augment-vscode|augment-cursor):/.test(id);
+    var resumable = termResumable(id);
     postTermOpen(id, resumable ? 'resume' : 'cwd').then(function (res) {
+      if (res.status === 403) termExtDeny();
       if (res.status === 409 && res.j && res.j.recreate && window.ExtVT && window.ExtVT.confirmRecreate) {   // E1 (lazy: ext_vt.js loads last)
         window.ExtVT.confirmRecreate(res.j, function (x) {
           postTermOpen(id, resumable ? 'resume' : 'cwd', x).then(function (r2) {
+            if (r2.status === 403) termExtDeny();
             emit('notify', { text: (r2.ok && !(r2.j && r2.j.error)) ? 'Opened in an external window — this machine only.'
               : ((r2.j && r2.j.error) || 'Couldn’t open an external terminal.') });
           });

@@ -173,14 +173,14 @@ class TestReadonlyUI(unittest.TestCase):
 
     def test_new_selectors_hidden_only_under_readonly(self):
         ext = [sel for sel, body in _rules(_read("ext_cr.css")) if "display: none" in body]
-        # .crd-row1-actions .tsplit: the header's Resume/Open terminal/External now live in one split
-        # button (termSplit) -- the whole group hides read-only, where each button used to.
-        for s in (".tracker-next .cr-rail-pin", ".tracker-next .cr-rail-rename", ".tracker-next .crd-phone-input",
-                  ".tracker-next .crd-row1-actions .tsplit"):
+        for s in (".tracker-next .cr-rail-pin", ".tracker-next .cr-rail-rename", ".tracker-next .crd-phone-input"):
             self.assertIn("html.tracker-readonly " + s, ext)
         app = [(sel, body) for sel, body in _rules(_read("app.css")) if sel.startswith("html.tracker-readonly")]
         hidden = [sel for sel, body in app if "display:none" in body.replace(" ", "")]
         self.assertIn("html.tracker-readonly .addflag", hidden)
+        # expected change: the header/toolbar/classic/board Resume split (termSplit) hides read-only
+        # through ONE universal rule in app.css, replacing the per-surface header selector in ext_cr.css.
+        self.assertIn("html.tracker-readonly .tsplit", hidden)
         self.assertIn("html.tracker-readonly .pin:not(.on)", hidden)
         self.assertNotIn("html.tracker-readonly .pin", hidden, "a pinned marker must stay visible")
         self.assertIn("html.tracker-readonly .pin", [s for s, b in app if "pointer-events:none" in b.replace(" ", "")])

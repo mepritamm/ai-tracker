@@ -2700,6 +2700,7 @@ window.CR = window.CR || {};
       // "the single most likely regression."
       var scrollTop = paneScroll('board', els.boardScroll);
 
+      var tsnap = termSplitSnapshot('board-hero:');
       els.board.innerHTML = '';
       // Pending-work card: prepended OUTSIDE boardTiles() so the cap and filters never see it.
       // Policy (show/title/summary) is the server's `card`; nothing is derived here.
@@ -2720,6 +2721,7 @@ window.CR = window.CR || {};
         var el = els.board.querySelector('[data-tile-id="' + cssEscape(focusedTileId) + '"]');
         if (el) el.focus();
       }
+      termSplitRestore(tsnap);
 
       els.boardScroll.scrollTop = scrollTop;
       savePaneScroll('board', scrollTop);
@@ -2734,7 +2736,7 @@ window.CR = window.CR || {};
         tabindex: '0', role: 'listitem', 'data-tile-id': tileId(t),
         onfocus: function () { focusedTileId = tileId(t); },
         onclick: function (e) {
-          if (e.target.closest('button,a,input,select,textarea,[role=button]')) return;
+          if (e.target.closest('button,a,input,select,textarea,[role=button],[role=menu]')) return;
           activateTile(t);
         },
         // Enter on a focused inner control (e.g. the Resume button) bubbles here; only the tile itself activates.
@@ -2949,6 +2951,28 @@ window.CR = window.CR || {};
       return h('div', { class: cls, title: (hl.label ? hl.label + ' · ' : '') + hl.text, html: pill + body });
     }
 
+    // Hero "Waiting on you" tile: the same Resume + caret split as the session header. Resume keeps
+    // emitting 'session:resume' (in-app terminal); the caret menu adds Open terminal / Resume externally.
+    function heroSplit(s, canResume) {
+      var sp = termSplit({
+        key: 'board-hero:' + s.id, primaryCls: 'cr-tile-action', caretCls: 'cr-tile-action', resumable: canResume,
+        icons: { resume: icon('play', '<path d="M8 4.5l11.5 7.5L8 19.5z"/>') },
+        titles: { resume: 'Resume this session to answer', open: 'Open a terminal to answer' }
+      });
+      function emit(name) {
+        return function (e) {
+          if (e && e.stopPropagation) e.stopPropagation();
+          ctx && ctx.emit && ctx.emit(name, { id: s.id });
+        };
+      }
+      var ext = termExtAllowed();
+      termSplitSet(sp, { resumable: canResume, ext: ext === true });
+      // Probe unresolved on first render: re-set the SAME node when it lands (no re-render needed).
+      if (ext === null) termExtProbe().then(function () { termSplitSet(sp, { resumable: canResume, ext: termExtAllowed() === true }); });
+      termSplitOn(sp, { resume: emit('session:resume'), open: emit('terminal:open'), external: emit('session:openExternal') });
+      return sp;
+    }
+
     function sessionTile(t, now) {
       var s = t.session, state = t.state;
       var cls = 'cr-tile cr-tile--' + state;
@@ -3021,16 +3045,7 @@ window.CR = window.CR || {};
         // other two counters — REQUIRED ADDITION in the report.
         var sidebar = h('div', { class: 'cr-tile-sidebar' }, [
           h('div', { class: 'cr-tile-counts' }, [glyph('note', 'tn-emo-n'), (s.note_count || 0) + ' notes']),
-          canResume ? h('button', {
-            class: 'cr-tile-action', type: 'button', 'data-act': 'resume',
-            title: 'Resume this session to answer', 'aria-label': 'Resume this session to answer',
-            onclick: function (e) { e.stopPropagation(); ctx && ctx.emit && ctx.emit('session:resume', { id: s.id }); }
-          }, [icon('play', '<path d="M8 4.5l11.5 7.5L8 19.5z"/>'), 'Resume'])
-          : readOnly ? null
-          : h('button', {
-            class: 'cr-tile-action', type: 'button',
-            onclick: function (e) { e.stopPropagation(); ctx && ctx.emit && ctx.emit('terminal:open', { id: s.id }); }
-          }, ['Open terminal to answer']),
+          readOnly ? null : heroSplit(s, canResume),
         ]);
         var inner = h('div', { class: 'cr-tile-inner' }, [main, sidebar]);
         return h('div', attrs, [inner]);

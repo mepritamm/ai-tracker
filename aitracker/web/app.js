@@ -100,55 +100,251 @@ window.icoScale = ()=>_icoScale;
 // Raw glyph char for a name under the CURRENT style, or null in "icons" style — for generators
 // elsewhere (ext_cr_boot.js, ext_vt.js) that build their own markup/DOM instead of calling ico().
 window.icoChar = name=>_icoStyle==="emoji"?ICO_EMOJI[name]:_icoStyle==="text"?ICO_TEXT[name]:null;
-// ---- split button: primary action + a "▾" disclosure holding the secondary ones ----
-// ONE helper for the Control Room header, the CR terminal overlay bar and the classic pane (the
-// secondary "Open terminal" / "External ..." actions hide behind the caret beside Resume). Plain
-// <details>/<summary> disclosure: no ARIA menu roles. Returns the primary alone when there are no items.
-function termSplit(primaryHtml, itemsHtml, caretCls, soloLabel){
-  if(!itemsHtml)return primaryHtml;
-  const lbl=soloLabel?'<span class="tsplit-solo-label">'+soloLabel+'</span>':"";
-  return '<span class="tsplit">'+primaryHtml+
-    '<details class="tsplit-menu"><summary class="'+(caretCls||"")+' tsplit-caret" aria-label="More terminal actions" title="More terminal actions">'+
-    lbl+'<span aria-hidden="true">▾</span></summary><div class="tsplit-list">'+itemsHtml+'</div></details></span>';
+// ---- split button: primary action + a joined WAI-ARIA menu button holding the secondary ones ----
+// ONE helper for every Resume entry point (Control Room header, CR terminal overlay bar, classic pane,
+// board hero tile). Callers pass only their button classes + handlers; this block owns the markup, the
+// labels (by resumability), visibility, the "⌥-click = external" shortcut, keyboard and outside-close.
+// Built with createElement only and every reference kept on `split._ts`, so nothing here runs a selector.
+// Loopback test: the ONE copy.
+// ponytail: deliberate, user-approved exception to the "never gate behaviour by host" rule in
+// .claude/rules/conventions.md. Every other feature in this app works the same over a tunnel as on
+// localhost; the external-terminal action launches an OS process on whatever machine runs the server,
+// so it must never be OFFERED to a remote viewer. It is cosmetics only — curl ignores it, and the
+// server is what actually refuses (term_launch._local_caller). Do not "fix" it to match the usual
+// rule, and do not mistake it for the security boundary. In-browser Resume / Open terminal are NOT
+// covered by this exception — they run over the tunnel like every other panel.
+function trackerIsLocal(){ return location.hostname==="localhost"||location.hostname==="127.0.0.1"; }
+// External-allowed: the server owns whether terminals exist (TRACKER_TERMINAL + TRACKER_AUTH). A POST
+// with an empty session runs term_gate.guard() first: 403 = off, 400 = on; nothing is launched.
+// One probe per page load; any later 403 calls termExtDeny().
+const TERM_EXT={allowed:null,probe:null};
+function termExtProbe(){
+  if(!TERM_EXT.probe){
+    TERM_EXT.probe=fetch("/api/term/open",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({session:""})})
+      .then(r=>{TERM_EXT.allowed=r.status!==403;return TERM_EXT.allowed;},()=>{TERM_EXT.allowed=false;return false;});
+  }
+  return TERM_EXT.probe;
 }
-// Re-derive visibility after a caller toggled [hidden] on primary/list buttons: the caret disappears
-// when the list has nothing visible; with no visible primary the caret carries `soloLabel`.
-function termSplitSync(split){
-  if(!split||!split.querySelector)return;
-  const menu=split.querySelector(".tsplit-menu");
-  if(!menu)return;
-  const items=menu.querySelectorAll(".tsplit-list button");
-  let any=false;
-  for(let i=0;i<items.length;i++)if(!items[i].hidden){any=true;break;}
-  menu.hidden=!any;
-  if(!any)menu.open=false;
-  let prim=false;
-  const kids=split.children||[];
-  for(let i=0;i<kids.length;i++)if(kids[i]!==menu&&!kids[i].hidden){prim=true;break;}
-  if(split.classList)split.classList.toggle("tsplit-solo",!prim);
+function termExtAllowed(){
+  if(!trackerIsLocal())return false;
+  if(TERM_EXT.allowed===null)termExtProbe();
+  return TERM_EXT.allowed;
+}
+function termExtDeny(){
+  TERM_EXT.allowed=false; TERM_EXT.probe=Promise.resolve(false);
+  for(const k in TSPLITS){   // hide every live split's external item at once, whichever caller got the 403
+    const sp=TSPLITS[k];
+    if(sp&&sp._ts&&sp._ts.s&&sp.isConnected!==false)termSplitSet(sp,Object.assign({},sp._ts.s,{ext:false}));
+  }
+}
+// Resumable: the server's list flag wins; the id rule (term_launch._is_claude) is only the fallback.
+function termResumable(id){
+  if(!id)return false;
+  let rows=[];
+  try{rows=sessions||[];}catch(e){}
+  for(let i=0;i<rows.length;i++)if(rows[i]&&rows[i].id===id&&typeof rows[i].resumable==="boolean")return rows[i].resumable;
+  return !/^(auggie|augment-vscode|augment-cursor):/.test(id);
+}
+const TSPLITS={};   // key -> latest split built for that key (so Close/Snapshot/Restore need no DOM query)
+function _tsplitPrune(){ for(const k in TSPLITS)if(TSPLITS[k].isConnected===false)delete TSPLITS[k]; }   // drop splits whose node left the DOM
+function _tsplitOwner(n){ while(n){ if(n._ts)return n; n=n.parentNode; } return null; }
+function _tsplitIsOpen(sp){ return !!(sp&&sp._ts&&sp._ts.caret.getAttribute("aria-expanded")==="true"); }
+function _tsplitShut(sp){
+  const t=sp&&sp._ts; if(!t)return;
+  t.list.hidden=true; t.caret.setAttribute("aria-expanded","false");
+}
+function _tsplitVisible(sp){ return sp._ts.items.filter(b=>!b.hidden); }
+// Single alignment rule: the list is right-aligned to the caret; flip to left-aligned when that would
+// cross the left edge of the nearest horizontally clipping ancestor (or the viewport). Call AFTER unhiding.
+function _tsplitFit(split){
+  const t=split._ts;
+  split.classList.remove("tsplit-start");
+  if(typeof t.list.getBoundingClientRect!=="function"||typeof getComputedStyle!=="function")return;
+  let left=0;
+  for(let n=split.parentNode;n;n=n.parentNode){
+    if(n.nodeType!==undefined&&n.nodeType!==1)continue;
+    let ox="";
+    try{ox=(getComputedStyle(n)||{}).overflowX;}catch(e){}
+    if(ox&&ox!=="visible"&&typeof n.getBoundingClientRect==="function"){left=n.getBoundingClientRect().left;break;}
+  }
+  if(t.list.getBoundingClientRect().left<left)split.classList.add("tsplit-start");
+}
+function termSplit(o){
+  o=o||{};
+  const key=String(o.key||"");
+  const id="tsplit-"+key.replace(/[^\w-]/g,"_")+"-menu";
+  const mk=(tag,cls)=>{const e=document.createElement(tag);if(cls)e.className=cls;return e;};
+  const txt=(tag,cls,s,hide)=>{const e=mk(tag,cls);e.textContent=s;if(hide)e.setAttribute("aria-hidden","true");return e;};
+  const btn=(cls,act,label,ico)=>{
+    const b=mk("button",cls);b.setAttribute("type","button");b.setAttribute("data-tsplit-act",act);
+    if(ico){const s=mk("span","tsplit-ico");if(typeof ico==="string")s.innerHTML=ico;else s.appendChild(ico);b.appendChild(s);}
+    b.appendChild(txt("span","tsplit-txt",label));
+    return b;
+  };
+  const ic=o.icons||{};
+  const split=mk("span","tsplit");
+  split.setAttribute("data-tsplit-key",key);
+  const pc=(o.primaryCls||"")+" tsplit-primary";
+  const res=btn(pc,"resume","Resume",ic.resume);
+  const open=btn(pc,"open","Open terminal",ic.open);
+  res.hidden=true;open.hidden=true;
+  const caret=mk("button",(o.caretCls||"")+" tsplit-caret");
+  caret.setAttribute("type","button");caret.setAttribute("aria-haspopup","menu");
+  caret.setAttribute("aria-expanded","false");caret.setAttribute("aria-controls",id);
+  caret.appendChild(txt("span","tsplit-solo-label","External"));
+  caret.appendChild(txt("span","","▾",true));
+  const list=mk("div","tsplit-list");
+  list.setAttribute("role","menu");list.setAttribute("id",id);list.setAttribute("aria-label","Resume options");list.hidden=true;
+  const item=(act,node)=>{
+    const b=mk("button","tsplit-item");b.setAttribute("type","button");b.setAttribute("role","menuitem");
+    b.setAttribute("tabindex","-1");b.setAttribute("data-tsplit-act",act);
+    node.forEach(n=>b.appendChild(n));return b;
+  };
+  const iOpen=item("open",[txt("span","","Open terminal")]);
+  const label=txt("span","tsplit-label","Resume externally");
+  const hint=txt("span","tsplit-hint","⌥-click",true);
+  const iExt=item("external",[label,txt("span","tsplit-arrow"," ↗",true),hint]);
+  iOpen.hidden=true;iExt.hidden=true;
+  list.appendChild(iOpen);list.appendChild(iExt);
+  split.appendChild(res);split.appendChild(open);split.appendChild(caret);split.appendChild(list);
+  split._ts={key:key,res:res,open:open,caret:caret,list:list,iOpen:iOpen,iExt:iExt,label:label,hint:hint,
+    items:[iOpen,iExt],titles:o.titles||{},on:false,h:null};
+  caret.addEventListener("click",e=>{
+    if(e&&e.preventDefault)e.preventDefault();
+    if(_tsplitIsOpen(split))termSplitClose();else termSplitOpen(split,"first");
+  });
+  _tsplitPrune();
+  TSPLITS[key]=split;
+  termSplitSet(split,{resumable:!!o.resumable,ext:false});
+  return split;
+}
+// The ONLY label/visibility API. s={resumable, here (default true), ext}.
+function termSplitSet(split,s){
+  const t=split&&split._ts; if(!t)return;
+  s=s||{};
+  const r=!!s.resumable,here=s.here!==false,ext=!!s.ext;
+  t.s={resumable:r,here:here,ext:ext};   // last state, so termExtDeny can re-sync without caller wiring
+  t.hint.hidden=!here;   // no primary to ⌥-click in solo mode
+  t.res.hidden=!(here&&r);t.open.hidden=!(here&&!r);
+  t.iOpen.hidden=!(here&&r);t.iExt.hidden=!ext;
+  t.label.textContent=r?"Resume externally":"Open externally";
+  t.iExt.title=(r?"Resume via claude --resume":"Open a shell")+" in an external Terminal/iTerm window — this machine only";
+  const sfx=ext?" — ⌥-click: "+(r?"resume":"open")+" externally":"";
+  t.res.title=(t.titles.resume||"Resume")+sfx;
+  t.open.title=(t.titles.open||"Open terminal")+sfx;
+  const anyItem=!t.iOpen.hidden||!t.iExt.hidden;
+  const solo=!here;
+  t.caret.hidden=!anyItem;
+  const nm=solo?"External terminal options":"More "+(r?"Resume":"Open terminal")+" options";
+  t.caret.setAttribute("aria-label",nm);t.caret.title=nm;
+  t.list.setAttribute("aria-label",solo?"External terminal options":(r?"Resume":"Open terminal")+" options");
+  split.classList.toggle("tsplit-solo",solo&&anyItem);
+  split.classList.toggle("tsplit-nomenu",!anyItem);
+  split.hidden=!here&&!ext;
+  if(!anyItem)_tsplitShut(split);
+}
+// h={resume,open,external}(e). Binds once; later calls only swap the handlers.
+function termSplitOn(split,h){
+  const t=split&&split._ts; if(!t)return;
+  t.h=h||{};
+  if(t.on)return;
+  t.on=true;
+  const bind=(b,isItem)=>b.addEventListener("click",e=>{
+    let act=b.getAttribute("data-tsplit-act");
+    if(!isItem&&e&&e.altKey&&!t.iExt.hidden)act="external";   // ⌥-click on a primary = external
+    termSplitClose();
+    if(isItem&&t.caret.focus)t.caret.focus();                   // before the handler: a dialog it opens captures the caret as opener
+    if(e&&e.preventDefault)e.preventDefault();
+    if(t.h[act])t.h[act](e);
+  });
+  bind(t.res,false);bind(t.open,false);bind(t.iOpen,true);bind(t.iExt,true);
+}
+function termSplitOpen(split,where){
+  const t=split&&split._ts; if(!t||t.caret.hidden)return;
+  termSplitClose(split);
+  t.list.hidden=false;
+  _tsplitFit(split);
+  t.caret.setAttribute("aria-expanded","true");
+  if(where){
+    const v=_tsplitVisible(split),it=where==="last"?v[v.length-1]:v[0];
+    if(it&&it.focus)it.focus();
+  }
 }
 function termSplitClose(except){
-  document.querySelectorAll(".tsplit-menu[open]").forEach(m=>{if(m!==except)m.open=false;});
+  for(const k in TSPLITS)if(TSPLITS[k]!==except)_tsplitShut(TSPLITS[k]);
 }
-function termSplitOnClick(e){
-  const t=e&&e.target;
-  const m=t&&t.closest?t.closest(".tsplit-menu"):null;
-  if(m&&t.closest(".tsplit-list")){m.open=false;return;}   // picking an item closes its menu
-  termSplitClose(m);                                       // outside click / another menu's caret
+function _tsplitFocusTag(t){
+  const a=typeof document.activeElement!=="undefined"?document.activeElement:null;
+  if(!a)return null;
+  if(a===t.caret)return "caret";
+  if(a===t.res)return "primary:resume";
+  if(a===t.open)return "primary:open";
+  if(a===t.iOpen)return "item:open";
+  if(a===t.iExt)return "item:external";
+  return null;
+}
+function termSplitSnapshot(prefix){
+  for(const k in TSPLITS){
+    if(k.indexOf(prefix||"")!==0)continue;
+    const sp=TSPLITS[k];
+    if(sp.isConnected===false)continue;
+    const open=_tsplitIsOpen(sp),focus=_tsplitFocusTag(sp._ts);
+    if(open||focus)return {key:k,open:open,focus:focus};
+  }
+  return null;
+}
+function termSplitRestore(snap){
+  if(!snap)return;
+  const sp=TSPLITS[snap.key];
+  if(!sp||sp.isConnected===false)return;
+  if(snap.open)termSplitOpen(sp,null);
+  const t=sp._ts,f=snap.focus;
+  const el=f==="caret"?t.caret:f==="primary:resume"?t.res:f==="primary:open"?t.open:f==="item:open"?t.iOpen:f==="item:external"?t.iExt:null;
+  if(el&&!el.hidden&&el.focus)el.focus();
+}
+function _tsplitOutside(e){
+  _tsplitPrune();
+  if(!_tsplitIsOpen(_tsplitOwner(e&&e.target)))termSplitClose();   // outside press / another split: close, no focus move
+}
+function termSplitOnClick(e){ _tsplitOutside(e); }
+function termSplitOnPointerDown(e){ _tsplitOutside(e); }   // iOS sends no document click for taps on inert areas
+function termSplitOnFocusOut(e){
+  const rt=e&&e.relatedTarget;
+  if(!rt)return;   // null: Safari doesn't focus a clicked button / a node was removed in a rebuild; pointer events cover outside presses
+  const sp=_tsplitOwner(e.target);
+  if(_tsplitIsOpen(sp)&&_tsplitOwner(rt)!==sp)_tsplitShut(sp);
 }
 function termSplitOnKey(e){
-  if(e.key!=="Escape")return;
-  const t=e.target;
-  const m=t&&t.closest?t.closest(".tsplit-menu[open]"):null;
-  if(!m){termSplitClose();return;}   // Escape from elsewhere (xterm, a dialog): close stale menus silently, let the key through
-  m.open=false;
-  const sm=m.querySelector("summary");
-  if(sm&&sm.focus)sm.focus();
-  e.stopPropagation();e.preventDefault();   // keep the overlay's / page's own Escape handlers from also firing
+  if(!e)return;
+  const k=e.key,tg=e.target,sp=_tsplitOwner(tg),open=_tsplitIsOpen(sp),t=sp&&sp._ts;
+  const stop=()=>{ if(e.preventDefault)e.preventDefault(); if(e.stopPropagation)e.stopPropagation(); };
+  const inList=!!t&&(tg===t.list||t.items.indexOf(tg)>=0);
+  if(k==="Escape"){
+    if(open&&(tg===t.caret||inList)){_tsplitShut(sp);if(t.caret.focus)t.caret.focus();stop();return;}
+    termSplitClose();   // Escape from elsewhere (xterm, a dialog): close stale menus silently, let the key through
+    return;
+  }
+  if(!t)return;
+  if(tg===t.caret&&!t.caret.hidden&&(k==="ArrowDown"||k==="ArrowUp")){
+    termSplitOpen(sp,k==="ArrowDown"?"first":"last");stop();return;
+  }
+  if(!open||!inList)return;
+  if(k==="Tab"){ if(t.caret.focus)t.caret.focus(); _tsplitShut(sp); return; }   // no preventDefault: native Tab moves on from the caret
+  const v=_tsplitVisible(sp);
+  if(!v.length)return;
+  let i=v.indexOf(tg),to=null;
+  if(k==="ArrowDown")to=v[(i+1)%v.length];
+  else if(k==="ArrowUp")to=v[i<=0?v.length-1:i-1];
+  else if(k==="Home")to=v[0];
+  else if(k==="End")to=v[v.length-1];
+  if(to){if(to.focus)to.focus();stop();}
 }
 document.addEventListener("click",termSplitOnClick,true);
+document.addEventListener("pointerdown",termSplitOnPointerDown,true);
 document.addEventListener("keydown",termSplitOnKey,true);
-window.termSplit=termSplit;window.termSplitSync=termSplitSync;window.termSplitClose=termSplitClose;
+document.addEventListener("focusout",termSplitOnFocusOut,true);
+Object.assign(window,{trackerIsLocal,termExtProbe,termExtAllowed,termExtDeny,termResumable,termSplit,termSplitSet,termSplitOn,
+  termSplitOpen,termSplitClose,termSplitSnapshot,termSplitRestore});
 // Apply a style + size, the way setTheme() applies a theme: set the root attribute/var, cache it,
 // re-render what is already on the page, then announce it so other modules can redraw.
 function applyIconStyle(style,scalePercent){

@@ -518,7 +518,6 @@
 /* Read-only view (server-decided: app.js toggles html.tracker-readonly from X-Read-Only).
    Cosmetic only -- the server 403s every write regardless. Scoped under the class, never host-based. */
 html.tracker-readonly .cr-newsession,
-html.tracker-readonly .tracker-next .crd-row1-actions .tsplit,
 html.tracker-readonly .tracker-next [data-act="open-terminal"],
 html.tracker-readonly .tracker-next [data-act="resume"],
 html.tracker-readonly .tracker-next [data-act="external"],

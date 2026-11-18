@@ -1,31 +1,13 @@
-// Tier 1 — "Open terminal here" / "Resume in terminal" buttons, mounted into #ext_launch.
+// Tier 1 — the Resume / Open terminal split button (termSplit in app.js), mounted into #ext_launch.
 // Also mounts the (session-less) "+ New terminal" / "+ New Claude session" controls plus their
 // directory picker into #ext_launch_side, in the sidebar.
 // Registers itself into EXT (app.js's render hook) at load time; never edits app.js itself.
 // Concatenated into the same top-level <script> as app.js (see page.py), so `cur`, `EXT`,
 // `toast` and `esc` below are the real globals from app.js, not a guess at their shape.
 (function () {
-  // ponytail: deliberate, user-approved exception to the "never gate behaviour by host" rule in
-  // .claude/rules/conventions.md. Every other feature in this app works the same over a tunnel
-  // as on localhost; this one launches an OS process on whatever machine is running the server,
-  // so it must never be OFFERED to a remote viewer. It is cosmetics only — curl ignores it, and
-  // the server is what actually refuses (term_launch._local_caller). Do not "fix" it to match
-  // the usual rule, and do not mistake it for the security boundary. The in-browser buttons
-  // below (the "…here" pair and the sidebar's "+ New …" pair) are NOT covered by this exception
-  // — they run over the tunnel exactly like every other panel in this app.
-  function localOnly() {
-    return location.hostname === "localhost" || location.hostname === "127.0.0.1";
-  }
-
-  // Server owns policy (conventions rule 5): whether the terminal routes exist at all is
-  // TRACKER_TERMINAL + TRACKER_AUTH, which only the server knows. Tier 2 is concurrently adding
-  // GET /api/term/status, so we must not invent a route here — instead we ask the route we
-  // already have: a POST with an empty session runs term_gate.guard() FIRST, so it comes back
-  // 403 when the feature is off and 400 ("session required") when it is on. Nothing is launched
-  // either way. One probe per page load; any later 403 (e.g. proxied) latches the buttons off.
-  var allowed = null;                   // null = not asked yet, true/false = the server's answer
-  var probing = null;
-
+  // ponytail: the host/probe gating for the native (external) launch lives in app.js now: see
+  // trackerIsLocal() / termExtAllowed() / termExtProbe() / termExtDeny() there for the user-approved
+  // exception and the 403 latch. In-browser Resume / Open terminal are NOT covered by it.
   function post(payload) {
     return fetch("/api/term/open", {
       method: "POST",
@@ -34,20 +16,11 @@
     });
   }
 
-  function probe() {
-    if (!probing) {
-      probing = post({ session: "" })
-        .then(function (r) { allowed = r.status !== 403; })
-        .catch(function () { allowed = false; });
-    }
-    return probing;
-  }
-
   // Resume is Claude-only server-side (term_launch._is_claude, which reads registry.PROVIDERS —
   // that list is the source of truth for these prefixes; this copy only keeps a button from
   // appearing where it would always 400, and the server call is the real gate).
   function isClaudeId(sid) {
-    return !!sid && !/^(auggie|augment-vscode|augment-cursor):/.test(sid);
+    return termResumable(sid);
   }
 
   function hide(el) {
@@ -55,6 +28,7 @@
     el.innerHTML = "";
   }
 
+  let lastD;                            // the latest render(d), so a 403 can redraw without the external item
   async function openTerm(mode, extra) {
     if (!cur) return;
     const sidAtClick = cur;
@@ -70,11 +44,10 @@
       }
       if (!r.ok || j.error) {
         if (r.status === 403) {         // feature off, or the server refused us as remote
-          allowed = false;
-          // only the native sub-section hides -- the in-browser buttons are a different
+          // only the external item hides -- the in-browser buttons are a different
           // feature/gate entirely and must not disappear because native launch was refused.
-          const nat = document.getElementById("extnative");
-          if (nat) { nat.style.display = "none"; nat.innerHTML = ""; termSplitSync(nat.closest(".tsplit")); }
+          termExtDeny();
+          if (lastD !== undefined) render(lastD);
         }
         alert(j.error || "failed to open terminal");
         return;
@@ -92,7 +65,7 @@
   // truly global: no session need be selected, they now ask WHICH DIRECTORY via the picker
   // below. Rendered once at load (unlike render() further down, nothing about this depends on
   // session data, so there is no need to rebuild it on every 2s poll) and never host-gated —
-  // see the ponytail comment above localOnly(): that exception is for the native process
+  // see the ponytail comment at the top of this file: that exception is for the native process
   // launcher only, not these in-browser buttons.
   function buildSideControls() {
     var el = document.getElementById("ext_launch_side");
@@ -419,70 +392,42 @@
   //    host/viewport -- exactly as usable over the tunnel as any other panel). A disabled server
   //    feature (TRACKER_TERMINAL unset) surfaces as an in-modal error on click, not as a missing
   //    button -- see ExtVT.open's 403 handling in ext_vt.js.
-  //  - native "↗ External …" buttons: unchanged from before -- localOnly() + the existing
-  //    /api/term/open probe-and-latch, both already justified by the ponytail comment above.
+  //  - the split's external item: gated by trackerIsLocal() / termExtAllowed() and latched off by
+  //    termExtDeny() (all in app.js), justified by the ponytail comment at the top of this file.
   function render(d) {
     const el = document.getElementById("ext_launch");
     if (!el) return;
+    lastD = d;
     if (!cur) return hide(el);
     el.style.display = "";
     const resumable = isClaudeId(cur);
 
-    const openHtml =
-      '<button class="mini extlaunchbtn" id=extvtopenbtn ' +
-      'title="Open a terminal right here in the browser, cd\'d to this session\'s working directory">' +
-      ico("play") + " Open terminal here</button>";
-    const resumeHtml = resumable
-      ? '<button class="mini extlaunchbtn" id=extvtresumebtn ' +
-        'title="Resume this session in a terminal right here in the browser (claude --resume)">' +
-        ico("redo") + " Resume terminal here</button>"
-      : "";
-
-    let nativeHtml = "";
-    if (localOnly()) {
-      if (allowed === false) {          // latched off by a previous 403 -- nothing native this cycle
-        nativeHtml = "";
-      } else if (allowed === null) {    // not answered yet: probe, then redraw once it resolves
-        probe().then(function () { render(d); });
-      } else {
-        nativeHtml =
-          '<span id=extnative>' +
-          '<button class="mini extlaunchbtn" id=extopenbtn ' +
-          'title="Open an external Terminal/iTerm window, cd\'d here — this machine only">' + ico("external") + ' External terminal</button>' +
-          (resumable
-            ? '<button class="mini extlaunchbtn" id=extresumebtn ' +
-              'title="Resume via claude --resume in an external Terminal/iTerm window — this machine only">' + ico("external") + ' External resume</button>'
-            : "") +
-          "</span>";
-      }
-    }
-
     // Server-owned note (registry.parse_any -> meta.term_home_note); rendered verbatim, never derived
     // here. Empty (Auggie, or nothing to say) renders nothing.
     const homeNote = d && d.meta && typeof d.meta.term_home_note === "string" ? d.meta.term_home_note : "";
-    // Split button (termSplit, app.js): Resume is the primary for a Claude id with "Open terminal
-    // here" + the External pair in the caret's list; a non-Claude id has no Resume, so Open
-    // terminal here is the primary (alone, no caret, when there is no External either).
-    const vtHtml = termSplit(resumable ? resumeHtml : openHtml, (resumable ? openHtml : "") + nativeHtml, "mini extlaunchbtn");
-    // The pane is rebuilt on every 2 s poll: carry an open menu and the caret's focus across it.
-    const wasOpen = !!el.querySelector(".tsplit-menu[open]");
-    const ae = document.activeElement;
-    const hadFocus = !!(ae && ae.closest && ae.closest("#ext_launch .tsplit-caret"));
-    const fid = ae && ae.id && el.contains && el.contains(ae) ? ae.id : "";   // focus on a list item
-    el.innerHTML = vtHtml +
-      (homeNote ? '<div class="extlaunchnote" data-el="homenote">' + esc(homeNote) + "</div>" : "");
-    const menu = el.querySelector(".tsplit-menu");
-    if (menu && wasOpen) menu.open = true;
-    if (menu && hadFocus) { const sm = menu.querySelector("summary"); if (sm) sm.focus(); }
-    else if (fid) { const f = document.getElementById(fid); if (f && f.focus) f.focus(); }
-    const vb = document.getElementById("extvtopenbtn");
-    if (vb) vb.onclick = () => window.ExtVT ? window.ExtVT.open(cur, "cwd") : alert("in-browser terminal unavailable");
-    const vr = document.getElementById("extvtresumebtn");
-    if (vr) vr.onclick = () => window.ExtVT ? window.ExtVT.open(cur, "resume") : alert("in-browser terminal unavailable");
-    const ob = document.getElementById("extopenbtn");
-    if (ob) ob.onclick = () => openTerm("cwd");
-    const rb = document.getElementById("extresumebtn");
-    if (rb) rb.onclick = () => openTerm("resume");
+    // Split button (termSplit, app.js): Resume is the primary for a Claude id with "Open terminal" +
+    // the one external item in the caret's list; a non-Claude id has Open terminal as the primary.
+    // The pane is rebuilt on every 2 s poll: carry an open menu and focus across it.
+    const snap = termSplitSnapshot("ext_launch:");
+    el.innerHTML = homeNote ? '<div class="extlaunchnote" data-el="homenote">' + esc(homeNote) + "</div>" : "";
+    const split = termSplit({
+      key: "ext_launch:" + cur, primaryCls: "mini extlaunchbtn", caretCls: "mini extlaunchbtn", resumable,
+      icons: { resume: ico("redo"), open: ico("play") },
+      titles: {
+        resume: "Resume this session in a terminal right here in the browser (claude --resume)",
+        open: "Open a terminal right here in the browser, cd'd to this session's working directory",
+      },
+    });
+    if (el.firstChild) el.insertBefore(split, el.firstChild); else el.appendChild(split);
+    const ext = termExtAllowed();
+    termSplitSet(split, { resumable, ext: ext === true });
+    if (ext === null) termExtProbe().then(() => render(d));
+    termSplitOn(split, {
+      resume: () => window.ExtVT ? window.ExtVT.open(cur, "resume") : alert("in-browser terminal unavailable"),
+      open: () => window.ExtVT ? window.ExtVT.open(cur, "cwd") : alert("in-browser terminal unavailable"),
+      external: () => openTerm(resumable ? "resume" : "cwd"),
+    });
+    termSplitRestore(snap);
   }
 
   EXT.push(render);

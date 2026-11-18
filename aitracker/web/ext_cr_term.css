@@ -165,10 +165,6 @@
   white-space: nowrap;
 }
 .cr .cr-term-btn[hidden] { display: none; }
-/* Split button in the control bar (termSplit, app.js): the list drops into the terminal frame, above
-   the engine surface; its rows are full-width buttons. */
-.cr .cr-term-controlbar .tsplit-list { z-index: 80; }
-.cr .cr-term-controlbar .tsplit-list .cr-term-btn { justify-content: flex-start; }
 .cr .cr-term-btn-solid {
   background: var(--fill-action);
   color: var(--text-on-action);
