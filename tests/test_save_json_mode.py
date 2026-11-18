@@ -79,6 +79,10 @@ class SecureConfigFileTests(unittest.TestCase):
     def test_server_run_calls_it_before_binding(self):
         from aitracker import server
         calls = []
+        for attr in ("BIND_HOST", "BIND_PORT", "SERVICE"):
+            patcher = mock.patch.object(config, attr, getattr(config, attr))
+            patcher.start()
+            self.addCleanup(patcher.stop)
         with mock.patch.object(server, "secure_config_file", lambda: calls.append("chmod")), \
              mock.patch.object(server, "bind", side_effect=RuntimeError("stop")), \
              mock.patch.object(server.signal, "signal"):
@@ -118,6 +122,19 @@ class SecureConfigFileTests(unittest.TestCase):
             lambda c: mock.patch.object(c, "svc_baked", return_value=None),
             lambda c: mock.patch.object(c, "svc_install", return_value=2),
             lambda c: mock.patch.object(c, "_port_busy", return_value=False)))
+
+    def test_serve_install_failure_still_secures_config(self):
+        import sys
+        from aitracker import cli
+        store._save_json(self.p, {"TUNNEL_PASS": "x"})
+        os.chmod(self.p, 0o644)
+        with mock.patch.object(sys, "argv", ["aitracker", "--serve"]), \
+             mock.patch.object(cli, "svc_baked", return_value=None), \
+             mock.patch.object(cli, "_port_busy", return_value=False), \
+             mock.patch.object(cli, "svc_install", return_value=1):
+            with self.assertRaises(SystemExit):
+                cli.main()
+        self.assertEqual(_mode(self.p), 0o600)
 
 
 if __name__ == "__main__":

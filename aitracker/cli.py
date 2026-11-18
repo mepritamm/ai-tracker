@@ -6,6 +6,7 @@ import sys
 from . import __version__, config
 from .server import run, _port_busy
 from .pending import cli_main
+from .store import secure_config_file
 from .schedule import svc_install, svc_uninstall, svc_status, svc_baked, svc_spawn_deferred, svc_log_path
 
 HELP = """ai-tracker — live dashboard for AI coding sessions (Claude Code, Auggie, …).
@@ -52,6 +53,7 @@ def main():
     if in_svc and ("--serve" in sys.argv or "--install-service" in sys.argv or "--reinstall-service" in sys.argv):
         config.SERVICE = True       # write the plist only; the detached helper does launchctl
     if "--serve" in sys.argv:
+        secure_config_file()    # tighten config.json even if the service install below fails
         if os.environ.get("TRACKER_AUTH"):
             print("ai-tracker: note: TRACKER_AUTH is not carried into the background service (loopback-only, no login)", file=sys.stderr)
         baked = svc_baked()
@@ -73,6 +75,7 @@ def main():
             sys.exit(1)
         print("ai-tracker: cannot install as a service here; running in the foreground instead")
     if "--install-service" in sys.argv or "--reinstall-service" in sys.argv:
+        secure_config_file()
         if "--reinstall-service" in sys.argv and "PORT" not in os.environ:
             port, host = svc_baked() or (port, host)
         rc = svc_install(port, host)
