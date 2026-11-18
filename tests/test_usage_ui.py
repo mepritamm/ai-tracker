@@ -181,6 +181,19 @@ class UsageTab(unittest.TestCase):
         self.assertIn("your organisation's limits apply", r["text"])
         self.assertNotIn("nlimited", r["text"])
 
+    def test_empty_limits_message_only_without_credits(self):
+        none = dict(CLAUDE_A, limits=[], credits=None, message="No plan limits reported for this login.")
+        r = _run({"tab": "Usage", "routes": usage_routes(**{"/api/usage/claude": ok(none)})})
+        self.assertIn("No plan limits reported for this login.", r["text"])
+        self.assertEqual(r["credits"], 0)
+        cred = dict(CLAUDE_A, limits=[], message="", credits={"text": "$758.44 spent of $2000.00 this month", "utilization": 37.9, "note": ""})
+        r = _run({"tab": "Usage", "routes": usage_routes(**{"/api/usage/claude": ok(cred)})})
+        self.assertNotIn("No plan limits reported", r["text"])
+        self.assertEqual((r["rows"], r["credits"]), (0, 1))
+        both = dict(CLAUDE_A, credits=cred["credits"])
+        r = _run({"tab": "Usage", "routes": usage_routes(**{"/api/usage/claude": ok(both)})})
+        self.assertEqual((r["rows"], r["credits"]), (3, 1))
+
     def test_no_report_message_and_error(self):
         nr = dict(CLAUDE_A, state="no_report", limits=[], message="Claude Code returned no plan usage for this login")
         r = _run({"tab": "Usage", "routes": usage_routes(**{"/api/usage/claude": ok(nr)})})
@@ -301,7 +314,7 @@ class StaticChecks(unittest.TestCase):
         with open(os.path.join(os.path.dirname(_WEB), "accounts.py"), encoding="utf-8") as fh:
             acc = fh.read()
         js = self._fn("usageBlock") + self._fn("usageCard") + self._fn("auggieLoginBlock") + self._fn("openrouterKeyBlock")
-        for field in ("limits", "credits", "label", "percent", "resets_at", "severity", "active", "note", "text",
+        for field in ("limits", "credits", "label", "percent", "resets_at", "severity", "active", "utilization", "note", "text",
                       "message", "error", "account", "refreshing", "stale", "rows", "limit_text", "remaining_text", "free_tier",
                       "window", "cost_text", "sessions", "logged_in", "key_set", "file", "state", "at"):
             self.assertRegex(acc, r'["\']%s["\']' % field, field)

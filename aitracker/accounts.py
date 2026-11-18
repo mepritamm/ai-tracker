@@ -105,7 +105,7 @@ def _acct_num(v):
 
 def _acct_parse_usage_report(ur, sub):
     """-> (limits, credits). Built from named fields only: nothing else of `usage_report` is forwarded.
-    credits stays None until the usage-credits branch lands (gated on a probe of that account)."""
+    credits comes from rate_limits.extra_usage (see _acct_credits)."""
     limits = []
     rl = ur.get("rate_limits")
     for row in ((rl.get("limits") if isinstance(rl, dict) else None) or []):
@@ -134,7 +134,31 @@ def _acct_parse_usage_report(ur, sub):
         sev = row.get("severity") if row.get("severity") in _ACCT_SEVERITIES else "normal"
         limits.append({"kind": kind, "label": label, "percent": pct, "resets_at": ra, "severity": sev,
                        "active": row.get("is_active") is True})
-    return limits, None
+    return limits, _acct_credits(rl.get("extra_usage") if isinstance(rl, dict) else None, sub)
+
+
+def _acct_money(minor, cur):
+    """Minor units (cents for USD) -> text. USD is "$12.34"; any other currency "12.34 EUR"."""
+    return "$%.2f" % (minor / 100) if cur == "USD" else "%.2f %s" % (minor / 100, cur)
+
+
+def _acct_credits(eu, sub):
+    """The usage-credits block, only when extra_usage.is_enabled is exactly True (probed shape:
+    usage_report.rate_limits.extra_usage = {is_enabled, monthly_limit, used_credits, utilization, currency}).
+    A null monthly_limit (team/enterprise) is never rendered as "Unlimited"."""
+    if not isinstance(eu, dict) or eu.get("is_enabled") is not True:
+        return None
+    used = _acct_num(eu.get("used_credits"))
+    if used is None or used < 0:
+        return None
+    cur = eu.get("currency") if isinstance(eu.get("currency"), str) and re.fullmatch(r"[A-Z]{3}", eu.get("currency")) else "USD"
+    lim = _acct_num(eu.get("monthly_limit"))
+    util = _acct_num(eu.get("utilization"))
+    util = round(util, 1) if util is not None and 0 <= util <= 100 else None
+    text = ("%s spent of %s this month" % (_acct_money(used, cur), _acct_money(lim, cur)) if lim is not None and lim >= 0
+            else "%s spent this month · no monthly limit of its own" % _acct_money(used, cur))
+    return {"used_minor": used, "limit_minor": lim, "utilization": util, "currency": cur, "text": text,
+            "note": "your organisation's limits apply" if sub in ("team", "enterprise") else ""}
 
 
 def _acct_iso(s):

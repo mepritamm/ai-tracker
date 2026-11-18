@@ -79,6 +79,49 @@ class ClaudeUsageTests(Base):
                 self.out = (0, stream(report(extra_usage=eu)), b"")
                 self.assertIsNone(self.run_it()[0]["credits"])
 
+    def test_fixture_b_usage_credits_account(self):
+        # B: the probed usage-credits account's shape (empty limits, extra_usage inside rate_limits), neutral numbers.
+        eu = {"is_enabled": True, "monthly_limit": 200000, "used_credits": 75844, "utilization": 37.922, "currency": "USD"}
+        self.out = (0, stream(report(limits=[], extra_usage=eu)), b"")
+        body, ok, _ = self.run_it()
+        self.assertEqual((body["state"], ok, body["limits"], body["message"]), ("ok", True, [], ""))
+        c = body["credits"]
+        self.assertEqual(c["text"], "$758.44 spent of $2000.00 this month")
+        self.assertEqual((c["used_minor"], c["limit_minor"], c["utilization"], c["currency"], c["note"]),
+                         (75844, 200000, 37.9, "USD", ""))
+
+    def test_fixture_c_team_enterprise_null_limit_never_unlimited(self):
+        eu = {"is_enabled": True, "monthly_limit": None, "used_credits": 1234, "utilization": None, "currency": "USD"}
+        self.out = (0, stream(report(limits=[], extra_usage=eu)), b"")
+        for sub in ("team", "enterprise"):
+            with self.subTest(sub=sub), mock.patch.object(accounts, "claude_auth_cached", return_value={"label": "x", "subscription": sub}):
+                body = self.run_it()[0]
+                c = body["credits"]
+                self.assertEqual(c["text"], "$12.34 spent this month · no monthly limit of its own")
+                self.assertEqual((c["note"], c["limit_minor"], c["utilization"]), ("your organisation's limits apply", None, None))
+                self.assertNotIn("nlimited", json.dumps(body))
+        self.assertEqual(self.run_it()[0]["credits"]["note"], "")        # a max login: no organisation note
+
+    def test_credits_alongside_limits_and_other_currency(self):
+        eu = {"is_enabled": True, "monthly_limit": 5000, "used_credits": 250, "utilization": 5, "currency": "EUR"}
+        self.out = (0, stream(report(extra_usage=eu)), b"")
+        body = self.run_it()[0]
+        self.assertEqual(len(body["limits"]), 3)
+        self.assertEqual(body["credits"]["text"], "2.50 EUR spent of 50.00 EUR this month")
+
+    def test_credits_bad_values_are_none_or_sanitized(self):
+        for eu in ({"is_enabled": True, "used_credits": "9"}, {"is_enabled": True, "used_credits": True},
+                   {"is_enabled": True, "used_credits": -5}, {"is_enabled": True}):
+            with self.subTest(eu=eu):
+                self.out = (0, stream(report(limits=[], extra_usage=eu)), b"")
+                body = self.run_it()[0]
+                self.assertIsNone(body["credits"])
+                self.assertEqual(body["message"], "No plan limits reported for this login.")
+        eu = {"is_enabled": True, "monthly_limit": 100, "used_credits": 50, "utilization": 900, "currency": "<b>x</b>"}
+        self.out = (0, stream(report(limits=[], extra_usage=eu)), b"")
+        c = self.run_it()[0]["credits"]
+        self.assertEqual((c["utilization"], c["currency"], c["text"]), (None, "USD", "$0.50 spent of $1.00 this month"))
+
     def test_no_usage_report_is_no_report(self):
         self.out = (0, stream(None), b"")
         body, ok, _ = self.run_it()
