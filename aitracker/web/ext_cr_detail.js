@@ -35,7 +35,7 @@
 //   agents[]        {t,type,desc} — Task tool dispatches — claude.py:922-923,985
 //   agents_bg[]     {id,aid,wf,task,last,ts,running,state,waiting_on,tools} — claude.py:537-546,986
 //   shells[]        parse_shells() shape, opaque here — claude.py:971,988
-//   decisions[]     {t,open,answer,questions:[{q,header,options[]}]} — claude.py:924-929,990
+//   decisions[]     {t,open,answer,questions:[{q,header,options[],answer?}]} — claude.py:924-929,990
 //   waiting         bool — claude.py:993
 //   prs[]           {url,repo,num,created,narr,state,t,agent?} — util.py:162-220, claude.py:994
 //                   NOTE: no PR title is ever captured (only url/repo/num) — see REQUIRED ADDITION.
@@ -706,8 +706,12 @@
     });
     (session.decisions || []).forEach(function (d) {
       var t = parseT(d.t);
-      if (t != null) markers.push({ t: t, kind: "ask", glyph: "hourglass", label: "",
-        title: ((d.questions && d.questions[0] && d.questions[0].q) || "Question") + " · " + fmtClock(t) });
+      if (t != null) {
+        var sq = d.questions || [], sq0 = sq[0] || {}, sn = sq.length, sa = qAnswer(d, sq0, sn);
+        markers.push({ t: t, kind: "ask", glyph: "hourglass", label: "",
+          title: (sq0.q || "Question") + (sn > 1 ? " (+" + (sn - 1) + " more)" : "") +
+            (sn <= 1 && !d.open && sa ? " \u2192 " + sa : "") + " \u00b7 " + fmtClock(t) });
+      }
     });
     (session.agents_bg || []).forEach(function (a) {
       if (!a.running && a.ts) {
@@ -1167,24 +1171,31 @@
   // The awaiting-question card: same source (session.decisions, open pinned
   // first) the Decisions panel already renders in full -- this is a compact,
   // phone-only duplicate of just the top open question, not a second data path.
-  function renderPhoneAwaiting(node, session) {
+  function renderPhoneAwaiting(node, session, ui) {
     var card = qs(node, ".crd-phone-awaiting");
     if (!card) return;
     var open = (session.decisions || []).filter(function (d) { return d.open; });
-    if (!open.length) { card.hidden = true; card.innerHTML = ""; return; }
+    if (!open.length) { card.hidden = true; card.innerHTML = ""; card._qHtml = ""; return; }
     var d = open[0];
     var q0 = (d.questions && d.questions[0]) || { q: "", options: [] };
     var opts = (q0.options || []).map(function (o) {
       return '<div class="crd-phone-awaiting-opt">' + mdHtml(null, o) + "</div>";
     }).join("");
     card.hidden = false;
-    card.innerHTML =
+    var nq = (d.questions || []).length;
+    var html =
       '<div class="crd-phone-awaiting-head"><span class="tn-emo-a" aria-hidden="true">' + ico('hourglass') + '</span> Waiting on you' +
         (open.length > 1 ? '<span class="crd-phone-awaiting-more mono"> +' + (open.length - 1) + " more</span>" : "") +
       "</div>" +
-      '<div class="crd-phone-awaiting-q">' + mdHtml(null, q0.q) + "</div>" +
-      opts +
+      (nq > 1 ? questionPagerHtml(d, null, ui, "crd-phone-awaiting-opt", true)
+        : '<div class="crd-phone-awaiting-q">' + mdHtml(null, q0.q) + "</div>" + opts) +
       '<div class="crd-phone-awaiting-foot">View-only — answer in the session itself.</div>';
+    if (card._qHtml !== html) {
+      var fq = focusedQKey(card);
+      card.innerHTML = html;
+      card._qHtml = html;
+      refocusQ(card, fq);
+    }
   }
 
   // FIX 5: the old ad-hoc `isDegradedTranscript` (meta.source/entrypoint sniffed for
@@ -1576,6 +1587,8 @@
       sid: null,
       panels: {}, // key -> wrap element
       timelineSeen: 0,
+      timelineOpenAsks: -1,
+      qPage: {},
       // FIX (defect 1): the timeline is now newest-first (mergeTimeline sorts
       // descending), matching curNarr/app.js's "index 0 = newest" convention
       // (navFirst's own comment) and the server's own narrative[::-1]. "Stuck to
@@ -1756,6 +1769,7 @@
 
     // role=button panel headers (heartbeat/spine): Enter/Space activate like a click.
     node.addEventListener("keydown", function (ev) {
+      if (qPagerOnKey(ev, ui, node)) return;
       if (ev.key !== "Enter" && ev.key !== " ") return;
       var h = ev.target && ev.target.closest && ev.target.closest('[data-act="toggle-panel"][role="button"]');
       if (!h || h !== ev.target) return;
@@ -1782,6 +1796,7 @@
         ui.spineSession = null; ui.spineNowMs = null;
         ui.narrAcc = null; ui.timelineEntries = null;
         ui.diagramEntries = []; ui.timelineSeen = 0; ui.timelineStuckLatest = true;
+        ui.qPage = {}; ui.timelineOpenAsks = -1;
         ui.flagOpen = ui.noteOpen = ui.searchOpen = false;
         termSplitClose();
         [".crd-flagcard", ".crd-notecard", ".crd-searchcard"].forEach(function (c) {
@@ -1799,6 +1814,9 @@
     // ---- single delegated click handler ----
     node.addEventListener("click", function (ev) {
       if (ev.target.closest(".codecopy")) return;   // Copy inside a timeline entry copies; it must not also open the entry
+      var pg = ev.target.closest && ev.target.closest(".crd-qpager");
+      if (pg && !pg.contains(document.activeElement)) pg.focus({ preventScroll: true });   // Safari doesn't focus buttons on click
+      if (pg && ev.target.closest(".crd-qpager-head") && !ev.target.closest('[data-act^="qpage-"]')) return;   // counter/gap in the pager head: not an entry-open click
       var t = ev.target.closest("[data-act]");
       if (!t) return;
       var act = t.getAttribute("data-act");
@@ -1806,6 +1824,16 @@
       switch (act) {
         case "back":
           ctx.go("board");
+          break;
+        case "qpage-go":
+          if (pg) { goQPage(node, ui, pg.getAttribute("data-qkey"), +t.getAttribute("data-i")); focusFirstCur(pg); }
+          break;
+        case "qpage-step":
+          if (pg) {
+            var qk = pg.getAttribute("data-qkey");
+            goQPage(node, ui, qk, qPageStep((ui.qPage || {})[qk] || 0, +t.getAttribute("data-dir"), qsa(pg, ".crd-qpager-tab").length));
+            focusFirstCur(pg);
+          }
           break;
         case "cost":
           if (typeof openCostModal === "function") openCostModal((ui.lastSession || {}).cost || {});
@@ -2297,8 +2325,8 @@
     applyProgressView(node, pView);
     if (pView === "spine") renderSpine(node, ctx, session, nowMs, ui);
 
-    renderDecisions(ui.panels.decisions, session);
-    renderPhoneAwaiting(node, session);
+    renderDecisions(ui.panels.decisions, session, ui);
+    renderPhoneAwaiting(node, session, ui);
     renderPRs(ui.panels.prs, session);
     renderLinks(ui.panels.links, session);
     renderSummary(ui.panels.summary, ctx, session);
@@ -2781,7 +2809,7 @@
 
   // ---- State column panels ----
 
-  function renderDecisions(wrap, session) {
+  function renderDecisions(wrap, session, ui) {
     var decisions = session.decisions || [];
     var open = decisions.filter(function (d) { return d.open; });
     var closed = decisions.filter(function (d) { return !d.open; });
@@ -2790,10 +2818,16 @@
 
     function renderQ(d, isOpen) {
       var q0 = (d.questions && d.questions[0]) || { q: "", options: [] };
+      var nq = (d.questions || []).length;
+      if (nq > 1) {
+        var own = (d.questions || []).some(function (q) { return q.answer; });
+        return '<div class="crd-decision' + (isOpen ? " is-open" : "") + '">' +
+          questionPagerHtml(d, null, ui, "crd-decision-opt", true) + (!isOpen && !own ? answerHtml(null, d.answer) : "") + "</div>";
+      }
       var opts = (q0.options || []).map(function (o) {
         return '<div class="crd-decision-opt">' + mdHtml(null, o) + "</div>";
       }).join("");
-      var answer = !isOpen && d.answer ? '<div class="crd-decision-answer">Decided: ' + mdHtml(null, d.answer) + "</div>" : "";
+      var answer = isOpen ? "" : answerHtml(null, qAnswer(d, q0, 1));
       return '<div class="crd-decision' + (isOpen ? " is-open" : "") + '">' +
         '<div class="crd-decision-q">' + mdHtml(null, q0.q) + "</div>" +
         (isOpen ? opts : "") + answer + "</div>";
@@ -2810,7 +2844,12 @@
         closed.map(function (d) { return renderQ(d, false); }).join("");
     }
     if (!open.length && !closed.length) html = emptyHtml("No decisions recorded yet", "This session hasn't raised any questions. It will fill in as it works.");
-    setPanelBody(wrap, html);
+    if (wrap._qHtml !== html) {            // identical markup: leave the DOM (and its focus) alone
+      var fq = focusedQKey(wrap);
+      setPanelBody(wrap, html);
+      wrap._qHtml = html;
+      refocusQ(wrap, fq);
+    }
   }
 
   function renderPRs(wrap, session) {
@@ -3276,7 +3315,98 @@
     return ' data-act="timeline-entry-open" data-key="' + esc(e.key) + '"';
   }
 
-  function entryHtml(e, ctx, diagram) {
+  // ---- question pager + answer line (one implementation for card, panel, phone, modal, spine) ----
+  function qKey(d) { return String(d.t || "") + "#" + (d.questions || []).length; }
+  function qPageStep(i, dir, n) { return Math.max(0, Math.min(n - 1, i + dir)); }
+  // The single fallback rule: a question's own answer, else (single-question + closed) the decision's text.
+  function qAnswer(d, q, n) { return q.answer || (n <= 1 && !d.open ? (d.answer || "") : ""); }
+  // The ONLY place answer HTML is built (typography comes from Config's .cr-cfg-row-sub).
+  function answerHtml(ctx, text) {
+    return text ? '<div class="crd-answer cr-cfg-row-sub"><span class="crd-answer-arrow" aria-hidden="true">\u2192</span> ' + mdHtml(ctx, text) + "</div>" : "";
+  }
+  function questionPagerHtml(d, ctx, ui, optCls, showOpts) {
+    var qsl = d.questions || [], n = qsl.length, key = qKey(d);
+    var cur = qPageStep(((ui && ui.qPage) || {})[key] || 0, 0, n);
+    var tabs = qsl.map(function (q, i) {
+      return '<button type="button" role="tab" class="crd-qpager-tab' + (i === cur ? " is-cur" : "") + '" data-act="qpage-go" data-i="' + i +
+        '" aria-selected="' + (i === cur ? "true" : "false") + '" tabindex="' + (i === cur ? "0" : "-1") + '">' +
+        (qAnswer(d, q, n) ? "\u2612" : "\u2610") + " " + (q.header ? esc(q.header) : "Q" + (i + 1)) + "</button>";
+    }).join("");
+    function step(dir, label, arrow, dim) {
+      return '<button type="button" class="crd-qpager-step' + (dim ? " is-dim" : "") + '" data-act="qpage-step" data-dir="' + dir +
+        '" aria-label="' + label + '"' + (dim ? ' aria-disabled="true"' : "") + ">" + arrow + "</button>";
+    }
+    var panes = qsl.map(function (q, i) {
+      var opts = showOpts ? (q.options || []).map(function (o) { return '<div class="' + optCls + '">' + mdHtml(ctx, o) + "</div>"; }).join("") : "";
+      return '<div class="crd-qpager-pane" role="tabpanel" data-i="' + i + '"' + (i === cur ? "" : " hidden") + ">" +
+        '<div class="crd-qpager-q">' + mdHtml(ctx, q.q) + "</div>" + opts + answerHtml(ctx, qAnswer(d, q, n)) + "</div>";
+    }).join("");
+    return '<div class="crd-qpager" data-qkey="' + esc(key) + '" tabindex="-1" role="group" aria-label="' + n + ' questions">' +
+      '<div class="crd-qpager-head">' + step(-1, "Previous question", "\u2190", cur === 0) +
+      '<div class="crd-qpager-tabs" role="tablist">' + tabs + "</div>" + step(1, "Next question", "\u2192", cur === n - 1) +
+      '<span class="crd-qpager-pos mono">' + (cur + 1) + "/" + n + "</span></div>" + panes + "</div>";
+  }
+  // DOM-only page switch (hidden/is-cur/aria/dim/counter); no re-render.
+  function applyQPage(pg, i) {
+    qsa(pg, ".crd-qpager-pane").forEach(function (el, k) { el.hidden = k !== i; });
+    var tabs = qsa(pg, ".crd-qpager-tab");
+    tabs.forEach(function (el, k) {
+      el.classList.toggle("is-cur", k === i);
+      el.setAttribute("aria-selected", k === i ? "true" : "false");
+      el.setAttribute("tabindex", k === i ? "0" : "-1");
+    });
+    qsa(pg, ".crd-qpager-step").forEach(function (el, k) {
+      var dim = k === 0 ? i === 0 : i === tabs.length - 1;
+      el.classList.toggle("is-dim", dim);
+      el.setAttribute("aria-disabled", dim ? "true" : "false");
+    });
+    var pos = pg.querySelector(".crd-qpager-pos");
+    if (pos) pos.textContent = (i + 1) + "/" + tabs.length;
+  }
+  function goQPage(node, ui, key, i) {
+    ui.qPage = ui.qPage || {};
+    ui.qPage[key] = i;
+    qsa(node, ".crd-qpager").forEach(function (pg) {
+      if (pg.getAttribute("data-qkey") === key) applyQPage(pg, i);
+    });
+  }
+  function focusFirstCur(pg) {
+    var t = pg.querySelector(".crd-qpager-tab.is-cur");
+    try { (t || pg).focus({ preventScroll: true }); } catch (e) { try { (t || pg).focus(); } catch (e2) {} }
+  }
+  // Arrow keys page ONLY when focus is inside a pager (never a document-level grab).
+  function qPagerOnKey(ev, ui, node) {
+    if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return false;
+    if (ev.shiftKey || ev.metaKey || ev.ctrlKey || ev.altKey) return false;
+    var mm = document.getElementById("msgmodal"), dm = document.getElementById("diffmodal");
+    if ((mm && mm.style.display === "flex") || (dm && dm.style.display === "flex")) return false;
+    var pg = ev.target && ev.target.closest && ev.target.closest(".crd-qpager");
+    if (!pg || !node.contains(pg)) return false;
+    var key = pg.getAttribute("data-qkey"), n = qsa(pg, ".crd-qpager-tab").length;
+    ui.qPage = ui.qPage || {};
+    goQPage(node, ui, key, qPageStep(ui.qPage[key] || 0, ev.key === "ArrowRight" ? 1 : -1, n));
+    if (ev.target.classList && ev.target.classList.contains("crd-qpager-tab")) focusFirstCur(pg);
+    ev.preventDefault();
+    return true;
+  }
+  // Focus survives a repaint: remember where it was before the innerHTML write, restore after.
+  function focusedQKey(container) {
+    var a = document.activeElement;
+    var pg = a && container.contains(a) && a.closest && a.closest(".crd-qpager");
+    return pg ? { key: pg.getAttribute("data-qkey"), onTab: a.classList.contains("crd-qpager-tab") } : null;
+  }
+  function refocusQ(container, f) {
+    if (!f) return;
+    var pgs = qsa(container, ".crd-qpager");
+    for (var i = 0; i < pgs.length; i++) {
+      if (pgs[i].getAttribute("data-qkey") === f.key) {
+        if (f.onTab) focusFirstCur(pgs[i]); else pgs[i].focus({ preventScroll: true });
+        return;
+      }
+    }
+  }
+
+  function entryHtml(e, ctx, diagram, ui) {
     if (e.kind === "prompt") {
       return '<div class="crd-entry crd-entry-prompt"' + entryOpenAttrs(e) + '><span class="crd-entry-ts mono">' + fmtClock(e.t) + "</span>" +
         '<div class="crd-bubble crd-bubble-prompt">' + mdHtml(ctx, e.text) + "</div></div>";
@@ -3322,6 +3452,8 @@
       // same as narration/prompts -- mdHtml(ctx, ...), not esc(). See the mdHtml()
       // comment above for why this was the one asymmetry capability #31 missed.
       var opts = (q0.options || []).map(function (o) { return '<span class="crd-ask-pill">' + mdHtml(ctx, o) + "</span>"; }).join("");
+      var nq = (d.questions || []).length;
+      var anyOwn = (d.questions || []).some(function (q) { return q.answer; });
       // FIX (design-audit drift 6): 5b's ask bubble carries a mini-header
       // ("hourglass It asked you · still open") above the question — only while it's
       // still open; a closed decision doesn't claim to still be open. 5b's
@@ -3329,9 +3461,11 @@
       var miniHead = d.open ? '<div class="crd-ask-minihead"><span class="tn-emo-a" aria-hidden="true">' + svgIcon(ctx, "hourglass") + '</span>' +
         '<span class="crd-ask-minihead-label">It asked you · still open</span></div>' : "";
       return '<div class="crd-entry crd-entry-ask"' + entryOpenAttrs(e) + '><span class="crd-entry-ts mono crd-ts-ask">' + fmtClock(e.t) + "</span>" +
-        '<div class="crd-bubble crd-bubble-ask">' + miniHead + '<div class="crd-ask-q">' + mdHtml(ctx, q0.q) + "</div>" +
-        '<div class="crd-ask-opts">' + opts + "</div>" +
-        '<div class="crd-ask-note">View-only — answer in the session. The tracker never writes to it.</div></div></div>';
+        '<div class="crd-bubble crd-bubble-ask">' + miniHead +
+        (nq > 1 ? questionPagerHtml(d, ctx, ui, "crd-ask-pill", true) + (!d.open && !anyOwn ? answerHtml(ctx, d.answer) : "")
+          : '<div class="crd-ask-q">' + mdHtml(ctx, q0.q) + "</div>" +
+            '<div class="crd-ask-opts">' + opts + "</div>" + (d.open ? "" : answerHtml(ctx, qAnswer(d, q0, 1)))) +
+        (d.open ? '<div class="crd-ask-note">View-only — answer in the session. The tracker never writes to it.</div>' : "") + "</div></div>";
     }
     if (e.kind === "command" || e.kind === "command-fail") {
       var c = e.cmd;
@@ -3461,15 +3595,11 @@
     // failing command are "a result".
     results: ["command", "command-fail"]
   };
-  // NOTE (defect 2, ask's home): `ask` (a decision/open question) deliberately maps
-  // to NONE of the four chips. It's arguably conversational, but "talk only" is
-  // shipped, tested behaviour that excludes ask today (:kind==="prompt"||"narration"
-  // only) — folding it into the narration or prompts bucket would make toggling
-  // that chip silently start showing decisions under "talk only", changing behaviour
-  // the owner explicitly said not to touch. So ask stays exactly where it already
-  // was: visible only under the "all" preset (no chips active), same as before this
-  // fix. A fifth "questions" chip would be the clean way to make it independently
-  // selectable, if that's ever wanted — not invented here since it wasn't asked for.
+  // NOTE (defect 2, ask's home): `ask` (a decision/open question) still maps to
+  // NONE of the four chips (chips unchanged), but the "talk only" PRESET now
+  // includes it (user contract 2026-11-18: talk-only must include the
+  // questions/decisions as well). A fifth "questions" chip would be the clean way
+  // to make it independently selectable — not invented here since it wasn't asked for.
 
   function timelineActiveKinds(ui) {
     return TIMELINE_KIND_KEYS.filter(function (k) { return ui.timelineKindsOn && ui.timelineKindsOn[k]; });
@@ -3484,8 +3614,8 @@
       }
       return false;
     }
-    // No chip active — defer to the existing, unchanged all/talk preset.
-    return ui.timelineFilter === "talk" ? (e.kind === "prompt" || e.kind === "narration") : true;
+    // No chip active — defer to the all/talk preset; talk = prompts, narration and questions/decisions.
+    return ui.timelineFilter === "talk" ? (e.kind === "prompt" || e.kind === "narration" || e.kind === "ask") : true;
   }
 
   function updateTimelineFilterButtons(wrap, ui) {
@@ -3511,7 +3641,7 @@
       return emptyHtml("No " + nouns.join(" or ") + " recorded",
         "This session hasn't produced any yet — some providers (Auggie, Augment) never will, since they carry no commands/tools data.");
     }
-    if (ui.timelineFilter === "talk") return emptyHtml("No prompts or narration recorded yet", "Talk-only shows just what was said.");
+    if (ui.timelineFilter === "talk") return emptyHtml("No prompts, narration or questions recorded yet", "Talk-only shows what was said and asked.");
     return emptyHtml("Nothing recorded yet", "The first prompt starts the conversation.");
   }
 
@@ -3549,13 +3679,15 @@
     // filtered, newest-first list, so index 0 is "the newest visible entry".
     ui.timelineEntries = filtered;
 
-    if (force || filtered.length !== ui.timelineSeen || !scrollEl.childNodes.length) {
+    var openAsks = filtered.filter(function (e) { return e.kind === "ask" && e.decision && e.decision.open; }).length;
+    if (force || filtered.length !== ui.timelineSeen || openAsks !== ui.timelineOpenAsks || !scrollEl.childNodes.length) {
+      var fq = focusedQKey(scrollEl);
       var wasStuck = ui.timelineStuckLatest;
       var prevScrollTop = scrollEl.scrollTop;
       var heightBefore = scrollEl.scrollHeight;
       var olderEl = scrollEl.querySelector(".crd-timeline-older"); // preserved across the repaint below
       scrollEl.innerHTML = filtered.length ?
-        filtered.map(function (e) { return entryHtml(e, ctx, diagramByKey[e.key]); }).join("") :
+        filtered.map(function (e) { return entryHtml(e, ctx, diagramByKey[e.key], ui); }).join("") :
         "";
       if (!filtered.length) scrollEl.innerHTML = timelineEmptyMessage(ui);
       if (olderEl) scrollEl.appendChild(olderEl); // FIX (defect 1): older status lives at the bottom now
@@ -3576,7 +3708,9 @@
       // ahead of this file into one <script> tag by page.py's build_page(), so it's a
       // reachable global here, not a re-implementation).
       if (typeof upgradeMermaidIn === "function") upgradeMermaidIn(scrollEl);
+      refocusQ(scrollEl, fq);
       ui.timelineSeen = filtered.length;
+      ui.timelineOpenAsks = openAsks;
       // FIX (defect 1): newest-first means fresh entries are prepended at the TOP
       // now, not appended at the bottom — so a reader who isn't stuck-to-latest
       // needs the opposite compensation the old oldest-first code never needed.
@@ -3600,10 +3734,21 @@
       var d = e.decision || {};
       var q0 = (d.questions && d.questions[0]) || { q: "", options: [] };
       var lines = [];
-      if (q0.q) lines.push("**" + q0.q + "**");
-      (q0.options || []).forEach(function (o) { lines.push("- " + o); });
-      if (!d.open && d.answer) lines.push("\n**Decided:** " + d.answer);
-      else if (d.open) lines.push("\n_View-only — answer in the session itself; the tracker never writes to it._");
+      var nq = (d.questions || []).length;
+      if (nq > 1) {
+        d.questions.forEach(function (q, i) {
+          lines.push((i ? "\n" : "") + "**" + (i + 1) + "/" + nq + (q.header ? " \u00b7 " + q.header : "") + "** \u2014 " + q.q);
+          if (d.open) (q.options || []).forEach(function (o) { lines.push("- " + o); });
+          var a = qAnswer(d, q, nq);
+          if (a) lines.push("\u2192 " + a);
+        });
+        if (!d.open && d.answer && !d.questions.some(function (q) { return q.answer; })) lines.push("\n\u2192 " + d.answer);
+      } else {
+        if (q0.q) lines.push("**" + q0.q + "**");
+        (q0.options || []).forEach(function (o) { lines.push("- " + o); });
+        if (!d.open && qAnswer(d, q0, 1)) lines.push("\n\u2192 " + qAnswer(d, q0, 1));
+      }
+      if (d.open) lines.push("\n_View-only — answer in the session itself; the tracker never writes to it._");
       return { title: "Decision", when: when, text: lines.join("\n") };
     }
     if (e.kind === "command" || e.kind === "command-fail") {
@@ -3764,6 +3909,7 @@
     groupAgentReruns: groupAgentReruns,
     // defect 2 / defect 3 additions, exposed the same way as everything above:
     timelineEntryVisible: timelineEntryVisible,
+    timelineEmptyMessage: timelineEmptyMessage,
     TIMELINE_KIND_MAP: TIMELINE_KIND_MAP,
     timelineEntryModalPayload: timelineEntryModalPayload,
     openTimelineEntry: openTimelineEntry,
@@ -3776,6 +3922,12 @@
     renderHeartbeat: renderHeartbeat,
     setPanelCollapsed: setPanelCollapsed,
     mdHtml: mdHtml,
-    renderDecisions: renderDecisions
+    renderDecisions: renderDecisions,
+    renderPhoneAwaiting: renderPhoneAwaiting,
+    entryHtml: entryHtml,
+    buildMarkers: buildMarkers,
+    qKey: qKey, qPageStep: qPageStep, qAnswer: qAnswer, answerHtml: answerHtml,
+    questionPagerHtml: questionPagerHtml, qPagerOnKey: qPagerOnKey,
+    focusedQKey: focusedQKey, refocusQ: refocusQ
   };
 })();

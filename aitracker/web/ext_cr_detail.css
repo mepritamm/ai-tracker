@@ -1088,7 +1088,17 @@
   border: 1px solid var(--line-subtle);
   border-radius: 6px;
 }
-.cr .crd-decision-answer { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
+.cr .cr-cfg-row-sub.crd-answer { color: var(--text-secondary); margin-top: 4px; }
+.cr .crd-answer-arrow { color: var(--text-muted); }
+.cr .crd-qpager:focus { outline: none; }
+.cr .crd-qpager:focus-visible { outline: 2px solid var(--line-default); outline-offset: 2px; }
+.cr .crd-qpager-head { display: flex; align-items: center; gap: 6px; }
+.cr .crd-qpager-tabs { display: flex; flex-wrap: wrap; gap: 4px; flex: 1; min-width: 0; }
+.cr .crd-qpager-tab { white-space: nowrap; max-width: 14ch; overflow: hidden; text-overflow: ellipsis; font: inherit; font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line-subtle); background: none; color: var(--text-secondary); }
+.cr .crd-qpager-tab.is-cur { color: var(--text-primary); border-color: currentColor; font-weight: 600; }
+.cr .crd-qpager-step { background: none; border: 0; color: inherit; font: inherit; }
+.cr .crd-qpager-step.is-dim { opacity: .35; }
+.cr .crd-qpager-pos { font-size: 10.5px; color: var(--text-muted); }
 .cr .crd-decision-footrule {
   font-size: 10.5px;
   color: var(--text-muted);
@@ -1486,6 +1496,7 @@
 .cr .crd-summary-body code,
 .cr .crd-agent-title code,
 .cr .crd-ask-q code,
+.cr .crd-answer code,
 .cr .crd-ask-pill code { font-family: var(--font-mono); background: var(--surface-sunken); padding: 1px 4px; border-radius: 3px; overflow-wrap: anywhere; }
 
 /* TASK 2 (capability #33, "Copy per code block — on every fence"): mdHtml()
@@ -1886,6 +1897,7 @@
   display: none;
 }
 @media (max-width: 600px) {
+  .cr .crd-qpager-step, .cr .crd-qpager-tab { min-height: 44px; min-width: 44px; }
   /* Doc 03's phone layout ("Detail:" list) never includes the stat-chip row
      among the phone detail's pieces — it names status bar, back chevron +
      breadcrumb, presence orb, live narration, the compressed spine, the chat

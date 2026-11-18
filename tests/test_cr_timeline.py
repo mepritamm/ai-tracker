@@ -171,8 +171,180 @@ def _talk_only_provider_detail():
     )
 
 
+def _decisions_detail():
+    qs = [{"q": "pick?", "options": ["a", "b"]}]
+    return make_detail(
+        requests=[{"t": iso_ms(BASE + 10_000), "text": "go"}],
+        decisions=[
+            {"t": iso_ms(BASE + 20_000), "open": False, "answer": "a", "questions": qs},
+            {"t": iso_ms(BASE + 30_000), "open": True, "answer": "", "questions": qs},
+        ],
+    )
+
+
+def _multi_q_detail():
+    def q(text, header="", opts=("a",), answer=None):
+        d = {"q": text, "header": header, "options": list(opts)}
+        if answer is not None:
+            d["answer"] = answer
+        return d
+    return make_detail(decisions=[
+        {"t": iso_ms(BASE + 1_000), "open": True, "answer": "",
+         "questions": [q("Scope q?", "Scope", ("a", "b")), q("Second q?", "", ("c",)), q("DB q?", "DB", ("pg",))]},
+        {"t": iso_ms(BASE + 2_000), "open": False, "answer": '"Q1"="A", "Q2"="B"',
+         "questions": [q("Q1", "", ("A", "Z"), "A"), q("Q2", "", ("B",), "B")]},
+        {"t": iso_ms(BASE + 3_000), "open": False, "answer": '"Ship?"="Yes"',
+         "questions": [q("Ship?", "", ("Yes", "No"), "Yes")]},
+        {"t": iso_ms(BASE + 4_000), "open": False, "answer": "ok",
+         "questions": [q("Proceed?", "", ("Yes",))]},
+        {"t": iso_ms(BASE + 5_000), "open": True, "answer": "",
+         "questions": [q("Auggie open?", "", ("x",))]},
+    ])
+
+
+_MULTI_Q_JS = r"""
+(function () {
+  var I = window.CR.detail._internal, MQ = __MQ__, R = {};
+  OUT.mq = R;
+  function T(name, fn) { try { R[name] = fn(); } catch (e) { R[name] = { err: String(e && e.stack || e) }; } }
+  var entries = I.mergeTimeline(MQ);
+  function ask(textStart) {
+    return entries.filter(function (e) { return e.kind === "ask" && e.decision.questions[0].q.indexOf(textStart) === 0; })[0];
+  }
+  var ask3 = ask("Scope q"), closed2 = ask("Q1"), closed1 = ask("Ship"), augC = ask("Proceed"), augO = ask("Auggie");
+  function fakeWrap() { return makeEl(); }
+
+  T("pager", function () { return I.entryHtml(ask3, null, null, { qPage: {} }); });
+  T("key", function () { return I.qKey(ask3.decision); });
+  T("page2", function () {
+    var k = I.qKey(ask3.decision), a = { qPage: {} }, b = { qPage: {} };
+    a.qPage[k] = 2; b.qPage[k] = 9;
+    return { ok: I.entryHtml(ask3, null, null, a), clamp: I.entryHtml(ask3, null, null, b) };
+  });
+  T("step", function () { return [I.qPageStep(0, -1, 3), I.qPageStep(2, 1, 3), I.qPageStep(0, 1, 3)]; });
+
+  function fakePager(key, n) {
+    var tabs = [], prevent = 0;
+    for (var i = 0; i < n; i++) tabs.push(makeEl());
+    var steps = [makeEl(), makeEl()], panes = [makeEl(), makeEl(), makeEl()], pos = makeEl();
+    var pg = makeEl();
+    pg.getAttribute = function (a) { return a === "data-qkey" ? key : null; };
+    pg.querySelectorAll = function (sel) {
+      if (sel.indexOf("tab") >= 0 && sel.indexOf("is-cur") < 0) return tabs;
+      if (sel.indexOf("pane") >= 0) return panes;
+      if (sel.indexOf("step") >= 0) return steps;
+      return [];
+    };
+    pg.querySelector = function (sel) { return sel.indexOf("is-cur") >= 0 ? tabs[0] : (sel.indexOf("pos") >= 0 ? pos : null); };
+    pg.focus = function () { pg._focused = true; };
+    pg._tabs = tabs;
+    return pg;
+  }
+  function fakeNode(pg) {
+    var n = makeEl();
+    n.contains = function (x) { return x === pg || (pg && pg._tabs.indexOf(x) >= 0); };
+    n.querySelectorAll = function (sel) { return sel.indexOf("crd-qpager") >= 0 ? [pg] : []; };
+    return n;
+  }
+  function ev(target, over) {
+    var e = { key: "ArrowRight", target: target, shiftKey: false, metaKey: false, ctrlKey: false, altKey: false, prevented: 0,
+              preventDefault: function () { e.prevented++; } };
+    for (var k in (over || {})) e[k] = over[k];
+    return e;
+  }
+  T("keys", function () {
+    var K = "kk#3", pg = fakePager(K, 3), node = fakeNode(pg), out = {};
+    document.getElementById("msgmodal").style.display = "";   // the pop-out test above left it "flex"
+    var inside = makeEl(); inside.closest = function () { return pg; };
+    var outside = makeEl(); outside.closest = function () { return null; };
+    var ui = { qPage: {} }, e1 = ev(inside);
+    out.right = I.qPagerOnKey(e1, ui, node); out.page = ui.qPage[K]; out.prevented = e1.prevented;
+    var ui2 = { qPage: {} };
+    out.outside = I.qPagerOnKey(ev(outside), ui2, node); out.outsidePage = ui2.qPage[K];
+    out.j = I.qPagerOnKey(ev(inside, { key: "j" }), { qPage: {} }, node);
+    out.mods = ["shiftKey", "metaKey", "ctrlKey", "altKey"].map(function (m) {
+      var o = {}; o[m] = true; return I.qPagerOnKey(ev(inside, o), { qPage: {} }, node); });
+    var mm = document.getElementById("msgmodal"); mm.style.display = "flex";
+    out.modal = I.qPagerOnKey(ev(inside), { qPage: {} }, node);
+    mm.style.display = "";
+    return out;
+  });
+  T("refocus", function () {
+    var K = "kk#3", pg = fakePager(K, 3), cont = fakeNode(pg), out = {};
+    var tab = makeEl();
+    tab.classList = { contains: function (c) { return c === "crd-qpager-tab"; }, add() {}, remove() {}, toggle() {} };
+    tab.closest = function () { return pg; };
+    cont.contains = function (x) { return x === tab; };
+    document.activeElement = tab;
+    var f = I.focusedQKey(cont); out.f = f;
+    var focusArgs = null, cur = pg._tabs[0];
+    cur.focus = function (a) { focusArgs = a || true; };
+    var newC = fakeNode(pg);
+    I.refocusQ(newC, f); out.focusArgs = focusArgs;
+    var gone = makeEl(); gone.querySelectorAll = function () { return []; }; gone.querySelector = function () { return null; };
+    focusArgs = null; I.refocusQ(gone, f); out.goneCalls = focusArgs;
+    I.refocusQ(newC, null); out.nullNoop = focusArgs;
+    document.activeElement = null;
+    return out;
+  });
+  function repaintCase(render, rootKey, probeSel) {
+    var openD = MQ.decisions.filter(function (d) { return d.open; })[0];
+    var K = I.qKey(openD), out = { key: K };
+    var pg = fakePager(K, 3), body = makeEl();
+    var tab = makeEl(), calls = [];
+    tab.classList = { contains: function (c) { return c === "crd-qpager-tab"; }, add() {}, remove() {}, toggle() {} };
+    tab.closest = function () { return pg; };
+    pg._tabs[0].focus = function (a) { calls.push(a || true); };
+    var root = makeEl();
+    root.contains = function (x) { return x === tab; };
+    root.querySelector = function (sel) { return sel.indexOf("crd-qpager") >= 0 ? pg : (sel === probeSel ? root : body); };
+    root.querySelectorAll = function (sel) { return sel.indexOf("crd-qpager") >= 0 ? [pg] : []; };
+    var u = { qPage: {} };
+    document.activeElement = null;
+    render(root, MQ, u);
+    document.activeElement = tab;
+    u.qPage[K] = 1;
+    render(root, MQ, u);
+    document.activeElement = null;
+    out.calls = calls;
+    return out;
+  }
+  T("panelRefocus", function () { return repaintCase(I.renderDecisions, "wrap", ""); });
+  T("phoneRefocus", function () { return repaintCase(I.renderPhoneAwaiting, "node", ".crd-phone-awaiting"); });
+  T("single", function () { return I.entryHtml(augO, null, null, { qPage: {} }); });
+  T("closedSingle", function () {
+    return { yes: I.entryHtml(closed1, null, null, { qPage: {} }), aug: I.entryHtml(augC, null, null, { qPage: {} }) };
+  });
+  T("panel", function () { var w = fakeWrap(); I.renderDecisions(w, MQ, { qPage: {} }); return w.innerHTML; });
+  T("phone", function () { var n = fakeWrap(); I.renderPhoneAwaiting(n, MQ, { qPage: {} }); return n.innerHTML; });
+  T("markers", function () {
+    var base = entries[0].t;
+    return I.buildMarkers(MQ, base + 10000, base - 10000, base + 10000, false)
+      .filter(function (m) { return m.kind === "ask"; }).map(function (m) { return m.title; });
+  });
+  T("modal", function () {
+    return { o3: I.timelineEntryModalPayload(ask3).text, c2: I.timelineEntryModalPayload(closed2).text,
+             o1: I.timelineEntryModalPayload(augO).text };
+  });
+  T("degrade", function () {
+    var bare = { kind: "ask", t: 1, key: "k", decision: { t: "x", open: true, questions: [], answer: "" } };
+    var w = fakeWrap(); I.renderDecisions(w, make0(), { qPage: {} });
+    return { bare: I.entryHtml(bare, null, null, { qPage: {} }), empty: w.innerHTML };
+    function make0() { return { decisions: [] }; }
+  });
+  T("answerHtml", function () { return { a: I.answerHtml(null, "**x**"), b: I.answerHtml(null, "") }; });
+  T("answerPaths", function () {
+    var k = I.qKey(closed2.decision), pages = [0, 1].map(function (i) {
+      var u = { qPage: {} }; u.qPage[k] = i; return I.entryHtml(closed2, null, null, u); });
+    return { pages: pages, panel: (function () { var w = fakeWrap(); I.renderDecisions(w, MQ, { qPage: {} }); return w.innerHTML; })() };
+  });
+})();
+"""
+
+
 def _driver_js():
     detail = _mixed_detail()
+    decisions_detail = _decisions_detail()
     provider_detail = _talk_only_provider_detail()
     bundle_html = _read_page()
     bundle_js = _extract_script_content(bundle_html)
@@ -180,12 +352,13 @@ def _driver_js():
     js_body = r"""
 var detail = %s;
 var providerDetail = %s;
+var decisionsDetail = %s;
 var OUT = {};
 
 // -- defect 1: newest-first -------------------------------------------------
 OUT.merged = window.CR.detail._internal.mergeTimeline(detail).map(function(e){ return {kind:e.kind, t:e.t}; });
 
-// -- defect 2: kind mapping + talk-only unchanged ---------------------------
+// -- defect 2: kind mapping + talk-only = prompts + narration + questions ---------------------------
 function visibleKinds(ui) {
   return window.CR.detail._internal.mergeTimeline(detail)
     .filter(function (e) { return window.CR.detail._internal.timelineEntryVisible(e, ui); })
@@ -199,6 +372,11 @@ OUT.chipTools = visibleKinds({ timelineFilter: "all", timelineKindsOn: { tools: 
 OUT.chipResults = visibleKinds({ timelineFilter: "all", timelineKindsOn: { results: true } });
 OUT.chipUnion = visibleKinds({ timelineFilter: "all", timelineKindsOn: { prompts: true, tools: true } });
 OUT.kindMap = window.CR.detail._internal.TIMELINE_KIND_MAP;
+OUT.talkDecisions = window.CR.detail._internal.mergeTimeline(decisionsDetail)
+  .filter(function (e) { return window.CR.detail._internal.timelineEntryVisible(e, { timelineFilter: "talk", timelineKindsOn: {} }); })
+  .filter(function (e) { return e.kind === "ask"; })
+  .map(function (e) { return e.decision.open; });
+OUT.talkEmpty = window.CR.detail._internal.timelineEmptyMessage({ timelineFilter: "talk", timelineKindsOn: {} });
 
 // Provider parity: Auggie/augment-* never emit a command/tool entry, so the
 // "results"/"tools" chips must yield an EMPTY list, never throw.
@@ -233,9 +411,11 @@ OUT.payloadPrompt = window.CR.detail._internal.timelineEntryModalPayload(
   filteredAll.filter(function (e) { return e.kind === "prompt"; })[0]
 );
 
+__MQ_BLOCK__
 console.log("===CR_TIMELINE_JSON_START===");
 console.log(JSON.stringify(OUT));
-""" % (json.dumps(detail), json.dumps(provider_detail))
+""" % (json.dumps(detail), json.dumps(provider_detail), json.dumps(decisions_detail))
+    js_body = js_body.replace("__MQ_BLOCK__", _MULTI_Q_JS.replace("__MQ__", json.dumps(_multi_q_detail())))
 
     return "\n".join([_JS_PREAMBLE, bundle_js, _JS_MID, js_body])
 
@@ -409,7 +589,7 @@ class TestCRTimeline(unittest.TestCase):
         self.assertEqual(merged[0]["kind"], "command-fail")
         self.assertEqual(merged[-1]["kind"], "prompt")
 
-    # -- defect 2: the four chips + talk-only unchanged ----------------------
+    # -- defect 2: the four chips + talk-only = prompts + narration + questions ----------------------
 
     def test_default_all_shows_every_kind_including_ask(self):
         self.assertEqual(
@@ -417,9 +597,16 @@ class TestCRTimeline(unittest.TestCase):
             sorted(["prompt", "narration", "ask", "command", "command-fail", "tool"]),
         )
 
-    def test_talk_only_is_unchanged_prompt_and_narration_only(self):
-        self.assertEqual(sorted(self.OUT["talkOnly"]), ["narration", "prompt"])
-        self.assertNotIn("ask", self.OUT["talkOnly"])
+    def test_talk_only_shows_prompts_narration_and_questions(self):
+        self.assertEqual(sorted(self.OUT["talkOnly"]), ["ask", "narration", "prompt"])
+        for k in ("command", "command-fail", "tool"):
+            self.assertNotIn(k, self.OUT["talkOnly"])
+
+    def test_talk_only_shows_open_and_answered_decisions(self):
+        self.assertEqual(sorted(self.OUT["talkDecisions"]), [False, True])
+
+    def test_talk_only_empty_message_names_questions(self):
+        self.assertIn("questions", self.OUT["talkEmpty"])
 
     def test_chip_prompts_yields_only_prompt(self):
         self.assertEqual(self.OUT["chipPrompts"], ["prompt"])
@@ -477,6 +664,181 @@ class TestCRTimeline(unittest.TestCase):
         p = self.OUT["payloadPrompt"]
         self.assertEqual(p["title"], "Prompt")
         self.assertEqual(p["text"], "do the thing")
+
+    # -- multi-question pager + answers (every path renders through the shared helpers) ------------
+
+    def _mq(self, name):
+        v = self.OUT["mq"][name]
+        if isinstance(v, dict) and "err" in v:
+            self.fail("driver step %r threw: %s" % (name, v["err"]))
+        return v
+
+    @staticmethod
+    def _panes(html):
+        return re.findall(r'<div class="crd-qpager-pane"[^>]*>', html)
+
+    def test_card_pager_renders_every_question(self):
+        h = self._mq("pager")
+        self.assertIn("crd-qpager", h)
+        for t in ("Scope q?", "Second q?", "DB q?"):
+            self.assertIn(t, h)
+        for lab in ("Scope", "Q2", "DB"):
+            self.assertIn(lab, h)
+        panes = self._panes(h)
+        self.assertEqual(len(panes), 3)
+        self.assertEqual(len([x for x in panes if " hidden" not in x]), 1)
+        prev = re.search(r'<button[^>]*data-dir="-1"[^>]*>', h).group(0)
+        self.assertIn('aria-disabled="true"', prev)
+        self.assertNotIn(" disabled", prev)
+        self.assertRegex(h, r'<div class="crd-qpager"[^>]*tabindex="-1"')
+
+    def test_card_pager_respects_ui_page(self):
+        r = self._mq("page2")
+        for h in (r["ok"], r["clamp"]):
+            vis = [x for x in self._panes(h) if " hidden" not in x]
+            self.assertEqual(len(vis), 1)
+            self.assertIn('data-i="2"', vis[0])
+            self.assertIn("3/3", h)
+
+    def test_qpage_step_clamps(self):
+        self.assertEqual(self._mq("step"), [0, 2, 1])
+
+    def test_arrow_keys_page_only_when_focus_in_pager(self):
+        k = self._mq("keys")
+        self.assertIs(k["right"], True)
+        self.assertEqual(k["page"], 1)
+        self.assertEqual(k["prevented"], 1)
+        self.assertIs(k["outside"], False)
+        self.assertIsNone(k.get("outsidePage"))
+        self.assertIs(k["j"], False)
+        self.assertEqual(k["mods"], [False] * 4)
+        self.assertIs(k["modal"], False)
+
+    def test_refocus_restores_pager_focus(self):
+        r = self._mq("refocus")
+        self.assertEqual(r["f"], {"key": "kk#3", "onTab": True})
+        self.assertEqual(r["focusArgs"], {"preventScroll": True})
+        self.assertIsNone(r["goneCalls"])
+        self.assertIsNone(r["nullNoop"])
+
+    def test_panel_repaint_restores_pager_focus(self):
+        r = self._mq("panelRefocus")
+        self.assertEqual(r["calls"], [{"preventScroll": True}])
+
+    def test_phone_repaint_restores_pager_focus(self):
+        r = self._mq("phoneRefocus")
+        self.assertEqual(r["calls"], [{"preventScroll": True}])
+
+    @staticmethod
+    def _fn_slice(js, start, end_marker="\n  function "):
+        i = js.index(start)
+        j = js.find(end_marker, i + len(start))
+        return js[i:j if j >= 0 else len(js)]
+
+    def test_repaint_sites_wired_source_pins(self):
+        js = open(os.path.join(_ROOT, "aitracker", "web", "ext_cr_detail.js"), encoding="utf-8").read()
+        tl = self._fn_slice(js, "function renderTimelineEntries")
+        for needle in ("focusedQKey(scrollEl)", "refocusQ(scrollEl, fq)", "openAsks !== ui.timelineOpenAsks"):
+            self.assertIn(needle, tl)
+        for fn in ("function renderDecisions", "function renderPhoneAwaiting"):
+            body = self._fn_slice(js, fn)
+            self.assertIn("focusedQKey(", body, fn)
+            self.assertIn("refocusQ(", body, fn)
+        i = js.index('node.addEventListener("click", function (ev) {')
+        h = js[i:i + 1500]
+        self.assertIn("pg.focus({ preventScroll: true })", h)
+        self.assertLess(h.index("pg.focus({ preventScroll: true })"), h.index('closest("[data-act]")'))
+
+    def test_single_question_ask_renders_unchanged(self):
+        h = self._mq("single")
+        self.assertNotIn("crd-qpager", h)
+        for t in ("crd-ask-q", "crd-ask-pill", "View-only"):
+            self.assertIn(t, h)
+
+    def test_closed_single_question_card_shows_answer(self):
+        r = self._mq("closedSingle")
+        h = r["yes"]
+        self.assertIn('class="crd-answer cr-cfg-row-sub"', h)
+        self.assertIn("</span> Yes</div>", h)
+        self.assertNotIn('"Ship?"=', h)
+        self.assertNotIn("answer in the session", h)
+        self.assertIn("</span> ok</div>", r["aug"])
+
+    def test_decisions_panel_pages_open_and_closed_multi_q(self):
+        h = self._mq("panel")
+        self.assertEqual(h.count('class="crd-qpager"') , 2)
+        for t in ("Scope q?", "Second q?", "DB q?", "Q1", "Q2"):
+            self.assertIn(t, h)
+        self.assertIn("crd-decision-opt", h)
+        self.assertNotIn('"Q1"="A"', h)
+        self.assertNotIn("Decided:", h)
+
+    def test_phone_awaiting_pages_multi_q(self):
+        h = self._mq("phone")
+        self.assertIn("crd-qpager", h)
+        for t in ("Scope q?", "Second q?", "DB q?"):
+            self.assertIn(t, h)
+
+    def test_spine_marker_title_counts_more(self):
+        titles = self._mq("markers")
+        self.assertTrue(any("Scope q? (+2 more)" in t for t in titles), titles)
+        self.assertTrue(any("Ship?" in t and "→ Yes" in t for t in titles), titles)
+
+    def test_modal_payload_lists_every_question(self):
+        m = self._mq("modal")
+        for t in ("1/3", "2/3", "3/3", "Scope q?", "Second q?", "DB q?"):
+            self.assertIn(t, m["o3"])
+        self.assertIn("→ A", m["c2"])
+        self.assertIn("→ B", m["c2"])
+        self.assertNotIn("Decided:", m["c2"])
+        self.assertEqual(
+            m["o1"],
+            "**Auggie open?**\n- x\n\n_View-only — answer in the session itself; the tracker never writes to it._")
+
+    def test_auggie_and_empty_degrade(self):
+        h = self._mq("single")
+        self.assertIn("crd-ask-q", h)
+        self.assertNotIn("crd-qpager", h)
+        d = self._mq("degrade")
+        self.assertNotIn("crd-qpager", d["bare"])
+        self.assertIn("No decisions recorded yet", d["empty"])
+
+    def test_answer_html_uses_config_note_class(self):
+        a = self._mq("answerHtml")
+        self.assertTrue(a["a"].startswith('<div class="crd-answer cr-cfg-row-sub">'))
+        self.assertIn("→", a["a"])
+        self.assertIn("<strong>x</strong>", a["a"])
+        self.assertEqual(a["b"], "")
+        web = os.path.join(_ROOT, "aitracker", "web")
+        dlg = open(os.path.join(web, "ext_cr_dialogs.css"), encoding="utf-8").read()
+        self.assertRegex(dlg, r"\.cr \.cr-cfg-row-sub \{[^}]*11\.5px")
+        css = open(os.path.join(web, "ext_cr_detail.css"), encoding="utf-8").read()
+        m = re.search(r"\.cr \.cr-cfg-row-sub\.crd-answer \{([^}]*)\}", css)
+        self.assertTrue(m, "missing .cr .cr-cfg-row-sub.crd-answer rule")
+        self.assertNotIn("font", m.group(1))
+        self.assertIn(".cr .crd-answer code", css)
+        js = open(os.path.join(web, "ext_cr_detail.js"), encoding="utf-8").read()
+        for gone in ("crd-decision-answer", "crd-ask-answer", "crd-qpager-answer"):
+            self.assertNotIn(gone, js)
+
+    def test_every_answer_path_uses_answer_html(self):
+        r = self._mq("answerPaths")
+        for i, want in enumerate(("</span> A</div>", "</span> B</div>")):
+            vis = re.split(r'<div class="crd-qpager-pane"', r["pages"][i])[1:]
+            vis = [x for x in vis if not x.split(">", 1)[0].count(" hidden")]
+            self.assertEqual(len(vis), 1)
+            self.assertIn(want, vis[0])
+        self.assertEqual(r["panel"].count('class="crd-answer cr-cfg-row-sub"'), 4)
+
+    def test_pager_wired_on_click_key_and_state(self):
+        js = open(os.path.join(_ROOT, "aitracker", "web", "ext_cr_detail.js"), encoding="utf-8").read()
+        for needle in ('case "qpage-go"', 'case "qpage-step"', "if (qPagerOnKey(ev, ui, node)) return;",
+                       "qPage: {}", "ui.qPage = {}", "refocusQ(", "focusedQKey("):
+            self.assertIn(needle, js)
+        i = js.index('node.addEventListener("click", function (ev) {')
+        h = js[i:i + 1500]
+        self.assertIn('closest(".crd-qpager-head")', h)
+        self.assertLess(h.index('closest(".crd-qpager-head")'), h.index('closest("[data-act]")'))
 
     # -- shared-overlay regression: #msgmodal/#diffmodal must survive Control
     # Room mode un-hidden, while the actual classic chrome still gets hidden --

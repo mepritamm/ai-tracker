@@ -2260,9 +2260,36 @@ def _transcript_pass(path):
                             # _is_real_bash_error; leave fail_cmd as it was
                         else:
                             fail_cmd = None
-                    if rid in asks:                                # the user's answer to an AskUserQuestion
-                        asks[rid]["answer"] = re.sub(r"^Your questions have been answered:\s*", "", rtext).strip()[:2000]
-                        asks[rid]["open"] = False
+                    if rid in asks and o.get("type") not in _BLOB_TYPES:  # the user's answer to an AskUserQuestion
+                        if b.get("is_error"):                      # declined / interrupted: never show tool boilerplate
+                            m = re.search(r"the user said:\s*(.*?)(?:\n\s*\n|$)", rtext, re.S)
+                            asks[rid]["answer"] = (
+                                "Declined" + (" \u2014 " + m.group(1).strip()[:500] if m and m.group(1).strip() else "")
+                                if rtext.startswith("The user doesn't want to proceed") else "No answer recorded")
+                            asks[rid]["open"] = False
+                        else:
+                            a = re.sub(r"^(?:Your questions have been answered:|The user answered:)\s*", "", rtext)
+                            a = re.sub(r"\.?\s*(?:You can now continue with these answers in mind\.|Read the answers carefully\b.*)\s*$",
+                                       "", a, flags=re.S).strip()
+                            asks[rid]["answer"] = a[:2000]
+                            asks[rid]["open"] = False
+                            tur = o.get("toolUseResult")
+                            ans = tur.get("answers") if isinstance(tur, dict) else None
+                            ann = tur.get("annotations") if isinstance(tur, dict) else None
+                            by_q = {str(k)[:500]: v for k, v in ans.items()} if isinstance(ans, dict) else {}
+                            for q in asks[rid]["questions"]:
+                                v = by_q.get(q["q"])
+                                if isinstance(v, list):
+                                    v = ", ".join(str(x) for x in v)           # multiSelect
+                                if isinstance(v, str) and v:
+                                    n = (ann.get(q["q"]) if isinstance(ann, dict) else None) or {}
+                                    n = n.get("notes") if isinstance(n, dict) else None
+                                    if isinstance(n, str) and n.strip():
+                                        v = v + " \u2014 notes: " + n.strip()[:300]  # the user's own note
+                                    q["answer"] = v[:500]
+                            got = [q["answer"] for q in asks[rid]["questions"] if q.get("answer")]
+                            if got:                                        # show the answers, not the raw "q"="a" pair
+                                asks[rid]["answer"] = "; ".join(got)[:2000]
                     if rid in task_creates:                    # resolve the id TaskCreate's own input never carries
                         d = task_creates.pop(rid, None)
                         m = _TASK_CREATE_ID_RE.search(rtext)
@@ -2358,7 +2385,7 @@ def _transcript_pass(path):
                                        # so `model` stays honestly "", never a guess (the agents_bg
                                        # rows carry model_req / model_label for that).
                                        "model": ""})
-                    elif name == "AskUserQuestion":                # a decision the session asked the user for
+                    elif name == "AskUserQuestion" and o.get("type") not in _BLOB_TYPES:                # a decision the session asked the user for
                         qs = [{"q": (q.get("question") or "")[:500], "header": (q.get("header") or "")[:40],
                                "options": [(o.get("label") or "")[:120] for o in (q.get("options") or [])
                                            if isinstance(o, dict)]}

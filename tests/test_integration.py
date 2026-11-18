@@ -1250,6 +1250,92 @@ class TestDecisions(unittest.TestCase):
         self.assertIn("Yes", decided["answer"])
         self.assertFalse(decided["answer"].startswith("Your questions"))  # prefix stripped
 
+    def _ask_session(self, name, asks):
+        """asks = [(question_text, result_text, is_error, toolUseResult_or_None)] -> parsed decisions."""
+        d = os.path.join(config.PROJECTS, "proj"); os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, name + ".jsonl")
+        lines = []
+        for i, (q, res, err, tur) in enumerate(asks):
+            qs = q if isinstance(q, list) else [q]
+            lines.append({"type": "assistant", "timestamp": "2026-07-16T10:%02d:00Z" % (i * 2), "message": {
+                "role": "assistant", "content": [{"type": "tool_use", "id": "a%d" % i, "name": "AskUserQuestion",
+                    "input": {"questions": [{"question": x, "header": "H", "options": [{"label": "o"}]} for x in qs]}}]}})
+            blk = {"type": "tool_result", "tool_use_id": "a%d" % i, "content": res}
+            if err:
+                blk["is_error"] = True
+            rec = {"type": "user", "timestamp": "2026-07-16T10:%02d:30Z" % (i * 2),
+                   "message": {"role": "user", "content": [blk]}}
+            if tur is not None:
+                rec["toolUseResult"] = tur
+            lines.append(rec)
+        open(path, "w").write("\n".join(json.dumps(x) for x in lines))
+        return _claude.parse_session(path)["decisions"]
+
+    def test_claude_decisions_strip_trailer_and_alt_prefix(self):
+        dec = self._ask_session("s2", [
+            ("Ship it now?", 'Your questions have been answered: "Ship it now?"="Yes". You can now continue with these answers in mind.', False, None),
+            ("Pick?", 'The user answered: "Pick?"="B". Read the answers carefully \u2014 they may request clarification, changes, or that you not proceed \u2014 and follow what they actually say.', False, None),
+        ])
+        by = {x["questions"][0]["q"]: x for x in dec}
+        self.assertFalse(by["Ship it now?"]["answer"].endswith("in mind."))
+        self.assertEqual(by["Ship it now?"]["answer"], '"Ship it now?"="Yes"')
+        self.assertEqual(by["Pick?"]["answer"], '"Pick?"="B"')
+
+    def test_claude_multi_question_answers(self):
+        tur = {"questions": [], "answers": {"Q1 text": "A", "Q2 text": ["x", "y"]},
+               "annotations": {"Q1 text": {"notes": "only on staging", "preview": "P"}}}
+        dec = self._ask_session("s3", [(["Q1 text", "Q2 text"],
+            'Your questions have been answered: "Q1 text"="A", "Q2 text"="x, y". You can now continue with these answers in mind.',
+            False, tur)])
+        self.assertEqual(len(dec), 1)
+        qs = dec[0]["questions"]
+        self.assertEqual(qs[0]["answer"], "A \u2014 notes: only on staging")
+        self.assertEqual(qs[1]["answer"], "x, y")
+        self.assertEqual(dec[0]["answer"], "A \u2014 notes: only on staging; x, y")  # S2: joined per-question answers
+        self.assertFalse(dec[0]["open"])
+
+    def test_claude_ask_blob_replay_ignored(self):
+        """I5: api-request-blob records replay earlier messages; they must not reopen an answered ask."""
+        d = os.path.join(config.PROJECTS, "proj"); os.makedirs(d, exist_ok=True)
+        tu = {"type": "tool_use", "id": "a0", "name": "AskUserQuestion", "input": {"questions": [
+            {"question": "Go?", "header": "H", "options": [{"label": "Go"}]}]}}
+        res = {"type": "tool_result", "tool_use_id": "a0",
+               "content": 'Your questions have been answered: "Go?"="Go, implement it"'}
+        for variant in ("A", "B"):
+            path = os.path.join(d, "blob%s.jsonl" % variant)
+            lines = [
+                {"type": "assistant", "timestamp": "2026-07-16T10:00:00Z", "message": {"role": "assistant", "content": [tu]}},
+                {"type": "user", "timestamp": "2026-07-16T10:01:00Z", "toolUseResult": {"answers": {"Go?": "Go, implement it"}},
+                 "message": {"role": "user", "content": [res]}},
+                {"type": "api-request-blob", "message": {"role": "assistant", "content": [tu]}},
+            ]
+            if variant == "B":
+                lines.append({"type": "api-request-blob", "message": {"role": "user", "content": [res]}})
+            open(path, "w").write("\n".join(json.dumps(x) for x in lines))
+            r = _claude.parse_session(path)
+            dec = r["decisions"]
+            self.assertEqual(len(dec), 1, variant)
+            self.assertFalse(dec[0]["open"], variant)
+            self.assertEqual(dec[0]["t"], "2026-07-16T10:00:00Z", variant)
+            self.assertEqual(dec[0]["questions"][0]["answer"], "Go, implement it", variant)
+            self.assertFalse(r["waiting"], variant)
+
+    def test_claude_declined_ask_is_clean(self):
+        base = ("The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, "
+                "the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.")
+        dec = self._ask_session("s4", [
+            ("Q one?", base, True, None),
+            ("Q two?", base + " To tell you how to proceed, the user said:\nclarify first\n\nNote: The user's next message may contain a correction.", True, None),
+            ("Q three?", "[Tool call interrupted: the session ended before this call's result was recorded, so its outcome is unknown.]", True, None),
+        ])
+        by = {x["questions"][0]["q"]: x for x in dec}
+        self.assertEqual(by["Q one?"]["answer"], "Declined")
+        self.assertEqual(by["Q two?"]["answer"], "Declined \u2014 clarify first")
+        self.assertEqual(by["Q three?"]["answer"], "No answer recorded")
+        for x in dec:
+            self.assertFalse(x["open"])
+            self.assertNotIn("answer", x["questions"][0])
+
     def test_auggie_decisions(self):
         sid = "au1"
         doc = {"sessionId": sid, "modified": "2026-07-16T10:00:00Z", "chatHistory": [
