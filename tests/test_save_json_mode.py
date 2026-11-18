@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from aitracker import store
+from aitracker import config, store
 
 
 def _mode(p):
@@ -55,6 +55,35 @@ class SaveJsonModeTests(unittest.TestCase):
             os.fchmod = saved
         self.assertEqual(store._load_json(self.p, {}), {"a": 2})
         self.assertEqual([f for f in os.listdir(self.d) if f.endswith(".tmp")], [])
+
+
+class SecureConfigFileTests(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.p = os.path.join(self.d, "config.json")
+        patcher = mock.patch.object(config, "CONFIG_FILE", self.p)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_startup_tightens_a_0644_config(self):
+        store._save_json(self.p, {"TUNNEL_PASS": "x"})
+        os.chmod(self.p, 0o644)
+        store.secure_config_file()
+        self.assertEqual(_mode(self.p), 0o600)
+
+    def test_missing_config_is_not_created_and_does_not_raise(self):
+        store.secure_config_file()
+        self.assertFalse(os.path.exists(self.p))
+
+    def test_server_run_calls_it_before_binding(self):
+        from aitracker import server
+        calls = []
+        with mock.patch.object(server, "secure_config_file", lambda: calls.append("chmod")), \
+             mock.patch.object(server, "bind", side_effect=RuntimeError("stop")), \
+             mock.patch.object(server.signal, "signal"):
+            with self.assertRaises(RuntimeError):
+                server.run(open_browser=False)
+        self.assertEqual(calls, ["chmod"])
 
 
 if __name__ == "__main__":

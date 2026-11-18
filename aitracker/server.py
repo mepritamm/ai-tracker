@@ -14,7 +14,7 @@ from .schedule import sched_install, sched_uninstall, sched_status, autoinstall_
 from .schedule import svc_install, svc_uninstall, svc_status, svc_baked, svc_spawn_deferred, SVC_WAIT, SVC_GRACE
 from .update import update_status, update_fetch, update_apply, start_restart, _APPLY
 from .agent_cli import agent_status, agent_plan_upgrade, agent_start, agent_job_running, agent_plan_resume_all, agent_start_resume_all
-from .store import set_hidden, load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, save_model_keep, load_title_sync, save_title_sync, _load_json, _save_json, load_last_login
+from .store import set_hidden, load_flags, save_flags, load_titles, load_pins, load_notes, save_notes, save_model_keep, load_title_sync, save_title_sync, _load_json, _save_json, load_last_login, secure_config_file
 # TITLES_FILE/PINS_FILE (below) are referenced live as config.TITLES_FILE/config.PINS_FILE at
 # their write sites, never imported by name -- a copied name freezes the value at import
 # time, so a caller that repoints config.TITLES_FILE (e.g. a test's temp-dir override) would
@@ -1207,6 +1207,7 @@ def run(host="127.0.0.1", port=8790, open_browser=True, service=False):
     # config.py's own import time -- see its module comment -- so a pre-existing config.json
     # override needs this explicit apply at real startup to take effect immediately rather
     # than waiting for someone to open the Config dialog first).
+    secure_config_file()    # chmod 600 config.json on every start (make serve and launchd both come through run())
     config.apply_overrides(_load_json(config.CONFIG_FILE, {}))
     signal.signal(signal.SIGTERM, _on_sigterm)
     srv = bind(host, port, strict=service, wait=SVC_WAIT, grace=SVC_GRACE)

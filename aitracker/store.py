@@ -1,4 +1,4 @@
-import glob, json, os, stat, time, uuid
+import glob, json, os, stat, sys, time, uuid
 try:
     import fcntl
 except ImportError:   # Windows: the forks lock falls back to msvcrt.locking
@@ -13,6 +13,16 @@ def _load_json(path, default):
             return json.load(fh)
     except (OSError, ValueError):
         return default
+
+
+def secure_config_file():
+    """config.json holds secrets (TUNNEL_PASS, OPENROUTER_API_KEY); an older install may be 0644. Called at every server start."""
+    try:
+        os.chmod(config.CONFIG_FILE, 0o600)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"warning: could not chmod 600 {config.CONFIG_FILE}: {e.strerror}", file=sys.stderr, flush=True)
 
 
 def _save_json(path, obj, mode=None):
