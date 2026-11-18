@@ -243,4 +243,10 @@ Reviews (opus): `docs/usage-panel-impl-review-security.md` (0 blocker/1 major/2 
 | U-nits | 7 nits | Not examined individually | No change unless the fixer finds one is a one-liner in a touched line |
 | — | Not examined: cents scale for `used_credits` confirmed only from docs (the live report shows no $) | Main thread | Keep; flag in the PR. The user can eyeball it against claude.ai Settings → Usage after restart |
 
-Fixes applied in COMMITSHA: S-M1, S-M2, S-M3 (trimmed), U-M1 (same-run label and plan, no stale), U-m1..m5 done. S-L1 no change. S-L2 documented only (it needs the generation threaded through the six `_acct_or_fail` sites; known small gap). U-nits untouched.
+Fixes applied in 8281c90: S-M1, S-M2, S-M3 (trimmed), U-M1 (same-run label and plan, no stale), U-m1..m5 done. S-L1 no change. S-L2 documented only (it needs the generation threaded through the six `_acct_or_fail` sites; known small gap). U-nits untouched.
+
+## Ship status (2026-11-18)
+- Branch `usage-panel` pushed to `personal` (see SHA below). No PR: personal remote, `/tracker-push` is the route to main.
+- Known gaps (documented, no change): S-L1 missing Sec-Fetch-Site treated as same-site (rate-limited, no leak); S-L2 OpenRouter in-flight run can touch backoff after a key replace; `tunnel.py` lost-update race on config.json; `/api/claude/auth` cross-site trigger (pre-existing); `used_credits` cents scale confirmed from docs only.
+- Pending, user-gated: step 3c (Auggie sessions-v2 reader) needs one real `auggie -p` session; see `docs/auggie-sessions-v2-handover.md`.
+- User actions: `chmod 600 aitracker/config.json` in the primary checkout; add the plan §7 launcher snippet to the OPENROUTER_LAUNCHER script; `make serve` after landing to see the UI.
