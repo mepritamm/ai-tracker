@@ -220,3 +220,7 @@ Shapes and verdicts only; no emails, org names or secrets.
 ## Implementation status (2026-11-18)
 
 Done: steps 1, 2, 3a, 4, 5, 6 and 7 (doc lines) of `docs/usage-panel-plan.md`. Pending, user-gated: step 3b (credits branch + fixtures B/C; `accounts._acct_parse_usage_report` returns `credits = None`, and the UI already renders a non-null `credits` block) and step 3c (Auggie sessions-v2 reader, probe 0(f)). With 3b pending, the credits account renders as "No plan limits reported for this login." with no credits block.
+
+## Step 3b done (2026-11-18)
+
+Commit 3c9a943: the Claude usage-credits branch. `credits` is read from `usage_report.rate_limits.extra_usage` (the probed shape, not the plan's field names) and set only when `is_enabled is True`; amounts are minor units of `currency`; a null `monthly_limit` renders "no monthly limit of its own" (never "Unlimited"), with the organisation note for team/enterprise logins. "No plan limits reported for this login." now shows only when there are no limits and no credits. Fixtures B (probed credits account, neutral numbers) and C (null limit, team/enterprise) are in `tests/test_accounts_claude_usage.py`; the Max shape is unchanged. Pending, user-gated: step 3c (Auggie sessions-v2 reader).
