@@ -137,6 +137,11 @@ def _auth_run(exe):
     return d if isinstance(d, dict) else None
 
 
+def claude_auth_cached():
+    """The last claude_auth_status() body, or None when it has never run. Never runs the CLI."""
+    return _AUTH_CACHE["val"]
+
+
 def claude_auth_status(fresh=False):
     """-> {"available","logged_in","auth_method","subscription","label","error"}, built FRESH from three
     keys of `claude auth status --json` (loggedIn/authMethod/subscriptionType) -- never spreads the CLI's

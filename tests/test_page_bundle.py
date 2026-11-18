@@ -418,5 +418,22 @@ class TestTermTabHostsMark(unittest.TestCase):
             self.assertNotIn("/*__TERM_TAB_HOSTS__*/", _read_page())
 
 
+class TestBundleAccounts(unittest.TestCase):
+    def test_bundle_header_and_qualifiers(self):
+        """scripts/bundle.py strips imports and rewrites only the config./tunnel. prefixes, so server.py must call
+        accounts' names bare (never `accounts.X`), and the flat file's HEADER must import what accounts.py uses."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "bundle_under_test", os.path.join(os.path.dirname(_AITRACKER), "scripts", "bundle.py"))
+        b = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(b)
+        for mod in ("ssl", "urllib.error", "urllib.request"):
+            self.assertRegex(b.HEADER, r"[ ,]%s[,\n]" % re.escape(mod), mod)
+        self.assertLess(b.ORDER.index("agent_cli.py"), b.ORDER.index("accounts.py"))
+        self.assertLess(b.ORDER.index("accounts.py"), b.ORDER.index("server.py"))
+        with open(os.path.join(_AITRACKER, "server.py"), encoding="utf-8") as fh:
+            self.assertIsNone(re.search(r"(?<![\w.])accounts\.", fh.read()))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,4 @@
-import glob, json, os, time, uuid
+import glob, json, os, stat, time, uuid
 try:
     import fcntl
 except ImportError:   # Windows: the forks lock falls back to msvcrt.locking
@@ -15,7 +15,7 @@ def _load_json(path, default):
         return default
 
 
-def _save_json(path, obj):
+def _save_json(path, obj, mode=None):
     """Atomic write via a per-call UNIQUE temp name in the same directory. A
     fixed `path + ".tmp"` let concurrent writers step on each other's temp
     file -- of 10 threads calling this concurrently on the same path, 9 raised
@@ -23,10 +23,21 @@ def _save_json(path, obj):
     been renamed away by whichever writer got there first) and only 1 write
     survived. A unique name per call removes that race entirely; os.replace
     keeps the atomic swap-in property. This fixes every caller (flags/titles/
-    pins/notes/forks), not just forks -- the weakness was in the shared helper."""
+    pins/notes/forks), not just forks -- the weakness was in the shared helper.
+
+    Mode: an existing file keeps its EXACT mode (a 0600 config.json stays 0600 through every writer); `mode=`
+    forces one, applied to the temp file before it holds data. A new file keeps 0666 & ~umask."""
     d = os.path.dirname(path) or "."
     tmp = os.path.join(d, ".%s.%s.tmp" % (os.path.basename(path), uuid.uuid4().hex))
-    with open(tmp, "w", encoding="utf-8") as fh:
+    if mode is None:
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            mode = None
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666 if mode is None else mode)
+    if mode is not None:
+        os.fchmod(fd, mode)   # exact, not masked by the umask
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(obj, fh, indent=2)
     os.replace(tmp, path)
 

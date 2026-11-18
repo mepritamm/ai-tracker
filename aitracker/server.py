@@ -7,6 +7,7 @@ from .config import NARR_PAGE
 from .util import is_loopback_host, origin_matches_host
 from .page import build_page
 from .gateway import openrouter_configured, claude_auth_status
+from .accounts import claude_usage, openrouter_usage, openrouter_peek, auggie_auth_status, auggie_usage, usage_invalidate
 from .registry import all_sessions, parse_any, search_all, search_session, drill, _attached_pty
 from .pending import start_worker, load_report, item_detail, run_async
 from .schedule import sched_install, sched_uninstall, sched_status, autoinstall_once, _optout_path
@@ -240,6 +241,14 @@ def _local_caller(handler):
     if not config.AUTH and not is_loopback_host(handler.headers.get("Host", "")):
         return False, "refused: Host is not loopback%s" % _NOT_LOCAL
     return True, ""
+
+
+_USAGE_GET = ("/api/usage/claude", "/api/usage/openrouter", "/api/usage/auggie", "/api/auggie/auth")
+
+
+def _same_site(handler):
+    """Browsers send Sec-Fetch-Site; CLI callers send none (treated as same-origin), the SPA sends same-origin."""
+    return handler.headers.get("Sec-Fetch-Site", "same-origin") in ("same-origin", "none")
 
 
 _CLAUDE_AUTH_KEYS = ("available", "logged_in", "auth_method", "subscription", "label", "error")
@@ -516,6 +525,23 @@ class Handler(BaseHTTPRequestHandler):
             body = {k: st.get(k) for k in _CLAUDE_AUTH_KEYS if k in st}
             body["last_login"] = load_last_login()      # when the last Config login ended + how (never an identity)
             return self._json(body)
+        elif p.path in _USAGE_GET:
+            # Config -> Usage / Server: this machine only AND same-site (a cross-site <img> must not be able to
+            # trigger a `claude -p /usage` run or an openrouter.ai fetch); never in _RO_GET_ALLOW.
+            ok, err = _local_caller(self)
+            if not ok:
+                return self._json({"error": err}, 403)
+            if not _same_site(self):
+                return self._json({"error": "refused: cross-site request%s" % _NOT_LOCAL}, 403)
+            qs = parse_qs(p.query)
+            fresh = qs.get("fresh") == ["1"]
+            if p.path == "/api/usage/claude":
+                return self._json(claude_usage(fresh))
+            if p.path == "/api/usage/openrouter":
+                return self._json(openrouter_peek() if qs.get("peek") == ["1"] else openrouter_usage(fresh))
+            if p.path == "/api/usage/auggie":
+                return self._json(auggie_usage())
+            return self._json(auggie_auth_status(fresh))
         elif p.path == "/api/config":
             # The Config dialog's live read: every config.json-overridable setting's current
             # effective value (config.json > env > default -- see config.py's big module
@@ -571,6 +597,8 @@ class Handler(BaseHTTPRequestHandler):
         elif p.path == "/api/file":
             # ponytail: local single-user tool — reads the file at the given path
             # (paths come from the session's own edits) with a size cap.
+            if not self._tunnel_route_ok():   # DNS-rebinding page: config.json may hold a typed key
+                return self._json({"error": "refused: Host is not loopback or cross-origin", "content": ""}, 403)
             fp = parse_qs(p.query).get("path", [""])[0]
             try:
                 if not fp or not os.path.isfile(fp):
@@ -772,6 +800,27 @@ class Handler(BaseHTTPRequestHandler):
             # checked by config.VALIDATORS before anything touches disk -- a bad value is
             # rejected with 400 and never reaches config.json.
             key = body.get("key")
+            if isinstance(key, str) and key in config.SECRET_EDITABLE:
+                # Typed-in secret (see config.py's OPENROUTER_API_KEY exception): local callers only, never
+                # echoed, never in EDITABLE/GET /api/config. The temp file is 0600 before it holds the key.
+                ok, err = _local_caller(self)
+                if not ok:
+                    return self._json({"error": err}, 403)
+                ok, v = config.SECRET_VALIDATORS[key](body.get("value"))
+                if not ok:
+                    return self._json({"error": "invalid value for %s" % key}, 400)   # never echoes the value
+                overrides = _load_json(config.CONFIG_FILE, {})
+                if v:
+                    overrides[key] = v
+                else:
+                    overrides.pop(key, None)
+                _save_json(config.CONFIG_FILE, overrides, mode=0o600)
+                try:
+                    os.chmod(config.CONFIG_FILE, 0o600)
+                except OSError:
+                    pass
+                usage_invalidate("openrouter")
+                return self._json({"ok": True, "key": key, "set": bool(v), "file": config.CONFIG_FILE})   # path, never the value
             if not isinstance(key, str) or key not in config.EDITABLE:
                 self._json({"error": "unknown config key", "key": key}, 400)
                 return

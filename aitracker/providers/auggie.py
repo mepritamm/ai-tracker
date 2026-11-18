@@ -311,6 +311,68 @@ def _auggie_todos_for_list(root_uuid):
     return _auggie_resolve(root, _load_task_file) if root else []
 
 
+_AUGGIE_BILL_CACHE = {}   # (path, mtime, since) -> (usd, sessions, unpriced)
+
+
+def month_cost(since):
+    """Local Auggie cost since epoch `since` -> {"usd","sessions","unpriced","sources"}. Reads only the legacy
+    ~/.augment/sessions/*.json (shape confirmed from real files); the sessions-v2 layout has no confirmed
+    shape yet, so it is NOT read. A file whose mtime is before `since` is never opened. Each billed exchange
+    counts when its own `finishedAt` >= since (else the file's `modified` decides); the session-level sub-agent
+    cost counts when `modified` >= since. A non-numeric billed value adds 0 and is counted in `unpriced`."""
+    usd, sessions, unpriced = 0.0, 0, 0
+    for f in glob.glob(os.path.join(config.AUGGIE_SESSIONS, "*.json")):
+        try:
+            mt = os.path.getmtime(f)
+        except OSError:
+            continue
+        if mt < since:
+            continue
+        key = (f, mt, since)
+        hit = _AUGGIE_BILL_CACHE.get(key)
+        if hit is None:
+            try:
+                with open(f, encoding="utf-8") as fh:
+                    d = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(d, dict):
+                continue
+            fmod = _iso_epoch(d.get("modified")) or mt
+            u, n_un, hit_any = 0.0, 0, False
+            for m in d.get("chatHistory") or []:
+                if not isinstance(m, dict):
+                    continue
+                ts = _ts_epoch(m.get("finishedAt")) if m.get("finishedAt") else 0.0
+                if (ts or fmod) < since:
+                    continue
+                for rn in (m.get("exchange") or {}).get("response_nodes") or []:
+                    bm = rn.get("billing_metadata") if isinstance(rn, dict) else None
+                    if not isinstance(bm, dict):
+                        continue
+                    try:
+                        v = float(bm.get("cost_usd") or 0)
+                        if v != v or v in (float("inf"), float("-inf")):
+                            raise ValueError
+                        u += v
+                        hit_any = True
+                    except (TypeError, ValueError):
+                        n_un += 1
+            if fmod >= since:
+                sub = _sub_agent_usd(d)
+                if sub:
+                    u += sub
+                    hit_any = True
+            hit = (u, 1 if hit_any else 0, n_un)
+            if len(_AUGGIE_BILL_CACHE) > 4000:
+                _AUGGIE_BILL_CACHE.clear()
+            _AUGGIE_BILL_CACHE[key] = hit
+        usd += hit[0]
+        sessions += hit[1]
+        unpriced += hit[2]
+    return {"usd": usd, "sessions": sessions, "unpriced": unpriced, "sources": ["~/.augment/sessions"]}
+
+
 def list_auggie():
     """Auggie CLI sessions live at ~/.augment/sessions/<id>.json (the local transcripts)."""
     titles = load_titles()

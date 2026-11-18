@@ -128,6 +128,15 @@ CURSOR_WS_ROOT = os.environ.get(
 # Writing a password typed into a web form into a plaintext JSON file on disk, on a server
 # that may be reachable over a tunnel, is a real security regression, not a convenience —
 # the Config dialog only ever shows "set" / "not set" for this row, same as before.
+#
+# Narrow exception (user-requested 2026-11-18: "enter key in the config ... never display or show the
+# existing key"): OPENROUTER_API_KEY -- and only it, joining the TUNNEL_PASS precedent -- may be typed into
+# Config and stored in config.json. It is in SECRET_EDITABLE, never in EDITABLE, so GET /api/config
+# (reachable read-only through a tunnel) never carries it. Only POST /api/config's secret branch writes
+# it, from a local caller; that write creates config.json's temp file at 0600, and store._save_json keeps
+# that exact mode on every later write. No route returns it: the only status is "set"/"not set" from the
+# local-only /api/usage/openrouter?peek=1, and /api/file refuses rebinding requests. It never enters
+# os.environ, the launchd plist or a log. TRACKER_AUTH stays env-only.
 AUTH = os.environ.get("TRACKER_AUTH", "")
 
 
@@ -230,6 +239,22 @@ EDITABLE = ("LIVE_WINDOW", "TERM_RENDERER", "MAX_TERMS", "TERMINAL",
             "TERM_APP", "TERM_ALLOW", "PORT", "HOST", "ICON_STYLE", "ICON_SCALE",
             "TERM_IDLE_TTL_MIN", "SNAPSHOT_TTL_MIN", "GATEWAY", "OPENROUTER_LAUNCHER", "OPENROUTER_SLOTS_FILE", "HEADER_LINE",
             "PENDING_INTERVAL", "PENDING_CLEAN", "TERM_THEME")
+
+# Typed-in secrets: written by POST /api/config's separate branch (local callers only), NEVER published by
+# GET /api/config and never in EDITABLE (see the exception beside AUTH).
+SECRET_EDITABLE = ("OPENROUTER_API_KEY",)
+_OR_KEY_RE = re.compile(r"[A-Za-z0-9_.\-]{16,256}")
+
+
+def _v_or_key(v):
+    """"" clears; otherwise 16-256 safe chars; no whitespace/CR/LF (blocks header injection)."""
+    if not isinstance(v, str):
+        return False, None
+    v = v.strip()
+    return (True, v) if v == "" or _OR_KEY_RE.fullmatch(v) else (False, None)
+
+
+SECRET_VALIDATORS = {"OPENROUTER_API_KEY": _v_or_key}
 
 # Keys that only bind at process startup -- the dialog labels these "takes effect on
 # restart" and never claims a live apply for them.
