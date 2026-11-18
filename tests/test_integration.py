@@ -2692,5 +2692,72 @@ class TestMakeServeEnv(unittest.TestCase):
         self.assertIn("PORT=9001", self._dry(port="9001"))
 
 
+class TestLastLoginEndToEnd(unittest.TestCase):
+    """Real server on an ephemeral port: /api/claude/auth serves last_login; the page ships both login buttons."""
+
+    def setUp(self):
+        self.snap = _snap()
+        self.addCleanup(_restore, self.snap)
+        _empty_env()
+        d = tempfile.mkdtemp()
+        for k, v in (("AUTH", ""), ("CONFIG_FILE", os.path.join(d, "config.json")),
+                     ("LAST_LOGIN_FILE", os.path.join(d, "last_login.json"))):
+            p = mock.patch.object(config, k, v)
+            p.start()
+            self.addCleanup(p.stop)
+        m = mock.patch.object(_server, "claude_auth_status", return_value={
+            "available": True, "logged_in": True, "auth_method": "claude.ai", "subscription": "max",
+            "label": "Logged in", "error": ""})
+        m.start()
+        self.addCleanup(m.stop)
+        self.srv = _server.Server(("127.0.0.1", 0), _server.Handler)
+        self.addCleanup(self.srv.server_close)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.addCleanup(self.srv.shutdown)
+
+    def _get(self, path):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", path)
+        r = c.getresponse()
+        body = r.read()
+        c.close()
+        return r.status, body
+
+    def test_auth_route_serves_last_login(self):
+        st, body = self._get("/api/claude/auth")
+        self.assertEqual(st, 200)
+        self.assertIsNone(json.loads(body).get("last_login"))
+        from aitracker import store
+        self.assertTrue(store.record_login("ok"))
+        st, body = self._get("/api/claude/auth")
+        ll = json.loads(body)["last_login"]
+        self.assertEqual(st, 200)
+        self.assertEqual(ll["outcome"], "ok")
+        self.assertTrue(ll["label"])
+        self.assertIsInstance(ll["at"], (int, float))
+        self.assertIsInstance(ll["ok_at"], (int, float))
+
+    def test_page_has_both_login_buttons(self):
+        st, body = self._get("/")
+        self.assertEqual(st, 200)
+        page = body.decode("utf-8")
+        self.assertIn("Log in with Console (API)", page)
+        self.assertIn("login('console')", page)
+        self.assertIn("login('claudeai')", page)
+        self.assertIn("Last login: ", page)
+        i = page.index("cr-claude-login-block")
+        block = page[i - 300:i + 4000]
+        self.assertNotIn("location.hostname", block)
+        self.assertNotIn("location.host", block)
+        # no phone (<=600px) or tablet (601-900px) media block touches the login controls
+        for m in re.finditer(r"@media[^{]*(max-width:\s*600px|min-width:\s*601px)[^{]*\{", page):
+            depth, j = 1, m.end()
+            while j < len(page) and depth:
+                depth += {"{": 1, "}": -1}.get(page[j], 0)
+                j += 1
+            self.assertNotIn("cr-claude-login", page[m.end():j])
+
+
 if __name__ == "__main__":
     unittest.main()
