@@ -3330,13 +3330,25 @@ def _open_pty(handler, parsed, body, own):
     elif mode == "new":
         gw = body.get("gateway")   # optional per-open override of config.GATEWAY; other values ignored
         gw_eff = gw if gw in (gateway.ANTHROPIC, gateway.OPENROUTER) else config.GATEWAY
-        try:
-            argv = [gateway.launcher(gw_eff)]
-        except gateway.GatewayError as e:
-            return handler._json({"error": str(e), "openrouter_configured": False}, 400)
         lp = body.get("prompt")
-        row = LOGIN_ARGV.get(lp.strip()) if gw_eff == gateway.ANTHROPIC and isinstance(lp, str) else None
-        if row:
+        if isinstance(lp, str) and lp.strip() == AUGGIE_LOGIN_PROMPT:
+            # Config's Auggie login: `auggie auth login --headless` from a fixed constant, on any gateway
+            # (it never touches the Claude launcher). The prompt only SELECTS this row; it is never typed.
+            from .agent_cli import _agent_spec
+            spec = _agent_spec("auggie")
+            if not spec or not spec.get("path"):
+                return handler._json({"error": "auggie not found on the server's PATH"}, 400)
+            argv, login = [spec["path"], *AUGGIE_LOGIN_ARGS], "auggie"
+            row = None
+        else:
+            try:
+                argv = [gateway.launcher(gw_eff)]
+            except gateway.GatewayError as e:
+                return handler._json({"error": str(e), "openrouter_configured": False}, 400)
+            row = LOGIN_ARGV.get(lp.strip()) if gw_eff == gateway.ANTHROPIC and isinstance(lp, str) else None
+        if login:
+            pass
+        elif row:
             # A login open: `claude auth login` (never the /login REPL command), argv from the fixed table.
             login = row[0]
             argv = [argv[0]] + list(row[1])
@@ -3632,6 +3644,10 @@ LOGIN_CONSOLE_PROMPT = "/login --console"
 # from it. Each runs the CLI's own `claude auth login` (no REPL, so no session, transcript or trust prompt).
 LOGIN_ARGV = {LOGIN_PROMPT: ("claudeai", ("auth", "login")),
               LOGIN_CONSOLE_PROMPT: ("console", ("auth", "login", "--console"))}
+# Config's Auggie "Log in / Switch account": a selector prompt (never typed) and the fixed argv tail. --headless
+# makes `auggie auth login` exit after authenticating instead of starting the agent (no Auggie chat session).
+AUGGIE_LOGIN_PROMPT = "auggie auth login"
+AUGGIE_LOGIN_ARGS = ("auth", "login", "--headless")
 LOGIN_POLL = 0.5
 LOGIN_WATCH_MAX = 1800.0
 
@@ -3648,9 +3664,17 @@ def _login_outcome(pt):
 
 
 def _login_finished(pt):
-    """Pty.finish(): the one thing a login leaves behind is its outcome (store.record_login). Never raises."""
+    """Pty.finish(): the one thing a Claude login leaves behind is its outcome (store.record_login); an Auggie
+    login records none. Either way the cached account status is dropped. Never raises."""
+    claude = pt.login in ("claudeai", "console")
     try:
-        store.record_login(_login_outcome(pt))
+        if claude:
+            store.record_login(_login_outcome(pt))
+    except Exception:
+        pass
+    try:
+        from .accounts import usage_invalidate
+        usage_invalidate("claude" if claude else "auggie_auth")
     except Exception:
         pass
 

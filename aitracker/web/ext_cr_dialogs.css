@@ -690,3 +690,15 @@
 .cr .cr-resume-all-note { font: 400 11px/1.45 var(--font-sans, sans-serif); color: var(--text-muted, #877866); }
 .cr .cr-confirm-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 6px; padding-top: 2px; }
 .cr .cr-update-confirm code, .cr .cr-resume-all-row-meta { overflow-wrap: anywhere; }
+
+/* Config -> Usage */
+.cr .cr-usage-block { display: block; }
+.cr .cr-usage-card .cr-usage-body { margin-top: 6px; }
+.cr .cr-usage-row, .cr .cr-usage-credits { margin: 8px 0; max-width: 460px; }
+.cr .cr-usage-label { font: 600 12px var(--font-sans, sans-serif); color: var(--text-primary, #1F1A14); }
+.cr .cr-usage-active { font: 600 9.5px var(--font-mono, monospace); padding: 1px 6px; border-radius: var(--radius-sm, 4px); border: 1px solid var(--line-default, #CFC7B7); color: var(--text-secondary, #4A4237); }
+.cr .cr-usage-bar { height: 6px; margin: 4px 0; border-radius: 3px; background: var(--surface-sunken, #F4F1E8); border: 1px solid var(--line-subtle, #E7E2D5); overflow: hidden; }
+.cr .cr-usage-fill { height: 100%; background: var(--text-secondary, #4A4237); }
+.cr .cr-usage-bar.is-warning .cr-usage-fill { background: var(--text-awaiting, #9A4F19); }
+.cr .cr-usage-bar.is-critical .cr-usage-fill { background: var(--text-failed, #A32D2D); }
+.cr .cr-or-key-input { font: 400 12px var(--font-mono, monospace); min-width: 220px; padding: 3px 6px; }

@@ -20,7 +20,8 @@ receive session data through), so the Links panel inherits it with no client-sid
 change beyond deriveLinks() itself reading the new key.
 
 A REMOTE link (http/https -- a PR URL, a link cited in narration) must be marked
-alive UNCONDITIONALLY: this app makes no outbound network requests, ever, so there
+alive UNCONDITIONALLY: this app makes no outbound network requests (bar the single OpenRouter key-usage read, see conventions
+rule 6), so there
 must be no existence check, no socket, no DNS lookup, no timeout-based probe for one.
 That invariant is the one most likely to regress under a future "improvement" (e.g.
 someone "helpfully" adding a HEAD request to detect a 404'd PR) -- see

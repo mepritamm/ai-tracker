@@ -3,7 +3,7 @@
 Agent context. Read before editing. Hard rules: [`.claude/rules/conventions.md`](.claude/rules/conventions.md).
 
 ## What this is
-A **zero-dependency** local web dashboard showing what your AI coding sessions are doing — live, across tools (Claude Code, Auggie, …). It only **reads** the logs each tool writes to disk; nothing leaves the machine.
+A **zero-dependency** local web dashboard showing what your AI coding sessions are doing — live, across tools (Claude Code, Auggie, …). It only **reads** the logs each tool writes to disk; nothing leaves the machine, except, once you save an OpenRouter key, one read of openrouter.ai's key-usage endpoint when you open Config → Usage.
 
 ## Layout (production package; still stdlib-only)
 ```

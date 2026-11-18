@@ -1689,12 +1689,211 @@
     return wrap;
   }
 
+  // Config > Usage (display only): one card per account source. Each card has its own route, so one slow
+  // source never holds the others; a `refreshing` body is re-polled every 3 s (at most 60 tries) until the
+  // card leaves the DOM. The server owns every label and amount; only the two timestamps are formatted here.
+  function usageWhen(sec) {
+    var d = new Date(sec * 1000);
+    return typeof d.toLocaleString === 'function' ? d.toLocaleString() : String(d);
+  }
+  function usageBar(pct, sev) {
+    var p = typeof pct === 'number' ? Math.max(0, Math.min(100, pct)) : 0;
+    return h('div', { class: 'cr-usage-bar is-' + (sev || 'normal') }, [
+      h('div', { class: 'cr-usage-fill', style: 'width:' + p + '%' }, []),
+    ]);
+  }
+  function usageCard(title, url, accountOf, fill) {
+    var card = h('div', { class: 'cr-cfg-row cr-usage-card' });
+    var us = null, msg = '', denied = false, tries = 0;
+    function paint() {
+      card.innerHTML = '';
+      var meta = [];
+      var who = us && accountOf ? accountOf(us) : '';
+      if (who) meta.push(who);
+      if (us && us.at) meta.push('as of ' + usageWhen(us.at) + (us.stale ? ' (last known)' : ''));
+      var head = [h('div', { class: 'cr-cfg-row-name' }, [title])];
+      if (meta.length) head.push(h('div', { class: 'cr-cfg-row-sub cr-usage-meta' }, [meta.join(' · ')]));
+      var box = h('div', { class: 'cr-usage-body' });
+      if (denied) box.appendChild(h('div', { class: 'cr-cfg-row-sub' }, ['Usage is shown on this machine only']));
+      else if (!us) box.appendChild(h('div', { class: 'cr-cfg-row-sub' }, [msg || 'Loading…']));
+      else {
+        fill(us, box);
+        if (us.refreshing) box.appendChild(h('div', { class: 'cr-cfg-row-sub cr-usage-refreshing' }, ['Refreshing…']));
+      }
+      card.appendChild(h('div', { class: 'cr-cfg-row-label' }, head.concat([box])));
+      var ctl = h('div', { class: 'cr-cfg-row-control' });
+      ctl.appendChild(crBtn('Refresh', function () { tries = 0; load(true); }));
+      card.appendChild(ctl);
+    }
+    function load(fresh) {
+      crCall(url + (fresh ? (url.indexOf('?') >= 0 ? '&' : '?') + 'fresh=1' : '')).then(function (r) {
+        denied = r.status === 403;
+        if (r.ok) { us = r.body; msg = ''; } else if (!denied) msg = (r.body && r.body.error) || 'request failed';
+        paint();
+        if (r.ok && us && us.refreshing && ++tries <= 60 && card.isConnected !== false) {
+          setTimeout(function () { if (card.isConnected !== false) load(false); }, 3000);
+        }
+      });
+    }
+    paint(); load(false);
+    return card;
+  }
+  function usageLine(box, text, cls) { if (text) box.appendChild(h('div', { class: 'cr-cfg-row-sub' + (cls ? ' ' + cls : '') }, [text])); }
+  function usageBlock() {
+    if (crReadOnly()) return null;
+    var wrap = h('div', { class: 'cr-usage-block' });
+    wrap.appendChild(usageCard('Claude Code plan usage', '/api/usage/claude', function (s) { return s.account; }, function (s, box) {
+      (s.limits || []).forEach(function (l) {
+        var t = (typeof l.percent === 'number' ? l.percent + '% used' : 'usage unknown') + (l.resets_at ? ' · resets ' + usageWhen(Date.parse(l.resets_at) / 1000) : '');
+        box.appendChild(h('div', { class: 'cr-usage-row' }, [
+          h('div', { class: 'cr-usage-label' }, [l.label + (l.active ? ' ' : ''), l.active ? h('span', { class: 'cr-usage-active' }, ['active']) : null]),
+          usageBar(l.percent, l.severity),
+          h('div', { class: 'cr-cfg-row-sub' }, [t]),
+        ]));
+      });
+      if (s.credits) {
+        box.appendChild(h('div', { class: 'cr-usage-credits' }, [
+          h('div', { class: 'cr-usage-label' }, [s.credits.text]),
+          usageBar(s.credits.utilization, 'normal'),
+          s.credits.note ? h('div', { class: 'cr-cfg-row-sub' }, [s.credits.note]) : null,
+        ]));
+      }
+      if (!(s.limits || []).length && !s.credits) usageLine(box, s.error || s.message || '');
+      else if (s.error) usageLine(box, s.error);
+    }));
+    wrap.appendChild(usageCard('OpenRouter key', '/api/usage/openrouter', null, function (s, box) {
+      if (s.state === 'not_set') return usageLine(box, 'No OpenRouter key saved — add it in Config → Server');
+      if (s.state === 'rejected') return usageLine(box, 'OpenRouter rejected the saved key — replace it in Config → Server');
+      (s.rows || []).forEach(function (r) { usageLine(box, r.label + ': ' + r.text); });
+      usageLine(box, s.limit_text); usageLine(box, s.remaining_text);
+      if (s.free_tier === true) usageLine(box, 'Free tier');
+      if (s.state === 'error' || s.error) usageLine(box, s.error);
+    }));
+    wrap.appendChild(usageCard('Auggie', '/api/usage/auggie', null, function (s, box) {
+      box.appendChild(h('div', { class: 'cr-usage-label' }, [s.label || '']));
+      usageLine(box, s.window);
+      usageLine(box, s.cost_text ? s.cost_text + ' · ' + s.sessions + ' session' + (s.sessions === 1 ? '' : 's') : '');
+      usageLine(box, s.note);
+    }));
+    return wrap;
+  }
+
+  // Settings > Server "Auggie login": status from GET /api/auggie/auth (polled while `refreshing`); the buttons
+  // open a terminal in ~ running `auggie auth login --headless` (server-side constant) via ExtLaunch.openAt.
+  function auggieLoginBlock() {
+    if (crReadOnly()) return null;
+    var wrap = h('div', { class: 'cr-cfg-row cr-auggie-login-block' });
+    var us = null, msg = '', denied = false, busy = false, tries = 0;
+    function paint() {
+      var status = denied ? 'Login status is shown on this machine only' : (msg || (us ? (us.error || us.label || '') : 'Loading…'));
+      wrap.innerHTML = '';
+      wrap.appendChild(h('div', { class: 'cr-cfg-row-label' }, [
+        h('div', { class: 'cr-cfg-row-name' }, ['Auggie login']),
+        h('div', { class: 'cr-cfg-row-sub cr-auggie-login-status' }, [status]),
+        h('div', { class: 'cr-cfg-row-sub' }, ['Opens `auggie auth login --headless` in a terminal over this page and signs in every Auggie session on this machine. Switching asks you to confirm in the terminal (y), then opens your browser.']),
+      ]));
+      var ctl = h('div', { class: 'cr-cfg-row-control' });
+      var b = crBtn(us && us.logged_in ? 'Switch account' : 'Log in', login);
+      if (busy) b.setAttribute('disabled', 'disabled');
+      ctl.appendChild(b);
+      wrap.appendChild(ctl);
+    }
+    function load(fresh, announce) {
+      crCall('/api/auggie/auth' + (fresh ? '?fresh=1' : '')).then(function (r) {
+        denied = r.status === 403;
+        if (r.ok) { us = r.body; msg = ''; } else if (!denied) msg = (r.body && r.body.error) || 'request failed';
+        paint();
+        if (r.ok && us && us.refreshing && ++tries <= 60 && wrap.isConnected !== false) {
+          setTimeout(function () { if (wrap.isConnected !== false) load(false, announce); }, 3000);
+        } else if (announce && r.ok && us) toast({ title: 'Auggie: ' + (us.error || us.label || '') });
+      });
+    }
+    function login() {
+      var L = window.ExtLaunch;
+      if (!L || typeof L.openAt !== 'function') { msg = 'Log in failed: terminals are unavailable in this build'; paint(); return; }
+      busy = true; msg = ''; tries = 0; paint();
+      var pr, inline = !!(window.ExtVT && typeof window.ExtVT.mountInto === 'function');
+      try { pr = L.openAt('~', 'new', 'auggie auth login', inline ? { gateway: 'anthropic', tab: false } : { gateway: 'anthropic' }); } catch (e) { pr = { ok: false, error: String(e) }; }
+      Promise.resolve(pr).then(function (x) {
+        if (x && x.ok && inline && x.tty) {
+          try {
+            open('claude-login', { tty: x.tty, renderer: x.renderer, title: 'Auggie login', onDone: function (ended) { busy = false; tries = 0; load(true, ended); } });
+          } catch (e) {
+            crCall('/api/term/close', 'POST', window.ExtVT.ttyBody(x.tty, {}, ''));
+            busy = false; msg = 'Log in failed: ' + e; paint();
+          }
+          return;
+        }
+        busy = false;
+        msg = x && x.ok === false ? 'Log in failed: ' + (x.error || 'unknown error') : '';
+        paint();
+      }, function (e) { busy = false; msg = 'Log in failed: ' + e; paint(); });
+    }
+    function onFocus() {
+      if (wrap.isConnected === false) { window.removeEventListener('focus', onFocus); return; }
+      tries = 0; load(true);
+    }
+    if (typeof window.addEventListener === 'function') window.addEventListener('focus', onFocus);
+    paint(); load(false);
+    return wrap;
+  }
+
+  // Settings > Server "OpenRouter API key": write-only. Status ("set"/"not set") comes from the config-only
+  // ?peek=1 read (never a network call to openrouter.ai). The typed value is cleared from the input after every
+  // save attempt that is not a 400, and is never filled from any response.
+  function openrouterKeyBlock() {
+    if (crReadOnly()) return null;
+    var wrap = h('div', { class: 'cr-cfg-row cr-or-key-block' });
+    var peek = null, msg = '', denied = false, editing = false, input = null;
+    function paint() {
+      wrap.innerHTML = '';
+      var status = denied ? 'Key status is shown on this machine only' : (msg || (peek ? 'API key: ' + (peek.key_set ? 'set' : 'not set') : 'Loading…'));
+      var sub = peek && peek.file ? 'Saved to ' + peek.file + ' (owner-only), the config of the checkout this dashboard runs from. Never shown again. Your OpenRouter launcher reads it from there.' : '';
+      wrap.appendChild(h('div', { class: 'cr-cfg-row-label' }, [
+        h('div', { class: 'cr-cfg-row-name' }, ['OpenRouter API key']),
+        h('div', { class: 'cr-cfg-row-sub cr-or-key-status' }, [status]),
+        sub ? h('div', { class: 'cr-cfg-row-sub' }, [sub]) : null,
+      ]));
+      var ctl = h('div', { class: 'cr-cfg-row-control' });
+      if (editing) {
+        input = h('input', { type: 'password', autocomplete: 'new-password', spellcheck: 'false', class: 'cr-or-key-input', placeholder: 'sk-or-…' });
+        ctl.appendChild(input);
+        ctl.appendChild(crBtn('Save', function () { save(input.value); }));
+        ctl.appendChild(crBtn('Cancel', function () { editing = false; msg = ''; paint(); }));
+      } else if (!denied) {
+        ctl.appendChild(crBtn(peek && peek.key_set ? 'Replace' : 'Set', function () { editing = true; msg = ''; paint(); }));
+        if (peek && peek.key_set) ctl.appendChild(crBtn('Clear', function () {
+          if (typeof window.confirm === 'function' && !window.confirm('Remove the saved OpenRouter key?')) return;
+          save('');
+        }));
+      }
+      wrap.appendChild(ctl);
+    }
+    function load() {
+      crCall('/api/usage/openrouter?peek=1').then(function (r) {
+        denied = r.status === 403;
+        if (r.ok) { peek = r.body; } else if (!denied) msg = (r.body && r.body.error) || 'request failed';
+        paint();
+      });
+    }
+    function save(value) {
+      crCall('/api/config', 'POST', { key: 'OPENROUTER_API_KEY', value: value }).then(function (r) {
+        if (r.ok) { editing = false; msg = ''; if (input) input.value = ''; input = null; load(); return; }
+        if (input) input.value = '';
+        if (r.status === 400) { msg = (r.body && r.body.error) || 'invalid key'; paint(); return; }
+        msg = (r.body && r.body.error) || 'request failed'; editing = false; paint();
+      });
+    }
+    paint(); load();
+    return wrap;
+  }
+
   // Claude login modal: the `claude auth login` pty (opened by claudeLoginBlock) mounted inline over Config.
   // Polls the existing GET /api/term/attached: 404 = the pty is gone (`claude auth login` exits when it
   // finishes, or the window was closed) -> close. Esc closes the modal even while the terminal has focus (capture-phase listener below).
   function renderClaudeLogin(payload) {
     var tty = payload.tty;
-    var chrome = buildChrome('claude-login', 'Claude Code login', 'gear', '~', true);
+    var chrome = buildChrome('claude-login', payload.title || 'Claude Code login', 'gear', '~', true);
     chrome.panel.classList.add('cr-dialog-login');
     // Capture phase: runs before the terminal's own keydown handler, which would send Esc to claude.
     chrome.panel.addEventListener('keydown', function (e) {
@@ -1752,7 +1951,7 @@
     var chrome = buildChrome('config', 'Config', 'gear', subtitle, true);
     chrome.panel.classList.add('cr-dialog-config');
 
-    var sections = ['Interface', 'Board', 'Terminal', 'Agents', 'Notifications', 'Server', 'Tunnel', 'Data files'];
+    var sections = ['Interface', 'Board', 'Terminal', 'Agents', 'Usage', 'Notifications', 'Server', 'Tunnel', 'Data files'];
     var nav = h('div', { class: 'cr-cfg-nav' });
     var body = h('div', { class: 'cr-cfg-body' });
     // `payload.section` lets a caller open Config straight onto a given tab -- the boot-
@@ -2019,6 +2218,9 @@
           }));
       } else if (active === 'Agents') {
         var agEl = agentsBlock(); if (agEl) body.appendChild(agEl);
+      } else if (active === 'Usage') {
+        var usEl = usageBlock(); if (usEl) body.appendChild(usEl);
+        else body.appendChild(h('p', { class: 'cr-help-note' }, ['Usage is shown on this machine only.']));
       } else if (active === 'Notifications') {
         // Fix (drift 4): this tab used to carry its own second copy of the two toggles
         // now combined into the Interface tab's single "Desktop notifications + sound"
@@ -2043,6 +2245,10 @@
           readonlyField(String((srv.cfg && srv.cfg.HOST && srv.cfg.HOST.value) || '127.0.0.1')), true));
         var loginEl = claudeLoginBlock();
         if (loginEl) body.appendChild(loginEl);
+        var augEl = auggieLoginBlock();
+        if (augEl) body.appendChild(augEl);
+        var orKeyEl = openrouterKeyBlock();
+        if (orKeyEl) body.appendChild(orKeyEl);
         var updEl = updateBlock();
         if (updEl) body.appendChild(updEl);
         var svcEl = serviceBlock();

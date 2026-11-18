@@ -65,7 +65,7 @@ Flags: `python3 -m aitracker --version` · `--help`. Set a port without the Make
 
 To keep it running in the background: `nohup python3 -m aitracker >/tmp/tracker.log 2>&1 &`.
 
-**Local by default.** `make serve` binds to `localhost` only, with no login — nothing leaves your machine and no tunnel is involved. Reaching it from a phone is entirely **opt-in** (`make tunnel`, or the other options in the guide below); until you choose one, it stays localhost-only.
+**Local by default.** `make serve` binds to `localhost` only, with no login — nothing leaves your machine, except, once you save an OpenRouter key, one read of openrouter.ai's key-usage endpoint when you open Config → Usage, and no tunnel is involved. Reaching it from a phone is entirely **opt-in** (`make tunnel`, or the other options in the guide below); until you choose one, it stays localhost-only.
 
 ---
 
@@ -363,7 +363,7 @@ The maintainer also runs `/tracker-push` (green self-check → commit → push) 
 - **Auggie CLI** reads the full local transcript (`~/.augment/sessions/`) — summary, tokens, narration, files, commands, reads, working folder, and git branch — at near-Claude parity. The only gaps are background agents/shells (Auggie has no such model), command exit status (Auggie doesn't record it, so its commands render as ✓), and push delivery (Auggie has no hooks — the note still queues, you deliver it with copy).
 - **Augment VS Code / Cursor extensions** are read from per-workspace IDE storage (`workspaceStorage/**/Augment.vscode-augment/`) — **todos + files-touched only**, honestly degraded. The chat transcript lives in an `augment-kv-store` LevelDB that stdlib can't decode, so the narration panel says exactly that instead of pretending it's empty. Everything the SPA does render (todos, files, source badge, live filter, search, notes, flags, rename, pin) works for these sessions the same way it does for the other two.
 - **"Live" is a 5-minute window** since the last activity. Background-agent completion is inferred from that window, so an agent-finished notification can lag a few minutes; background shells with real process state notify promptly.
-- **Everything stays on your machine.** Read-only against the tool logs, no outbound network, no telemetry.
+- **Everything stays on your machine.** Read-only against the tool logs, no outbound network, except, once you save an OpenRouter key, one read of openrouter.ai's key-usage endpoint when you open Config → Usage, no telemetry.
 
 ---
 
