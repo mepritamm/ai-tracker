@@ -393,3 +393,37 @@ Steps 1, 2 and 5 wait on no account probe, and steps 3b/3c don't block the rest.
 | R8 | Fixture B/C are deferred, so could the credits UI ship untested? | The UI test's "credits fixture" also waits for 3b. **Open: the step 6 UI test must use a 3b fixture. If 3b is still blocked at step 6, the credits-render UI assertion waits with it, and the PR states that.** |
 | R9 | The Auggie login runs with any gateway, but the client still sends `gateway:'anthropic'`. Is that harmless? | Yes: the branch runs before `gateway.launcher`. |
 | R10 | `month_cost` never looks at the augment_ext (VS Code) provider. | It is out of scope: the user asked for Auggie, and the card's note says "Auggie CLI sessions". |
+
+## Addendum (2026-11-19): config.json chmod on Update and restart
+
+**Ask (verbatim):** "it should also run when someone runs `Update and Restart`" — "it" = `store.secure_config_file()` (`aitracker/store.py:18`), called at the top of `server.run()` (`aitracker/server.py:1210`).
+
+### How "Update and restart" restarts (evidence)
+- Route: `POST /api/update/apply` (`server.py:736`) → `update_apply()` (`update.py:263`) → `_apply_locked()` does the only write, `git merge --ff-only <sha>` (`update.py:318`), returns 202. After the 202 is flushed, the handler calls `start_restart(port)` (`server.py:770-772`), a 0.5 s `threading.Timer` → `restart_in_place()` (`update.py:382-387`).
+- `restart_in_place()` (`update.py:347-379`) **re-execs in place**: `os.execv(sys.executable, sys.orig_argv or [python, "-m", "aitracker", *argv[1:]])` (`update.py:356, 372`). Same PID, same argv. It does not exit for launchd to respawn, and it does not reload in-process. The exec runs a fresh interpreter, so it runs the newly merged code from `aitracker/__main__.py` → `cli.main()`.
+- **(a) launchd service:** the plist argv is `[python, "-m", "aitracker", "--service"]` (`schedule.py:271`). The re-exec keeps that argv and PID, so launchd sees no exit and KeepAlive never fires. `cli.main()` reaches `run(..., service=True)` (`cli.py:89-90`) → `secure_config_file()` (`server.py:1210`).
+- **(b) foreground:** `python -m aitracker` re-execs to `cli.py:90` → `run()`. A foreground `make serve` (`Makefile:10`, `--serve`, worktree or non-macOS) re-execs with `--serve`. `svc_install` again returns 2 ("refused", `schedule.py:302-308`) → falls through (`cli.py:74`) → `run()`. Edge case: if the service install could succeed on the re-exec, the process exits 0 (`cli.py:66-69`). The service it installed then starts through `--service` → `run()`. Either way, whichever process ends up serving has passed through `secure_config_file()`.
+- Bundle/package kinds (`update.py:91-99`) cannot update in-app, so they are out of scope.
+- **Exec failure** (`update.py:373-379`): the process stays up on the code it already had, so there is no restart to hook.
+
+### Does the merge touch config.json? Is there a 0644 window?
+- `aitracker/config.json` is gitignored (`.gitignore:16`, confirmed with `git check-ignore -v`). It is untracked, so `merge --ff-only` neither writes it nor changes its mode. One exception: git treats ignored files as expendable, so if an upstream commit ever *tracked* `aitracker/config.json`, the ff-merge would silently overwrite it with git's 0644. That would be a separate, much larger bug (secrets in git), and the re-exec's `run()` would still re-chmod it to 0600.
+- No new window. Between the merge and the exec (~0.5 s plus the pre-exec steps), the file keeps whatever mode it had. If the running process is already post-5d34ac5, its own startup already made it 0600, and `_save_json` keeps that mode (`store.py:27-38`).
+- **Key point:** the update that *first* brings in `secure_config_file` is applied by the *old* process's `update.py`, which has no chmod. Any call added to `update.py` would not run for that transition, and for later updates it would duplicate what the re-exec's `run()` already does. Only the new process's `run()` can cover the first upgrade, and it already does.
+
+### Verdict: already covered, so no production code change
+Every successful "Update and restart" path re-execs into `cli.main()` → `server.run()` → `secure_config_file()`. The change is **tests only**, pinning the link the existing tests don't cover: from the re-exec argv to the chmod. (`test_update_restart.py` already pins the argv, and `test_save_json_mode.py:78` pins `run()` → chmod. Nothing pins `cli.main()` with the re-exec argv → `run()` → chmod.)
+
+### Exact change: `tests/test_save_json_mode.py`, class `SecureConfigFileTests` (`:60`)
+Add two tests in the existing style: `self.p` is a temp `config.json` patched into `config.CONFIG_FILE` by `setUp`, `server.bind` is patched with `side_effect=RuntimeError("stop")`, and `server.signal.signal` is patched. Each test asserts the real file mode, not a mock call.
+1. `test_update_reexec_as_service_secures_config`: `store._save_json(self.p, {"TUNNEL_PASS": "x"})`, `os.chmod(self.p, 0o644)`, then `mock.patch.object(sys, "argv", ["aitracker", "--service"])` and `mock.patch.dict(os.environ, {"PORT": "8791", "TRACKER_NO_BROWSER": "1", "TRACKER_SCHEDULER_AUTOINSTALL": "0"})` (the env `restart_in_place` sets, `update.py:354-355`). Call `cli.main()` inside `assertRaises(RuntimeError)` and assert `_mode(self.p) == 0o600`.
+2. `test_update_reexec_foreground_serve_secures_config`: same setup, with argv `["aitracker", "--serve"]`, `mock.patch.object(cli, "svc_baked", return_value=None)`, `mock.patch.object(cli, "svc_install", return_value=2)` (the "refused" fallback, `schedule.py:303-308`) and `mock.patch.object(cli, "_port_busy", return_value=False)`. Assert 0600. This also pins that `--serve` falls through to `run()` and is not swallowed.
+- Also patch `server.publish_endpoint`/`start_worker` only if the order changes. Today `bind` raises at `server.py:1213`, before either of them runs, so neither needs patching. No other file changes. Stdlib `unittest`/`mock` only.
+- **Proof of red:** comment out `secure_config_file()` at `server.py:1210`, and both new tests fail with mode `0o644`. Separately, make `cli.main()` return before `run()` in the `--serve` fallback, and test 2 fails. Restore both and run `make check` (`unset TRACKER_AUTH;` first, per memory), which must be green.
+
+### Risky spot and fallback
+- **Risk:** `cli.main()` imports, and `run()` reached through it, have side effects beyond `bind`: `AITRACKER_SERVICE_PID` is set in `os.environ` (`server.py:1203-1204`), and `config.BIND_*`/`config.SERVICE` are mutated (`server.py:1200-1202`). Contain the env change with `mock.patch.dict(os.environ)`. Restore `config.BIND_HOST`/`BIND_PORT`/`SERVICE` in `addCleanup`, the same way `test_server_run_calls_it_before_binding` leaves them. If cross-test leakage shows up, also patch those three with `mock.patch.object`.
+- **Fallback:** if `cli.main()` proves too entangled to drive under test, drop to a narrower pin. Assert `restart_in_place`'s fallback argv is `[sys.executable, "-m", "aitracker", ...]` (it already is, `test_update_restart.py:143`), then call `cli.main()` with only `server.run` patched to record that it was called. Together with the existing `test_server_run_calls_it_before_binding` (`:78`), that chain still pins re-exec → `run()` → chmod.
+
+### Conventions
+**No conventions change is needed.** The rule-6 Update exception text (`.claude/rules/conventions.md`) is untouched: no new git command, no new write, no new action. `secure_config_file` is a chmod of app-owned state that already exists and already runs at startup.
