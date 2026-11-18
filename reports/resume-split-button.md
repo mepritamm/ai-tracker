@@ -655,6 +655,7 @@ The re-review found every row applied and the Units 2–5 file sets disjoint. It
 | 6 old tests + full gate + RED proofs | sonnet / haiku gate | done: 6 old test modules reconciled (readonly_ui, page_bundle, term_launch, term_split_menu on _tsplit_dom, cr_detail_action_row_responsive, term_vt_client), README updated; gate 172/172 modules rc 0/5 after fixes (2 load-sensitive term_vt tests failed in the full run, pass isolated); no source edits; RED sweep and :has() z-index browser check NOT done |
 | code review | opus + sonnet | pending |
 | review fixes | sonnet | done: A1+S3 prune (_tsplitPrune), A2 list label, A3+S2 termExtDeny re-sync via t.s, S1 hint hidden in solo (app.js; 4 tests in test_tsplit_shared, RED proven); B1 hero CSS ellipsis + caret flex:none (ext_cr_board.css, test_cr_board_resume_button RED proven); B2 README; B3 dead localOnly removed + comments + test_term_vt_client anchor |
+| caret 28px | sonnet | done (user decision 2026-11-18): shared `.tsplit-caret` min-width:28px (app.css); board hero keeps flex:none, primary ellipsis absorbs; test_tsplit_shared pins it |
 
 ## Code review reconciliation (main thread, 2026-11-18)
 
@@ -676,6 +677,6 @@ Reviews:
 | B4 | Probe re-renders a stale `d` in classic | **same as base**: no change | Known gap; documented here. |
 | B5 | A click lost mid-rebuild also applies to the board | **same as base**: no change | Known gap; documented here (as S6). |
 | S4 | Board reads raw `s.resumable` rather than `termResumable` | **no change**: same value (`termResumable` reads that flag first); the board's gate is `awaiting && resumable` | none |
-| Browser | Caret hit box is 24px (< 28px touch threshold) | **parked: the user's call** (a design size; the dashboard is mostly desktop) | Options: keep 24px / raise to 28px. Recommendation: 28px on coarse pointers only (`@media (pointer:coarse)`). |
+| Browser | Caret hit box is 24px (< 28px touch threshold) | **parked: the user's call** (a design size; the dashboard is mostly desktop) | user chose 28px everywhere — applied |
 | Browser | Caret tooltip doesn't name ⌥ (the primary's tooltip and the menu item do) | **no change**: contract clause 6 says "named in the tooltip and beside the menu item"; both are met | none |
 | Missed | Toolbar split never seen in a real browser | open | The browser re-check opens the toolbar only if a terminal is already running; otherwise it is named as unverified in the final report. |

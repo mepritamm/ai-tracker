@@ -371,6 +371,14 @@ class TestSources(unittest.TestCase):
         for gone in ("tsplit-menu", "::-webkit-details-marker", "#extnative"):
             self.assertNotIn(gone, css, gone)
 
+    def test_15f_caret_min_width_is_28px(self):
+        m = re.search(r"\.tsplit:not\(\.tsplit-solo\):not\(\.tsplit-nomenu\)>\.tsplit-caret\{([^}]*)\}", _css())
+        self.assertIsNotNone(m)
+        w = re.search(r"min-width:(\d+)px", m.group(1))
+        self.assertIsNotNone(w)
+        self.assertGreaterEqual(int(w.group(1)), 28)
+        self.assertIn("box-sizing:border-box", m.group(1))
+
     def test_15b_no_state_class_in_any_css(self):
         allowed = {"solo", "nomenu", "start", "primary", "caret", "list", "item", "hint", "solo-label", "ico", "txt", "label", "arrow"}
         seen = set()

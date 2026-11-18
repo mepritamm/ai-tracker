@@ -660,7 +660,7 @@ main[data-sess=refreshing] #hmeta::after{content:" · " attr(data-snap)}
 .tsplit>button.tsplit-primary,.tsplit>button.tsplit-caret{align-self:stretch}
 .tsplit:not(.tsplit-solo):not(.tsplit-nomenu)>.tsplit-primary{border-top-right-radius:0;border-bottom-right-radius:0;border-right-width:0}
 .tsplit:not(.tsplit-solo):not(.tsplit-nomenu)>.tsplit-caret{border-top-left-radius:0;border-bottom-left-radius:0;
-  border-left:1px solid color-mix(in srgb,currentColor 35%,transparent);padding-left:6px;padding-right:6px;min-width:24px}
+  border-left:1px solid color-mix(in srgb,currentColor 35%,transparent);padding-left:6px;padding-right:6px;min-width:28px;box-sizing:border-box}
 .tsplit-caret{cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:4px}
 .tsplit-solo-label{display:none}.tsplit-solo .tsplit-solo-label{display:inline}
 .tsplit-list{position:absolute;top:100%;right:0;left:auto;margin-top:4px;z-index:80;display:flex;flex-direction:column;
