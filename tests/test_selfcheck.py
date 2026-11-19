@@ -951,6 +951,11 @@ def _run():
             stdout=" 100 1 100\n 200 100 200\n 201 100 100\n 300 999 300\n")):
         assert term_vt._claude_work_children(100) == [200], "only own-group-escaping tool shells are work"
     # idle TTL vs a session live elsewhere: a Claude pty whose transcript was just written is held
+    _q = term_vt.Pty(); _q.viewers = 1; _q.live_hold = 0.0
+    _q.last_active = time.time() - config.TERM_IDLE_TTL_MIN * 60 - 5
+    assert term_vt._idle_due(_q, time.time()), "a terminal a pane merely displays must still idle out"
+    _q.live_hold = time.time() + 60
+    assert not term_vt._idle_due(_q, time.time()), "a _session_live HOLD still defers the reap"
     _p = term_vt.Pty()
     _p.mode, _p.session = "resume", "S"
     assert term_vt._pty_session_ids(_p) == ("S",), "a resume pty runs its own session"

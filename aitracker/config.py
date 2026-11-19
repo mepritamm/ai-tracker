@@ -588,7 +588,7 @@ def resolve_icon_scale(overrides):
 
 
 def resolve_term_idle_ttl_min(overrides):
-    """Minutes a terminal nobody is watching or typing into survives before it is closed.
+    """Minutes a terminal with no input and no counted output survives before it is closed (an open pane alone does not keep it).
     config.json > TRACKER_TERM_IDLE_TTL_MIN > 30; clamped to [1, 1440]."""
     if "TERM_IDLE_TTL_MIN" in overrides:
         try:

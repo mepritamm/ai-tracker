@@ -1257,6 +1257,7 @@ MAX_STREAMS = 24         # concurrent SSE /api/term/screen connections, across a
                           # term_run.stream's docstring for the thread-exhaustion measurement this
                           # cap exists to prevent (same ThreadingHTTPServer, same failure mode).
 # Idle reap TTL is `config.TERM_IDLE_TTL_MIN` (minutes, live-tunable), read at check time in `_reader`.
+_FOCUS_REPORTS = (b"\x1b[I", b"\x1b[O")   # ?1004 focus in/out: the pane gained/lost focus, not input -- never resets the idle clock
 FINISH_REAP_WAIT = 5.0   # s finish() waits for the child after closing the pty; past this the row is released
 SESSION_LIVE_RECHECK = 30.0   # s between re-probes while an idle pty is HELD by _session_live (no touch: the idle clock keeps running)
 _REAP_LINGER = 600        # seconds a FINISHED pty's record (its final rc) lingers in PTYS before
@@ -1522,7 +1523,7 @@ class Pty:
                                     # "monotonic for the life of the object" rule).
         self.ended = 0.0           # time.time() when finish() ran; 0.0 while still live
         self.started = time.time()
-        self.last_active = self.started   # last keystroke, last viewer leaving, or a screen change `_note_activity` counts -- idle clock
+        self.last_active = self.started   # last keystroke/paste/inject, or a screen change `_note_activity` counts -- idle clock (viewers never move it)
         self._act_v = None        # last screen-activity version `_note_activity` saw (reader-only)
         self._act_raw = None   # last screen.v _note_activity sampled (reader-only)
         self._act_t = 0.0         # when `_note_activity` last sampled (throttle; reader-only)
@@ -1533,7 +1534,7 @@ class Pty:
                                            # informal style as `last_active`); this is what
                                            # `inject()`'s quiescence wait polls, deliberately
                                            # distinct from `last_active` (which also moves on a
-                                           # keystroke or a viewer connecting/leaving, neither of
+                                           # keystroke, neither of
                                            # which means the TUI has finished redrawing)
         self.lock = threading.Lock()      # guards `screen` only
 
@@ -1866,9 +1867,15 @@ def _note_activity(pt, now):
         pt._act_v = v                    # never has its backdated last_active overwritten
 
 
+def _idle_due(pt, now):
+    """The idle reap's trigger: no counted activity for TERM_IDLE_TTL_MIN, and no live HOLD pending.
+    Deliberately NOT gated on `pt.viewers`: a dashboard pane that merely displays a terminal
+    keeps an SSE stream open forever, so a viewer gate meant "never" (term-idle-reap)."""
+    return now - pt.last_active > config.TERM_IDLE_TTL_MIN * 60 and now >= pt.live_hold
+
+
 def _reader(pt):
-    """Drain the pty into `pt.screen` via `feed()` until EOF, or until the idle timeout fires with
-    nobody attached. Owns the reap: the thread that reads the fd is the thread that `waitpid()`s
+    """Drain the pty into `pt.screen` via `feed()` until EOF, or until the idle timeout fires. Owns the reap: the thread that reads the fd is the thread that `waitpid()`s
     it, so there is exactly one waitpid per child and never a zombie (mirrors term_run._reader).
 
     The idle check lives in this loop (rather than a separate timer thread) because `select`'s own
@@ -1885,8 +1892,7 @@ def _reader(pt):
             if pt.screen is not None:
                 _note_activity(pt, time.time())
             now = time.time()
-            if (pt.viewers <= 0 and now - pt.last_active > config.TERM_IDLE_TTL_MIN * 60
-                    and now >= pt.live_hold):
+            if _idle_due(pt, now):
                 if _claude_busy(pt):
                     pt.touch()       # in-pty tool work counts as activity; re-probed one TTL later
                     pt.last_hold = "busy"
@@ -1894,6 +1900,9 @@ def _reader(pt):
                     pt.live_hold = now + SESSION_LIVE_RECHECK   # HOLD, not touch: reaped once the session goes quiet
                     pt.last_hold = "live"
                 else:
+                    if pt.screen is not None:
+                        _feed_note(pt, "[ai-tracker] closed: no activity for %g min (Config → Terminal → Idle terminal TTL)"
+                                   % config.TERM_IDLE_TTL_MIN)
                     pt.kill()
                     break
             try:
@@ -4276,7 +4285,8 @@ def keys(handler, parsed, body):
         data = base64.b64decode(body.get("data") or "", validate=False)
     except Exception:
         return handler._json({"error": "bad base64"}, 400)
-    pt.touch()
+    if data not in _FOCUS_REPORTS:
+        pt.touch()
     try:
         os.write(pt.fd, data)
     except OSError as e:
@@ -4440,7 +4450,6 @@ def resize_pty(handler, parsed, body):
         return _mismatch(handler, tid)
     cols = _clamp_int(body.get("cols"), MIN_COLS, MAX_COLS, pt.screen.cols)
     rows = _clamp_int(body.get("rows"), MIN_ROWS, MAX_ROWS, pt.screen.rows)
-    pt.touch()
     _set_winsize(pt.fd, rows, cols)
     with pt.lock:
         pt.screen.resize(cols, rows)
@@ -4953,8 +4962,9 @@ def screen_stream(handler, parsed):
     LAST viewer disconnects, because a finished one-shot command has nothing left to show anyone.
     A PTY here is a persistent shell -- the whole point of `tty` being a stable id the client can
     reattach to is that closing every tab and coming back later finds the SAME session still
-    running -- so the last viewer leaving only calls `pt.touch()`, starting the idle TTL
-    clock, rather than killing anything. `_reader()` is what actually reaps an abandoned PTY.
+    running -- so the last viewer leaving kills nothing. Viewers do not affect the idle
+    clock at all: `_reader()` reaps a PTY after `TERM_IDLE_TTL_MIN` of no input or counted output,
+    whether or not a pane shows it.
     """
     global _STREAMS
     if not term_gate.guard(handler):
@@ -4972,7 +4982,6 @@ def screen_stream(handler, parsed):
         if pt is not None and not busy and not mismatch:
             _STREAMS += 1
             pt.viewers += 1
-            pt.touch()
     if pt is None:                                       # returns fast, holds no thread
         return handler._json({"error": "no such terminal", "tty": tid}, 404)
     if mismatch:
@@ -4985,7 +4994,6 @@ def screen_stream(handler, parsed):
         with _LOCK:
             _STREAMS -= 1
             pt.viewers -= 1
-            pt.touch()                                   # last-viewer-leaves starts the idle clock
 
 
 def _screen_stream_body(handler, pt):
@@ -5600,7 +5608,6 @@ def raw_stream(handler, parsed):
         if pt is not None and not busy and not mismatch:
             _STREAMS += 1
             pt.viewers += 1
-            pt.touch()
     if pt is None:                                       # returns fast, holds no thread
         return handler._json({"error": "no such terminal", "tty": tid}, 404)
     if mismatch:
@@ -5618,7 +5625,6 @@ def raw_stream(handler, parsed):
         with _LOCK:
             _STREAMS -= 1
             pt.viewers -= 1
-            pt.touch()                                   # last-viewer-leaves starts the idle clock
 
 
 def _raw_stream_body(handler, pt, q):

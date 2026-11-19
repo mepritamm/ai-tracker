@@ -1978,6 +1978,68 @@ class TestStreamAccounting(unittest.TestCase):
         self.assertEqual(pt.viewers, 0)
         h.close()
 
+    def test_watched_idle_pty_is_reaped_and_stream_ends(self):
+        ttl0 = config.TERM_IDLE_TTL_MIN
+        self.addCleanup(setattr, config, "TERM_IDLE_TTL_MIN", ttl0)
+        config.TERM_IDLE_TTL_MIN = 30
+        pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
+        term_vt.PTYS[pt.id] = pt
+        h = _StreamHandler()
+        t = threading.Thread(target=term_vt.screen_stream, args=(h, _Q("session=&tty=" + pt.id)))
+        t.daemon = True
+        t.start()
+        try:
+            self.assertTrue(_wait_for(lambda: pt.viewers == 1, 5))
+            config.TERM_IDLE_TTL_MIN = 0.001
+            self.assertTrue(_drain(pt, 5).done, "a watched but idle PTY must be reaped")
+            t.join(5)
+            self.assertFalse(t.is_alive(), "the stream must end once the PTY is reaped")
+            h.connection.close()
+            data = b""
+            h.peer.settimeout(1)
+            try:
+                while True:
+                    c = h.peer.recv(65536)
+                    if not c:
+                        break
+                    data += c
+            except OSError:
+                pass
+            self.assertIn(b"no activity for", data)
+        finally:
+            pt.kill()
+            _drain(pt, 5)
+            term_vt.PTYS.pop(pt.id, None)
+            h.close()
+        self.assertEqual(pt.viewers, 0)
+        self.assertEqual(term_vt._STREAMS, 0)
+
+    def test_stream_attach_detach_does_not_touch_idle_clock(self):
+        ttl0 = config.TERM_IDLE_TTL_MIN
+        self.addCleanup(setattr, config, "TERM_IDLE_TTL_MIN", ttl0)
+        config.TERM_IDLE_TTL_MIN = 30
+        pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
+        term_vt.PTYS[pt.id] = pt
+        try:
+            self.assertTrue(_wait_for(lambda: pt._act_v is not None, 5))
+            for route in (term_vt.screen_stream, term_vt.raw_stream):
+                pt.last_active = before = time.time() - 120
+                h = _StreamHandler()
+                t = threading.Thread(target=route, args=(h, _Q("session=&tty=" + pt.id)))
+                t.daemon = True
+                t.start()
+                self.assertTrue(_wait_for(lambda: pt.viewers == 1, 5))
+                h.close_peer()
+                t.join(5)
+                self.assertFalse(t.is_alive())
+                self.assertTrue(_wait_for(lambda: pt.viewers == 0, 5))
+                self.assertEqual(pt.last_active, before, route.__name__)
+                h.close()
+        finally:
+            pt.kill()
+            _drain(pt, 5)
+            term_vt.PTYS.pop(pt.id, None)
+
 
 class TestWireFormat(unittest.TestCase):
     """The two integration bugs neither TestRoutes nor TestStreamAccounting can see on their own:
@@ -2159,17 +2221,54 @@ class TestIdleTimeout(unittest.TestCase):
         finally:
             pt.kill()
 
-    def test_active_viewer_prevents_idle_reap(self):
+    def test_viewer_alone_does_not_prevent_idle_reap(self):
         config.TERM_IDLE_TTL_MIN = 0.001
         pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
         pt.viewers = 1                     # simulate an attached viewer, no route needed
         try:
-            time.sleep(0.6)
-            self.assertFalse(pt.done, "a PTY with an active viewer must not be idle-reaped")
+            self.assertTrue(_drain(pt, 5).done, "a displayed-but-idle PTY must still be reaped")
         finally:
             pt.viewers = 0
             pt.kill()
             _drain(pt, 5)
+
+    def _guarded(self):
+        """Terminal routes on; restored by cleanup. Registers nothing -- callers add their pty."""
+        t0, a0 = config.TERMINAL, config.AUTH
+        config.TERMINAL, config.AUTH = True, "u:p"
+        def undo():
+            config.TERMINAL, config.AUTH = t0, a0
+        self.addCleanup(undo)
+
+    def _idle_pty(self):
+        """A sleep pty past the reader's first activity sample, with last_active backdated 120 s."""
+        config.TERM_IDLE_TTL_MIN = 30
+        pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24)
+        term_vt.PTYS[pt.id] = pt
+        def undo():
+            pt.kill()
+            _drain(pt, 5)
+            term_vt.PTYS.pop(pt.id, None)
+        self.addCleanup(undo)
+        self.assertTrue(_wait_for(lambda: pt._act_v is not None, 5))
+        pt.last_active = time.time() - 120
+        return pt, pt.last_active
+
+    def test_same_size_resize_does_not_touch_idle_clock(self):
+        self._guarded()
+        pt, before = self._idle_pty()
+        term_vt.resize_pty(_FakeHandler(), None, {"session": "", "tty": pt.id, "cols": 80, "rows": 24})
+        self.assertEqual(pt.last_active, before)
+
+    def test_focus_report_does_not_touch_but_a_key_does(self):
+        self._guarded()
+        pt, before = self._idle_pty()
+        b64 = lambda b: base64.b64encode(b).decode()
+        term_vt.keys(_FakeHandler(), None, {"session": "", "tty": pt.id, "data": b64(b"\x1b[I")})
+        term_vt.keys(_FakeHandler(), None, {"session": "", "tty": pt.id, "data": b64(b"\x1b[O")})
+        self.assertEqual(pt.last_active, before)
+        term_vt.keys(_FakeHandler(), None, {"session": "", "tty": pt.id, "data": b64(b"x")})
+        self.assertGreater(pt.last_active, before)
 
     def _claude(self, body):
         script = _CLAUDE_LAYOUT_CHILD % {"body": "True" if body else "False"}

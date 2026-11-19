@@ -103,8 +103,8 @@ AGENT_RA_PICK = ("Only %d terminal slot%s free (%d of %d in use), so the newest 
                  "instead, or close a terminal first. Each new folder, and each further session in a folder whose "
                  "terminal is busy, takes a slot.")
 AGENT_RA_ALREADY = "Already open in a terminal here, so not listed: %s."
-AGENT_RA_NOTE = ("Nobody is watching these terminals, so one that sits idle closes after %d minutes "
-                 "(Config → Terminal → Idle terminal TTL). Peek or open one to keep it.")
+AGENT_RA_NOTE = ("These terminals close after %d minutes with no activity, even while open on screen "
+                 "(Config → Terminal → Idle terminal TTL). Type into one to keep it.")
 AGENT_RA_TOO_MANY = ("The %d you ticked need %d terminal slot%s, but only %d %s free now. Untick some or close a "
                      "terminal, then press Resume again. The list below is current.")
 AGENT_RA_NONE_PICKED = "None of the sessions you ticked can be opened now. The list below is current."
