@@ -1534,8 +1534,8 @@ class Pty:
                                            # informal style as `last_active`); this is what
                                            # `inject()`'s quiescence wait polls, deliberately
                                            # distinct from `last_active` (which also moves on a
-                                           # keystroke, neither of
-                                           # which means the TUI has finished redrawing)
+                                           # keystroke, which does not mean the TUI has
+                                           # finished redrawing)
         self.lock = threading.Lock()      # guards `screen` only
 
     def touch(self):
@@ -1870,13 +1870,14 @@ def _note_activity(pt, now):
 def _idle_due(pt, now):
     """The idle reap's trigger: no counted activity for TERM_IDLE_TTL_MIN, and no live HOLD pending.
     Deliberately NOT gated on `pt.viewers`: a dashboard pane that merely displays a terminal
-    keeps an SSE stream open forever, so a viewer gate meant "never" (term-idle-reap)."""
-    return now - pt.last_active > config.TERM_IDLE_TTL_MIN * 60 and now >= pt.live_hold
+    keeps an SSE stream open forever, so a viewer gate meant "never" (term-idle-reap).
+    A Config login pty is bounded by LOGIN_WATCH_MAX (`_login_watch`), never by the idle TTL."""
+    return not pt.login and now - pt.last_active > config.TERM_IDLE_TTL_MIN * 60 and now >= pt.live_hold
 
 
 def _reader(pt):
-    """Drain the pty into `pt.screen` via `feed()` until EOF, or until the idle timeout fires. Owns the reap: the thread that reads the fd is the thread that `waitpid()`s
-    it, so there is exactly one waitpid per child and never a zombie (mirrors term_run._reader).
+    """Drain the pty into `pt.screen` via `feed()` until EOF, or until the idle timeout fires.
+    Owns the reap: the thread that reads the fd is the thread that `waitpid()`s it, so there is exactly one waitpid per child and never a zombie (mirrors term_run._reader).
 
     The idle check lives in this loop (rather than a separate timer thread) because `select`'s own
     timeout already wakes this thread once a second regardless of PTY activity -- a second thread

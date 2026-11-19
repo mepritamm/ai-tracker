@@ -179,3 +179,119 @@ Red proofs (scoped revert of the fix, test fails; then restored):
 - S1 (selfcheck `_idle_due` assertion): RED with the viewer gate restored.
 
 Gate: `tests.test_term_vt` + `tests.test_selfcheck` together: 384 tests OK. All other tests/test_*.py modules run one per process: all rc=0 (no flake).
+
+## Review (post-fix, opus)
+
+Reviewed `7ee2d01` against `ee03212`. I started from the assumption that the implementation report is false. I checked the change against `tracker-gap`, CLAUDE.md and conventions.md. I read the code in scoped per-file diffs, plus `sed` ranges of `term_vt.py`.
+
+**Verdict: ship after fixes.** There are 0 blockers, 3 should-fix findings and 7 nits. The core fix is correct and is proven on the live path.
+
+### What I re-proved myself (with scoped Edits, restored afterwards; `git diff --stat 7ee2d01` is clean)
+- **Viewer gate.** I put `pt.viewers <= 0 and` back in **`_reader`**, not in `_idle_due`, so the tests have to prove the live loop and not only the helper. With that edit, U1 `test_viewer_alone_does_not_prevent_idle_reap` and U2 `test_watched_idle_pty_is_reaped_and_stream_ends` both went RED.
+  - S1 in selfcheck tests only `_idle_due`, so it stays green against that edit. U1 and U2 carry the live-path proof. Acceptable.
+- **Resize touch.** With `pt.touch()` restored in `resize_pty`, U4 `test_same_size_resize_does_not_touch_idle_clock` went RED. That proves the `_FakeHandler` call really reaches the line and the test is not vacuous.
+- **Green run.** All 6 new or renamed tests are green with the fix in place.
+
+### Verified clean (no finding)
+- **Every `last_active` write enumerated** (`term_vt.py` 1542 / 1866 / 1897 / 1943 / 2134 / 3945 / 4289 / 5486 / 5522).
+  - No viewer, attach, detach, reconnect or resize path touches it any more.
+  - Keys, inject, `_inject_argv`, the swap claim and counted output still do.
+- **`_feed_note` before `pt.kill()` (term_vt.py:1903-1907).**
+  - `_reader` holds no lock at that point. `_feed_note` takes `pt.lock` once, and `_tee_raw` only uses `put_nowait`. No deadlock.
+  - `_screen_stream_body` reads `snapshot()` and `pt.done` under the same lock (5081-5092), so the final frame always carries the note.
+  - `_raw_stream_body` drains its queue and the notices before it returns on `done`.
+  - The `pt.screen is None` guard is correct.
+- **Holds.** The order is unchanged. `_claude_busy` touches, `_session_live` holds without touching, and `last_hold` keeps the same semantics. The folder-swap guard `fp.viewers > 0` (3936) still gates the swap, and the swap claim still touches.
+- **Focus guard.**
+  - Native renderer: each `_send` posts one focus report on its own (ext_vt.js:905/909, then the `_enqueue` chain, one POST per call, no batching).
+  - xterm renderer: `onData` emits the report as its own event.
+  - CSI I and CSI O have no bracketed or combined variant, so an exact match is enough.
+
+### Findings
+
+**F1 (should-fix). A Config login terminal is now idle-reaped while the user is in the browser finishing the login.**
+- **Where:** `term_vt.py:1873-1874` (`_idle_due`), and `_reader` at 1895-1907.
+- **Repro:**
+  1. Set TTL = 5 (the slider minimum).
+  2. In Config, click Log in. The pane shows `claude auth login`, which prints nothing while it waits.
+  3. Spend more than 5 minutes on SSO or MFA in the browser.
+- **Actual:** the pty is SIGKILLed at 5 minutes, and `_login_outcome` records `"closed"` (rc -9).
+- **Expected:** the login is bounded by its own policy, `LOGIN_WATCH_MAX` (1800 s, `_login_watch`, 3691-3703), and records `"timeout"` when that runs out.
+- **Base behaviour:** the open pane's viewer gate protected the login. This change removed that protection, so it is a regression below a 30-min TTL.
+- **Fix direction:** idle reap skips login ptys. `_login_watch` stays their only time bound. Do NOT change `_login_watch`, `LOGIN_WATCH_MAX` or the outcome mapping.
+- **Way:** in `_idle_due`, use `return not pt.login and now - pt.last_active > config.TERM_IDLE_TTL_MIN * 60 and now >= pt.live_hold`. Add one docstring line: "a Config login pty is bounded by LOGIN_WATCH_MAX (`_login_watch`), never by the idle TTL". This covers both Claude (`claudeai`/`console`) and Auggie (`pt.login` set) logins, because `spawn(login=...)` sets it.
+- **Tests:**
+  - (a) Selfcheck, next to S1: `_q.live_hold = 0.0; _q.login = "claudeai"; assert not term_vt._idle_due(_q, time.time()), "a login pty is bounded by LOGIN_WATCH_MAX, not the idle TTL"`.
+  - (b) `TestIdleTimeout`, `test_login_pty_is_not_idle_reaped`:
+    - Run `term_vt.spawn(os.getcwd(), ["sleep","30"], 80, 24, login="claudeai")` with TTL 0.001.
+    - Assert `not pt.done` after `time.sleep(2.5)`.
+    - Cleanup: `pt.kill(); _drain(pt, 5)`. `tests/__init__.py` already redirects `last_login.json`.
+  - Both go RED before the fix.
+
+**F2 (should-fix: a user decision and copy, no code). A displayed pane now loses state that base protected, beyond "reading for longer than the TTL" (plan P6).** Once `max(LIVE_WINDOW, TTL)` has passed with no input:
+- (a) A Claude waiting on a permission prompt or an AskUserQuestion (`session_state == "waiting"`, providers/claude.py:803) is killed mid-turn. `_session_live`'s own docstring already lists "a pending permission dialog counts as idle after one window".
+- (b) An unsent draft typed into Claude's input box is lost.
+- (c) A `/loop` whose interval is longer than the TTL dies between iterations: no tool children are running, and the transcript is too old.
+- (d) A `claude agents`, `claude attach` or parked client pane closes, even while the user is watching its spinners. `_note_activity` never counts output for a client.
+
+Repro for (a): set TTL to 30. Let Claude ask a permission question in a pane that stays open, and leave for 35 min. Actual: the pane says "closed: no activity…". Base: the session was still waiting.
+
+- **Fix direction:** no code change. D1 was accepted, and an unbounded hold for "waiting" would bring back the 10-hour terminals.
+  - Before the push, put (a)-(d) to the user as a D1 follow-up ("D3").
+  - Add one sentence to `ext_cr_dialogs.js:2189` and `README.md:112`: "This includes a Claude waiting on a permission prompt or a question, and an unsent draft; Resume brings the session back."
+- **If the user wants (a) protected:** in `_session_live`, add a hold while `_claude.session_state(s) == "waiting"`, capped at one extra TTL after the transcript's last write. Never uncapped.
+- **Test, only if the code option is chosen:** `TestIdleSessionLive`, `test_waiting_session_held_one_extra_ttl`. Patch `session_state` to return `"waiting"` and `session_last_active` to `now - 1.5*window`. Assert held. At `now - 2.5*window`, assert reaped.
+
+**F3 (should-fix: copy). The README now says something false about resizing.**
+- **Where:** `README.md:112` says "opening, reconnecting, resizing or focusing a pane does not [reset the clock]".
+- **Why it is false:** only a re-fit at the same size is ignored. A real size change goes through `Screen.resize`, which bumps `v` and every `row_v` (term_vt.py:425-466), and `_note_activity` counts that on the next tick. For Claude, the body rows are dirty, and Claude also redraws on SIGWINCH.
+- **Repro:** open the same pty in a second window of a different size, so `POST /api/term/resize` goes to 100x30 from 80x24. Within 1 s, `idle_s` in `/api/term/list` drops to 0.
+- **Fix:** change the README to "opening, reconnecting, a same-size re-fit, or focusing a pane does not; a real size change does (the program redraws)". No code change, and no test.
+
+**N1 (nit). An explicit Peek or Resume of a terminal close to its TTL can close it seconds after it opens.**
+- **Why:** the client finds an existing pty through `/api/term/list` and only attaches the stream (ext_vt.js inline `spawn`/peek; `open_pty`'s reuse returns at 3401 and 3522 do not touch). An explicit open cannot be told apart from a reconnect.
+- **Direction:** no change; it is a known gap, and the closing note plus Resume cover it. If the user objects, put back the attach-only touch (not the detach touch) in `screen_stream` and `raw_stream`. That accepts tunnel and SSE-reconnect resets. Do not put back the viewer gate.
+
+**N2 (nit). The selfcheck insertion is out of place.** At `tests/test_selfcheck.py:953-958`, the new `_q` block sits between the comment `# idle TTL vs a session live elsewhere: …` and the `_p` block that comment describes.
+- **Fix:** move the five lines above that comment, under their own comment: `# idle TTL ignores viewers: a displayed pty still idles out; a live HOLD still defers it`.
+
+**N3 (nit). Comment grammar and line length.**
+- The `Pty.last_output` comment (term_vt.py:1536-1538) now reads "moves on a keystroke, neither of which". Change it to "(which also moves on a keystroke, which does not mean the TUI has finished redrawing)".
+- The first line of the `_reader` docstring (1877) runs past 160 characters. Rewrap it.
+
+**N4 (nit; no change, same as base).** In `keys()` (term_vt.py:4294-4297), a focus report still sets `pt.startup_done = True` for a folder shell. That does not match "focus is not input". It only matters when a program inside a folder shell that is still starting enables `?1004`. Mention it in the push notes.
+
+**N5 (nit; no change).** Mouse-motion reports (`?1003`) sent while the pointer merely hovers over a pane count as input, so hovering over a pane running vim or htop resets the clock. Claude Code does not enable `?1003`. A wheel scroll is real input to the program.
+
+**N6 (nit; tracker-gap Step 4). No integration eval, and no live curl proof yet.**
+- U2 drives the real `screen_stream` route against a real reader thread, which is acceptable in place of an integration test.
+- The ship step must restart the server, then GET `/api/term/list` and show a `viewers: 1` pty whose `idle_s` passes the TTL and whose row goes done. Use a scratch pty, and only with ownership proof.
+
+**N7 (nit; no change).** The comments at `ext_vt.js:747` and `3052` describe the old viewer pin in the past tense ("used to"). The leaked-stream fixes they document still matter for `MAX_STREAMS`.
+
+### Overall clean fix list (for a cheaper fixer)
+1. **F1:** in `_idle_due`, add `not pt.login and`, plus the one docstring line. Add the selfcheck line (F1a) and `test_login_pty_is_not_idle_reaped` (F1b). Prove both RED by removing the clause.
+2. **F3:** the README wording on resizing.
+3. **F2:** the one-sentence copy in `ext_cr_dialogs.js:2189` and `README.md:112`. Put D3 to the user before the push; write code only if they choose it.
+4. **N2 and N3:** move the selfcheck block, fix the comment wording, rewrap the docstring.
+5. **Gate and ship:** `unset TRACKER_AUTH;` run one module per process, then `/branch-sync`, then restart, then the live check in N6.
+
+## Reconciliation (main thread)
+
+| # | Verdict | Action |
+|---|---|---|
+| F1 login pty idle-reaped mid-login | confirmed | apply: `not pt.login and` in `_idle_due` + selfcheck line + `test_login_pty_is_not_idle_reaped` |
+| F2 open-but-untouched pane no longer protects a waiting Claude / draft / slow `/loop` | confirmed, intended (the user's ask: reap ~10h-idle terminals; a reaped Claude is resumable; busy/live holds unchanged) | wording only in `ext_cr_dialogs.js:2189` + `README.md:112`; surfaced to the user as D3 in the final report |
+| F3 README says resize never resets the clock | confirmed | reword to "a same-size re-fit does not" |
+| nits: selfcheck comment placement, comment grammar/length, stale `ext_vt.js` comments | confirmed, comment-only | apply |
+| nits: Peek near TTL, mouse-hover reports, focus marking shell startup done | overstated for this change | no change |
+| live `/api/term/list` proof | needs a restart of 8790, which kills all running terminals | not done automatically; user restarts |
+
+## Review fixes applied
+
+- F1: `_idle_due` now starts with `not pt.login and` (login ptys keep only `LOGIN_WATCH_MAX`); selfcheck line + `TestIdleTimeout.test_login_pty_is_not_idle_reaped`. Proven RED by removing the guard (test FAILED), GREEN restored.
+- F2 wording: one sentence in `ext_cr_dialogs.js` (TTL row) and README (waiting Claude / unsent draft closed after the TTL; resumable). Code option (hold a "waiting" Claude) NOT taken; D3 stays a user decision.
+- F3 wording: README says a same-size re-fit does not reset the clock, a real size change does.
+- Nits applied (comment-only): selfcheck block regrouped under its own comment, `last_output` comment grammar, `_reader` docstring rewrapped, stale `ext_vt.js` viewer-pin comments reworded.
+- Not changed: N1 (Peek near TTL), N4, N5, N7 logic; N6 live curl proof needs a 8790 restart (user).
+- Gate: test_term_vt + test_selfcheck OK (385 tests); remaining modules run one per process.

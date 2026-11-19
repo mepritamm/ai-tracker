@@ -2186,7 +2186,7 @@
             return sliderCtlCommit(1, 64, value != null ? value : 12, onCommit, '');
           }));
         body.appendChild(serverRow('Idle terminal TTL', 'TERM_IDLE_TTL_MIN',
-          'A terminal nobody types into, and whose program prints nothing that counts, is closed after this many minutes, even while a pane shows it. The slider covers 5–240; env TRACKER_TERM_IDLE_TTL_MIN or config.json accept 1–1440. Output counts as activity for a program or a local Claude, but not for a Claude client or the agents board, which close even while their spinners move. A Claude is kept open while its tool or background shells run, and while its transcript was written within the larger of LIVE_WINDOW and this TTL, whether by another terminal or by this pane\'s own Claude.',
+          'A terminal nobody types into, and whose program prints nothing that counts, is closed after this many minutes, even while a pane shows it. An open but untouched pane does not keep it alive: a Claude waiting on you, or an unsent draft, is closed after the TTL too (a working or recently live Claude is still held; the session can be resumed). The slider covers 5–240; env TRACKER_TERM_IDLE_TTL_MIN or config.json accept 1–1440. Output counts as activity for a program or a local Claude, but not for a Claude client or the agents board, which close even while their spinners move. A Claude is kept open while its tool or background shells run, and while its transcript was written within the larger of LIVE_WINDOW and this TTL, whether by another terminal or by this pane\'s own Claude.',
           function (value, onCommit) {
             return sliderCtlCommit(5, 240, value != null ? value : 30, onCommit, ' min');
           }));

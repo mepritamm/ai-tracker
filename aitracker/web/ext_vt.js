@@ -744,7 +744,7 @@
     // and opens the EventSource inside a requestAnimationFrame, so a closeVT()/renderer switch
     // landing in that gap used to run the callback ANYWAY -- opening a stream on an already-
     // destroyed terminal that nothing would ever close (destroy() had already seen a null
-    // this.es), pinning the server's `pt.viewers > 0` so the pty could never be idle-reaped.
+    // this.es), leaking a viewer stream that counts against MAX_STREAMS.
     // Same pattern (and same reason) as XtermTerminal._destroyed -- see that constructor.
     this._destroyed = false;
     // `starting`: true only while a mode="resume" pane is still coming up after the server's
@@ -3049,8 +3049,8 @@
             // activeSid equal and would slip through. Dropping the response used to LEAK the pty
             // the server had already spawned for us: live, viewer-less and invisible until
             // idle TTL (config.TERM_IDLE_TTL_MIN) — or, in the same-sid case, forever, since a second attach overwrote
-            // the first terminal without closing its SSE, pinning pt.viewers above 0 so the idle
-            // reap could never fire. Harmless-looking until you arrive here from the capacity
+            // the first terminal without closing its SSE, leaking a viewer stream
+            // (MAX_STREAMS). Harmless-looking until you arrive here from the capacity
             // block, where the user is actively trying to free slots and would silently gain a
             // hidden one instead. Now that /api/term/close exists, handing it back is one call.
             // Fire-and-forget: nothing is left to render.

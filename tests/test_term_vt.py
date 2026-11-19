@@ -2232,6 +2232,16 @@ class TestIdleTimeout(unittest.TestCase):
             pt.kill()
             _drain(pt, 5)
 
+    def test_login_pty_is_not_idle_reaped(self):
+        config.TERM_IDLE_TTL_MIN = 0.001
+        pt = term_vt.spawn(os.getcwd(), ["sleep", "30"], 80, 24, login="claudeai")
+        try:
+            time.sleep(2.5)
+            self.assertFalse(pt.done, "a login pty is bounded by LOGIN_WATCH_MAX, not the idle TTL")
+        finally:
+            pt.kill()
+            _drain(pt, 5)
+
     def _guarded(self):
         """Terminal routes on; restored by cleanup. Registers nothing -- callers add their pty."""
         t0, a0 = config.TERMINAL, config.AUTH
